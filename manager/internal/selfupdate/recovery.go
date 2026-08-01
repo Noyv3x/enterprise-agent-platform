@@ -200,7 +200,7 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 		if err := m.runner().Run(ctx, "systemctl", "--user", "start", unit); err != nil {
 			return fmt.Errorf("ensure recovered Manager service is started: %w", err)
 		}
-		if err := waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, newSHA); err != nil {
+		if err := m.waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, newSHA); err != nil {
 			return fmt.Errorf("verify recovered Manager control health: %w", err)
 		}
 		if err := m.verifyRecoveryServiceProcess(ctx, unit, newSHA); err != nil {
@@ -241,7 +241,7 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	if err := m.runner().Run(ctx, "systemctl", "--user", "start", unit); err != nil {
 		return rollback(fmt.Errorf("start recovered Manager service: %w", err))
 	}
-	if err := waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, newSHA); err != nil {
+	if err := m.waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, newSHA); err != nil {
 		return rollback(fmt.Errorf("wait for recovered Manager control health: %w", err))
 	}
 	if err := m.verifyRecoveryServiceProcess(ctx, unit, newSHA); err != nil {
@@ -498,7 +498,7 @@ func (m *Manager) restoreRecoveryCurrent(oldBinary []byte, unit string) error {
 	if writeErr == nil {
 		startErr = m.runner().Run(ctx, "systemctl", "--user", "start", unit)
 		if startErr == nil {
-			healthErr = waitRestoredManagerHealthy(ctx, m.SocketPath, m.ControlTokenFile)
+			healthErr = m.waitRestoredManagerHealthy(ctx, m.SocketPath, m.ControlTokenFile)
 		}
 	}
 	return errors.Join(
@@ -673,8 +673,8 @@ func validateRecoveryOwner(path string, info os.FileInfo) error {
 	return nil
 }
 
-func waitRecoveryManagerIdentity(ctx context.Context, socketPath, tokenPath, expectedVersion, expectedSHA string) error {
-	ticker := time.NewTicker(recoveryHealthPoll)
+func (m *Manager) waitRecoveryManagerIdentity(ctx context.Context, socketPath, tokenPath, expectedVersion, expectedSHA string) error {
+	ticker := time.NewTicker(m.recoveryPollingInterval(recoveryHealthPoll))
 	defer ticker.Stop()
 	consecutive := 0
 	for {
@@ -734,8 +734,8 @@ func recoveryManagerIdentityMatches(ctx context.Context, socketPath, tokenPath, 
 	return identity.Status == "healthy" && identity.Version == expectedVersion && identity.SHA256 == expectedSHA
 }
 
-func waitRestoredManagerHealthy(ctx context.Context, socketPath, tokenPath string) error {
-	ticker := time.NewTicker(recoveryHealthPoll)
+func (m *Manager) waitRestoredManagerHealthy(ctx context.Context, socketPath, tokenPath string) error {
+	ticker := time.NewTicker(m.recoveryPollingInterval(recoveryHealthPoll))
 	defer ticker.Stop()
 	for {
 		if restoredManagerHealthy(ctx, socketPath, tokenPath) {
@@ -747,6 +747,13 @@ func waitRestoredManagerHealthy(ctx context.Context, socketPath, tokenPath strin
 		case <-ticker.C:
 		}
 	}
+}
+
+func (m *Manager) recoveryPollingInterval(productionDefault time.Duration) time.Duration {
+	if m.recoveryPollInterval > 0 {
+		return m.recoveryPollInterval
+	}
+	return productionDefault
 }
 
 func restoredManagerHealthy(ctx context.Context, socketPath, tokenPath string) bool {

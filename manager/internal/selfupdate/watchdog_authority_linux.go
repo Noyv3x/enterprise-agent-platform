@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
@@ -33,6 +34,27 @@ type WatchdogBinding struct {
 	// basenames. Production bindings never set it.
 	bindingValidator func(WatchdogBinding) error
 	processVerifier  func(context.Context, WatchdogBinding, Plan, string, string) error
+	// Timing fields are private unit-test seams. WatchdogBinding leaves both
+	// zero so real watchdogs retain the production poll and deadline policy.
+	pollInterval  time.Duration
+	healthTimeout time.Duration
+}
+
+func (binding WatchdogBinding) pollIntervalValue() time.Duration {
+	if binding.pollInterval > 0 {
+		return binding.pollInterval
+	}
+	return 250 * time.Millisecond
+}
+
+func (binding WatchdogBinding) healthTimeoutValue(planTimeout time.Duration) time.Duration {
+	if binding.healthTimeout > 0 {
+		return binding.healthTimeout
+	}
+	if planTimeout < time.Second {
+		return time.Second
+	}
+	return planTimeout
 }
 
 // WatchdogBinding returns the exact runtime authority represented by m. The

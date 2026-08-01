@@ -27,6 +27,8 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
+const testRecoveryObserverTimeout = 50 * time.Millisecond
+
 type activationTakeoverRunner struct {
 	mu    sync.Mutex
 	calls [][]string
@@ -339,6 +341,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		Runner:                   fixture.runner,
 		Now:                      func() time.Time { return completedAt.Add(time.Second) },
 		BootID:                   func() string { return fixture.originalPlan.BootID },
+		recoveryPollInterval:     time.Millisecond,
 		recoveryExecutableReader: testRecoveryExecutableReader,
 	}
 	fixture.manager.RecoveryUnitActive = func(_ context.Context, unit string) (bool, error) {
@@ -987,7 +990,7 @@ func TestRecoverCurrentQuiescerFailurePreservesActivationAndFiles(t *testing.T) 
 func TestRecoveryWatchdogCommitReplayDoesNotRotatePreviousTwice(t *testing.T) {
 	fixture := newActivationTakeoverFixture(t)
 	fixture.setCommitBehavior(true, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil || !strings.Contains(err.Error(), "owned by its watchdog") {
@@ -999,7 +1002,7 @@ func TestRecoveryWatchdogCommitReplayDoesNotRotatePreviousTwice(t *testing.T) {
 		t.Fatalf("takeover did not stop at replayable main_started boundary: %#v exists=%v err=%v", journal, exists, err)
 	}
 	spawns := fixture.runner.countCommand("systemd-run")
-	replayCtx, replayCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	replayCtx, replayCancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err = fixture.manager.RecoverCurrent(replayCtx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	replayCancel()
 	if err == nil || !strings.Contains(err.Error(), "owned by its watchdog") {
@@ -1051,7 +1054,7 @@ func TestSupersededOldWatchdogSnapshotCannotCommitOrRestore(t *testing.T) {
 	fixture := newActivationTakeoverFixture(t)
 	fixture.setCommitBehavior(true, false)
 	oldPlanSnapshot := fixture.originalPlan
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil {
@@ -1077,7 +1080,7 @@ func TestRecoveryWatchdogRollbackRestoresCurrentCheckpointAndIsReplayable(t *tes
 	platformBefore := activationTakeoverFileSHA(t, fixture.platformPath)
 	operationBefore := activationTakeoverFileSHA(t, fixture.operationPath)
 	manifestBefore := activationTakeoverFileSHA(t, fixture.manifestPath)
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil || !strings.Contains(err.Error(), "owned by its watchdog") {
@@ -1130,7 +1133,7 @@ func TestRecoveryWatchdogRollbackRestoresCurrentCheckpointAndIsReplayable(t *tes
 func TestRecoveryTakeoverJournalRejectsLostConditionalOwnership(t *testing.T) {
 	fixture := newActivationTakeoverFixture(t)
 	fixture.setCommitBehavior(true, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil {
@@ -1521,7 +1524,7 @@ func TestRecoveryMainStartReplayAdvancesMissingPhaseWithoutDuplicateWatchdog(t *
 		t.Fatal(err)
 	}
 	watchdogSpawns := fixture.runner.countCommand("systemd-run")
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil || !strings.Contains(err.Error(), "owned by its watchdog") {
@@ -2232,7 +2235,7 @@ func TestRecoveryHostRebootRearmsWatcherFromRecoveryArtifact(t *testing.T) {
 func activationTakeoverPauseAtMainStarted(t *testing.T, fixture *activationTakeoverFixture) recoveryTakeoverJournal {
 	t.Helper()
 	fixture.setCommitBehavior(true, false)
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), testRecoveryObserverTimeout)
 	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA)
 	cancel()
 	if err == nil || !strings.Contains(err.Error(), "owned by its watchdog") {

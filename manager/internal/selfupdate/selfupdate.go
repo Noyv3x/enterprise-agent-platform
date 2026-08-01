@@ -157,6 +157,9 @@ type Manager struct {
 	RecoveryWatchdogVerifier func(context.Context, string, string, string, string) error
 	OrdinaryWatchdogVerifier func(context.Context, string, string, string, string) error
 	recoveryExecutableReader func(string, string) ([]byte, error)
+	// recoveryPollInterval is an in-package unit-test seam. Production callers
+	// cannot set it and therefore always retain each call site's default cadence.
+	recoveryPollInterval time.Duration
 }
 
 // ProbeTransientUnit proves that the current user-systemd session can host
@@ -910,10 +913,7 @@ func RunWatchdog(
 			return fmt.Errorf("unsupported Manager activation watchdog status %q", plan.Status)
 		}
 	}
-	timeout := time.Duration(plan.HealthTimeoutMS) * time.Millisecond
-	if timeout < time.Second {
-		timeout = time.Second
-	}
+	timeout := binding.healthTimeoutValue(time.Duration(plan.HealthTimeoutMS) * time.Millisecond)
 	deadline := time.Now().Add(timeout)
 	consecutive := 0
 	restartSubmitted := false
@@ -970,7 +970,7 @@ func RunWatchdog(
 			restartAttempts++
 			if err := runner.Run(ctx, "systemctl", "--user", "restart", "--no-block", plan.UnitName); err != nil {
 				lastRestartError = err
-				delay := time.Duration(1<<min(restartAttempts-1, 4)) * 250 * time.Millisecond
+				delay := time.Duration(1<<min(restartAttempts-1, 4)) * binding.pollIntervalValue()
 				nextRestartAttempt = time.Now().Add(delay)
 			} else {
 				restartSubmitted = true
@@ -991,7 +991,7 @@ func RunWatchdog(
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(binding.pollIntervalValue()):
 		}
 	}
 	if lastRestartError != nil && !restartSubmitted {

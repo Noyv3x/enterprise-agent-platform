@@ -48,6 +48,8 @@ func testWatchdogBinding(active identity.ActiveProfile, plan Plan) WatchdogBindi
 		controlTokenFile: plan.ControlTokenFile, unitName: plan.UnitName,
 		bindingValidator: func(WatchdogBinding) error { return nil },
 		processVerifier:  func(context.Context, WatchdogBinding, Plan, string, string) error { return nil },
+		pollInterval:     time.Millisecond,
+		healthTimeout:    250 * time.Millisecond,
 	}
 }
 

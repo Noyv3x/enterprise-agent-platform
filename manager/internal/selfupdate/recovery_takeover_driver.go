@@ -579,7 +579,7 @@ func validateRecoveryPlanOwnership(plan Plan, journal recoveryTakeoverJournal) e
 }
 
 func (m *Manager) observeJournaledRecoveryActivation(ctx context.Context, request recoveryActivationRequest, evidence recoveryFinalizeEvidence, journal recoveryTakeoverJournal) error {
-	ticker := time.NewTicker(recoveryActivationObservationPoll)
+	ticker := time.NewTicker(m.recoveryPollingInterval(recoveryActivationObservationPoll))
 	defer ticker.Stop()
 	for {
 		latest, exists, err := m.readRecoveryTakeoverJournal(journal.Path)
@@ -764,7 +764,7 @@ func (m *Manager) convergeRecoveryCommitService(ctx context.Context, journal rec
 	if err := m.runner().Run(ctx, "systemctl", "--user", "start", journal.UnitName); err != nil {
 		return fmt.Errorf("start registered recovery Current after commit: %w", err)
 	}
-	if err := waitRecoveryManagerIdentity(ctx, journal.SocketPath, journal.ControlTokenFile, journal.RecoveryVersion, journal.RecoverySHA256); err != nil {
+	if err := m.waitRecoveryManagerIdentity(ctx, journal.SocketPath, journal.ControlTokenFile, journal.RecoveryVersion, journal.RecoverySHA256); err != nil {
 		return fmt.Errorf("verify registered recovery Current identity after commit: %w", err)
 	}
 	if err := m.verifyRecoveryServiceProcess(ctx, journal.UnitName, journal.RecoverySHA256); err != nil {
@@ -790,7 +790,7 @@ func (m *Manager) convergeRecoveryRollbackService(ctx context.Context, journal r
 	if err := m.runner().Run(ctx, "systemctl", "--user", "restart", "--no-block", journal.UnitName); err != nil {
 		return fmt.Errorf("restart registered Current after current recovery rollback: %w", err)
 	}
-	if err := waitRecoveryManagerIdentity(ctx, journal.SocketPath, journal.ControlTokenFile, journal.OriginalCurrent.Version, journal.OriginalCurrent.SHA256); err != nil {
+	if err := m.waitRecoveryManagerIdentity(ctx, journal.SocketPath, journal.ControlTokenFile, journal.OriginalCurrent.Version, journal.OriginalCurrent.SHA256); err != nil {
 		return fmt.Errorf("verify registered Current identity after current recovery rollback: %w", err)
 	}
 	if err := m.verifyRecoveryServiceProcess(ctx, journal.UnitName, journal.OriginalCurrent.SHA256); err != nil {
@@ -837,7 +837,7 @@ func (m *Manager) verifyCommittedRecovery(ctx context.Context, request recoveryA
 		state.Current.SourceCommit != request.platformCommit || state.Current.SHA256 != request.newSHA {
 		return errors.New("committed current recovery state does not contain the expected Current/Previous boundary")
 	}
-	if err := waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, request.newSHA); err != nil {
+	if err := m.waitRecoveryManagerIdentity(ctx, m.SocketPath, m.ControlTokenFile, m.RunningVersion, request.newSHA); err != nil {
 		return fmt.Errorf("verify committed recovery Manager identity: %w", err)
 	}
 	if err := m.verifyRecoveryServiceProcess(ctx, request.unit, request.newSHA); err != nil {

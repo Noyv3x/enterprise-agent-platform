@@ -227,6 +227,7 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 		RunningVersion:           recoveryVersion,
 		Runner:                   runner,
 		Now:                      func() time.Time { return time.Unix(3, 0).UTC() },
+		recoveryPollInterval:     time.Millisecond,
 		recoveryExecutableReader: testRecoveryExecutableReader,
 		RecoveryProcessVerifier: func(_ context.Context, unit, stable, expectedSHA string) error {
 			if unit != "agent-platform-manager.service" || stable != stablePath || expectedSHA != newSHA {
@@ -355,7 +356,7 @@ func TestRecoverCurrentRejectsWrongCandidateIdentityAndRollsBack(t *testing.T) {
 					fixture.identity.set(true, version, digest)
 				}
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 			err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.newSHA)
 			if err == nil || !strings.Contains(err.Error(), "control health") {
