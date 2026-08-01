@@ -357,8 +357,18 @@ test("an uncooperative provider cannot hold the run slot past idle cleanup grace
     assert.equal(nextCompleted.result?.content, "the next run acquired the released slot");
   } finally {
     coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
+    await rm(home, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 10,
+    });
+    await rm(workspace, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 10,
+    });
   }
 });
 

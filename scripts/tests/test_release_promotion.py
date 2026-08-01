@@ -1277,6 +1277,10 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         self.assertIn("application/octet-stream", cleanup_publish)
         self.assertIn('(.id | type == "number" and . > 0)', cleanup_publish)
+        self.assertIn(
+            'asset_id="$(jq -er --arg name "$asset"', cleanup_publish
+        )
+        self.assertIn('> "$predecessor_root/$asset"', cleanup_publish)
         self.assertNotIn("gh release download", cleanup_publish)
         self.assertIn("Cleanup must be prebuilt while its Bridge predecessor remains draft", container)
         self.assertIn("Cleanup predecessor has no exact successful sealed publisher provenance", container)

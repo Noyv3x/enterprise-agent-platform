@@ -198,12 +198,15 @@ jobs:
 
       - name: Stress runtime inactivity lifecycle
         shell: bash
+        env:
+          RUNTIME_STRESS_RUNS: "12"
+          RUNTIME_STRESS_PARALLELISM: "2"
         run: |
           work="$(mktemp -d)"
           trap 'rm -rf -- "$work"' EXIT
           export work
           set +e
-          seq 1 12 | xargs -P 2 -I '{}' sh -c '
+          seq 1 "$RUNTIME_STRESS_RUNS" | xargs -P "$RUNTIME_STRESS_PARALLELISM" -I '{}' sh -c '
             log="$work/run-{}.log"
             node --test --test-concurrency=1 \
               --test-name-pattern="active foreground terminal work|uncooperative provider" \
