@@ -263,6 +263,133 @@ class DatabaseFtsRebuildTests(unittest.TestCase):
                 db.close()
 
 
+class DatabaseMemoryFtsContractTests(unittest.TestCase):
+    def test_startup_repairs_legacy_tags_projection_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.db"
+            db = Database(path)
+            try:
+                if not db.fts_available:
+                    self.skipTest("FTS5 not available in this SQLite build")
+                memory_id = db.insert(
+                    """
+                    INSERT INTO agent_memories(
+                        scope_key, target, content, tags_json, created_at, updated_at
+                    ) VALUES (?, 'memory', ?, ?, ?, ?)
+                    """,
+                    (
+                        "private:1",
+                        "stable deployment preference",
+                        '["ocean","urgent"]',
+                        1,
+                        1,
+                    ),
+                )
+
+                # Reproduce the shipped legacy definition. Its FTS projection
+                # names the source column `tags`, although agent_memories only
+                # has `tags_json`, so a rebuild or query cannot read content.
+                for trigger_name in (
+                    "agent_memory_ai",
+                    "agent_memory_ad",
+                    "agent_memory_au",
+                ):
+                    db._conn.execute(f'DROP TRIGGER "{trigger_name}"')
+                db._conn.execute('DROP TABLE "agent_memory_fts"')
+                db._conn.execute(
+                    "CREATE VIRTUAL TABLE agent_memory_fts "
+                    "USING fts5(content, tags, "
+                    "content='agent_memories', content_rowid='id')"
+                )
+                db._conn.executescript(
+                    """
+                    CREATE TRIGGER agent_memory_ai AFTER INSERT ON agent_memories BEGIN
+                        INSERT INTO agent_memory_fts(rowid, content, tags)
+                        VALUES (new.id, new.content, new.tags_json);
+                    END;
+                    CREATE TRIGGER agent_memory_ad AFTER DELETE ON agent_memories BEGIN
+                        INSERT INTO agent_memory_fts(
+                            agent_memory_fts, rowid, content, tags
+                        ) VALUES ('delete', old.id, old.content, old.tags_json);
+                    END;
+                    CREATE TRIGGER agent_memory_au AFTER UPDATE ON agent_memories BEGIN
+                        INSERT INTO agent_memory_fts(
+                            agent_memory_fts, rowid, content, tags
+                        ) VALUES ('delete', old.id, old.content, old.tags_json);
+                        INSERT INTO agent_memory_fts(rowid, content, tags)
+                        VALUES (new.id, new.content, new.tags_json);
+                    END;
+                    """
+                )
+                db._conn.commit()
+                self.assertEqual(
+                    [
+                        str(row["name"])
+                        for row in db._conn.execute(
+                            'PRAGMA table_info("agent_memory_fts")'
+                        ).fetchall()
+                    ],
+                    ["content", "tags"],
+                )
+            finally:
+                db.close()
+
+            repaired = Database(path)
+            try:
+                self.assertTrue(repaired.fts_available)
+                self.assertEqual(
+                    [
+                        str(row["name"])
+                        for row in repaired._conn.execute(
+                            'PRAGMA table_info("agent_memory_fts")'
+                        ).fetchall()
+                    ],
+                    ["content", "tags_json"],
+                )
+                self.assertEqual(
+                    repaired.scalar(
+                        "SELECT count(*) FROM agent_memory_fts_docsize"
+                    ),
+                    1,
+                )
+                result = repaired.query_one(
+                    """
+                    SELECT m.id FROM agent_memory_fts
+                    JOIN agent_memories m ON m.id = agent_memory_fts.rowid
+                    WHERE agent_memory_fts MATCH ?
+                    """,
+                    ("ocean",),
+                )
+                self.assertEqual(int(result["id"]), memory_id)
+
+                # The repaired UPDATE trigger must delete old terms and index
+                # the new tags_json value using the same canonical projection.
+                repaired.execute(
+                    "UPDATE agent_memories SET tags_json = ? WHERE id = ?",
+                    ('["violet"]', memory_id),
+                )
+                self.assertIsNotNone(
+                    repaired.query_one(
+                        "SELECT rowid FROM agent_memory_fts "
+                        "WHERE agent_memory_fts MATCH ?",
+                        ("violet",),
+                    )
+                )
+                schema_version = int(repaired.scalar("PRAGMA schema_version"))
+            finally:
+                repaired.close()
+
+            reopened = Database(path)
+            try:
+                # A second startup proves the canonical objects and performs no
+                # replacement DDL.
+                self.assertEqual(
+                    int(reopened.scalar("PRAGMA schema_version")), schema_version
+                )
+            finally:
+                reopened.close()
+
+
 class DatabaseTransactionTests(unittest.TestCase):
     def _count(self, db: Database) -> int:
         return db.scalar("SELECT count(*) FROM knowledge_documents")

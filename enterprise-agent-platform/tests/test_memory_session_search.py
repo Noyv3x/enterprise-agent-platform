@@ -122,6 +122,42 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_memory_fts_searches_the_tags_json_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                if not service.db.fts_available:
+                    self.skipTest("FTS5 not available in this SQLite build")
+                _, admin = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(int(admin["id"]))
+                created = service.agent_memory_mutate(
+                    {
+                        "scope_key": scope.scope_key,
+                        "owner_user_id": admin["id"],
+                        "target": "memory",
+                        "content": "Keep the release workspace tidy",
+                        "tags": ["ocean", "urgent"],
+                    }
+                )
+
+                # The fallback LIKE search cannot match this phrase because the
+                # JSON tags are separated by punctuation. A hit therefore
+                # proves the service-level FTS path can query tags_json.
+                result = service.agent_memory_search(
+                    {
+                        "scope_key": scope.scope_key,
+                        "target": "memory",
+                        "query": "ocean urgent",
+                    }
+                )
+                self.assertTrue(result["found"])
+                self.assertEqual(
+                    [memory["id"] for memory in result["memories"]],
+                    [created["changed"][0]["id"]],
+                )
+            finally:
+                service.close()
+
     def test_memory_injection_is_rejected_and_blocked_rows_remain_user_manageable(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))

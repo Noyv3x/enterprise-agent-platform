@@ -33,8 +33,42 @@ if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
 
 
+_AGENT_MEMORY_FTS_TABLE_SQL = (
+    "CREATE VIRTUAL TABLE agent_memory_fts "
+    "USING fts5(content, tags_json, content='agent_memories', content_rowid='id')"
+)
+_AGENT_MEMORY_FTS_TRIGGER_SQL = {
+    "agent_memory_ai": """
+        CREATE TRIGGER agent_memory_ai AFTER INSERT ON agent_memories BEGIN
+            INSERT INTO agent_memory_fts(rowid, content, tags_json)
+            VALUES (new.id, new.content, new.tags_json);
+        END
+    """.strip(),
+    "agent_memory_ad": """
+        CREATE TRIGGER agent_memory_ad AFTER DELETE ON agent_memories BEGIN
+            INSERT INTO agent_memory_fts(
+                agent_memory_fts, rowid, content, tags_json
+            ) VALUES ('delete', old.id, old.content, old.tags_json);
+        END
+    """.strip(),
+    "agent_memory_au": """
+        CREATE TRIGGER agent_memory_au AFTER UPDATE ON agent_memories BEGIN
+            INSERT INTO agent_memory_fts(
+                agent_memory_fts, rowid, content, tags_json
+            ) VALUES ('delete', old.id, old.content, old.tags_json);
+            INSERT INTO agent_memory_fts(rowid, content, tags_json)
+            VALUES (new.id, new.content, new.tags_json);
+        END
+    """.strip(),
+}
+
+
 def now_ts() -> int:
     return int(time.time())
+
+
+def _normalized_schema_sql(value: object) -> str:
+    return "".join(str(value or "").casefold().split())
 
 
 def _close_database_descriptors(database_fd: int, directory_fd: int) -> None:
@@ -1293,28 +1327,7 @@ class Database:
                 END;
                 """
             )
-            self._conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts "
-                "USING fts5(content, tags, content='agent_memories', content_rowid='id')"
-            )
-            self._conn.executescript(
-                """
-                CREATE TRIGGER IF NOT EXISTS agent_memory_ai AFTER INSERT ON agent_memories BEGIN
-                    INSERT INTO agent_memory_fts(rowid, content, tags)
-                    VALUES (new.id, new.content, new.tags_json);
-                END;
-                CREATE TRIGGER IF NOT EXISTS agent_memory_ad AFTER DELETE ON agent_memories BEGIN
-                    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, content, tags)
-                    VALUES ('delete', old.id, old.content, old.tags_json);
-                END;
-                CREATE TRIGGER IF NOT EXISTS agent_memory_au AFTER UPDATE ON agent_memories BEGIN
-                    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, content, tags)
-                    VALUES ('delete', old.id, old.content, old.tags_json);
-                    INSERT INTO agent_memory_fts(rowid, content, tags)
-                    VALUES (new.id, new.content, new.tags_json);
-                END;
-                """
-            )
+            memory_fts_rebuilt = self._ensure_agent_memory_fts_contract()
             # The AFTER triggers only sync rows changed after they exist, so an
             # index created on a DB that already has documents (migrated from a
             # build without FTS5, or where FTS5 was unavailable on a prior boot)
@@ -1332,15 +1345,97 @@ class Database:
                 self._conn.execute(
                     "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
                 )
-            memory_count = self._conn.execute("SELECT count(*) FROM agent_memories").fetchone()[0]
-            if memory_count > 0:
-                indexed = self._conn.execute("SELECT count(*) FROM agent_memory_fts_docsize").fetchone()[0]
+            memory_count = self._conn.execute(
+                "SELECT count(*) FROM agent_memories"
+            ).fetchone()[0]
+            if memory_count > 0 and not memory_fts_rebuilt:
+                indexed = self._conn.execute(
+                    "SELECT count(*) FROM agent_memory_fts_docsize"
+                ).fetchone()[0]
                 if indexed != memory_count:
-                    self._conn.execute("INSERT INTO agent_memory_fts(agent_memory_fts) VALUES('rebuild')")
+                    self._conn.execute(
+                        "INSERT INTO agent_memory_fts(agent_memory_fts) "
+                        "VALUES('rebuild')"
+                    )
             self.fts_available = True
         except sqlite3.OperationalError:
             # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
             self.fts_available = False
+
+    def _ensure_agent_memory_fts_contract(self) -> bool:
+        """Repair the derived memory index when its projection has drifted.
+
+        The authoritative table stores ``tags_json``. An earlier FTS definition
+        exposed that source value through a non-existent external-content column
+        named ``tags``, so FTS5 tried to read ``agent_memories.tags`` during a
+        rebuild or query. Validate the complete owned schema rather than trusting
+        ``CREATE ... IF NOT EXISTS`` and replace only these derived objects when
+        they differ.
+
+        Returns True when the index was recreated and already rebuilt.
+        """
+
+        table = self._conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'agent_memory_fts'"
+        ).fetchone()
+        columns = tuple(
+            str(row["name"])
+            for row in self._conn.execute(
+                'PRAGMA table_info("agent_memory_fts")'
+            ).fetchall()
+        )
+        matches = (
+            table is not None
+            and columns == ("content", "tags_json")
+            and _normalized_schema_sql(table["sql"])
+            == _normalized_schema_sql(_AGENT_MEMORY_FTS_TABLE_SQL)
+        )
+        if matches:
+            for trigger_name, expected_sql in _AGENT_MEMORY_FTS_TRIGGER_SQL.items():
+                trigger = self._conn.execute(
+                    "SELECT tbl_name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name = ?",
+                    (trigger_name,),
+                ).fetchone()
+                if (
+                    trigger is None
+                    or str(trigger["tbl_name"]) != "agent_memories"
+                    or _normalized_schema_sql(trigger["sql"])
+                    != _normalized_schema_sql(expected_sql)
+                ):
+                    matches = False
+                    break
+        if matches:
+            return False
+
+        savepoint = "agent_memory_fts_contract"
+        self._conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            for trigger_name in _AGENT_MEMORY_FTS_TRIGGER_SQL:
+                self._conn.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+            self._conn.execute('DROP TABLE IF EXISTS "agent_memory_fts"')
+            self._conn.execute(_AGENT_MEMORY_FTS_TABLE_SQL)
+            for trigger_sql in _AGENT_MEMORY_FTS_TRIGGER_SQL.values():
+                self._conn.execute(trigger_sql)
+            self._conn.execute(
+                "INSERT INTO agent_memory_fts(agent_memory_fts) VALUES('rebuild')"
+            )
+        except sqlite3.OperationalError as exc:
+            self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            # Knowledge FTS creation above has already proved that this SQLite
+            # connection supports FTS5. A failure here is therefore a broken
+            # derived schema, not an optional-capability fallback.
+            raise sqlite3.DatabaseError(
+                "agent memory FTS contract repair failed"
+            ) from exc
+        except BaseException:
+            self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return True
 
     def _ensure_message_fts(self) -> None:
         """Maintain a message index for internal cross-session search.

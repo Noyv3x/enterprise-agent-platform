@@ -67,6 +67,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 每条记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual` 或 `automatic`。所有权和是否允许自动写入从可信 Run context 派生；模型参数不能覆盖 owner 或把 unattended/channel/delegated Run 提升为可写。写入有配额、长度、注入扫描和去重约束，精确限制由代码契约和测试维护。
 
+`agent_memory_fts` 是 `agent_memories` 的 FTS5 外部内容派生索引，投影列必须精确为 `content, tags_json`，并以 `content_rowid='id'` 关联源表。启动时必须检查实际虚拟表列、建表 SQL 和三个同步触发器；如果发现旧的 `tags` 投影或任何不符合当前契约的派生对象，只删除并重建该 FTS 虚拟表及其三个触发器，再从权威源表执行 `rebuild`。正确且已同步的索引在重复启动时不执行 DDL 或重建；索引契约错误不能被当作“SQLite 不支持 FTS5”而永久降级。
+
 交互式私人顶层 Run 在对话中发现稳定且跨会话有价值的信息时直接写入、替换或忘记正式记忆，不弹出审批。Agent 应优先更新同一事实而不是追加冲突副本；临时任务状态和过程信息留在 session 或工作区。计划任务、邮件唤醒、频道 Agent 和委派 Agent 只能召回，不得自动修改记忆。普通自动写入也不是只凭 Runtime metadata 放行：Platform 必须持有该 scope 的 lifecycle start barrier，并在覆盖授权复验、记忆变更和返回快照的同一个 `BEGIN IMMEDIATE` 事务内确认 canonical private scope/current lifecycle、激活账号与私人权限、来源用户消息，以及 `agent_run_inputs.runtime_run_id` 所属父 `agent` durable job 仍为 running。撤权、reset、父任务终结和记忆写入据此线性化，不能在预检与落盘之间穿越。
 
 前台即时维护之外还有 Hermes 风格的回复后复盘。每个私人 Agent 的节奏状态保存在 SQLite `settings`，触发任务保存在 `durable_jobs`；成功私人回合每十次触发记忆审查，成功工具调用累计十次可提前触发流程审查。计数和任务都绑定当前 lifecycle，轮换后从零开始；同一来源消息只能产生一个复盘任务。复盘使用近期产品消息和有界工具活动作为不可信历史，只保存稳定事实、消除冲突或忘记已明确失效的事实，不保存凭据、一次性错误、短期任务状态和未经用户确认的推断。
