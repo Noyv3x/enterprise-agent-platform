@@ -54,6 +54,8 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。发布器生成的镜像键必须与当前 JSON Schema 的必需集合精确相等；上游 Firecrawl Compose 验证只要求源码契约列出的现役受管服务存在，不能把未采用的上游实验服务重新带入产品契约。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须确认 PostgreSQL 是唯一队列基线、Compose 不含 FoundationDB 服务或注入，并真实启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API。随后在保留同一 PostgreSQL bind 数据的前提下重建服务，以容器 id 变化、精确读回首轮数据哨兵和真实提取请求共同证明持久与运行契约；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。
 
+同一静态验收还必须按 job 边界证明 Manager 的全量 `go test` 只在 Quality 中以禁用结果复用的方式出现一次；Container 的 Manager 工件矩阵只能交叉编译两个受支持架构并分别生成、上传校验和。Quality、工件矩阵与真实 user-systemd job 都必须把 Go 缓存绑定到仓库内精确的 Manager 依赖文件；缓存不能移除真实 systemd 测试、双架构编译或发布对这些 job 的依赖。
+
 受管镜像容量目录同样属于机器契约：文档同步器必须要求它与当前受管镜像集合精确相等，并为 Python、TypeScript 与 Go 生成同一份只读目录。发布静态验收必须证明匿名拉取、双架构压缩/展开尺寸门、真实 Compose 和最终 release manifest 全部消费同一份已经验证的镜像工件；每次临时拉取后只能按刚刚观察到的精确 image ID 清理，身份漂移、缺失或 Docker 状态不可读时失败关闭，不能用宽泛 prune 或忽略删除错误掩盖 CI 磁盘增长。
 
 镜像声明为 volume 的配置根必须由完整受管目录 bind 覆盖，并在发布工作流启动真实容器后检查 Mounts，确认没有匿名卷；SearXNG 的 `/etc/searxng` 是该规则的固定回归边界。

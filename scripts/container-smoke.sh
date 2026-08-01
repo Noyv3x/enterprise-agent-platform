@@ -732,15 +732,98 @@ import re
 from pathlib import Path
 
 workflow = Path(".github/workflows/container-release.yml").read_text(encoding="utf-8")
+quality_workflow = Path(".github/workflows/quality.yml").read_text(encoding="utf-8")
 
-def job(name: str) -> str:
+def workflow_job(source: str, name: str, label: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-        workflow,
+        source,
     )
     if match is None:
-        raise SystemExit(f"container release job is missing: {name}")
+        raise SystemExit(f"{label} job is missing: {name}")
     return match.group(0)
+
+
+def job(name: str) -> str:
+    return workflow_job(workflow, name, "container release")
+
+quality_manager = workflow_job(quality_workflow, "manager", "Quality")
+manager_binaries = job("manager-binaries")
+manager_systemd = job("manager-systemd-integration")
+publish_job = job("publish")
+
+if (
+    quality_manager.count("run: go test -count=1 ./...") != 1
+    or quality_workflow.count("go test -count=1 ./...") != 1
+):
+    raise SystemExit("Quality must execute the Manager full suite exactly once without result reuse")
+if (
+    "go test" in manager_binaries
+    or "go test ./..." in workflow
+    or "go test -count=1 ./..." in workflow
+):
+    raise SystemExit("Manager architecture builders must not repeat the full test suite")
+for label, block in (
+    ("Quality Manager", quality_manager),
+    ("Manager architecture builders", manager_binaries),
+    ("Manager user-systemd gate", manager_systemd),
+):
+    for fragment in ("cache: true", "cache-dependency-path: manager/go.sum"):
+        if fragment not in block:
+            raise SystemExit(f"{label} does not use the exact Manager Go cache: {fragment}")
+arch_block = re.search(r"(?ms)^        arch:\n((?:          - [^\n]+\n)+)", manager_binaries)
+architectures = [] if arch_block is None else re.findall(
+    r"(?m)^          - ([^\n]+)$", arch_block.group(1)
+)
+if architectures != ["amd64", "arm64"]:
+    raise SystemExit("Manager artifact matrix must contain exactly amd64 and arm64")
+for fragment in (
+    "GOARCH: ${{ matrix.arch }}",
+    "CGO_ENABLED=0 GOOS=linux go -C manager build",
+    'output="dist/agent-platform-manager-linux-${GOARCH}"',
+    'sha256sum "$(basename "$output")"',
+    "name: manager-${{ matrix.arch }}",
+    "            dist/agent-platform-manager-linux-${{ matrix.arch }}\n",
+    "dist/agent-platform-manager-linux-${{ matrix.arch }}.sha256",
+    "if-no-files-found: error",
+):
+    if fragment not in manager_binaries:
+        raise SystemExit(f"Manager architecture artifact validation is missing: {fragment}")
+for fragment in (
+    'AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"',
+    "go test -count=1 -v",
+    "RecoverySystemdQuiescenceIntegration",
+    "OrdinarySystemdActivationRestartIntegration",
+    "PersistentHelperUserSystemdIntegration",
+):
+    if fragment not in manager_systemd:
+        raise SystemExit(f"real user-systemd Manager gate is missing: {fragment}")
+for dependency in ("manager-binaries", "manager-systemd-integration"):
+    if f"      - {dependency}\n" not in publish_job:
+        raise SystemExit(f"release publication no longer requires {dependency}")
+
+prepare = job("prepare")
+target_gate_start = prepare.index('if [[ "$transition_stage" == target_baseline ]]; then')
+target_gate_end = prepare.index("          manager_command=./cmd/agent-platform-manager")
+target_gate = prepare[target_gate_start:target_gate_end]
+if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in prepare:
+    raise SystemExit("pre-image target-baseline predecessor lookup is unauthenticated")
+for fragment in (
+    ".predecessor_generation",
+    'current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"',
+    '^container-([0-9a-f]{40})$',
+    'current_generation="${BASH_REMATCH[1]}"',
+    'git merge-base --is-ancestor "$transition_predecessor" "$current_generation"',
+    'git merge-base --is-ancestor "$current_generation" "$source_commit"',
+):
+    if fragment not in target_gate:
+        raise SystemExit(f"pre-image target-baseline predecessor gate is missing: {fragment}")
+if target_gate_start >= prepare.index("          image_matrix="):
+    raise SystemExit("target-baseline predecessor gate runs after image-matrix publication")
+if "      - prepare\n" not in job("images"):
+    raise SystemExit("container images can build before release-predecessor validation")
+if '[[ "$current_tag" == "container-${transition_predecessor}" ]]' in target_gate:
+    raise SystemExit("target-baseline pre-image gate permanently pins Cleanup as latest")
 
 public_images = job("public-images")
 for fragment in (
@@ -917,6 +1000,42 @@ for fragment in (
 publish = job("publish")
 if "pattern: '*'" in publish or 'pattern: "*"' in publish:
     raise SystemExit("publish must not download every workflow artifact")
+if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in publish:
+    raise SystemExit("Cleanup predecessor pagination is unauthenticated")
+target_publish_start = publish.index('if [[ "$TRANSITION_STAGE" == target_baseline ]]; then')
+target_publish_end = publish.index('          predecessor_root="$RUNNER_TEMP/predecessor-release"')
+target_publish = publish[target_publish_start:target_publish_end]
+for fragment in ('^container-([0-9a-f]{40})$', 'predecessor="${BASH_REMATCH[1]}"'):
+    if fragment not in target_publish:
+        raise SystemExit(f"target-baseline does not bind the current public predecessor: {fragment}")
+if '[[ "$current_tag" == "container-${predecessor}" ]]' in target_publish:
+    raise SystemExit("target-baseline publish permanently pins Cleanup as predecessor")
+lookup_start = publish.index('          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"')
+lookup_end = publish.index("          assembler_args=(")
+predecessor_lookup = publish[lookup_start:lookup_end]
+cleanup_branch = 'if [[ "$TRANSITION_STAGE" == cleanup ]]; then'
+paginated_releases = '"/repos/${GITHUB_REPOSITORY}/releases?per_page=100"'
+tagged_release = '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
+for fragment in (
+    cleanup_branch,
+    "gh api --paginate -H 'Accept: application/vnd.github+json'",
+    paginated_releases,
+    'jq -se --arg tag "container-${predecessor}"',
+    "if length == 1 then .[0]",
+    "Cleanup predecessor draft release identity is not unique",
+):
+    if fragment not in predecessor_lookup:
+        raise SystemExit(f"Cleanup predecessor pagination gate is missing: {fragment}")
+if predecessor_lookup.count(tagged_release) != 1:
+    raise SystemExit("Cleanup predecessor tag endpoint is not confined to one fallback branch")
+cleanup_else = predecessor_lookup.index("          else\n")
+if not (
+    predecessor_lookup.index(cleanup_branch)
+    < predecessor_lookup.index(paginated_releases)
+    < cleanup_else
+    < predecessor_lookup.index(tagged_release)
+):
+    raise SystemExit("Cleanup predecessor is not uniquely resolved before the tag-endpoint fallback")
 for fragment in ("name: verified-managed-images", "pattern: manager-*"):
     if fragment not in publish:
         raise SystemExit(f"publish omits scoped release artifact family: {fragment}")

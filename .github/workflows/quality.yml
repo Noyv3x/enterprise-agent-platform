@@ -224,9 +224,10 @@ jobs:
         with:
           go-version-file: manager/go.mod
           cache: true
+          cache-dependency-path: manager/go.sum
 
       - name: Test manager
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Vet manager
         run: go vet ./...

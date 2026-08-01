@@ -552,11 +552,8 @@ jobs:
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
         with:
           go-version-file: manager/go.mod
-          cache: false
-
-      - name: Test manager
-        working-directory: manager
-        run: go test ./...
+          cache: true
+          cache-dependency-path: manager/go.sum
 
       - name: Build static manager
         shell: bash
@@ -602,7 +599,8 @@ jobs:
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
         with:
           go-version-file: manager/go.mod
-          cache: false
+          cache: true
+          cache-dependency-path: manager/go.sum
 
       - name: Start the runner user-systemd manager
         shell: bash
