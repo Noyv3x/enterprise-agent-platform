@@ -1182,6 +1182,21 @@ class DocsSyncTests(unittest.TestCase):
             governance["tests"],
         )
 
+    def test_repository_manifest_classifies_release_and_scope_regressions(self) -> None:
+        manifest = json.loads(
+            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
+        )
+        deployment = self.manifest_domain(manifest, "deployment")
+        data = self.manifest_domain(manifest, "data-memory-sessions")
+
+        self.assertIn("scripts/tests/**", manifest["coverage"]["code_exclude"])
+        self.assertIn("scripts/release_promotion.py", deployment["code"])
+        self.assertIn("scripts/tests/**", deployment["tests"])
+        self.assertIn(
+            "enterprise-agent-platform/tests/test_agent_scopes.py",
+            data["tests"],
+        )
+
     def test_repository_manifest_assigns_manager_selfupdate_security_ownership(self) -> None:
         manifest = json.loads(
             (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")

@@ -35,6 +35,7 @@
       "enterprise-agent-platform/frontend/src/**/*.tsx"
     ],
     "code_exclude": [
+      "scripts/tests/**",
       "enterprise-agent-platform/enterprise_agent_platform/static/**",
       "enterprise-agent-platform/frontend/scripts/*.test.mjs",
       "enterprise-agent-platform/frontend/src/**/*.test.ts",
@@ -91,11 +92,13 @@
       "code": [
         "manager/**",
         "containers/**",
+        "scripts/release_promotion.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py"
       ],
       "tests": [
+        "scripts/tests/**",
         "enterprise-agent-platform/tests/test_auto_update_coordination.py",
         "enterprise-agent-platform/tests/test_container_data_layout.py"
       ]
@@ -120,6 +123,7 @@
         "enterprise-agent-platform/agent-runtime/src/platform-gateway.ts"
       ],
       "tests": [
+        "enterprise-agent-platform/tests/test_agent_scopes.py",
         "enterprise-agent-platform/tests/test_memory_session_search.py",
         "enterprise-agent-platform/tests/test_learning_review.py",
         "enterprise-agent-platform/tests/test_knowledge_db.py",

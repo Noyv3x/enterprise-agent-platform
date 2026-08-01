@@ -26,6 +26,8 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 每个 workspace 写入 `.ubitech-agent-scope.json`，只记录 scope、lifecycle、sandbox identity、workspace identity 和固定隔离边界。字段集合必须精确匹配当前格式；多余或缺失字段触发受控重写，不能把已退役的状态维度继续带入新基线。数据库不得保存容器内或宿主绝对 workspace 路径；Platform 在自己的数据根解析相对标识，Manager 将同一目录映射为 Sandbox `/workspace`。当前基线发现绝对路径、越界相对路径或任何不等于 scope 规范 identity 的 workspace 标识时，启动和后续读取都必须明确拒绝，不能把旧绝对路径静默换算或改写为当前 identity。每次使用都重新检查路径组成与符号链接，缓存不得绕过。
 
+仅在发布契约精确证明唯一 P1 来源与当次 update reservation 时，source-owner 候选版才能将已登记但尚未物化的 workspace 归一化为规范相对目录。目录发布以候选观察的 device/inode 为身份；从 missing 状态 rename 得到的新目录在同进程重试时必须保持为空，而已观察且合法的共享非空前缀不得因一次耐久化失败被错误重分类为“必须为空”。只有完整目录耐久屏障与 identity 复验成功后，才能提交 marker/runtime alias 并释放 reservation；内容注入、identity 漂移或未知 residue 均保留证据并失败关闭。
+
 停用账号保留私人 workspace、session 和 memory，以便重新启用。账号停用和产品消息隐藏都不隐式销毁这些持久上下文；需要重置时必须使用独立、显式的 lifecycle/session cleanup 语义。
 
 ## 产品消息与 Runtime 会话

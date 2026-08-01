@@ -650,6 +650,11 @@ class AgentScopeSessionTests(unittest.TestCase):
                 second_scope = AgentScopeManager(config, db).ensure_channel_scope(2)
                 workspace = Path(scope.workspace_path)
                 second_workspace = Path(second_scope.workspace_path)
+                db.execute(
+                    "DELETE FROM agent_runtime_scope_sessions "
+                    "WHERE scope_key = ? AND session_id = ?",
+                    (scope.scope_key, scope.session_id),
+                )
                 shutil.rmtree(workspace.parent)
                 candidate = AgentScopeManager(
                     config,
@@ -698,6 +703,14 @@ class AgentScopeSessionTests(unittest.TestCase):
                 self.assertEqual(post_rename_syncs, 3)
                 self.assertTrue(workspace.parent.is_dir())
                 self.assertFalse(workspace.exists())
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT COUNT(*) FROM agent_runtime_scope_sessions "
+                        "WHERE scope_key = ? AND session_id = ?",
+                        (scope.scope_key, scope.session_id),
+                    ),
+                    0,
+                )
                 candidate.commit_schema_upgrade()
                 self.assertTrue(workspace.is_dir())
                 self.assertTrue(second_workspace.is_dir())
@@ -710,6 +723,14 @@ class AgentScopeSessionTests(unittest.TestCase):
                 self.assertEqual(
                     candidate._workspace_directory_empty_recovery,
                     {},
+                )
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT COUNT(*) FROM agent_runtime_scope_sessions "
+                        "WHERE scope_key = ? AND session_id = ?",
+                        (scope.scope_key, scope.session_id),
+                    ),
+                    1,
                 )
             finally:
                 db.close()
@@ -764,6 +785,22 @@ class AgentScopeSessionTests(unittest.TestCase):
                 candidate.commit_schema_upgrade()
                 self.assertTrue(Path(first.workspace_path).is_dir())
                 self.assertTrue(Path(second.workspace_path).is_dir())
+                self.assertTrue(
+                    (
+                        Path(first.workspace_path)
+                        / ".ubitech-agent-scope.json"
+                    ).is_file()
+                )
+                self.assertTrue(
+                    (
+                        Path(second.workspace_path)
+                        / ".ubitech-agent-scope.json"
+                    ).is_file()
+                )
+                self.assertEqual(
+                    candidate._workspace_directory_empty_recovery,
+                    {},
+                )
             finally:
                 db.close()
 

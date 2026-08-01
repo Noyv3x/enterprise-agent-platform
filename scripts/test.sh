@@ -6,7 +6,13 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if [[ "${UBITECH_DOCS_ALREADY_CHECKED:-0}" != "1" ]]; then
   "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check
+  "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check-change \
+    --base HEAD \
+    --head WORKTREE
 fi
+
+cd "$ROOT"
+"$PYTHON_BIN" -m unittest discover -s scripts/tests
 
 cd "$ROOT/manager"
 go test ./...

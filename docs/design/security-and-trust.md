@@ -120,6 +120,8 @@ Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验
 
 数据根、workspace、Runtime 根和 Agent env 必须由部署用户拥有、不是符号链接，并收紧权限。workspace 路径的每个组成部分都要重新检查符号链接。数据库只保存相对 workspace 标识，不能写入宿主绝对路径。
 
+跨 staging 与 workspace 父目录发布私有目录时，首次 rename 和 exact-final 崩溃重放必须使用同一耐久屏障：依次 `fsync` 已固定 child fd、staging/source parent 和 destination parent，即使 staging 名已消失或 exact 空 residue 已清理也不能省略。任一步失败只能在 final 仍是预期 inode，且本次 missing→rename 或已建立的空目录恢复身份仍为空时分类为 committed-but-not-durable；重试必须再走完整屏障。若在 rename 后的检查或 `fsync` 窗口出现内容、类型、权限或 inode 漂移，不得宣称已提交，不得删除证据或继续提交数据库状态。
+
 上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。上传没有固定墙钟超时，但连续没有收到字节达到上传 socket 空闲上限、断线、取消、更新切换或大小越界仍会终止传输；持续前进的慢速上传不会因普通总耗时被中断，界面只展示浏览器已实际发送的字节进度。Multipart 读取期间只写 owner-only staging，不占用可无限延长的更新写准入；只有完整读取后的附件验证、权威复制、消息和 durable job 提交占用短准入。若更新先预约，旧请求可以中断并清除 staging，不能通过慢滴流永久阻止版本收敛。Platform 为上传使用独立的有界并发预算，超过预算时明确拒绝新上传，不能让大文件占满普通请求工作线程。
 
 Multipart 正文必须增量读取并先写入 Platform 数据根内 owner-only 的请求 staging 目录；解析过程只保留边界探测所需的小型缓冲区，不得把完整请求或附件复制到内存。服务端完成数量、大小、配额、文件类型和摘要校验后再把 staging 文件流式提交到附件目录；请求成功、失败、取消或超时后都必须清理 staging。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载 `/workspace/.ubitech/attachments` 访问。Platform 不得把自己的数据路径写进普通 Run metadata；唯一例外是由可信配置派生、只进入当前 scope 系统提示的宿主工作区映射。Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。

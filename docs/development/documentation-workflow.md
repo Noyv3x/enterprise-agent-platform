@@ -38,6 +38,8 @@ Manifest、canonical 文档、机器契约及生成目标都必须位于仓库�
 
 `check-change` 先运行全部当前树检查。比较两个提交时，以它们的 Git merge-base 到 head 作为变更集，避免落后主线的分支把主线变化误算成自己的修改；是否属于首次 bootstrap 仍以 policy base 上是否已有 manifest 判断。校验同时读取 merge-base 与目标版本的 domain manifest，并按前后 coverage 与 owner 的并集归类路径，因此删除 owner、缩窄 coverage、删除文件或把文件 rename 出受管路径都不能绕过原设计域。将 `--head` 设为 `INDEX` 时只检查基准提交、已有提交和暂存快照，防止“已暂存代码、文档仍未暂存”的下一次提交逃逸；设为 `WORKTREE` 时会进一步合并未暂存修改和未跟踪文件。两种本地模式都把 rename 当成删除加新增，并由 `./scripts/test.sh` 与 CI 共同执行。
 
+提交前检查尚未入库的完整变更必须使用 `--head WORKTREE`（或在全部暂存后使用 `INDEX`）；`--head HEAD` 只能检查已提交快照，不能用它为未提交修改出具文档同步结论。发布 promotion evaluator 同时属于文档治理与部署协议：更改其选择或前任绑定时，必须同时更新本流程文档、部署自动更新契约与对应验收测试。
+
 受管生产路径改变时，它匹配的每个文档域都必须有设计文档或契约改变；设计文档或契约改变时，对应域必须有生产代码、生成模块或验收测试改变。构建配置、依赖 lockfile、前端 public 资产、bundled skill、CI workflow 和上游源码契约同样属于受管生产路径。首次引入 `docs/domains.json` 的提交属于 bootstrap，只执行当前树检查。
 
 ## 边界
