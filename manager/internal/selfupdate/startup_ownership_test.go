@@ -846,7 +846,7 @@ func newCommittedRecoveryRelayFixture(t *testing.T) (*activationTakeoverFixture,
 	runningSHA := sha256Hex(running)
 	replacement := Version{
 		Version: strings.Repeat("3", 40),
-		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], "ubitech-manager"),
+		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], fixture.manager.managerBinaryName()),
 		SHA256:  runningSHA, VerifiedAt: time.Now().UTC(), PlatformCommitted: true,
 	}
 	writeStartupVersion(t, replacement, running, replacement)
@@ -942,7 +942,7 @@ func TestRolledBackRecoveryCannotBecomeRelayProbe(t *testing.T) {
 	runningSHA := sha256Hex(running)
 	replacement := Version{
 		Version: strings.Repeat("3", 40),
-		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], "ubitech-manager"),
+		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], fixture.manager.managerBinaryName()),
 		SHA256:  runningSHA, VerifiedAt: time.Now().UTC(), PlatformCommitted: true,
 	}
 	writeStartupVersion(t, replacement, running, replacement)
