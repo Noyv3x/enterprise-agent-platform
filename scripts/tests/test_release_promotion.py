@@ -1191,6 +1191,93 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertNotIn(retired_bridge_qualification, evaluator)
         self.assertIn("agent-platform-compose.yaml", container)
         self.assertIn("agent-platform-manager-linux-amd64", container)
+        publish = container[container.index("\n  publish:\n") :]
+        predecessor_lookup = publish[
+            publish.index(
+                '          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"'
+            )
+            : publish.index("          assembler_args=(")
+        ]
+        cleanup_branch = 'if [[ "$TRANSITION_STAGE" == cleanup ]]; then'
+        paginated_releases = '"/repos/${GITHUB_REPOSITORY}/releases?per_page=100"'
+        tagged_release = (
+            '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
+        )
+        self.assertIn(cleanup_branch, predecessor_lookup)
+        self.assertIn("gh api --paginate", predecessor_lookup)
+        self.assertIn(paginated_releases, predecessor_lookup)
+        self.assertIn(
+            'jq -se --arg tag "container-${predecessor}"', predecessor_lookup
+        )
+        self.assertIn("[.[] | .[] | select(.tag_name == $tag)]", predecessor_lookup)
+        self.assertIn("if length == 1 then .[0]", predecessor_lookup)
+        self.assertIn(
+            "Cleanup predecessor draft release identity is not unique",
+            predecessor_lookup,
+        )
+        self.assertEqual(predecessor_lookup.count(tagged_release), 1)
+        cleanup_else = predecessor_lookup.index("          else\n")
+        self.assertLess(
+            predecessor_lookup.index(cleanup_branch),
+            predecessor_lookup.index(paginated_releases),
+        )
+        self.assertLess(cleanup_else, predecessor_lookup.index(tagged_release))
+        jq_program = predecessor_lookup.split(
+            'jq -se --arg tag "container-${predecessor}" \'', 1
+        )[1].split("\n              ' >", 1)[0]
+        matched = subprocess.run(
+            ["jq", "-se", "--arg", "tag", "container-target", jq_program],
+            input=(
+                '[{"tag_name":"container-other"}]\n'
+                '[{"tag_name":"container-target","id":42}]\n'
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(matched.returncode, 0, matched.stderr)
+        self.assertEqual(json.loads(matched.stdout)["id"], 42)
+        duplicate = subprocess.run(
+            ["jq", "-se", "--arg", "tag", "container-target", jq_program],
+            input=(
+                '[{"tag_name":"container-target","id":41}]\n'
+                '[{"tag_name":"container-target","id":42}]\n'
+            ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        missing = subprocess.run(
+            ["jq", "-se", "--arg", "tag", "container-target", jq_program],
+            input='[{"tag_name":"container-other"}]\n',
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        malformed = subprocess.run(
+            ["jq", "-se", "--arg", "tag", "container-target", jq_program],
+            input='{"tag_name":"container-target"}\n',
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(malformed.returncode, 0)
+        cleanup_publish = publish[
+            publish.index('          elif [[ "$TRANSITION_STAGE" == cleanup ]]; then')
+            : publish.index(
+                '          elif [[ "$TRANSITION_STAGE" == target_baseline ]]; then',
+                publish.index('          elif [[ "$TRANSITION_STAGE" == cleanup ]]; then'),
+            )
+        ]
+        self.assertIn(
+            "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}",
+            cleanup_publish,
+        )
+        self.assertIn("application/octet-stream", cleanup_publish)
+        self.assertIn('(.id | type == "number" and . > 0)', cleanup_publish)
+        self.assertNotIn("gh release download", cleanup_publish)
         self.assertIn("Cleanup must be prebuilt while its Bridge predecessor remains draft", container)
         self.assertIn("Cleanup predecessor has no exact successful sealed publisher provenance", container)
         self.assertEqual(

@@ -1302,9 +1302,20 @@ jobs:
           predecessor_root="$RUNNER_TEMP/predecessor-release"
           mkdir -p "$predecessor_root"
           predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"
-          gh api -H 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}" \
-            > "$predecessor_api"
+          if [[ "$TRANSITION_STAGE" == cleanup ]]; then
+            gh api --paginate -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -se --arg tag "container-${predecessor}" '
+                if all(.[]; type == "array") then [.[] | .[] | select(.tag_name == $tag)]
+                else error("invalid paginated releases response") end |
+                if length == 1 then .[0]
+                else error("Cleanup predecessor draft release identity is not unique") end
+              ' > "$predecessor_api"
+          else
+            gh api -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}" \
+              > "$predecessor_api"
+          fi
           assembler_args=(
             scripts/assemble_release_manifest.py
             --contract docs/contracts/release-transition.json
@@ -1352,12 +1363,17 @@ jobs:
               .draft == true and .prerelease == false and
               ([.assets[].name] | sort) == $names and
               ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
-              all(.assets[]; .state == "uploaded" and (.size | type == "number" and . > 0) and
+              all(.assets[]; (.id | type == "number" and . > 0) and
+                .state == "uploaded" and (.size | type == "number" and . > 0) and
                 (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))
             ' "$predecessor_api" >/dev/null
             for asset in "${bridge_assets[@]}"; do
-              gh release download "container-${predecessor}" --repo "$GITHUB_REPOSITORY" \
-                --dir "$predecessor_root" --pattern "$asset"
+              asset_id="$(jq -er --arg name "$asset" \
+                '.assets[] | select(.name == $name) | .id | select(type == "number" and . > 0)' \
+                "$predecessor_api")"
+              gh api -H 'Accept: application/octet-stream' \
+                "/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                > "$predecessor_root/$asset"
             done
             for contract_asset in release-transition.json release-transition-challenge.schema.json release-transition-receipt.schema.json; do
               git show "$predecessor:docs/contracts/$contract_asset" > "$predecessor_root/$contract_asset"
