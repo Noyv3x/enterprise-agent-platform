@@ -17,7 +17,12 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
-const defaultMaxDockerEvidenceObjects = 1024
+const (
+	defaultMaxDockerEvidenceObjects = 1024
+	containerInspectProjection      = `[{{json .Id}},{{json .Name}},{{json .Config.Image}},{{json .Image}},{{json .State.Status}},{{json .Config.User}},{{json .Config.Labels}},{{json .NetworkSettings.Networks}},{{json .Mounts}}]`
+	networkInspectProjection        = `[{{json .Id}},{{json .Name}},{{json .Driver}},{{json .Labels}}]`
+	volumeInspectProjection         = `[{{json .Name}},{{json .Driver}},{{json .Labels}}]`
+)
 
 var (
 	dockerEvidenceID = regexp.MustCompile(`^[0-9a-f]{12,64}$`)
@@ -252,9 +257,8 @@ func (docker DockerCLI) containers(ctx context.Context) ([]dockerContainer, erro
 		return nil, err
 	}
 	values := make([]dockerContainer, 0, len(ids))
-	format := `{{json .Id}}\t{{json .Name}}\t{{json .Config.Image}}\t{{json .Image}}\t{{json .State.Status}}\t{{json .Config.User}}\t{{json .Config.Labels}}\t{{json .NetworkSettings.Networks}}\t{{json .Mounts}}`
 	for _, id := range ids {
-		line, err := docker.inspect(ctx, "container", id, format, 9)
+		line, err := docker.inspect(ctx, "container", id, containerInspectProjection, 9)
 		if err != nil {
 			return nil, err
 		}
@@ -279,9 +283,8 @@ func (docker DockerCLI) networks(ctx context.Context) ([]dockerNetwork, error) {
 		return nil, err
 	}
 	values := make([]dockerNetwork, 0, len(ids))
-	format := `{{json .Id}}\t{{json .Name}}\t{{json .Driver}}\t{{json .Labels}}`
 	for _, id := range ids {
-		line, err := docker.inspect(ctx, "network", id, format, 4)
+		line, err := docker.inspect(ctx, "network", id, networkInspectProjection, 4)
 		if err != nil {
 			return nil, err
 		}
@@ -306,9 +309,8 @@ func (docker DockerCLI) volumes(ctx context.Context) ([]dockerVolume, error) {
 		return nil, err
 	}
 	values := make([]dockerVolume, 0, len(names))
-	format := `{{json .Name}}\t{{json .Driver}}\t{{json .Labels}}`
 	for _, name := range names {
-		line, err := docker.inspect(ctx, "volume", name, format, 3)
+		line, err := docker.inspect(ctx, "volume", name, volumeInspectProjection, 3)
 		if err != nil {
 			return nil, err
 		}
@@ -364,28 +366,27 @@ func (docker DockerCLI) objectList(ctx context.Context, args []string, requireID
 	return lines, nil
 }
 
-func (docker DockerCLI) inspect(ctx context.Context, kind, object, format string, fields int) ([]string, error) {
+func (docker DockerCLI) inspect(ctx context.Context, kind, object, format string, fields int) ([]json.RawMessage, error) {
 	result, err := docker.runner().Run(ctx, docker.binary(), []string{kind, "inspect", "--format", format, object}, nil)
 	if err != nil {
 		return nil, err
 	}
-	line := strings.TrimSuffix(result.Stdout, "\n")
-	if strings.Contains(line, "\n") {
-		return nil, errors.New("Docker inspect returned multiple records for one identity")
+	var values []json.RawMessage
+	if err := json.Unmarshal([]byte(result.Stdout), &values); err != nil {
+		return nil, fmt.Errorf("Docker inspect returned an invalid JSON projection: %w", err)
 	}
-	values := strings.Split(line, "\t")
 	if len(values) != fields {
 		return nil, errors.New("Docker inspect returned an incomplete projection")
 	}
 	return values, nil
 }
 
-func decodeFields(fields []string, destinations ...any) error {
+func decodeFields(fields []json.RawMessage, destinations ...any) error {
 	if len(fields) != len(destinations) {
 		return errors.New("Docker inspect field count differs from its decoder")
 	}
 	for index := range fields {
-		if err := json.Unmarshal([]byte(fields[index]), destinations[index]); err != nil {
+		if err := json.Unmarshal(fields[index], destinations[index]); err != nil {
 			return err
 		}
 	}
