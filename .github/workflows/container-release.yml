@@ -1278,7 +1278,18 @@ jobs:
           }
 
           inspect_release() {
-            gh api "/repos/${GITHUB_REPOSITORY}/releases/tags/${release_tag}" > "$release_api"
+            local api_url release_id
+            if ! api_url="$(gh release view "$release_tag" \
+              --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"; then
+              return 1
+            fi
+            case "$api_url" in
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/"*) ;;
+              *) echo "Release API identity is outside the repository" >&2; exit 1 ;;
+            esac
+            release_id="${api_url##*/}"
+            [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}" > "$release_api"
             jq -e --arg tag "$release_tag" --arg source "$SOURCE_COMMIT" '
               (.id | type == "number" and . > 0) and
               .tag_name == $tag and .target_commitish == $source and

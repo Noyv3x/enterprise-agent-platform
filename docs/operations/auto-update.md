@@ -23,6 +23,8 @@
 
 manifest 必须最后公开，部署机不能看到半套资产。品牌配置不是 release identity，不能改变 manifest URL、commit、digest、Manager 路径或更新幂等键。
 
+发布中的 draft 通过认证的 release identity 和数字 ID 读取、上传及复验；公开的按 tag REST 查询只用于已经可见的 release，不能作为发现 draft 的前提。这样发布任务在上传前、上传后和最终公开后始终校验同一个 release 对象。
+
 ## 检测与预拉取
 
 Manager 定时读取 latest manifest，也可由签名 webhook 唤醒。检查阶段只做纯读验证；没有更新时不创建 operation。候选必须满足：

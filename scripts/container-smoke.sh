@@ -582,6 +582,8 @@ for expected in \
   'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
   'group: container-channel-main' \
   'python3 scripts/assemble_release_manifest.py' \
+  'gh release view "$release_tag"' \
+  'gh api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"' \
   'scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"' \
   'gh release upload "$release_tag" --repo "$GITHUB_REPOSITORY" "$stage/$asset"' \
   'gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest' \

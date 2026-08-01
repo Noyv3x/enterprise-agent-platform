@@ -21,6 +21,8 @@
 
 CI 中的 Python 仓库工具必须显式通过 `python3` 调用，不能依赖 Git 可执行位或 runner 的隐式命令解析；静态发布验收需要锁定这一调用形式。
 
+原子发布使用 draft 隐藏未封印资产时，工作流必须通过认证的 release identity 取得数字 ID，再以 ID 读取 REST 元数据；不能假设公开的按 tag REST 端点能够发现 draft。静态门禁需保留这条查找链。
+
 ## Manager 与容器
 
 ```bash
