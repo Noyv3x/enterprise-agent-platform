@@ -188,7 +188,7 @@ func run(arguments []string) int {
 		parsed, parseErr := parseStartupArguments(command, arguments[1:])
 		if parseErr != nil {
 			err = parseErr
-		} else if startup, routeErr := resolveInvocationAuthorityWithConfig(context.Background(), parsed.ConfigPath); routeErr != nil {
+		} else if startup, routeErr := resolveWatchdogInvocationAuthorityWithConfig(context.Background(), parsed.ConfigPath); routeErr != nil {
 			err = fmt.Errorf("route watchdog technical identity: %w", routeErr)
 		} else {
 			routedArguments, bindErr := bindInvocationConfig(arguments[1:], startup)

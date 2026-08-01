@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/handoff"
@@ -19,6 +20,11 @@ import (
 )
 
 const handoffTransactionEnvironment = "AGENT_PLATFORM_HANDOFF_TRANSACTION_DIRECTORY"
+
+const (
+	watchdogAuthorityRoutingTimeout       = 45 * time.Second
+	watchdogAuthorityRoutingRetryInterval = 100 * time.Millisecond
+)
 
 type invocationStartup struct {
 	decision       handoffstartup.Decision
@@ -236,6 +242,73 @@ func resolveInvocationAuthority(ctx context.Context) (invocationStartup, error) 
 
 func resolveInvocationAuthorityWithConfig(ctx context.Context, configPath string) (invocationStartup, error) {
 	return resolveInvocationStartupMode(ctx, "", false, configPath)
+}
+
+type invocationAuthorityResolver func(context.Context, string) (invocationStartup, error)
+
+// resolveWatchdogInvocationAuthorityWithConfig is the only technical-routing
+// entry point allowed to wait for a busy handoff authority. The ordinary
+// updater retains its observation until systemd has accepted this watchdog;
+// all other commands keep using resolveInvocationAuthorityWithConfig directly
+// and therefore remain fail-fast.
+func resolveWatchdogInvocationAuthorityWithConfig(ctx context.Context, configPath string) (invocationStartup, error) {
+	return resolveWatchdogInvocationAuthority(
+		ctx,
+		configPath,
+		watchdogAuthorityRoutingTimeout,
+		watchdogAuthorityRoutingRetryInterval,
+		resolveInvocationAuthorityWithConfig,
+	)
+}
+
+func resolveWatchdogInvocationAuthority(
+	ctx context.Context,
+	configPath string,
+	timeout time.Duration,
+	retryInterval time.Duration,
+	resolve invocationAuthorityResolver,
+) (invocationStartup, error) {
+	if resolve == nil {
+		return invocationStartup{}, errors.New("watchdog technical routing resolver is unavailable")
+	}
+	if timeout <= 0 || retryInterval <= 0 {
+		return invocationStartup{}, errors.New("watchdog technical routing wait policy is invalid")
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var lastBusy error
+	for {
+		if err := waitCtx.Err(); err != nil {
+			return invocationStartup{}, watchdogAuthorityWaitError(lastBusy, err)
+		}
+		startup, err := resolve(waitCtx, configPath)
+		if err == nil {
+			return startup, nil
+		}
+		if !errors.Is(err, handoff.ErrBusy) {
+			return invocationStartup{}, err
+		}
+		lastBusy = err
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-timer.C:
+		case <-waitCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return invocationStartup{}, watchdogAuthorityWaitError(lastBusy, waitCtx.Err())
+		}
+	}
+}
+
+func watchdogAuthorityWaitError(lastBusy, contextErr error) error {
+	if lastBusy == nil {
+		return fmt.Errorf("wait for watchdog technical routing authority: %w", contextErr)
+	}
+	return fmt.Errorf("wait for watchdog technical routing authority: %w", errors.Join(lastBusy, contextErr))
 }
 
 func resolveInvocationStartupMode(ctx context.Context, transactionDirectory string, requireStableProcess bool, configPath string) (invocationStartup, error) {
