@@ -434,17 +434,17 @@ class ConfigFromEnvTests(unittest.TestCase):
                 self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
                 self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
 
-    def test_target_baseline_transition_is_not_projected_into_platform_runtime(self):
+    def test_cleanup_transition_is_not_projected_into_platform_runtime(self):
         repository_root = Path(__file__).resolve().parents[2]
         contract = json.loads(
             (repository_root / "docs/contracts/release-transition.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.assertEqual(contract["stage"], "target_baseline")
+        self.assertEqual(contract["stage"], "cleanup")
         self.assertEqual(
             contract["predecessor_generation"],
-            "ef8ab25d60998cffa57acab16379bdd2d62b54a8",
+            "104e6c8c74c4027852c0efb1292ac11de687fcb1",
         )
         self.assertFalse(
             (
