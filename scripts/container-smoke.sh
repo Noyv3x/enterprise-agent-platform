@@ -99,6 +99,76 @@ grep -Fq \
 [[ "$(grep -Fxc 'COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform' containers/platform.Dockerfile)" -eq 1 ]] \
   || fail "Platform package source must enter only the Python build stage"
 
+python3 - <<'PY'
+import pathlib
+import re
+
+dockerfiles = (
+    pathlib.Path("containers/platform.Dockerfile"),
+    pathlib.Path("containers/agent-runtime.Dockerfile"),
+    pathlib.Path("containers/camofox.Dockerfile"),
+    pathlib.Path("containers/agent-sandbox.Dockerfile"),
+)
+instruction = re.compile(r"(?m)^(FROM|ARG|LABEL|RUN|COPY|ADD)\b")
+for path in dockerfiles:
+    source = path.read_text(encoding="utf-8")
+    final_from = tuple(re.finditer(r"(?m)^FROM\b", source))[-1].start()
+    final_stage = source[final_from:]
+    entries = [(match.group(1), match.start()) for match in instruction.finditer(final_stage)]
+    filesystem_positions = [
+        offset for name, offset in entries if name in {"RUN", "COPY", "ADD"}
+    ]
+    if not filesystem_positions:
+        raise SystemExit(f"{path}: final stage has no filesystem instructions")
+    source_arg = final_stage.find("ARG SOURCE_COMMIT=unknown")
+    release_arg = final_stage.find("ARG RELEASE_VERSION=development")
+    label = final_stage.find("LABEL org.opencontainers.image.title=")
+    if not max(filesystem_positions) < source_arg < release_arg < label:
+        raise SystemExit(
+            f"{path}: volatile release arguments must follow all filesystem layers "
+            "and immediately precede image labels"
+        )
+    label_block_end = min(
+        (
+            offset
+            for name, offset in entries
+            if offset > label and name in {"ARG", "LABEL", "RUN", "COPY", "ADD"}
+        ),
+        default=len(final_stage),
+    )
+    label_block = final_stage[label:label_block_end]
+    for value in ("$SOURCE_COMMIT", "$RELEASE_VERSION"):
+        if value not in label_block:
+            raise SystemExit(f"{path}: final image label does not consume {value}")
+
+camofox = pathlib.Path("containers/camofox.Dockerfile").read_text(encoding="utf-8")
+build_stage, final_stage = camofox.split("\nFROM node:24-bookworm-slim AS camofox\n", 1)
+patch_copy = (
+    "COPY enterprise-agent-platform/camofox-runtime/patch-runtime.cjs ./"
+)
+loopback_copy = (
+    "COPY enterprise-agent-platform/camofox-runtime/loopback-preload.cjs ./"
+)
+npm_install = "RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev"
+if not build_stage.index(patch_copy) < build_stage.index(npm_install) < build_stage.index(loopback_copy):
+    raise SystemExit(
+        "Camoufox small runtime preload must not invalidate dependency installation"
+    )
+if re.search(
+    r"(?m)^COPY --from=camofox-build\b[^\n]* /opt/camofox /opt/camofox\s*$",
+    final_stage,
+):
+    raise SystemExit("Camoufox final stage must not repack the complete build root")
+for copy in (
+    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/browser ./browser",
+    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/node_modules ./node_modules",
+    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/package.json /opt/camofox/package-lock.json ./",
+    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/patch-runtime.cjs /opt/camofox/loopback-preload.cjs ./",
+):
+    if final_stage.count(copy) != 1:
+        raise SystemExit(f"Camoufox cache boundary is missing: {copy}")
+PY
+
 installer_test="$(mktemp -d)"
 installer_stubs="$installer_test/bin"
 mkdir -p "$installer_stubs"

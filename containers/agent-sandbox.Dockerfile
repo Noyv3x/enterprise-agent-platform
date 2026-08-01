@@ -1,14 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
 FROM node:24-bookworm-slim AS agent-sandbox
-ARG SOURCE_COMMIT=unknown
-ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="Agent Platform Sandbox" \
-      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
-      org.opencontainers.image.revision="$SOURCE_COMMIT" \
-      org.opencontainers.image.version="$RELEASE_VERSION" \
-      io.agent-platform.role="sandbox" \
-      io.agent-platform.profile="agent-platform-v1"
 ENV DEBIAN_FRONTEND=noninteractive \
     HOME=/home/agent \
     LANG=C.UTF-8 \
@@ -29,6 +21,14 @@ RUN apt-get update \
     && install -d -o 1000 -g 1000 -m 0700 /workspace /opt/agent-env
 COPY containers/agent-sandbox-entrypoint.sh /usr/local/bin/agent-sandbox-entrypoint
 RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint
+ARG SOURCE_COMMIT=unknown
+ARG RELEASE_VERSION=development
+LABEL org.opencontainers.image.title="Agent Platform Sandbox" \
+      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
+      org.opencontainers.image.revision="$SOURCE_COMMIT" \
+      org.opencontainers.image.version="$RELEASE_VERSION" \
+      io.agent-platform.role="sandbox" \
+      io.agent-platform.profile="agent-platform-v1"
 USER root
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/agent-sandbox-entrypoint"]

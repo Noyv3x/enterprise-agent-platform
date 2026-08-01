@@ -33,18 +33,13 @@ RUN set -eu; \
     test -d browser/fontconfig; \
     printf '{\n  "release": "beta.25",\n  "version": "150.0.2"\n}\n' > browser/version.json
 COPY enterprise-agent-platform/camofox-runtime/package.json enterprise-agent-platform/camofox-runtime/package-lock.json ./
-COPY enterprise-agent-platform/camofox-runtime/loopback-preload.cjs enterprise-agent-platform/camofox-runtime/patch-runtime.cjs ./
+COPY enterprise-agent-platform/camofox-runtime/patch-runtime.cjs ./
 RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev \
     && node patch-runtime.cjs \
     && grep -Fq 'reporter.resetNativeMemBaseline?.();' node_modules/@askjo/camofox-browser/server.js
+COPY enterprise-agent-platform/camofox-runtime/loopback-preload.cjs ./
 
 FROM node:24-bookworm-slim AS camofox
-ARG SOURCE_COMMIT=unknown
-ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="Agent Platform Camoufox browser" \
-      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
-      org.opencontainers.image.revision="$SOURCE_COMMIT" \
-      org.opencontainers.image.version="$RELEASE_VERSION"
 ENV NODE_ENV=production \
     AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1 \
     HOME=/var/lib/agent-platform/camofox/home \
@@ -69,9 +64,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o node -g node -m 0700 /var/lib/agent-platform/camofox
 WORKDIR /opt/camofox
-COPY --from=camofox-build --chown=1000:1000 /opt/camofox /opt/camofox
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/browser ./browser
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/node_modules ./node_modules
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/package.json /opt/camofox/package-lock.json ./
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/patch-runtime.cjs /opt/camofox/loopback-preload.cjs ./
 COPY containers/camofox-entrypoint.sh /usr/local/bin/camofox-entrypoint
 RUN chmod 0755 /usr/local/bin/camofox-entrypoint
+ARG SOURCE_COMMIT=unknown
+ARG RELEASE_VERSION=development
+LABEL org.opencontainers.image.title="Agent Platform Camoufox browser" \
+      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
+      org.opencontainers.image.revision="$SOURCE_COMMIT" \
+      org.opencontainers.image.version="$RELEASE_VERSION"
 USER node
 EXPOSE 9377
 HEALTHCHECK --interval=10s --timeout=3s --start-period=45s --retries=18 \

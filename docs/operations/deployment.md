@@ -200,6 +200,8 @@ Manager 持有所有产品监听。默认主入口只绑定回环；管理员可
 
 main 质量门构建受支持架构的镜像与 Manager 二进制。release manifest 包含 source commit、协议版本、数据库版本、Manager 校验和、Compose 摘要及每个镜像的完整 registry digest。Manager 只按 digest 拉取，不使用 mutable tag 作为运行身份。Platform 与 Agent Runtime 的各架构压缩层总量和本地展开尺寸还必须不超过同一提交 [`container-platform.json`](../contracts/container-platform.json) 的容量上限；该上限供部署机按“本地缺失 digest”计算更新空间，不是可由部署端放宽的设置。
 
+发布镜像必须把只随 generation 变化的 revision/version 元数据放在所有文件系统构建层之后，使没有内容变化的连续发布可复用依赖安装、系统包和大型资产层。这只是构建缓存边界：最终镜像仍必须写入当次精确 revision/version label，镜像内路径、所有权、入口和运行内容不得因分层而改变。Camoufox 的锁定浏览器资产、已打补丁依赖与小型运行源文件必须分层复制，小文件变化不应重新打包锁定浏览器资产。仓库静态门禁固定这两个顺序与分层不变量。
+
 官方清单引用的 Platform、Runtime、Camoufox 和 Sandbox package 必须能够在无 registry 登录状态下按 digest 拉取。CI 使用隔离的匿名 Docker 配置验证这一点，再执行 Compose smoke test；必需工件全部通过后才发布清单。
 
 部署机不拉取 Cognee 或 Firecrawl Git 源码。Cognee 在镜像构建阶段从精确契约 revision 安装；Firecrawl Compose 服务和 digest 在 CI 中对上游契约验证后进入发布清单。

@@ -38,12 +38,6 @@ RUN python -m pip install . \
     && python -m compileall -q "$VIRTUAL_ENV/lib/python3.11/site-packages/enterprise_agent_platform"
 
 FROM python:3.11-slim-bookworm AS platform
-ARG SOURCE_COMMIT=unknown
-ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="Agent Platform" \
-      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
-      org.opencontainers.image.revision="$SOURCE_COMMIT" \
-      org.opencontainers.image.version="$RELEASE_VERSION"
 ENV PATH="/opt/venv/bin:$PATH" \
     HOME=/var/lib/agent-platform/.home \
     PYTHONUNBUFFERED=1 \
@@ -71,6 +65,12 @@ RUN apt-get update \
 COPY --from=python-build /opt/venv /opt/venv
 COPY containers/platform-entrypoint.sh /usr/local/bin/agent-platform-entrypoint
 RUN chmod 0755 /usr/local/bin/agent-platform-entrypoint
+ARG SOURCE_COMMIT=unknown
+ARG RELEASE_VERSION=development
+LABEL org.opencontainers.image.title="Agent Platform" \
+      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
+      org.opencontainers.image.revision="$SOURCE_COMMIT" \
+      org.opencontainers.image.version="$RELEASE_VERSION"
 USER 1000:1000
 WORKDIR /var/lib/agent-platform
 EXPOSE 8765

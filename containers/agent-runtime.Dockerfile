@@ -13,12 +13,6 @@ RUN npm run build \
     && npm prune --omit=dev
 
 FROM node:24-bookworm-slim AS agent-runtime
-ARG SOURCE_COMMIT=unknown
-ARG RELEASE_VERSION=development
-LABEL org.opencontainers.image.title="Agent Platform Runtime" \
-      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
-      org.opencontainers.image.revision="$SOURCE_COMMIT" \
-      org.opencontainers.image.version="$RELEASE_VERSION"
 ENV NODE_ENV=production \
     AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1 \
     HOME=/var/lib/agent-platform/runtime/home \
@@ -34,6 +28,12 @@ COPY --from=runtime-build /build/agent-runtime/node_modules ./node_modules
 COPY --from=runtime-build /build/agent-runtime/dist ./dist
 COPY containers/agent-runtime-entrypoint.sh /usr/local/bin/agent-runtime-entrypoint
 RUN chmod 0755 /usr/local/bin/agent-runtime-entrypoint
+ARG SOURCE_COMMIT=unknown
+ARG RELEASE_VERSION=development
+LABEL org.opencontainers.image.title="Agent Platform Runtime" \
+      org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
+      org.opencontainers.image.revision="$SOURCE_COMMIT" \
+      org.opencontainers.image.version="$RELEASE_VERSION"
 USER node
 EXPOSE 8766
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=12 \
