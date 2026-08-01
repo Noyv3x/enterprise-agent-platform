@@ -1184,6 +1184,69 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertNotIn(retired_bridge_qualification, evaluator)
         self.assertIn("agent-platform-compose.yaml", container)
         self.assertIn("agent-platform-manager-linux-amd64", container)
+        prepare = container[
+            container.index("\n  prepare:\n") : container.index(
+                "\n  upstream-contracts:\n"
+            )
+        ]
+        target_gate = prepare[
+            prepare.index('if [[ "$transition_stage" == target_baseline ]]; then')
+            : prepare.index("          manager_command=./cmd/agent-platform-manager")
+        ]
+        self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", prepare)
+        self.assertIn(".predecessor_generation", target_gate)
+        self.assertIn(
+            'current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"',
+            target_gate,
+        )
+        self.assertIn(
+            '[[ "$current_tag" == "container-${transition_predecessor}" ]]',
+            target_gate,
+        )
+        self.assertLess(
+            prepare.index('if [[ "$transition_stage" == target_baseline ]]; then'),
+            prepare.index("          image_matrix="),
+        )
+        images = container[
+            container.index("\n  images:\n") : container.index("\n  public-images:\n")
+        ]
+        self.assertIn("      - prepare\n", images)
+
+        publish = container[container.index("\n  publish:\n") :]
+        self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", publish)
+        predecessor_lookup = publish[
+            publish.index(
+                '          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"'
+            )
+            : publish.index("          assembler_args=(")
+        ]
+        cleanup_branch = 'if [[ "$TRANSITION_STAGE" == cleanup ]]; then'
+        paginated_releases = '"/repos/${GITHUB_REPOSITORY}/releases?per_page=100"'
+        tagged_release = (
+            '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
+        )
+        self.assertIn(cleanup_branch, predecessor_lookup)
+        self.assertIn(
+            "gh api --paginate -H 'Accept: application/vnd.github+json'",
+            predecessor_lookup,
+        )
+        self.assertIn(paginated_releases, predecessor_lookup)
+        self.assertIn(
+            'jq -se --arg tag "container-${predecessor}"', predecessor_lookup
+        )
+        self.assertIn("if length == 1 then .[0]", predecessor_lookup)
+        self.assertIn(
+            "Cleanup predecessor draft release identity is not unique",
+            predecessor_lookup,
+        )
+        self.assertEqual(predecessor_lookup.count(tagged_release), 1)
+        cleanup_else = predecessor_lookup.index("          else\n")
+        self.assertLess(
+            predecessor_lookup.index(cleanup_branch),
+            predecessor_lookup.index(paginated_releases),
+        )
+        self.assertLess(predecessor_lookup.index(paginated_releases), cleanup_else)
+        self.assertLess(cleanup_else, predecessor_lookup.index(tagged_release))
         self.assertIn("Cleanup must be prebuilt while its Bridge predecessor remains draft", container)
         self.assertIn("Cleanup predecessor has no exact successful sealed publisher provenance", container)
         self.assertEqual(

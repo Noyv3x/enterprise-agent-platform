@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "transition_id": "technical-namespace-v1",
-  "stage": "cleanup",
-  "predecessor_generation": "3dcbb997be5f1664b73ed6943d9f228cd5a77d4e",
+  "stage": "target_baseline",
+  "predecessor_generation": "da0980cc4294ae5684b68826e9d33b160d11c3d7",
   "source_profile_id": "ubitech-agent-v1",
   "target_profile_id": "agent-platform-v1",
   "manifest_protocol": {

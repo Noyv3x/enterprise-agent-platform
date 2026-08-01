@@ -434,6 +434,12 @@ class ConfigFromEnvTests(unittest.TestCase):
                 self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
                 self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
 
+    def test_release_transition_contract_has_no_platform_runtime_projection(self):
+        package_root = Path(__file__).resolve().parents[1] / "enterprise_agent_platform"
+        self.assertFalse(
+            (package_root / "release_transition_contract_generated.py").exists()
+        )
+
     def test_unknown_technical_profile_is_rejected(self):
         environments = (
             {
