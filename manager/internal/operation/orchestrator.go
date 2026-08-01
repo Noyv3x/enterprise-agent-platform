@@ -3,7 +3,6 @@ package operation
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,22 +59,11 @@ type Orchestrator struct {
 	LocalActiveProcesses func() int
 	FixedStackMu         sync.Locker
 	MaintenanceMu        sync.Locker
-	// HandoffAdmission is acquired before MaintenanceMu for every ordinary
-	// operation publication boundary. A source-owner Manager uses it to retain
-	// the deployment-wide handoff observation lock and reject a nonterminal
-	// namespace transaction. The returned release function must be idempotent.
-	HandoffAdmission func(context.Context) (release func(), err error)
-	// NamespaceHandoffCheck is installed only by the complete source-owner
-	// application. It receives the already validated and immutably retained
-	// bridge manifest identity after the ordinary observation lease is released,
-	// and must route it to the handoff coordinator. Ordinary update execution
-	// still rejects the descriptor; the coordinator is its only mutation owner.
-	NamespaceHandoffCheck func(context.Context, release.Manifest, string, string) error
-	ReclaimCapacity       func(context.Context, string, release.Manifest) error
-	mu                    sync.Mutex
-	finalizeMu            sync.Mutex
-	rollbackMu            sync.Mutex
-	running               map[string]context.CancelFunc
+	ReclaimCapacity      func(context.Context, string, release.Manifest) error
+	mu                   sync.Mutex
+	finalizeMu           sync.Mutex
+	rollbackMu           sync.Mutex
+	running              map[string]context.CancelFunc
 }
 
 const reservationReleaseTimeout = 10 * time.Second
@@ -90,14 +78,7 @@ func (o *Orchestrator) releaseProfile() identity.ActiveProfile {
 	if o.TechnicalProfile.Validate() == nil {
 		return o.TechnicalProfile
 	}
-	// Production application assembly always injects the routed profile. A
-	// focused helper that omitted it may use only the canonical compile-time
-	// stage; it cannot silently fall back to source in a target-only build.
-	active, err := identity.CompileTimeActiveProfile()
-	if err != nil {
-		return identity.ActiveProfile{}
-	}
-	return active
+	return identity.CompileTimeActiveProfile()
 }
 
 func (o *Orchestrator) Preflight(ctx context.Context) error {
@@ -118,42 +99,6 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	manifest, data, err := o.ReleaseClient.FetchForProfile(ctx, url, o.Channel, o.releaseProfile())
 	if err != nil {
 		return release.Manifest{}, err
-	}
-	if manifest.NamespaceHandoff != nil && o.NamespaceHandoffCheck == nil {
-		return release.Manifest{}, errors.New("namespace handoff requires the complete handoff owner and cannot run as an ordinary update")
-	}
-	if manifest.NamespaceHandoff == nil {
-		if err := rejectUnownedNamespaceHandoff(manifest); err != nil {
-			return release.Manifest{}, err
-		}
-	}
-	if manifest.NamespaceHandoff != nil {
-		// Retain bytes and clear any old check-only Candidate while following the
-		// ordinary global->runtime lock order. Release that observation before
-		// entering Coordinator.Begin, which takes the same global lock and then
-		// acquires its stronger runtime freeze. Re-entering while held deadlocks;
-		// publishing a Candidate would let runUpdate misinterpret the bridge.
-		unlockMaintenance, lockErr := o.lockMaintenanceAdmission(ctx)
-		if lockErr != nil {
-			return release.Manifest{}, lockErr
-		}
-		path, saveErr := o.saveManifest(ctx, manifest, data)
-		if saveErr == nil {
-			_, saveErr = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
-				state.Candidate = nil
-				state.LastError = ""
-				return nil
-			})
-		}
-		unlockMaintenance()
-		if saveErr != nil {
-			return release.Manifest{}, saveErr
-		}
-		digest := sha256.Sum256(data)
-		if err := o.NamespaceHandoffCheck(ctx, manifest, path, fmt.Sprintf("%x", digest[:])); err != nil {
-			return release.Manifest{}, err
-		}
-		return manifest, nil
 	}
 	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
 	if err != nil {
@@ -244,24 +189,15 @@ func (o *Orchestrator) Recover(ctx context.Context) error {
 }
 
 func (o *Orchestrator) lockMaintenanceAdmission(ctx context.Context) (func(), error) {
-	releaseHandoff := func() {}
-	if o.HandoffAdmission != nil {
-		var err error
-		releaseHandoff, err = o.HandoffAdmission(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if releaseHandoff == nil {
-			return nil, errors.New("handoff admission returned a nil release function")
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if o.MaintenanceMu == nil {
-		return releaseHandoff, nil
+		return func() {}, nil
 	}
 	o.MaintenanceMu.Lock()
 	return func() {
 		o.MaintenanceMu.Unlock()
-		releaseHandoff()
 	}, nil
 }
 
@@ -479,10 +415,6 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			return
 		}
 	}
-	if err = rejectUnownedNamespaceHandoff(manifest); err != nil {
-		o.failBeforeMaintenance(op, err)
-		return
-	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
 		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreDownload, manifest); err != nil {
 			o.failBeforeMaintenanceRetryable(op, err)
@@ -653,13 +585,6 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	if err == nil {
 		_ = o.finalizeCommitted(context.Background(), op, manifest)
 	}
-}
-
-func rejectUnownedNamespaceHandoff(manifest release.Manifest) error {
-	if manifest.NamespaceHandoff != nil {
-		return errors.New("namespace handoff requires the complete handoff owner and cannot run as an ordinary update")
-	}
-	return nil
 }
 
 func (o *Orchestrator) checkCapacity(ctx context.Context, checker driver.CapacityChecker, operationID, stage string, manifest release.Manifest) error {
@@ -2000,9 +1925,7 @@ func (o *Orchestrator) loadManifest(path string) (release.Manifest, error) {
 	return value, nil
 }
 
-// loadStateManifest accepts only the active profile's supported manifest
-// schemas. Bridge target binaries do not retain the A2/P1 compatibility reader;
-// source recovery belongs to the already-published source owner and its bundle.
+// loadStateManifest accepts only the current target manifest schema.
 func (o *Orchestrator) loadStateManifest(generation *model.Generation) (release.Manifest, error) {
 	if generation == nil {
 		return release.Manifest{}, errors.New("retained generation is absent")

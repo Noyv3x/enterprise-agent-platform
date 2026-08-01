@@ -27,15 +27,9 @@ import (
 )
 
 type ProcessManager struct {
-	Engine    driver.Engine
-	Sandboxes *sandbox.Manager
-	MaxOutput int64
-	// BackgroundAdmission is the deployment-wide handoff observation used by
-	// asynchronous process completion. Foreground process mutations remain
-	// inside the executor request's global -> runtime lease; background waiters
-	// must reacquire the global lease before changing their observable status,
-	// registry counters, process journal, or retained files.
-	BackgroundAdmission func(context.Context) (release func(), err error)
+	Engine              driver.Engine
+	Sandboxes           *sandbox.Manager
+	MaxOutput           int64
 	mu                  sync.Mutex
 	processes           map[string]*managedProcess
 	pendingByFamily     map[string]int
@@ -107,7 +101,7 @@ func (b *boundedBuffer) String() string {
 	return result
 }
 
-func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64, backgroundAdmission func(context.Context) (func(), error)) (*ProcessManager, error) {
+func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64) (*ProcessManager, error) {
 	profile, err := active.Profile()
 	if err != nil {
 		return nil, fmt.Errorf("process executor technical profile: %w", err)
@@ -116,7 +110,7 @@ func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Eng
 		maxOutput = 1 << 20
 	}
 	manager := &ProcessManager{
-		Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput, BackgroundAdmission: backgroundAdmission,
+		Engine: engine, Sandboxes: sandboxes, MaxOutput: maxOutput,
 		processes:           map[string]*managedProcess{},
 		pendingByFamily:     map[string]int{},
 		maxRunningPerFamily: 16,
@@ -435,22 +429,7 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 }
 
 func (m *ProcessManager) wait(process *managedProcess) {
-	process.mu.Lock()
-	startedInBackground := process.snapshot.Background
-	process.mu.Unlock()
 	err := process.command.Wait()
-	releaseAdmission := func() {}
-	if startedInBackground {
-		var admissionErr error
-		releaseAdmission, admissionErr = m.acquireBackgroundAdmission(context.Background())
-		if admissionErr != nil {
-			// Keep the in-memory and durable process active. That conservative
-			// state continues to block handoff rather than publishing process
-			// control or completion outside the global observation boundary.
-			return
-		}
-	}
-	defer releaseAdmission()
 	contextErr := process.context.Err()
 	confirmed := true
 	if process.snapshot.Target == "sandbox" && err != nil {
@@ -655,13 +634,6 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		if err != nil || running {
 			continue
 		}
-		releaseAdmission, admissionErr := m.acquireBackgroundAdmission(context.Background())
-		if admissionErr != nil {
-			// A nonterminal handoff owns the deployment. Preserve the active
-			// durable record and let target/source startup reconciliation settle
-			// it under the selected namespace instead of writing across ownership.
-			return
-		}
 		now := time.Now().UTC()
 		process.mu.Lock()
 		if activeProcessStatus(process.snapshot.Status) {
@@ -676,27 +648,8 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		_ = m.persistProcess(process)
 		_ = m.Sandboxes.ProcessExited(process.sandboxID, now)
 		m.pruneCompleted(now)
-		releaseAdmission()
 		return
 	}
-}
-
-func (m *ProcessManager) acquireBackgroundAdmission(ctx context.Context) (func(), error) {
-	if m == nil || m.BackgroundAdmission == nil {
-		return nil, errors.New("background process handoff admission is unavailable")
-	}
-	releaseAdmission, err := m.BackgroundAdmission(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if releaseAdmission == nil {
-		return nil, errors.New("background process handoff admission returned a nil release function")
-	}
-	if err := ctx.Err(); err != nil {
-		releaseAdmission()
-		return nil, err
-	}
-	return releaseAdmission, nil
 }
 
 func (m *ProcessManager) sandboxCommand(process *managedProcess, script string) (string, error) {

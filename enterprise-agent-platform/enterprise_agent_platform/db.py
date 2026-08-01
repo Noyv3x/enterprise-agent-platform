@@ -20,15 +20,15 @@ from .secure_fs import (
     ensure_private_directory,
 )
 from .technical_profile import (
-    SOURCE_DATABASE_BASELINE,
-    SOURCE_TECHNICAL_PROFILE,
+    TARGET_DATABASE_BASELINE,
+    TARGET_TECHNICAL_PROFILE,
     TechnicalProfile,
     technical_profile,
 )
 
 
 _DATABASE_BASELINE_VERSION = 2026072901
-_DATABASE_BASELINE_NAME = SOURCE_DATABASE_BASELINE
+_DATABASE_BASELINE_NAME = TARGET_DATABASE_BASELINE
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
 
@@ -123,7 +123,7 @@ def _assert_pinned_database_profile(
 
 def assert_existing_database_profile(
     path: Path,
-    technical_profile_value: TechnicalProfile | str = SOURCE_TECHNICAL_PROFILE,
+    technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
 ) -> None:
     """Reject a cross-profile database without opening a writable handle."""
 
@@ -199,7 +199,7 @@ class Database:
     def __init__(
         self,
         path: Path,
-        technical_profile_value: TechnicalProfile | str = SOURCE_TECHNICAL_PROFILE,
+        technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
     ):
         self.path = Path(path).expanduser()
         self.technical_profile = technical_profile(technical_profile_value)

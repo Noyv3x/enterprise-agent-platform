@@ -1,7 +1,6 @@
 package selfupdate
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,21 +26,17 @@ import (
 )
 
 var (
-	testActiveProfile    = identity.SourceActiveProfile()
-	testTechnicalProfile = identity.SourceProfile()
+	testActiveProfile    = identity.CompileTimeActiveProfile()
+	testTechnicalProfile = identity.TargetProfile()
 )
 
 func runTestWatchdog(ctx context.Context, active identity.ActiveProfile, planPath string, runner Runner) error {
-	return runTestWatchdogWithTransfer(ctx, active, planPath, runner, func() error { return nil })
-}
-
-func runTestWatchdogWithTransfer(ctx context.Context, active identity.ActiveProfile, planPath string, runner Runner, transfer func() error) error {
 	_, plan, err := readRecoveryActivationPlan(planPath)
 	if err != nil {
 		return err
 	}
 	binding := testWatchdogBinding(active, plan)
-	return RunWatchdog(ctx, binding, planPath, runner, transfer)
+	return RunWatchdog(ctx, binding, planPath, runner)
 }
 
 func testWatchdogBinding(active identity.ActiveProfile, plan Plan) WatchdogBinding {
@@ -107,7 +102,7 @@ func TestStartupIdentityTracksRunningInodeAfterPathReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	copyPath := filepath.Join(t.TempDir(), "ubitech-manager-inode-helper")
+	copyPath := filepath.Join(t.TempDir(), "agent-platform-manager-inode-helper")
 	if err := atomicfile.WriteFile(copyPath, data, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -150,10 +145,9 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) error {
 func candidateManifest(t *testing.T, binary []byte) (release.Manifest, *httptest.Server) {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(binary) }))
-	manifest := releasetest.NewSource(
+	manifest := releasetest.NewTarget(
 		strings.Repeat("a", 40),
 		releasetest.WithArtifactBaseURL(server.URL),
-		releasetest.WithManagerVersion("next"),
 		releasetest.WithManagerBinary("amd64", binary),
 		releasetest.WithManagerBinary("arm64", binary),
 	).Manifest
@@ -163,14 +157,14 @@ func candidateManifest(t *testing.T, binary []byte) (release.Manifest, *httptest
 func newPreparedManager(t *testing.T) (*Manager, release.Manifest, []byte, *fakeRunner) {
 	t.Helper()
 	oldBinary := []byte("#!/bin/sh\necho current\n")
-	newBinary := []byte("#!/bin/sh\necho next\n")
+	newBinary := []byte("#!/bin/sh\necho aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")
 	manifest, server := candidateManifest(t, newBinary)
 	t.Cleanup(server.Close)
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	install := filepath.Join(root, "bin", "ubitech-manager")
+	install := filepath.Join(root, "bin", "agent-platform-manager")
 	if err := atomicfile.WriteFile(install, oldBinary, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +173,7 @@ func newPreparedManager(t *testing.T) (*Manager, release.Manifest, []byte, *fake
 	if err := atomicfile.WriteFile(tokenFile, []byte("0123456789abcdef0123456789abcdef\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{Profile: testActiveProfile, ConfigPath: filepath.Join(root, "config", "manager.toml"), Root: filepath.Join(root, "state", "binaries"), StatePath: filepath.Join(root, "state", "manager-binaries.json"), InstallPath: install, SocketPath: filepath.Join(root, "manager.sock"), ControlTokenFile: tokenFile, UnitName: "ubitech-agent-manager.service", RunningVersion: "current", Client: release.Client{HTTP: server.Client()}, Runner: runner, Now: func() time.Time { return time.Unix(10, 0) }, BootID: func() string { return "boot-a" }}
+	manager := &Manager{Profile: testActiveProfile, ConfigPath: filepath.Join(root, "config", "manager.toml"), Root: filepath.Join(root, "state", "binaries"), StatePath: filepath.Join(root, "state", "manager-binaries.json"), InstallPath: install, SocketPath: filepath.Join(root, "manager.sock"), ControlTokenFile: tokenFile, UnitName: "agent-platform-manager.service", RunningVersion: "current", Client: release.Client{HTTP: server.Client()}, Runner: runner, Now: func() time.Time { return time.Unix(10, 0) }, BootID: func() string { return "boot-a" }}
 	manager.RecoveryUnitActive = func(_ context.Context, unit string) (bool, error) {
 		return runner.activeUnits[unit], nil
 	}
@@ -232,7 +226,7 @@ func TestPrepareVerifiesButDoesNotActivateCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Current == nil || state.Current.Version != "current" || state.Candidate == nil || state.Candidate.Version != "next" || state.Candidate.PlatformCommitted || state.Activation != nil {
+	if state.Current == nil || state.Current.Version != "current" || state.Candidate == nil || state.Candidate.Version != strings.Repeat("a", 40) || state.Candidate.PlatformCommitted || state.Activation != nil {
 		t.Fatalf("unsafe state transition: %#v", state)
 	}
 	installed, _ := os.ReadFile(manager.InstallPath)
@@ -268,7 +262,7 @@ func TestPrepareRejectsStagedManagerThatReportsAnotherVersion(t *testing.T) {
 		Now:            func() time.Time { return time.Unix(10, 0) },
 	}
 	err := manager.Prepare(context.Background(), manifest)
-	if err == nil || !strings.Contains(err.Error(), `staged manager version "unexpected" does not match release version "next"`) {
+	if err == nil || !strings.Contains(err.Error(), `staged manager version "unexpected" does not match release version "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`) {
 		t.Fatalf("Prepare with mismatched staged version = %v", err)
 	}
 	if _, statErr := os.Lstat(manager.StatePath); !os.IsNotExist(statErr) {
@@ -422,7 +416,7 @@ func TestPruneVersionsRemovesOnlyExpiredVerifiedUnreferencedDirectories(t *testi
 	oldCommit := strings.Repeat("b", 40)
 	oldVersion := Version{
 		Version: "obsolete", SourceCommit: oldCommit,
-		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+oldCommit[:12]), "ubitech-manager"),
+		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+oldCommit[:12]), "agent-platform-manager"),
 		SHA256:     oldDigest,
 		VerifiedAt: time.Unix(10, 0).UTC(),
 	}
@@ -457,7 +451,7 @@ func TestPruneVersionsRetainsDirectoryContainingUnknownEvidence(t *testing.T) {
 	commit := strings.Repeat("c", 40)
 	version := Version{
 		Version: "obsolete", SourceCommit: commit,
-		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+commit[:12]), "ubitech-manager"),
+		Path:       filepath.Join(manager.Root, "versions", safeID("obsolete-"+commit[:12]), "agent-platform-manager"),
 		SHA256:     digest,
 		VerifiedAt: time.Unix(10, 0).UTC(),
 	}
@@ -666,51 +660,11 @@ func TestWatchdogCommitsAcknowledgedHealthyCandidate(t *testing.T) {
 		t.Fatal(err)
 	}
 	state, _ = manager.State()
-	if state.Current == nil || state.Current.Version != "next" || state.Previous == nil || state.Previous.Version != "current" || state.Candidate != nil || state.Activation != nil {
+	if state.Current == nil || state.Current.Version != strings.Repeat("a", 40) || state.Previous == nil || state.Previous.Version != "current" || state.Candidate != nil || state.Activation != nil {
 		t.Fatalf("watchdog did not commit candidate: %#v", state)
 	}
 	if committed, err := manager.ActivationCommitted(manifest); err != nil || !committed {
 		t.Fatalf("watchdog commit was not visible to cleanup barrier: committed=%v err=%v", committed, err)
-	}
-}
-
-func TestWatchdogAuthorityTransferFailurePrecedesEveryMutation(t *testing.T) {
-	manager, manifest, _, runner := newPreparedManager(t)
-	if err := manager.MarkPlatformCommitted(manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Activate(context.Background(), manifest); err != nil {
-		t.Fatal(err)
-	}
-	state, err := manager.State()
-	if err != nil || state.Activation == nil {
-		t.Fatalf("activation fixture is incomplete: %#v %v", state, err)
-	}
-	stateBefore, err := os.ReadFile(manager.StatePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	planBefore, err := os.ReadFile(state.Activation.PlanPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runnerCalls := len(runner.calls)
-	want := errors.New("handoff authority changed")
-	called := false
-	err = runTestWatchdogWithTransfer(context.Background(), testActiveProfile, state.Activation.PlanPath, runner, func() error {
-		called = true
-		return want
-	})
-	if !called || !errors.Is(err, want) {
-		t.Fatalf("watchdog authority transfer result = %v called=%v", err, called)
-	}
-	stateAfter, stateErr := os.ReadFile(manager.StatePath)
-	planAfter, planErr := os.ReadFile(state.Activation.PlanPath)
-	if stateErr != nil || planErr != nil || !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(planBefore, planAfter) {
-		t.Fatalf("failed watchdog authority transfer mutated durable state: state_err=%v plan_err=%v", stateErr, planErr)
-	}
-	if len(runner.calls) != runnerCalls {
-		t.Fatalf("failed watchdog authority transfer invoked a service mutation: %#v", runner.calls[runnerCalls:])
 	}
 }
 

@@ -18,9 +18,6 @@ validate_id() {
 
 [ "$(id -u)" -eq 0 ] || fail "startup identity must be root"
 
-if env | grep -Eq '^(UBITECH_|ENTERPRISE_)'; then
-  fail "source-profile environment is not accepted by the target Sandbox image"
-fi
 [ "${AGENT_PLATFORM_TECHNICAL_PROFILE:-}" = "agent-platform-v1" ] \
   || fail "AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1"
 
