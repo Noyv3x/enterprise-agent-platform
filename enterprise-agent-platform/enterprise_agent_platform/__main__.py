@@ -45,7 +45,7 @@ def main() -> None:
         run_server(config)
         return
     if cmd == "migrate":
-        database = Database(config.db_path)
+        database = Database(config.db_path, config.technical_profile)
         try:
             version = int(
                 database.scalar(

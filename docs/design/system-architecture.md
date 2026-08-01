@@ -26,9 +26,9 @@ Docker network
 
 部署后的产品名称、标识图和其它品牌字段是 Platform 所有的展示数据，只能影响浏览器界面、通知、面向用户的 Agent 自称及其它明确的展示投影。管理员品牌字段不得派生或改写 Manager 二进制与 unit 名、配置和数据根、Compose project、网络、容器与 ownership label、环境变量、secret mount、Cookie、内部 API 路径、数据库 marker、workspace/session identity、包名或 release asset；这些对象属于发布协议和持久身份，不属于品牌。
 
-当前白标发布只把 `ubitech-manager`、`ubitech-agent`、`UBITECH_*`、`ENTERPRISE_*`、`.ubitech*` 与 `enterprise_*` 等既有值作为桥接源身份继续读取，绝不把它们作为用户可见产品名称回退。其后先由 source-profile generation 集中并固定现役身份，再由普通 source-owner generation 把完整的源侧交接能力送达并稳定运行；再下一桥接发布把内部身份交接到固定的中性 `agent-platform` 命名空间，最终清理基线删除源名称、迁移器和兼容读取。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取品牌而依赖已停止的 Platform 数据库。
+当前 Bridge 只把 `ubitech-manager`、`ubitech-agent`、`UBITECH_*`、`ENTERPRISE_*`、`.ubitech*` 与 `enterprise_*` 等既有值作为已完成 source-profile/source-owner 发布留下的精确交接源身份继续读取，绝不把它们作为用户可见产品名称回退。Bridge 把内部身份交接到固定的中性 `agent-platform` 命名空间，紧随其后的 Cleanup 基线删除源名称、迁移器和兼容读取。Manager 在 Platform 不可达或维护期间始终使用中性公共文案，不能为了读取品牌而依赖已停止的 Platform 数据库。
 
-目标身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。普通 generation 更新、管理员保存品牌或源码全局替换都不得直接承担这项迁移；唯一流程是[部署文档](../operations/deployment.md#技术命名空间交接)定义的两发布 Manager handoff。
+目标身份固定为 `agent-platform-manager` 二进制和 unit、`~/.config/agent-platform` 配置根、`~/.local/share/agent-platform` 状态根、容器内 `/var/lib/agent-platform` 数据根及其 `.agent-platform.lock` 单实例锁、`agent-platform` Compose project、`agent-platform_core` 网络、`AGENT_PLATFORM_*` 环境前缀、`io.agent-platform.*` ownership label、`agent-platform-sandbox-*` Sandbox 名以及 `.agent-platform` 内部工作目录。普通 generation 更新、管理员保存品牌或源码全局替换都不得直接承担这项迁移；唯一流程是[部署文档](../operations/deployment.md#技术命名空间交接)定义的两发布 Manager handoff。
 
 Manager 在解析默认配置路径、打开状态根、恢复普通 operation 或取得 control/Gateway 所有权之前先构造身份 Router。无交接事务时 Router 只能注入编译期 source profile；target profile 只能由位于源/目标数据根之外、经过完整身份与阶段校验的 handoff journal 选择。命令行、环境变量、管理员品牌、release manifest 本身或目标目录恰好存在都不能选择 target。Router 还在普通 update/self-update owner 之前识别 `namespace_handoff`：描述符存在时只能交给独立 handoff coordinator，普通 operation 不得先创建 Candidate、Activation、维护状态或其它所有权事实。
 

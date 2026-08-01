@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 )
 
 func TestSourceProfileMatchesExistingDeploymentProtocol(t *testing.T) {
@@ -116,5 +118,60 @@ func TestProfilesAreReturnedByValue(t *testing.T) {
 	changed.ManagerBinary = "changed"
 	if TargetProfile().ManagerBinary != "agent-platform-manager" {
 		t.Fatal("caller mutated the target profile")
+	}
+}
+
+func TestReleaseStageSelectsOnlyTheCanonicalCompileTimeProfile(t *testing.T) {
+	for _, test := range []struct {
+		stage string
+		want  Profile
+	}{
+		{stage: "bridge", want: SourceProfile()},
+		{stage: "cleanup", want: TargetProfile()},
+		{stage: "target_baseline", want: TargetProfile()},
+	} {
+		t.Run(test.stage, func(t *testing.T) {
+			active, err := ActiveProfileForReleaseContract(
+				test.stage, SourceProfile().ProfileID, TargetProfile().ProfileID,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := active.Profile()
+			if err != nil || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("stage %q profile = %#v, %v; want %#v", test.stage, got, err, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name, stage, sourceID, targetID string
+	}{
+		{name: "unknown stage", stage: "source_owner", sourceID: SourceProfile().ProfileID, targetID: TargetProfile().ProfileID},
+		{name: "source drift", stage: "bridge", sourceID: TargetProfile().ProfileID, targetID: TargetProfile().ProfileID},
+		{name: "target drift", stage: "cleanup", sourceID: SourceProfile().ProfileID, targetID: SourceProfile().ProfileID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ActiveProfileForReleaseContract(test.stage, test.sourceID, test.targetID); err == nil {
+				t.Fatal("invalid release contract selected a technical profile")
+			}
+		})
+	}
+}
+
+func TestCompileTimeProfileMatchesGeneratedStage(t *testing.T) {
+	active, err := CompileTimeActiveProfile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SourceActiveProfile()
+	if contract.ReleaseTransitionStage == "cleanup" || contract.ReleaseTransitionStage == "target_baseline" {
+		want, err = ActivateVerifiedHandoffTarget(TargetProfile())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if active != want {
+		t.Fatalf("stage %q selected %#v, want %#v", contract.ReleaseTransitionStage, active, want)
 	}
 }

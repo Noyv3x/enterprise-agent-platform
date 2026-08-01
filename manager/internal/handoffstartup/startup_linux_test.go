@@ -950,3 +950,43 @@ func digestPath(t *testing.T, path string) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
 }
+
+func TestJournalFreeTargetBaselineUsesOnlyTheSelectedTargetProfile(t *testing.T) {
+	root := t.TempDir()
+	profile := identity.TargetProfile()
+	active, err := identity.ActivateVerifiedHandoffTarget(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := RuntimePaths{
+		StableBinary: filepath.Join(root, "bin", profile.ManagerBinary),
+		ConfigPath:   filepath.Join(root, "config", profile.ConfigDirectory, profile.ConfigFile),
+		DataRoot:     filepath.Join(root, "data", profile.DataDirectory),
+		StateRoot:    filepath.Join(root, "data", profile.DataDirectory, profile.ManagerStateDirectory),
+		SocketPath:   filepath.Join(root, "run", filepath.FromSlash(profile.RuntimeSocketPath)),
+	}
+	for _, directory := range []string{
+		filepath.Dir(paths.StableBinary), filepath.Dir(paths.ConfigPath), paths.DataRoot,
+		paths.StateRoot, filepath.Dir(paths.SocketPath),
+	} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(paths.ConfigPath, []byte("# target baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := routeBaselineProfilePaths(active, paths, false)
+	if err != nil {
+		t.Fatalf("route target baseline: %v", err)
+	}
+	if decision.ActiveProfile != active || decision.Profile != profile || decision.Paths != paths || decision.TransactionID != "" {
+		t.Fatalf("target baseline decision = %#v", decision)
+	}
+	if _, err := routeBaselineProfilePaths(identity.SourceActiveProfile(), paths, false); err == nil {
+		t.Fatal("source profile accepted the target-only baseline layout")
+	}
+}

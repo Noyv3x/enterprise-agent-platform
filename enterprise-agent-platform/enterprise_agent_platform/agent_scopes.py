@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,21 +18,18 @@ from .db import Database, now_ts
 from .secure_fs import (
     PrivatePublicationCommittedError,
     UnsafePrivatePathError,
-    ensure_private_child_directory_fd,
     ensure_private_directory,
     open_private_child_directory_fd,
     open_private_directory_fd,
     publish_private_file_at,
     read_private_file_at,
-    verify_private_child_directory_fd,
 )
+from .technical_profile import other_technical_profile
 
 
 _MAX_SESSION_ID_LENGTH = 512
 _SCOPE_MARKER_SCHEMA_VERSION = 1
 _SCOPE_MARKER_KIND = "agent-workspace-scope"
-_SOURCE_TECHNICAL_PROFILE = "ubitech-agent-v1"
-_SOURCE_SCOPE_MARKER_NAME = ".ubitech-agent-scope.json"
 _MAX_SCOPE_MARKER_BYTES = 16 * 1024
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _SCOPE_SELECT = """
@@ -41,6 +39,195 @@ _SCOPE_SELECT = """
     FROM agent_scopes AS scopes
     JOIN agent_runtime_scopes AS runtime ON runtime.scope_key = scopes.scope_key
 """
+
+
+def _scope_marker_payload_for_profile(
+    scope: AgentExecutionScope,
+    profile_id: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _SCOPE_MARKER_SCHEMA_VERSION,
+        "kind": _SCOPE_MARKER_KIND,
+        "technical_profile": profile_id,
+        "scope_key": scope.scope_key,
+        "scope_type": scope.scope_type,
+        "scope_id": scope.scope_id,
+        "lifecycle_id": scope.lifecycle_id,
+        "sandbox_id": scope.sandbox_id,
+        "workspace_id": scope.workspace_id,
+        "workspace_relative_path": f"workspaces/{scope.workspace_id}",
+        "isolation": "container-workspace",
+    }
+
+
+def assert_existing_workspace_profile(config: PlatformConfig) -> None:
+    """Pure-read rejection of cross-profile workspace markers.
+
+    Target data has already passed the handoff transformer, so every recorded
+    workspace must carry its target marker before the Platform may start any
+    writer. Source inventory must likewise remain entirely source-profile.
+    """
+
+    try:
+        database_info = os.lstat(config.db_path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(database_info.st_mode) or database_info.st_size == 0:
+        return
+    uri = config.db_path.absolute().as_uri() + "?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                _SCOPE_SELECT + " ORDER BY scopes.scope_key"
+            ).fetchall()
+            scope_count = int(
+                connection.execute("SELECT COUNT(*) FROM agent_scopes").fetchone()[0]
+            )
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise sqlite3.DatabaseError(
+            "Agent workspace inventory is unavailable for profile validation"
+        ) from exc
+    if not rows and scope_count == 0:
+        return
+    if len(rows) != scope_count:
+        raise sqlite3.DatabaseError(
+            "Agent workspace runtime identity is incomplete for profile validation"
+        )
+
+    selected = config.technical_profile
+    other_marker_name = other_technical_profile(selected).scope_marker_name
+    try:
+        root_fd = open_private_directory_fd(config.workspace_dir)
+    except (FileNotFoundError, UnsafePrivatePathError) as exc:
+        if selected.is_target:
+            raise sqlite3.DatabaseError(
+                "target Agent workspace root is missing or unsafe"
+            ) from exc
+        return
+    try:
+        other_internal_directory = other_technical_profile(
+            selected
+        ).workspace_internal_directory
+        for row in rows:
+            scope_key = str(row["scope_key"])
+            scope_type = str(row["scope_type"])
+            scope_id = str(row["scope_id"])
+            if scope_type == "private":
+                try:
+                    workspace_id = f"user-{int(scope_id)}"
+                except ValueError as exc:
+                    raise sqlite3.DatabaseError(
+                        "Agent workspace inventory has an invalid private scope"
+                    ) from exc
+            elif scope_type == "channel":
+                workspace_id = (
+                    "channels/channel-"
+                    + AgentScopeManager._safe_channel_id(scope_id)
+                )
+            else:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace inventory has an invalid scope type"
+                )
+            workspace_path = str(row["workspace_path"])
+            if workspace_path != workspace_id:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace inventory does not match its scope identity"
+                )
+            relative = Path(str(workspace_path))
+            if relative.is_absolute() or any(
+                part in {"", ".", ".."} for part in relative.parts
+            ):
+                raise sqlite3.DatabaseError(
+                    "Agent workspace inventory contains an unsafe path"
+                )
+            current_fd = os.dup(root_fd)
+            try:
+                try:
+                    for part in relative.parts:
+                        next_fd = open_private_child_directory_fd(current_fd, part)
+                        os.close(current_fd)
+                        current_fd = next_fd
+                except (FileNotFoundError, UnsafePrivatePathError) as exc:
+                    if selected.is_target:
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace is missing or unsafe: "
+                            + str(scope_key)
+                        ) from exc
+                    continue
+                try:
+                    os.stat(
+                        other_marker_name,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise sqlite3.DatabaseError(
+                        "Agent workspace contains another technical profile marker: "
+                        + str(scope_key)
+                    )
+                try:
+                    os.stat(
+                        other_internal_directory,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise sqlite3.DatabaseError(
+                        "Agent workspace contains another technical profile directory: "
+                        + str(scope_key)
+                    )
+                if selected.is_target:
+                    try:
+                        raw, _ = read_private_file_at(
+                            current_fd,
+                            selected.scope_marker_name,
+                            maximum_bytes=_MAX_SCOPE_MARKER_BYTES,
+                        )
+                        payload = AgentScopeManager._decode_scope_marker(
+                            raw,
+                            config.workspace_dir
+                            / relative
+                            / selected.scope_marker_name,
+                        )
+                    except (FileNotFoundError, UnsafePrivatePathError) as exc:
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace marker is missing or unsafe: "
+                            + str(scope_key)
+                        ) from exc
+                    scope = AgentExecutionScope(
+                        scope_key=scope_key,
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                        session_id=str(row["runtime_session_id"]),
+                        lifecycle_id=str(row["runtime_lifecycle_id"]),
+                        workspace_path=str(config.workspace_dir / relative),
+                        workspace_id=workspace_id,
+                        sandbox_id=str(row["sandbox_id"]),
+                    )
+                    expected = _scope_marker_payload_for_profile(
+                        scope,
+                        selected.profile_id,
+                    )
+                    if not AgentScopeManager._scope_marker_payload_matches(
+                        payload,
+                        expected,
+                    ):
+                        raise sqlite3.DatabaseError(
+                            "target Agent workspace marker does not match its database identity: "
+                            + str(scope_key)
+                        )
+            finally:
+                os.close(current_fd)
+    finally:
+        os.close(root_fd)
 
 
 @dataclass(frozen=True)
@@ -75,20 +262,6 @@ class AgentExecutionScope:
         }
 
 
-@dataclass
-class _WorkspaceObservation:
-    """Candidate-time P1 workspace evidence kept stable across local retries."""
-
-    scope_key: str
-    relative_parts: tuple[str, ...]
-    root_identity: tuple[int, int]
-    component_identities: list[tuple[int, int]]
-    current_payload: dict[str, Any]
-    marker_state: str
-    marker_payload: dict[str, Any] | None
-    marker_identity: tuple[int, int] | None = None
-
-
 class AgentScopeManager:
     """Own stable Agent workspaces, sandbox identities and runtime sessions."""
 
@@ -98,10 +271,17 @@ class AgentScopeManager:
         db: Database,
         *,
         commit_schema_upgrade: bool = True,
-        allow_unmaterialized_p1_workspaces: bool = False,
     ):
         self.config = config
         self.db = db
+        self._technical_profile = self.config.technical_profile
+        self._scope_marker_name = self._technical_profile.scope_marker_name
+        self._other_scope_marker_name = other_technical_profile(
+            self._technical_profile
+        ).scope_marker_name
+        self._other_workspace_internal_directory = other_technical_profile(
+            self._technical_profile
+        ).workspace_internal_directory
         self._schema_writes_enabled = bool(commit_schema_upgrade)
         self._workspace_root = Path(
             os.path.abspath(os.fspath(self.config.workspace_dir.expanduser()))
@@ -120,24 +300,11 @@ class AgentScopeManager:
         )
         self._scope_cache: dict[str, AgentExecutionScope] = {}
         self._scope_cache_lock = threading.RLock()
-        if allow_unmaterialized_p1_workspaces and self._schema_writes_enabled:
-            raise ValueError(
-                "unmaterialized P1 workspace compatibility requires candidate startup"
-            )
-        self._p1_normalization_allowed = bool(
-            allow_unmaterialized_p1_workspaces
-        )
-        self._workspace_observations: dict[str, _WorkspaceObservation] = {}
-        self._workspace_directory_empty_recovery: dict[
-            tuple[str, ...], tuple[int, int]
-        ] = {}
         self._assert_workspace_records()
-        missing_aliases = self._missing_current_runtime_aliases()
-        if missing_aliases and not self._p1_normalization_allowed:
+        if self._missing_current_runtime_aliases():
             raise sqlite3.DatabaseError(
                 "Agent Runtime current alias is missing from the current baseline"
             )
-        self._p1_missing_aliases = tuple(missing_aliases)
         self._assert_scope_markers()
 
     @staticmethod
@@ -151,6 +318,15 @@ class AgentScopeManager:
     @staticmethod
     def _safe_channel_id(channel_id: str | int) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(channel_id)).strip(".-") or "default"
+
+    def _private_session_prefix(self, user_id: int | str) -> str:
+        return f"{self._technical_profile.session_namespace}-private-u{int(user_id)}"
+
+    def _channel_session_prefix(self, channel_id: str | int) -> str:
+        return (
+            f"{self._technical_profile.session_namespace}-channel-"
+            f"{self._safe_channel_id(channel_id)}-main-agent"
+        )
 
     @staticmethod
     def _valid_session_id(session_id: str | None) -> bool:
@@ -217,160 +393,11 @@ class AgentScopeManager:
             )
         for row in rows:
             scope = self._from_row(row)
-            observation = self._observe_workspace(
-                scope,
-                allow_p1_compatibility=self._p1_normalization_allowed,
+            self._validate_existing_workspace(
+                scope.scope_type,
+                scope.scope_id,
             )
-            if self._p1_normalization_allowed:
-                self._workspace_observations[scope.scope_key] = observation
-        if self._p1_normalization_allowed:
-            self._validate_workspace_observation_consistency()
-
-    def _validate_workspace_observation_consistency(self) -> None:
-        """Reject an inventory that changed while candidate evidence was read."""
-
-        root_identity: tuple[int, int] | None = None
-        identities: dict[tuple[str, ...], tuple[int, int]] = {}
-        missing_prefixes: set[tuple[str, ...]] = set()
-        for observation in self._workspace_observations.values():
-            if root_identity is None:
-                root_identity = observation.root_identity
-            elif observation.root_identity != root_identity:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace root changed during P1 observation"
-                )
-            for index, identity in enumerate(observation.component_identities):
-                prefix = observation.relative_parts[: index + 1]
-                if prefix in missing_prefixes or (
-                    prefix in identities and identities[prefix] != identity
-                ):
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace inventory changed during P1 observation"
-                    )
-                identities[prefix] = identity
-            if len(observation.component_identities) < len(
-                observation.relative_parts
-            ):
-                first_missing = observation.relative_parts[
-                    : len(observation.component_identities) + 1
-                ]
-                if first_missing in identities:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace inventory changed during P1 observation"
-                    )
-                missing_prefixes.add(first_missing)
-
-    def _observe_workspace(
-        self,
-        scope: AgentExecutionScope,
-        *,
-        allow_p1_compatibility: bool,
-    ) -> _WorkspaceObservation:
-        """Pure-read one scope and bind its directory identity for commit."""
-
-        relative = Path(scope.workspace_id)
-        parts = tuple(relative.parts)
-        root_fd = open_private_directory_fd(self._workspace_root)
-        current_fd = root_fd
-        identities: list[tuple[int, int]] = []
-        traversed = self._workspace_root
-        try:
-            root_info = os.fstat(root_fd)
-            current_payload = self._scope_marker_payload(scope)
-            for part in parts:
-                traversed = traversed / part
-                try:
-                    next_fd = open_private_child_directory_fd(current_fd, part)
-                except FileNotFoundError as exc:
-                    if not allow_p1_compatibility:
-                        raise sqlite3.DatabaseError(
-                            f"Agent workspace directory is missing: {traversed}"
-                        ) from exc
-                    return _WorkspaceObservation(
-                        scope_key=scope.scope_key,
-                        relative_parts=parts,
-                        root_identity=(root_info.st_dev, root_info.st_ino),
-                        component_identities=identities,
-                        current_payload=current_payload,
-                        marker_state="unmaterialized",
-                        marker_payload=None,
-                    )
-                except (OSError, UnsafePrivatePathError) as exc:
-                    raise sqlite3.DatabaseError(
-                        f"Agent workspace directory has unsafe metadata: {traversed}"
-                    ) from exc
-                if current_fd != root_fd:
-                    os.close(current_fd)
-                current_fd = next_fd
-                opened = os.fstat(current_fd)
-                identities.append((opened.st_dev, opened.st_ino))
-
-            marker = Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
-            payload, marker_identity = self._read_scope_marker_with_identity(
-                marker,
-                allow_missing=True,
-                directory_fd=current_fd,
-            )
-            current_matches = self._scope_marker_payload_matches(
-                payload,
-                current_payload,
-            )
-            if (
-                not current_matches
-                and not allow_p1_compatibility
-                and self._schema_writes_enabled
-                and payload is not None
-                and self._replay_pre_exchange_scope_marker(
-                    scope,
-                    marker,
-                    directory_fd=current_fd,
-                )
-            ):
-                payload, marker_identity = self._read_scope_marker_with_identity(
-                    marker,
-                    directory_fd=current_fd,
-                )
-                current_matches = self._scope_marker_payload_matches(
-                    payload,
-                    current_payload,
-                )
-            if current_matches:
-                marker_state = "current"
-                if self._schema_writes_enabled and not allow_p1_compatibility:
-                    self._cleanup_scope_marker_residue_from_marker(
-                        scope,
-                        marker,
-                        directory_fd=current_fd,
-                    )
-            elif allow_p1_compatibility and payload is None:
-                marker_state = "missing"
-            elif allow_p1_compatibility and payload == self._legacy_scope_marker_payload(
-                scope
-            ):
-                marker_state = "legacy-container"
-            elif allow_p1_compatibility and payload == self._logical_legacy_scope_marker_payload(
-                scope
-            ):
-                marker_state = "legacy-logical"
-            else:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace scope marker does not match the current baseline: "
-                    + scope.scope_key
-                )
-            return _WorkspaceObservation(
-                scope_key=scope.scope_key,
-                relative_parts=parts,
-                root_identity=(root_info.st_dev, root_info.st_ino),
-                component_identities=identities,
-                current_payload=current_payload,
-                marker_state=marker_state,
-                marker_payload=payload,
-                marker_identity=marker_identity,
-            )
-        finally:
-            if current_fd != root_fd:
-                os.close(current_fd)
-            os.close(root_fd)
+            self._require_scope_marker(scope)
 
     def _missing_current_runtime_aliases(self) -> list[tuple[str, str, str, int]]:
         rows = self.db.query(
@@ -396,102 +423,10 @@ class AgentScopeManager:
             for row in rows
         ]
 
-    def _commit_runtime_aliases(
-        self,
-        aliases: list[tuple[str, str, str, int]],
-    ) -> None:
-        """Deterministically materialize only a current-row-derived alias."""
-
-        if not aliases:
-            return
-        with self.db.transaction() as conn:
-            for scope_key, lifecycle_id, session_id, created_at in aliases:
-                current = conn.execute(
-                    """
-                    SELECT lifecycle_id, session_id, created_at
-                    FROM agent_runtime_scopes
-                    WHERE scope_key = ?
-                    """,
-                    (scope_key,),
-                ).fetchone()
-                if current is None or (
-                    str(current["lifecycle_id"]),
-                    str(current["session_id"]),
-                    int(current["created_at"]),
-                ) != (lifecycle_id, session_id, created_at):
-                    raise sqlite3.DatabaseError(
-                        "Agent Runtime current identity changed during alias normalization"
-                    )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO agent_runtime_scope_sessions(
-                        scope_key, lifecycle_id, session_id, created_at
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    (scope_key, lifecycle_id, session_id, created_at),
-                )
-                persisted = conn.execute(
-                    """
-                    SELECT created_at
-                    FROM agent_runtime_scope_sessions
-                    WHERE scope_key = ? AND lifecycle_id = ? AND session_id = ?
-                    """,
-                    (scope_key, lifecycle_id, session_id),
-                ).fetchone()
-                if persisted is None or int(persisted["created_at"]) != created_at:
-                    raise sqlite3.DatabaseError(
-                        "Agent Runtime alias conflicts with current identity"
-                    )
-
     def commit_schema_upgrade(self) -> None:
-        """Publish validated legacy markers after the generation commits."""
+        """Revalidate the current baseline before opening its write gate."""
 
         if self._schema_writes_enabled:
-            return
-        if not self._p1_normalization_allowed:
-            self.release_schema_write_gate_after_abort()
-            return
-        rows = self.db.query(_SCOPE_SELECT + " ORDER BY scopes.scope_key")
-        expected_count = int(self.db.scalar("SELECT COUNT(*) FROM agent_scopes") or 0)
-        if len(rows) != expected_count:
-            raise sqlite3.DatabaseError(
-                "Agent scope runtime identity is incomplete in the current baseline"
-            )
-        scopes = [self._from_row(row) for row in rows]
-        if {scope.scope_key for scope in scopes} != set(self._workspace_observations):
-            raise sqlite3.DatabaseError(
-                "Agent scope inventory changed during P1 workspace normalization"
-            )
-        for scope in scopes:
-            observation = self._workspace_observations[scope.scope_key]
-            self._commit_observed_p1_workspace(scope, observation)
-
-        current_missing_aliases = set(self._missing_current_runtime_aliases())
-        observed_missing_aliases = set(self._p1_missing_aliases)
-        if current_missing_aliases != observed_missing_aliases:
-            raise sqlite3.DatabaseError(
-                "Agent Runtime current alias state changed during P1 normalization"
-            )
-        self._commit_runtime_aliases(list(self._p1_missing_aliases))
-        self._p1_missing_aliases = ()
-        if self._missing_current_runtime_aliases():
-            raise sqlite3.DatabaseError(
-                "Agent Runtime current alias normalization is incomplete"
-            )
-        self._schema_writes_enabled = True
-        self._p1_normalization_allowed = False
-        self._workspace_observations.clear()
-
-    def release_schema_write_gate_after_abort(self) -> None:
-        """Reopen only a strictly-current candidate after a non-schema abort.
-
-        A P1-compatible candidate may have observed missing or legacy machine
-        state and therefore stays write-disabled until Manager stops it. A
-        normal same-generation reservation can resume only after repeating the
-        complete read-only current-schema validation.
-        """
-
-        if self._schema_writes_enabled or self._p1_normalization_allowed:
             return
         if self._missing_current_runtime_aliases():
             raise sqlite3.DatabaseError(
@@ -500,134 +435,17 @@ class AgentScopeManager:
         self._assert_scope_markers()
         self._schema_writes_enabled = True
 
-    def abort_requires_process_quiescence(self) -> bool:
-        """Return whether abort must leave this P1 candidate frozen."""
+    def release_schema_write_gate_after_abort(self) -> None:
+        """Reopen a candidate only after pure-read current-schema validation."""
 
-        return bool(self._p1_normalization_allowed and not self._schema_writes_enabled)
-
-    def _commit_observed_p1_workspace(
-        self,
-        scope: AgentExecutionScope,
-        observation: _WorkspaceObservation,
-    ) -> None:
-        """Commit one candidate-bound P1 observation without reclassification."""
-
-        if observation.relative_parts != tuple(Path(scope.workspace_id).parts):
-            raise sqlite3.DatabaseError(
-                "Agent scope workspace observation changed: " + scope.scope_key
-            )
-        if observation.current_payload != self._scope_marker_payload(scope):
-            raise sqlite3.DatabaseError(
-                "Agent scope runtime identity changed during P1 normalization: "
-                + scope.scope_key
-            )
-        self._commit_legacy_workspace(scope, observation=observation)
-
-    def _record_published_workspace_component(
-        self,
-        prefix: tuple[str, ...],
-        identity: tuple[int, int],
-    ) -> None:
-        """Advance every compatible observation sharing one published prefix."""
-
-        for observation in self._workspace_observations.values():
-            index = len(prefix) - 1
-            if observation.relative_parts[: len(prefix)] != prefix:
-                continue
-            if len(observation.component_identities) > index:
-                if observation.component_identities[index] != identity:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace inventory changed during P1 normalization"
-                    )
-            elif len(observation.component_identities) == index:
-                observation.component_identities.append(identity)
-
-    def _commit_observed_scope_marker(
-        self,
-        scope: AgentExecutionScope,
-        observation: _WorkspaceObservation,
-        *,
-        directory_fd: int,
-    ) -> None:
-        marker = Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
-        payload, marker_identity = self._read_scope_marker_with_identity(
-            marker,
-            allow_missing=True,
-            directory_fd=directory_fd,
-        )
-        current = self._scope_marker_payload(scope)
-        if (
-            observation.marker_identity is not None
-            and marker_identity != observation.marker_identity
-        ):
-            raise sqlite3.DatabaseError(
-                "Agent workspace scope marker identity changed during schema commit: "
-                + scope.scope_key
-            )
-        if observation.marker_state == "current":
-            if not self._scope_marker_payload_matches(payload, current):
-                raise sqlite3.DatabaseError(
-                    "Agent workspace current marker changed during schema commit: "
-                    + scope.scope_key
-                )
-            self._cleanup_scope_marker_residue_from_marker(
-                scope,
-                marker,
-                directory_fd=directory_fd,
-            )
+        if self._schema_writes_enabled:
             return
-        if observation.marker_state in {"unmaterialized", "missing"}:
-            if payload is not None:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace missing marker appeared during schema commit: "
-                    + scope.scope_key
-                )
-            try:
-                self._write_scope_marker(scope, directory_fd=directory_fd)
-            except PrivatePublicationCommittedError as exc:
-                observation.marker_state = "current"
-                observation.marker_payload = current
-                observation.marker_identity = exc.published_identity
-                raise sqlite3.DatabaseError(
-                    "Agent workspace scope marker publication was not durable: "
-                    + scope.scope_key
-                ) from exc
-        elif observation.marker_state in {"legacy-container", "legacy-logical"}:
-            if payload != observation.marker_payload:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace legacy marker changed during schema commit: "
-                    + scope.scope_key
-                )
-            try:
-                self._write_scope_marker(
-                    scope,
-                    expected_previous=observation.marker_payload,
-                    directory_fd=directory_fd,
-                )
-            except PrivatePublicationCommittedError as exc:
-                observation.marker_state = "current"
-                observation.marker_payload = current
-                observation.marker_identity = exc.published_identity
-                raise sqlite3.DatabaseError(
-                    "Agent workspace scope marker publication was not durable: "
-                    + scope.scope_key
-                ) from exc
-        else:
+        if self._missing_current_runtime_aliases():
             raise sqlite3.DatabaseError(
-                "Agent workspace marker observation is invalid: " + scope.scope_key
+                "Agent Runtime current alias is missing from the current baseline"
             )
-        committed_payload, committed_identity = self._read_scope_marker_with_identity(
-            marker,
-            directory_fd=directory_fd,
-        )
-        if not self._scope_marker_payload_matches(committed_payload, current):
-            raise sqlite3.DatabaseError(
-                "Agent workspace scope marker did not remain current after publication: "
-                + scope.scope_key
-            )
-        observation.marker_state = "current"
-        observation.marker_payload = current
-        observation.marker_identity = committed_identity
+        self._assert_scope_markers()
+        self._schema_writes_enabled = True
 
     def handoff_workspace_identity(self) -> str:
         """Pure-read, closed-world workspace identity for Manager handoff.
@@ -651,7 +469,8 @@ class AgentScopeManager:
             )
             scope = self._from_row(row)
             expected = self._scope_marker_payload(scope)
-            marker = Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
+            self._reject_other_profile_marker(None, scope)
+            marker = Path(scope.workspace_path) / self._scope_marker_name
             if not self._scope_marker_payload_matches(
                 self._read_scope_marker(marker), expected
             ):
@@ -703,168 +522,13 @@ class AgentScopeManager:
                 os.close(current_fd)
             os.close(root_fd)
 
-    def _commit_legacy_workspace(
-        self,
-        scope: AgentExecutionScope,
-        *,
-        observation: _WorkspaceObservation,
-    ) -> None:
-        """Commit one exact DB-backed P1 workspace through a pinned fd chain."""
-
-        relative = Path(scope.workspace_id)
-        if relative != Path(self._workspace_id(scope.scope_type, scope.scope_id)):
-            raise sqlite3.DatabaseError(
-                "Agent scope workspace does not match the current baseline: "
-                + scope.scope_key
-            )
-        descriptors = [open_private_directory_fd(self._workspace_root)]
-        staging_fd: int | None = None
-        links: list[tuple[int, str, int, tuple[int, int]]] = []
-        traversed = self._workspace_root
-        prefix: list[str] = []
-        try:
-            root_info = os.fstat(descriptors[0])
-            if (root_info.st_dev, root_info.st_ino) != observation.root_identity:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace root changed during schema commit: "
-                    + scope.scope_key
-                )
-            staging_fd = open_private_directory_fd(self._machine_staging_root)
-            for index, part in enumerate(relative.parts):
-                prefix.append(part)
-                prefix_key = tuple(prefix)
-                traversed = traversed / part
-                next_fd: int | None = None
-                try:
-                    parent_fd = descriptors[-1]
-                    expected_identity = (
-                        observation.component_identities[index]
-                        if index < len(observation.component_identities)
-                        else None
-                    )
-                    recovery_identity = (
-                        self._workspace_directory_empty_recovery.get(prefix_key)
-                    )
-                    if (
-                        recovery_identity is not None
-                        and expected_identity != recovery_identity
-                    ):
-                        raise sqlite3.DatabaseError(
-                            "Agent workspace directory recovery identity changed: "
-                            + str(traversed)
-                        )
-                    next_fd = ensure_private_child_directory_fd(
-                        parent_fd,
-                        part,
-                        staging_fd=staging_fd,
-                        staging_name=self._workspace_directory_staging_name(
-                            scope,
-                            tuple(prefix),
-                        ),
-                        expected_existing_identity=expected_identity,
-                        require_empty=recovery_identity is not None,
-                    )
-                    descriptors.append(next_fd)
-                    opened = verify_private_child_directory_fd(
-                        parent_fd,
-                        part,
-                        next_fd,
-                    )
-                    opened_identity = (opened.st_dev, opened.st_ino)
-                    if recovery_identity is not None:
-                        if opened_identity != recovery_identity:
-                            raise sqlite3.DatabaseError(
-                                "Agent workspace directory recovery identity changed: "
-                                + str(traversed)
-                            )
-                        del self._workspace_directory_empty_recovery[prefix_key]
-                except PrivatePublicationCommittedError as exc:
-                    # The rename effect is exact even though its durability
-                    # call failed. Preserve the first error, but advance every
-                    # observation sharing this prefix so the next commit retry
-                    # can reconcile the published inode instead of treating it
-                    # as an external creator.
-                    self._record_published_workspace_component(
-                        prefix_key,
-                        exc.published_identity,
-                    )
-                    if expected_identity is None or recovery_identity is not None:
-                        previous_recovery = (
-                            self._workspace_directory_empty_recovery.get(prefix_key)
-                        )
-                        if (
-                            previous_recovery is not None
-                            and previous_recovery != exc.published_identity
-                        ):
-                            raise sqlite3.DatabaseError(
-                                "Agent workspace directory recovery identity changed: "
-                                + str(traversed)
-                            ) from exc
-                        self._workspace_directory_empty_recovery[prefix_key] = (
-                            exc.published_identity
-                        )
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace directory publication was not durable: "
-                        + str(traversed)
-                    ) from exc
-                except (OSError, UnsafePrivatePathError) as exc:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace directory could not be committed safely: "
-                        + str(traversed)
-                    ) from exc
-                links.append(
-                    (
-                        parent_fd,
-                        part,
-                        next_fd,
-                        (opened.st_dev, opened.st_ino),
-                    )
-                )
-                if expected_identity is None:
-                    self._record_published_workspace_component(
-                        prefix_key,
-                        (opened.st_dev, opened.st_ino),
-                    )
-
-            # Marker publication uses the pinned leaf descriptor. Keeping every
-            # ancestor pinned and reproving the complete chain afterwards turns
-            # a concurrent rename/replace into a failed commit rather than
-            # silent adoption.
-            self._commit_observed_scope_marker(
-                scope,
-                observation,
-                directory_fd=descriptors[-1],
-            )
-            for parent_fd, part, child_fd, identity in links:
-                try:
-                    current = verify_private_child_directory_fd(
-                        parent_fd,
-                        part,
-                        child_fd,
-                    )
-                except (OSError, UnsafePrivatePathError) as exc:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace directory changed during schema commit: "
-                        + scope.scope_key
-                    ) from exc
-                if (current.st_dev, current.st_ino) != identity:
-                    raise sqlite3.DatabaseError(
-                        "Agent workspace directory changed during schema commit: "
-                        + scope.scope_key
-                    )
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
-            if staging_fd is not None:
-                os.close(staging_fd)
-
     def ensure_private_scope(self, user_id: int) -> AgentExecutionScope:
         uid = int(user_id)
         return self._ensure_scope(
             scope_key=self.private_scope_key(uid),
             scope_type="private",
             scope_id=str(uid),
-            default_session_id=f"ubitech-private-u{uid}",
+            default_session_id=self._private_session_prefix(uid),
         )
 
     def ensure_channel_scope(
@@ -872,7 +536,7 @@ class AgentScopeManager:
         channel_id: str | int,
     ) -> AgentExecutionScope:
         scope_id = str(channel_id)
-        default_session_id = f"ubitech-channel-{self._safe_channel_id(scope_id)}-main-agent"
+        default_session_id = self._channel_session_prefix(scope_id)
         return self._ensure_scope(
             scope_key=self.channel_scope_key(scope_id),
             scope_type="channel",
@@ -905,7 +569,6 @@ class AgentScopeManager:
             self._validate_existing_workspace(scope_type, scope_id)
             self._require_scope_marker(
                 cached,
-                allow_legacy_upgrade=False,
             )
             return cached
         if cached is not None:
@@ -922,7 +585,6 @@ class AgentScopeManager:
             self._validate_existing_workspace(scope_type, scope_id)
             self._require_scope_marker(
                 existing,
-                allow_legacy_upgrade=False,
             )
             with self._scope_cache_lock:
                 self._scope_cache[scope_key] = existing
@@ -1038,12 +700,11 @@ class AgentScopeManager:
         self._validate_existing_workspace(scope.scope_type, scope.scope_id)
         self._require_scope_marker(
             scope,
-            allow_legacy_upgrade=False,
         )
         if scope.scope_type == "private":
-            prefix = f"ubitech-private-u{int(scope.scope_id)}"
+            prefix = self._private_session_prefix(scope.scope_id)
         else:
-            prefix = f"ubitech-channel-{self._safe_channel_id(scope.scope_id)}-main-agent"
+            prefix = self._channel_session_prefix(scope.scope_id)
         session_id = f"{prefix}-{secrets.token_urlsafe(12)}"
         lifecycle_id = secrets.token_hex(16)
         ts = now_ts()
@@ -1085,7 +746,7 @@ class AgentScopeManager:
             # that the prepared new inode is abandoned and can be removed.
             self._cleanup_scope_marker_residue_from_marker(
                 scope,
-                Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME,
+                Path(scope.workspace_path) / self._scope_marker_name,
             )
             raise
         refreshed = self.get_scope(scope.scope_key)
@@ -1104,7 +765,8 @@ class AgentScopeManager:
         previous: AgentExecutionScope,
         planned: AgentExecutionScope,
     ) -> None:
-        marker = Path(previous.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
+        self._reject_other_profile_marker(None, previous)
+        marker = Path(previous.workspace_path) / self._scope_marker_name
         marker_fd = open_private_directory_fd(marker.parent)
         staging_fd: int | None = None
         try:
@@ -1217,7 +879,8 @@ class AgentScopeManager:
         expected_previous: dict[str, Any] | None = None,
         directory_fd: int | None = None,
     ) -> None:
-        marker = Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
+        self._reject_other_profile_marker(directory_fd, scope)
+        marker = Path(scope.workspace_path) / self._scope_marker_name
         encoded = self._encoded_scope_marker(scope)
         owns_directory_fd = directory_fd is None
         if directory_fd is None:
@@ -1281,11 +944,58 @@ class AgentScopeManager:
             if owns_directory_fd:
                 os.close(directory_fd)
 
-    @staticmethod
-    def _encoded_scope_marker(scope: AgentExecutionScope) -> bytes:
+    def _reject_other_profile_marker(
+        self,
+        directory_fd: int | None,
+        scope: AgentExecutionScope,
+    ) -> None:
+        owns_directory_fd = directory_fd is None
+        if directory_fd is None:
+            directory_fd = open_private_directory_fd(Path(scope.workspace_path))
+        try:
+            try:
+                os.stat(
+                    self._other_scope_marker_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace profile marker could not be inspected: "
+                    + scope.scope_key
+                ) from exc
+            else:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace contains another technical profile marker: "
+                    + scope.scope_key
+                )
+            try:
+                os.stat(
+                    self._other_workspace_internal_directory,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise sqlite3.DatabaseError(
+                    "Agent workspace profile directory could not be inspected: "
+                    + scope.scope_key
+                ) from exc
+            raise sqlite3.DatabaseError(
+                "Agent workspace contains another technical profile directory: "
+                + scope.scope_key
+            )
+        finally:
+            if owns_directory_fd:
+                os.close(directory_fd)
+
+    def _encoded_scope_marker(self, scope: AgentExecutionScope) -> bytes:
         return (
             json.dumps(
-                AgentScopeManager._scope_marker_payload(scope),
+                self._scope_marker_payload(scope),
                 ensure_ascii=False,
                 sort_keys=True,
             )
@@ -1305,18 +1015,6 @@ class AgentScopeManager:
             + hashlib.sha256(previous_raw).hexdigest()
             + "-"
             + hashlib.sha256(current_raw).hexdigest()
-            + ".stage"
-        )
-
-    @staticmethod
-    def _workspace_directory_staging_name(
-        scope: AgentExecutionScope,
-        prefix: tuple[str, ...],
-    ) -> str:
-        identity = scope.scope_key + "\x00" + "/".join(prefix)
-        return (
-            ".platform-workspace-directory-"
-            + hashlib.sha256(identity.encode("utf-8")).hexdigest()
             + ".stage"
         )
 
@@ -1529,14 +1227,9 @@ class AgentScopeManager:
             workspace_id=scope.workspace_id,
             sandbox_id=scope.sandbox_id,
         )
-        if self._scope_marker_payload_matches(
-            payload, self._scope_marker_payload(historical)
-        ):
-            return True
-        # P1 legacy marker normalization never changes lifecycle identity.
-        return lifecycle_id == scope.lifecycle_id and payload in (
-            self._legacy_scope_marker_payload(historical),
-            self._logical_legacy_scope_marker_payload(historical),
+        return self._scope_marker_payload_matches(
+            payload,
+            self._scope_marker_payload(historical),
         )
 
     def _authorized_future_scope_marker(
@@ -1574,55 +1267,20 @@ class AgentScopeManager:
             return False
         return actual == expected
 
-    @staticmethod
-    def _scope_marker_payload(scope: AgentExecutionScope) -> dict[str, Any]:
-        return {
-            "schema_version": _SCOPE_MARKER_SCHEMA_VERSION,
-            "kind": _SCOPE_MARKER_KIND,
-            "technical_profile": _SOURCE_TECHNICAL_PROFILE,
-            "scope_key": scope.scope_key,
-            "scope_type": scope.scope_type,
-            "scope_id": scope.scope_id,
-            "lifecycle_id": scope.lifecycle_id,
-            "sandbox_id": scope.sandbox_id,
-            "workspace_id": scope.workspace_id,
-            "workspace_relative_path": f"workspaces/{scope.workspace_id}",
-            "isolation": "container-workspace",
-        }
-
-    @staticmethod
-    def _legacy_scope_marker_payload(scope: AgentExecutionScope) -> dict[str, Any]:
-        return {
-            "scope_key": scope.scope_key,
-            "scope_type": scope.scope_type,
-            "scope_id": scope.scope_id,
-            "lifecycle_id": scope.lifecycle_id,
-            "sandbox_id": scope.sandbox_id,
-            "workspace_id": scope.workspace_id,
-            "isolation": "container-workspace",
-        }
-
-    @staticmethod
-    def _logical_legacy_scope_marker_payload(
-        scope: AgentExecutionScope,
-    ) -> dict[str, Any]:
-        return {
-            "scope_key": scope.scope_key,
-            "scope_type": scope.scope_type,
-            "scope_id": scope.scope_id,
-            "lifecycle_id": scope.lifecycle_id,
-            "execution_backend": "host",
-            "isolation": "logical",
-        }
+    def _scope_marker_payload(self, scope: AgentExecutionScope) -> dict[str, Any]:
+        return _scope_marker_payload_for_profile(
+            scope,
+            self._technical_profile.profile_id,
+        )
 
     def _require_scope_marker(
         self,
         scope: AgentExecutionScope,
         *,
-        allow_legacy_upgrade: bool,
         directory_fd: int | None = None,
     ) -> None:
-        marker = Path(scope.workspace_path) / _SOURCE_SCOPE_MARKER_NAME
+        self._reject_other_profile_marker(directory_fd, scope)
+        marker = Path(scope.workspace_path) / self._scope_marker_name
         payload = self._read_scope_marker(
             marker,
             allow_missing=True,
@@ -1639,10 +1297,10 @@ class AgentScopeManager:
                 )
             return
         # A committed current process may finish only the exact DB-new / marker-
-        # old session-rotation checkpoint. P1 missing and legacy marker shapes
-        # are admitted exclusively by candidate-time observations and never by
-        # an ordinary scope read after startup.
-        if not allow_legacy_upgrade and payload is not None:
+        # old session-rotation checkpoint. Candidate startup is pure read and
+        # therefore rejects the same half checkpoint until the current writer
+        # has converged it.
+        if self._schema_writes_enabled and payload is not None:
             if self._replay_pre_exchange_scope_marker(
                 scope,
                 marker,
@@ -1658,31 +1316,10 @@ class AgentScopeManager:
                     )
                 return
         if payload is None:
-            if not allow_legacy_upgrade:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace scope marker is missing from the current baseline: "
-                    + scope.scope_key
-                )
-            self._write_scope_marker(scope, directory_fd=directory_fd)
-            return
-        if (
-            payload == self._legacy_scope_marker_payload(scope)
-            or payload == self._logical_legacy_scope_marker_payload(scope)
-        ):
-            if not allow_legacy_upgrade:
-                raise sqlite3.DatabaseError(
-                    "Agent workspace scope marker does not match the current baseline: "
-                    + scope.scope_key
-                )
-            # The path was derived from the DB row and _expected_workspace has
-            # already proved every directory component. The legacy payload must
-            # match every identity field before it is replaced.
-            self._write_scope_marker(
-                scope,
-                expected_previous=payload,
-                directory_fd=directory_fd,
+            raise sqlite3.DatabaseError(
+                "Agent workspace scope marker is missing from the current baseline: "
+                + scope.scope_key
             )
-            return
         raise sqlite3.DatabaseError(
             "Agent workspace scope marker does not match the current baseline: "
             + scope.scope_key

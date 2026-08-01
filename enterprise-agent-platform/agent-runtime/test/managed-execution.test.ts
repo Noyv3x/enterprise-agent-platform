@@ -15,23 +15,25 @@ const MANAGER_TOKEN = "manager-executor-test-token";
 
 test("production configuration fails closed without Manager identity and forbids local fallback", () => {
   assert.throws(
-    () => loadConfig({ AGENT_RUNTIME_TOKEN: "runtime" }),
+    () => loadConfig({ AGENT_RUNTIME_TOKEN: "runtime", AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1" }),
     /Manager executor bearer token is required/,
   );
   assert.throws(
     () => loadConfig({
       AGENT_RUNTIME_TOKEN: "runtime",
       AGENT_RUNTIME_EXECUTOR_MODE: "local",
+      AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
       NODE_ENV: "production",
     }),
     /local execution fallback is disabled in production/,
   );
   const configured = loadConfig({
     AGENT_RUNTIME_TOKEN: "runtime",
+    AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     AGENT_MANAGER_EXECUTOR_TOKEN: MANAGER_TOKEN,
   });
   assert.equal(configured.executionMode, "manager");
-  assert.equal(configured.managerSocketPath, "/run/ubitech-agent/manager.sock");
+  assert.equal(configured.managerSocketPath, "/run/agent-platform-manager/manager.sock");
 });
 
 test("managed execution audit bindings exactly match Manager call projections", () => {

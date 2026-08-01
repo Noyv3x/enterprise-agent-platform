@@ -39,10 +39,11 @@ type invocationStartup struct {
 }
 
 type startupHandoffAuthority struct {
-	store  *handoff.Store
-	lease  *handoffstartup.AuthorityLease
-	mu     sync.Mutex
-	closed bool
+	store    *handoff.Store
+	lease    *handoffstartup.AuthorityLease
+	baseline func(context.Context) error
+	mu       sync.Mutex
+	closed   bool
 }
 
 func (authority *startupHandoffAuthority) Revalidate(ctx context.Context) error {
@@ -51,8 +52,14 @@ func (authority *startupHandoffAuthority) Revalidate(ctx context.Context) error 
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
-	if authority.closed || authority.store == nil || authority.lease == nil {
+	if authority.closed {
 		return errors.New("startup handoff authority is closed")
+	}
+	if authority.baseline != nil {
+		return authority.baseline(ctx)
+	}
+	if authority.store == nil || authority.lease == nil {
+		return errors.New("startup handoff authority is unavailable")
 	}
 	return authority.lease.Revalidate(ctx)
 }
@@ -63,8 +70,17 @@ func (authority *startupHandoffAuthority) Transfer(ctx context.Context) error {
 	}
 	authority.mu.Lock()
 	defer authority.mu.Unlock()
-	if authority.closed || authority.store == nil || authority.lease == nil {
+	if authority.closed {
 		return errors.New("startup handoff authority is closed")
+	}
+	if authority.baseline != nil {
+		if err := authority.baseline(ctx); err != nil {
+			return err
+		}
+		return authority.closeLocked()
+	}
+	if authority.store == nil || authority.lease == nil {
+		return errors.New("startup handoff authority is unavailable")
 	}
 	if err := authority.lease.Revalidate(ctx); err != nil {
 		return err
@@ -86,6 +102,12 @@ func (authority *startupHandoffAuthority) closeLocked() error {
 		return nil
 	}
 	authority.closed = true
+	if authority.baseline != nil {
+		return nil
+	}
+	if authority.lease == nil || authority.store == nil {
+		return errors.New("startup handoff authority is unavailable")
+	}
 	return errors.Join(authority.lease.Close(), authority.store.Close())
 }
 
@@ -361,12 +383,16 @@ func resolveInvocationStartupMode(ctx context.Context, transactionDirectory stri
 		// therefore take the explicit baseline route instead of failing before
 		// build can create the neutral handoff root.
 		if errors.Is(err, handoff.ErrNoJournals) || errors.Is(err, os.ErrNotExist) {
-			bootstrap, snapshot, loadErr := loadSourceBootstrapConfig(configPath, locator)
+			baselineActive, profileErr := identity.CompileTimeActiveProfile()
+			if profileErr != nil {
+				return invocationStartup{}, fmt.Errorf("select compiled baseline technical profile: %w", profileErr)
+			}
+			bootstrap, snapshot, loadErr := loadBaselineBootstrapConfig(baselineActive, configPath, locator)
 			if loadErr != nil {
 				return invocationStartup{}, loadErr
 			}
 			if bootstrap.StateHome != stateHome {
-				return invocationStartup{}, errors.New("full source config state_home differs from the startup routing snapshot")
+				return invocationStartup{}, errors.New("full baseline config state_home differs from the startup routing snapshot")
 			}
 			if err := verifyStartupConfigSnapshotStillBound(snapshot); err != nil {
 				return invocationStartup{}, err
@@ -378,13 +404,16 @@ func resolveInvocationStartupMode(ctx context.Context, transactionDirectory stri
 			result.configSnapshot = snapshot
 			result.configBound = true
 			result.stateHome = stateHome
-			paths, pathErr := sourceRuntimePaths(bootstrap)
+			paths, pathErr := baselineRuntimePaths(baselineActive, bootstrap)
 			if pathErr != nil {
 				return invocationStartup{}, pathErr
 			}
 			if requireStableProcess {
-				result.decision, err = handoffstartup.RouteBaselineSourcePaths(paths)
-			} else {
+				result.decision, err = handoffstartup.RouteCompileTimeBaselinePaths(paths)
+			} else if baselineActive == identity.SourceActiveProfile() {
+				// Bridge still has a writer capable of creating the one-time
+				// handoff journal. Retain its empty observation until the
+				// watchdog/recovery plan has acquired its own authority.
 				store, err = handoff.Open(handoffRoot, bootstrap.DataRoot, bootstrap.TargetDataRoot())
 				if err != nil {
 					return invocationStartup{}, fmt.Errorf("open baseline startup authority Store: %w", err)
@@ -400,11 +429,36 @@ func resolveInvocationStartupMode(ctx context.Context, transactionDirectory stri
 					_ = store.Close()
 				} else {
 					result.authority = &startupHandoffAuthority{store: store, lease: authorityLease}
-					if result.decision.ActiveProfile != identity.SourceActiveProfile() ||
+					if result.decision.ActiveProfile != baselineActive ||
 						!reflect.DeepEqual(result.decision.Paths, paths) || result.decision.TransactionID != "" {
 						_ = result.closeAuthority()
 						return invocationStartup{}, errors.New("a handoff journal appeared while baseline recovery authority was being routed")
 					}
+				}
+			} else {
+				// Cleanup/target-baseline contains no handoff writer. Its
+				// watchdog and recovery still revalidate the exact compiled
+				// target layout and absence of a journal, but must not create a
+				// source-shaped Store merely to hold a compatibility lease.
+				result.decision, err = handoffstartup.RouteCompileTimeBaselineAuthorityPaths(paths)
+				if err == nil {
+					expected := result.decision
+					result.authority = &startupHandoffAuthority{baseline: func(revalidate context.Context) error {
+						if err := revalidate.Err(); err != nil {
+							return err
+						}
+						if err := confirmNoTerminalHandoff(handoffRoot); err != nil {
+							return err
+						}
+						current, err := handoffstartup.RouteCompileTimeBaselineAuthorityPaths(paths)
+						if err != nil {
+							return err
+						}
+						if !reflect.DeepEqual(current, expected) {
+							return errors.New("compiled target baseline identity changed during authority transfer")
+						}
+						return nil
+					}}
 				}
 			}
 			if err != nil {
@@ -442,8 +496,10 @@ func resolveInvocationStartupMode(ctx context.Context, transactionDirectory stri
 	return result, nil
 }
 
-func loadSourceBootstrapConfig(path string, located startupConfigSnapshot) (config.Config, startupConfigSnapshot, error) {
-	active := identity.SourceActiveProfile()
+func loadBaselineBootstrapConfig(active identity.ActiveProfile, path string, located startupConfigSnapshot) (config.Config, startupConfigSnapshot, error) {
+	if err := active.Validate(); err != nil {
+		return config.Config{}, startupConfigSnapshot{}, err
+	}
 	if path == "" {
 		path = located.Path
 	}
@@ -451,11 +507,11 @@ func loadSourceBootstrapConfig(path string, located startupConfigSnapshot) (conf
 		return config.Config{}, startupConfigSnapshot{}, errors.New("startup config path must be canonical and absolute")
 	}
 	if located.Path != path {
-		return config.Config{}, startupConfigSnapshot{}, errors.New("source config path differs from the startup routing snapshot")
+		return config.Config{}, startupConfigSnapshot{}, errors.New("baseline config path differs from the startup routing snapshot")
 	}
 	value, err := config.LoadStartupSnapshot(active, path, located.Raw, located.Exists, located.StateHome)
 	if err != nil {
-		return config.Config{}, startupConfigSnapshot{}, fmt.Errorf("load startup config snapshot: %w", err)
+		return config.Config{}, startupConfigSnapshot{}, fmt.Errorf("load baseline startup config snapshot: %w", err)
 	}
 	return value, located, nil
 }
@@ -492,16 +548,16 @@ func verifyRoutedStartupDecision(ctx context.Context, startup invocationStartup,
 		var current handoffstartup.Decision
 		var err error
 		if requireStableProcess {
-			current, err = handoffstartup.RouteBaselineSourcePaths(paths)
+			current, err = handoffstartup.RouteCompileTimeBaselinePaths(paths)
 		} else {
 			return errors.New("non-stable baseline revalidation requires a retained handoff authority lease")
 		}
 		if err != nil {
-			return fmt.Errorf("reprove baseline source identity: %w", err)
+			return fmt.Errorf("reprove compiled baseline identity: %w", err)
 		}
 		if current.ActiveProfile != startup.activeProfile() || current.TransactionID != "" ||
 			!reflect.DeepEqual(current.Paths, startup.decision.Paths) {
-			return errors.New("baseline source identity changed after startup routing")
+			return errors.New("compiled baseline identity changed after startup routing")
 		}
 		return nil
 	}
@@ -547,17 +603,17 @@ func (startup invocationStartup) selectedStableBinary() string {
 	return paths.StableBinary
 }
 
-func sourceRuntimePaths(source config.Config) (handoffstartup.RuntimePaths, error) {
-	stable := managerInstallPath(identity.SourceActiveProfile())
+func baselineRuntimePaths(active identity.ActiveProfile, baseline config.Config) (handoffstartup.RuntimePaths, error) {
+	stable := managerInstallPath(active)
 	if stable == "" {
-		return handoffstartup.RuntimePaths{}, errors.New("resolve source stable Manager path")
+		return handoffstartup.RuntimePaths{}, errors.New("resolve baseline stable Manager path")
 	}
 	return handoffstartup.RuntimePaths{
 		StableBinary: stable,
-		ConfigPath:   source.ConfigPath,
-		DataRoot:     source.DataRoot,
-		StateRoot:    source.StateDir,
-		SocketPath:   source.SocketPath,
+		ConfigPath:   baseline.ConfigPath,
+		DataRoot:     baseline.DataRoot,
+		StateRoot:    baseline.StateDir,
+		SocketPath:   baseline.SocketPath,
 	}, nil
 }
 

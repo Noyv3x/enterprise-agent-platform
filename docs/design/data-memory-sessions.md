@@ -22,11 +22,13 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 ## Agent scope
 
-规范私人 scope 为 `private:<user-id>`，频道主 Agent scope 为 `channel:<channel-id>:main-agent`。scope 保存稳定的相对 workspace 标识和不可由模型覆盖的主 Agent sandbox identity；Runtime lifecycle 和 session 可以独立轮换。委派 scope 继承父 sandbox identity，不建立新的工作目录。当前架构只有 Sandbox 执行路径，因此数据库和 workspace marker 不保存可选择的执行后端字段。
+规范私人 scope 为 `private:<user-id>`，频道主 Agent scope 为 `channel:<channel-id>:main-agent`。`agent_scopes.lifecycle_id` 属于稳定 logical scope 元数据；`agent_runtime_scopes.lifecycle_id` 与 session 属于当前 conversation runtime，可以独立轮换，二者没有相等关系。scope 保存稳定的相对 workspace 标识和不可由模型覆盖的主 Agent sandbox identity；workspace marker 绑定 logical scope 的 key/type/id、sandbox/workspace identity 与当前 Runtime lifecycle，而不是 logical scope lifecycle。历史 Runtime lifecycle/session 由 alias 表保留，技术命名空间交接必须分别保留 logical scope lifecycle、当前 Runtime lifecycle 及全部 aliases。委派 scope 继承父 sandbox identity，不建立新的工作目录。当前架构只有 Sandbox 执行路径，因此数据库和 workspace marker 不保存可选择的执行后端字段。
 
-每个 workspace 写入 `.ubitech-agent-scope.json`，只记录 scope、lifecycle、sandbox identity、workspace identity 和固定隔离边界。字段集合必须精确匹配当前格式；多余或缺失字段触发受控重写，不能把已退役的状态维度继续带入新基线。数据库不得保存容器内或宿主绝对 workspace 路径；Platform 在自己的数据根解析相对标识，Manager 将同一目录映射为 Sandbox `/workspace`。当前基线发现绝对路径、越界相对路径或任何不等于 scope 规范 identity 的 workspace 标识时，启动和后续读取都必须明确拒绝，不能把旧绝对路径静默换算或改写为当前 identity。每次使用都重新检查路径组成与符号链接，缓存不得绕过。
+每个 workspace 写入 active technical profile 的 scope marker；Bridge source 使用 `.ubitech-agent-scope.json`，target 与唯一新基线使用 `.agent-platform-scope.json`。marker 只记录 scope、lifecycle、sandbox identity、workspace identity、`technical_profile` 和固定隔离边界，字段集合必须精确匹配当前 schema；多余、缺失或另一个 profile 的 marker失败关闭，不能把已退役的状态维度继续带入新基线。只有 Bridge transformer 可以把已验证 source marker 结构化转换为 target marker。数据库不得保存容器内或宿主绝对 workspace 路径；Platform 在自己的数据根解析相对标识，Manager 将同一目录映射为 Sandbox `/workspace`。当前基线发现绝对路径、越界相对路径或任何不等于 scope 规范 identity 的 workspace 标识时，启动和后续读取都必须明确拒绝，不能把旧绝对路径静默换算或改写为当前 identity。每次使用都重新检查路径组成与符号链接，缓存不得绕过。
 
-仅在发布契约精确证明唯一 P1 来源与当次 update reservation 时，source-owner 候选版才能将已登记但尚未物化的 workspace 归一化为规范相对目录。目录发布以候选观察的 device/inode 为身份；从 missing 状态 rename 得到的新目录在同进程重试时必须保持为空，而已观察且合法的共享非空前缀不得因一次耐久化失败被错误重分类为“必须为空”。只有完整目录耐久屏障与 identity 复验成功后，才能提交 marker/runtime alias 并释放 reservation；内容注入、identity 漂移或未知 residue 均保留证据并失败关闭。
+会话 ID 是持久 Runtime 引用，不是管理员品牌。Bridge 对 source 已存在的会话 ID 逐字保留，不能为了清理名称而改写历史会话、alias、消息 metadata 或 JSONL；target Platform 只对交接后新建或显式轮换的会话使用中性 `agent-platform-private-u<id>` 与 `agent-platform-channel-<id>-main-agent` 前缀。source Platform 继续只生成原 source 前缀。新 target 会话不得继续制造 source 技术名称，历史 source ID 也不得被“修复”为 target ID。
+
+当前 baseline 不接受已登记但尚未物化的 workspace。workspace 根、规范相对目录、marker 与 Runtime alias 必须在 Platform/Runtime 启动前完整存在并彼此一致；缺失、旧 marker、身份漂移或未知 residue 都失败关闭，普通更新不得创建、修复或推断这些对象。Bridge 只迁移已经通过该 current 规则的 workspace。
 
 停用账号保留私人 workspace、session 和 memory，以便重新启用。账号停用和产品消息隐藏都不隐式销毁这些持久上下文；需要重置时必须使用独立、显式的 lifecycle/session cleanup 语义。
 
@@ -88,6 +90,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 用户技能存放在 `agent-skills/<scope-hash>/`，scope key 不直接出现在路径中。每个包以 `SKILL.md` 为可移植主体，`.skill.json` 只保存平台生命周期状态；支持文件只能位于 `references`、`templates`、`scripts` 和 `assets`。
 
 仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
+
+bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用当前 target 内部目录 `.agent-platform/`，不能把 source `.ubitech/` 写进目标 Agent 的提示词。Bridge 的 source 数据变换负责复制并重命名既有 source 内部目录；target skill 本身不提供双路径回退，也不根据管理员品牌选择路径。
 
 每个 scope 还保存 owner-only、原子写入的 `.skill-usage.json`。状态以不可变 skill id 为键，记录 `created_by=user|agent`、使用/patch 次数和时间、`active|stale|archived`、pin 与归档时间。既有技能缺少状态时必须安全解释为 `user + active`，自动流程不能因此取得维护权。普通界面或前台 Run 创建的 Skill 都是 user-owned；只有通过可信 `agent_learning_review` context 创建的 Skill 才标记为 agent-owned，模型参数不能声明来源。
 

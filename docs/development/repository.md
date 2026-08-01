@@ -68,6 +68,10 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。一个可交付变更集应同时包含规范、实现、测试和必要生成产物，避免文档与代码跨提交长期漂移。代码域允许多重匹配；修改跨域文件时必须同步每个声明域，并由评审补充路径映射无法识别的真实语义域。
 
+开始实现时记录预期交付物、非目标、受影响域与大致变更规模。若实际受影响域或文件数超出预估两倍，或任务从组件变更演变为新协议、新迁移层或发布架构改造，必须在继续扩大变更前重新报告范围。发现的无关缺陷记入后续项，除非它直接阻断本交付物，不在当前变更中顺手扩展。
+
+`main` 的每次 push 都会触发完整 Quality、不可变容器构建和通道提升，因此只推送已完成、已通过本地全量门禁的垂直交付单元。调试提交、只有文档或只有实现的中间检查点可保留在本地分支，交付前收敛为一个可回滚单元；不得为获取 CI 反馈而连续向自动发布分支推送试错提交。
+
 不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器及其校验文件和全部镜像 digest。每个构建先保持 draft 并封印资产，只有持有 `container-channel-main` 全局锁的唯一 promotion evaluator 才能按直接前任关系公开它；其它 workflow 不得修改 release visibility 或 latest。普通 source-owner generation 通过质量门后可由 evaluator 自动提升，技术命名空间 bridge/cleanup generation 还必须分别通过唯一部署机的 Ed25519 签名回执门，具体契约只由[自动更新](../operations/auto-update.md)与 [`release-transition.json`](../contracts/release-transition.json)定义。
 
 `promotion.json` 是无环资产封印：它必须以排序后的闭世界目录绑定除自身外每个 release asset 的精确名称、SHA-256 和字节数，它自身则与其余资产一起由精确成功 `Publish atomic main release` run/attempt 的独立 Actions 出处证明绑定 GitHub release/asset ID、digest 和 size。证明生成器从 Container workflow 的 execution head 独立 checkout，不能依赖可能较旧且尚未包含当前证明协议的 built-source checkout；证明还分别绑定该 execution head、实际 source commit 以及经 API 重证的 Quality run/attempt，两种 head 不因 `workflow_run` 的 default-branch 语义而混为一谈。手工 dispatch 额外绑定输入 ref 和确定性 source 解析规则。重复发布同一 source commit 时必须逐项比较资产内容和 API identity，禁止 `--clobber`、重名、未知资产或封印后漂移。封印已上传但出处证明尚未上传的中断重试不改写 release，而是在完整复验后用新 run attempt 上传另一份精确证明。main 通道提升前必须从 release 重新下载并验证整个目录，验证上述出处证明，先证明或 create-only 建立指向 candidate commit 的同名 lightweight tag，以匿名 registry manifest 请求在可见性切换前后都重验 manifest 中全部受管镜像 digest，并复读 release ID、tag、target commit、draft/latest 和资产 ID/digest/size；任一公开前漂移都不得公开，公开后镜像后验失败则必须明确作为已可见事故报警。安装器只能使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。

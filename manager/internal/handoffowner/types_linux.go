@@ -234,6 +234,7 @@ type Coordinator struct {
 	store     *handoff.Store
 	host      HostDriver
 	listeners ListenerDriver
+	active    identity.ActiveProfile
 	source    identity.Profile
 	target    identity.Profile
 	channel   string

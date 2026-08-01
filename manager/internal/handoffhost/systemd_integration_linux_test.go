@@ -17,8 +17,8 @@ import (
 // systemd unit. It exercises the exact same persistent-unit boundary as
 // production and removes only the proof-bound unit it created.
 func TestPersistentHelperUserSystemdIntegration(t *testing.T) {
-	if os.Getenv("UBITECH_SYSTEMD_INTEGRATION") != "1" {
-		t.Skip("set UBITECH_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
+	if os.Getenv("AGENT_PLATFORM_SYSTEMD_INTEGRATION") != "1" {
+		t.Skip("set AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
 	}
 	if _, err := exec.LookPath("systemctl"); err != nil {
 		t.Fatal(err)
@@ -82,10 +82,33 @@ func main(){ c:=make(chan os.Signal,1); signal.Notify(c,syscall.SIGTERM,syscall.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := host.Inspect(ctx, result.Spec); err != nil {
+	first, err := host.Inspect(ctx, result.Spec)
+	if err != nil {
 		t.Fatal(err)
 	}
-	removed, err := host.Remove(ctx, RemovalRequest{Spec: result.Spec, ExpectedProof: result.Proof})
+	if output, err := exec.CommandContext(
+		ctx,
+		"systemctl", "--user", "kill", "--kill-whom=main", "--signal=SIGKILL", result.Spec.UnitName,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("kill persistent helper: %v: %s", err, output)
+	}
+	var restarted HelperProof
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		observed, inspectErr := host.Inspect(ctx, result.Spec)
+		if inspectErr == nil && observed.MainPID != first.MainPID {
+			restarted = observed
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if restarted.MainPID == 0 {
+		t.Fatal("persistent handoff helper did not restart with a new process after SIGKILL")
+	}
+	if restarted.BootID != first.BootID {
+		t.Fatal("process-only SIGKILL unexpectedly changed the host boot identity")
+	}
+	removed, err := host.Remove(ctx, RemovalRequest{Spec: result.Spec, ExpectedProof: restarted})
 	if err != nil {
 		t.Fatal(err)
 	}

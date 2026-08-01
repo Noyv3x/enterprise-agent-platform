@@ -308,6 +308,29 @@
       "targets": []
     },
     {
+      "id": "technical-profiles",
+      "source": "docs/contracts/technical-profiles.json",
+      "domains": [
+        "deployment",
+        "platform",
+        "agent-runtime"
+      ],
+      "targets": [
+        {
+          "path": "manager/internal/identity/technical_profiles_generated.go",
+          "format": "go-technical-profiles"
+        },
+        {
+          "path": "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py",
+          "format": "python-technical-profiles"
+        },
+        {
+          "path": "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts",
+          "format": "typescript-technical-profile"
+        }
+      ]
+    },
+    {
       "id": "runtime-policy",
       "source": "docs/contracts/runtime-policy.json",
       "domains": [

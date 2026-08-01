@@ -46,6 +46,7 @@ from enterprise_agent_platform.service import (
     agent_tool_detail,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
+from enterprise_agent_platform.technical_profile import TARGET_TECHNICAL_PROFILE
 
 
 class RecordingAgent:
@@ -613,6 +614,56 @@ def make_config(tmp: Path) -> PlatformConfig:
     return config
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_target_profile_writes_only_neutral_machine_setting_keys(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(
+                make_config(Path(td)),
+                technical_profile=TARGET_TECHNICAL_PROFILE,
+            )
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                rotated_secret = "target-session-secret-0123456789abcdef"
+                service.update_platform_security_config(
+                    admin,
+                    {"session_secret": rotated_secret},
+                )
+                service.update_telegram_admin_config(
+                    admin,
+                    {
+                        "bot_token": "123456:target-token",
+                        "webhook_secret": "target-webhook-secret",
+                    },
+                )
+
+                rows = {
+                    str(row["key"]): (
+                        str(row["value"]),
+                        int(row["secret"]),
+                    )
+                    for row in service.db.query(
+                        "SELECT key, value, secret FROM settings "
+                        "WHERE key LIKE 'AGENT_PLATFORM_%' "
+                        "OR key LIKE 'ENTERPRISE_%'"
+                    )
+                }
+                self.assertEqual(
+                    rows,
+                    {
+                        "AGENT_PLATFORM_SESSION_SECRET": (rotated_secret, 1),
+                        "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN": (
+                            "123456:target-token",
+                            1,
+                        ),
+                        "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET": (
+                            "target-webhook-secret",
+                            1,
+                        ),
+                    },
+                )
+            finally:
+                service.close()
+
     def test_agent_reply_events_use_a_cross_scope_user_visible_watermark(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -713,7 +764,6 @@ class PlatformServiceTests(unittest.TestCase):
                     "active_operation_id": "",
                     "finalize_pending_operation_id": "",
                     "operation_id": "",
-                    "workspace_schema_commit": None,
                     "gate_settlement": None,
                 }
             )

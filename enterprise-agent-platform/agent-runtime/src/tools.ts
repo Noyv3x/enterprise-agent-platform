@@ -1909,10 +1909,10 @@ function protectedReadPath(path: string): boolean {
 }
 
 function protectedManagerPath(path: string): boolean {
-  return /^(?:\/var\/run|\/run)\/ubitech-agent(?:\/|$)/.test(path)
-    || /^\/var\/lib\/ubitech-agent\/manager(?:\/|$)/.test(path)
-    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/ubitech-agent\/manager(?:\/|$)/.test(path)
-    || /^\/(?:root|home\/[^/]+)\/\.config\/ubitech-agent(?:\/|$)/.test(path);
+  return /^(?:\/var\/run|\/run)(?:\/user\/\d+)?\/agent-platform-manager(?:\/|$)/.test(path)
+    || /^\/var\/lib\/agent-platform\/manager(?:\/|$)/.test(path)
+    || /^\/(?:root|home\/[^/]+)\/\.local\/share\/agent-platform\/manager(?:\/|$)/.test(path)
+    || /^\/(?:root|home\/[^/]+)\/\.config\/agent-platform(?:\/|$)/.test(path);
 }
 
 export async function assertReadableTargetAllowed(target: string): Promise<void> {

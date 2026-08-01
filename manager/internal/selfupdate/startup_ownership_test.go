@@ -21,11 +21,14 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
-const startupPrepareProbeEnvironment = "UBITECH_STARTUP_PREPARE_PROBE"
+const (
+	startupPrepareProbeEnvironment        = "UBITECH_STARTUP_PREPARE_PROBE"
+	startupPrepareProbeVersionEnvironment = "AGENT_PLATFORM_STARTUP_PREPARE_PROBE_VERSION"
+)
 
 func TestMain(m *testing.M) {
 	if os.Getenv(startupPrepareProbeEnvironment) == "1" && len(os.Args) == 2 && os.Args[1] == "version" {
-		fmt.Println("startup-ownership-test-manager")
+		fmt.Println(os.Getenv(startupPrepareProbeVersionEnvironment))
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
@@ -358,6 +361,7 @@ func TestStartupOwnershipRealPrepareMarkRestartUsesImmutableMetadataFields(t *te
 	fixture.manager.Client = release.Client{HTTP: server.Client()}
 	fixture.manager.Now = func() time.Time { return manifest.GeneratedAt }
 	t.Setenv(startupPrepareProbeEnvironment, "1")
+	t.Setenv(startupPrepareProbeVersionEnvironment, commit)
 	if err := fixture.manager.Prepare(context.Background(), manifest); err != nil {
 		t.Fatalf("real Prepare: %v", err)
 	}
@@ -440,6 +444,7 @@ func TestStartupOwnershipRecoveredCurrentCanRestartAndOwnNextRealPrepare(t *test
 	defer server.Close()
 	fixture.manager.Client = release.Client{HTTP: server.Client()}
 	t.Setenv(startupPrepareProbeEnvironment, "1")
+	t.Setenv(startupPrepareProbeVersionEnvironment, nextCommit)
 	if err := fixture.manager.Prepare(context.Background(), manifest); err != nil {
 		t.Fatalf("real Prepare after recovered Current: %v", err)
 	}

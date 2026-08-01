@@ -41,9 +41,9 @@ Runtime 提供 terminal、process、read_file、write_file、patch_file、search
 
 terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。
 
-数据库中的 scope/runtime identity 可以在旧基线中早于第一次 Sandbox 执行存在。Runtime 不负责创建或修复对应宿主 workspace；A2 候选只有在旧 Manager 证明精确 P1 Current 与 active reservation，或新 Manager 从同一 P1→A2 unfinalized operation 派生精确 `workspace_schema_commit` 能力时，才能只读接受完全未物化的旧 scope，并由 Platform 的 commit-release 在准入冻结后补齐。除此之外，缺失 workspace 必须在 Runtime 接受 Run 之前失败关闭。
+Runtime 不创建、修复或推断宿主 workspace。每条 scope/runtime identity 对应的 workspace、当前 marker 与 alias 必须在接受 Run 前完整存在并匹配；任何未物化、缺失、旧格式或身份漂移都失败关闭，普通更新和恢复也没有放宽入口。
 
-用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件只使用 `/workspace/.ubitech/attachments/...` 逻辑路径，经 Manager 在当前 scope 的只读附件挂载中解析；Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
+用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件使用 active technical profile 的内部目录；target-only 路径为 `/workspace/.agent-platform/attachments/...`，Bridge source 路径仅在交接前为 `/workspace/.ubitech/attachments/...`。Manager 在当前 scope 的只读附件挂载中解析；Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
 
 模型可为单次 terminal、process 或文件调用显式选择 `target=host`。Sandbox 命令不等待人工审批；terminal、process 与文件工具的宿主目标都必须逐次取得用户批准，并且只提供本次批准或拒绝，不能创建 session/permanent 规则。批准后管理器以部署用户在宿主机执行，并允许该用户已有的免密 `sudo`。每次调用仍必须在执行前发出可见审计事件，包含未经隐藏的实际命令参数或 canonical 文件路径、目标、cwd 和超时；凭据只做安全脱敏。宿主执行不能复用为后续调用的隐式授权，也不能把 host 变为 Run 默认值。
 

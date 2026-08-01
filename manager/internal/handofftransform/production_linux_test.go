@@ -121,6 +121,12 @@ func TestProductionBoundaryStagesPublishesReplaysAndRestores(t *testing.T) {
 		t.Fatalf("target Compose control mount does not match participant socket: env=%q want=%q", environment, wantControl)
 	}
 	assertTargetDatabaseBaseline(t, filepath.Join(fixture.operation.Target.DataRoot, "data", "platform.db"))
+	if _, err := os.Lstat(filepath.Join(fixture.operation.Target.DataRoot, "data", ".agent-platform.lock")); err != nil {
+		t.Fatalf("target instance lock was not generated with the target identity: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.operation.Target.DataRoot, "data", ".enterprise-platform.lock")); !os.IsNotExist(err) {
+		t.Fatalf("source instance lock survived target transform: %v", err)
+	}
 	markerPath := filepath.Join(fixture.operation.Target.DataRoot, "data", "workspaces", "user-1", TargetWorkspaceMarkerName)
 	markerRaw, err := os.ReadFile(markerPath)
 	if err != nil || !strings.Contains(string(markerRaw), `"technical_profile":"agent-platform-v1"`) {
@@ -157,6 +163,34 @@ func TestProductionBoundaryStagesPublishesReplaysAndRestores(t *testing.T) {
 	}
 	if _, err := os.Lstat(fixture.operation.Source.DataRoot); err != nil {
 		t.Fatalf("source root changed during target rollback: %v", err)
+	}
+}
+
+func TestProductionBoundaryRejectsMixedPlatformSettingNamespaces(t *testing.T) {
+	fixture := newProductionFixture(t)
+	databasePath := filepath.Join(fixture.operation.Source.DataRoot, "data", "platform.db")
+	database, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec(
+		`INSERT INTO settings(key, value, secret, updated_at) VALUES (?, ?, 1, 101)`,
+		"AGENT_PLATFORM_SESSION_SECRET",
+		"source-session-secret",
+	); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = fixture.boundary.StageTarget(context.Background(), fixture.operation)
+	if err == nil || !strings.Contains(err.Error(), "target Platform setting key \"AGENT_PLATFORM_SESSION_SECRET\" already exists") {
+		t.Fatalf("mixed source/target setting namespace was accepted: %v", err)
+	}
+	if _, statErr := os.Lstat(fixture.operation.Target.DataRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("conflicting setting migration published a target root: %v", statErr)
 	}
 }
 
@@ -521,13 +555,20 @@ func createOverLimitIdentityDatabase(t *testing.T, overload string) string {
 		t.Fatal(err)
 	}
 	insertScope := func(index int) {
+		scopeKey := fmt.Sprintf("private:%05d", index)
 		_, err := transaction.Exec(
 			`INSERT INTO agent_scopes VALUES (?, 'private', ?, ?, ?, ?)`,
-			fmt.Sprintf("private:%05d", index), strconv.Itoa(index), fmt.Sprintf("life-%05d", index),
+			scopeKey, strconv.Itoa(index), fmt.Sprintf("scope-life-%05d", index),
 			fmt.Sprintf("sandbox-%05d", index), fmt.Sprintf("workspace-%05d", index),
 		)
 		if err != nil {
 			t.Fatalf("insert identity-limit scope: %v", err)
+		}
+		if _, err := transaction.Exec(
+			`INSERT INTO agent_runtime_scopes VALUES (?, ?, ?)`,
+			scopeKey, fmt.Sprintf("runtime-life-%05d", index), fmt.Sprintf("session-%05d", index),
+		); err != nil {
+			t.Fatalf("insert identity-limit current scope: %v", err)
 		}
 	}
 	switch overload {
@@ -538,17 +579,17 @@ func createOverLimitIdentityDatabase(t *testing.T, overload string) string {
 	case "aliases":
 		insertScope(0)
 		for index := 0; index <= contract.AgentRuntimeMaximumIdentityRecords; index++ {
-			if _, err := transaction.Exec(`INSERT INTO agent_runtime_scope_sessions VALUES ('private:00000', 'life-00000', ?)`, fmt.Sprintf("session-%05d", index)); err != nil {
+			if _, err := transaction.Exec(`INSERT INTO agent_runtime_scope_sessions VALUES ('private:00000', 'runtime-life-00000', ?)`, fmt.Sprintf("session-%05d", index)); err != nil {
 				t.Fatalf("insert identity-limit alias: %v", err)
 			}
 		}
 	case "current":
 		insertScope(0)
-		if _, err := transaction.Exec(`INSERT INTO agent_runtime_scope_sessions VALUES ('private:00000', 'life-00000', 'session-00000')`); err != nil {
+		if _, err := transaction.Exec(`INSERT INTO agent_runtime_scope_sessions VALUES ('private:00000', 'runtime-life-00000', 'session-00000')`); err != nil {
 			t.Fatal(err)
 		}
 		for index := 0; index <= contract.AgentRuntimeMaximumIdentityRecords; index++ {
-			if _, err := transaction.Exec(`INSERT INTO agent_runtime_scopes VALUES ('private:00000', 'life-00000', 'session-00000')`); err != nil {
+			if _, err := transaction.Exec(`INSERT INTO agent_runtime_scopes VALUES ('private:00000', 'runtime-life-00000', 'session-00000')`); err != nil {
 				t.Fatalf("insert identity-limit current scope: %v", err)
 			}
 		}
@@ -682,7 +723,7 @@ func assertFreshTargetManagerArtifacts(t *testing.T, fixture productionFixture) 
 
 func simulateTargetStartupMutations(t *testing.T, root string) {
 	t.Helper()
-	mustWrite(t, filepath.Join(root, "data", ".enterprise-platform.lock"), []byte("4321\n"), 0o600)
+	mustWrite(t, filepath.Join(root, "data", ".agent-platform.lock"), []byte("4321\n"), 0o600)
 	mustWrite(t, filepath.Join(root, "data", "platform.db-wal"), []byte("runtime wal bytes\n"), 0o600)
 	if err := os.Remove(filepath.Join(root, "data", "platform.db-shm")); err != nil {
 		t.Fatal(err)
@@ -715,13 +756,18 @@ func createProductionSource(t *testing.T, root string) {
 		`CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
 		`INSERT INTO schema_migrations(version, name) VALUES (` + strconv.Itoa(productionDatabaseVersion) + `, '` + SourceDatabaseBaselineName + `')`,
 		`CREATE TABLE agent_scopes (scope_key TEXT PRIMARY KEY, scope_type TEXT NOT NULL, scope_id TEXT NOT NULL, lifecycle_id TEXT NOT NULL, sandbox_id TEXT NOT NULL, workspace_path TEXT NOT NULL)`,
-		`INSERT INTO agent_scopes VALUES ('private:1', 'private', '1', 'life-1', 'sandbox-1', 'user-1')`,
+		`INSERT INTO agent_scopes VALUES ('private:1', 'private', '1', 'scope-life-1', 'sandbox-1', 'user-1')`,
 		`CREATE TABLE agent_runtime_scope_sessions (scope_key TEXT NOT NULL, lifecycle_id TEXT NOT NULL, session_id TEXT NOT NULL, PRIMARY KEY(scope_key, lifecycle_id, session_id))`,
-		`INSERT INTO agent_runtime_scope_sessions VALUES ('private:1', 'life-1', 'session-1')`,
+		`INSERT INTO agent_runtime_scope_sessions VALUES ('private:1', 'runtime-life-1', 'ubitech-private-u1')`,
 		`CREATE TABLE agent_runtime_scopes (scope_key TEXT PRIMARY KEY, lifecycle_id TEXT NOT NULL, session_id TEXT NOT NULL)`,
-		`INSERT INTO agent_runtime_scopes VALUES ('private:1', 'life-1', 'session-1')`,
+		`INSERT INTO agent_runtime_scopes VALUES ('private:1', 'runtime-life-1', 'ubitech-private-u1')`,
 		`CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT NOT NULL)`,
 		`INSERT INTO messages(body) VALUES ('user text containing ubitech-agent must remain unchanged')`,
+		`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, secret INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)`,
+		`INSERT INTO settings VALUES ('ENTERPRISE_SESSION_SECRET', 'source-session-secret', 1, 101)`,
+		`INSERT INTO settings VALUES ('ENTERPRISE_TELEGRAM_BOT_TOKEN', '123456:source-token', 1, 102)`,
+		`INSERT INTO settings VALUES ('ENTERPRISE_TELEGRAM_WEBHOOK_SECRET', 'source-webhook-secret', 1, 103)`,
+		`INSERT INTO settings VALUES ('user_custom_setting', 'user text ENTERPRISE_SESSION_SECRET must remain unchanged', 0, 104)`,
 	}
 	for _, statement := range statements {
 		if _, err := database.Exec(statement); err != nil {
@@ -742,7 +788,7 @@ func createProductionSource(t *testing.T, root string) {
 	mustMkdirAll(t, workspace, 0o700)
 	marker := workspaceMarker{
 		SchemaVersion: workspaceSchema, Kind: "agent-workspace-scope", TechnicalProfile: identity.SourceProfile().ProfileID,
-		ScopeKey: "private:1", ScopeType: "private", ScopeID: "1", LifecycleID: "life-1",
+		ScopeKey: "private:1", ScopeType: "private", ScopeID: "1", LifecycleID: "runtime-life-1",
 		SandboxID: "sandbox-1", WorkspaceID: "user-1", WorkspaceRelativePath: "workspaces/user-1", Isolation: "container-workspace",
 	}
 	markerRaw, _ := json.Marshal(marker)
@@ -903,15 +949,65 @@ func assertTargetDatabaseBaseline(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	var baseline, body string
+	var baseline, body, scopeLifecycle, runtimeLifecycle, currentSession, historicalSession string
 	if err := database.QueryRow(`SELECT name FROM schema_migrations WHERE version = ?`, productionDatabaseVersion).Scan(&baseline); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.QueryRow(`SELECT body FROM messages`).Scan(&body); err != nil {
 		t.Fatal(err)
 	}
-	if baseline != TargetDatabaseBaselineName || !strings.Contains(body, "ubitech-agent") {
-		t.Fatalf("database transform changed the wrong content: baseline=%q body=%q", baseline, body)
+	if err := database.QueryRow(`SELECT lifecycle_id FROM agent_scopes WHERE scope_key = 'private:1'`).Scan(&scopeLifecycle); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT lifecycle_id, session_id FROM agent_runtime_scopes WHERE scope_key = 'private:1'`).Scan(&runtimeLifecycle, &currentSession); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.QueryRow(`SELECT session_id FROM agent_runtime_scope_sessions WHERE scope_key = 'private:1' AND lifecycle_id = 'runtime-life-1'`).Scan(&historicalSession); err != nil {
+		t.Fatal(err)
+	}
+	if baseline != TargetDatabaseBaselineName || !strings.Contains(body, "ubitech-agent") ||
+		scopeLifecycle != "scope-life-1" || runtimeLifecycle != "runtime-life-1" ||
+		currentSession != "ubitech-private-u1" || historicalSession != "ubitech-private-u1" {
+		t.Fatalf(
+			"database transform changed content outside the baseline marker: baseline=%q body=%q scope_lifecycle=%q runtime_lifecycle=%q current_session=%q historical_session=%q",
+			baseline, body, scopeLifecycle, runtimeLifecycle, currentSession, historicalSession,
+		)
+	}
+	for source, target := range map[string]string{
+		"ENTERPRISE_SESSION_SECRET":          "AGENT_PLATFORM_SESSION_SECRET",
+		"ENTERPRISE_TELEGRAM_BOT_TOKEN":      "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN",
+		"ENTERPRISE_TELEGRAM_WEBHOOK_SECRET": "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET",
+	} {
+		var sourceCount int
+		if err := database.QueryRow(`SELECT COUNT(*) FROM settings WHERE key = ?`, source).Scan(&sourceCount); err != nil {
+			t.Fatal(err)
+		}
+		if sourceCount != 0 {
+			t.Fatalf("source Platform setting key %q survived target transform", source)
+		}
+		var value string
+		var secret, updatedAt int64
+		if err := database.QueryRow(`SELECT value, secret, updated_at FROM settings WHERE key = ?`, target).Scan(&value, &secret, &updatedAt); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]struct {
+			value     string
+			updatedAt int64
+		}{
+			"AGENT_PLATFORM_SESSION_SECRET":          {"source-session-secret", 101},
+			"AGENT_PLATFORM_TELEGRAM_BOT_TOKEN":      {"123456:source-token", 102},
+			"AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET": {"source-webhook-secret", 103},
+		}[target]
+		if value != want.value || secret != 1 || updatedAt != want.updatedAt {
+			t.Fatalf("target Platform setting %q changed payload: value=%q secret=%d updated_at=%d", target, value, secret, updatedAt)
+		}
+	}
+	var customValue string
+	if err := database.QueryRow(`SELECT value FROM settings WHERE key = 'user_custom_setting'`).Scan(&customValue); err != nil {
+		t.Fatal(err)
+	}
+	if customValue != "user text ENTERPRISE_SESSION_SECRET must remain unchanged" {
+		t.Fatalf("user-owned setting content was rewritten: %q", customValue)
 	}
 }
 

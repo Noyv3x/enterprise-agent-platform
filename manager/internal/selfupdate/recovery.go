@@ -147,7 +147,7 @@ func (m *Manager) RecoverCurrentWithAuthorityTransfer(
 		if journal.Phase == recoveryTakeoverCommitted {
 			return m.verifyCommittedRecovery(ctx, activationRequest, journal)
 		}
-		evidence, evidenceErr := readRecoveryFinalizeEvidence(platformStatePath, platformCommit)
+		evidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformStatePath, platformCommit)
 		if evidenceErr != nil {
 			return evidenceErr
 		}

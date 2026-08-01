@@ -15,7 +15,7 @@ class ContainerDataLayoutTests(unittest.TestCase):
         )
 
         self.assertIn(
-            "UBITECH_HOST_DATA_ROOT: ${UBITECH_DATA_ROOT:?UBITECH_DATA_ROOT must be set}",
+            "AGENT_PLATFORM_HOST_DATA_ROOT: ${AGENT_PLATFORM_DATA_ROOT:?AGENT_PLATFORM_DATA_ROOT must be set}",
             compose,
         )
 
@@ -28,7 +28,7 @@ class ContainerDataLayoutTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn(
-            "${UBITECH_DATA_ROOT}/data/runtimes/searxng/config:/etc/searxng:ro",
+            "${AGENT_PLATFORM_DATA_ROOT}/data/runtimes/searxng/config:/etc/searxng:ro",
             compose,
         )
         self.assertNotIn(
@@ -51,7 +51,7 @@ class ContainerDataLayoutTests(unittest.TestCase):
 
         mounts = set(
             re.findall(
-                r"\$\{UBITECH_DATA_ROOT\}/data/runtimes/firecrawl/([^:\s]+):([^:\s]+)",
+                r"\$\{AGENT_PLATFORM_DATA_ROOT\}/data/runtimes/firecrawl/([^:\s]+):([^:\s]+)",
                 compose,
             )
         )

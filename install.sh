@@ -2,13 +2,11 @@
 set -euo pipefail
 umask 077
 
-repository="${UBITECH_RELEASE_REPOSITORY:-Noyv3x/enterprise-agent-platform}"
+repository="Noyv3x/enterprise-agent-platform"
 default_manifest_url="https://github.com/${repository}/releases/latest/download/release.json"
-manifest_url="${UBITECH_RELEASE_MANIFEST_URL:-$default_manifest_url}"
-manager_url="${UBITECH_MANAGER_URL:-}"
-manager_checksum_url="${UBITECH_MANAGER_CHECKSUM_URL:-}"
-config_path="${XDG_CONFIG_HOME:-$HOME/.config}/ubitech-agent/manager.toml"
-data_root="${XDG_DATA_HOME:-$HOME/.local/share}/ubitech-agent"
+manifest_url="$default_manifest_url"
+config_path="${XDG_CONFIG_HOME:-$HOME/.config}/agent-platform/manager.toml"
+data_root="${XDG_DATA_HOME:-$HOME/.local/share}/agent-platform"
 listen="127.0.0.1:8080"
 assume_yes=0
 
@@ -18,10 +16,6 @@ Install the Agent Platform from the current container release channel.
 
 Usage: ./install.sh [options]
   --manifest-url URL          persistent release manifest URL
-  --manager-url URL           Manager binary URL
-  --manager-checksum-url URL  Manager SHA-256 sidecar URL
-  --config PATH               manager.toml destination
-  --data-root PATH            persistent data root
   --listen HOST:PORT          public Manager listener
   --yes                       do not prompt
   -h, --help                  show this help
@@ -34,10 +28,6 @@ EOF
 while (($#)); do
   case "$1" in
     --manifest-url) manifest_url="${2:?missing URL}"; shift 2 ;;
-    --manager-url) manager_url="${2:?missing URL}"; shift 2 ;;
-    --manager-checksum-url) manager_checksum_url="${2:?missing URL}"; shift 2 ;;
-    --config) config_path="${2:?missing path}"; shift 2 ;;
-    --data-root) data_root="${2:?missing path}"; shift 2 ;;
     --listen) listen="${2:?missing listener}"; shift 2 ;;
     --yes) assume_yes=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -45,7 +35,7 @@ while (($#)); do
   esac
 done
 
-for command in curl sha256sum install systemctl uname awk stat realpath id mktemp docker find grep rm rmdir; do
+for command in curl sha256sum install systemctl uname awk stat realpath id mktemp docker find grep rm rmdir python3 flock; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'required command is missing: %s\n' "$command" >&2
     exit 69
@@ -71,24 +61,15 @@ case "$(uname -m)" in
   *) printf 'unsupported architecture: %s\n' "$(uname -m)" >&2; exit 65 ;;
 esac
 
-asset="ubitech-manager-linux-${architecture}"
-if [[ -z "$manager_url" ]]; then
-  manager_url="https://github.com/${repository}/releases/latest/download/${asset}"
+asset="agent-platform-manager-linux-${architecture}"
+[[ "$manifest_url" == https://* ]] || {
+  printf 'release URL must use HTTPS: %s\n' "$manifest_url" >&2
+  exit 65
+}
+if [[ "$manifest_url" == *$'\n'* || "$manifest_url" == *$'\r'* || "$manifest_url" == *'"'* || "$manifest_url" == *"'"* || "$manifest_url" == *'\'* ]]; then
+  printf '%s\n' 'release URL contains unsupported characters' >&2
+  exit 65
 fi
-if [[ -z "$manager_checksum_url" ]]; then
-  manager_checksum_url="${manager_url}.sha256"
-fi
-
-for value in "$manifest_url" "$manager_url" "$manager_checksum_url"; do
-  [[ "$value" == https://* ]] || {
-    printf 'release URL must use HTTPS: %s\n' "$value" >&2
-    exit 65
-  }
-  if [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *'"'* || "$value" == *"'"* || "$value" == *'\'* ]]; then
-    printf '%s\n' 'release URL contains unsupported characters' >&2
-    exit 65
-  fi
-done
 
 if [[ ! "$listen" =~ ^(127\.0\.0\.1|0\.0\.0\.0|\[::1\]|\[::\]):([1-9][0-9]{0,4})$ ]] \
   || ((10#${BASH_REMATCH[2]:-0} > 65535)); then
@@ -109,39 +90,18 @@ done
 
 bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
 unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-stable_manager="$bin_dir/ubitech-manager"
-unit_path="$unit_dir/ubitech-agent-manager.service"
-socket_path="$data_root/manager/control/manager.sock"
+runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+stable_manager="$bin_dir/agent-platform-manager"
+unit_name="agent-platform-manager.service"
+unit_path="$unit_dir/$unit_name"
+socket_path="$runtime_root/agent-platform-manager/manager.sock"
 
-for path in "$bin_dir" "$unit_dir" "$stable_manager" "$unit_path" "$socket_path"; do
+for path in "$bin_dir" "$unit_dir" "$runtime_root" "$stable_manager" "$unit_path" "$socket_path"; do
   [[ "$path" == /* ]] || {
     printf 'installation path must be absolute: %s\n' "$path" >&2
     exit 65
   }
 done
-
-for path in "$config_path" "$stable_manager" "$unit_path" "$socket_path"; do
-  if [[ -e "$path" || -L "$path" || -S "$path" ]]; then
-    printf '%s\n' 'an Agent Platform installation already exists; use Manager update' >&2
-    exit 73
-  fi
-done
-
-data_root_preexisting=0
-if [[ -e "$data_root" || -L "$data_root" ]]; then
-  data_root_preexisting=1
-  ensure_data_root="$(realpath -m -s -- "$data_root")"
-  physical_data_root="$(realpath -m -- "$data_root")"
-  if [[ "$ensure_data_root" != "$physical_data_root" || -L "$data_root" || ! -d "$data_root" ]] \
-    || [[ "$(stat -c '%u' "$data_root")" != "$(id -u)" ]]; then
-    printf 'refusing an unsafe data root: %s\n' "$data_root" >&2
-    exit 73
-  fi
-  if find "$data_root" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-    printf '%s\n' 'the data root is not empty; fresh install never adopts existing data' >&2
-    exit 73
-  fi
-fi
 
 ensure_owner_directory() {
   local directory="$1" lexical physical mode existed=0
@@ -168,21 +128,14 @@ ensure_owner_directory() {
   fi
 }
 
-if ((assume_yes == 0)); then
-  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
-    printf '%s\n' 'interactive confirmation requires a controlling terminal; pass --yes for unattended installation' >&2
-    exit 64
-  fi
-  printf 'Install the Agent Platform for user %s? [y/N] ' "${USER:-$(id -un)}" >/dev/tty
-  read -r answer </dev/tty
-  [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]] || exit 0
-fi
-
 temporary="$(mktemp -d)"
 manager_activated=0
 manager_root_created=0
 stable_installed=0
 unit_installed=0
+installation_owned=0
+data_root_preexisting=0
+install_lock_fd=""
 config_incoming=""
 manager_incoming=""
 unit_incoming=""
@@ -190,9 +143,9 @@ created_directories=()
 cleanup() {
   local status=$? index
   trap - EXIT
-  if ((status != 0 && manager_activated == 0)); then
+  if ((status != 0 && manager_activated == 0 && installation_owned == 1)); then
     if ((unit_installed)); then
-      systemctl --user disable --now ubitech-agent-manager.service >/dev/null 2>&1 || true
+      systemctl --user disable --now "$unit_name" >/dev/null 2>&1 || true
       rm -f "$unit_path"
       systemctl --user daemon-reload >/dev/null 2>&1 || true
     fi
@@ -220,13 +173,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ensure_owner_directory "$bin_dir"
-ensure_owner_directory "$(dirname "$config_path")"
-ensure_owner_directory "$unit_dir"
-ensure_owner_directory "$data_root"
-manager_root_created=1
-ensure_owner_directory "$data_root/manager"
-
 download() {
   local output="$1" url="$2"
   curl --fail --location --proto '=https' --tlsv1.2 --retry 4 \
@@ -234,13 +180,188 @@ download() {
     --output "$output" "$url"
 }
 
-download "$temporary/$asset" "$manager_url"
-download "$temporary/$asset.sha256" "$manager_checksum_url"
-expected="$(awk 'NR == 1 { print $1 }' "$temporary/$asset.sha256")"
-[[ "$expected" =~ ^[0-9a-f]{64}$ ]] || {
-  printf '%s\n' 'Manager checksum sidecar is invalid' >&2
-  exit 65
+download "$temporary/release.json" "$manifest_url"
+mapfile -t manifest_artifact < <(python3 - "$temporary/release.json" "$architecture" <<'PY'
+import json
+import pathlib
+import re
+import sys
+import urllib.parse
+from datetime import datetime
+
+def closed(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate manifest key: {key}")
+        value[key] = item
+    return value
+
+try:
+    raw = pathlib.Path(sys.argv[1]).read_bytes()
+    if not raw or len(raw) > 1024 * 1024:
+        raise ValueError("release manifest has an invalid size")
+    manifest = json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=closed,
+    )
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    raise SystemExit(f"release manifest is invalid: {exc}")
+if not isinstance(manifest, dict):
+    raise SystemExit("release manifest must be an object")
+expected_top = {
+    "schema_version", "channel", "source_commit", "generated_at",
+    "protocol_version", "database_schema_version", "manager", "compose", "images",
 }
+if set(manifest) != expected_top:
+    if "namespace_handoff" in manifest:
+        raise SystemExit(
+            "fresh installation is unavailable during the one-time namespace handoff; "
+            "wait for the target-only baseline"
+        )
+    raise SystemExit("fresh install requires the closed target-only release manifest")
+if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 2 or type(manifest.get("protocol_version")) is not int or manifest["protocol_version"] != 2:
+    raise SystemExit(
+        "fresh installation requires manifest schema/protocol 2; "
+        "Bridge releases require an already-running predecessor"
+    )
+if type(manifest.get("channel")) is not str or manifest["channel"] != "main":
+    raise SystemExit("fresh install manifest channel must be main")
+if not isinstance(manifest.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
+    raise SystemExit("fresh install manifest source_commit is invalid")
+if not isinstance(manifest.get("generated_at"), str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", manifest["generated_at"]):
+    raise SystemExit("fresh install manifest generated_at is invalid")
+try:
+    datetime.fromisoformat(manifest["generated_at"].removesuffix("Z") + "+00:00")
+except ValueError as exc:
+    raise SystemExit("fresh install manifest generated_at is invalid") from exc
+if type(manifest.get("database_schema_version")) is not int or manifest["database_schema_version"] < 1:
+    raise SystemExit("fresh install manifest database schema is invalid")
+
+manager = manifest.get("manager")
+if not isinstance(manager, dict) or set(manager) != {"version", "artifacts"} or manager.get("version") != manifest["source_commit"]:
+    raise SystemExit("fresh install Manager release is invalid")
+artifacts = manager.get("artifacts")
+if not isinstance(artifacts, dict) or set(artifacts) != {"amd64", "arm64"}:
+    raise SystemExit("fresh install Manager artifacts must contain exactly amd64 and arm64")
+
+def artifact(value, label, basename):
+    if not isinstance(value, dict) or set(value) != {"url", "sha256"}:
+        raise SystemExit(f"{label} artifact is not a closed object")
+    url = value.get("url")
+    sha = value.get("sha256")
+    if not isinstance(url, str) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise SystemExit(f"{label} artifact identity is invalid")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise SystemExit(f"{label} artifact URL must be a credential-free HTTPS URL")
+    if pathlib.PurePosixPath(parsed.path).name != basename:
+        raise SystemExit(f"{label} artifact basename must be {basename}")
+    return url, sha
+
+architecture = sys.argv[2]
+manager_url, manager_sha = artifact(
+    artifacts.get(architecture),
+    f"Manager {architecture}",
+    f"agent-platform-manager-linux-{architecture}",
+)
+artifact(manifest.get("compose"), "Compose", "agent-platform-compose.yaml")
+
+expected_images = {
+    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+    "firecrawl-redis", "firecrawl-rabbitmq",
+}
+images = manifest.get("images")
+if not isinstance(images, dict) or set(images) != expected_images:
+    raise SystemExit("fresh install manifest does not contain the exact schema 2 image set")
+for name, reference in images.items():
+    if not isinstance(reference, str) or not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", reference):
+        raise SystemExit(f"fresh install image {name} is not immutable")
+
+print(manager_url)
+print(manager_sha)
+PY
+)
+if [[ "${#manifest_artifact[@]}" -ne 2 ]]; then
+  printf '%s\n' 'release manifest did not produce one bound Manager artifact' >&2
+  exit 65
+fi
+manager_url="${manifest_artifact[0]}"
+expected="${manifest_artifact[1]}"
+
+# Serialize the entire fresh-install ownership decision. The lock is acquired
+# only after the manifest has passed its closed-world validation, so a Bridge or
+# malformed release still creates no target installation path. The inode is
+# retained deliberately; unlinking a flock file creates a split-lock race.
+ensure_owner_directory "$runtime_root"
+install_lock="$runtime_root/agent-platform-install.lock"
+if [[ -L "$install_lock" || ( -e "$install_lock" && ! -f "$install_lock" ) ]]; then
+  printf '%s\n' 'refusing an unsafe fresh-install lock' >&2
+  exit 73
+fi
+if ! exec {install_lock_fd}<>"$install_lock"; then
+  printf '%s\n' 'cannot open the fresh-install lock' >&2
+  exit 73
+fi
+lock_path_identity="$(stat -c '%d:%i:%u:%a:%h' -- "$install_lock" 2>/dev/null || true)"
+lock_fd_identity="$(stat -Lc '%d:%i:%u:%a:%h' -- "/proc/$$/fd/$install_lock_fd" 2>/dev/null || true)"
+IFS=: read -r lock_device lock_inode lock_uid lock_mode lock_links <<<"$lock_path_identity"
+if [[ -L "$install_lock" || -z "$lock_path_identity" || "$lock_path_identity" != "$lock_fd_identity" \
+  || ! -f "$install_lock" || "$lock_uid" != "$(id -u)" || "$lock_links" != 1 \
+  || ! "$lock_mode" =~ ^[0-7]{3,4}$ ]] \
+  || (( (8#$lock_mode & 077) != 0 )); then
+  printf '%s\n' 'refusing an unsafe fresh-install lock' >&2
+  exit 73
+fi
+if ! flock -n "$install_lock_fd"; then
+  printf '%s\n' 'another Agent Platform installation is already running' >&2
+  exit 75
+fi
+
+for path in "$config_path" "$stable_manager" "$unit_path" "$socket_path"; do
+  if [[ -e "$path" || -L "$path" || -S "$path" ]]; then
+    printf '%s\n' 'an Agent Platform installation already exists; use Manager update' >&2
+    exit 73
+  fi
+done
+
+if [[ -e "$data_root" || -L "$data_root" ]]; then
+  data_root_preexisting=1
+  ensure_data_root="$(realpath -m -s -- "$data_root")"
+  physical_data_root="$(realpath -m -- "$data_root")"
+  if [[ "$ensure_data_root" != "$physical_data_root" || -L "$data_root" || ! -d "$data_root" ]] \
+    || [[ "$(stat -c '%u' "$data_root")" != "$(id -u)" ]]; then
+    printf 'refusing an unsafe data root: %s\n' "$data_root" >&2
+    exit 73
+  fi
+  if find "$data_root" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    printf '%s\n' 'the data root is not empty; fresh install never adopts existing data' >&2
+    exit 73
+  fi
+fi
+installation_owned=1
+
+if ((assume_yes == 0)); then
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    printf '%s\n' 'interactive confirmation requires a controlling terminal; pass --yes for unattended installation' >&2
+    exit 64
+  fi
+  printf 'Install the Agent Platform for user %s? [y/N] ' "${USER:-$(id -un)}" >/dev/tty
+  read -r answer </dev/tty
+  [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]] || exit 0
+fi
+
+ensure_owner_directory "$bin_dir"
+ensure_owner_directory "$(dirname "$config_path")"
+ensure_owner_directory "$unit_dir"
+ensure_owner_directory "$runtime_root"
+ensure_owner_directory "$(dirname "$socket_path")"
+ensure_owner_directory "$data_root"
+manager_root_created=1
+ensure_owner_directory "$data_root/manager"
+
+download "$temporary/$asset" "$manager_url"
 actual="$(sha256sum "$temporary/$asset" | awk '{ print $1 }')"
 [[ "$actual" == "$expected" ]] || {
   printf 'Manager checksum mismatch: expected %s, found %s\n' "$expected" "$actual" >&2
@@ -251,6 +372,7 @@ chmod 0700 "$temporary/$asset"
 config_incoming="$(mktemp "$(dirname "$config_path")/.manager.toml.XXXXXX")"
 cat > "$config_incoming" <<EOF
 data_root = "$data_root"
+socket_path = "$socket_path"
 listen = "$listen"
 release_manifest_url = "$manifest_url"
 release_channel = "main"
@@ -264,7 +386,7 @@ chmod 0600 "$config_incoming"
 mv -f "$config_incoming" "$config_path"
 config_incoming=""
 
-manager_incoming="$(mktemp "$bin_dir/.ubitech-manager.XXXXXX")"
+manager_incoming="$(mktemp "$bin_dir/.agent-platform-manager.XXXXXX")"
 install -m 0755 "$temporary/$asset" "$manager_incoming"
 [[ "$(sha256sum "$manager_incoming" | awk '{ print $1 }')" == "$expected" ]] || {
   rm -f "$manager_incoming"
@@ -277,7 +399,7 @@ stable_installed=1
 
 "$stable_manager" preflight --config "$config_path"
 
-unit_incoming="$(mktemp "$unit_dir/.ubitech-agent-manager.service.XXXXXX")"
+unit_incoming="$(mktemp "$unit_dir/.agent-platform-manager.service.XXXXXX")"
 cat > "$unit_incoming" <<EOF
 [Unit]
 Description=Agent Platform Manager
@@ -302,7 +424,7 @@ unit_incoming=""
 unit_installed=1
 
 systemctl --user daemon-reload
-systemctl --user enable --now ubitech-agent-manager.service
+systemctl --user enable --now "$unit_name"
 manager_activated=1
 if "$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"; then
   :

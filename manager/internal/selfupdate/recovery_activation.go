@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
@@ -75,7 +76,7 @@ func (m *Manager) recoverCurrentActivation(ctx context.Context, request recovery
 		return err
 	}
 
-	evidence, err := readRecoveryFinalizeEvidence(request.platformStatePath, request.platformCommit)
+	evidence, err := readRecoveryFinalizeEvidence(m.Profile, request.platformStatePath, request.platformCommit)
 	if err != nil {
 		return err
 	}
@@ -115,7 +116,7 @@ func (m *Manager) recoverCurrentActivation(ctx context.Context, request recovery
 
 	// Stopping an active watchdog is a synchronization boundary, not proof that
 	// its final write lost the race. Re-read and classify the durable state.
-	latestEvidence, err := readRecoveryFinalizeEvidence(request.platformStatePath, request.platformCommit)
+	latestEvidence, err := readRecoveryFinalizeEvidence(m.Profile, request.platformStatePath, request.platformCommit)
 	if err != nil {
 		return fmt.Errorf("revalidate Platform finalize state after quiescing Manager: %w", err)
 	}
@@ -178,7 +179,10 @@ func (r recoveryActivationRequest) stateData() []byte {
 	return r.originalStateData
 }
 
-func readRecoveryFinalizeEvidence(path, expectedCommit string) (recoveryFinalizeEvidence, error) {
+func readRecoveryFinalizeEvidence(active identity.ActiveProfile, path, expectedCommit string) (recoveryFinalizeEvidence, error) {
+	if err := active.Validate(); err != nil {
+		return recoveryFinalizeEvidence{}, fmt.Errorf("validate recovery technical profile: %w", err)
+	}
 	var evidence recoveryFinalizeEvidence
 	data, _, err := readRecoveryRegularFile(path, recoveryMaxJSONBytes, true)
 	if err != nil {
@@ -227,7 +231,7 @@ func readRecoveryFinalizeEvidence(path, expectedCommit string) (recoveryFinalize
 	}
 	manifest := evidence.manifest
 	_, artifactOK := manifest.Manager.Artifacts[runtime.GOARCH]
-	if manifest.Validate(manifest.Channel, "linux", runtime.GOARCH) != nil || manifest.SourceCommit != expectedCommit || manifest.Manager.Version == "" || !artifactOK ||
+	if validateSelfUpdateManifest(active, manifest) != nil || manifest.SourceCommit != expectedCommit || manifest.Manager.Version == "" || !artifactOK ||
 		manifest.DatabaseSchemaVersion != state.Current.DatabaseVersion || !reflect.DeepEqual(manifest.Images, state.Current.Images) {
 		return evidence, errors.New("Platform Current release manifest does not match the committed generation")
 	}
@@ -237,6 +241,13 @@ func readRecoveryFinalizeEvidence(path, expectedCommit string) (recoveryFinalize
 	evidence.operationPath = operationPath
 	evidence.manifestPath = manifestPath
 	return evidence, nil
+}
+
+func validateSelfUpdateManifest(active identity.ActiveProfile, manifest release.Manifest) error {
+	if err := active.Validate(); err != nil {
+		return fmt.Errorf("validate self-update technical profile: %w", err)
+	}
+	return manifest.ValidateForProfile(manifest.Channel, "linux", runtime.GOARCH, active)
 }
 
 func sameRecoveryFinalize(left, right recoveryFinalizeEvidence) bool {

@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
@@ -87,19 +86,18 @@ type reservationReleaseUncertainError struct{ cause error }
 func (e *reservationReleaseUncertainError) Error() string { return e.cause.Error() }
 func (e *reservationReleaseUncertainError) Unwrap() error { return e.cause }
 
-type retainedGenerationSlot string
-
-const (
-	retainedGenerationCurrent  retainedGenerationSlot = "current"
-	retainedGenerationPrevious retainedGenerationSlot = "previous"
-)
-
-// retainedSourceAbortGate is deliberately narrower than Gate. Only the source
-// profile's exact, locally retained public predecessor may opt into the one
-// legacy endpoint needed to abort its reservation. Ordinary fakes, target
-// Managers, remote manifests and future generations never acquire this method.
-type retainedSourceAbortGate interface {
-	releaseRetainedSourcePredecessor(context.Context, string, string) error
+func (o *Orchestrator) releaseProfile() identity.ActiveProfile {
+	if o.TechnicalProfile.Validate() == nil {
+		return o.TechnicalProfile
+	}
+	// Production application assembly always injects the routed profile. A
+	// focused helper that omitted it may use only the canonical compile-time
+	// stage; it cannot silently fall back to source in a target-only build.
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return identity.ActiveProfile{}
+	}
+	return active
 }
 
 func (o *Orchestrator) Preflight(ctx context.Context) error {
@@ -117,7 +115,7 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	if url == "" {
 		url = o.ManifestURL
 	}
-	manifest, data, err := o.ReleaseClient.Fetch(ctx, url, o.Channel)
+	manifest, data, err := o.ReleaseClient.FetchForProfile(ctx, url, o.Channel, o.releaseProfile())
 	if err != nil {
 		return release.Manifest{}, err
 	}
@@ -392,7 +390,7 @@ func (o *Orchestrator) recoverFinalize(ctx context.Context, state model.ManagerS
 	if state.Current == nil || state.Current.ManifestPath == "" || op.TargetGeneration != state.Current.ID {
 		return errors.New("pending finalize generation does not match current generation")
 	}
-	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
+	manifest, err := o.loadStateManifest(state.Current)
 	if err != nil {
 		return err
 	}
@@ -453,7 +451,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	var data []byte
 	var err error
 	for {
-		manifest, data, err = o.ReleaseClient.Fetch(ctx, url, o.Channel)
+		manifest, data, err = o.ReleaseClient.FetchForProfile(ctx, url, o.Channel, o.releaseProfile())
 		if err == nil {
 			break
 		}
@@ -764,15 +762,6 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 		if watchdogCommitted {
 			action = model.GateSettlementCommit
 		}
-		if action == model.GateSettlementAbort && op.Kind == model.OperationUpdate &&
-			stateBefore.Previous != nil &&
-			stateBefore.Previous.ID == contract.SourceOwnerCompatGeneration &&
-			stateBefore.Previous.SourceCommit == contract.SourceOwnerCompatGeneration {
-			return o.finalizeFailure(
-				"P1 workspace normalization requires a committed Manager activation",
-				errors.New("watchdog did not authorize the machine-schema commit Gate"),
-			)
-		}
 		releaseErr := o.settleGate(ctx, op.ID, op.Kind, action)
 		if releaseErr != nil {
 			return o.finalizeFailure("update reservation release is pending", releaseErr)
@@ -967,7 +956,7 @@ func (o *Orchestrator) runRestart(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("there is no current generation"))
 		return
 	}
-	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
+	manifest, err := o.loadStateManifest(state.Current)
 	if err != nil {
 		o.failBeforeMaintenance(op, err)
 		return
@@ -1036,7 +1025,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("there is no previous generation"))
 		return
 	}
-	manifest, err := o.loadStateManifest(state.Previous, retainedGenerationPrevious)
+	manifest, err := o.loadStateManifest(state.Previous)
 	if err != nil {
 		o.failBeforeMaintenance(op, err)
 		return
@@ -1148,7 +1137,7 @@ func (o *Orchestrator) runRepair(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, errors.New("no current generation is available for repair"))
 		return
 	}
-	manifest, err := o.loadStateManifest(state.Current, retainedGenerationCurrent)
+	manifest, err := o.loadStateManifest(state.Current)
 	if err == nil {
 		_, err = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 			value.TargetGeneration = state.Current.ID
@@ -1788,7 +1777,7 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 	state := o.Store.State()
 	if readErr == nil && state.Current != nil {
 		var previous release.Manifest
-		previous, readErr = o.loadStateManifest(state.Current, retainedGenerationCurrent)
+		previous, readErr = o.loadStateManifest(state.Current)
 		if readErr == nil {
 			_ = o.Engine.StopFixed(ctx)
 			readErr = o.Engine.StartFixed(ctx, previous)
@@ -2005,51 +1994,25 @@ func (o *Orchestrator) loadManifest(path string) (release.Manifest, error) {
 	if err := atomicfile.ReadJSON(path, &value); err != nil {
 		return value, err
 	}
-	if err := value.Validate(o.Channel, runtime.GOOS, runtime.GOARCH); err != nil {
+	if err := value.ValidateForProfile(o.Channel, runtime.GOOS, runtime.GOARCH, o.releaseProfile()); err != nil {
 		return value, err
 	}
 	return value, nil
 }
 
-// loadStateManifest keeps the current parser strict for every normal retained
-// generation. The compatibility reader is reached only after strict validation
-// fails and independently proves the exact source-profile Current/Previous P1
-// bytes and path fixed by the release-transition contract.
-func (o *Orchestrator) loadStateManifest(generation *model.Generation, slot retainedGenerationSlot) (release.Manifest, error) {
+// loadStateManifest accepts only the active profile's supported manifest
+// schemas. Bridge target binaries do not retain the A2/P1 compatibility reader;
+// source recovery belongs to the already-published source owner and its bundle.
+func (o *Orchestrator) loadStateManifest(generation *model.Generation) (release.Manifest, error) {
 	if generation == nil {
 		return release.Manifest{}, errors.New("retained generation is absent")
 	}
-	manifest, strictErr := o.loadManifest(generation.ManifestPath)
-	if strictErr == nil {
-		return manifest, nil
-	}
-	manifest, compatibilityErr := o.loadRetainedSourceCompatibility(generation, slot)
-	if compatibilityErr == nil {
-		return manifest, nil
-	}
-	return release.Manifest{}, errors.Join(
-		strictErr,
-		fmt.Errorf("retained source predecessor compatibility rejected: %w", compatibilityErr),
-	)
+	return o.loadManifest(generation.ManifestPath)
 }
 
-// releaseGate performs the normal abort first in all cases. HTTPGate is allowed
-// to try the historical endpoint only when this process can still prove that
-// the authoritative Current is the exact canonical source predecessor.
 func (o *Orchestrator) releaseGate(ctx context.Context, gate Gate, operationID string) error {
 	if gate == nil {
 		return errors.New("platform admission gate is not configured for release")
-	}
-	if o.Store == nil {
-		return gate.Release(ctx, operationID)
-	}
-	state := o.Store.State()
-	if state.Current != nil {
-		if _, err := o.loadRetainedSourceCompatibility(state.Current, retainedGenerationCurrent); err == nil {
-			if compatibilityGate, ok := gate.(retainedSourceAbortGate); ok {
-				return compatibilityGate.releaseRetainedSourcePredecessor(ctx, operationID, state.Current.ID)
-			}
-		}
 	}
 	return gate.Release(ctx, operationID)
 }

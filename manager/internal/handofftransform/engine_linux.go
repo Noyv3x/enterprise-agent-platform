@@ -359,9 +359,9 @@ func (e Engine) stageStructuredInput(ctx context.Context, prepared preparedReque
 }
 
 func (e Engine) verifyFinalResources(ctx context.Context, prepared preparedRequest, sourceBefore map[string][]Entry, manifests []ResourceManifest) error {
-	manifestByName := make(map[string]ResourceManifest, len(manifests))
-	for _, manifest := range manifests {
-		manifestByName[manifest.Name] = manifest
+	manifestByName, err := indexExactManifestResources(prepared.resources, manifests)
+	if err != nil {
+		return err
 	}
 	for _, resource := range prepared.resources {
 		if err := ctx.Err(); err != nil {
@@ -477,8 +477,8 @@ func (e Engine) Publish(ctx context.Context, request Request) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
-	if err := os.Rename(result.StagingRoot, request.TargetRoot); err != nil {
-		return Result{}, fmt.Errorf("publish handoff target root: %w", err)
+	if err := renameNoReplace(result.StagingRoot, request.TargetRoot); err != nil {
+		return Result{}, fmt.Errorf("publish handoff target root without replacement: %w", err)
 	}
 	if err := syncDirectory(filepath.Dir(request.TargetRoot)); err != nil {
 		return Result{}, fmt.Errorf("sync published handoff target parent: %w", err)
@@ -556,16 +556,16 @@ func (e Engine) verifyRemovablePublishedRoot(ctx context.Context, prepared prepa
 	if manifest.SchemaVersion != ManifestSchema || manifest.TransactionID != prepared.request.TransactionID ||
 		manifest.SourceRoot != prepared.request.SourceRoot || manifest.TargetRoot != prepared.request.TargetRoot ||
 		manifest.SourceProfile != prepared.mapping.Source.ProfileID || manifest.TargetProfile != prepared.mapping.Target.ProfileID ||
-		manifest.CreatedAt.IsZero() || len(manifest.Resources) != len(prepared.resources) {
+		manifest.CreatedAt.IsZero() {
 		return errors.New("handoff publication manifest identity is invalid for rollback")
 	}
-	resources := make(map[string]Resource, len(prepared.resources))
-	for _, resource := range prepared.resources {
-		resources[resource.Name] = resource
+	manifestByName, err := indexExactManifestResources(prepared.resources, manifest.Resources)
+	if err != nil {
+		return err
 	}
-	for _, evidence := range manifest.Resources {
-		resource, exists := resources[evidence.Name]
-		if !exists || evidence.Kind != resource.Kind || evidence.Access != resource.Access || evidence.PrivilegedImage != resource.PrivilegedImage || evidence.Source != resource.Source || evidence.Target != resource.Target ||
+	for _, resource := range prepared.resources {
+		evidence := manifestByName[resource.Name]
+		if evidence.Kind != resource.Kind || evidence.Access != resource.Access || evidence.PrivilegedImage != resource.PrivilegedImage || evidence.Source != resource.Source || evidence.Target != resource.Target ||
 			evidence.SchemaIdentifier != resource.SchemaIdentifier || evidence.SchemaVersion != resource.SchemaVersion {
 			return fmt.Errorf("handoff rollback resource %q has an invalid manifest binding", evidence.Name)
 		}
@@ -584,10 +584,6 @@ func (e Engine) verifyRemovablePublishedRoot(ctx context.Context, prepared prepa
 		default:
 			return fmt.Errorf("handoff rollback resource %q lacks original validation evidence", evidence.Name)
 		}
-		delete(resources, evidence.Name)
-	}
-	if len(resources) != 0 {
-		return errors.New("handoff rollback manifest omits one or more request resources")
 	}
 	return nil
 }
@@ -624,16 +620,13 @@ func (e Engine) verifyPublishedRoot(ctx context.Context, prepared preparedReques
 		manifest.SourceProfile != prepared.mapping.Source.ProfileID || manifest.TargetProfile != prepared.mapping.Target.ProfileID {
 		return Result{}, errors.New("handoff publication manifest identity is invalid")
 	}
-	if len(manifest.Resources) != len(prepared.resources) {
-		return Result{}, errors.New("handoff publication manifest resource count is invalid")
+	manifestByName, err := indexExactManifestResources(prepared.resources, manifest.Resources)
+	if err != nil {
+		return Result{}, err
 	}
-	resources := make(map[string]Resource, len(prepared.resources))
 	for _, resource := range prepared.resources {
-		resources[resource.Name] = resource
-	}
-	for _, evidence := range manifest.Resources {
-		resource, exists := resources[evidence.Name]
-		if !exists || evidence.Kind != resource.Kind || evidence.Access != resource.Access || evidence.PrivilegedImage != resource.PrivilegedImage || evidence.Source != resource.Source || evidence.Target != resource.Target ||
+		evidence := manifestByName[resource.Name]
+		if evidence.Kind != resource.Kind || evidence.Access != resource.Access || evidence.PrivilegedImage != resource.PrivilegedImage || evidence.Source != resource.Source || evidence.Target != resource.Target ||
 			evidence.SchemaIdentifier != resource.SchemaIdentifier || evidence.SchemaVersion != resource.SchemaVersion {
 			return Result{}, fmt.Errorf("handoff publication resource %q has an invalid binding", evidence.Name)
 		}
@@ -661,6 +654,35 @@ func (e Engine) verifyPublishedRoot(ctx context.Context, prepared preparedReques
 	}
 	digest := sha256.Sum256(raw)
 	return Result{StagingRoot: root, ManifestPath: manifestPath, ManifestSHA256: hex.EncodeToString(digest[:]), RequiredBytes: manifest.RequiredBytes, Manifest: manifest}, nil
+}
+
+func indexExactManifestResources(resources []Resource, manifests []ResourceManifest) (map[string]ResourceManifest, error) {
+	if len(manifests) != len(resources) {
+		return nil, errors.New("handoff publication manifest resource count is invalid")
+	}
+	expected := make(map[string]struct{}, len(resources))
+	for _, resource := range resources {
+		if _, exists := expected[resource.Name]; exists {
+			return nil, fmt.Errorf("immutable handoff request contains duplicate resource %q", resource.Name)
+		}
+		expected[resource.Name] = struct{}{}
+	}
+	indexed := make(map[string]ResourceManifest, len(manifests))
+	for _, manifest := range manifests {
+		if _, exists := expected[manifest.Name]; !exists {
+			return nil, fmt.Errorf("handoff publication manifest contains unknown resource %q", manifest.Name)
+		}
+		if _, exists := indexed[manifest.Name]; exists {
+			return nil, fmt.Errorf("handoff publication manifest contains duplicate resource %q", manifest.Name)
+		}
+		indexed[manifest.Name] = manifest
+	}
+	for _, resource := range resources {
+		if _, exists := indexed[resource.Name]; !exists {
+			return nil, fmt.Errorf("handoff publication manifest omits request resource %q", resource.Name)
+		}
+	}
+	return indexed, nil
 }
 
 func validatePublicationTree(root string, resources []markerResource, uid, gid int) error {

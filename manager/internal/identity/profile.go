@@ -40,55 +40,9 @@ type Profile struct {
 	InternalWorkspaceDirectory string
 }
 
-var source = Profile{
-	ProfileID:                  "ubitech-agent-v1",
-	ManagerBinary:              "ubitech-manager",
-	ManagerUnit:                "ubitech-agent-manager.service",
-	ConfigDirectory:            "ubitech-agent",
-	ConfigFile:                 "manager.toml",
-	DataDirectory:              "ubitech-agent",
-	ManagerStateDirectory:      "manager",
-	DataRootSocketPath:         "manager/control/manager.sock",
-	ContainerDataRoot:          contract.ContainerDataRoot,
-	ContainerSecretRoot:        "/run/secrets/ubitech",
-	ContainerControlSocketPath: "/run/ubitech-manager/manager.sock",
-	GatewayStatusPath:          "/__ubitech/status",
-	GatewayHealthPath:          "/__ubitech/health",
-	ComposeProject:             "ubitech-agent",
-	CoreNetwork:                "ubitech-agent_core",
-	EnvironmentPrefix:          "UBITECH",
-	LabelPrefix:                "org.ubitech.agent",
-	SandboxContainerPrefix:     "ubitech-sandbox-",
-	MigrationContainerPrefix:   "ubitech-migration-",
-	WatchdogUnitPrefix:         "ubitech-agent-manager-watchdog-",
-	RecoveryWatchdogUnitPrefix: "ubitech-agent-manager-watchdog-current-recovery-",
-	InternalWorkspaceDirectory: ".ubitech",
-}
+var source = generatedSourceProfile
 
-var target = Profile{
-	ProfileID:                  "agent-platform-v1",
-	ManagerBinary:              "agent-platform-manager",
-	ManagerUnit:                "agent-platform-manager.service",
-	ConfigDirectory:            "agent-platform",
-	ConfigFile:                 "manager.toml",
-	DataDirectory:              "agent-platform",
-	ManagerStateDirectory:      "manager",
-	RuntimeSocketPath:          "agent-platform-manager/manager.sock",
-	ContainerDataRoot:          "/var/lib/agent-platform",
-	ContainerSecretRoot:        "/run/secrets/agent-platform",
-	ContainerControlSocketPath: "/run/agent-platform-manager/manager.sock",
-	GatewayStatusPath:          "/__agent_platform/status",
-	GatewayHealthPath:          "/__agent_platform/health",
-	ComposeProject:             "agent-platform",
-	CoreNetwork:                "agent-platform_core",
-	EnvironmentPrefix:          "AGENT_PLATFORM",
-	LabelPrefix:                "io.agent-platform",
-	SandboxContainerPrefix:     "agent-platform-sandbox-",
-	MigrationContainerPrefix:   "agent-platform-migration-",
-	WatchdogUnitPrefix:         "agent-platform-manager-watchdog-",
-	RecoveryWatchdogUnitPrefix: "agent-platform-manager-watchdog-current-recovery-",
-	InternalWorkspaceDirectory: ".agent-platform",
-}
+var target = generatedTargetProfile
 
 // ActiveProfile is an opaque, validated technical profile. Keeping its value
 // private prevents mutable Config structs or administrator input from selecting
@@ -112,6 +66,37 @@ func TargetProfileID() string { return target.ProfileID }
 
 // SourceActiveProfile is the only ordinary-startup profile selector.
 func SourceActiveProfile() ActiveProfile { return ActiveProfile{value: source} }
+
+// ActiveProfileForReleaseContract selects the only ordinary-startup profile
+// allowed by a canonical release-transition contract. The profile IDs are
+// compared with the complete compile-time profiles before the stage is
+// considered, so a generated-contract drift cannot silently select either
+// namespace.
+func ActiveProfileForReleaseContract(stage, sourceProfileID, targetProfileID string) (ActiveProfile, error) {
+	if sourceProfileID != source.ProfileID || targetProfileID != target.ProfileID {
+		return ActiveProfile{}, errors.New("release transition profile IDs do not match the compiled technical profiles")
+	}
+	switch stage {
+	case "bridge":
+		return ActiveProfile{value: source}, nil
+	case "cleanup", "target_baseline":
+		return ActiveProfile{value: target}, nil
+	default:
+		return ActiveProfile{}, fmt.Errorf("unsupported compiled release transition stage %q", stage)
+	}
+}
+
+// CompileTimeActiveProfile is the sole no-journal identity selector. It uses
+// only generated constants from the canonical documentation contract; paths,
+// argv, environment, manifest contents, branding, and executable basenames
+// cannot influence the result.
+func CompileTimeActiveProfile() (ActiveProfile, error) {
+	return ActiveProfileForReleaseContract(
+		contract.ReleaseTransitionStage,
+		contract.ReleaseTransitionSourceProfileID,
+		contract.ReleaseTransitionTargetProfileID,
+	)
+}
 
 // ActivateVerifiedHandoffTarget constructs the target profile only after the
 // caller has verified the external handoff journal and capability. This

@@ -14,7 +14,27 @@ import {
   TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS,
   TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE,
 } from "./design-contract.generated.js";
+import {
+  SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES,
+  TARGET_MANAGER_EXECUTOR_SOCKET_PATH,
+  TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE,
+  TARGET_TECHNICAL_PROFILE_ID,
+} from "./technical-profile.generated.js";
 import type { RuntimeConfig } from "./types.js";
+
+function validateTechnicalProfile(env: NodeJS.ProcessEnv): void {
+  const sourceNames = Object.keys(env).filter((name) =>
+    SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES.some((prefix) => name.startsWith(prefix)),
+  );
+  if (sourceNames.length > 0) {
+    throw new Error(`Source-profile environment is not accepted by the target Agent Runtime: ${sourceNames.sort().join(", ")}`);
+  }
+  if (env[TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE]?.trim() !== TARGET_TECHNICAL_PROFILE_ID) {
+    throw new Error(
+      `${TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE} must be ${TARGET_TECHNICAL_PROFILE_ID}`,
+    );
+  }
+}
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   if (value === undefined || value.trim() === "") return fallback;
@@ -65,6 +85,7 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
   const bearerToken = loadToken(env);
+  validateTechnicalProfile(env);
   const requestedExecutionMode = env.AGENT_RUNTIME_EXECUTOR_MODE?.trim() || "manager";
   if (requestedExecutionMode !== "manager" && requestedExecutionMode !== "local") {
     throw new Error("AGENT_RUNTIME_EXECUTOR_MODE must be manager or local");
@@ -122,7 +143,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     ),
   };
   if (requestedExecutionMode === "manager") {
-    config.managerSocketPath = resolve(env.AGENT_MANAGER_EXECUTOR_SOCKET || "/run/ubitech-agent/manager.sock");
+    config.managerSocketPath = resolve(
+      env.AGENT_MANAGER_EXECUTOR_SOCKET || TARGET_MANAGER_EXECUTOR_SOCKET_PATH,
+    );
     config.managerToken = managerToken!;
   }
   const platformUrl = env.AGENT_PLATFORM_INTERNAL_URL?.replace(/\/$/, "");

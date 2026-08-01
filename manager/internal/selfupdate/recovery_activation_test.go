@@ -1480,7 +1480,7 @@ func activationTakeoverActivationClearedCrashCheckpoint(t *testing.T) (*activati
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence, err := readRecoveryFinalizeEvidence(fixture.platformPath, fixture.candidateCommit)
+	evidence, err := readRecoveryFinalizeEvidence(testActiveProfile, fixture.platformPath, fixture.candidateCommit)
 	if err != nil {
 		t.Fatal(err)
 	}

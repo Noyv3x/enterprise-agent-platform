@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/handoff"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/runtimegate"
 )
 
@@ -17,8 +18,9 @@ import (
 // nil Store is an explicit fail-closed participant state, never an invitation
 // to skip the deployment-wide journal boundary.
 type routedHandoffAdmission struct {
-	mu    sync.RWMutex
-	store *handoff.Store
+	mu             sync.RWMutex
+	store          *handoff.Store
+	targetBaseline bool
 }
 
 func (admission *routedHandoffAdmission) SetStore(store *handoff.Store) error {
@@ -27,10 +29,38 @@ func (admission *routedHandoffAdmission) SetStore(store *handoff.Store) error {
 	}
 	admission.mu.Lock()
 	defer admission.mu.Unlock()
-	if admission.store != nil && admission.store != store {
+	if admission.targetBaseline || admission.store != nil && admission.store != store {
 		return errors.New("handoff admission store is already bound")
 	}
 	admission.store = store
+	return nil
+}
+
+// SetCompileTimeTargetBaseline opens ordinary runtime admission only when the
+// generated release stage itself selects the target profile. This is not a
+// caller-selectable bypass: Bridge can never enter it, and a journal-backed
+// target continues to use the retained Store observation instead.
+func (admission *routedHandoffAdmission) SetCompileTimeTargetBaseline(active identity.ActiveProfile) error {
+	if admission == nil {
+		return errors.New("handoff admission is unavailable")
+	}
+	compiled, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	profile, err := active.Profile()
+	if err != nil {
+		return err
+	}
+	if active != compiled || profile != identity.TargetProfile() {
+		return errors.New("journal-free admission requires the compiled target-only baseline")
+	}
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.store != nil {
+		return errors.New("handoff admission store is already bound")
+	}
+	admission.targetBaseline = true
 	return nil
 }
 
@@ -40,7 +70,15 @@ func (admission *routedHandoffAdmission) Acquire(ctx context.Context) (func(), e
 	}
 	admission.mu.RLock()
 	store := admission.store
+	targetBaseline := admission.targetBaseline
 	admission.mu.RUnlock()
+	if targetBaseline {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var once sync.Once
+		return func() { once.Do(func() {}) }, nil
+	}
 	if store == nil {
 		return nil, errors.New("ordinary runtime is unavailable while namespace handoff owns the participant")
 	}

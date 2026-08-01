@@ -61,6 +61,7 @@ type participantObservationService struct {
 	executableSHA string
 	socketPath    string
 	manifestSHA   string
+	active        identity.ActiveProfile
 	config        config.Config
 	manifest      release.Manifest
 	docker        *driver.DockerCLI
@@ -125,7 +126,7 @@ func (service *participantObservationService) clock() time.Time {
 }
 
 func (service *participantObservationService) checkTargetChannel(ctx context.Context) error {
-	latest, raw, err := (release.Client{}).Fetch(ctx, service.config.ReleaseURL, service.config.ReleaseChannel)
+	latest, raw, err := (release.Client{}).FetchForProfile(ctx, service.config.ReleaseURL, service.config.ReleaseChannel, service.active)
 	if err != nil {
 		return fmt.Errorf("verify target auto-update channel: %w", err)
 	}
@@ -266,7 +267,7 @@ func serveHandoffParticipant(arguments []string, startup invocationStartup, buil
 	if err := validateParticipantSocketBinding(journalSocketPath, cfg.SocketPath); err != nil {
 		return err
 	}
-	manifest, rawManifest, err := loadHandoffParticipantManifest(cfg, generation, role, startup.txDir, transactionID)
+	manifest, rawManifest, err := loadHandoffParticipantManifest(active, cfg, generation, role, startup.txDir, transactionID)
 	if err != nil {
 		return err
 	}
@@ -340,7 +341,7 @@ func serveHandoffParticipant(arguments []string, startup invocationStartup, buil
 	observer := &participantObservationService{
 		transactionID: transactionID, startupRev: revision, bindingSHA: bindingSHA, role: role,
 		generation: generation, executableSHA: executableSHA, socketPath: journalSocketPath,
-		manifestSHA: initialJournal.Release.ManifestSHA256, config: cfg, manifest: manifest,
+		manifestSHA: initialJournal.Release.ManifestSHA256, active: active, config: cfg, manifest: manifest,
 		docker: restricted.docker, gateway: gatewayControl,
 	}
 	restrictedAPI := &control.API{
@@ -505,22 +506,22 @@ func validateParticipantJournal(value handoff.Journal, startup invocationStartup
 	return nil
 }
 
-func loadParticipantManifest(cfg config.Config, generation string) (release.Manifest, []byte, error) {
+func loadParticipantManifest(active identity.ActiveProfile, cfg config.Config, generation string) (release.Manifest, []byte, error) {
 	path := filepath.Join(cfg.StateDir, "releases", generation, "manifest.json")
 	raw, err := readOwnerInputFile(path, participantManifestMaximum)
 	if err != nil {
 		return release.Manifest{}, nil, fmt.Errorf("read participant retained manifest: %w", err)
 	}
-	manifest, err := release.DecodeManifest(raw, cfg.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
+	manifest, err := release.DecodeManifestForProfile(raw, cfg.ReleaseChannel, runtime.GOOS, runtime.GOARCH, active)
 	if err != nil {
 		return release.Manifest{}, nil, err
 	}
 	return manifest, raw, nil
 }
 
-func loadHandoffParticipantManifest(cfg config.Config, generation string, role handoffhelper.ParticipantRole, transactionDirectory, transactionID string) (release.Manifest, []byte, error) {
+func loadHandoffParticipantManifest(active identity.ActiveProfile, cfg config.Config, generation string, role handoffhelper.ParticipantRole, transactionDirectory, transactionID string) (release.Manifest, []byte, error) {
 	if role == handoffhelper.ParticipantTarget {
-		return loadParticipantManifest(cfg, generation)
+		return loadParticipantManifest(active, cfg, generation)
 	}
 	if role != handoffhelper.ParticipantSource {
 		return release.Manifest{}, nil, errors.New("participant manifest role is invalid")
@@ -533,7 +534,7 @@ func loadHandoffParticipantManifest(cfg config.Config, generation string, role h
 	if err != nil {
 		return release.Manifest{}, nil, fmt.Errorf("read bundled source participant manifest: %w", err)
 	}
-	manifest, err := release.DecodeManifest(raw, cfg.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
+	manifest, err := release.DecodeManifestForProfile(raw, cfg.ReleaseChannel, runtime.GOOS, runtime.GOARCH, active)
 	if err != nil {
 		return release.Manifest{}, nil, err
 	}

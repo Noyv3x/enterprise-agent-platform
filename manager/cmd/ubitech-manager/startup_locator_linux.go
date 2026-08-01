@@ -54,7 +54,15 @@ func locateStartupConfigSnapshot(configPath string) (startupConfigSnapshot, erro
 	}
 	defaultStateHome := filepath.Join(home, ".local", "state")
 	if configPath == "" {
-		configPath = defaultSourceStartupConfigPath(home)
+		active, profileErr := identity.CompileTimeActiveProfile()
+		if profileErr != nil {
+			return startupConfigSnapshot{}, fmt.Errorf("select compiled startup technical profile: %w", profileErr)
+		}
+		profile, profileErr := active.Profile()
+		if profileErr != nil {
+			return startupConfigSnapshot{}, profileErr
+		}
+		configPath = profile.DefaultConfigPath(filepath.Join(home, ".config"))
 	}
 	if !canonicalStartupPath(configPath) {
 		return startupConfigSnapshot{}, errors.New("startup config path must be canonical and absolute")

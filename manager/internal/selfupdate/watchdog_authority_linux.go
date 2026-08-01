@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
@@ -33,7 +32,7 @@ type WatchdogBinding struct {
 	// whose temporary roots intentionally do not use the installed profile
 	// basenames. Production bindings never set it.
 	bindingValidator func(WatchdogBinding) error
-	processVerifier  func(context.Context, WatchdogBinding, Plan, string, string, bool) error
+	processVerifier  func(context.Context, WatchdogBinding, Plan, string, string) error
 }
 
 // WatchdogBinding returns the exact runtime authority represented by m. The
@@ -109,9 +108,9 @@ func (binding WatchdogBinding) validatePlan(planPath string, plan Plan) error {
 	return nil
 }
 
-func (binding WatchdogBinding) verifyCurrentProcess(ctx context.Context, plan Plan, immutablePath, expectedSHA string, allowSourceOwnerCompatArguments bool) error {
+func (binding WatchdogBinding) verifyCurrentProcess(ctx context.Context, plan Plan, immutablePath, expectedSHA string) error {
 	if binding.processVerifier != nil {
-		return binding.processVerifier(ctx, binding, plan, immutablePath, expectedSHA, allowSourceOwnerCompatArguments)
+		return binding.processVerifier(ctx, binding, plan, immutablePath, expectedSHA)
 	}
 	profile, _ := binding.active.Profile()
 	unit := profile.WatchdogUnitPrefix + safeID(plan.PlatformCommit[:12])
@@ -144,21 +143,12 @@ func (binding WatchdogBinding) verifyCurrentProcess(ctx context.Context, plan Pl
 	}
 	arguments := strings.Split(strings.TrimRight(string(commandData), "\x00"), "\x00")
 	want := []string{arguments[0], "self-update-watchdog", "--plan", plan.PlanPath, "--config", binding.configPath}
-	compat := []string{arguments[0], "self-update-watchdog", "--plan", plan.PlanPath}
-	if !reflect.DeepEqual(arguments, want) &&
-		!(allowSourceOwnerCompatArguments && plan.Mode == "" && reflect.DeepEqual(arguments, compat)) {
+	if !reflect.DeepEqual(arguments, want) {
 		return errors.New("watchdog command line does not exactly own the routed plan and config")
-	}
-	if allowSourceOwnerCompatArguments && plan.Mode != "" {
-		return errors.New("recovery watchdog cannot use source-owner compatibility arguments")
 	}
 	cgroupData, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil || !recoveryProcessInExactControlGroup(cgroupData, controlGroup) {
 		return errors.New("watchdog process is outside its exact systemd control group")
 	}
 	return nil
-}
-
-func sourceOwnerCompatWatchdog(version *Version) bool {
-	return version != nil && version.SourceCommit == contract.SourceOwnerCompatGeneration
 }

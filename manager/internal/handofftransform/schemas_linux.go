@@ -48,6 +48,19 @@ const (
 
 var hexadecimalDigest = regexpMust(`^[0-9a-f]{64}$`)
 
+type platformSettingKeyMapping struct {
+	Source string `json:"source"`
+	Target string `json:"target"`
+}
+
+func platformMachineSettingMappings() []platformSettingKeyMapping {
+	return []platformSettingKeyMapping{
+		{Source: "ENTERPRISE_SESSION_SECRET", Target: "AGENT_PLATFORM_SESSION_SECRET"},
+		{Source: "ENTERPRISE_TELEGRAM_BOT_TOKEN", Target: "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN"},
+		{Source: "ENTERPRISE_TELEGRAM_WEBHOOK_SECRET", Target: "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET"},
+	}
+}
+
 // ScopeIdentity is the SQLite-authoritative binding for one workspace and its
 // current Runtime identity. It intentionally contains no host absolute path.
 type ScopeIdentity struct {
@@ -150,7 +163,18 @@ func LoadAuthoritativeIdentities(ctx context.Context, path string, databaseVersi
 	}
 	identities := RuntimeIdentities{Scopes: map[string]ScopeIdentity{}, Sessions: map[string]map[string]map[string]struct{}{}}
 	workspaceIDs := map[string]string{}
-	rows, err := database.QueryContext(ctx, `SELECT scope_key, scope_type, scope_id, lifecycle_id, sandbox_id, workspace_path FROM agent_scopes ORDER BY scope_key LIMIT ?`, contract.AgentRuntimeMaximumIdentityRecords+1)
+	rows, err := database.QueryContext(ctx, `
+		SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
+		       COALESCE((
+		           SELECT runtime.lifecycle_id
+		           FROM agent_runtime_scopes AS runtime
+		           WHERE runtime.scope_key = scopes.scope_key
+		           LIMIT 1
+		       ), ''),
+		       scopes.sandbox_id, scopes.workspace_path
+		FROM agent_scopes AS scopes
+		ORDER BY scopes.scope_key
+		LIMIT ?`, contract.AgentRuntimeMaximumIdentityRecords+1)
 	if err != nil {
 		return RuntimeIdentities{}, err
 	}
@@ -247,6 +271,11 @@ func LoadAuthoritativeIdentities(ctx context.Context, path string, databaseVersi
 			rows.Close()
 			return RuntimeIdentities{}, err
 		}
+		scopeIdentity, scopeExists := identities.Scopes[scope]
+		if !scopeExists || scopeIdentity.LifecycleID != lifecycle {
+			rows.Close()
+			return RuntimeIdentities{}, errors.New("current Agent Runtime lifecycle differs from the workspace identity")
+		}
 		if _, exists := identities.Sessions[scope][lifecycle][session]; !exists {
 			rows.Close()
 			return RuntimeIdentities{}, errors.New("current Agent Runtime session has no durable alias")
@@ -273,10 +302,11 @@ func PlatformDatabaseResource(databaseVersion int) Resource {
 		Type: RegularFile, Required: true, SchemaIdentifier: "platform-database", SchemaVersion: platformDatabaseSchema,
 		Transformer: transformer, Validator: validator,
 		TransformationSHA256: semanticDigest(struct {
-			Version int    `json:"version"`
-			Source  string `json:"source"`
-			Target  string `json:"target"`
-		}{databaseVersion, SourceDatabaseBaselineName, TargetDatabaseBaselineName}),
+			Version  int                         `json:"version"`
+			Source   string                      `json:"source"`
+			Target   string                      `json:"target"`
+			Settings []platformSettingKeyMapping `json:"settings"`
+		}{databaseVersion, SourceDatabaseBaselineName, TargetDatabaseBaselineName, platformMachineSettingMappings()}),
 	}
 }
 
@@ -474,13 +504,24 @@ func (transformer *platformDatabaseTransformer) Transform(ctx context.Context, i
 	if err := verifyDatabaseBaseline(ctx, database, transformer.databaseVersion, SourceDatabaseBaselineName); err != nil {
 		return err
 	}
-	result, err := database.ExecContext(ctx, `UPDATE schema_migrations SET name = ? WHERE version = ? AND name = ?`, TargetDatabaseBaselineName, transformer.databaseVersion, SourceDatabaseBaselineName)
+	transaction, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin target Platform identity transaction: %w", err)
+	}
+	defer transaction.Rollback()
+	if err := migratePlatformMachineSettingKeys(ctx, transaction); err != nil {
+		return err
+	}
+	result, err := transaction.ExecContext(ctx, `UPDATE schema_migrations SET name = ? WHERE version = ? AND name = ?`, TargetDatabaseBaselineName, transformer.databaseVersion, SourceDatabaseBaselineName)
 	if err != nil {
 		return fmt.Errorf("write target Platform baseline marker: %w", err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil || changed != 1 {
 		return errors.New("target Platform baseline marker update did not affect exactly one row")
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit target Platform identity transaction: %w", err)
 	}
 	if _, err := database.ExecContext(ctx, "PRAGMA journal_mode=DELETE"); err != nil {
 		return fmt.Errorf("finalize target Platform database journal mode: %w", err)
@@ -520,16 +561,105 @@ func (validator *platformDatabaseValidator) Validate(ctx context.Context, input 
 	if err := verifyDatabaseBaseline(ctx, target, validator.databaseVersion, TargetDatabaseBaselineName); err != nil {
 		return err
 	}
-	sourceProjection, err := databaseProjection(ctx, source, validator.databaseVersion, SourceDatabaseBaselineName)
+	if err := validatePlatformMachineSettingMigration(ctx, source, target); err != nil {
+		return err
+	}
+	mappings := platformMachineSettingMappings()
+	canonicalSourceKeys := make(map[string]string, len(mappings))
+	for _, mapping := range mappings {
+		canonicalSourceKeys[mapping.Source] = mapping.Target
+	}
+	sourceProjection, err := databaseProjection(ctx, source, validator.databaseVersion, SourceDatabaseBaselineName, canonicalSourceKeys)
 	if err != nil {
 		return err
 	}
-	targetProjection, err := databaseProjection(ctx, target, validator.databaseVersion, TargetDatabaseBaselineName)
+	targetProjection, err := databaseProjection(ctx, target, validator.databaseVersion, TargetDatabaseBaselineName, nil)
 	if err != nil {
 		return err
 	}
 	if sourceProjection != targetProjection {
 		return errors.New("target Platform database changed content outside the registered baseline marker")
+	}
+	return nil
+}
+
+func migratePlatformMachineSettingKeys(ctx context.Context, transaction *sql.Tx) error {
+	for _, mapping := range platformMachineSettingMappings() {
+		var sourceCount, targetCount int
+		if err := transaction.QueryRowContext(
+			ctx,
+			`SELECT COALESCE(SUM(CASE WHEN key = ? THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN key = ? THEN 1 ELSE 0 END), 0) FROM settings`,
+			mapping.Source,
+			mapping.Target,
+		).Scan(&sourceCount, &targetCount); err != nil {
+			return fmt.Errorf("inspect Platform setting key mapping %q: %w", mapping.Source, err)
+		}
+		if sourceCount < 0 || sourceCount > 1 {
+			return fmt.Errorf("source Platform setting key %q is not unique", mapping.Source)
+		}
+		if targetCount != 0 {
+			return fmt.Errorf("target Platform setting key %q already exists in the source database", mapping.Target)
+		}
+		if sourceCount == 0 {
+			continue
+		}
+		result, err := transaction.ExecContext(ctx, `UPDATE settings SET key = ? WHERE key = ?`, mapping.Target, mapping.Source)
+		if err != nil {
+			return fmt.Errorf("migrate Platform setting key %q: %w", mapping.Source, err)
+		}
+		changed, err := result.RowsAffected()
+		if err != nil || changed != 1 {
+			return fmt.Errorf("Platform setting key %q migration did not affect exactly one row", mapping.Source)
+		}
+	}
+	return nil
+}
+
+type platformSettingRecord struct {
+	Value     string
+	Secret    int64
+	UpdatedAt int64
+}
+
+func readPlatformSetting(ctx context.Context, database *sql.DB, key string) (platformSettingRecord, bool, error) {
+	var record platformSettingRecord
+	err := database.QueryRowContext(ctx, `SELECT value, secret, updated_at FROM settings WHERE key = ?`, key).Scan(
+		&record.Value,
+		&record.Secret,
+		&record.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return platformSettingRecord{}, false, nil
+	}
+	if err != nil {
+		return platformSettingRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func validatePlatformMachineSettingMigration(ctx context.Context, source, target *sql.DB) error {
+	for _, mapping := range platformMachineSettingMappings() {
+		sourceRecord, sourceExists, err := readPlatformSetting(ctx, source, mapping.Source)
+		if err != nil {
+			return fmt.Errorf("read source Platform setting %q: %w", mapping.Source, err)
+		}
+		if _, exists, err := readPlatformSetting(ctx, source, mapping.Target); err != nil {
+			return fmt.Errorf("read conflicting source Platform setting %q: %w", mapping.Target, err)
+		} else if exists {
+			return fmt.Errorf("source Platform database already contains target setting key %q", mapping.Target)
+		}
+		if _, exists, err := readPlatformSetting(ctx, target, mapping.Source); err != nil {
+			return fmt.Errorf("read stale target Platform setting %q: %w", mapping.Source, err)
+		} else if exists {
+			return fmt.Errorf("target Platform database retained source setting key %q", mapping.Source)
+		}
+		targetRecord, targetExists, err := readPlatformSetting(ctx, target, mapping.Target)
+		if err != nil {
+			return fmt.Errorf("read target Platform setting %q: %w", mapping.Target, err)
+		}
+		if sourceExists != targetExists || (sourceExists && sourceRecord != targetRecord) {
+			return fmt.Errorf("target Platform setting %q did not preserve the source row", mapping.Target)
+		}
 	}
 	return nil
 }
@@ -2016,7 +2146,7 @@ func verifyDatabaseBaseline(ctx context.Context, database *sql.DB, version int, 
 	return nil
 }
 
-func databaseProjection(ctx context.Context, database *sql.DB, version int, baseline string) (string, error) {
+func databaseProjection(ctx context.Context, database *sql.DB, version int, baseline string, settingKeyProjection map[string]string) (string, error) {
 	hash := sha256.New()
 	rows, err := database.QueryContext(ctx, `SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name, tbl_name, sql`)
 	if err != nil {
@@ -2038,7 +2168,7 @@ func databaseProjection(ctx context.Context, database *sql.DB, version int, base
 		return "", err
 	}
 	for _, table := range tables {
-		projection, err := tableProjection(ctx, database, table, version, baseline)
+		projection, err := tableProjection(ctx, database, table, version, baseline, settingKeyProjection)
 		if err != nil {
 			return "", err
 		}
@@ -2047,7 +2177,7 @@ func databaseProjection(ctx context.Context, database *sql.DB, version int, base
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func tableProjection(ctx context.Context, database *sql.DB, table string, version int, baseline string) (string, error) {
+func tableProjection(ctx context.Context, database *sql.DB, table string, version int, baseline string, settingKeyProjection map[string]string) (string, error) {
 	rows, err := database.QueryContext(ctx, "SELECT * FROM "+quoteSQLiteIdentifier(table))
 	if err != nil {
 		return "", err
@@ -2072,6 +2202,12 @@ func tableProjection(ctx context.Context, database *sql.DB, table string, versio
 		for index, value := range values {
 			if table == "schema_migrations" && columns[index] == "name" {
 				value = "<technical-baseline>"
+			} else if table == "settings" && columns[index] == "key" {
+				if key, ok := value.(string); ok {
+					if projected, exists := settingKeyProjection[key]; exists {
+						value = projected
+					}
+				}
 			}
 			writeSQLValue(rowHash, value)
 		}

@@ -3,9 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import datetime as dt
-import hashlib
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,10 +17,8 @@ sys.path.insert(0, str(REPOSITORY_ROOT / "scripts"))
 import release_promotion as promotion  # noqa: E402
 
 
-P1 = "983f79b4900502f35fac6de8154eb344fc9f143b"
+SOURCE_PREDECESSOR = "1" * 40
 A2 = "2" * 40
-STABILIZED_A2 = "7" * 40
-ALTERNATE_STABILIZED_A2 = "8" * 40
 BRIDGE = "3" * 40
 CLEANUP = "4" * 40
 MANAGER_SHA = "a" * 64
@@ -51,6 +47,11 @@ class ReleasePromotionTests(unittest.TestCase):
 
     @staticmethod
     def manifest(generation: str, schema_version: int = 1) -> dict[str, object]:
+        managed = (
+            promotion.MANAGED_IMAGES_V1
+            if schema_version == 1
+            else promotion.MANAGED_IMAGES_V2
+        )
         return {
             "schema_version": schema_version,
             "channel": "main",
@@ -75,7 +76,10 @@ class ReleasePromotionTests(unittest.TestCase):
                 "url": "https://example.invalid/compose.yaml",
                 "sha256": "c" * 64,
             },
-            "images": {},
+            "images": {
+                name: f"ghcr.io/example/{name}@sha256:{index:064x}"
+                for index, name in enumerate(sorted(managed), 1)
+            },
         }
 
     def write_release(
@@ -91,18 +95,23 @@ class ReleasePromotionTests(unittest.TestCase):
         contract = copy.deepcopy(self.base_contract)
         contract["stage"] = stage
         contract["predecessor_generation"] = predecessor
-        if stage != "source_owner":
-            contract.pop("source_owner_compat", None)
         schema_version = 2 if stage in {"cleanup", "target_baseline"} else 1
         manifest = self.manifest(generation, schema_version)
         if stage == "bridge":
             predecessor_manifest = self.manifest(predecessor)
             manifest["namespace_handoff"] = {
                 "schema_version": 1,
+                "predecessor_generation": predecessor,
+                "bridge_generation": generation,
                 "source": {
                     "profile_id": self.base_contract["source_profile_id"],
                     "manager": predecessor_manifest["manager"],
                     "compose": predecessor_manifest["compose"],
+                },
+                "target": {
+                    "profile_id": self.base_contract["target_profile_id"],
+                    "manager": manifest["manager"],
+                    "compose": manifest["compose"],
                 },
             }
         paths = {
@@ -122,7 +131,7 @@ class ReleasePromotionTests(unittest.TestCase):
         }
         for name, value in paths.items():
             (root / name).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-        for name in promotion.SEALED_RELEASE_ASSETS:
+        for name in promotion._release_assets(stage):
             path = root / name
             if name != "release.json":
                 path.write_bytes(f"sealed fixture for {name}\n".encode("utf-8"))
@@ -139,111 +148,73 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         return record
 
-    def write_p1_compat(self) -> Path:
-        root = self.root / "p1-current"
+    def write_historical_current(
+        self, root: Path, *, generation: str, predecessor: str
+    ) -> dict[str, object]:
+        """Write an already-sealed current release with an opaque retired contract."""
+
         root.mkdir(parents=True, exist_ok=True)
-        testdata = REPOSITORY_ROOT / "manager/internal/release/testdata"
-        shutil.copyfile(
-            testdata / f"{P1}-release.json",
-            root / "release.json",
-        )
-        shutil.copyfile(
-            testdata / f"{P1}-compose.yaml",
-            root / "ubitech-compose.yaml",
-        )
-        for name in promotion.SEALED_RELEASE_ASSETS:
+        contract = {"retired_contract": True, "opaque_historical_bytes": True}
+        paths = {
+            "release-transition.json": contract,
+            "release.json": self.manifest(generation),
+            "release-transition-challenge.schema.json": json.loads(
+                self.challenge_schema.read_text(encoding="utf-8")
+            ),
+            "release-transition-receipt.schema.json": json.loads(
+                self.receipt_schema.read_text(encoding="utf-8")
+            ),
+            "metadata.json": {
+                "tag_name": f"container-{generation}",
+                "draft": False,
+                "target_commitish": generation,
+            },
+        }
+        for name, value in paths.items():
+            (root / name).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        for name in promotion.BRIDGE_SEALED_RELEASE_ASSETS:
             path = root / name
-            if not path.exists():
-                path.write_bytes(f"canonical P1 fixture placeholder for {name}\n".encode())
-        return root
-
-    def test_source_owner_preserves_exact_v1_manifest_and_no_receipt(self) -> None:
-        root = self.root / A2
-        record = self.write_release(
-            root,
-            stage="source_owner",
-            generation=A2,
-            predecessor=P1,
-            draft=True,
+            if name != "release.json":
+                path.write_bytes(f"sealed historical fixture for {name}\n".encode("utf-8"))
+        record = {
+            "schema_version": 1,
+            "transition_id": self.base_contract["transition_id"],
+            "stage": "source_owner",
+            "generation": generation,
+            "predecessor_generation": predecessor,
+            "source_profile_id": self.base_contract["source_profile_id"],
+            "target_profile_id": self.base_contract["target_profile_id"],
+            "manifest_schema_version": 1,
+            "manifest_sha256": promotion._sha256(root / "release.json"),
+            "contract_sha256": promotion._sha256(root / "release-transition.json"),
+            "challenge_schema_sha256": promotion._sha256(
+                root / "release-transition-challenge.schema.json"
+            ),
+            "receipt_schema_sha256": promotion._sha256(
+                root / "release-transition-receipt.schema.json"
+            ),
+            "required_receipt_type": None,
+            "sealed_assets": promotion._sealed_assets(root, "source_owner"),
+        }
+        (root / "promotion.json").write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
         )
-        self.assertEqual(record["manifest_schema_version"], 1)
-        self.assertIsNone(record["required_receipt_type"])
-
-        manifest_path = root / "release.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["namespace_handoff"] = {"schema_version": 1}
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        with self.assertRaisesRegex(
-            promotion.PromotionError, "exact ordinary nine-key shape"
-        ):
-            promotion.build_promotion(
-                root / "release-transition.json",
-                manifest_path,
-                root / "release-transition-challenge.schema.json",
-                root / "release-transition-receipt.schema.json",
-                A2,
-                root,
-            )
-
-    def test_first_promotion_accepts_only_the_contract_pinned_real_p1_release(self) -> None:
-        api = json.loads(
-            (REPOSITORY_ROOT / "scripts/tests/fixtures/p1-release-api.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(api["tag_name"], f"container-{P1}")
-        self.assertFalse(api["draft"])
-        self.assertEqual(
-            [asset["name"] for asset in api["assets"]],
-            list(promotion.SEALED_RELEASE_ASSETS),
-        )
-        self.assertNotIn("promotion.json", {asset["name"] for asset in api["assets"]})
-        api_digests = {asset["name"]: asset["digest"] for asset in api["assets"]}
-        fixture_root = self.write_p1_compat()
-        for name in ("release.json", "ubitech-compose.yaml"):
-            observed = "sha256:" + hashlib.sha256((fixture_root / name).read_bytes()).hexdigest()
-            self.assertEqual(observed, api_digests[name])
-
-        contract = copy.deepcopy(self.base_contract)
-        validated = promotion.validate_source_owner_compat(fixture_root, contract, P1)
-        self.assertEqual(validated["source_commit"], P1)
-        self.assertEqual(len(validated["images"]), 10)
-
-        extra = fixture_root / "promotion.json"
-        extra.write_text("{}\n", encoding="utf-8")
-        with self.assertRaisesRegex(promotion.PromotionError, "exact P1 asset set"):
-            promotion.validate_source_owner_compat(fixture_root, contract, P1)
-        extra.unlink()
-
-        changed = copy.deepcopy(contract)
-        changed["source_owner_compat"]["generation"] = A2
-        with self.assertRaisesRegex(promotion.PromotionError, "exact current generation"):
-            promotion.validate_source_owner_compat(fixture_root, changed, P1)
-
-        generalized = copy.deepcopy(contract)
-        generalized["predecessor_generation"] = A2
-        generalized["source_owner_compat"]["generation"] = A2
-        generalized_path = self.root / "generalized-legacy-contract.json"
-        generalized_path.write_text(json.dumps(generalized), encoding="utf-8")
-        with self.assertRaisesRegex(
-            promotion.PromotionError, "limited to the canonical P1 generation and bytes"
-        ):
-            promotion._load_contract(generalized_path)
+        return record
 
     def test_promotion_seals_exact_non_self_release_asset_directory(self) -> None:
         root = self.root / A2
         record = self.write_release(
             root,
-            stage="source_owner",
+            stage="bridge",
             generation=A2,
-            predecessor=P1,
+            predecessor=SOURCE_PREDECESSOR,
             draft=True,
         )
         self.assertEqual(
             [asset["name"] for asset in record["sealed_assets"]],
-            list(promotion.SEALED_RELEASE_ASSETS),
+            list(promotion.BRIDGE_SEALED_RELEASE_ASSETS),
         )
-        self.assertNotIn("promotion.json", promotion.SEALED_RELEASE_ASSETS)
+        self.assertNotIn("promotion.json", promotion.BRIDGE_SEALED_RELEASE_ASSETS)
 
         def validate(*, with_assets: bool = True) -> None:
             promotion.validate_promotion(
@@ -264,9 +235,9 @@ class ReleasePromotionTests(unittest.TestCase):
 
         self.write_release(
             root,
-            stage="source_owner",
+            stage="bridge",
             generation=A2,
-            predecessor=P1,
+            predecessor=SOURCE_PREDECESSOR,
             draft=True,
         )
         changed = json.loads((root / "promotion.json").read_text(encoding="utf-8"))
@@ -283,8 +254,30 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(promotion.PromotionError, "unique and sorted"):
             validate(with_assets=False)
 
+    def test_target_only_seal_uses_only_neutral_asset_names(self) -> None:
+        root = self.root / CLEANUP
+        record = self.write_release(
+            root,
+            stage="cleanup",
+            generation=CLEANUP,
+            predecessor=BRIDGE,
+            draft=True,
+        )
+        names = [asset["name"] for asset in record["sealed_assets"]]
+        self.assertEqual(names, list(promotion.TARGET_SEALED_RELEASE_ASSETS))
+        self.assertIn("agent-platform-compose.yaml", names)
+        self.assertFalse(any("ubitech" in name for name in names))
+
+        source_identity = self.release_identity(CLEANUP, "bridge")
+        with self.assertRaisesRegex(promotion.PromotionError, "unknown name"):
+            promotion.validate_release_identity(
+                source_identity, CLEANUP, "cleanup"
+            )
+
     @staticmethod
-    def release_identity(generation: str) -> dict[str, object]:
+    def release_identity(
+        generation: str, stage: str = "bridge"
+    ) -> dict[str, object]:
         return {
             "release_id": 4001,
             "tag_name": f"container-{generation}",
@@ -299,7 +292,7 @@ class ReleasePromotionTests(unittest.TestCase):
                     "size": index + 1,
                     "state": "uploaded",
                 }
-                for index, name in enumerate(promotion.ALL_RELEASE_ASSETS)
+                for index, name in enumerate(promotion._all_release_assets(stage))
             ],
         }
 
@@ -336,6 +329,7 @@ class ReleasePromotionTests(unittest.TestCase):
             A2,
             selection,
             identity,
+            "bridge",
         )
         self.assertEqual(proof["workflow_path"], promotion.PUBLISHER_WORKFLOW_PATH)
         self.assertEqual(proof["execution_head_sha"], BRIDGE)
@@ -352,6 +346,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 A2,
                 selection,
                 identity,
+                "bridge",
             ),
             proof,
         )
@@ -374,6 +369,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 "source_commit": A2,
                 "source_selection": selection,
                 "release_identity": identity,
+                "candidate_stage": "bridge",
             }
             kwargs[field] = value
             with self.subTest(field=field), self.assertRaises(promotion.PromotionError):
@@ -412,6 +408,7 @@ class ReleasePromotionTests(unittest.TestCase):
                     A2,
                     selection,
                     changed,
+                    "bridge",
                 )
 
         mismatched_selection = copy.deepcopy(selection)
@@ -428,7 +425,72 @@ class ReleasePromotionTests(unittest.TestCase):
                 A2,
                 mismatched_selection,
                 identity,
+                "bridge",
             )
+
+        changed_proof = copy.deepcopy(proof)
+        changed_proof["run_attempt"] = 3
+        with self.assertRaisesRegex(
+            promotion.PromotionError, "does not match the successful release attempt"
+        ):
+            promotion.validate_publisher_provenance(
+                changed_proof,
+                "example/agent-platform",
+                "workflow_run",
+                12345,
+                2,
+                BRIDGE,
+                A2,
+                selection,
+                identity,
+                "bridge",
+            )
+
+    def test_publisher_provenance_rejects_retired_bridge_qualification_field(self) -> None:
+        bridge_identity = self.release_identity(A2, "bridge")
+        bridge_selection = self.source_selection("workflow_run", A2)
+        bridge = promotion.build_publisher_provenance(
+            "example/agent-platform",
+            "workflow_run",
+            12345,
+            2,
+            BRIDGE,
+            A2,
+            bridge_selection,
+            bridge_identity,
+            "bridge",
+        )
+        self.assertNotIn("bridge_qualification", bridge)
+        retired = copy.deepcopy(bridge)
+        retired["bridge_qualification"] = {"harness_sha256": "6" * 64}
+        with self.assertRaisesRegex(promotion.PromotionError, "exact closed shape"):
+            promotion.validate_publisher_provenance(
+                retired,
+                "example/agent-platform",
+                "workflow_run",
+                12345,
+                2,
+                BRIDGE,
+                A2,
+                bridge_selection,
+                bridge_identity,
+                "bridge",
+            )
+
+        identity = self.release_identity(CLEANUP, "target_baseline")
+        selection = self.source_selection("workflow_run", CLEANUP)
+        ordinary = promotion.build_publisher_provenance(
+            "example/agent-platform",
+            "workflow_run",
+            12345,
+            2,
+            BRIDGE,
+            CLEANUP,
+            selection,
+            identity,
+            "target_baseline",
+        )
+        self.assertNotIn("bridge_qualification", ordinary)
 
     def test_publisher_provenance_cli_round_trip_is_retry_safe(self) -> None:
         identity = self.release_identity(A2)
@@ -453,6 +515,7 @@ class ReleasePromotionTests(unittest.TestCase):
             "--source-commit", A2,
             "--source-selection", str(selection_path),
             "--release-identity", str(identity_path),
+            "--candidate-stage", "bridge",
         ]
         self.assertEqual(
             promotion.main(["create-publisher-provenance", *common, "--output", str(proof_path)]),
@@ -470,28 +533,18 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_selector_cannot_skip_or_reorder_transition_stages(self) -> None:
         candidates = self.root / "candidates"
         a2_root = candidates / A2
-        stabilized_root = candidates / STABILIZED_A2
         bridge_root = candidates / BRIDGE
         cleanup_root = candidates / CLEANUP
-        self.write_release(
+        self.write_historical_current(
             a2_root,
-            stage="source_owner",
             generation=A2,
-            predecessor=P1,
-            draft=True,
-        )
-        self.write_release(
-            stabilized_root,
-            stage="source_owner",
-            generation=STABILIZED_A2,
-            predecessor=A2,
-            draft=True,
+            predecessor=SOURCE_PREDECESSOR,
         )
         self.write_release(
             bridge_root,
             stage="bridge",
             generation=BRIDGE,
-            predecessor=STABILIZED_A2,
+            predecessor=A2,
             draft=True,
         )
         self.write_release(
@@ -502,18 +555,10 @@ class ReleasePromotionTests(unittest.TestCase):
             draft=True,
         )
 
-        first = promotion.select_candidate(
-            P1, candidates, None, self.write_p1_compat()
-        )
-        self.assertEqual(first["candidate"]["generation"], A2)
-        second = promotion.select_candidate(A2, candidates, a2_root)
-        self.assertEqual(second["candidate"]["generation"], STABILIZED_A2)
-        third = promotion.select_candidate(
-            STABILIZED_A2, candidates, stabilized_root
-        )
-        self.assertEqual(third["candidate"]["generation"], BRIDGE)
-        fourth = promotion.select_candidate(BRIDGE, candidates, bridge_root)
-        self.assertEqual(fourth["candidate"]["generation"], CLEANUP)
+        first = promotion.select_candidate(A2, candidates, a2_root)
+        self.assertEqual(first["candidate"]["generation"], BRIDGE)
+        second = promotion.select_candidate(BRIDGE, candidates, bridge_root)
+        self.assertEqual(second["candidate"]["generation"], CLEANUP)
         self.assertEqual(
             promotion.select_candidate(CLEANUP, candidates, cleanup_root),
             {"action": "none"},
@@ -537,140 +582,107 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(promotion.PromotionError, "does not directly follow"):
             promotion.select_candidate(A2, candidates, a2_root)
 
-    def test_source_owner_stabilization_keeps_exact_p1_compatibility(self) -> None:
-        candidates = self.root / "candidates"
-        current_root = candidates / A2
-        candidate_root = candidates / STABILIZED_A2
-        self.write_release(
-            current_root,
-            stage="source_owner",
+    def test_historical_source_owner_current_uses_only_its_byte_seal(self) -> None:
+        candidates = self.root / "historical-current"
+        current = candidates / A2
+        bridge = candidates / BRIDGE
+        self.write_historical_current(
+            current,
             generation=A2,
-            predecessor=P1,
-            draft=False,
+            predecessor=SOURCE_PREDECESSOR,
         )
-        record = self.write_release(
-            candidate_root,
-            stage="source_owner",
-            generation=STABILIZED_A2,
+        self.write_release(
+            bridge,
+            stage="bridge",
+            generation=BRIDGE,
             predecessor=A2,
             draft=True,
         )
-
-        contract = json.loads(
-            (candidate_root / "release-transition.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(record["predecessor_generation"], A2)
-        self.assertEqual(contract["source_owner_compat"]["generation"], P1)
-        self.assertIsNone(record["required_receipt_type"])
-        selected = promotion.select_candidate(A2, candidates, current_root)
-        self.assertEqual(selected["candidate"]["generation"], STABILIZED_A2)
-
-    def test_source_owner_stabilization_cannot_skip_current_generation(self) -> None:
-        candidates = self.root / "candidates"
-        current_root = candidates / A2
         self.write_release(
-            current_root,
-            stage="source_owner",
-            generation=A2,
-            predecessor=P1,
-            draft=False,
-        )
-        self.write_release(
-            candidates / STABILIZED_A2,
-            stage="source_owner",
-            generation=STABILIZED_A2,
-            predecessor=P1,
+            candidates / CLEANUP,
+            stage="cleanup",
+            generation=CLEANUP,
+            predecessor=BRIDGE,
             draft=True,
         )
-
         self.assertEqual(
-            promotion.select_candidate(A2, candidates, current_root),
-            {"action": "none"},
+            promotion.select_candidate(A2, candidates, current)["candidate"]["generation"],
+            BRIDGE,
         )
+        contract = current / "release-transition.json"
+        contract.write_bytes(contract.read_bytes() + b" ")
+        with self.assertRaisesRegex(promotion.PromotionError, "contract_sha256"):
+            promotion.select_candidate(A2, candidates, current)
 
-    def test_source_owner_stabilization_rejects_multiple_direct_successors(self) -> None:
+        self.write_historical_current(
+            current,
+            generation=A2,
+            predecessor=SOURCE_PREDECESSOR,
+        )
+        install = current / "install.sh"
+        install.write_bytes(install.read_bytes() + b"drift\n")
+        with self.assertRaisesRegex(promotion.PromotionError, "sealed asset directory"):
+            promotion.select_candidate(A2, candidates, current)
+
+    def test_selector_requires_sealed_current_and_rejects_public_candidate(self) -> None:
         candidates = self.root / "candidates"
         current_root = candidates / A2
-        self.write_release(
+        self.write_historical_current(
             current_root,
-            stage="source_owner",
             generation=A2,
-            predecessor=P1,
+            predecessor=SOURCE_PREDECESSOR,
+        )
+        self.write_release(
+            candidates / BRIDGE,
+            stage="bridge",
+            generation=BRIDGE,
+            predecessor=A2,
             draft=False,
         )
-        for generation in (STABILIZED_A2, ALTERNATE_STABILIZED_A2):
-            self.write_release(
-                candidates / generation,
-                stage="source_owner",
-                generation=generation,
-                predecessor=A2,
-                draft=True,
-            )
-
-        with self.assertRaisesRegex(
-            promotion.PromotionError, "multiple releases claim the same direct predecessor"
-        ):
+        with self.assertRaisesRegex(promotion.PromotionError, "complete sealed promotion"):
+            promotion.select_candidate(A2, candidates, None)
+        with self.assertRaisesRegex(promotion.PromotionError, "is not draft"):
             promotion.select_candidate(A2, candidates, current_root)
 
-    def test_source_owner_stabilization_cannot_be_chained_twice(self) -> None:
-        candidates = self.root / "candidates"
-        current_root = candidates / STABILIZED_A2
-        self.write_release(
+    def test_bridge_cannot_be_selected_before_exact_cleanup_is_prebuilt(self) -> None:
+        candidates = self.root / "prebuild-gate"
+        current_root = candidates / A2
+        self.write_historical_current(
             current_root,
-            stage="source_owner",
-            generation=STABILIZED_A2,
-            predecessor=A2,
-            draft=False,
+            generation=A2,
+            predecessor=SOURCE_PREDECESSOR,
         )
         self.write_release(
-            candidates / ALTERNATE_STABILIZED_A2,
-            stage="source_owner",
-            generation=ALTERNATE_STABILIZED_A2,
-            predecessor=STABILIZED_A2,
+            candidates / BRIDGE,
+            stage="bridge",
+            generation=BRIDGE,
+            predecessor=A2,
             draft=True,
         )
+        waiting = promotion.select_candidate(A2, candidates, current_root)
+        self.assertEqual(waiting["action"], "prepare_cleanup")
+        self.assertEqual(waiting["candidate"]["generation"], BRIDGE)
 
-        with self.assertRaisesRegex(
-            promotion.PromotionError,
-            "limited to the first source_owner successor",
-        ):
-            promotion.select_candidate(
-                STABILIZED_A2,
-                candidates,
-                current_root,
-            )
-
-    def test_source_owner_stabilization_rejects_identity_drift(self) -> None:
-        current = {
-            "transition_id": "technical-namespace-v1",
-            "source_profile_id": "ubitech-agent-v1",
-            "target_profile_id": "agent-platform-v1",
-        }
-        for field in current:
-            with self.subTest(field=field):
-                candidate = dict(current)
-                candidate[field] = f"different-{field}"
-                with self.assertRaisesRegex(
-                    promotion.PromotionError,
-                    rf"source_owner stabilization changes transition binding {field}",
-                ):
-                    promotion._validate_transition_binding(
-                        candidate,
-                        current,
-                        label="source_owner stabilization",
-                    )
-
-    def test_selector_rejects_a_candidate_published_outside_the_evaluator(self) -> None:
-        candidates = self.root / "candidates"
+        cleanup_root = candidates / CLEANUP
         self.write_release(
-            candidates / A2,
-            stage="source_owner",
-            generation=A2,
-            predecessor=P1,
-            draft=False,
+            cleanup_root,
+            stage="cleanup",
+            generation=CLEANUP,
+            predecessor=BRIDGE,
+            draft=True,
         )
-        with self.assertRaisesRegex(promotion.PromotionError, "is not draft"):
-            promotion.select_candidate(P1, candidates, None)
+        selected = promotion.select_candidate(A2, candidates, current_root)
+        self.assertEqual(selected["prebuilt_cleanup_generation"], CLEANUP)
+
+        metadata = json.loads(
+            (cleanup_root / "metadata.json").read_text(encoding="utf-8")
+        )
+        metadata["draft"] = False
+        (cleanup_root / "metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(promotion.PromotionError, "must remain draft"):
+            promotion.select_candidate(A2, candidates, current_root)
 
     def test_cleanup_schema_v2_barrier_is_enforced_before_publication(self) -> None:
         root = self.root / CLEANUP
@@ -699,18 +711,23 @@ class ReleasePromotionTests(unittest.TestCase):
         candidates = self.root / "candidates"
         predecessor_root = candidates / A2
         bridge_root = candidates / BRIDGE
-        self.write_release(
+        self.write_historical_current(
             predecessor_root,
-            stage="source_owner",
             generation=A2,
-            predecessor=P1,
-            draft=False,
+            predecessor=SOURCE_PREDECESSOR,
         )
         self.write_release(
             bridge_root,
             stage="bridge",
             generation=BRIDGE,
             predecessor=A2,
+            draft=True,
+        )
+        self.write_release(
+            candidates / CLEANUP,
+            stage="cleanup",
+            generation=CLEANUP,
+            predecessor=BRIDGE,
             draft=True,
         )
 
@@ -835,6 +852,72 @@ class ReleasePromotionTests(unittest.TestCase):
                 target_e,
                 e_root,
             )
+
+    def test_target_publication_predecessor_is_bound_at_seal_time(self) -> None:
+        root = self.root / ("7" * 40)
+        generation = root.name
+        self.write_release(
+            root,
+            stage="target_baseline",
+            generation=generation,
+            predecessor=CLEANUP,
+            draft=True,
+        )
+        dynamic_predecessor = "6" * 40
+        record = promotion.build_promotion(
+            root / "release-transition.json",
+            root / "release.json",
+            root / "release-transition-challenge.schema.json",
+            root / "release-transition-receipt.schema.json",
+            generation,
+            root,
+            dynamic_predecessor,
+        )
+        self.assertEqual(record["predecessor_generation"], dynamic_predecessor)
+        (root / "promotion.json").write_text(json.dumps(record), encoding="utf-8")
+        validated = promotion.validate_promotion(
+            root / "promotion.json",
+            root / "release-transition.json",
+            root / "release.json",
+            root / "release-transition-challenge.schema.json",
+            root / "release-transition-receipt.schema.json",
+            generation,
+            root,
+        )
+        self.assertEqual(validated["predecessor_generation"], dynamic_predecessor)
+
+    def test_target_publication_slot_rejects_second_sealed_direct_successor(self) -> None:
+        slot = self.root / "target-slot"
+        first = "7" * 40
+        second = "8" * 40
+        self.write_release(
+            slot / first,
+            stage="target_baseline",
+            generation=first,
+            predecessor=CLEANUP,
+            draft=True,
+        )
+        promotion.ensure_publication_slot(CLEANUP, first, "target_baseline", slot)
+        with self.assertRaisesRegex(promotion.PromotionError, "slot is occupied"):
+            promotion.ensure_publication_slot(CLEANUP, second, "target_baseline", slot)
+
+    def test_transition_publication_slot_also_rejects_duplicate_bridge_or_cleanup(self) -> None:
+        for stage, predecessor in (("bridge", A2), ("cleanup", BRIDGE)):
+            with self.subTest(stage=stage):
+                slot = self.root / f"{stage}-slot"
+                first = "9" * 40
+                second = "a" * 40
+                self.write_release(
+                    slot / first,
+                    stage=stage,
+                    generation=first,
+                    predecessor=predecessor,
+                    draft=True,
+                )
+                with self.assertRaisesRegex(promotion.PromotionError, "slot is occupied"):
+                    promotion.ensure_publication_slot(
+                        predecessor, second, stage, slot
+                    )
 
     def _signed_receipt_fixture(self) -> tuple[
         dict[str, object],
@@ -983,7 +1066,7 @@ class ReleasePromotionTests(unittest.TestCase):
         for field, wrong in (
             ("deployment_id", "deployment-2"),
             ("profile_id", "agent-platform-v1"),
-            ("observed_generation", P1),
+            ("observed_generation", SOURCE_PREDECESSOR),
             ("capability", "target_owner"),
             ("status", "committed"),
         ):
@@ -1068,9 +1151,9 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertIn("invalid paginated releases response", evaluator)
         self.assertIn("invalid paginated workflow jobs response", evaluator)
         self.assertIn("downloaded release directory mismatch", evaluator)
-        self.assertIn("--current-compat-root", evaluator)
-        self.assertIn("canonical P1 release has an unexpected asset directory", evaluator)
-        self.assertIn("source_owner_compat.generation", evaluator)
+        self.assertIn("Current release is not a complete sealed generation", evaluator)
+        self.assertNotIn("--current-compat-root", evaluator)
+        self.assertNotIn("source_owner_compat", evaluator)
         self.assertEqual(
             evaluator.count("scripts/verify-release-images-anonymous.sh"), 4
         )
@@ -1089,6 +1172,46 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertIn("Triggering Container release run has no unique provenance", evaluator)
         self.assertIn("execution_head_sha", evaluator)
         self.assertIn("qualification_head_sha", evaluator)
+        self.assertIn("Verify real Manager restart and watchdog cgroups", container)
+        self.assertIn("Verify Bridge persistent helper cgroup", container)
+        self.assertIn('AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"', container)
+        self.assertIn("scripts/release_promotion.py verify-receipt", evaluator)
+        self.assertIn("RELEASE_TRANSITION_ED25519_PUBLIC_KEY_PEM", evaluator)
+        self.assertIn("--candidate-stage \"$CANDIDATE_STAGE\"", evaluator)
+        for retired_bridge_qualification in (
+            "release-transition-qualification.schema.json",
+            "scripts/release_qualification.py",
+            "Bridge qualification artifact",
+            "--bridge-qualification",
+            "provenance_harness_sha",
+            "Predecessor crash qualification",
+            "bridge-predecessor-qualification",
+        ):
+            self.assertNotIn(retired_bridge_qualification, evaluator)
+        self.assertIn("agent-platform-compose.yaml", container)
+        self.assertIn("agent-platform-manager-linux-amd64", container)
+        self.assertIn("Cleanup must be prebuilt while its Bridge predecessor remains draft", container)
+        self.assertIn("Cleanup predecessor has no exact successful sealed publisher provenance", container)
+        self.assertEqual(
+            container.count('elif [[ -n "$expected_id" ]]; then'), 1
+        )
+        self.assertIn("Expected pulled image ${reference} (${expected_id}) is already missing", container)
+        self.assertIn("prebuilt_cleanup_generation", evaluator)
+        self.assertIn("prebuilt Cleanup sealed asset drift", evaluator)
+        self.assertIn("group: container-publish-main", container)
+        self.assertIn("scripts/release_promotion.py ensure-publication-slot", container)
+        self.assertIn('promotion_args+=(--predecessor-generation "$predecessor")', container)
+        self.assertIn("action == 'prepare_cleanup'", evaluator)
+        self.assertIn("Queue the canonical missing Cleanup release", evaluator)
+        self.assertIn('gh workflow run container-release.yml', evaluator)
+        self.assertIn("Queue the latest qualified target-only main generation", evaluator)
+        self.assertIn("Continue the sealed transition chain", evaluator)
+        self.assertIn("if: needs.prepare.outputs.transition_stage == 'bridge'", container)
+        self.assertIn("./internal/handoffhost", container)
+        self.assertIn("manager_command=./cmd/agent-platform-manager", container)
+        self.assertIn('matrix: ${{ fromJSON(needs.prepare.outputs.image_matrix) }}', container)
+        self.assertIn('[[ "$TRANSITION_STAGE" == bridge ]] && expected_images=11', container)
+        self.assertIn("agent-platform-compose.yaml", evaluator)
         self.assertIn('cmp "$SEALED_IDENTITY" "$before"', evaluator)
         self.assertEqual(evaluator.count('cmp "$SEALED_IDENTITY" "$before"'), 2)
         self.assertEqual(evaluator.count("releases/latest"), 4)
@@ -1097,17 +1220,14 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertNotIn("requested='${{ inputs.candidate_generation }}'", evaluator)
         self.assertIn('[[ ! "$CHALLENGE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]', evaluator)
         normalized = " ".join(evaluator.split())
-        ordinary = (
-            "(steps.select.outputs.candidate_stage == 'source_owner' || "
-            "steps.select.outputs.candidate_stage == 'target_baseline')"
-        )
+        ordinary = "steps.select.outputs.candidate_stage == 'target_baseline'"
         gated = (
             "(steps.select.outputs.candidate_stage == 'bridge' || "
             "steps.select.outputs.candidate_stage == 'cleanup')"
         )
         self.assertIn(ordinary, normalized)
         self.assertEqual(normalized.count(gated), 3)
-        self.assertNotIn("candidate_stage != 'source_owner'", evaluator)
+        self.assertNotIn("candidate_stage == 'source_owner'", evaluator)
         for workflow in (REPOSITORY_ROOT / ".github/workflows").glob("*.yml"):
             if workflow.name == "channel-promotion.yml":
                 continue

@@ -34,6 +34,7 @@ from docs_sync import (
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_RE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 PROMOTION_KEYS = {
     "schema_version",
     "transition_id",
@@ -51,7 +52,7 @@ PROMOTION_KEYS = {
     "sealed_assets",
 }
 SEALED_ASSET_KEYS = {"name", "sha256", "size"}
-SEALED_RELEASE_ASSETS = tuple(
+BRIDGE_SEALED_RELEASE_ASSETS = tuple(
     sorted(
         {
             "install.sh",
@@ -65,7 +66,20 @@ SEALED_RELEASE_ASSETS = tuple(
         }
     )
 )
-ALL_RELEASE_ASSETS = tuple(sorted((*SEALED_RELEASE_ASSETS, "promotion.json")))
+TARGET_SEALED_RELEASE_ASSETS = tuple(
+    sorted(
+        {
+            "install.sh",
+            "install.sh.sha256",
+            "release.json",
+            "agent-platform-compose.yaml",
+            "agent-platform-manager-linux-amd64",
+            "agent-platform-manager-linux-amd64.sha256",
+            "agent-platform-manager-linux-arm64",
+            "agent-platform-manager-linux-arm64.sha256",
+        }
+    )
+)
 PUBLISHER_WORKFLOW_PATH = ".github/workflows/container-release.yml"
 PUBLISHER_EVENTS = {"workflow_run", "workflow_dispatch"}
 PUBLISHER_PROVENANCE_KEYS = {
@@ -78,9 +92,11 @@ PUBLISHER_PROVENANCE_KEYS = {
     "execution_head_branch",
     "execution_head_sha",
     "source_commit",
+    "candidate_stage",
     "source_selection",
     "release",
 }
+PUBLISHER_STAGES = {"bridge", "cleanup", "target_baseline"}
 SOURCE_SELECTION_KEYS = {
     "kind",
     "resolution",
@@ -121,11 +137,26 @@ ORDINARY_MANIFEST_KEYS = {
     "compose",
     "images",
 }
+BRIDGE_MANIFEST_KEYS = ORDINARY_MANIFEST_KEYS | {"namespace_handoff"}
 STAGE_PREDECESSOR = {
     "bridge": "source_owner",
     "cleanup": "bridge",
 }
 TARGET_BASELINE_PREDECESSORS = {"cleanup", "target_baseline"}
+MANAGED_IMAGES_V1 = {
+    "platform",
+    "agent-runtime",
+    "camofox",
+    "agent-sandbox",
+    "searxng",
+    "firecrawl-api",
+    "firecrawl-playwright",
+    "firecrawl-postgres",
+    "firecrawl-redis",
+    "firecrawl-rabbitmq",
+    "handoff-fs-helper",
+}
+MANAGED_IMAGES_V2 = MANAGED_IMAGES_V1 - {"handoff-fs-helper"}
 
 
 class PromotionError(RuntimeError):
@@ -159,7 +190,19 @@ def _require_regular(path: Path, label: str) -> None:
         _fail(f"{label} must be a regular non-symlink file: {path}")
 
 
-def _sealed_assets(root: Path) -> list[dict[str, Any]]:
+def _release_assets(stage: str) -> tuple[str, ...]:
+    if stage in {"source_owner", "bridge"}:
+        return BRIDGE_SEALED_RELEASE_ASSETS
+    if stage in {"cleanup", "target_baseline"}:
+        return TARGET_SEALED_RELEASE_ASSETS
+    _fail(f"unsupported release stage: {stage!r}")
+
+
+def _all_release_assets(stage: str) -> tuple[str, ...]:
+    return tuple(sorted((*_release_assets(stage), "promotion.json")))
+
+
+def _sealed_assets(root: Path, stage: str) -> list[dict[str, Any]]:
     try:
         info = root.lstat()
     except FileNotFoundError as exc:
@@ -167,7 +210,7 @@ def _sealed_assets(root: Path) -> list[dict[str, Any]]:
     if not stat.S_ISDIR(info.st_mode) or root.is_symlink():
         _fail(f"sealed asset root must be a non-symlink directory: {root}")
     assets: list[dict[str, Any]] = []
-    for name in SEALED_RELEASE_ASSETS:
+    for name in _release_assets(stage):
         path = root / name
         _require_regular(path, f"sealed release asset {name}")
         size = path.stat().st_size
@@ -177,8 +220,11 @@ def _sealed_assets(root: Path) -> list[dict[str, Any]]:
     return assets
 
 
-def _validate_sealed_assets(value: Any, manifest_sha256: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or len(value) != len(SEALED_RELEASE_ASSETS):
+def _validate_sealed_assets(
+    value: Any, manifest_sha256: str, stage: str
+) -> list[dict[str, Any]]:
+    release_assets = _release_assets(stage)
+    if not isinstance(value, list) or len(value) != len(release_assets):
         _fail("sealed asset directory must have the exact closed release shape")
     names: list[str] = []
     assets: list[dict[str, Any]] = []
@@ -189,7 +235,7 @@ def _validate_sealed_assets(value: Any, manifest_sha256: str) -> list[dict[str, 
         name = asset.get("name")
         digest = asset.get("sha256")
         size = asset.get("size")
-        if not isinstance(name, str) or name not in SEALED_RELEASE_ASSETS:
+        if not isinstance(name, str) or name not in release_assets:
             _fail("sealed release asset has an unknown name")
         if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
             _fail(f"sealed release asset has an invalid digest: {name}")
@@ -197,7 +243,7 @@ def _validate_sealed_assets(value: Any, manifest_sha256: str) -> list[dict[str, 
             _fail(f"sealed release asset has an invalid size: {name}")
         names.append(name)
         assets.append({"name": name, "sha256": digest, "size": size})
-    if names != list(SEALED_RELEASE_ASSETS) or len(set(names)) != len(names):
+    if names != list(release_assets) or len(set(names)) != len(names):
         _fail("sealed release assets must be unique and sorted by exact name")
     release_asset = next(asset for asset in assets if asset["name"] == "release.json")
     if release_asset["sha256"] != manifest_sha256:
@@ -205,7 +251,9 @@ def _validate_sealed_assets(value: Any, manifest_sha256: str) -> list[dict[str, 
     return assets
 
 
-def validate_release_identity(value: Any, generation: str) -> dict[str, Any]:
+def validate_release_identity(
+    value: Any, generation: str, stage: str
+) -> dict[str, Any]:
     """Validate the closed GitHub Release identity sealed by a publish attempt."""
 
     if COMMIT_RE.fullmatch(generation) is None:
@@ -223,8 +271,9 @@ def validate_release_identity(value: Any, generation: str) -> dict[str, Any]:
         or identity.get("prerelease") is not False
     ):
         _fail("release identity does not match the candidate generation")
+    all_release_assets = _all_release_assets(stage)
     raw_assets = identity.get("assets")
-    if not isinstance(raw_assets, list) or len(raw_assets) != len(ALL_RELEASE_ASSETS):
+    if not isinstance(raw_assets, list) or len(raw_assets) != len(all_release_assets):
         _fail("release identity must contain the exact closed asset set")
     assets: list[dict[str, Any]] = []
     names: list[str] = []
@@ -239,7 +288,7 @@ def validate_release_identity(value: Any, generation: str) -> dict[str, Any]:
         size = asset.get("size")
         if isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0:
             _fail("release identity asset has an invalid id")
-        if not isinstance(name, str) or name not in ALL_RELEASE_ASSETS:
+        if not isinstance(name, str) or name not in all_release_assets:
             _fail("release identity asset has an unknown name")
         if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
             _fail(f"release identity asset has an invalid digest: {name}")
@@ -258,7 +307,7 @@ def validate_release_identity(value: Any, generation: str) -> dict[str, Any]:
                 "state": "uploaded",
             }
         )
-    if names != list(ALL_RELEASE_ASSETS) or len(set(names)) != len(names):
+    if names != list(all_release_assets) or len(set(names)) != len(names):
         _fail("release identity assets must be unique and sorted by exact name")
     if len(set(ids)) != len(ids):
         _fail("release identity asset ids must be unique")
@@ -281,6 +330,7 @@ def build_publisher_provenance(
     source_commit: str,
     source_selection: Any,
     release_identity: Any,
+    candidate_stage: str,
 ) -> dict[str, Any]:
     """Bind one successful Container release attempt to exact GitHub assets."""
 
@@ -302,7 +352,7 @@ def build_publisher_provenance(
     selection = validate_source_selection(
         source_selection, repository, workflow_event, source_commit
     )
-    release = validate_release_identity(release_identity, source_commit)
+    release = validate_release_identity(release_identity, source_commit, candidate_stage)
     return {
         "schema_version": 1,
         "repository": repository,
@@ -313,6 +363,7 @@ def build_publisher_provenance(
         "execution_head_branch": "main",
         "execution_head_sha": execution_head_sha,
         "source_commit": source_commit,
+        "candidate_stage": candidate_stage,
         "source_selection": selection,
         "release": release,
     }
@@ -369,6 +420,7 @@ def validate_publisher_provenance(
     source_commit: str,
     source_selection: Any,
     release_identity: Any,
+    candidate_stage: str,
 ) -> dict[str, Any]:
     provenance = _object(value, "publisher provenance")
     if set(provenance) != PUBLISHER_PROVENANCE_KEYS:
@@ -382,6 +434,7 @@ def validate_publisher_provenance(
         source_commit,
         source_selection,
         release_identity,
+        candidate_stage,
     )
     if provenance != expected:
         _fail("publisher provenance does not match the successful release attempt")
@@ -430,87 +483,90 @@ def _validate_manifest_for_stage(
     stage = contract["stage"]
     protocol = contract["manifest_protocol"]
     schema_version = manifest.get("schema_version")
-    if stage == "source_owner":
-        if schema_version != protocol["ordinary_schema_version"]:
-            _fail("source_owner must use the ordinary manifest schema")
-        if set(manifest) != ORDINARY_MANIFEST_KEYS:
-            _fail("source_owner manifest must preserve the exact ordinary nine-key shape")
-    elif stage == "bridge":
+    images = _object(manifest.get("images"), f"{stage} manifest images")
+    if any(
+        not isinstance(reference, str) or IMAGE_RE.fullmatch(reference) is None
+        for reference in images.values()
+    ):
+        _fail(f"{stage} manifest contains a non-immutable image reference")
+    if stage == "bridge":
         if schema_version != protocol["bridge_schema_version"]:
             _fail("bridge must use the bridge manifest schema")
-        if not isinstance(manifest.get("namespace_handoff"), dict):
-            _fail("bridge manifest must carry namespace_handoff")
+        if set(manifest) != BRIDGE_MANIFEST_KEYS:
+            _fail("bridge manifest must have the exact ordinary-plus-handoff shape")
+        if manifest.get("protocol_version") != 1 or set(images) != MANAGED_IMAGES_V1:
+            _fail("bridge manifest must use protocol 1 and the exact eleven-image set")
+        descriptor = _object(manifest.get("namespace_handoff"), "bridge namespace_handoff")
+        if set(descriptor) != {
+            "schema_version",
+            "predecessor_generation",
+            "bridge_generation",
+            "source",
+            "target",
+        }:
+            _fail("bridge namespace_handoff must be a closed descriptor")
+        if (
+            descriptor.get("schema_version") != 1
+            or descriptor.get("predecessor_generation")
+            != contract["predecessor_generation"]
+            or descriptor.get("bridge_generation") != generation
+        ):
+            _fail("bridge namespace_handoff generation binding is invalid")
+        source = _object(descriptor.get("source"), "bridge namespace_handoff source")
+        target = _object(descriptor.get("target"), "bridge namespace_handoff target")
+        for name, binding, profile, version in (
+            (
+                "source",
+                source,
+                contract["source_profile_id"],
+                contract["predecessor_generation"],
+            ),
+            ("target", target, contract["target_profile_id"], generation),
+        ):
+            if set(binding) != {"profile_id", "manager", "compose"}:
+                _fail(f"bridge {name} binding must be a closed object")
+            if binding.get("profile_id") != profile:
+                _fail(f"bridge {name} profile does not match the transition contract")
+            manager = _object(binding.get("manager"), f"bridge {name} manager")
+            compose = _object(binding.get("compose"), f"bridge {name} compose")
+            if set(manager) != {"version", "artifacts"} or manager.get("version") != version:
+                _fail(f"bridge {name} manager identity is invalid")
+            artifacts = _object(manager.get("artifacts"), f"bridge {name} manager artifacts")
+            if set(artifacts) != {"amd64", "arm64"}:
+                _fail(f"bridge {name} manager artifacts must contain exactly amd64 and arm64")
+            for arch, artifact_value in artifacts.items():
+                artifact = _object(artifact_value, f"bridge {name} manager {arch}")
+                if (
+                    set(artifact) != {"url", "sha256"}
+                    or not isinstance(artifact.get("url"), str)
+                    or not artifact["url"].startswith("https://")
+                    or not isinstance(artifact.get("sha256"), str)
+                    or SHA256_RE.fullmatch(artifact["sha256"]) is None
+                ):
+                    _fail(f"bridge {name} manager {arch} artifact is invalid")
+            if (
+                set(compose) != {"url", "sha256"}
+                or not isinstance(compose.get("url"), str)
+                or not compose["url"].startswith("https://")
+                or not isinstance(compose.get("sha256"), str)
+                or SHA256_RE.fullmatch(compose["sha256"]) is None
+            ):
+                _fail(f"bridge {name} compose artifact is invalid")
+        if target["manager"] != manifest.get("manager"):
+            _fail("bridge target manager must exactly match the top-level manager")
+        if target["compose"] != manifest.get("compose"):
+            _fail("bridge target compose must exactly match the top-level compose")
     elif stage in {"cleanup", "target_baseline"}:
         if schema_version != protocol["cleanup_schema_version"]:
             _fail(f"{stage} must use the target-only manifest schema-v2 barrier")
         if "namespace_handoff" in manifest:
             _fail(f"{stage} manifest must not retain the one-time namespace_handoff descriptor")
+        if set(manifest) != ORDINARY_MANIFEST_KEYS:
+            _fail(f"{stage} manifest must have the exact target-only shape")
+        if manifest.get("protocol_version") != 2 or set(images) != MANAGED_IMAGES_V2:
+            _fail(f"{stage} manifest must use protocol 2 and the exact ten-image set")
     else:  # contract validation already protects this
         _fail(f"unsupported transition stage: {stage!r}")
-
-
-def validate_source_owner_compat(
-    root: Path,
-    contract: dict[str, Any],
-    current_generation: str,
-) -> dict[str, Any]:
-    """Validate the one canonical pre-promotion P1 release directory.
-
-    P1 predates ``promotion.json`` and publisher provenance.  This is not a
-    generic legacy decoder: it is enabled only by the source-owner contract
-    and accepts the exact eight-asset release plus the two contract-pinned
-    byte digests.
-    """
-
-    compat = contract.get("source_owner_compat")
-    if contract.get("stage") != "source_owner" or not isinstance(compat, dict):
-        _fail("legacy current release is allowed only by source_owner_compat")
-    if compat.get("generation") != current_generation:
-        _fail("source_owner_compat does not bind the exact current generation")
-    try:
-        root_info = root.lstat()
-    except FileNotFoundError as exc:
-        raise PromotionError("canonical source_owner predecessor directory is missing") from exc
-    if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
-        _fail("canonical source_owner predecessor root must be a non-symlink directory")
-    actual_names = sorted(path.name for path in root.iterdir())
-    if actual_names != list(SEALED_RELEASE_ASSETS):
-        _fail("canonical source_owner predecessor must have the exact P1 asset set")
-    observed_assets = _sealed_assets(root)
-    observed = {asset["name"]: asset for asset in observed_assets}
-    if observed["release.json"]["sha256"] != compat.get("manifest_sha256"):
-        _fail("canonical source_owner predecessor manifest bytes do not match the contract")
-    if observed["ubitech-compose.yaml"]["sha256"] != compat.get("compose_sha256"):
-        _fail("canonical source_owner predecessor Compose bytes do not match the contract")
-    manifest = _object(
-        read_strict_json(root / "release.json", "canonical source_owner predecessor manifest"),
-        "canonical source_owner predecessor manifest",
-    )
-    if (
-        set(manifest) != ORDINARY_MANIFEST_KEYS
-        or manifest.get("schema_version") != 1
-        or manifest.get("channel") != "main"
-        or manifest.get("source_commit") != current_generation
-        or manifest.get("protocol_version") != 1
-    ):
-        _fail("canonical source_owner predecessor manifest has the wrong closed identity")
-    manager = _object(manifest.get("manager"), "canonical source_owner predecessor manager")
-    compose = _object(manifest.get("compose"), "canonical source_owner predecessor compose")
-    if manager.get("version") != current_generation:
-        _fail("canonical source_owner predecessor Manager version is wrong")
-    if compose.get("sha256") != compat.get("compose_sha256"):
-        _fail("canonical source_owner predecessor manifest does not bind its Compose bytes")
-    images = _object(manifest.get("images"), "canonical source_owner predecessor images")
-    expected_images = compat.get("managed_images")
-    if not isinstance(expected_images, list) or sorted(images) != expected_images:
-        _fail("canonical source_owner predecessor does not have the exact P1 image set")
-    if any(
-        not isinstance(image, str)
-        or re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image) is None
-        for image in images.values()
-    ):
-        _fail("canonical source_owner predecessor has an invalid image digest")
-    return manifest
 
 
 def _promotion_core(
@@ -519,6 +575,7 @@ def _promotion_core(
     challenge_schema_path: Path,
     receipt_schema_path: Path,
     generation: str,
+    predecessor_generation: str | None = None,
 ) -> dict[str, Any]:
     if COMMIT_RE.fullmatch(generation) is None:
         _fail("generation must be a lowercase 40-character commit")
@@ -535,11 +592,19 @@ def _promotion_core(
         _fail("receipt schema is not draft 2020-12")
     _validate_manifest_for_stage(manifest, contract, generation)
     stage = contract["stage"]
+    if predecessor_generation is not None:
+        if stage != "target_baseline":
+            _fail("only target_baseline may bind its public predecessor at publication")
+        if (
+            COMMIT_RE.fullmatch(predecessor_generation) is None
+            or predecessor_generation == generation
+        ):
+            _fail("target_baseline publication predecessor is invalid")
+    else:
+        predecessor_generation = contract["predecessor_generation"]
     receipt_policy = contract["deployment_receipt"]
     required_receipt: str | None
-    if stage == "source_owner":
-        required_receipt = None
-    elif stage == "bridge":
+    if stage == "bridge":
         required_receipt = receipt_policy["source_owner_receipt_type"]
     elif stage == "cleanup":
         required_receipt = receipt_policy["target_commit_receipt_type"]
@@ -552,7 +617,7 @@ def _promotion_core(
         "transition_id": contract["transition_id"],
         "stage": stage,
         "generation": generation,
-        "predecessor_generation": contract["predecessor_generation"],
+        "predecessor_generation": predecessor_generation,
         "source_profile_id": contract["source_profile_id"],
         "target_profile_id": contract["target_profile_id"],
         "manifest_schema_version": manifest["schema_version"],
@@ -571,6 +636,7 @@ def build_promotion(
     receipt_schema_path: Path,
     generation: str,
     assets_root: Path,
+    predecessor_generation: str | None = None,
 ) -> dict[str, Any]:
     result = _promotion_core(
         contract_path,
@@ -578,9 +644,13 @@ def build_promotion(
         challenge_schema_path,
         receipt_schema_path,
         generation,
+        predecessor_generation,
     )
-    result["sealed_assets"] = _sealed_assets(assets_root)
-    _validate_sealed_assets(result["sealed_assets"], result["manifest_sha256"])
+    stage = result["stage"]
+    result["sealed_assets"] = _sealed_assets(assets_root, stage)
+    _validate_sealed_assets(
+        result["sealed_assets"], result["manifest_sha256"], stage
+    )
     return result
 
 
@@ -599,8 +669,11 @@ def validate_promotion(
     )
     if set(promotion) != PROMOTION_KEYS:
         _fail("promotion record must have the exact closed shape")
+    stage = promotion.get("stage")
+    if not isinstance(stage, str):
+        _fail("promotion record has no valid stage")
     sealed_assets = _validate_sealed_assets(
-        promotion.get("sealed_assets"), promotion.get("manifest_sha256")
+        promotion.get("sealed_assets"), promotion.get("manifest_sha256"), stage
     )
     expected = _promotion_core(
         contract_path,
@@ -608,11 +681,16 @@ def validate_promotion(
         challenge_schema_path,
         receipt_schema_path,
         generation,
+        promotion.get("predecessor_generation")
+        if stage == "target_baseline"
+        else None,
     )
     expected["sealed_assets"] = (
-        _sealed_assets(assets_root) if assets_root is not None else sealed_assets
+        _sealed_assets(assets_root, stage) if assets_root is not None else sealed_assets
     )
-    _validate_sealed_assets(expected["sealed_assets"], expected["manifest_sha256"])
+    _validate_sealed_assets(
+        expected["sealed_assets"], expected["manifest_sha256"], stage
+    )
     if promotion != expected:
         _fail("promotion record does not match its immutable contract and release assets")
     return promotion
@@ -629,6 +707,126 @@ def _load_metadata(path: Path, generation: str) -> dict[str, Any]:
     ):
         _fail("release metadata does not match candidate generation")
     return metadata
+
+
+def ensure_publication_slot(
+    current_generation: str,
+    candidate_generation: str,
+    candidate_stage: str,
+    candidates_root: Path,
+) -> None:
+    """Reject a second sealed same-stage draft for one direct predecessor.
+
+    The caller materializes only draft releases whose promotion asset already
+    exists (promotion.json is the seal uploaded last).  Container publishers
+    invoke this beneath the repository-wide publish concurrency group.
+    """
+
+    for label, generation in (
+        ("current", current_generation),
+        ("candidate", candidate_generation),
+    ):
+        if COMMIT_RE.fullmatch(generation) is None:
+            _fail(f"{label} generation must be a lowercase 40-character commit")
+    if candidate_stage not in {"bridge", "cleanup", "target_baseline"}:
+        _fail("publication slot candidate stage is invalid")
+    if not candidates_root.is_dir() or candidates_root.is_symlink():
+        _fail("target publication slot root must be a non-symlink directory")
+    blockers: list[str] = []
+    for root in sorted(candidates_root.iterdir()):
+        if not root.is_dir() or COMMIT_RE.fullmatch(root.name) is None:
+            _fail("target publication slot contains an unknown entry")
+        metadata = _load_metadata(root / "metadata.json", root.name)
+        if metadata["draft"] is not True:
+            _fail("target publication slot input must contain only drafts")
+        record = _object(
+            read_strict_json(root / "promotion.json", "target draft promotion"),
+            "target draft promotion",
+        )
+        record_stage = record.get("stage")
+        if record_stage not in {"bridge", "cleanup", "target_baseline"}:
+            _fail("sealed draft promotion stage is invalid")
+        if record_stage != candidate_stage:
+            continue
+        if record.get("generation") != root.name:
+            _fail("target draft promotion generation does not match its directory")
+        predecessor = record.get("predecessor_generation")
+        if not isinstance(predecessor, str) or COMMIT_RE.fullmatch(predecessor) is None:
+            _fail("target draft promotion predecessor is invalid")
+        if predecessor == current_generation and root.name != candidate_generation:
+            blockers.append(root.name)
+    if blockers:
+        _fail(
+            "target publication slot is occupied by sealed direct successor "
+            + ",".join(blockers)
+        )
+
+
+def _validate_historical_source_owner_current(
+    root: Path, generation: str
+) -> dict[str, Any]:
+    """Verify the sealed predecessor without reviving its retired parser."""
+
+    promotion_path = root / "promotion.json"
+    _require_regular(promotion_path, "historical promotion record")
+    record = _object(
+        read_strict_json(promotion_path, "historical promotion record"),
+        "historical promotion record",
+    )
+    if set(record) != PROMOTION_KEYS:
+        _fail("historical promotion record must have the exact closed shape")
+    if (
+        record.get("schema_version") != 1
+        or record.get("stage") != "source_owner"
+        or record.get("generation") != generation
+        or record.get("manifest_schema_version") != 1
+        or record.get("required_receipt_type") is not None
+        or not isinstance(record.get("transition_id"), str)
+        or not record["transition_id"]
+        or not isinstance(record.get("source_profile_id"), str)
+        or not record["source_profile_id"]
+        or not isinstance(record.get("target_profile_id"), str)
+        or not record["target_profile_id"]
+        or not isinstance(record.get("predecessor_generation"), str)
+        or COMMIT_RE.fullmatch(record["predecessor_generation"]) is None
+    ):
+        _fail("historical source-owner promotion identity is invalid")
+    bound_files = {
+        "manifest_sha256": root / "release.json",
+        "contract_sha256": root / "release-transition.json",
+        "challenge_schema_sha256": root
+        / "release-transition-challenge.schema.json",
+        "receipt_schema_sha256": root / "release-transition-receipt.schema.json",
+    }
+    for field, path in bound_files.items():
+        _require_regular(path, f"historical {field} file")
+        digest = record.get(field)
+        if (
+            not isinstance(digest, str)
+            or SHA256_RE.fullmatch(digest) is None
+            or digest != _sha256(path)
+        ):
+            _fail(f"historical source-owner {field} does not match sealed bytes")
+    sealed = _validate_sealed_assets(
+        record.get("sealed_assets"), record["manifest_sha256"], "source_owner"
+    )
+    if sealed != _sealed_assets(root, "source_owner"):
+        _fail("historical source-owner sealed asset directory has drifted")
+    manifest = _object(
+        read_strict_json(root / "release.json", "historical release manifest"),
+        "historical release manifest",
+    )
+    if (
+        set(manifest) != ORDINARY_MANIFEST_KEYS
+        or manifest.get("schema_version") != 1
+        or manifest.get("protocol_version") != 1
+        or manifest.get("channel") != "main"
+        or manifest.get("source_commit") != generation
+    ):
+        _fail("historical source-owner manifest identity is invalid")
+    if _load_metadata(root / "metadata.json", generation)["draft"] is not False:
+        _fail("historical source-owner current release must already be public")
+    return record
 
 
 def _validate_predecessor_artifact_binding(
@@ -659,27 +857,75 @@ def _validate_predecessor_artifact_binding(
         _fail("bridge source compose must exactly match the predecessor manifest")
 
 
-def _validate_transition_binding(
-    candidate: dict[str, Any],
-    current: dict[str, Any],
-    *,
-    label: str,
-) -> None:
-    for field in ("transition_id", "source_profile_id", "target_profile_id"):
-        if candidate[field] != current[field]:
-            _fail(f"{label} changes transition binding {field}")
+def _prebuilt_cleanup_for_bridge(
+    candidates_root: Path, bridge: dict[str, Any]
+) -> str | None:
+    """Require the sealed target-only escape hatch before Bridge visibility.
+
+    Cleanup is intentionally assembled while Bridge is still draft.  Merely
+    documenting that ordering is not enough: the serialized evaluator must
+    refuse to issue a Bridge challenge until one immutable Cleanup draft is
+    already present and directly bound to that Bridge generation.
+    """
+
+    matches: list[str] = []
+    bridge_generation = bridge["generation"]
+    for root in sorted(candidates_root.iterdir()):
+        if (
+            not root.is_dir()
+            or root.name == bridge_generation
+            or COMMIT_RE.fullmatch(root.name) is None
+            or not (root / "promotion.json").is_file()
+        ):
+            continue
+        header = _object(
+            read_strict_json(root / "promotion.json", "prebuilt Cleanup promotion"),
+            "prebuilt Cleanup promotion",
+        )
+        if (
+            header.get("stage") != "cleanup"
+            or header.get("predecessor_generation") != bridge_generation
+        ):
+            continue
+        cleanup = validate_promotion(
+            root / "promotion.json",
+            root / "release-transition.json",
+            root / "release.json",
+            root / "release-transition-challenge.schema.json",
+            root / "release-transition-receipt.schema.json",
+            root.name,
+        )
+        if _load_metadata(root / "metadata.json", root.name)["draft"] is not True:
+            _fail("prebuilt Cleanup must remain draft before Bridge publication")
+        for field in ("transition_id", "source_profile_id", "target_profile_id"):
+            if cleanup[field] != bridge[field]:
+                _fail(f"prebuilt Cleanup changes Bridge transition binding {field}")
+        matches.append(root.name)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        _fail("Bridge has multiple sealed direct Cleanup drafts")
+    return matches[0]
 
 
 def select_candidate(
     current_generation: str,
     candidates_root: Path,
     current_root: Path | None,
-    current_compat_root: Path | None = None,
 ) -> dict[str, Any]:
     if COMMIT_RE.fullmatch(current_generation) is None:
         _fail("current generation must be a lowercase 40-character commit")
-    current_promotion: dict[str, Any] | None = None
-    if current_root is not None:
+    if current_root is None:
+        _fail("current release must have a complete sealed promotion directory")
+    current_header = _object(
+        read_strict_json(current_root / "promotion.json", "current promotion record"),
+        "current promotion record",
+    )
+    if current_header.get("stage") == "source_owner":
+        current_promotion = _validate_historical_source_owner_current(
+            current_root, current_generation
+        )
+    else:
         current_promotion = validate_promotion(
             current_root / "promotion.json",
             current_root / "release-transition.json",
@@ -687,6 +933,7 @@ def select_candidate(
             current_root / "release-transition-challenge.schema.json",
             current_root / "release-transition-receipt.schema.json",
             current_generation,
+            current_root,
         )
     eligible: list[dict[str, Any]] = []
     if not candidates_root.is_dir():
@@ -697,6 +944,16 @@ def select_candidate(
         generation = candidate_root.name
         if generation == current_generation:
             continue
+        candidate_header = _object(
+            read_strict_json(
+                candidate_root / "promotion.json", "candidate promotion record"
+            ),
+            "candidate promotion record",
+        )
+        if candidate_header.get("predecessor_generation") != current_generation:
+            continue
+        if candidate_header.get("stage") == "source_owner":
+            _fail("new source_owner releases are closed after the sealed predecessor")
         promotion = validate_promotion(
             candidate_root / "promotion.json",
             candidate_root / "release-transition.json",
@@ -706,47 +963,18 @@ def select_candidate(
             generation,
         )
         metadata = _load_metadata(candidate_root / "metadata.json", generation)
-        candidate_contract = _load_contract(candidate_root / "release-transition.json")
         stage = promotion["stage"]
-        if promotion["predecessor_generation"] != current_generation:
-            continue
         if metadata["draft"] is not True:
             _fail(f"unpromoted {stage} release is not draft")
-        if stage == "source_owner":
-            if current_promotion is None:
-                if current_compat_root is None:
-                    _fail("source_owner requires the exact canonical P1 predecessor release")
-                validate_source_owner_compat(
-                    current_compat_root, candidate_contract, current_generation
-                )
-            else:
-                if current_promotion["stage"] != "source_owner":
-                    _fail("source_owner stabilization must directly follow source_owner")
-                compat_generation = candidate_contract["source_owner_compat"][
-                    "generation"
-                ]
-                if (
-                    current_promotion["predecessor_generation"]
-                    != compat_generation
-                ):
-                    _fail(
-                        "source_owner stabilization is limited to the first "
-                        "source_owner successor"
-                    )
-                _validate_transition_binding(
-                    promotion,
-                    current_promotion,
-                    label="source_owner stabilization",
-                )
-        elif stage == "target_baseline":
-            if current_promotion is None or current_promotion["stage"] not in TARGET_BASELINE_PREDECESSORS:
+        if stage == "target_baseline":
+            if current_promotion["stage"] not in TARGET_BASELINE_PREDECESSORS:
                 _fail("target_baseline must directly follow cleanup or target_baseline")
             for field in ("transition_id", "target_profile_id"):
                 if promotion[field] != current_promotion[field]:
                     _fail(f"target_baseline changes target transition binding {field}")
         else:
             expected_stage = STAGE_PREDECESSOR[stage]
-            if current_promotion is None or current_promotion["stage"] != expected_stage:
+            if current_promotion["stage"] != expected_stage:
                 _fail(f"{stage} does not directly follow {expected_stage}")
             for field in ("transition_id", "source_profile_id", "target_profile_id"):
                 if promotion[field] != current_promotion[field]:
@@ -768,7 +996,16 @@ def select_candidate(
         return {"action": "none"}
     if len(eligible) != 1:
         _fail("multiple releases claim the same direct predecessor")
-    return {"action": "promote", "candidate": eligible[0]}
+    candidate = eligible[0]
+    result: dict[str, Any] = {"action": "promote", "candidate": candidate}
+    if candidate["stage"] == "bridge":
+        cleanup = _prebuilt_cleanup_for_bridge(
+            candidates_root, candidate
+        )
+        if cleanup is None:
+            return {"action": "prepare_cleanup", "candidate": candidate}
+        result["prebuilt_cleanup_generation"] = cleanup
+    return result
 
 
 def _utc_now(value: str | None) -> dt.datetime:
@@ -1077,6 +1314,7 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--generation", required=True)
         if name == "create-promotion":
             command.add_argument("--assets-root", type=Path, required=True)
+            command.add_argument("--predecessor-generation")
             command.add_argument("--output", type=Path, required=True)
         else:
             command.add_argument("--assets-root", type=Path)
@@ -1085,9 +1323,16 @@ def build_parser() -> argparse.ArgumentParser:
     select = commands.add_parser("select-candidate")
     select.add_argument("--current-generation", required=True)
     select.add_argument("--candidates-root", type=Path, required=True)
-    select.add_argument("--current-root", type=Path)
-    select.add_argument("--current-compat-root", type=Path)
+    select.add_argument("--current-root", type=Path, required=True)
     select.add_argument("--output", type=Path, required=True)
+
+    publication_slot = commands.add_parser("ensure-publication-slot")
+    publication_slot.add_argument("--current-generation", required=True)
+    publication_slot.add_argument("--candidate-generation", required=True)
+    publication_slot.add_argument(
+        "--candidate-stage", choices=("bridge", "cleanup", "target_baseline"), required=True
+    )
+    publication_slot.add_argument("--candidates-root", type=Path, required=True)
 
     for name in ("create-publisher-provenance", "validate-publisher-provenance"):
         command = commands.add_parser(name)
@@ -1099,6 +1344,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--source-commit", required=True)
         command.add_argument("--source-selection", type=Path, required=True)
         command.add_argument("--release-identity", type=Path, required=True)
+        command.add_argument(
+            "--candidate-stage", choices=tuple(sorted(PUBLISHER_STAGES)), required=True
+        )
         if name == "create-publisher-provenance":
             command.add_argument("--output", type=Path, required=True)
         else:
@@ -1146,6 +1394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.receipt_schema,
                 arguments.generation,
                 arguments.assets_root,
+                arguments.predecessor_generation,
             )
             _write_json(arguments.output, promotion)
         elif arguments.command == "validate-promotion":
@@ -1163,9 +1412,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.current_generation,
                 arguments.candidates_root,
                 arguments.current_root,
-                arguments.current_compat_root,
             )
             _write_json(arguments.output, result)
+        elif arguments.command == "ensure-publication-slot":
+            ensure_publication_slot(
+                arguments.current_generation,
+                arguments.candidate_generation,
+                arguments.candidate_stage,
+                arguments.candidates_root,
+            )
         elif arguments.command in {
             "create-publisher-provenance",
             "validate-publisher-provenance",
@@ -1186,6 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.source_commit,
                     source_selection,
                     release_identity,
+                    arguments.candidate_stage,
                 )
                 _write_json(arguments.output, provenance)
             else:
@@ -1199,6 +1455,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.source_commit,
                     source_selection,
                     release_identity,
+                    arguments.candidate_stage,
                 )
         elif arguments.command == "issue-challenge":
             promotion, contract, challenge_schema, _ = _promotion_inputs(arguments)

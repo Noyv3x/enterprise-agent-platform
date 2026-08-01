@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	pathpkg "path"
 	"regexp"
 	"runtime"
 	"strings"
@@ -44,27 +45,41 @@ var canonicalManifestJSONKeys = func() map[string]string {
 }()
 
 const (
+	// ManifestSchemaVersionV1 is the source-owner and one-time Bridge catalog
+	// shape. It retains the handoff helper image and may carry the signed
+	// namespace_handoff descriptor.
+	ManifestSchemaVersionV1 = 1
+	// ManifestSchemaVersionV2 is the target-only cleanup/baseline catalog shape.
+	// It cannot carry the one-time handoff descriptor or helper image.
+	ManifestSchemaVersionV2       = 2
 	namespaceHandoffSchemaVersion = 1
 )
 
-var managedImageNames = []string{
+var managedImageNamesV1 = []string{
 	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
 	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
 	"firecrawl-redis", "firecrawl-rabbitmq",
 	"handoff-fs-helper",
 }
 
+var managedImageNamesV2 = []string{
+	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+	"firecrawl-redis", "firecrawl-rabbitmq",
+}
+
 var managedImageNameSet = func() map[string]struct{} {
-	result := make(map[string]struct{}, len(managedImageNames))
-	for _, name := range managedImageNames {
+	result := make(map[string]struct{}, len(managedImageNamesV1))
+	for _, name := range managedImageNamesV1 {
 		result[name] = struct{}{}
 	}
 	return result
 }()
 
-// IsManagedImageName identifies the exact closed set admitted by the current
-// release protocol. A manifest with an unknown or missing image key is invalid;
-// compatibility is introduced only by a versioned schema change.
+// IsManagedImageName identifies every logical image name recognized by one of
+// the supported release schemas. Manifest validation applies the narrower
+// schema-specific closed set; this union remains useful for exact cleanup of a
+// retained schema-v1 handoff helper after the target switches to schema v2.
 func IsManagedImageName(name string) bool {
 	_, ok := managedImageNameSet[name]
 	return ok
@@ -121,7 +136,43 @@ type Manifest struct {
 
 func (m Manifest) ID() string { return m.SourceCommit }
 func (m Manifest) Validate(channel, goos, goarch string) error {
-	if m.SchemaVersion != contract.SchemaVersion {
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return m.ValidateForProfile(channel, goos, goarch, active)
+}
+
+// ValidateForProfile applies the manifest/protocol barrier using the active
+// technical identity selected by the startup Router. Schema v2 is deliberately
+// unavailable to source Managers, even when every other field is well formed.
+func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identity.ActiveProfile) error {
+	profile, err := active.Profile()
+	if err != nil {
+		return fmt.Errorf("validate release technical profile: %w", err)
+	}
+	if contract.ReleaseTransitionStage != "bridge" && m.SchemaVersion != ManifestSchemaVersionV2 {
+		return fmt.Errorf("release stage %q accepts only target manifest schema 2", contract.ReleaseTransitionStage)
+	}
+	var managedImages []string
+	switch m.SchemaVersion {
+	case ManifestSchemaVersionV1:
+		managedImages = managedImageNamesV1
+		if m.ProtocolVersion != ManifestSchemaVersionV1 {
+			return fmt.Errorf("unsupported manager protocol %d for manifest schema %d", m.ProtocolVersion, m.SchemaVersion)
+		}
+	case ManifestSchemaVersionV2:
+		if profile.ProfileID != identity.TargetProfileID() {
+			return errors.New("manifest schema 2 requires the verified target technical profile")
+		}
+		managedImages = managedImageNamesV2
+		if m.ProtocolVersion != ManifestSchemaVersionV2 {
+			return fmt.Errorf("unsupported manager protocol %d for manifest schema %d", m.ProtocolVersion, m.SchemaVersion)
+		}
+		if m.NamespaceHandoff != nil {
+			return errors.New("manifest schema 2 must not contain namespace_handoff")
+		}
+	default:
 		return fmt.Errorf("unsupported manifest schema %d", m.SchemaVersion)
 	}
 	if m.Channel != channel {
@@ -129,9 +180,6 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	}
 	if !commitPattern.MatchString(m.SourceCommit) {
 		return errors.New("manifest source_commit must be a full 40-character commit")
-	}
-	if m.ProtocolVersion != contract.SchemaVersion {
-		return fmt.Errorf("unsupported manager protocol %d", m.ProtocolVersion)
 	}
 	if m.DatabaseSchemaVersion < 1 {
 		return errors.New("manifest database version is invalid")
@@ -142,18 +190,20 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	if len(m.Images) != len(managedImageNames) {
-		return fmt.Errorf("manifest images must contain exactly %d managed entries", len(managedImageNames))
+	if len(m.Images) != len(managedImages) {
+		return fmt.Errorf("manifest schema %d images must contain exactly %d managed entries", m.SchemaVersion, len(managedImages))
 	}
-	for _, name := range managedImageNames {
+	managedImageSet := make(map[string]struct{}, len(managedImages))
+	for _, name := range managedImages {
+		managedImageSet[name] = struct{}{}
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q must use a complete registry sha256 digest", name)
 		}
 	}
 	for name, digest := range m.Images {
-		if !IsManagedImageName(name) {
-			return fmt.Errorf("image %q is outside the current managed release set", name)
+		if _, ok := managedImageSet[name]; !ok {
+			return fmt.Errorf("image %q is outside manifest schema %d managed release set", name, m.SchemaVersion)
 		}
 		if !imageNamePattern.MatchString(name) {
 			return fmt.Errorf("image name %q must use lowercase kebab-case", name)
@@ -164,6 +214,11 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 	}
 	if m.Manager.Version == "" {
 		return errors.New("manager version is required")
+	}
+	if m.SchemaVersion == ManifestSchemaVersionV2 {
+		if err := m.validateTargetArtifactCatalog(); err != nil {
+			return err
+		}
 	}
 	artifact, ok := m.Manager.Artifacts[goarch]
 	if !ok {
@@ -179,6 +234,45 @@ func (m Manifest) Validate(channel, goos, goarch string) error {
 		if err := m.NamespaceHandoff.Validate(m); err != nil {
 			return fmt.Errorf("namespace_handoff: %w", err)
 		}
+	}
+	return nil
+}
+
+func (m Manifest) validateTargetArtifactCatalog() error {
+	if m.Manager.Version != m.SourceCommit {
+		return errors.New("target manager version must match manifest source_commit")
+	}
+	if len(m.Manager.Artifacts) != 2 {
+		return errors.New("target manager artifacts must contain exactly amd64 and arm64")
+	}
+	for _, arch := range []string{"amd64", "arm64"} {
+		artifact, ok := m.Manager.Artifacts[arch]
+		if !ok {
+			return fmt.Errorf("target manager artifact for %s is missing", arch)
+		}
+		if err := validateTargetArtifact(artifact, "agent-platform-manager-linux-"+arch); err != nil {
+			return fmt.Errorf("target manager artifact for %s: %w", arch, err)
+		}
+	}
+	if err := validateTargetArtifact(m.Compose, "agent-platform-compose.yaml"); err != nil {
+		return fmt.Errorf("target compose artifact: %w", err)
+	}
+	return nil
+}
+
+func validateTargetArtifact(artifact Artifact, expectedBase string) error {
+	if err := artifact.Validate(); err != nil {
+		return err
+	}
+	parsed, err := url.Parse(artifact.URL)
+	if err != nil {
+		return errReleaseURLPolicy
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("URL must not contain a query or fragment")
+	}
+	if pathpkg.Base(parsed.EscapedPath()) != expectedBase {
+		return fmt.Errorf("URL basename must be %q", expectedBase)
 	}
 	return nil
 }
@@ -325,11 +419,21 @@ func IsTemporarilyUnavailable(err error) bool {
 }
 
 func (c Client) Fetch(ctx context.Context, url, channel string) (Manifest, []byte, error) {
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+	return c.FetchForProfile(ctx, url, channel, active)
+}
+
+// FetchForProfile downloads and validates a catalog for the already-routed
+// technical profile. Callers must never derive active from manifest contents.
+func (c Client) FetchForProfile(ctx context.Context, url, channel string, active identity.ActiveProfile) (Manifest, []byte, error) {
 	data, err := c.fetch(ctx, url, maxManifestBytes)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
-	manifest, err := DecodeManifest(data, channel, runtime.GOOS, runtime.GOARCH)
+	manifest, err := DecodeManifestForProfile(data, channel, runtime.GOOS, runtime.GOARCH, active)
 	if err != nil {
 		return Manifest{}, nil, err
 	}
@@ -341,64 +445,21 @@ func (c Client) Fetch(ctx context.Context, url, channel string) (Manifest, []byt
 // helper uses it after the source Manager has stopped; it must never reinterpret
 // a journal-bound manifest through a weaker decoder.
 func DecodeManifest(data []byte, channel, goos, goarch string) (Manifest, error) {
-	manifest, err := decodeManifestDocument(data)
+	active, err := identity.CompileTimeActiveProfile()
 	if err != nil {
 		return Manifest{}, err
 	}
-	if err := manifest.Validate(channel, goos, goarch); err != nil {
-		return Manifest{}, err
-	}
-	return manifest, nil
+	return DecodeManifestForProfile(data, channel, goos, goarch, active)
 }
 
-// DecodeRetainedHandoffPredecessorManifest is the only compatibility parser
-// for the source-owner A2 handoff. It accepts the exact, immutable P1 bytes
-// named by the canonical transition contract and no other old manifest. The
-// caller must additionally prove that these bytes came from the canonical
-// source-profile retained Current/Previous generation path; remote releases,
-// candidates and bridge manifests must continue to use DecodeManifest.
-func DecodeRetainedHandoffPredecessorManifest(data []byte, channel, goos, goarch string) (Manifest, error) {
-	digest := sha256.Sum256(data)
-	if hex.EncodeToString(digest[:]) != contract.SourceOwnerCompatManifestSHA256 {
-		return Manifest{}, errors.New("retained handoff predecessor manifest checksum is not canonical")
-	}
+// DecodeManifestForProfile applies the same target-only schema barrier to
+// retained immutable bytes as FetchForProfile applies to a remote catalog.
+func DecodeManifestForProfile(data []byte, channel, goos, goarch string, active identity.ActiveProfile) (Manifest, error) {
 	manifest, err := decodeManifestDocument(data)
 	if err != nil {
 		return Manifest{}, err
 	}
-	if manifest.SourceCommit != contract.SourceOwnerCompatGeneration ||
-		manifest.Manager.Version != contract.SourceOwnerCompatGeneration || manifest.NamespaceHandoff != nil {
-		return Manifest{}, errors.New("retained handoff predecessor identity is not canonical")
-	}
-	if len(manifest.Images) != len(contract.SourceOwnerCompatManagedImages) {
-		return Manifest{}, errors.New("retained handoff predecessor image set is not canonical")
-	}
-	for _, name := range contract.SourceOwnerCompatManagedImages {
-		if image, ok := manifest.Images[name]; !ok || !digestPattern.MatchString(image) {
-			return Manifest{}, fmt.Errorf("retained handoff predecessor image %q is not canonical", name)
-		}
-	}
-	for name := range manifest.Images {
-		found := false
-		for _, expected := range contract.SourceOwnerCompatManagedImages {
-			if name == expected {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return Manifest{}, fmt.Errorf("retained handoff predecessor image %q is outside the canonical set", name)
-		}
-	}
-	// Reuse every current cross-field validation other than the deliberate P1
-	// image-set difference. The synthetic entry is never returned or executed.
-	validated := manifest
-	validated.Images = make(map[string]string, len(manifest.Images)+1)
-	for name, image := range manifest.Images {
-		validated.Images[name] = image
-	}
-	validated.Images["handoff-fs-helper"] = manifest.Images["platform"]
-	if err := validated.Validate(channel, goos, goarch); err != nil {
+	if err := manifest.ValidateForProfile(channel, goos, goarch, active); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil

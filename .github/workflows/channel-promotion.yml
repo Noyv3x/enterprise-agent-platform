@@ -35,7 +35,7 @@ on:
         type: string
 
 permissions:
-  actions: read
+  actions: write
   contents: write
 
 concurrency:
@@ -149,84 +149,53 @@ jobs:
               git show "$generation:docs/contracts/$contract" > "$root/$contract"
             done
           done
-          current_root=""
-          if [[ -f "$candidates/$current/promotion.json" ]]; then
-            current_root="$candidates/$current"
+          current_root="$candidates/$current"
+          if [[ ! -f "$current_root/promotion.json" ]]; then
+            echo "Current release is not a complete sealed generation: $current" >&2
+            exit 1
           fi
-          current_compat_root=""
-          compat_generation="$(jq -r '.source_owner_compat.generation // ""' docs/contracts/release-transition.json)"
-          if [[ -z "$current_root" && "$current" == "$compat_generation" ]]; then
-            legacy_assets=(
-              install.sh
-              install.sh.sha256
-              release.json
+          current_stage="$(jq -er '.stage | select(. == "source_owner" or . == "bridge" or . == "cleanup" or . == "target_baseline")' "$current_root/promotion.json")"
+          current_assets=(install.sh install.sh.sha256 promotion.json release.json)
+          if [[ "$current_stage" == source_owner || "$current_stage" == bridge ]]; then
+            current_assets+=(
               ubitech-compose.yaml
-              ubitech-manager-linux-amd64
-              ubitech-manager-linux-amd64.sha256
-              ubitech-manager-linux-arm64
-              ubitech-manager-linux-arm64.sha256
+              ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256
+              ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256
             )
-            legacy_names="$(printf '%s\n' "${legacy_assets[@]}" | jq -R . | jq -sc 'sort')"
-            legacy_api="$scan/current-compat-api.json"
-            jq -e --arg tag "container-${current}" --arg target "$current" --argjson names "$legacy_names" '
-              [.[] | select(.tag_name == $tag)] as $matches |
-              ($matches | length) == 1 and
-              ($matches[0].target_commitish == $target) and
-              ($matches[0].draft == false) and ($matches[0].prerelease == false) and
-              ($matches[0].id | type == "number" and . > 0) and
-              ([ $matches[0].assets[].name ] | sort) == $names and
-              ([ $matches[0].assets[].name ] | length) == ([ $matches[0].assets[].name ] | unique | length) and
-              all($matches[0].assets[];
-                (.id | type == "number" and . > 0) and
-                (.size | type == "number" and . > 0) and
-                .state == "uploaded" and
-                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
-              )
-            ' "$scan/releases.json" >/dev/null
-            jq -cS --arg tag "container-${current}" '
-              .[] | select(.tag_name == $tag) | {
-                release_id: .id, tag_name, target_commitish, draft, prerelease,
-                assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
-              }
-            ' "$scan/releases.json" > "$legacy_api"
-            current_compat_root="$scan/current-compat"
-            mkdir -p "$current_compat_root"
-            gh release download "container-${current}" --repo "$GITHUB_REPOSITORY" \
-              --dir "$current_compat_root"
-            python3 - "$current_compat_root" "$legacy_api" <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import stat
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          identity = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-          expected = identity["assets"]
-          if sorted(path.name for path in root.iterdir()) != [asset["name"] for asset in expected]:
-              raise SystemExit("canonical P1 release has an unexpected asset directory")
-          for asset in expected:
-              path = root / asset["name"]
-              observed = path.lstat()
-              if not stat.S_ISREG(observed.st_mode) or path.is_symlink() or observed.st_size != asset["size"]:
-                  raise SystemExit(f"canonical P1 release asset metadata mismatch: {asset['name']}")
-              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-              if digest != asset["digest"]:
-                  raise SystemExit(f"canonical P1 release asset digest mismatch: {asset['name']}")
-          PY
+          else
+            current_assets+=(
+              agent-platform-compose.yaml
+              agent-platform-manager-linux-amd64 agent-platform-manager-linux-amd64.sha256
+              agent-platform-manager-linux-arm64 agent-platform-manager-linux-arm64.sha256
+            )
           fi
+          expected_current_names="$(printf '%s\n' "${current_assets[@]}" | jq -R . | jq -sc 'sort')"
+          jq -e --arg tag "container-${current}" --argjson names "$expected_current_names" '
+            [.[] | select(.tag_name == $tag)] as $matches |
+            ($matches | length) == 1 and
+            ($matches[0].draft == false) and ($matches[0].prerelease == false) and
+            ([ $matches[0].assets[].name ] | sort) == $names and
+            ([ $matches[0].assets[].name ] | length) == ([ $matches[0].assets[].name ] | unique | length) and
+            all($matches[0].assets[];
+              (.id | type == "number" and . > 0) and
+              (.size | type == "number" and . > 0) and
+              .state == "uploaded" and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$"))
+            )
+          ' "$scan/releases.json" >/dev/null
+          for asset in "${current_assets[@]}"; do
+            if [[ ! -f "$current_root/$asset" ]]; then
+              gh release download "container-${current}" --repo "$GITHUB_REPOSITORY" \
+                --dir "$current_root" --pattern "$asset"
+            fi
+          done
           command=(
             python3 scripts/release_promotion.py select-candidate
             --current-generation "$current"
             --candidates-root "$candidates"
+            --current-root "$current_root"
             --output "$scan/selection.json"
           )
-          if [[ -n "$current_root" ]]; then
-            command+=(--current-root "$current_root")
-          fi
-          if [[ -n "$current_compat_root" ]]; then
-            command+=(--current-compat-root "$current_compat_root")
-          fi
           "${command[@]}"
           action="$(jq -r .action "$scan/selection.json")"
           echo "action=$action" >> "$GITHUB_OUTPUT"
@@ -238,6 +207,75 @@ jobs:
           fi
           candidate="$(jq -r .candidate.generation "$scan/selection.json")"
           stage="$(jq -r .candidate.stage "$scan/selection.json")"
+          if [[ "$action" == prepare_cleanup ]]; then
+            echo "bridge_generation=$candidate" >> "$GITHUB_OUTPUT"
+            echo "Bridge is sealed but its exact Cleanup draft is absent; queueing canonical Cleanup."
+            exit 0
+          fi
+          [[ "$action" == promote ]] || {
+            echo "Unsupported promotion selection action: $action" >&2
+            exit 1
+          }
+          if [[ "$stage" == bridge ]]; then
+            cleanup="$(jq -er '.prebuilt_cleanup_generation | select(test("^[0-9a-f]{40}$"))' "$scan/selection.json")"
+            cleanup_root="$candidates/$cleanup"
+            cleanup_assets=(
+              install.sh install.sh.sha256 promotion.json release.json
+              agent-platform-compose.yaml
+              agent-platform-manager-linux-amd64 agent-platform-manager-linux-amd64.sha256
+              agent-platform-manager-linux-arm64 agent-platform-manager-linux-arm64.sha256
+            )
+            expected_cleanup_names="$(printf '%s\n' "${cleanup_assets[@]}" | jq -R . | jq -sc 'sort')"
+            jq -e --arg tag "container-${cleanup}" --arg cleanup "$cleanup" \
+              --argjson names "$expected_cleanup_names" '
+              [.[] | select(.tag_name == $tag)] as $matches |
+              ($matches | length) == 1 and
+              $matches[0].target_commitish == $cleanup and
+              $matches[0].draft == true and $matches[0].prerelease == false and
+              ([ $matches[0].assets[].name ] | sort) == $names and
+              ([ $matches[0].assets[].name ] | length) == ([ $matches[0].assets[].name ] | unique | length) and
+              all($matches[0].assets[];
+                (.id | type == "number" and . > 0) and .state == "uploaded" and
+                (.size | type == "number" and . > 0) and
+                (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))
+            ' "$scan/releases.json" >/dev/null
+            for asset in "${cleanup_assets[@]}"; do
+              if [[ ! -f "$cleanup_root/$asset" ]]; then
+                gh release download "container-${cleanup}" --repo "$GITHUB_REPOSITORY" \
+                  --dir "$cleanup_root" --pattern "$asset"
+              fi
+            done
+            python3 scripts/release_promotion.py validate-promotion \
+              --contract "$cleanup_root/release-transition.json" \
+              --manifest "$cleanup_root/release.json" \
+              --challenge-schema "$cleanup_root/release-transition-challenge.schema.json" \
+              --receipt-schema "$cleanup_root/release-transition-receipt.schema.json" \
+              --generation "$cleanup" \
+              --assets-root "$cleanup_root" \
+              --promotion "$cleanup_root/promotion.json"
+            python3 - "$cleanup_root" "$scan/releases.json" "$cleanup" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          releases = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          generation = sys.argv[3]
+          release = [item for item in releases if item["tag_name"] == f"container-{generation}"]
+          if len(release) != 1:
+              raise SystemExit("prebuilt Cleanup release identity is ambiguous")
+          expected = {item["name"]: item for item in release[0]["assets"]}
+          for name, item in expected.items():
+              path = root / name
+              digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != item["digest"] or path.stat().st_size != item["size"]:
+                  raise SystemExit(f"prebuilt Cleanup sealed asset drift: {name}")
+          PY
+            git merge-base --is-ancestor "$candidate" "$cleanup"
+            git merge-base --is-ancestor "$cleanup" origin/main
+            echo "prebuilt_cleanup_generation=$cleanup" >> "$GITHUB_OUTPUT"
+          fi
           requested="$REQUESTED_CANDIDATE"
           if [[ -n "$requested" && ! "$requested" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Requested generation must be a full lowercase commit" >&2
@@ -254,6 +292,60 @@ jobs:
           echo "candidate_root=$candidates/$candidate" >> "$GITHUB_OUTPUT"
           echo "current_root=$candidates/$current" >> "$GITHUB_OUTPUT"
 
+      - name: Queue the canonical missing Cleanup release
+        if: steps.select.outputs.action == 'prepare_cleanup'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRIDGE: ${{ steps.select.outputs.bridge_generation }}
+        run: |
+          set -euo pipefail
+          [[ "$BRIDGE" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --quiet --no-tags origin main
+          matches=()
+          while IFS= read -r generation; do
+            contract="$RUNNER_TEMP/cleanup-contract-${generation}.json"
+            if ! git show "${generation}:docs/contracts/release-transition.json" > "$contract" 2>/dev/null; then
+              continue
+            fi
+            if jq -e --arg bridge "$BRIDGE" '
+              .stage == "cleanup" and .predecessor_generation == $bridge
+            ' "$contract" >/dev/null; then
+              matches+=("$generation")
+            fi
+          done < <(git rev-list --reverse "${BRIDGE}..origin/main")
+          if [[ "${#matches[@]}" -ne 1 ]]; then
+            echo "Expected exactly one canonical Cleanup descendant of ${BRIDGE}; found ${#matches[@]}" >&2
+            exit 1
+          fi
+          cleanup="${matches[0]}"
+          quality_runs="$RUNNER_TEMP/cleanup-quality-runs.json"
+          gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${cleanup}&event=push&status=completed&per_page=100" |
+            jq -s '
+              if all(.[]; type == "object" and (.workflow_runs | type == "array"))
+              then {workflow_runs: [.[].workflow_runs[]]}
+              else error("invalid paginated Quality runs response") end
+            ' > "$quality_runs"
+          jq -e --arg repo "$GITHUB_REPOSITORY" --arg cleanup "$cleanup" '
+            any(.workflow_runs[];
+              .path == ".github/workflows/quality.yml" and
+              .event == "push" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $cleanup and
+              .head_repository.full_name == $repo)
+          ' "$quality_runs" >/dev/null
+          active_runs="$RUNNER_TEMP/cleanup-container-runs.json"
+          gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/container-release.yml/runs?head_sha=${cleanup}&per_page=100" |
+            jq -s '[.[].workflow_runs[] | select(.status == "queued" or .status == "in_progress")]' \
+              > "$active_runs"
+          if jq -e 'length > 0' "$active_runs" >/dev/null; then
+            echo "Cleanup Container release is already queued or running: $cleanup"
+            exit 0
+          fi
+          gh workflow run container-release.yml --repo "$GITHUB_REPOSITORY" \
+            --ref main -f "ref=$cleanup"
+
       - name: Validate all selected immutable release assets
         id: assets
         if: steps.select.outputs.action == 'promote'
@@ -261,23 +353,27 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE: ${{ steps.select.outputs.candidate_generation }}
+          CANDIDATE_STAGE: ${{ steps.select.outputs.candidate_stage }}
           CANDIDATE_ROOT: ${{ steps.select.outputs.candidate_root }}
           REQUIRED_RUN_ID: ${{ steps.upstream.outputs.run_id }}
           REQUIRED_RUN_ATTEMPT: ${{ steps.upstream.outputs.run_attempt }}
           REQUIRED_EXECUTION_HEAD_SHA: ${{ steps.upstream.outputs.execution_head_sha }}
         run: |
           set -euo pipefail
-          assets=(
-            install.sh
-            install.sh.sha256
-            promotion.json
-            release.json
-            ubitech-compose.yaml
-            ubitech-manager-linux-amd64
-            ubitech-manager-linux-amd64.sha256
-            ubitech-manager-linux-arm64
-            ubitech-manager-linux-arm64.sha256
-          )
+          assets=(install.sh install.sh.sha256 promotion.json release.json)
+          if [[ "$CANDIDATE_STAGE" == bridge ]]; then
+            assets+=(
+              ubitech-compose.yaml
+              ubitech-manager-linux-amd64 ubitech-manager-linux-amd64.sha256
+              ubitech-manager-linux-arm64 ubitech-manager-linux-arm64.sha256
+            )
+          else
+            assets+=(
+              agent-platform-compose.yaml
+              agent-platform-manager-linux-amd64 agent-platform-manager-linux-amd64.sha256
+              agent-platform-manager-linux-arm64 agent-platform-manager-linux-arm64.sha256
+            )
+          fi
           expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -sc 'sort')"
           tag="container-${CANDIDATE}"
           api_url="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json apiUrl --jq .apiUrl)"
@@ -344,24 +440,33 @@ jobs:
             --generation "$CANDIDATE" \
             --assets-root "$release" \
             --promotion "$release/promotion.json"
-          python3 - "$release" <<'PY'
+          python3 - "$release" "$CANDIDATE_STAGE" <<'PY'
           import hashlib
           import json
           import pathlib
           import sys
 
           root = pathlib.Path(sys.argv[1])
+          stage = sys.argv[2]
           manifest = json.loads((root / "release.json").read_text(encoding="utf-8"))
+          if stage == "bridge":
+              compose_name = "ubitech-compose.yaml"
+              manager_prefix = "ubitech-manager-linux"
+          elif stage in {"cleanup", "target_baseline"}:
+              compose_name = "agent-platform-compose.yaml"
+              manager_prefix = "agent-platform-manager-linux"
+          else:
+              raise SystemExit(f"unsupported candidate stage: {stage}")
           artifacts = {
-              "ubitech-compose.yaml": manifest["compose"]["sha256"],
-              "ubitech-manager-linux-amd64": manifest["manager"]["artifacts"]["amd64"]["sha256"],
-              "ubitech-manager-linux-arm64": manifest["manager"]["artifacts"]["arm64"]["sha256"],
+              compose_name: manifest["compose"]["sha256"],
+              f"{manager_prefix}-amd64": manifest["manager"]["artifacts"]["amd64"]["sha256"],
+              f"{manager_prefix}-arm64": manifest["manager"]["artifacts"]["arm64"]["sha256"],
           }
           for name, expected in artifacts.items():
               actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
               if actual != expected:
                   raise SystemExit(f"release asset checksum mismatch: {name}")
-              if name.startswith("ubitech-manager-"):
+              if name.startswith(manager_prefix):
                   sidecar = (root / f"{name}.sha256").read_text(encoding="utf-8").split()
                   if not sidecar or sidecar[0] != expected:
                       raise SystemExit(f"release checksum sidecar mismatch: {name}")
@@ -539,16 +644,20 @@ jobs:
                 qualification_head_repository: .head_repository.full_name
               }
             ' "$quality_run" > "$source_selection"
-            python3 scripts/release_promotion.py validate-publisher-provenance \
-              --repository "$GITHUB_REPOSITORY" \
-              --workflow-event "$workflow_event" \
-              --workflow-run-id "$run_id" \
-              --run-attempt "$run_attempt" \
-              --execution-head-sha "$execution_head" \
-              --source-commit "$CANDIDATE" \
-              --source-selection "$source_selection" \
-              --release-identity "$identity" \
+            provenance_args=(
+              scripts/release_promotion.py validate-publisher-provenance
+              --repository "$GITHUB_REPOSITORY"
+              --workflow-event "$workflow_event"
+              --workflow-run-id "$run_id"
+              --run-attempt "$run_attempt"
+              --execution-head-sha "$execution_head"
+              --source-commit "$CANDIDATE"
+              --source-selection "$source_selection"
+              --release-identity "$identity"
+              --candidate-stage "$CANDIDATE_STAGE"
               --provenance "$proof_file"
+            )
+            python3 "${provenance_args[@]}"
             proofs=$((proofs + 1))
             break
           done
@@ -560,10 +669,10 @@ jobs:
           echo "release_root=$release" >> "$GITHUB_OUTPUT"
 
       - name: Promote ordinary release
+        id: ordinary_promotion
         if: >-
           steps.select.outputs.action == 'promote' &&
-          (steps.select.outputs.candidate_stage == 'source_owner' ||
-          steps.select.outputs.candidate_stage == 'target_baseline') &&
+          steps.select.outputs.candidate_stage == 'target_baseline' &&
           (github.event_name != 'workflow_dispatch' || inputs.action == 'evaluate')
         shell: bash
         env:
@@ -617,6 +726,7 @@ jobs:
           gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/container-${CANDIDATE}" |
             jq -e --arg generation "$CANDIDATE" \
               '.object.type == "commit" and .object.sha == $generation' >/dev/null
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
 
       - name: Leave gated transition release draft during ordinary evaluation
         if: >-
@@ -674,6 +784,7 @@ jobs:
           retention-days: 1
 
       - name: Verify deployment receipt and promote transition release
+        id: transition_promotion
         if: >-
           steps.select.outputs.action == 'promote' &&
           (steps.select.outputs.candidate_stage == 'bridge' ||
@@ -818,3 +929,76 @@ jobs:
           gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/container-${CANDIDATE}" |
             jq -e --arg generation "$CANDIDATE" \
               '.object.type == "commit" and .object.sha == $generation' >/dev/null
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Continue the sealed transition chain
+        if: steps.transition_promotion.outputs.promoted == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh workflow run channel-promotion.yml
+          --repo "$GITHUB_REPOSITORY"
+          --ref main
+          -f action=evaluate
+
+      - name: Queue the latest qualified target-only main generation
+        if: >-
+          (steps.ordinary_promotion.outputs.promoted == 'true' ||
+           (steps.transition_promotion.outputs.promoted == 'true' &&
+            steps.select.outputs.candidate_stage == 'cleanup'))
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROMOTED: ${{ steps.select.outputs.candidate_generation }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin main
+          main_head="$(git rev-parse origin/main)"
+          if [[ "$main_head" == "$PROMOTED" ]]; then
+            echo "Public target channel already reached main."
+            exit 0
+          fi
+          git merge-base --is-ancestor "$PROMOTED" "$main_head"
+          contract="$RUNNER_TEMP/latest-target-contract.json"
+          git show "${main_head}:docs/contracts/release-transition.json" > "$contract"
+          jq -e '.stage == "target_baseline"' "$contract" >/dev/null || {
+            echo "Latest main is not yet a target-baseline source; leaving the fixed transition chain unchanged."
+            exit 0
+          }
+          quality_runs="$RUNNER_TEMP/latest-main-quality-runs.json"
+          gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${main_head}&event=push&status=completed&per_page=100" |
+            jq -s '
+              if all(.[]; type == "object" and (.workflow_runs | type == "array"))
+              then {workflow_runs: [.[].workflow_runs[]]}
+              else error("invalid paginated Quality runs response") end
+            ' > "$quality_runs"
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg head "$main_head" '
+            any(.workflow_runs[];
+              .path == ".github/workflows/quality.yml" and
+              .event == "push" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $head and
+              .head_repository.full_name == $repo)
+          ' "$quality_runs" >/dev/null; then
+            echo "Latest main has no exact successful pushed Quality run yet; its completion event will retry."
+            exit 0
+          fi
+          if gh release view "container-${main_head}" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '[.assets[].name] | index("promotion.json") != null' |
+              grep -Fxq true; then
+            gh workflow run channel-promotion.yml --repo "$GITHUB_REPOSITORY" \
+              --ref main -f action=evaluate
+            exit 0
+          fi
+          active_runs="$RUNNER_TEMP/latest-main-container-runs.json"
+          gh api --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/container-release.yml/runs?head_sha=${main_head}&per_page=100" |
+            jq -s '[.[].workflow_runs[] | select(.status == "queued" or .status == "in_progress")]' \
+              > "$active_runs"
+          if jq -e 'length > 0' "$active_runs" >/dev/null; then
+            echo "Latest main Container release is already queued or running: $main_head"
+            exit 0
+          fi
+          gh workflow run container-release.yml --repo "$GITHUB_REPOSITORY" \
+            --ref main -f "ref=$main_head"
