@@ -547,7 +547,7 @@ func (m *Manager) readStartupRecoverySnapshot(path string, globalBusy bool) (sta
 		if err := validateStartupTerminalRecovery(snapshot.journal, plan); err != nil {
 			return snapshot, err
 		}
-		if err := m.validateStartupTerminalRecoveryLiveState(&snapshot); err != nil {
+		if err := m.validateStartupTerminalRecoveryLiveState(&snapshot, globalBusy); err != nil {
 			return snapshot, err
 		}
 		return snapshot, nil
@@ -636,7 +636,7 @@ func validateStartupTerminalRecovery(journal recoveryTakeoverJournal, plan Plan)
 	return nil
 }
 
-func (m *Manager) validateStartupTerminalRecoveryLiveState(snapshot *startupRecoverySnapshot) error {
+func (m *Manager) validateStartupTerminalRecoveryLiveState(snapshot *startupRecoverySnapshot, globalBusy bool) error {
 	journal, state := snapshot.journal, snapshot.state
 	if state.Activation != nil && (state.Activation.PlanPath == journal.RecoveryPlanPath ||
 		state.Activation.CandidateSHA == journal.RecoverySHA256 || state.Activation.CandidatePath == journal.RecoveryPath) {
@@ -673,6 +673,12 @@ func (m *Manager) validateStartupTerminalRecoveryLiveState(snapshot *startupReco
 	}
 	snapshot.stableSHA = sha256Hex(stable)
 	if snapshot.stableSHA != wantStable {
+		if journal.Phase == recoveryTakeoverCommitted && globalBusy && recoveryCommittedStateMatches(state, journal) {
+			// recover-current replaces stable before it atomically registers the
+			// next recovery Current. The outer busy-lock admission performs the
+			// complete, stable double-snapshot proof for that new recovery inode.
+			return nil
+		}
 		return errors.New("live Manager state and stable executable disagree with terminal recovery journal")
 	}
 	return nil

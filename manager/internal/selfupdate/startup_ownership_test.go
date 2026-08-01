@@ -821,6 +821,146 @@ func newExternalRecoveryProbeFixture(t *testing.T) (*startupOwnershipFixture, Ve
 	return fixture, recovery
 }
 
+func newCommittedRecoveryRelayFixture(t *testing.T) (*activationTakeoverFixture, recoveryTakeoverJournal, Version) {
+	t.Helper()
+	fixture := newActivationTakeoverFixture(t)
+	journal := activationTakeoverPauseAtMainStarted(t, fixture)
+	if err := fixture.manager.acknowledgeExecutable(journal.RecoveryPath); err != nil {
+		t.Fatalf("acknowledge first recovery: %v", err)
+	}
+	_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commitActivation(testActiveProfile, plan.PlanPath, plan); err != nil {
+		t.Fatalf("commit first recovery: %v", err)
+	}
+	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if err != nil || !exists || journal.Phase != recoveryTakeoverCommitted {
+		t.Fatalf("first recovery journal = %#v, exists=%v err=%v", journal, exists, err)
+	}
+
+	running, err := os.ReadFile("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningSHA := sha256Hex(running)
+	replacement := Version{
+		Version: strings.Repeat("3", 40),
+		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], "ubitech-manager"),
+		SHA256:  runningSHA, VerifiedAt: time.Now().UTC(), PlatformCommitted: true,
+	}
+	writeStartupVersion(t, replacement, running, replacement)
+	if err := atomicfile.WriteFile(fixture.stablePath, running, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.RunningVersion = replacement.Version
+	return fixture, journal, replacement
+}
+
+func TestCommittedRecoveryRelayUsesProbeUntilAtomicCurrentRegistration(t *testing.T) {
+	fixture, journal, replacement := newCommittedRecoveryRelayFixture(t)
+	releaseGlobal, err := acquireRecoveryLock(fixture.manager.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	if err != nil || lease == nil || !lease.ExternalRecoveryProbe() || lease.RetainsRecoveryLock() {
+		t.Fatalf("committed recovery relay admission = %#v, err=%v", lease, err)
+	}
+
+	result := make(chan struct {
+		lease *StartupOwnershipLease
+		err   error
+	}, 1)
+	go func() {
+		settled, waitErr := fixture.manager.AwaitExternalRecoveryOwnership(context.Background(), 5*time.Millisecond)
+		result <- struct {
+			lease *StartupOwnershipLease
+			err   error
+		}{lease: settled, err: waitErr}
+	}()
+	state := activationTakeoverReadState(fixture.statePath)
+	replacement.SourceCommit = journal.PlatformCommit
+	replacement.VerifiedAt = replacement.VerifiedAt.Add(time.Second)
+	writeStartupJSON(t, fixture.statePath, State{
+		SchemaVersion: state.SchemaVersion, Current: &replacement, Previous: state.Current, UpdatedAt: replacement.VerifiedAt,
+	})
+	releaseGlobal()
+	select {
+	case observed := <-result:
+		if observed.err != nil || observed.lease == nil || !observed.lease.RetainsRecoveryLock() || observed.lease.ExternalRecoveryProbe() {
+			t.Fatalf("registered relay recovery did not obtain normal ownership: lease=%#v err=%v", observed.lease, observed.err)
+		}
+		observed.lease.Release()
+	case <-time.After(time.Second):
+		t.Fatal("registered relay recovery did not leave probe-only mode")
+	}
+}
+
+func TestCommittedRecoveryRelayRequiresBusyLockAndImmutableMetadata(t *testing.T) {
+	t.Run("lock free", func(t *testing.T) {
+		fixture, _, _ := newCommittedRecoveryRelayFixture(t)
+		if _, err := fixture.manager.AcquireStartupOwnership(); err == nil || !strings.Contains(err.Error(), "stable executable disagree") {
+			t.Fatalf("lock-free relay checkpoint was admitted: %v", err)
+		}
+	})
+	t.Run("missing metadata", func(t *testing.T) {
+		fixture, _, replacement := newCommittedRecoveryRelayFixture(t)
+		if err := os.Remove(filepath.Join(filepath.Dir(replacement.Path), "metadata.json")); err != nil {
+			t.Fatal(err)
+		}
+		releaseGlobal, err := acquireRecoveryLock(fixture.manager.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer releaseGlobal()
+		if _, err := fixture.manager.AcquireStartupOwnership(); err == nil || !strings.Contains(err.Error(), "metadata") {
+			t.Fatalf("relay without immutable metadata was admitted: %v", err)
+		}
+	})
+}
+
+func TestRolledBackRecoveryCannotBecomeRelayProbe(t *testing.T) {
+	fixture := newActivationTakeoverFixture(t)
+	journal := activationTakeoverPauseAtMainStarted(t, fixture)
+	_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Error = "first recovery failed"
+	if err := restorePrevious(testActiveProfile, plan, fixture.runner); err == nil || !strings.Contains(err.Error(), plan.Error) {
+		t.Fatalf("roll back first recovery: %v", err)
+	}
+	journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(journal.Path)
+	if err != nil || !exists || journal.Phase != recoveryTakeoverRolledBack {
+		t.Fatalf("rolled-back recovery journal = %#v, exists=%v err=%v", journal, exists, err)
+	}
+	running, err := os.ReadFile("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningSHA := sha256Hex(running)
+	replacement := Version{
+		Version: strings.Repeat("3", 40),
+		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+runningSHA[:12], "ubitech-manager"),
+		SHA256:  runningSHA, VerifiedAt: time.Now().UTC(), PlatformCommitted: true,
+	}
+	writeStartupVersion(t, replacement, running, replacement)
+	if err := atomicfile.WriteFile(fixture.stablePath, running, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manager.RunningVersion = replacement.Version
+	releaseGlobal, err := acquireRecoveryLock(fixture.manager.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseGlobal()
+	if _, err := fixture.manager.AcquireStartupOwnership(); err == nil || !strings.Contains(err.Error(), "stable executable disagree") {
+		t.Fatalf("rolled-back recovery became a relay probe: %v", err)
+	}
+}
+
 func TestExternalRecoveryProbeExitsIfLockOwnerDiesBeforeRegistration(t *testing.T) {
 	fixture, _ := newExternalRecoveryProbeFixture(t)
 	releaseGlobal, err := acquireRecoveryLock(fixture.manager.Root)
