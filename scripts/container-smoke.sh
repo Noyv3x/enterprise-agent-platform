@@ -672,6 +672,24 @@ def job(name: str) -> str:
         raise SystemExit(f"container release job is missing: {name}")
     return match.group(0)
 
+prepare = job("prepare")
+target_gate_start = prepare.index('if [[ "$transition_stage" == target_baseline ]]; then')
+target_gate_end = prepare.index("          manager_command=./cmd/agent-platform-manager")
+target_gate = prepare[target_gate_start:target_gate_end]
+if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in prepare:
+    raise SystemExit("pre-image target-baseline predecessor lookup is unauthenticated")
+for fragment in (
+    ".predecessor_generation",
+    'current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"',
+    '[[ "$current_tag" == "container-${transition_predecessor}" ]]',
+):
+    if fragment not in target_gate:
+        raise SystemExit(f"pre-image target-baseline predecessor gate is missing: {fragment}")
+if target_gate_start >= prepare.index("          image_matrix="):
+    raise SystemExit("target-baseline predecessor gate runs after image-matrix publication")
+if "      - prepare\n" not in job("images"):
+    raise SystemExit("container images can build before release-predecessor validation")
+
 public_images = job("public-images")
 for fragment in (
     'if [[ "$transition_stage" == bridge ]]; then',
@@ -847,6 +865,34 @@ for fragment in (
 publish = job("publish")
 if "pattern: '*'" in publish or 'pattern: "*"' in publish:
     raise SystemExit("publish must not download every workflow artifact")
+if "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" not in publish:
+    raise SystemExit("Cleanup predecessor pagination is unauthenticated")
+lookup_start = publish.index('          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"')
+lookup_end = publish.index("          assembler_args=(")
+predecessor_lookup = publish[lookup_start:lookup_end]
+cleanup_branch = 'if [[ "$TRANSITION_STAGE" == cleanup ]]; then'
+paginated_releases = '"/repos/${GITHUB_REPOSITORY}/releases?per_page=100"'
+tagged_release = '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
+for fragment in (
+    cleanup_branch,
+    "gh api --paginate -H 'Accept: application/vnd.github+json'",
+    paginated_releases,
+    'jq -se --arg tag "container-${predecessor}"',
+    "if length == 1 then .[0]",
+    "Cleanup predecessor draft release identity is not unique",
+):
+    if fragment not in predecessor_lookup:
+        raise SystemExit(f"Cleanup predecessor pagination gate is missing: {fragment}")
+if predecessor_lookup.count(tagged_release) != 1:
+    raise SystemExit("Cleanup predecessor tag endpoint is not confined to one fallback branch")
+cleanup_else = predecessor_lookup.index("          else\n")
+if not (
+    predecessor_lookup.index(cleanup_branch)
+    < predecessor_lookup.index(paginated_releases)
+    < cleanup_else
+    < predecessor_lookup.index(tagged_release)
+):
+    raise SystemExit("Cleanup predecessor is not uniquely resolved before the tag-endpoint fallback")
 for fragment in ("name: verified-managed-images", "pattern: manager-*"):
     if fragment not in publish:
         raise SystemExit(f"publish omits scoped release artifact family: {fragment}")

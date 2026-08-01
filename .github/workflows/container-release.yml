@@ -54,6 +54,8 @@ jobs:
       - name: Resolve immutable release inputs
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           source_commit="$(git rev-parse HEAD)"
@@ -63,6 +65,14 @@ jobs:
           cognee_revision="$(jq -er '.sources.cognee.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           transition_stage="$(jq -er '.stage | select(. == "bridge" or . == "cleanup" or . == "target_baseline")' docs/contracts/release-transition.json)"
+          if [[ "$transition_stage" == target_baseline ]]; then
+            transition_predecessor="$(jq -er '.predecessor_generation | select(test("^[0-9a-f]{40}$"))' docs/contracts/release-transition.json)"
+            current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            [[ "$current_tag" == "container-${transition_predecessor}" ]] || {
+              echo "Target baseline is waiting for its canonical Cleanup predecessor: ${current_tag}" >&2
+              exit 1
+            }
+          fi
           manager_command=./cmd/agent-platform-manager
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
           if [[ "$transition_stage" == bridge ]]; then
@@ -1293,18 +1303,28 @@ jobs:
           current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
           predecessor="$transition_predecessor"
           if [[ "$TRANSITION_STAGE" == target_baseline ]]; then
-            if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
-              echo "Target baseline latest is not an immutable generation: ${current_tag}" >&2
+            [[ "$current_tag" == "container-${predecessor}" ]] || {
+              echo "Target baseline predecessor is not the public latest: ${current_tag}" >&2
               exit 1
-            fi
-            predecessor="${BASH_REMATCH[1]}"
+            }
           fi
           predecessor_root="$RUNNER_TEMP/predecessor-release"
           mkdir -p "$predecessor_root"
           predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"
-          gh api -H 'Accept: application/vnd.github+json' \
-            "/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}" \
-            > "$predecessor_api"
+          if [[ "$TRANSITION_STAGE" == cleanup ]]; then
+            gh api --paginate -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" |
+              jq -se --arg tag "container-${predecessor}" '
+                if all(.[]; type == "array") then [.[].[] | select(.tag_name == $tag)]
+                else error("invalid paginated releases response") end |
+                if length == 1 then .[0]
+                else error("Cleanup predecessor draft release identity is not unique") end
+              ' > "$predecessor_api"
+          else
+            gh api -H 'Accept: application/vnd.github+json' \
+              "/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}" \
+              > "$predecessor_api"
+          fi
           assembler_args=(
             scripts/assemble_release_manifest.py
             --contract docs/contracts/release-transition.json
