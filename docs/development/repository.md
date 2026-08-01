@@ -41,8 +41,7 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 
 - Python 需要 3.11+，四空格缩进，函数/模块使用 `snake_case`，类型提示用于说明接口。
 - Runtime 使用严格 TypeScript 和 Node 22.19+；模型、工具、审批、session、进程和委派逻辑归 `agent-runtime/src`。
-- Manager 使用 Go；公网 Gateway、Docker 编排、operation journal、release 校验和宿主执行归 `manager/`，业务容器不得复制这些职责。
-- `handoff-fs-helper` 使用同一静态 Manager 源构建为独立、digest-pinned 的最小镜像，只开放闭世界内部 worker 入口；它不是第二个 Manager、通用维护镜像或脚本容器。Docker 启动策略和 request/receipt 协议仍由 `manager/` 拥有，不能以 shell、`tar` 或 vendored 文件同步工具替代。
+- Manager 使用 Go；唯一生产命令是 `manager/cmd/agent-platform-manager`，公网 Gateway、Docker 编排、operation journal、release 校验、自更新/恢复和宿主执行归 `manager/`，业务容器不得复制这些职责。Cleanup 基线不编译或保留 source/handoff/helper/attestation 命令与包。
 - 前端使用 React + TypeScript；组件按 chat、shell、admin、preview、memory、skills 等领域组织。
 - Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
 - `enterprise_agent_platform/static/` 是生成资源，禁止手改。

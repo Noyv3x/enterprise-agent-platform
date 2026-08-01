@@ -23,8 +23,6 @@ from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
-    _manager_handoff_receipt_digest,
-    _validate_manager_handoff_receipt,
 )
 from test_platform import RecordingAgent
 
@@ -291,138 +289,10 @@ class ManagerUpdateControlTests(unittest.TestCase):
             EnterpriseService._manager_startup_reservation_id(explicit_null), ""
         )
 
-    def test_handoff_commit_http_contract_is_authenticated_and_closed_world(self):
-        operation_id = "handoff_" + "6" * 32
-        target_generation = "7" * 40
-        binding_sha256 = "8" * 64
-        status = {
-            "maintenance": True,
-            "public_state": "updating",
-            "active_operation_id": operation_id,
-            "finalize_pending_operation_id": "",
-            "operation_id": operation_id,
-            "gate_settlement": None,
-        }
-        with tempfile.TemporaryDirectory() as td:
-            data_dir = Path(td)
-            token_file = data_dir / "manager-token"
-            token_file.write_text("manager-token\n", encoding="utf-8")
-            token_file.chmod(0o600)
-            config = replace(_config(data_dir), manager_token_file=token_file)
-            service = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=_ManagerStub(status=status),
-            )
-            server, thread = serve_in_thread(config, service)
-            host, port = server.server_address
-            headers = {
-                "Authorization": "Bearer manager-token",
-                "Content-Type": "application/json",
-            }
-            try:
-                oversized_conn = http.client.HTTPConnection(host, port, timeout=5)
-                oversized_conn.request(
-                    "POST",
-                    "/internal/manager/handoff/commit-release",
-                    body=" " * (16 * 1024 + 1),
-                    headers=headers,
-                )
-                oversized_response = oversized_conn.getresponse()
-                oversized_response.read()
-                self.assertEqual(oversized_response.status, 413)
-                oversized_conn.close()
-
-                conn = http.client.HTTPConnection(host, port, timeout=5)
-                conn.request("GET", "/internal/manager/handoff/reservation")
-                response = conn.getresponse()
-                response.read()
-                self.assertEqual(response.status, 401)
-
-                duplicate = (
-                    '{"operation_id":"%s","operation_id":"%s",'
-                    '"target_generation":"%s","binding_sha256":"%s"}'
-                    % (
-                        operation_id,
-                        operation_id,
-                        target_generation,
-                        binding_sha256,
-                    )
-                )
-                conn.request(
-                    "POST",
-                    "/internal/manager/handoff/commit-release",
-                    body=duplicate,
-                    headers=headers,
-                )
-                response = conn.getresponse()
-                response.read()
-                self.assertEqual(response.status, 400)
-                self.assertTrue(service.platform_update_is_blocking())
-
-                unknown = {
-                    "operation_id": operation_id,
-                    "target_generation": target_generation,
-                    "binding_sha256": binding_sha256,
-                    "unexpected": True,
-                }
-                conn.request(
-                    "POST",
-                    "/internal/manager/handoff/commit-release",
-                    body=json.dumps(unknown),
-                    headers=headers,
-                )
-                response = conn.getresponse()
-                response.read()
-                self.assertEqual(response.status, 400)
-
-                request = {
-                    "operation_id": operation_id,
-                    "target_generation": target_generation,
-                    "binding_sha256": binding_sha256,
-                }
-                conn.request(
-                    "POST",
-                    "/internal/manager/handoff/commit-release",
-                    body=json.dumps(request),
-                    headers=headers,
-                )
-                response = conn.getresponse()
-                committed = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(response.status, 200)
-                self.assertEqual(set(committed), {"released", "receipt"})
-                self.assertEqual(committed["receipt"]["operation_id"], operation_id)
-
-                conn.request(
-                    "GET",
-                    "/internal/manager/handoff/reservation",
-                    headers={"Authorization": "Bearer manager-token"},
-                )
-                response = conn.getresponse()
-                observed = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(response.status, 200)
-                self.assertEqual(
-                    set(observed),
-                    {
-                        "schema_version",
-                        "reserved",
-                        "reservation_id",
-                        "reservation_owner",
-                        "receipt",
-                    },
-                )
-                self.assertFalse(observed["reserved"])
-                self.assertEqual(observed["receipt"], committed["receipt"])
-            finally:
-                server.shutdown()
-                server.server_close()
-                service.close()
-                thread.join(timeout=2)
-
 
 class ServiceUpdateReservationTests(unittest.TestCase):
     @staticmethod
-    def _handoff_status(operation_id: str) -> dict[str, object]:
+    def _active_status(operation_id: str) -> dict[str, object]:
         return {
             "maintenance": True,
             "public_state": "updating",
@@ -500,10 +370,17 @@ class ServiceUpdateReservationTests(unittest.TestCase):
 
             calls: list[bool] = []
 
-            def observe_sidecar(data_dir, *, commit_schema_upgrade=False):
+            def observe_sidecar(
+                data_dir,
+                *,
+                commit_schema_upgrade=False,
+                technical_profile_value=None,
+            ):
                 calls.append(bool(commit_schema_upgrade))
                 return ensure_camofox_runtime_sidecar(
-                    data_dir, commit_schema_upgrade=commit_schema_upgrade
+                    data_dir,
+                    commit_schema_upgrade=commit_schema_upgrade,
+                    technical_profile_value=technical_profile_value,
                 )
 
             with mock.patch(
@@ -518,7 +395,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     ),
                 )
             try:
-                self.assertEqual(calls, [False])
+                self.assertEqual(calls, [False, False])
                 self.assertFalse(service.platform_update_is_blocking())
                 self.assertTrue(service.agent_scopes._schema_writes_enabled)
                 self.assertEqual(service._auto_update_last_released_id, operation_id)
@@ -568,7 +445,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             db = Database(config.db_path)
             try:
                 scope = AgentScopeManager(config, db).ensure_private_scope(1)
-                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
+                marker = Path(scope.workspace_path) / ".agent-platform-scope.json"
                 marker.unlink()
                 db.execute(
                     "DELETE FROM agent_runtime_scope_sessions WHERE scope_key = ?",
@@ -579,13 +456,13 @@ class ServiceUpdateReservationTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 sqlite3.DatabaseError,
-                "current alias is missing",
+                "workspace marker is missing",
             ):
                 EnterpriseService(
                     config,
                     agent_client=_BlockingAgent(),
                     manager_client=_ManagerStub(
-                        status=self._handoff_status(operation_id)
+                        status=self._active_status(operation_id)
                     ),
                 )
 
@@ -601,182 +478,10 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             finally:
                 verification.close()
 
-    def test_handoff_receipt_digest_uses_cross_runtime_canonical_form(self):
-        receipt = {
-            "schema_version": 1,
-            "operation_id": "handoff_" + "a" * 32,
-            "target_generation": "b" * 40,
-            "binding_sha256": "c" * 64,
-            "database_schema_version": 2026072901,
-            "committed_at": "2026-07-31T12:34:56.123456Z",
-        }
-        self.assertEqual(
-            _manager_handoff_receipt_digest(receipt),
-            "d88b7e48f47f0d3337d3a11a66a9fb3a863145127f5dd49b28ab7e280f35037b",
-        )
 
-    def test_handoff_receipt_requires_json_integer_schema_version(self):
-        receipt = {
-            "schema_version": True,
-            "operation_id": "handoff_" + "a" * 32,
-            "target_generation": "b" * 40,
-            "binding_sha256": "c" * 64,
-            "database_schema_version": 2026072901,
-            "committed_at": "2026-07-31T12:34:56.123456Z",
-        }
-        receipt["receipt_sha256"] = _manager_handoff_receipt_digest(receipt)
-        with self.assertRaisesRegex(ValueError, "schema is unsupported"):
-            _validate_manager_handoff_receipt(receipt)
 
-    def test_handoff_commit_receipt_survives_restart_and_lost_response(self):
-        operation_id = "handoff_" + "a" * 32
-        target_generation = "b" * 40
-        binding_sha256 = "c" * 64
-        with tempfile.TemporaryDirectory() as td:
-            data_dir = Path(td)
-            config = _config(data_dir)
-            manager = _ManagerStub(status=self._handoff_status(operation_id))
-            service = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=manager,
-            )
-            try:
-                first = service.manager_handoff_commit_release(
-                    operation_id, target_generation, binding_sha256
-                )
-                self.assertEqual(set(first), {"released", "receipt"})
-                self.assertTrue(first["released"])
-                self.assertEqual(first["receipt"]["operation_id"], operation_id)
-                self.assertEqual(
-                    service.manager_handoff_reservation(),
-                    {
-                        "schema_version": 1,
-                        "reserved": False,
-                        "reservation_id": "",
-                        "reservation_owner": "",
-                        "receipt": first["receipt"],
-                    },
-                )
-                # Treat the successful return as a response lost after the
-                # server completed every effect. The next process must return
-                # the same durable receipt without repeating schemas.
-            finally:
-                service.close()
 
-            restarted = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=_ManagerStub(
-                    status=self._handoff_status(operation_id)
-                ),
-            )
-            try:
-                with mock.patch.object(
-                    restarted.agent_scopes,
-                    "commit_schema_upgrade",
-                    side_effect=AssertionError("workspace schema repeated"),
-                ), mock.patch(
-                    "enterprise_agent_platform.service.ensure_camofox_runtime_sidecar",
-                    side_effect=AssertionError("Camoufox schema repeated"),
-                ):
-                    replay = restarted.manager_handoff_commit_release(
-                        operation_id, target_generation, binding_sha256
-                    )
-                self.assertEqual(replay, first)
-                self.assertFalse(restarted.platform_update_is_blocking())
-            finally:
-                restarted.close()
 
-    def test_handoff_receipt_before_release_is_reconciled_after_restart(self):
-        operation_id = "handoff_" + "d" * 32
-        target_generation = "e" * 40
-        binding_sha256 = "f" * 64
-        with tempfile.TemporaryDirectory() as td:
-            data_dir = Path(td)
-            config = _config(data_dir)
-            service = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=_ManagerStub(
-                    status=self._handoff_status(operation_id)
-                ),
-            )
-            try:
-                with mock.patch.object(
-                    service,
-                    "release_auto_update_reservation",
-                    return_value=False,
-                ):
-                    with self.assertRaisesRegex(
-                        ServiceError, "reservation does not match"
-                    ):
-                        service.manager_handoff_commit_release(
-                            operation_id, target_generation, binding_sha256
-                        )
-                uncertain = service.manager_handoff_reservation()
-                self.assertTrue(uncertain["reserved"])
-                self.assertIsNotNone(uncertain["receipt"])
-            finally:
-                service.close()
-
-            restarted = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=_ManagerStub(
-                    status=self._handoff_status(operation_id)
-                ),
-            )
-            try:
-                with mock.patch.object(
-                    restarted.agent_scopes,
-                    "commit_schema_upgrade",
-                    side_effect=AssertionError("workspace schema repeated"),
-                ), mock.patch(
-                    "enterprise_agent_platform.service.ensure_camofox_runtime_sidecar",
-                    side_effect=AssertionError("Camoufox schema repeated"),
-                ):
-                    result = restarted.manager_handoff_commit_release(
-                        operation_id, target_generation, binding_sha256
-                    )
-                self.assertEqual(result["receipt"], uncertain["receipt"])
-                self.assertFalse(restarted.platform_update_is_blocking())
-            finally:
-                restarted.close()
-
-    def test_handoff_commit_rejects_conflicting_or_malformed_identity(self):
-        operation_id = "handoff_" + "1" * 32
-        target_generation = "2" * 40
-        binding_sha256 = "3" * 64
-        with tempfile.TemporaryDirectory() as td:
-            config = _config(Path(td))
-            service = EnterpriseService(
-                config,
-                agent_client=_BlockingAgent(),
-                manager_client=_ManagerStub(
-                    status=self._handoff_status(operation_id)
-                ),
-            )
-            try:
-                service.manager_handoff_commit_release(
-                    operation_id, target_generation, binding_sha256
-                )
-                for arguments in (
-                    (operation_id, "4" * 40, binding_sha256),
-                    (operation_id, target_generation, "5" * 64),
-                ):
-                    with self.assertRaisesRegex(ServiceError, "another identity"):
-                        service.manager_handoff_commit_release(*arguments)
-                with self.assertRaisesRegex(ServiceError, "operation_id is invalid"):
-                    service.manager_handoff_commit_release(
-                        "op_not-a-handoff", target_generation, binding_sha256
-                    )
-                with self.assertRaisesRegex(ServiceError, "must be strings"):
-                    service.manager_handoff_commit_release(
-                        operation_id, 7, binding_sha256  # type: ignore[arg-type]
-                    )
-            finally:
-                service.close()
 
     def test_only_commit_release_advances_machine_schemas(self):
         with tempfile.TemporaryDirectory() as td:
@@ -791,7 +496,12 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 self.assertTrue(service.platform_update_is_blocking())
                 schema_events.append("workspace")
 
-            def commit_camofox_schema(_data_dir, *, commit_schema_upgrade=False):
+            def commit_camofox_schema(
+                _data_dir,
+                *,
+                commit_schema_upgrade=False,
+                technical_profile_value=None,
+            ):
                 self.assertTrue(service.platform_update_is_blocking())
                 self.assertTrue(commit_schema_upgrade)
                 schema_events.append("camofox")
@@ -1149,25 +859,19 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(idle["state"], "idle")
 
-                conn.request("GET", "/internal/manager/handoff/evidence")
+                conn.request("GET", "/internal/manager/health")
                 response = conn.getresponse()
                 response.read()
                 self.assertEqual(response.status, 401)
                 conn.request(
                     "GET",
-                    "/internal/manager/handoff/evidence",
+                    "/internal/manager/health",
                     headers={"Authorization": "Bearer manager-token"},
                 )
                 response = conn.getresponse()
-                evidence = json.loads(response.read().decode("utf-8"))
+                health = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(response.status, 200)
-                self.assertEqual(evidence["schema_version"], 1)
-                self.assertEqual(evidence["technical_profile"], "ubitech-agent-v1")
-                self.assertEqual(evidence["database_integrity"], "ok")
-                self.assertEqual(evidence["database_foreign_keys"], "ok")
-                self.assertTrue(evidence["platform_reservation_idle"])
-                self.assertRegex(evidence["runtime_identity_sha256"], r"^[0-9a-f]{64}$")
-                self.assertRegex(evidence["workspace_identity_sha256"], r"^[0-9a-f]{64}$")
+                self.assertEqual(health, {"status": "ok"})
 
                 update_id = "update-http"
                 self.assertTrue(service.try_reserve_auto_update(update_id)["reserved"])

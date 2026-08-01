@@ -39,12 +39,6 @@ class ReleasePromotionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_bridge_directly_follows_source_owner_repair(self) -> None:
-        self.assertEqual(
-            self.base_contract["predecessor_generation"],
-            "c09a4fe83b14ffa6a67beacf4bd27fade9ac9e94",
-        )
-
     @staticmethod
     def manifest(generation: str, schema_version: int = 1) -> dict[str, object]:
         managed = (

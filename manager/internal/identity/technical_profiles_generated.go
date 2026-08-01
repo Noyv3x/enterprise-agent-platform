@@ -1,32 +1,6 @@
 // Code generated from docs/contracts/technical-profiles.json by scripts/docs_sync.py; DO NOT EDIT.
 package identity
 
-var generatedSourceProfile = Profile{
-	ProfileID:                  "ubitech-agent-v1",
-	ManagerBinary:              "ubitech-manager",
-	ManagerUnit:                "ubitech-agent-manager.service",
-	ConfigDirectory:            "ubitech-agent",
-	ConfigFile:                 "manager.toml",
-	DataDirectory:              "ubitech-agent",
-	ManagerStateDirectory:      "manager",
-	DataRootSocketPath:         "manager/control/manager.sock",
-	RuntimeSocketPath:          "",
-	ContainerDataRoot:          "/var/lib/ubitech-agent",
-	ContainerSecretRoot:        "/run/secrets/ubitech",
-	ContainerControlSocketPath: "/run/ubitech-manager/manager.sock",
-	GatewayStatusPath:          "/__ubitech/status",
-	GatewayHealthPath:          "/__ubitech/health",
-	ComposeProject:             "ubitech-agent",
-	CoreNetwork:                "ubitech-agent_core",
-	EnvironmentPrefix:          "UBITECH",
-	LabelPrefix:                "org.ubitech.agent",
-	SandboxContainerPrefix:     "ubitech-sandbox-",
-	MigrationContainerPrefix:   "ubitech-migration-",
-	WatchdogUnitPrefix:         "ubitech-agent-manager-watchdog-",
-	RecoveryWatchdogUnitPrefix: "ubitech-agent-manager-watchdog-current-recovery-",
-	InternalWorkspaceDirectory: ".ubitech",
-}
-
 var generatedTargetProfile = Profile{
 	ProfileID:                  "agent-platform-v1",
 	ManagerBinary:              "agent-platform-manager",
@@ -35,7 +9,6 @@ var generatedTargetProfile = Profile{
 	ConfigFile:                 "manager.toml",
 	DataDirectory:              "agent-platform",
 	ManagerStateDirectory:      "manager",
-	DataRootSocketPath:         "",
 	RuntimeSocketPath:          "agent-platform-manager/manager.sock",
 	ContainerDataRoot:          "/var/lib/agent-platform",
 	ContainerSecretRoot:        "/run/secrets/agent-platform",

@@ -7,7 +7,7 @@
 用户级部署默认使用：
 
 ```text
-~/.local/share/ubitech-agent/
+~/.local/share/agent-platform/
 ├── manager/
 │   ├── state.json
 │   ├── operations/
@@ -46,17 +46,21 @@
 └── backups/
 ```
 
-`manager.toml` 位于 `~/.config/ubitech-agent/`，不属于数据根。`data_root` 是这个布局的唯一可配置根，Platform 权威数据目录始终是规范化后的 `$data_root/data`；schema migration、快照、Sandbox registry 和容器 bind mount 必须引用同一数据目录，不接受第二个 `data_dir`。
+`manager.toml` 位于 `~/.config/agent-platform/`，不属于数据根。`data_root` 是这个布局的唯一可配置根，Platform 权威数据目录始终是规范化后的 `$data_root/data`；schema migration、快照、Sandbox registry 和容器 bind mount 必须引用同一数据目录，不接受第二个 `data_dir`。
 
 Manager 只在已证明 `Current=nil` 的 fresh install 写入边界创建 `data/workspaces/` 这个 owner-only、非符号链接的受管根；普通更新、restart、repair、rollback 与恢复在 migration 或候选 Platform 启动前都只能验证已存在根，缺失、owner 或 mode 异常必须失败，不能借公共 data-layout helper 修复。Platform 候选同样只读打开该根，不能为了通过 readiness 自行创建或 chmod。具体 Agent 子目录只由 Platform 在正常已提交运行期创建；已经登记但未物化、缺 marker 或缺 Runtime alias 的 scope 属于损坏状态，普通更新没有兼容或修复入口。
 
-上述 `ubitech-*`、`.ubitech*` 和 `enterprise_*` 名称只是当前白标发布读取的桥接源身份，不是可定制品牌或最终基线。品牌设置保存在 Platform 权威数据中，但不得改变数据根、数据库文件、Runtime 目录、workspace/session identity、附件挂载、Skill 状态、Manager journal 或备份路径；品牌修改也不搬移任何文件。备份与恢复必须按真实技术路径工作，不能把管理员显示名称拼入文件名或目录。
+当前唯一布局使用 `agent-platform` 技术命名空间：宿主根固定为 `~/.local/share/agent-platform`，容器数据根固定为 `/var/lib/agent-platform`，内部工作目录固定为 `.agent-platform`。品牌设置保存在 Platform 权威数据中，但不得改变数据根、数据库文件、Runtime 目录、workspace/session identity、附件挂载、Skill 状态、Manager journal 或备份路径；品牌修改也不搬移任何文件。备份与恢复必须按真实技术路径工作，不能把管理员显示名称拼入文件名或目录。
 
-数据布局交接只能由[四阶段发布序列](../operations/deployment.md#技术命名空间交接)执行：source-profile 已建立不可变身份边界，source-owner 已让 coordinator/helper 完整接通并待命但不触发搬运；当前 Bridge 搬运一次，Cleanup 删除 source 识别。目标宿主根固定为 `~/.local/share/agent-platform`，容器数据根固定为 `/var/lib/agent-platform`，内部工作目录固定为 `.agent-platform`。禁止用符号链接、活跃数据库复制、双根写入、目录内全局字符串替换或递归猜测来维持兼容。
+Cleanup 后的普通启动只接受 `agent-platform-container-baseline-v1` 数据库基线、`.agent-platform-scope.json` workspace marker、`.agent-platform-runtime.json` Camoufox sidecar，以及带 target technical profile 和完整相对路径绑定的 Sandbox registry schema 2。缺失、旧版本、旧文件名、未知字段、混合 technical profile 或身份漂移都失败关闭；普通启动、update、restart、repair、rollback 和恢复均不自动升级、复制或兼容读取旧格式。
 
 所有产品持久状态使用宿主 bind mount。Docker 镜像、container writable layer、Engine metadata 和有界容器日志不属于备份数据。不得使用匿名 volume 保存产品权威状态。
 
-## 命名空间交接的数据变换
+<a id="命名空间交接的数据变换"></a>
+
+## Bridge→Cleanup 历史交接数据证据（非当前运行布局）
+
+本节记录已经完成的受控发布如何把旧持久身份一次性转换为当前布局，只用于审计、发布证明和理解历史备份。下述 source profile、旧根、旧 marker、Router/coordinator/helper、handoff journal 与转换器均不是 Cleanup 后 Manager、Platform 或 Runtime 的启动、更新或恢复能力；当前代码不能因这些文件或摘要存在而重新启用它们。精确历史状态机见[部署文档](../operations/deployment.md#技术命名空间交接)和[自动更新文档](../operations/auto-update.md#技术命名空间迁移发布)。
 
 桥接先把 source 数据 checkpoint 和快照，再停止所有 writer。source 的 `~/.local/share/ubitech-agent/`、source 配置和 source Manager 状态从此只读保留，直到 target 提交确认和清理发布的保留期结束；它们是回滚证据，不能原地 rename、改写 marker 或作为 target 的可写 bind。target 数据先写入 `~/.local/share/` 下与 transaction id 绑定的 owner-only sibling staging，完整校验并同步后才原子发布为 `~/.local/share/agent-platform/`。发布必须使用 Linux no-replace rename，从检查到 rename 之间出现的同名 target 不得被覆盖；已发布 manifest 必须对 request 中每个资源各有且只有一条证据，重复资源名或遗漏任一资源均失败关闭。最终 target 已存在、staging 不空或任一路径的 owner、类型、link count、mount/device 不符合 journal 时，交接在写入前拒绝。
 
@@ -119,9 +123,9 @@ target `manager/` 的生成集合也是闭世界：`state.json`、`active-genera
 
 `platform.db` 是账号、凭据、消息、记忆、知识、任务和设置的权威存储。SQLite 使用 WAL；迁移和备份必须在线 backup 或在停止 writer 后 checkpoint，不能单独复制主文件。
 
-Platform 只能通过已固定的数据目录 fd 打开 `platform.db`。既有主文件在任何 SQLite 只读 profile 检查或可写连接之前，必须证明是当前 Platform UID 拥有、单硬链接的非符号链接普通文件；空文件和 profile 检查也不豁免这些条件。缺失主文件只能在该固定父目录中以 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建为 `0600`；既有安全 inode 的宽权限只能用已打开 fd 收紧，不得按路径 `chmod`。Platform 保留该主文件 fd，每个 SQLite 连接从这一固定 inode 打开，并在连接建立后、启用 WAL 前再比较父目录项与 fd 的 device/inode。`platform.db-wal` 与 `platform.db-shm` 若已存在也必须在 SQLite 触碰它们前经过同样的 no-follow、owner、普通文件和单硬链接验证。符号链接、硬链接、特殊文件、owner 异常或任一打开/复核窗口中的 inode 置换，都必须在建立 writer 或创建/改写 WAL 前失败关闭。source 与 target profile 只改变基线 marker 和实例锁叶名，不改变数据库文件安全边界。
+Platform 只能通过已固定的数据目录 fd 打开 `platform.db`。既有主文件在任何 SQLite 只读基线检查或可写连接之前，必须证明是当前 Platform UID 拥有、单硬链接的非符号链接普通文件；空文件和基线检查也不豁免这些条件。缺失主文件只能在该固定父目录中以 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建为 `0600`；既有安全 inode 的宽权限只能用已打开 fd 收紧，不得按路径 `chmod`。Platform 保留该主文件 fd，每个 SQLite 连接从这一固定 inode 打开，并在连接建立后、启用 WAL 前再比较父目录项与 fd 的 device/inode。`platform.db-wal` 与 `platform.db-shm` 若已存在也必须在 SQLite 触碰它们前经过同样的 no-follow、owner、普通文件和单硬链接验证。符号链接、硬链接、特殊文件、owner 异常或任一打开/复核窗口中的 inode 置换，都必须在建立 writer 或创建/改写 WAL 前失败关闭。当前唯一基线 marker 是 `agent-platform-container-baseline-v1`，当前唯一实例锁是 `.agent-platform.lock`。
 
-附件、工作区和 Skill 的逻辑关系保持原设计。附件数据库路径为相对路径。Multipart 上传先增量写入 `upload-staging/` 下按请求隔离的 `0700` 目录和 `0600` 普通文件，提交后流式复制到 `attachments/`；staging 不是权威数据，不进入备份，并在请求成功、失败、取消或超时后删除。Platform 启动可以清理不属于活跃请求的遗留 staging 目录。工作区在数据库中保存相对标识，不保存宿主绝对路径；Platform 将其解析为宿主数据目录，Sandbox 内统一映射为 `/workspace`。管理器只把与当前私人或频道 scope 对应的附件子目录只读挂载到 active technical profile 的内部目录；target-only 路径为 `/workspace/.agent-platform/attachments`，Bridge source 路径只在交接前为 `/workspace/.ubitech/attachments`。当前 scope 的可信系统提示可以同时说明 `/workspace` 和由 Manager 数据根派生的精确宿主映射，帮助 Agent 在获批宿主命令中理解同一文件；该绝对路径不得写入数据库、公共 API、普通 Runtime metadata 或日志。
+附件、工作区和 Skill 的逻辑关系保持原设计。附件数据库路径为相对路径。Multipart 上传先增量写入 `upload-staging/` 下按请求隔离的 `0700` 目录和 `0600` 普通文件，提交后流式复制到 `attachments/`；staging 不是权威数据，不进入备份，并在请求成功、失败、取消或超时后删除。Platform 启动可以清理不属于活跃请求的遗留 staging 目录。工作区在数据库中保存相对标识，不保存宿主绝对路径；Platform 将其解析为宿主数据目录，Sandbox 内统一映射为 `/workspace`。管理器只把与当前私人或频道 scope 对应的附件子目录只读挂载到 `/workspace/.agent-platform/attachments`。当前 scope 的可信系统提示可以同时说明 `/workspace` 和由 Manager 数据根派生的精确宿主映射，帮助 Agent 在获批宿主命令中理解同一文件；该绝对路径不得写入数据库、公共 API、普通 Runtime metadata 或日志。
 
 Skill 使用与来源状态位于每个 scope 根的 `.skill-usage.json`，与包一起进入平台快照。文件为部署用户 owner-only 普通文件，以临时文件、fsync、rename 和父目录 fsync 原子替换；不是目录、符号链接、硬链接或未知 schema 时失败关闭。缺少单个 skill id 的状态不补猜历史来源，而按 user-owned active 处理。
 
@@ -131,9 +135,9 @@ Skill 使用与来源状态位于每个 scope 根的 `.skill-usage.json`，与�
 
 主 Agent 的工作文件仍位于稳定的 `workspaces/` 路径。`agent-envs/<scope-hash>/home` 和 `env` 保存用户级工具、虚拟环境与配置；scope hash 避免在基础设施路径暴露原始 scope key。
 
-容器名称和 writable layer 不是身份真相源。管理器根据数据库 scope、持久 Sandbox metadata 和 Docker label 对账，缺失容器可以从镜像和挂载目录重建。持久 metadata 中的 `sandbox_id` 到 `workspace_id` 绑定在首次成功登记后不可变；同一 `sandbox_id` 携带不同 `workspace_id` 的请求必须在创建目录或操作容器前拒绝，身份迁移必须使用新的 Sandbox identity。委派子 Agent不创建新的目录，使用父主 Agent 的 Sandbox、workspace、HOME 和 env。
+容器名称和 writable layer 不是身份真相源。管理器根据数据库 scope、Sandbox registry schema 2 和 `io.agent-platform.*` Docker label 对账，缺失容器可以从镜像和挂载目录重建。registry 顶层 technical profile 必须精确为 `agent-platform-v1`，每条记录必须包含可信配置可重新推导的 UID/GID 和 workspace、HOME、env、附件相对路径；schema 1、缺字段或旧技术身份直接拒绝，当前启动不提供原地升级。持久 metadata 中的 `sandbox_id` 到 `workspace_id` 绑定在首次成功登记后不可变；同一 `sandbox_id` 携带不同 `workspace_id` 的请求必须在创建目录或操作容器前拒绝，身份迁移必须使用新的 Sandbox identity。委派子 Agent不创建新的目录，使用父主 Agent 的 Sandbox、workspace、HOME 和 env。
 
-Sandbox 的持久目录保持宿主部署用户的 UID/GID，而不是假定为 `1000:1000`。管理器在每次创建或启动容器前，必须验证 workspace、HOME、env 和 scope 附件这四个宿主 bind root 均位于配置的数据目录内，是无符号链接、由部署用户 UID/GID 持有的真实目录；缺失目录只能在该受信数据目录下创建。已有路径类型或所有者不符时必须拒绝，不能借容器入口 `chown` 任意宿主路径。容器启动入口只把镜像内 `agent` 账号映射到管理器明确传入的 UID/GID，并只对 `/workspace`、`/home/agent`、`/opt/agent-env` 三个挂载根本身进行无符号链接的所有权与 `0700` 校正；禁止递归改写子树或触碰 active profile 的 `/workspace/<internal-directory>/attachments` 只读挂载。所有后续容器 exec 都以相同映射身份运行。
+Sandbox 的持久目录保持宿主部署用户的 UID/GID，而不是假定为 `1000:1000`。管理器在每次创建或启动容器前，必须验证 workspace、HOME、env 和 scope 附件这四个宿主 bind root 均位于配置的数据目录内，是无符号链接、由部署用户 UID/GID 持有的真实目录；缺失目录只能在该受信数据目录下创建。已有路径类型或所有者不符时必须拒绝，不能借容器入口 `chown` 任意宿主路径。容器启动入口只把镜像内 `agent` 账号映射到管理器明确传入的 UID/GID，并只对 `/workspace`、`/home/agent`、`/opt/agent-env` 三个挂载根本身进行无符号链接的所有权与 `0700` 校正；禁止递归改写子树或触碰 `/workspace/.agent-platform/attachments` 只读挂载。所有后续容器 exec 都以相同映射身份运行。
 
 Sandbox registry 的原子落盘是容器可用的提交边界。一次 ensure 若创建或重新启动了容器，但 registry 持久化失败，管理器必须恢复调用前的内存记录，并同步停止该次启动的既有容器或停止并删除该次新建的容器；镜像替换还必须恢复原登记镜像的容器状态。不得留下只存在于 Docker、却没有相符持久 identity 记录的运行中 Sandbox。
 
@@ -145,7 +149,7 @@ Sandbox 内 apt 或其它系统层修改随容器重建丢失。需要跨更新�
 
 Agent Runtime 的 session、approval 和 idempotency 继续保存在 `runtimes/agent`，Runtime 程序和 `node_modules` 位于镜像而不是数据根。
 
-Camoufox 使用共享服务和按 scope 派生的独立 Profile。浏览器二进制位于镜像；登录态、Cookie、Profile 和需要保留的 trace 位于 bind mount。
+Camoufox 使用共享服务和按 scope 派生的独立 Profile。平台自有 sidecar 固定为 `runtimes/camofox/.agent-platform-runtime.json`，其 technical profile 必须为 `agent-platform-v1`；旧文件名、旧 profile 或未知 schema 直接拒绝，当前启动不执行兼容转换。浏览器二进制位于镜像；登录态、Cookie、Profile 和需要保留的 trace 位于 bind mount。
 
 Cognee 代码和依赖位于 Platform 镜像，数据、system、cache、logs 与 `.env` 位于数据根。SearXNG 的整个 `config/` 目录只读映射到容器 `/etc/searxng`，`cache/` 单独读写映射；不能只覆盖 `settings.yml`，否则上游镜像声明的 `/etc/searxng` volume 会在每次 generation 切换时生成无法追踪的匿名卷。Firecrawl 的运行配置由 Compose 环境提供，Redis、RabbitMQ 与 PostgreSQL 数据分别映射到上图所列目录。当前数据布局不声明 FoundationDB 目录，release 也不得为它创建或挂载路径。权威数据不得只存在于匿名 Docker volume，固定服务的 Compose 也不得因镜像内 `VOLUME` 声明产生匿名持久卷。
 

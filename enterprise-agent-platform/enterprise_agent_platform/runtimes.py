@@ -541,31 +541,15 @@ class PlatformRuntimeManager:
     def _agent_runtime_token(self) -> str:
         return self.config.agent_runtime_token or self._first_secret(
             "agent_runtime_token",
-            self.config.technical_profile.environment_variable(
-                "ENTERPRISE_AGENT_RUNTIME_TOKEN"
-            ),
+            "AGENT_PLATFORM_AGENT_RUNTIME_TOKEN",
         )
 
     def _camofox_access_key(self) -> str:
-        profile = self.config.technical_profile
-        source_value = os.getenv("CAMOFOX_ACCESS_KEY", "")
-        source_file = os.getenv("CAMOFOX_ACCESS_KEY_FILE", "")
         target_name = "AGENT_PLATFORM_CAMOFOX_ACCESS_KEY"
         target_file_name = target_name + "_FILE"
         target_value = os.getenv(target_name, "")
         target_file = os.getenv(target_file_name, "")
 
-        if not profile.is_target:
-            if target_value or target_file:
-                raise RuntimeError(
-                    "source and target Camoufox secret namespaces cannot be mixed"
-                )
-            return self._first_secret("CAMOFOX_ACCESS_KEY")
-
-        if source_value or source_file:
-            raise RuntimeError(
-                "source and target Camoufox secret namespaces cannot be mixed"
-            )
         if target_value and target_file:
             raise RuntimeError(
                 f"{target_name} and {target_file_name} cannot both be set"

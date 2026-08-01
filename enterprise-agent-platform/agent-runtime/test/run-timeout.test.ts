@@ -320,8 +320,15 @@ test("an uncooperative provider cannot hold the run slot past idle cleanup grace
   const home = await temporaryDirectory("agent-uncooperative-idle-");
   const workspace = await temporaryDirectory("agent-uncooperative-idle-workspace-");
   const faux = fauxProvider();
+  let markProviderStarted: (() => void) | undefined;
+  const providerStarted = new Promise<void>((resolve) => {
+    markProviderStarted = resolve;
+  });
   faux.setResponses([
-    async () => await new Promise<never>(() => undefined),
+    async () => {
+      markProviderStarted?.();
+      return await new Promise<never>(() => undefined);
+    },
     fauxAssistantMessage("the next run acquired the released slot"),
   ]);
   const coordinator = new RunCoordinator({
@@ -330,7 +337,7 @@ test("an uncooperative provider cannot hold the run slot past idle cleanup grace
   });
   try {
     const run = coordinator.createRun(baseRequest(workspace));
-    await waitUntil(() => faux.state.callCount === 1 ? true : undefined);
+    await withDeadline(providerStarted, 10_000);
     const next = coordinator.createRun({
       ...baseRequest(workspace),
       scope_key: "next-scope",

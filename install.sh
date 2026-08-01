@@ -5,8 +5,6 @@ umask 077
 repository="Noyv3x/enterprise-agent-platform"
 default_manifest_url="https://github.com/${repository}/releases/latest/download/release.json"
 manifest_url="$default_manifest_url"
-config_path="${XDG_CONFIG_HOME:-$HOME/.config}/agent-platform/manager.toml"
-data_root="${XDG_DATA_HOME:-$HOME/.local/share}/agent-platform"
 listen="127.0.0.1:8080"
 assume_yes=0
 
@@ -35,7 +33,7 @@ while (($#)); do
   esac
 done
 
-for command in curl sha256sum install systemctl uname awk stat realpath id mktemp docker find grep rm rmdir python3 flock; do
+for command in curl sha256sum install systemctl uname awk stat realpath id getent mktemp docker find grep rm rmdir python3 flock; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'required command is missing: %s\n' "$command" >&2
     exit 69
@@ -60,6 +58,31 @@ case "$(uname -m)" in
   aarch64|arm64) architecture=arm64 ;;
   *) printf 'unsupported architecture: %s\n' "$(uname -m)" >&2; exit 65 ;;
 esac
+
+account_uid="$(id -u)"
+account_gid="$(id -g)"
+account_records=()
+mapfile -t account_records < <(getent passwd "$account_uid")
+if [[ "${#account_records[@]}" -ne 1 ]]; then
+  printf 'operating-system account lookup returned %s records for uid %s\n' \
+    "${#account_records[@]}" "$account_uid" >&2
+  exit 65
+fi
+IFS=: read -r account_name account_password account_record_uid account_record_gid \
+  account_gecos account_home account_shell account_extra <<<"${account_records[0]}"
+if [[ -n "${account_extra:-}" || -z "$account_name" \
+  || "$account_record_uid" != "$account_uid" \
+  || "$account_record_gid" != "$account_gid" \
+  || "$account_home" != /* ]]; then
+  printf '%s\n' 'operating-system account record is invalid for the current user' >&2
+  exit 65
+fi
+account_home="$(realpath -m -s -- "$account_home")"
+
+bin_dir="$account_home/.local/bin"
+config_path="$account_home/.config/agent-platform/manager.toml"
+unit_dir="$account_home/.config/systemd/user"
+data_root="$account_home/.local/share/agent-platform"
 
 asset="agent-platform-manager-linux-${architecture}"
 [[ "$manifest_url" == https://* ]] || {
@@ -88,8 +111,6 @@ for path in "$config_path" "$data_root"; do
   fi
 done
 
-bin_dir="${XDG_BIN_HOME:-$HOME/.local/bin}"
-unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 runtime_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 stable_manager="$bin_dir/agent-platform-manager"
 unit_name="agent-platform-manager.service"
@@ -214,17 +235,9 @@ expected_top = {
     "protocol_version", "database_schema_version", "manager", "compose", "images",
 }
 if set(manifest) != expected_top:
-    if "namespace_handoff" in manifest:
-        raise SystemExit(
-            "fresh installation is unavailable during the one-time namespace handoff; "
-            "wait for the target-only baseline"
-        )
     raise SystemExit("fresh install requires the closed target-only release manifest")
 if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 2 or type(manifest.get("protocol_version")) is not int or manifest["protocol_version"] != 2:
-    raise SystemExit(
-        "fresh installation requires manifest schema/protocol 2; "
-        "Bridge releases require an already-running predecessor"
-    )
+    raise SystemExit("fresh installation requires manifest schema/protocol 2")
 if type(manifest.get("channel")) is not str or manifest["channel"] != "main":
     raise SystemExit("fresh install manifest channel must be main")
 if not isinstance(manifest.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
@@ -295,6 +308,12 @@ expected="${manifest_artifact[1]}"
 # malformed release still creates no target installation path. The inode is
 # retained deliberately; unlinking a flock file creates a split-lock race.
 ensure_owner_directory "$runtime_root"
+runtime_mode="$(stat -c '%a' "$runtime_root" 2>/dev/null || true)"
+if [[ ! "$runtime_mode" =~ ^[0-7]{3,4}$ ]] \
+  || (( (8#$runtime_mode & 077) != 0 )); then
+  printf 'refusing a non-private runtime directory: %s\n' "$runtime_root" >&2
+  exit 73
+fi
 install_lock="$runtime_root/agent-platform-install.lock"
 if [[ -L "$install_lock" || ( -e "$install_lock" && ! -f "$install_lock" ) ]]; then
   printf '%s\n' 'refusing an unsafe fresh-install lock' >&2
@@ -347,7 +366,7 @@ if ((assume_yes == 0)); then
     printf '%s\n' 'interactive confirmation requires a controlling terminal; pass --yes for unattended installation' >&2
     exit 64
   fi
-  printf 'Install the Agent Platform for user %s? [y/N] ' "${USER:-$(id -un)}" >/dev/tty
+  printf 'Install the Agent Platform for user %s? [y/N] ' "$account_name" >/dev/tty
   read -r answer </dev/tty
   [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]] || exit 0
 fi
@@ -437,8 +456,8 @@ else
 fi
 
 if command -v loginctl >/dev/null \
-  && ! loginctl show-user "${USER:-$(id -un)}" -p Linger --value 2>/dev/null | grep -qx yes; then
-  printf 'Warning: user lingering is disabled; run `loginctl enable-linger %s`.\n' "${USER:-$(id -un)}" >&2
+  && ! loginctl show-user "$account_name" -p Linger --value 2>/dev/null | grep -qx yes; then
+  printf 'Warning: user lingering is disabled; run `loginctl enable-linger %s`.\n' "$account_name" >&2
 fi
 
 printf 'Agent Platform installed. Run: %s status\n' "$stable_manager"

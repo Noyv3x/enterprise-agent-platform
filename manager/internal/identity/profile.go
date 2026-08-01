@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
-
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 )
 
 // Profile is the complete fixed namespace needed to identify one Manager
@@ -22,7 +20,6 @@ type Profile struct {
 	ConfigFile                 string
 	DataDirectory              string
 	ManagerStateDirectory      string
-	DataRootSocketPath         string
 	RuntimeSocketPath          string
 	ContainerDataRoot          string
 	ContainerSecretRoot        string
@@ -40,8 +37,6 @@ type Profile struct {
 	InternalWorkspaceDirectory string
 }
 
-var source = generatedSourceProfile
-
 var target = generatedTargetProfile
 
 // ActiveProfile is an opaque, validated technical profile. Keeping its value
@@ -51,68 +46,22 @@ type ActiveProfile struct {
 	value Profile
 }
 
-// SourceProfile returns a copy of the currently deployed technical identity.
-// It is intended for protocol comparison and tests. Production construction
-// should inject SourceActiveProfile instead of consulting this function from
-// internal components.
-func SourceProfile() Profile { return source }
-
-// TargetProfile returns the immutable target binding used by the verified
-// namespace handoff.
+// TargetProfile returns the immutable technical identity for every supported
+// Manager lifecycle operation.
 func TargetProfile() Profile { return target }
 
 // TargetProfileID returns the signed target identity in release manifests.
 func TargetProfileID() string { return target.ProfileID }
 
-// SourceActiveProfile is the only ordinary-startup profile selector.
-func SourceActiveProfile() ActiveProfile { return ActiveProfile{value: source} }
+// CompileTimeActiveProfile is the sole production identity selector. Paths,
+// argv, environment, manifests, branding and executable basenames cannot
+// influence the selected namespace.
+func CompileTimeActiveProfile() ActiveProfile { return ActiveProfile{value: target} }
 
-// ActiveProfileForReleaseContract selects the only ordinary-startup profile
-// allowed by a canonical release-transition contract. The profile IDs are
-// compared with the complete compile-time profiles before the stage is
-// considered, so a generated-contract drift cannot silently select either
-// namespace.
-func ActiveProfileForReleaseContract(stage, sourceProfileID, targetProfileID string) (ActiveProfile, error) {
-	if sourceProfileID != source.ProfileID || targetProfileID != target.ProfileID {
-		return ActiveProfile{}, errors.New("release transition profile IDs do not match the compiled technical profiles")
-	}
-	switch stage {
-	case "bridge":
-		return ActiveProfile{value: source}, nil
-	case "cleanup", "target_baseline":
-		return ActiveProfile{value: target}, nil
-	default:
-		return ActiveProfile{}, fmt.Errorf("unsupported compiled release transition stage %q", stage)
-	}
-}
-
-// CompileTimeActiveProfile is the sole no-journal identity selector. It uses
-// only generated constants from the canonical documentation contract; paths,
-// argv, environment, manifest contents, branding, and executable basenames
-// cannot influence the result.
-func CompileTimeActiveProfile() (ActiveProfile, error) {
-	return ActiveProfileForReleaseContract(
-		contract.ReleaseTransitionStage,
-		contract.ReleaseTransitionSourceProfileID,
-		contract.ReleaseTransitionTargetProfileID,
-	)
-}
-
-// ActivateVerifiedHandoffTarget constructs the target profile only after the
-// caller has verified the external handoff journal and capability. This
-// function deliberately accepts no profile ID, path, environment, or branding
-// value: the supplied binding must equal the complete compile-time target.
-func ActivateVerifiedHandoffTarget(binding Profile) (ActiveProfile, error) {
-	if !reflect.DeepEqual(binding, target) {
-		return ActiveProfile{}, errors.New("verified handoff target does not match the canonical target profile")
-	}
-	return ActiveProfile{value: target}, nil
-}
-
-// Validate proves that the active value is one of the two exact compile-time
-// profiles. It rejects zero values and field-level mutations.
+// Validate proves that the active value is the exact compile-time target
+// profile. It rejects zero values and field-level mutations.
 func (a ActiveProfile) Validate() error {
-	if reflect.DeepEqual(a.value, source) || reflect.DeepEqual(a.value, target) {
+	if reflect.DeepEqual(a.value, target) {
 		return nil
 	}
 	return errors.New("active technical profile is invalid")
@@ -126,14 +75,13 @@ func (a ActiveProfile) Profile() (Profile, error) {
 	return a.value, nil
 }
 
-// ProtectedHostProfiles returns the technical roots that host execution must
-// protect while the one-time namespace handoff can have source rollback state
-// and target state on disk simultaneously.
+// ProtectedHostProfiles returns the sole technical root that host execution
+// must protect.
 func (a ActiveProfile) ProtectedHostProfiles() ([]Profile, error) {
 	if err := a.Validate(); err != nil {
 		return nil, err
 	}
-	return []Profile{source, target}, nil
+	return []Profile{target}, nil
 }
 
 func (p Profile) DefaultConfigPath(configHome string) string {
@@ -148,22 +96,15 @@ func (p Profile) ManagerStateRoot(dataRoot string) string {
 	return filepath.Join(dataRoot, p.ManagerStateDirectory)
 }
 
-// ControlSocketPath resolves the profile socket. Source uses its durable data
-// root while target uses the owner-specific XDG runtime directory.
-func (p Profile) ControlSocketPath(dataRoot, runtimeRoot string) (string, error) {
-	if p.DataRootSocketPath != "" && p.RuntimeSocketPath == "" {
-		if !filepath.IsAbs(dataRoot) {
-			return "", errors.New("data root must be absolute")
-		}
-		return filepath.Join(dataRoot, filepath.FromSlash(p.DataRootSocketPath)), nil
+// ControlSocketPath resolves the owner-specific runtime socket path.
+func (p Profile) ControlSocketPath(runtimeRoot string) (string, error) {
+	if p.RuntimeSocketPath == "" {
+		return "", fmt.Errorf("profile %q has no control socket binding", p.ProfileID)
 	}
-	if p.RuntimeSocketPath != "" && p.DataRootSocketPath == "" {
-		if !filepath.IsAbs(runtimeRoot) {
-			return "", errors.New("XDG runtime directory must be absolute for the target profile")
-		}
-		return filepath.Join(runtimeRoot, filepath.FromSlash(p.RuntimeSocketPath)), nil
+	if !filepath.IsAbs(runtimeRoot) {
+		return "", errors.New("XDG runtime directory must be absolute")
 	}
-	return "", fmt.Errorf("profile %q has an invalid control socket binding", p.ProfileID)
+	return filepath.Join(runtimeRoot, filepath.FromSlash(p.RuntimeSocketPath)), nil
 }
 
 func (p Profile) ManagerInstallPath(binHome string) string {

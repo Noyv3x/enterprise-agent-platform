@@ -32,6 +32,11 @@ for expected in \
   'docker compose version' \
   'read -r answer </dev/tty' \
   'asset="agent-platform-manager-linux-${architecture}"' \
+  'mapfile -t account_records < <(getent passwd "$account_uid")' \
+  'bin_dir="$account_home/.local/bin"' \
+  'config_path="$account_home/.config/agent-platform/manager.toml"' \
+  'unit_dir="$account_home/.config/systemd/user"' \
+  'data_root="$account_home/.local/share/agent-platform"' \
   'stable_manager="$bin_dir/agent-platform-manager"' \
   'unit_name="agent-platform-manager.service"' \
   'socket_path="$runtime_root/agent-platform-manager/manager.sock"' \
@@ -43,6 +48,11 @@ for expected in \
   'rm -rf --one-file-system -- "$data_root/manager"' \
   '"$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"'; do
   grep -Fq "$expected" install.sh || fail "fresh container installer contract is missing: $expected"
+done
+for ambient_install_root in HOME XDG_BIN_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
+  if grep -Eq "(^|[^A-Z0-9_])${ambient_install_root}([^A-Z0-9_]|$)" install.sh; then
+    fail "fresh installer derives a persistent path from ambient $ambient_install_root"
+  fi
 done
 for retired_installer_identity in \
   'ubitech-manager-linux-' \
@@ -240,7 +250,17 @@ if [[ " $* " == *' enable '* && -n "${FAKE_ENABLE_READY:-}" ]]; then
 fi
 exit 0
 EOF
-chmod 0755 "$installer_stubs/curl" "$installer_stubs/docker" "$installer_stubs/systemctl"
+cat > "$installer_stubs/getent" <<'EOF'
+#!/usr/bin/env bash
+[[ "$#" -eq 2 && "$1" == passwd && "$2" == "$(id -u)" ]]
+printf 'installer:x:%s:%s:Installer Test:%s:/bin/sh\n' \
+  "$(id -u)" "$(id -g)" "${FAKE_ACCOUNT_HOME:?}"
+EOF
+chmod 0755 \
+  "$installer_stubs/curl" \
+  "$installer_stubs/docker" \
+  "$installer_stubs/systemctl" \
+  "$installer_stubs/getent"
 
 assert_manifest_rejected_before_paths() {
   local case_name="$1" manifest="$2" expected_message="${3:-}"
@@ -250,6 +270,8 @@ assert_manifest_rejected_before_paths() {
     PATH="$installer_stubs:$PATH" \
     FAKE_MANAGER="$installer_test/fake-manager" \
     FAKE_MANIFEST="$manifest" \
+    FAKE_ACCOUNT_HOME="$installer_test/${case_name}-account-home" \
+    HOME="$installer_test/${case_name}-ambient-home" \
     XDG_DATA_HOME="$installer_test/${case_name}-data" \
     XDG_CONFIG_HOME="$installer_test/${case_name}-config" \
     XDG_BIN_HOME="$installer_test/${case_name}-bin" \
@@ -263,7 +285,7 @@ assert_manifest_rejected_before_paths() {
     grep -Fq "$expected_message" "$output" \
       || fail "$case_name rejection did not report the expected boundary"
   fi
-  for path in data config bin runtime; do
+  for path in account-home ambient-home data config bin runtime; do
     [[ ! -e "$installer_test/${case_name}-${path}" ]] \
       || fail "$case_name rejection created target installation path: $path"
   done
@@ -271,7 +293,7 @@ assert_manifest_rejected_before_paths() {
 
 assert_manifest_rejected_before_paths \
   bridge "$installer_test/bridge-release.json" \
-  'fresh installation is unavailable during the one-time namespace handoff'
+  'fresh install requires the closed target-only release manifest'
 assert_manifest_rejected_before_paths \
   schema1 "$installer_test/schema1-release.json" \
   'fresh installation requires manifest schema/protocol 2'
@@ -279,31 +301,78 @@ assert_manifest_rejected_before_paths extra "$installer_test/extra-release.json"
 assert_manifest_rejected_before_paths eleven "$installer_test/eleven-release.json"
 assert_manifest_rejected_before_paths source-basename "$installer_test/source-basename-release.json"
 
-happy_data="$installer_test/happy-data/agent-platform"
+unsafe_runtime="$installer_test/unsafe-runtime"
+unsafe_runtime_home="$installer_test/unsafe-runtime-account-home"
+unsafe_runtime_output="$installer_test/unsafe-runtime-install.log"
+mkdir -p "$unsafe_runtime"
+chmod 0755 "$unsafe_runtime"
+set +e
+cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
+  FAKE_ACCOUNT_HOME="$unsafe_runtime_home" \
+  HOME="$installer_test/unsafe-runtime-ambient-home" \
+  XDG_DATA_HOME="$installer_test/unsafe-runtime-data" \
+  XDG_CONFIG_HOME="$installer_test/unsafe-runtime-config" \
+  XDG_BIN_HOME="$installer_test/unsafe-runtime-bin" \
+  XDG_RUNTIME_DIR="$unsafe_runtime" \
+  bash -s -- --yes --manifest-url https://example.invalid/release.json \
+  >"$unsafe_runtime_output" 2>&1
+unsafe_runtime_status=$?
+set -e
+[[ "$unsafe_runtime_status" -eq 73 ]] \
+  || fail "fresh installer did not reject a non-private runtime directory"
+grep -Fq 'refusing a non-private runtime directory' "$unsafe_runtime_output" \
+  || fail "unsafe runtime rejection did not report the private-directory boundary"
+[[ ! -e "$unsafe_runtime_home" ]] \
+  || fail "unsafe runtime rejection created the authoritative account installation root"
+for ignored_root in \
+  "$installer_test/unsafe-runtime-ambient-home" \
+  "$installer_test/unsafe-runtime-data" \
+  "$installer_test/unsafe-runtime-config" \
+  "$installer_test/unsafe-runtime-bin"; do
+  [[ ! -e "$ignored_root" ]] \
+    || fail "unsafe runtime rejection used an ambient persistent root: $ignored_root"
+done
+
+happy_home="$installer_test/happy-account-home"
+happy_data="$happy_home/.local/share/agent-platform"
 cat install.sh | env \
   PATH="$installer_stubs:$PATH" \
   FAKE_MANAGER="$installer_test/fake-manager" \
   FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$happy_data" \
   FAKE_FAIL_STAGE=none \
+  FAKE_ACCOUNT_HOME="$happy_home" \
+  HOME="$installer_test/happy-ambient-home" \
   XDG_DATA_HOME="$installer_test/happy-data" \
   XDG_CONFIG_HOME="$installer_test/happy-config" \
   XDG_BIN_HOME="$installer_test/happy-bin" \
   XDG_RUNTIME_DIR="$installer_test/happy-runtime" \
   bash -s -- --yes --manifest-url https://example.invalid/release.json
-[[ -x "$installer_test/happy-bin/agent-platform-manager" ]] \
+[[ -x "$happy_home/.local/bin/agent-platform-manager" ]] \
   || fail "schema-2 fresh install did not activate the target Manager path"
-[[ -f "$installer_test/happy-config/agent-platform/manager.toml" ]] \
+[[ -f "$happy_home/.config/agent-platform/manager.toml" ]] \
   || fail "schema-2 fresh install did not create the target config path"
-[[ -f "$installer_test/happy-config/systemd/user/agent-platform-manager.service" ]] \
+[[ -f "$happy_home/.config/systemd/user/agent-platform-manager.service" ]] \
   || fail "schema-2 fresh install did not create the target unit"
 grep -Fq "$installer_test/happy-runtime/agent-platform-manager/manager.sock" \
-  "$installer_test/happy-config/agent-platform/manager.toml" \
+  "$happy_home/.config/agent-platform/manager.toml" \
   || fail "schema-2 fresh install did not bind the target runtime socket"
-[[ ! -e "$installer_test/happy-bin/ubitech-manager" ]] \
+[[ ! -e "$happy_home/.local/bin/ubitech-manager" ]] \
   || fail "schema-2 fresh install created a source Manager path"
+for ignored_root in \
+  "$installer_test/happy-ambient-home" \
+  "$installer_test/happy-data" \
+  "$installer_test/happy-config" \
+  "$installer_test/happy-bin"; do
+  [[ ! -e "$ignored_root" ]] \
+    || fail "schema-2 fresh install used an ambient persistent root: $ignored_root"
+done
 
-concurrent_data="$installer_test/concurrent-data/agent-platform"
+concurrent_home="$installer_test/concurrent-account-home"
+concurrent_data="$concurrent_home/.local/share/agent-platform"
 concurrent_ready="$installer_test/concurrent-enable-ready"
 concurrent_release="$installer_test/concurrent-enable-release"
 set +e
@@ -315,6 +384,8 @@ cat install.sh | env \
   FAKE_FAIL_STAGE=none \
   FAKE_ENABLE_READY="$concurrent_ready" \
   FAKE_ENABLE_RELEASE="$concurrent_release" \
+  FAKE_ACCOUNT_HOME="$concurrent_home" \
+  HOME="$installer_test/concurrent-ambient-home" \
   XDG_DATA_HOME="$installer_test/concurrent-data" \
   XDG_CONFIG_HOME="$installer_test/concurrent-config" \
   XDG_BIN_HOME="$installer_test/concurrent-bin" \
@@ -340,6 +411,8 @@ cat install.sh | env \
   FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$concurrent_data" \
   FAKE_FAIL_STAGE=none \
+  FAKE_ACCOUNT_HOME="$concurrent_home" \
+  HOME="$installer_test/concurrent-other-ambient-home" \
   XDG_DATA_HOME="$installer_test/concurrent-data" \
   XDG_CONFIG_HOME="$installer_test/concurrent-config" \
   XDG_BIN_HOME="$installer_test/concurrent-bin" \
@@ -354,9 +427,9 @@ grep -Fq 'another Agent Platform installation is already running' \
   "$installer_test/concurrent-loser.log" \
   || fail "competing fresh installer did not report lock ownership"
 for path in \
-  "$installer_test/concurrent-bin/agent-platform-manager" \
-  "$installer_test/concurrent-config/agent-platform/manager.toml" \
-  "$installer_test/concurrent-config/systemd/user/agent-platform-manager.service" \
+  "$concurrent_home/.local/bin/agent-platform-manager" \
+  "$concurrent_home/.config/agent-platform/manager.toml" \
+  "$concurrent_home/.config/systemd/user/agent-platform-manager.service" \
   "$concurrent_data/manager"; do
   [[ -e "$path" ]] || fail "competing installer removed winner-owned path: $path"
 done
@@ -371,13 +444,15 @@ set -e
 [[ -f "$concurrent_data/manager/operations/install" ]] \
   || fail "single-owner fresh installer did not complete its Manager operation"
 
-installer_data="$installer_test/xdg-data/agent-platform"
+installer_home="$installer_test/failure-account-home"
+installer_data="$installer_home/.local/share/agent-platform"
 mkdir -p \
   "$installer_test/xdg-data" \
   "$installer_test/xdg-bin" \
   "$installer_test/xdg-config/agent-platform" \
   "$installer_test/xdg-config/systemd/user" \
   "$installer_test/xdg-runtime"
+chmod 0700 "$installer_test/xdg-runtime"
 touch \
   "$installer_test/xdg-data/keep" \
   "$installer_test/xdg-bin/keep" \
@@ -389,6 +464,8 @@ if cat install.sh | env \
   FAKE_MANAGER="$installer_test/fake-manager" \
   FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$installer_data" \
+  FAKE_ACCOUNT_HOME="$installer_home" \
+  HOME="$installer_test/failure-ambient-home" \
   XDG_DATA_HOME="$installer_test/xdg-data" \
   XDG_CONFIG_HOME="$installer_test/xdg-config" \
   XDG_BIN_HOME="$installer_test/xdg-bin" \
@@ -398,11 +475,11 @@ if cat install.sh | env \
   fail "injected Manager preflight failure unexpectedly succeeded"
 fi
 [[ ! -e "$installer_data" ]] || fail "failed fresh install retained its data root"
-[[ ! -e "$installer_test/xdg-bin/agent-platform-manager" ]] \
+[[ ! -e "$installer_home/.local/bin/agent-platform-manager" ]] \
   || fail "failed fresh install retained its Manager binary"
-[[ ! -e "$installer_test/xdg-config/agent-platform/manager.toml" ]] \
+[[ ! -e "$installer_home/.config/agent-platform/manager.toml" ]] \
   || fail "failed fresh install retained its Manager config"
-[[ ! -e "$installer_test/xdg-config/systemd/user/agent-platform-manager.service" ]] \
+[[ ! -e "$installer_home/.config/systemd/user/agent-platform-manager.service" ]] \
   || fail "failed fresh install retained its systemd unit"
 for marker in \
   xdg-data/keep \
@@ -414,7 +491,8 @@ for marker in \
     || fail "failed fresh install removed a pre-existing object: $marker"
 done
 
-activated_data="$installer_test/activated-data/agent-platform"
+activated_home="$installer_test/activated-account-home"
+activated_data="$activated_home/.local/share/agent-platform"
 activated_output="$installer_test/activated-install.log"
 set +e
 cat install.sh | env \
@@ -423,6 +501,8 @@ cat install.sh | env \
   FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$activated_data" \
   FAKE_FAIL_STAGE=install \
+  FAKE_ACCOUNT_HOME="$activated_home" \
+  HOME="$installer_test/activated-ambient-home" \
   XDG_DATA_HOME="$installer_test/activated-data" \
   XDG_CONFIG_HOME="$installer_test/activated-config" \
   XDG_BIN_HOME="$installer_test/activated-bin" \
@@ -440,11 +520,11 @@ grep -Fq 'install --config' "$activated_output" \
   || fail "post-activation failure has no exact retry command"
 [[ -f "$activated_data/manager/operations/install" ]] \
   || fail "post-activation failure deleted Manager-owned operation state"
-[[ -x "$installer_test/activated-bin/agent-platform-manager" ]] \
+[[ -x "$activated_home/.local/bin/agent-platform-manager" ]] \
   || fail "post-activation failure deleted the active Manager binary"
-[[ -f "$installer_test/activated-config/agent-platform/manager.toml" ]] \
+[[ -f "$activated_home/.config/agent-platform/manager.toml" ]] \
   || fail "post-activation failure deleted Manager config"
-[[ -f "$installer_test/activated-config/systemd/user/agent-platform-manager.service" ]] \
+[[ -f "$activated_home/.config/systemd/user/agent-platform-manager.service" ]] \
   || fail "post-activation failure deleted Manager unit"
 rm -rf --one-file-system -- "$installer_test"
 
@@ -798,8 +878,6 @@ for entrypoint in \
   containers/agent-sandbox-entrypoint.sh; do
   grep -Fq 'AGENT_PLATFORM_TECHNICAL_PROFILE' "$entrypoint" \
     || fail "$entrypoint does not bind the target technical profile"
-  grep -Fq "env | grep -Eq '^(UBITECH_|ENTERPRISE_)'" "$entrypoint" \
-    || fail "$entrypoint does not reject mixed source-profile environment"
 done
 grep -Fq 'migrate|serve|init-admin|print-agent-token)' containers/platform-entrypoint.sh \
   || fail "Platform entrypoint does not dispatch CLI subcommands"
@@ -811,10 +889,10 @@ from pathlib import Path
 schema = json.loads(Path("containers/release-manifest.schema.json").read_text(encoding="utf-8"))
 upstream = json.loads(Path("docs/contracts/upstream-sources.json").read_text(encoding="utf-8"))
 properties = schema.get("properties", {})
-if properties.get("schema_version", {}).get("enum") != [1, 2]:
-    raise SystemExit("release manifest schema does not expose only schema versions 1 and 2")
-if properties.get("protocol_version", {}).get("enum") != [1, 2]:
-    raise SystemExit("release manifest schema does not expose only protocol versions 1 and 2")
+if properties.get("schema_version", {}).get("const") != 2:
+    raise SystemExit("target release manifest schema must require schema version 2")
+if properties.get("protocol_version", {}).get("const") != 2:
+    raise SystemExit("target release manifest schema must require protocol version 2")
 required = set(schema.get("required", ()))
 expected = {
     "schema_version", "channel", "source_commit", "generated_at",
@@ -825,46 +903,30 @@ if required != expected:
 image_pattern = schema.get("$defs", {}).get("image", {}).get("pattern", "")
 if "@sha256:" not in image_pattern:
     raise SystemExit("release images are not constrained to immutable digests")
-expected_v1 = {
+expected_images = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
+    "firecrawl-redis", "firecrawl-rabbitmq",
 }
-expected_v2 = expected_v1 - {"handoff-fs-helper"}
-for version, expected_images in ((1, expected_v1), (2, expected_v2)):
-    images_schema = schema.get("$defs", {}).get(f"images_v{version}", {})
-    required_images = set(images_schema.get("required", ()))
-    if required_images != expected_images:
-        raise SystemExit(
-            f"unexpected schema-v{version} release images: {sorted(required_images)}"
-        )
-    if (
-        images_schema.get("minProperties") != len(expected_images)
-        or images_schema.get("maxProperties") != len(expected_images)
-        or images_schema.get("additionalProperties") is not False
-    ):
-        raise SystemExit(f"schema-v{version} image directory is not an exact closed set")
-    image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
-    if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
-        raise SystemExit(f"schema-v{version} image names are not lowercase kebab-case")
-all_of = schema.get("allOf", [])
-if len(all_of) != 2:
-    raise SystemExit("release manifest schema does not have exactly two version branches")
-branches = {
-    branch.get("if", {}).get("properties", {}).get("schema_version", {}).get("const"): branch
-    for branch in all_of
-}
-for version in (1, 2):
-    branch = branches.get(version, {})
-    then = branch.get("then", {})
-    if then.get("properties", {}).get("protocol_version", {}).get("const") != version:
-        raise SystemExit(f"schema-v{version} does not bind protocol version {version}")
-    if then.get("properties", {}).get("images", {}).get("$ref") != f"#/$defs/images_v{version}":
-        raise SystemExit(f"schema-v{version} does not bind its exact image directory")
-if branches[2].get("then", {}).get("not") != {"required": ["namespace_handoff"]}:
-    raise SystemExit("schema-v2 does not reject the one-shot namespace handoff")
-if "firecrawl-foundationdb" in expected_v1 | expected_v2:
-    raise SystemExit("the current release schema still requires FoundationDB")
+if properties.get("images", {}).get("$ref") != "#/$defs/images":
+    raise SystemExit("target release manifest does not bind its image directory")
+images_schema = schema.get("$defs", {}).get("images", {})
+required_images = set(images_schema.get("required", ()))
+if required_images != expected_images:
+    raise SystemExit(f"unexpected target release images: {sorted(required_images)}")
+if (
+    images_schema.get("minProperties") != len(expected_images)
+    or images_schema.get("maxProperties") != len(expected_images)
+    or images_schema.get("additionalProperties") is not False
+):
+    raise SystemExit("target image directory is not an exact closed set")
+image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
+if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
+    raise SystemExit("target image names are not lowercase kebab-case")
+if schema.get("allOf") is not None or "namespace_handoff" in properties:
+    raise SystemExit("target release schema retains a transition branch")
+if "handoff-fs-helper" in expected_images or "firecrawl-foundationdb" in expected_images:
+    raise SystemExit("the current release schema still requires a retired image")
 managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
 expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
 if managed_firecrawl_services != expected_firecrawl_services:

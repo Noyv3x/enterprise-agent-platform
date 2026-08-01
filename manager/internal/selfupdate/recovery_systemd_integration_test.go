@@ -46,7 +46,7 @@ func init() {
 		}
 		binding, err := manager.WatchdogBinding()
 		if err == nil {
-			err = RunWatchdog(context.Background(), binding, os.Args[3], nil, func() error { return nil })
+			err = RunWatchdog(context.Background(), binding, os.Args[3], nil)
 		}
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "ordinary integration watchdog failed: %v\n", err)
@@ -200,7 +200,7 @@ func TestRecoverySystemdQuiescenceIntegration(t *testing.T) {
 	suffix := recoverySystemdIntegrationSuffix(t)
 	unitBase := testTechnicalProfile.WatchdogUnitPrefix + "integration-" + suffix
 	unit := unitBase + ".service"
-	mainUnit := "ubitech-agent-manager-integration-main-" + suffix + ".service"
+	mainUnit := "agent-platform-manager-integration-main-" + suffix + ".service"
 	if loadState, err := recoverySystemdProperty(ctx, unit, "LoadState"); err != nil {
 		t.Fatalf("inspect prospective integration unit: %v", err)
 	} else if loadState != "not-found" {

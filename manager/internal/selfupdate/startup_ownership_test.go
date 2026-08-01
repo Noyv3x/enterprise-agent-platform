@@ -9,16 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 const (
@@ -69,11 +68,11 @@ func newStartupOwnershipFixture(t *testing.T) *startupOwnershipFixture {
 	now := time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC)
 	current := Version{
 		Version: strings.Repeat("a", 40), SourceCommit: strings.Repeat("0", 40),
-		Path:   filepath.Join(root, "versions", "running-"+runningSHA[:12], "ubitech-manager"),
+		Path:   filepath.Join(root, "versions", "running-"+runningSHA[:12], "agent-platform-manager"),
 		SHA256: runningSHA, VerifiedAt: now, PlatformCommitted: true,
 	}
 	writeStartupVersion(t, current, running, current)
-	stablePath := filepath.Join(base, "bin", "ubitech-manager")
+	stablePath := filepath.Join(base, "bin", "agent-platform-manager")
 	if err := atomicfile.WriteFile(stablePath, running, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +87,7 @@ func newStartupOwnershipFixture(t *testing.T) *startupOwnershipFixture {
 			ConfigPath: filepath.Join(base, "config", "manager.toml"),
 			Root:       root, StatePath: statePath, InstallPath: stablePath,
 			SocketPath: filepath.Join(stateDir, "control", "manager.sock"), ControlTokenFile: tokenPath,
-			UnitName: "ubitech-agent-manager.service", RunningVersion: current.Version,
+			UnitName: "agent-platform-manager.service", RunningVersion: current.Version,
 		},
 		stateDir: stateDir, statePath: statePath, platformPath: filepath.Join(stateDir, "state.json"),
 		stablePath: stablePath, current: current, running: running, runningSHA: runningSHA,
@@ -120,7 +119,7 @@ func (f *startupOwnershipFixture) installPreparedCandidate(t *testing.T, committ
 	candidateSHA := sha256Hex(candidateBinary)
 	candidate := Version{
 		Version: commit, SourceCommit: commit,
-		Path:   filepath.Join(f.manager.Root, "versions", safeID(commit+"-"+commit[:12]), "ubitech-manager"),
+		Path:   filepath.Join(f.manager.Root, "versions", safeID(commit+"-"+commit[:12]), "agent-platform-manager"),
 		SHA256: candidateSHA, VerifiedAt: now, PlatformCommitted: committed,
 	}
 	metadata := candidate
@@ -129,16 +128,14 @@ func (f *startupOwnershipFixture) installPreparedCandidate(t *testing.T, committ
 	state := State{SchemaVersion: 1, Current: &f.current, Candidate: &candidate, UpdatedAt: now}
 	writeStartupJSON(t, f.statePath, state)
 
-	images := activationTakeoverImages()
 	manifestPath := filepath.Join(f.stateDir, "releases", commit, "manifest.json")
-	manifest := release.Manifest{
-		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: commit,
-		GeneratedAt: now, ProtocolVersion: contract.SchemaVersion, DatabaseSchemaVersion: contract.DatabaseSchemaVersion,
-		Manager: release.ManagerRelease{Version: candidate.Version, Artifacts: map[string]release.Artifact{
-			runtime.GOARCH: {URL: "http://127.0.0.1/manager", SHA256: candidate.SHA256},
-		}},
-		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("c", 64)}, Images: images,
-	}
+	manifest := releasetest.NewTarget(
+		commit,
+		releasetest.WithGeneratedAt(now),
+		releasetest.WithManagerBinary("amd64", candidateBinary),
+		releasetest.WithManagerBinary("arm64", candidateBinary),
+	).Manifest
+	images := manifest.Images
 	writeStartupJSON(t, manifestPath, manifest)
 	operationID := "op_startup_owner_1234567890"
 	operationPath := filepath.Join(f.stateDir, "operations", operationID+".json")
@@ -200,16 +197,13 @@ func startupOwnershipManifest(t *testing.T, binary []byte, commit string) (relea
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
 		_, _ = response.Write(binary)
 	}))
-	manifest := release.Manifest{
-		SchemaVersion: contract.SchemaVersion, Channel: contract.ReleaseChannel, SourceCommit: commit,
-		GeneratedAt: time.Date(2026, 7, 30, 13, 0, 0, 0, time.UTC), ProtocolVersion: contract.SchemaVersion,
-		DatabaseSchemaVersion: contract.DatabaseSchemaVersion,
-		Manager: release.ManagerRelease{Version: commit, Artifacts: map[string]release.Artifact{
-			runtime.GOARCH: {URL: server.URL, SHA256: sha256Hex(binary)},
-		}},
-		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("f", 64)},
-		Images:  activationTakeoverImages(),
-	}
+	manifest := releasetest.NewTarget(
+		commit,
+		releasetest.WithGeneratedAt(time.Date(2026, 7, 30, 13, 0, 0, 0, time.UTC)),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithManagerBinary("amd64", binary),
+		releasetest.WithManagerBinary("arm64", binary),
+	).Manifest
 	return manifest, server
 }
 
@@ -511,7 +505,7 @@ func TestStartupOwnershipRejectsTamperedOrdinaryRollbackHalfCandidate(t *testing
 			candidate.VerifiedAt = time.Time{}
 		}},
 		{name: "inexact managed candidate path", mutate: func(candidate *Version, activation *Activation, plan *Plan) {
-			candidate.Path = filepath.Join(filepath.Dir(filepath.Dir(candidate.Path)), "other", "ubitech-manager")
+			candidate.Path = filepath.Join(filepath.Dir(filepath.Dir(candidate.Path)), "other", "agent-platform-manager")
 			activation.CandidatePath = candidate.Path
 			plan.CandidatePath = candidate.Path
 		}},
@@ -562,7 +556,7 @@ func TestStartupOwnershipAdmitsOnlyExactOrdinaryStateFirstCommitCheckpoint(t *te
 	now := fixture.current.VerifiedAt.Add(time.Hour)
 	current := Version{
 		Version: commit, SourceCommit: commit,
-		Path:   filepath.Join(fixture.manager.Root, "versions", safeID(commit+"-"+commit[:12]), "ubitech-manager"),
+		Path:   filepath.Join(fixture.manager.Root, "versions", safeID(commit+"-"+commit[:12]), "agent-platform-manager"),
 		SHA256: fixture.runningSHA, VerifiedAt: now, PlatformCommitted: true,
 	}
 	writeStartupVersion(t, current, fixture.running, current)
@@ -584,12 +578,12 @@ func TestStartupOwnershipAdmitsOnlyExactOrdinaryStateFirstCommitCheckpoint(t *te
 	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
 		t.Fatalf("exact acknowledged state-first commit checkpoint was rejected: %v", err)
 	}
-	manifest := release.Manifest{
-		SourceCommit: commit,
-		Manager: release.ManagerRelease{Version: current.Version, Artifacts: map[string]release.Artifact{
-			runtime.GOARCH: {SHA256: current.SHA256},
-		}},
-	}
+	manifest := releasetest.NewTarget(
+		commit,
+		releasetest.WithGeneratedAt(now),
+		releasetest.WithManagerBinary("amd64", fixture.running),
+		releasetest.WithManagerBinary("arm64", fixture.running),
+	).Manifest
 	committed, err := fixture.manager.ActivationCommitted(manifest)
 	if err != nil || !committed {
 		t.Fatalf("restart barrier did not terminalize state-first checkpoint: committed=%v err=%v", committed, err)
@@ -711,7 +705,7 @@ func TestStartupOwnershipTerminalJournalSurvivesLaterArtifactPruning(t *testing.
 
 	later := Version{
 		Version: fixture.manager.RunningVersion, SourceCommit: strings.Repeat("9", 40),
-		Path:   filepath.Join(fixture.manager.Root, "versions", "running-"+fixture.recoverySHA[:12], "ubitech-manager"),
+		Path:   filepath.Join(fixture.manager.Root, "versions", "running-"+fixture.recoverySHA[:12], "agent-platform-manager"),
 		SHA256: fixture.recoverySHA, VerifiedAt: time.Now().UTC(), PlatformCommitted: true,
 	}
 	writeStartupVersion(t, later, fixture.recoveryBinary, later)
@@ -810,7 +804,7 @@ func newExternalRecoveryProbeFixture(t *testing.T) (*startupOwnershipFixture, Ve
 	oldSHA := sha256Hex(oldBinary)
 	old := Version{
 		Version: strings.Repeat("c", 40), SourceCommit: strings.Repeat("0", 40),
-		Path:   filepath.Join(fixture.manager.Root, "versions", "running-"+oldSHA[:12], "ubitech-manager"),
+		Path:   filepath.Join(fixture.manager.Root, "versions", "running-"+oldSHA[:12], "agent-platform-manager"),
 		SHA256: oldSHA, VerifiedAt: fixture.current.VerifiedAt, PlatformCommitted: true,
 	}
 	writeStartupVersion(t, old, oldBinary, old)
@@ -819,7 +813,7 @@ func newExternalRecoveryProbeFixture(t *testing.T) (*startupOwnershipFixture, Ve
 	fixture.manager.RunningVersion = recoveryVersion
 	recovery := Version{
 		Version: recoveryVersion,
-		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.runningSHA[:12], "ubitech-manager"),
+		Path:    filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.runningSHA[:12], "agent-platform-manager"),
 		SHA256:  fixture.runningSHA, VerifiedAt: old.VerifiedAt.Add(time.Second), PlatformCommitted: true,
 	}
 	writeStartupVersion(t, recovery, fixture.running, recovery)
@@ -893,7 +887,7 @@ func TestStartupOwnershipFreshInstallHasNoSyntheticOwner(t *testing.T) {
 	base := t.TempDir()
 	manager := &Manager{Profile: testActiveProfile,
 		Root: filepath.Join(base, "manager-binaries"), StatePath: filepath.Join(base, "manager-binaries.json"),
-		InstallPath: filepath.Join(base, "bin", "ubitech-manager"), RunningVersion: strings.Repeat("a", 40),
+		InstallPath: filepath.Join(base, "bin", "agent-platform-manager"), RunningVersion: strings.Repeat("a", 40),
 	}
 	lease, err := manager.AcquireStartupOwnership()
 	if err != nil || lease == nil || lease.RetainsRecoveryLock() || lease.ExternalRecoveryProbe() || lease.RecoveryCandidate() {

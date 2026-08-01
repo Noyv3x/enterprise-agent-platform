@@ -48,4 +48,4 @@ build/
 tmp/
 temp/
 *.log
-/manager/ubitech-manager
+/manager/agent-platform-manager

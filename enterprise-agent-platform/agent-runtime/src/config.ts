@@ -15,7 +15,6 @@ import {
   TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE,
 } from "./design-contract.generated.js";
 import {
-  SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES,
   TARGET_MANAGER_EXECUTOR_SOCKET_PATH,
   TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE,
   TARGET_TECHNICAL_PROFILE_ID,
@@ -23,12 +22,6 @@ import {
 import type { RuntimeConfig } from "./types.js";
 
 function validateTechnicalProfile(env: NodeJS.ProcessEnv): void {
-  const sourceNames = Object.keys(env).filter((name) =>
-    SOURCE_TECHNICAL_ENVIRONMENT_PREFIXES.some((prefix) => name.startsWith(prefix)),
-  );
-  if (sourceNames.length > 0) {
-    throw new Error(`Source-profile environment is not accepted by the target Agent Runtime: ${sourceNames.sort().join(", ")}`);
-  }
   if (env[TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE]?.trim() !== TARGET_TECHNICAL_PROFILE_ID) {
     throw new Error(
       `${TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE} must be ${TARGET_TECHNICAL_PROFILE_ID}`,
