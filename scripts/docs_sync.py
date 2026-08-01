@@ -1217,7 +1217,16 @@ def domains_for_code(manifest: Manifest, path: str) -> tuple[Domain, ...]:
 
 
 def domains_for_test(manifest: Manifest, path: str) -> tuple[Domain, ...]:
-    return tuple(domain for domain in manifest.domains if path_matches(path, domain.tests))
+    explicit = {
+        domain.identifier: domain
+        for domain in manifest.domains
+        if path_matches(path, domain.tests)
+    }
+    if _is_language_native_test(path):
+        explicit.update(
+            {domain.identifier: domain for domain in domains_for_code(manifest, path)}
+        )
+    return tuple(explicit[identifier] for identifier in sorted(explicit))
 
 
 def domains_for_document(manifest: Manifest, path: str) -> set[str]:
@@ -1234,7 +1243,15 @@ def domains_for_document(manifest: Manifest, path: str) -> set[str]:
 
 def _is_covered_code(manifest: Manifest, path: str) -> bool:
     coverage = manifest.coverage
-    return path_matches(path, coverage.code_include) and not path_matches(path, coverage.code_exclude)
+    return (
+        not _is_language_native_test(path)
+        and path_matches(path, coverage.code_include)
+        and not path_matches(path, coverage.code_exclude)
+    )
+
+
+def _is_language_native_test(path: str) -> bool:
+    return path.endswith("_test.go")
 
 
 def _is_covered_document(manifest: Manifest, path: str) -> bool:

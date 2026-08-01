@@ -782,6 +782,15 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("check-change", "--base", base, "--head", head, expect=1)
         self.assertIn("code changed in domain platform", result.stderr)
 
+    def test_check_change_treats_go_test_fixture_as_test_implementation(self) -> None:
+        base = self.ready_repository()
+        fixture = self.root / "manager/internal/example/helper_test.go"
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        fixture.write_text("package example\n\nconst fixture = 1\n", encoding="utf-8")
+        head = self.commit("test fixture only")
+
+        self.run_command("check-change", "--base", base, "--head", head, expect=0)
+
     def test_check_change_requires_implementation_for_documentation(self) -> None:
         base = self.ready_repository()
         document = self.root / "docs/design/feature.md"

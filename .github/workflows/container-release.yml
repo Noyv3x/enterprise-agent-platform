@@ -761,6 +761,9 @@ jobs:
           cp containers/searxng/settings.yml "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
           chmod 0700 \
             "$AGENT_PLATFORM_DATA_ROOT/data/workspaces" \
+            "$AGENT_PLATFORM_DATA_ROOT/data/runtimes" \
+            "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/agent" \
+            "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/camofox" \
             "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/config" \
             "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/cache"
           chmod 0600 "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/config/settings.yml"

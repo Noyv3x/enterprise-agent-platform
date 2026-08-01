@@ -212,6 +212,27 @@ func shortTempDir(t *testing.T) string {
 	return base
 }
 
+func TestRenderUnitUsesSystemdPropertyEscapingForWorkingDirectory(t *testing.T) {
+	working := "/tmp/path with/%specifier;quote\"back\\slash/ü"
+	unit, err := renderUnit(
+		"agent-platform-namespace-handoff-test.service",
+		"handoff_0123456789abcdef0123456789abcdef",
+		working,
+		[]string{"/tmp/helper", "serve"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(unit)
+	want := `WorkingDirectory=/tmp/path\x20with/%%specifier\x3bquote\x22back\x5cslash/\xc3\xbc`
+	if !strings.Contains(content, want+"\n") {
+		t.Fatalf("unit WorkingDirectory is not property escaped:\n%s", content)
+	}
+	if strings.Contains(content, `WorkingDirectory="`) {
+		t.Fatalf("unit reused ExecStart quoting for WorkingDirectory:\n%s", content)
+	}
+}
+
 func TestArmInspectAndRemovePersistentHelper(t *testing.T) {
 	fixture := newHostFixture(t)
 	result, err := fixture.host.Arm(context.Background(), fixture.request)

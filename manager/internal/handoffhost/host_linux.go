@@ -654,7 +654,7 @@ func renderUnit(unitName, transactionID, workingDirectory string, argv []string)
 		}
 		quoted[index] = encoded
 	}
-	working, err := quoteSystemd(workingDirectory)
+	working, err := escapeSystemdPath(workingDirectory)
 	if err != nil {
 		return nil, err
 	}
@@ -695,6 +695,30 @@ func quoteSystemd(value string) (string, error) {
 	value = strings.ReplaceAll(value, "\"", "\\\"")
 	value = strings.ReplaceAll(value, "%", "%%")
 	return "\"" + value + "\"", nil
+}
+
+func escapeSystemdPath(value string) (string, error) {
+	if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value {
+		return "", errors.New("systemd path must be absolute and canonical")
+	}
+	var escaped strings.Builder
+	for _, character := range []byte(value) {
+		if character < 0x20 || character == 0x7f {
+			return "", errors.New("systemd path contains a control character")
+		}
+		switch {
+		case character == '%':
+			escaped.WriteString("%%")
+		case character == '/' || character == '.' || character == '_' || character == '-' ||
+			character >= '0' && character <= '9' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= 'a' && character <= 'z':
+			escaped.WriteByte(character)
+		default:
+			fmt.Fprintf(&escaped, `\x%02x`, character)
+		}
+	}
+	return escaped.String(), nil
 }
 
 func unitBytes(spec HelperSpec) ([]byte, error) {
