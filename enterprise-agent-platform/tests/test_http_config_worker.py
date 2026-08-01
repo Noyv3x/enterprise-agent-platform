@@ -434,6 +434,25 @@ class ConfigFromEnvTests(unittest.TestCase):
                 self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
                 self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
 
+    def test_cleanup_transition_is_not_projected_into_platform_runtime(self):
+        repository_root = Path(__file__).resolve().parents[2]
+        contract = json.loads(
+            (repository_root / "docs/contracts/release-transition.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(contract["stage"], "cleanup")
+        self.assertEqual(
+            contract["predecessor_generation"],
+            "3a6dd8c0107cec7f6cf8d1b8805b687fc1f3f1a3",
+        )
+        self.assertFalse(
+            (
+                repository_root
+                / "enterprise-agent-platform/enterprise_agent_platform/release_transition_contract_generated.py"
+            ).exists()
+        )
+
     def test_unknown_technical_profile_is_rejected(self):
         environments = (
             {
