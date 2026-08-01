@@ -151,6 +151,7 @@ def ensure_private_child_directory_fd(
     staging_fd: int | None = None,
     staging_name: str | None = None,
     expected_existing_identity: tuple[int, int] | None = None,
+    require_empty: bool = False,
 ) -> int:
     """Open or create one private child below an already pinned parent.
 
@@ -203,6 +204,15 @@ def ensure_private_child_directory_fd(
                 staging_fd,
                 staging_name,
                 expected_device=opened.st_dev,
+                sync_parent=False,
+            )
+            _sync_private_directory_publication(
+                parent_fd,
+                name,
+                existing_fd,
+                staging_fd,
+                mode=mode,
+                require_empty=require_empty,
             )
             return existing_fd
         except BaseException:
@@ -254,34 +264,19 @@ def ensure_private_child_directory_fd(
             raise UnsafePrivatePathError(
                 f"private directory appeared during publication: {name}"
             ) from exc
-        published = verify_private_child_directory_fd(parent_fd, name, fd, mode=mode)
-        try:
-            os.fsync(parent_fd)
-            os.fsync(staging_fd)
-        except OSError as exc:
-            # renameat2 has already moved the pinned inode into the final
-            # namespace. Reprove that exact effect before exposing a recovery
-            # identity; the first durability error remains visible to callers.
-            try:
-                current = verify_private_child_directory_fd(
-                    parent_fd,
-                    name,
-                    fd,
-                    mode=mode,
-                )
-            except (OSError, UnsafePrivatePathError):
-                raise
-            if (current.st_dev, current.st_ino) != (
-                published.st_dev,
-                published.st_ino,
-            ):
-                raise UnsafePrivatePathError(
-                    f"private directory changed after publication: {name}"
-                ) from exc
-            raise PrivatePublicationCommittedError(
-                f"private directory publication durability failed: {name}",
-                (published.st_dev, published.st_ino),
-            ) from exc
+        verify_private_child_directory_fd(parent_fd, name, fd, mode=mode)
+        if os.listdir(fd):
+            raise UnsafePrivatePathError(
+                f"private directory gained contents during publication: {name}"
+            )
+        _sync_private_directory_publication(
+            parent_fd,
+            name,
+            fd,
+            staging_fd,
+            mode=mode,
+            require_empty=True,
+        )
         return fd
     except BaseException:
         os.close(fd)
@@ -294,6 +289,7 @@ def _remove_empty_private_directory_staging(
     *,
     child_fd: int | None = None,
     expected_device: int | None = None,
+    sync_parent: bool = True,
 ) -> None:
     """Remove only one exact, owner-only and empty directory residue."""
 
@@ -335,10 +331,73 @@ def _remove_empty_private_directory_staging(
                 f"private directory staging changed before cleanup: {staging_name}"
             )
         os.rmdir(staging_name, dir_fd=staging_fd)
-        os.fsync(staging_fd)
+        if sync_parent:
+            os.fsync(staging_fd)
     finally:
         if owns_child_fd and child_fd is not None:
             os.close(child_fd)
+
+
+def _sync_private_directory_publication(
+    parent_fd: int,
+    name: str,
+    child_fd: int,
+    staging_fd: int,
+    *,
+    mode: int,
+    require_empty: bool,
+) -> os.stat_result:
+    """Commit or replay one exact cross-directory publication durably.
+
+    The staged child is empty when first renamed, so persisting source-name
+    removal before destination-name creation is the recoverable ordering: a
+    crash before the final parent sync can at worst require recreating an empty
+    directory. Exact-final replay uses the same barrier even when the staging
+    name is already absent.
+    """
+
+    published = verify_private_child_directory_fd(
+        parent_fd,
+        name,
+        child_fd,
+        mode=mode,
+    )
+    identity = (published.st_dev, published.st_ino)
+
+    def reprove() -> os.stat_result:
+        current = verify_private_child_directory_fd(
+            parent_fd,
+            name,
+            child_fd,
+            mode=mode,
+        )
+        if (current.st_dev, current.st_ino) != identity:
+            raise UnsafePrivatePathError(
+                f"private directory changed after publication: {name}"
+            )
+        if require_empty and os.listdir(child_fd):
+            raise UnsafePrivatePathError(
+                f"private directory gained contents during publication: {name}"
+            )
+        return current
+
+    try:
+        os.fsync(child_fd)
+        os.fsync(staging_fd)
+        os.fsync(parent_fd)
+    except OSError as exc:
+        # renameat2 has already moved the pinned inode into the final
+        # namespace. Reprove that exact effect before exposing a recovery
+        # identity; the first durability error remains visible to callers.
+        try:
+            reprove()
+        except (OSError, UnsafePrivatePathError):
+            raise
+        raise PrivatePublicationCommittedError(
+            f"private directory publication durability failed: {name}",
+            identity,
+        ) from exc
+    return reprove()
 
 
 def verify_private_child_directory_fd(

@@ -128,6 +128,9 @@ class AgentScopeManager:
             allow_unmaterialized_p1_workspaces
         )
         self._workspace_observations: dict[str, _WorkspaceObservation] = {}
+        self._workspace_directory_empty_recovery: dict[
+            tuple[str, ...], tuple[int, int]
+        ] = {}
         self._assert_workspace_records()
         missing_aliases = self._missing_current_runtime_aliases()
         if missing_aliases and not self._p1_normalization_allowed:
@@ -729,6 +732,7 @@ class AgentScopeManager:
             staging_fd = open_private_directory_fd(self._machine_staging_root)
             for index, part in enumerate(relative.parts):
                 prefix.append(part)
+                prefix_key = tuple(prefix)
                 traversed = traversed / part
                 next_fd: int | None = None
                 try:
@@ -738,6 +742,17 @@ class AgentScopeManager:
                         if index < len(observation.component_identities)
                         else None
                     )
+                    recovery_identity = (
+                        self._workspace_directory_empty_recovery.get(prefix_key)
+                    )
+                    if (
+                        recovery_identity is not None
+                        and expected_identity != recovery_identity
+                    ):
+                        raise sqlite3.DatabaseError(
+                            "Agent workspace directory recovery identity changed: "
+                            + str(traversed)
+                        )
                     next_fd = ensure_private_child_directory_fd(
                         parent_fd,
                         part,
@@ -747,6 +762,7 @@ class AgentScopeManager:
                             tuple(prefix),
                         ),
                         expected_existing_identity=expected_identity,
+                        require_empty=recovery_identity is not None,
                     )
                     descriptors.append(next_fd)
                     opened = verify_private_child_directory_fd(
@@ -754,6 +770,14 @@ class AgentScopeManager:
                         part,
                         next_fd,
                     )
+                    opened_identity = (opened.st_dev, opened.st_ino)
+                    if recovery_identity is not None:
+                        if opened_identity != recovery_identity:
+                            raise sqlite3.DatabaseError(
+                                "Agent workspace directory recovery identity changed: "
+                                + str(traversed)
+                            )
+                        del self._workspace_directory_empty_recovery[prefix_key]
                 except PrivatePublicationCommittedError as exc:
                     # The rename effect is exact even though its durability
                     # call failed. Preserve the first error, but advance every
@@ -761,9 +785,24 @@ class AgentScopeManager:
                     # can reconcile the published inode instead of treating it
                     # as an external creator.
                     self._record_published_workspace_component(
-                        tuple(prefix),
+                        prefix_key,
                         exc.published_identity,
                     )
+                    if expected_identity is None or recovery_identity is not None:
+                        previous_recovery = (
+                            self._workspace_directory_empty_recovery.get(prefix_key)
+                        )
+                        if (
+                            previous_recovery is not None
+                            and previous_recovery != exc.published_identity
+                        ):
+                            raise sqlite3.DatabaseError(
+                                "Agent workspace directory recovery identity changed: "
+                                + str(traversed)
+                            ) from exc
+                        self._workspace_directory_empty_recovery[prefix_key] = (
+                            exc.published_identity
+                        )
                     raise sqlite3.DatabaseError(
                         "Agent workspace directory publication was not durable: "
                         + str(traversed)
@@ -783,7 +822,7 @@ class AgentScopeManager:
                 )
                 if expected_identity is None:
                     self._record_published_workspace_component(
-                        tuple(prefix),
+                        prefix_key,
                         (opened.st_dev, opened.st_ino),
                     )
 

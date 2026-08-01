@@ -569,6 +569,11 @@ class DocsSyncTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("RELEASE_TRANSITION_STAGE = 'source_owner'", generated)
         self.assertIn(
+            "PREDECESSOR_GENERATION = "
+            "'72b2fe687b5ff3e602e29da076398db375c101c4'",
+            generated,
+        )
+        self.assertIn(
             "SOURCE_OWNER_COMPAT_GENERATION = "
             "'983f79b4900502f35fac6de8154eb344fc9f143b'",
             generated,

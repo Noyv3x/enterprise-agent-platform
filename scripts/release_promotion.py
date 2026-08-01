@@ -465,10 +465,7 @@ def validate_source_owner_compat(
     compat = contract.get("source_owner_compat")
     if contract.get("stage") != "source_owner" or not isinstance(compat, dict):
         _fail("legacy current release is allowed only by source_owner_compat")
-    if (
-        compat.get("generation") != current_generation
-        or contract.get("predecessor_generation") != current_generation
-    ):
+    if compat.get("generation") != current_generation:
         _fail("source_owner_compat does not bind the exact current generation")
     try:
         root_info = root.lstat()
@@ -662,6 +659,17 @@ def _validate_predecessor_artifact_binding(
         _fail("bridge source compose must exactly match the predecessor manifest")
 
 
+def _validate_transition_binding(
+    candidate: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    for field in ("transition_id", "source_profile_id", "target_profile_id"):
+        if candidate[field] != current[field]:
+            _fail(f"{label} changes transition binding {field}")
+
+
 def select_candidate(
     current_generation: str,
     candidates_root: Path,
@@ -705,13 +713,31 @@ def select_candidate(
         if metadata["draft"] is not True:
             _fail(f"unpromoted {stage} release is not draft")
         if stage == "source_owner":
-            if current_promotion is not None:
-                _fail("source_owner can only follow the legacy source-profile baseline")
-            if current_compat_root is None:
-                _fail("source_owner requires the exact canonical P1 predecessor release")
-            validate_source_owner_compat(
-                current_compat_root, candidate_contract, current_generation
-            )
+            if current_promotion is None:
+                if current_compat_root is None:
+                    _fail("source_owner requires the exact canonical P1 predecessor release")
+                validate_source_owner_compat(
+                    current_compat_root, candidate_contract, current_generation
+                )
+            else:
+                if current_promotion["stage"] != "source_owner":
+                    _fail("source_owner stabilization must directly follow source_owner")
+                compat_generation = candidate_contract["source_owner_compat"][
+                    "generation"
+                ]
+                if (
+                    current_promotion["predecessor_generation"]
+                    != compat_generation
+                ):
+                    _fail(
+                        "source_owner stabilization is limited to the first "
+                        "source_owner successor"
+                    )
+                _validate_transition_binding(
+                    promotion,
+                    current_promotion,
+                    label="source_owner stabilization",
+                )
         elif stage == "target_baseline":
             if current_promotion is None or current_promotion["stage"] not in TARGET_BASELINE_PREDECESSORS:
                 _fail("target_baseline must directly follow cleanup or target_baseline")

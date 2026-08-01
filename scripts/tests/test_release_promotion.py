@@ -21,6 +21,8 @@ import release_promotion as promotion  # noqa: E402
 
 P1 = "983f79b4900502f35fac6de8154eb344fc9f143b"
 A2 = "2" * 40
+STABILIZED_A2 = "7" * 40
+ALTERNATE_STABILIZED_A2 = "8" * 40
 BRIDGE = "3" * 40
 CLEANUP = "4" * 40
 MANAGER_SHA = "a" * 64
@@ -83,9 +85,7 @@ class ReleasePromotionTests(unittest.TestCase):
         contract = copy.deepcopy(self.base_contract)
         contract["stage"] = stage
         contract["predecessor_generation"] = predecessor
-        if stage == "source_owner":
-            contract["source_owner_compat"]["generation"] = predecessor
-        else:
+        if stage != "source_owner":
             contract.pop("source_owner_compat", None)
         schema_version = 2 if stage in {"cleanup", "target_baseline"} else 1
         manifest = self.manifest(generation, schema_version)
@@ -464,6 +464,7 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_selector_cannot_skip_or_reorder_transition_stages(self) -> None:
         candidates = self.root / "candidates"
         a2_root = candidates / A2
+        stabilized_root = candidates / STABILIZED_A2
         bridge_root = candidates / BRIDGE
         cleanup_root = candidates / CLEANUP
         self.write_release(
@@ -474,10 +475,17 @@ class ReleasePromotionTests(unittest.TestCase):
             draft=True,
         )
         self.write_release(
+            stabilized_root,
+            stage="source_owner",
+            generation=STABILIZED_A2,
+            predecessor=A2,
+            draft=True,
+        )
+        self.write_release(
             bridge_root,
             stage="bridge",
             generation=BRIDGE,
-            predecessor=A2,
+            predecessor=STABILIZED_A2,
             draft=True,
         )
         self.write_release(
@@ -493,9 +501,13 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         self.assertEqual(first["candidate"]["generation"], A2)
         second = promotion.select_candidate(A2, candidates, a2_root)
-        self.assertEqual(second["candidate"]["generation"], BRIDGE)
-        third = promotion.select_candidate(BRIDGE, candidates, bridge_root)
-        self.assertEqual(third["candidate"]["generation"], CLEANUP)
+        self.assertEqual(second["candidate"]["generation"], STABILIZED_A2)
+        third = promotion.select_candidate(
+            STABILIZED_A2, candidates, stabilized_root
+        )
+        self.assertEqual(third["candidate"]["generation"], BRIDGE)
+        fourth = promotion.select_candidate(BRIDGE, candidates, bridge_root)
+        self.assertEqual(fourth["candidate"]["generation"], CLEANUP)
         self.assertEqual(
             promotion.select_candidate(CLEANUP, candidates, cleanup_root),
             {"action": "none"},
@@ -518,6 +530,129 @@ class ReleasePromotionTests(unittest.TestCase):
         (cleanup_root / "promotion.json").write_text(json.dumps(record), encoding="utf-8")
         with self.assertRaisesRegex(promotion.PromotionError, "does not directly follow"):
             promotion.select_candidate(A2, candidates, a2_root)
+
+    def test_source_owner_stabilization_keeps_exact_p1_compatibility(self) -> None:
+        candidates = self.root / "candidates"
+        current_root = candidates / A2
+        candidate_root = candidates / STABILIZED_A2
+        self.write_release(
+            current_root,
+            stage="source_owner",
+            generation=A2,
+            predecessor=P1,
+            draft=False,
+        )
+        record = self.write_release(
+            candidate_root,
+            stage="source_owner",
+            generation=STABILIZED_A2,
+            predecessor=A2,
+            draft=True,
+        )
+
+        contract = json.loads(
+            (candidate_root / "release-transition.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["predecessor_generation"], A2)
+        self.assertEqual(contract["source_owner_compat"]["generation"], P1)
+        self.assertIsNone(record["required_receipt_type"])
+        selected = promotion.select_candidate(A2, candidates, current_root)
+        self.assertEqual(selected["candidate"]["generation"], STABILIZED_A2)
+
+    def test_source_owner_stabilization_cannot_skip_current_generation(self) -> None:
+        candidates = self.root / "candidates"
+        current_root = candidates / A2
+        self.write_release(
+            current_root,
+            stage="source_owner",
+            generation=A2,
+            predecessor=P1,
+            draft=False,
+        )
+        self.write_release(
+            candidates / STABILIZED_A2,
+            stage="source_owner",
+            generation=STABILIZED_A2,
+            predecessor=P1,
+            draft=True,
+        )
+
+        self.assertEqual(
+            promotion.select_candidate(A2, candidates, current_root),
+            {"action": "none"},
+        )
+
+    def test_source_owner_stabilization_rejects_multiple_direct_successors(self) -> None:
+        candidates = self.root / "candidates"
+        current_root = candidates / A2
+        self.write_release(
+            current_root,
+            stage="source_owner",
+            generation=A2,
+            predecessor=P1,
+            draft=False,
+        )
+        for generation in (STABILIZED_A2, ALTERNATE_STABILIZED_A2):
+            self.write_release(
+                candidates / generation,
+                stage="source_owner",
+                generation=generation,
+                predecessor=A2,
+                draft=True,
+            )
+
+        with self.assertRaisesRegex(
+            promotion.PromotionError, "multiple releases claim the same direct predecessor"
+        ):
+            promotion.select_candidate(A2, candidates, current_root)
+
+    def test_source_owner_stabilization_cannot_be_chained_twice(self) -> None:
+        candidates = self.root / "candidates"
+        current_root = candidates / STABILIZED_A2
+        self.write_release(
+            current_root,
+            stage="source_owner",
+            generation=STABILIZED_A2,
+            predecessor=A2,
+            draft=False,
+        )
+        self.write_release(
+            candidates / ALTERNATE_STABILIZED_A2,
+            stage="source_owner",
+            generation=ALTERNATE_STABILIZED_A2,
+            predecessor=STABILIZED_A2,
+            draft=True,
+        )
+
+        with self.assertRaisesRegex(
+            promotion.PromotionError,
+            "limited to the first source_owner successor",
+        ):
+            promotion.select_candidate(
+                STABILIZED_A2,
+                candidates,
+                current_root,
+            )
+
+    def test_source_owner_stabilization_rejects_identity_drift(self) -> None:
+        current = {
+            "transition_id": "technical-namespace-v1",
+            "source_profile_id": "ubitech-agent-v1",
+            "target_profile_id": "agent-platform-v1",
+        }
+        for field in current:
+            with self.subTest(field=field):
+                candidate = dict(current)
+                candidate[field] = f"different-{field}"
+                with self.assertRaisesRegex(
+                    promotion.PromotionError,
+                    rf"source_owner stabilization changes transition binding {field}",
+                ):
+                    promotion._validate_transition_binding(
+                        candidate,
+                        current,
+                        label="source_owner stabilization",
+                    )
 
     def test_selector_rejects_a_candidate_published_outside_the_evaluator(self) -> None:
         candidates = self.root / "candidates"

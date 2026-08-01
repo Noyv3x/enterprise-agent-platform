@@ -647,7 +647,9 @@ class AgentScopeSessionTests(unittest.TestCase):
             db = Database(config.db_path)
             try:
                 scope = AgentScopeManager(config, db).ensure_channel_scope(1)
+                second_scope = AgentScopeManager(config, db).ensure_channel_scope(2)
                 workspace = Path(scope.workspace_path)
+                second_workspace = Path(second_scope.workspace_path)
                 shutil.rmtree(workspace.parent)
                 candidate = AgentScopeManager(
                     config,
@@ -659,6 +661,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                 real_fsync = secure_fs.os.fsync
                 renamed = False
                 failed = False
+                post_rename_syncs = 0
 
                 def rename_then_arm(*args, **kwargs):
                     nonlocal renamed
@@ -667,10 +670,14 @@ class AgentScopeSessionTests(unittest.TestCase):
                     return result
 
                 def fail_first_post_rename_fsync(fd):
-                    nonlocal failed
-                    if renamed and not failed:
-                        failed = True
-                        raise OSError("simulated post-rename durability failure")
+                    nonlocal failed, post_rename_syncs
+                    if renamed:
+                        post_rename_syncs += 1
+                        if post_rename_syncs == 3 and not failed:
+                            failed = True
+                            raise OSError(
+                                "simulated destination durability failure"
+                            )
                     return real_fsync(fd)
 
                 with mock.patch.object(
@@ -688,13 +695,75 @@ class AgentScopeSessionTests(unittest.TestCase):
                     ):
                         candidate.commit_schema_upgrade()
 
+                self.assertEqual(post_rename_syncs, 3)
                 self.assertTrue(workspace.parent.is_dir())
                 self.assertFalse(workspace.exists())
                 candidate.commit_schema_upgrade()
                 self.assertTrue(workspace.is_dir())
+                self.assertTrue(second_workspace.is_dir())
                 self.assertTrue(
                     (workspace / ".ubitech-agent-scope.json").is_file()
                 )
+                self.assertTrue(
+                    (second_workspace / ".ubitech-agent-scope.json").is_file()
+                )
+                self.assertEqual(
+                    candidate._workspace_directory_empty_recovery,
+                    {},
+                )
+            finally:
+                db.close()
+
+    def test_existing_nonempty_prefix_retry_does_not_require_empty_recovery(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                first = AgentScopeManager(config, db).ensure_channel_scope(1)
+                second = AgentScopeManager(config, db).ensure_channel_scope(2)
+                channels = Path(first.workspace_path).parent
+                channels_identity = (
+                    channels.stat().st_dev,
+                    channels.stat().st_ino,
+                )
+                candidate = AgentScopeManager(
+                    config,
+                    db,
+                    commit_schema_upgrade=False,
+                    allow_unmaterialized_p1_workspaces=True,
+                )
+                real_fsync = secure_fs.os.fsync
+                failed = False
+
+                def fail_existing_prefix_once(fd):
+                    nonlocal failed
+                    opened = os.fstat(fd)
+                    if (
+                        not failed
+                        and (opened.st_dev, opened.st_ino) == channels_identity
+                    ):
+                        failed = True
+                        raise OSError("simulated existing prefix durability failure")
+                    return real_fsync(fd)
+
+                with mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=fail_existing_prefix_once,
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.DatabaseError,
+                        "publication was not durable",
+                    ):
+                        candidate.commit_schema_upgrade()
+
+                self.assertEqual(
+                    candidate._workspace_directory_empty_recovery,
+                    {},
+                )
+                candidate.commit_schema_upgrade()
+                self.assertTrue(Path(first.workspace_path).is_dir())
+                self.assertTrue(Path(second.workspace_path).is_dir())
             finally:
                 db.close()
 

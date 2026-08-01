@@ -9,6 +9,7 @@ from unittest import mock
 
 from enterprise_agent_platform import secure_fs
 from enterprise_agent_platform.secure_fs import (
+    PrivatePublicationCommittedError,
     UnsafePrivatePathError,
     ensure_private_child_directory_fd,
     ensure_private_directory,
@@ -22,6 +23,186 @@ from enterprise_agent_platform.secure_fs import (
 
 
 class SecureFilesystemTests(unittest.TestCase):
+    def test_child_directory_initial_rename_runs_full_barrier(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            returned_fd: int | None = None
+            real_rename = secure_fs._rename_noreplace
+            real_fsync = secure_fs.os.fsync
+            renamed = False
+            syncs: list[str] = []
+
+            def rename_then_arm(*args, **kwargs):
+                nonlocal renamed
+                result = real_rename(*args, **kwargs)
+                renamed = True
+                return result
+
+            def record_post_rename_fsync(fd):
+                if renamed:
+                    opened = os.fstat(fd)
+                    if (opened.st_dev, opened.st_ino) == (
+                        os.fstat(staging_fd).st_dev,
+                        os.fstat(staging_fd).st_ino,
+                    ):
+                        syncs.append("staging")
+                    elif (opened.st_dev, opened.st_ino) == (
+                        os.fstat(root_fd).st_dev,
+                        os.fstat(root_fd).st_ino,
+                    ):
+                        syncs.append("destination")
+                    else:
+                        syncs.append("child")
+                return real_fsync(fd)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=rename_then_arm,
+                ), mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=record_post_rename_fsync,
+                ):
+                    returned_fd = ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                    )
+                self.assertEqual(syncs, ["child", "staging", "destination"])
+            finally:
+                if returned_fd is not None:
+                    os.close(returned_fd)
+                os.close(staging_fd)
+                os.close(root_fd)
+
+    def test_child_directory_exact_final_without_stage_runs_full_barrier(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            returned_fd: int | None = None
+            real_fsync = secure_fs.os.fsync
+            identities = {
+                identity: "child",
+                (os.fstat(staging_fd).st_dev, os.fstat(staging_fd).st_ino): "staging",
+                (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino): "destination",
+            }
+            syncs: list[str] = []
+
+            def record_fsync(fd):
+                opened = os.fstat(fd)
+                syncs.append(identities[(opened.st_dev, opened.st_ino)])
+                return real_fsync(fd)
+
+            try:
+                with mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=record_fsync,
+                ):
+                    returned_fd = ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                        expected_existing_identity=identity,
+                    )
+                self.assertEqual(syncs, ["child", "staging", "destination"])
+            finally:
+                if returned_fd is not None:
+                    os.close(returned_fd)
+                os.close(staging_fd)
+                os.close(root_fd)
+
+    def test_child_directory_exact_final_retries_every_failed_barrier_step(self):
+        for failed_step in ("child", "staging", "destination"):
+            with self.subTest(failed_step=failed_step), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                root.chmod(0o700)
+                child = root / "child"
+                child.mkdir(mode=0o700)
+                staging = root / "staging"
+                staging.mkdir(mode=0o700)
+                identity = (child.stat().st_dev, child.stat().st_ino)
+                root_fd = open_private_directory_fd(root)
+                staging_fd = open_private_directory_fd(staging)
+                returned_fd: int | None = None
+                real_fsync = secure_fs.os.fsync
+                identities = {
+                    identity: "child",
+                    (
+                        os.fstat(staging_fd).st_dev,
+                        os.fstat(staging_fd).st_ino,
+                    ): "staging",
+                    (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino): (
+                        "destination"
+                    ),
+                }
+                syncs: list[str] = []
+                injected = False
+
+                def fail_once(fd):
+                    nonlocal injected
+                    opened = os.fstat(fd)
+                    step = identities[(opened.st_dev, opened.st_ino)]
+                    syncs.append(step)
+                    if step == failed_step and not injected:
+                        injected = True
+                        raise OSError(f"simulated {step} durability failure")
+                    return real_fsync(fd)
+
+                try:
+                    with mock.patch.object(
+                        secure_fs.os,
+                        "fsync",
+                        side_effect=fail_once,
+                    ):
+                        with self.assertRaises(
+                            PrivatePublicationCommittedError
+                        ) as raised:
+                            ensure_private_child_directory_fd(
+                                root_fd,
+                                "child",
+                                staging_fd=staging_fd,
+                                staging_name="child.stage",
+                                expected_existing_identity=identity,
+                            )
+                        self.assertEqual(
+                            raised.exception.published_identity,
+                            identity,
+                        )
+                        retry_start = len(syncs)
+                        returned_fd = ensure_private_child_directory_fd(
+                            root_fd,
+                            "child",
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                            expected_existing_identity=identity,
+                        )
+                    self.assertEqual(
+                        syncs[retry_start:],
+                        ["child", "staging", "destination"],
+                    )
+                finally:
+                    if returned_fd is not None:
+                        os.close(returned_fd)
+                    os.close(staging_fd)
+                    os.close(root_fd)
+
     def test_child_directory_eexist_cleans_stage_and_retry_stays_failed(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -80,6 +261,217 @@ class SecureFilesystemTests(unittest.TestCase):
             root_fd = open_private_directory_fd(root)
             staging_fd = open_private_directory_fd(staging)
             returned_fd: int | None = None
+            real_fsync = secure_fs.os.fsync
+            identities = {
+                identity: "child",
+                (os.fstat(staging_fd).st_dev, os.fstat(staging_fd).st_ino): "staging",
+                (os.fstat(root_fd).st_dev, os.fstat(root_fd).st_ino): "destination",
+            }
+            syncs: list[str] = []
+
+            def record_fsync(fd):
+                opened = os.fstat(fd)
+                syncs.append(identities[(opened.st_dev, opened.st_ino)])
+                return real_fsync(fd)
+
+            try:
+                with mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=record_fsync,
+                ):
+                    returned_fd = ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                        expected_existing_identity=identity,
+                    )
+                self.assertFalse((staging / "child.stage").exists())
+                opened = os.fstat(returned_fd)
+                self.assertEqual((opened.st_dev, opened.st_ino), identity)
+                self.assertEqual(syncs, ["child", "staging", "destination"])
+            finally:
+                if returned_fd is not None:
+                    os.close(returned_fd)
+                os.close(staging_fd)
+                os.close(root_fd)
+
+    def test_child_directory_unknown_final_does_not_claim_exact_empty_stage(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            (staging / "child.stage").mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            try:
+                with self.assertRaisesRegex(
+                    UnsafePrivatePathError,
+                    "appeared before publication",
+                ):
+                    ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                    )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual((child.stat().st_dev, child.stat().st_ino), identity)
+            self.assertFalse((staging / "child.stage").exists())
+
+    def test_child_directory_rejects_content_added_at_rename_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            real_rename = secure_fs._rename_noreplace
+
+            def populate_then_rename(left_fd, left_name, right_fd, right_name):
+                sentinel = staging / left_name / "sentinel"
+                sentinel.write_text("preserve", encoding="utf-8")
+                sentinel.chmod(0o600)
+                return real_rename(left_fd, left_name, right_fd, right_name)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=populate_then_rename,
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafePrivatePathError,
+                        "gained contents during publication",
+                    ):
+                        ensure_private_child_directory_fd(
+                            root_fd,
+                            "child",
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                        )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual(
+                (child / "sentinel").read_text(encoding="utf-8"),
+                "preserve",
+            )
+            self.assertFalse((staging / "child.stage").exists())
+
+    def test_child_directory_fsync_window_content_is_not_committed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            real_rename = secure_fs._rename_noreplace
+            real_fsync = secure_fs.os.fsync
+            renamed = False
+            injected = False
+
+            def rename_then_arm(*args, **kwargs):
+                nonlocal renamed
+                result = real_rename(*args, **kwargs)
+                renamed = True
+                return result
+
+            def populate_and_fail_child_fsync(fd):
+                nonlocal injected
+                if renamed and not injected:
+                    injected = True
+                    sentinel = child / "sentinel"
+                    sentinel.write_text("preserve", encoding="utf-8")
+                    sentinel.chmod(0o600)
+                    raise OSError("simulated child durability failure")
+                return real_fsync(fd)
+
+            try:
+                with mock.patch.object(
+                    secure_fs,
+                    "_rename_noreplace",
+                    side_effect=rename_then_arm,
+                ), mock.patch.object(
+                    secure_fs.os,
+                    "fsync",
+                    side_effect=populate_and_fail_child_fsync,
+                ):
+                    with self.assertRaisesRegex(
+                        UnsafePrivatePathError,
+                        "gained contents during publication",
+                    ):
+                        ensure_private_child_directory_fd(
+                            root_fd,
+                            "child",
+                            staging_fd=staging_fd,
+                            staging_name="child.stage",
+                        )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual(
+                (child / "sentinel").read_text(encoding="utf-8"),
+                "preserve",
+            )
+
+    def test_child_directory_empty_recovery_rejects_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            sentinel = child / "sentinel"
+            sentinel.write_text("preserve", encoding="utf-8")
+            sentinel.chmod(0o600)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            try:
+                with self.assertRaisesRegex(
+                    UnsafePrivatePathError,
+                    "gained contents during publication",
+                ):
+                    ensure_private_child_directory_fd(
+                        root_fd,
+                        "child",
+                        staging_fd=staging_fd,
+                        staging_name="child.stage",
+                        expected_existing_identity=identity,
+                        require_empty=True,
+                    )
+            finally:
+                os.close(staging_fd)
+                os.close(root_fd)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_child_directory_normal_existing_prefix_may_be_nonempty(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            root.chmod(0o700)
+            child = root / "child"
+            child.mkdir(mode=0o700)
+            nested = child / "nested"
+            nested.mkdir(mode=0o700)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            identity = (child.stat().st_dev, child.stat().st_ino)
+            root_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            returned_fd: int | None = None
             try:
                 returned_fd = ensure_private_child_directory_fd(
                     root_fd,
@@ -88,7 +480,6 @@ class SecureFilesystemTests(unittest.TestCase):
                     staging_name="child.stage",
                     expected_existing_identity=identity,
                 )
-                self.assertFalse((staging / "child.stage").exists())
                 opened = os.fstat(returned_fd)
                 self.assertEqual((opened.st_dev, opened.st_ino), identity)
             finally:
@@ -96,6 +487,7 @@ class SecureFilesystemTests(unittest.TestCase):
                     os.close(returned_fd)
                 os.close(staging_fd)
                 os.close(root_fd)
+            self.assertTrue(nested.is_dir())
 
     def test_child_directory_never_consumes_nonempty_stage(self):
         with tempfile.TemporaryDirectory() as td:

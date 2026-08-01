@@ -377,8 +377,6 @@ def validate_release_transition_contract(value: Any, label: str) -> dict[str, An
         )
         if set(compat) != {"generation", "manifest_sha256", "compose_sha256", "managed_images"}:
             raise DocsSyncError(f"{label}.source_owner_compat must be complete")
-        if compat["generation"] != contract["predecessor_generation"]:
-            raise DocsSyncError(f"{label}.source_owner_compat.generation must equal predecessor_generation")
         canonical_p1 = {
             "generation": "983f79b4900502f35fac6de8154eb344fc9f143b",
             "manifest_sha256": "8772fc457552c48cb5c9623b4411647e78dde18065df07d6520ac6b9d32520c1",
