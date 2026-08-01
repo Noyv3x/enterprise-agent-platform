@@ -32,7 +32,7 @@ func TestPersistentHelperUserSystemdIntegration(t *testing.T) {
 	base := shortTempDir(t)
 	helperSource := filepath.Join(base, "helper.go")
 	if err := os.WriteFile(helperSource, []byte(`package main
-import ("os/signal"; "syscall")
+import ("os"; "os/signal"; "syscall")
 func main(){ c:=make(chan os.Signal,1); signal.Notify(c,syscall.SIGTERM,syscall.SIGINT); <-c }
 `), 0o600); err != nil {
 		t.Fatal(err)

@@ -205,7 +205,7 @@ jobs:
           set +e
           seq 1 12 | xargs -P 2 -I '{}' sh -c '
             log="$work/run-{}.log"
-            node --test --test-concurrency=4 \
+            node --test --test-concurrency=1 \
               --test-name-pattern="active foreground terminal work|uncooperative provider" \
               dist/test/run-timeout.test.js >"$log" 2>&1
             status=$?
