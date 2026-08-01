@@ -39,10 +39,10 @@ class ReleasePromotionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def test_source_owner_repair_directly_follows_public_a2(self) -> None:
+    def test_bridge_directly_follows_source_owner_repair(self) -> None:
         self.assertEqual(
             self.base_contract["predecessor_generation"],
-            "3fa84952c56a6daf2a9a18825778c54b2d150cf1",
+            "c09a4fe83b14ffa6a67beacf4bd27fade9ac9e94",
         )
 
     @staticmethod

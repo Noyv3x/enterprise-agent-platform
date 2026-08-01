@@ -36,7 +36,7 @@ Manager 测试覆盖 manifest schema、HTTPS、artifact 校验和与镜像 diges
 
 handoff 特权树测试必须用真实不同 UID/GID 且部署用户不可读的 `0700` PostgreSQL/RabbitMQ 风格目录，证明 native 路径失败、只有 `container_owned_tree + byte_exact_tree` 进入注入的 `PrivilegedTreeFS`，且内容、owner/group、mode、mtime、size 和完整 inventory 在复制前后不变。负例至少覆盖结构化/secret/单文件滥用、未知 access class、mutable 或错误镜像引用、额外挂载/网络/拉取/能力、symlink、hardlink、FIFO/device/socket、跨 mount、路径逃逸、request/receipt/label/image 摘要篡改、取消和崩溃残留。删除测试必须同时证明缺少 writer lease、target fence 或 publication proof 时零删除，身份完整时只删除声明目标；release smoke 还要从已发布 digest 真实运行 worker，并确认镜像没有 shell/tar 依赖或普通 serve 入口。
 
-Manager 自更新还必须在真实的 user-systemd manager 中验证，而不能只依赖 fake runner：发布门禁应实际启动独立 watchdog、由 watchdog 提交主 unit 的 `restart --no-block`、确认主进程切换到候选 inode、候选完成 acknowledgement/commit，并证明 watchdog 不随主 unit 停止、同一重启只提交一次且测试创建的瞬态 unit 被精确清理。受控恢复的主 unit/watchdog 隔离也必须使用同一真实 systemd 门禁验证；显式启用门禁后，缺少 systemd 前提或发现已有产品 watchdog 必须失败关闭，不能以跳过测试形成绿色结果。该门禁失败时不得发布或提升 latest channel。
+Manager 自更新还必须在真实的 user-systemd manager 中验证，而不能只依赖 fake runner：发布门禁应实际启动独立 watchdog、由 watchdog 提交主 unit 的 `restart --no-block`、确认主进程切换到候选 inode、候选完成 acknowledgement/commit，并证明 watchdog 不随主 unit 停止、同一重启只提交一次且测试创建的瞬态 unit 被精确清理。受控恢复的主 unit/watchdog 隔离也必须使用同一真实 systemd 门禁验证；显式启用门禁后，缺少 systemd 前提或发现已有产品 watchdog 必须失败关闭，不能以跳过测试形成绿色结果。持久 unit 的回归还必须区分 systemd 命令行与普通属性语法：`ExecStart` 对 argv 逐项引用，`WorkingDirectory` 使用属性值的路径转义，不能复用会把双引号当成路径字符的命令行引用器。该门禁失败时不得发布或提升 latest channel。
 
 Manager 启动/CLI 竞态测试还必须确定性交错 handoff、watchdog、`recover-current` 和本地 `preflight`：watchdog 必须在同一 terminal observation lease 内完成 plan/journal 证明后才释放，且释放后候选 Manager 能完成自身 Router；恢复必须证明 `handoff global → recovery.lock` 交接后 concurrent Begin 在产生 planned journal 前失败，同时 external-recovery probe 仍可启动；在 recovery ownership 取得前被抢先创建的 nonterminal journal 必须使恢复零写入失败。`preflight` 必须证明其完整宿主目录/secret、Docker 网络和 release 目录副作用都被同一 handoff observation 覆盖；路由后出现 nonterminal journal 时这些对象必须保持不存在，准入持有期间 concurrent Begin 不得落盘 journal。helper 参与者和 terminal target 的配置测试还必须确定性交错“正确配置已安装、同路径恶意配置替换、恢复正确配置、helper 验收”窗口：target 配置摘要必须在 source preflight 时进入 journal 和一次性能力，参与者只能解析与该摘要相同的已保留字节快照；同字段替换、同内容不同 inode、能力摘要篡改或落盘摘要漂移都必须在 application/Docker/控制面副作用前失败关闭。
 
@@ -78,7 +78,7 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
-涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。重复压力门禁只能以有界并行放大测试自身已经确定性注入的竞态，不能靠占满 runner CPU 制造调度饥饿；每个失败 worker 的完整 Node test 输出必须在 job 失败前回放，禁止用 `/dev/null` 隐去唯一诊断证据。
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。重复压力门禁保留十二轮验证，但最多并行两个 Node 进程且每个进程内部串行执行目标用例；它只能以有界并行放大测试自身已经确定性注入的竞态，不能靠占满 runner CPU 制造调度饥饿。每个失败 worker 的完整 Node test 输出必须在 job 失败前回放，禁止用 `/dev/null` 隐去唯一诊断证据。
 
 ## 前端
 
