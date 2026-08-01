@@ -709,7 +709,7 @@ grep -Fq 'docker pull --platform "linux/${architecture}" "$image"' .github/workf
   || fail "release does not verify every supported managed-image architecture"
 grep -Fq 'image_repository="${image%@*}"' .github/workflows/container-release.yml \
   || fail "release managed-image verification does not isolate its repository variable"
-if rg -q '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
+if grep -Eq '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
   fail "release managed-image verification overwrites the package repository variable"
 fi
 grep -Fq 'mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE"' .github/workflows/container-release.yml \
@@ -724,7 +724,7 @@ fi
 if grep -Fq 'foundationdb/foundationdb@sha256:' .github/workflows/container-release.yml; then
   fail "container release still publishes or validates a FoundationDB image"
 fi
-if rg -n 'gh api[^\n]*(--method|-X)[[:space:]]+PATCH|gh api[[:space:]]+--method[[:space:]]+PATCH' .github/workflows/container-release.yml; then
+if grep -En 'gh api[^\n]*(--method|-X)[[:space:]]+PATCH|gh api[[:space:]]+--method[[:space:]]+PATCH' .github/workflows/container-release.yml; then
   fail "release relies on an unsupported GitHub package visibility mutation"
 fi
 python3 - <<'PY'
@@ -742,7 +742,6 @@ def workflow_job(source: str, name: str, label: str) -> str:
     if match is None:
         raise SystemExit(f"{label} job is missing: {name}")
     return match.group(0)
-
 
 def job(name: str) -> str:
     return workflow_job(workflow, name, "container release")

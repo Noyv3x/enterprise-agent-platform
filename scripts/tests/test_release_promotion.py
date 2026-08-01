@@ -1191,7 +1191,55 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertNotIn(retired_bridge_qualification, evaluator)
         self.assertIn("agent-platform-compose.yaml", container)
         self.assertIn("agent-platform-manager-linux-amd64", container)
+        prepare = container[
+            container.index("\n  prepare:\n") : container.index(
+                "\n  upstream-contracts:\n"
+            )
+        ]
+        target_gate = prepare[
+            prepare.index('if [[ "$transition_stage" == target_baseline ]]; then')
+            : prepare.index("          manager_command=./cmd/agent-platform-manager")
+        ]
+        self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", prepare)
+        self.assertIn(".predecessor_generation", target_gate)
+        self.assertIn(
+            'current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"',
+            target_gate,
+        )
+        self.assertIn('^container-([0-9a-f]{40})$', target_gate)
+        self.assertIn('current_generation="${BASH_REMATCH[1]}"', target_gate)
+        self.assertIn(
+            'git merge-base --is-ancestor "$transition_predecessor" "$current_generation"',
+            target_gate,
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "$current_generation" "$source_commit"',
+            target_gate,
+        )
+        self.assertNotIn(
+            '[[ "$current_tag" == "container-${transition_predecessor}" ]]',
+            target_gate,
+        )
+        self.assertLess(
+            prepare.index('if [[ "$transition_stage" == target_baseline ]]; then'),
+            prepare.index("          image_matrix="),
+        )
+        images = container[
+            container.index("\n  images:\n") : container.index("\n  public-images:\n")
+        ]
+        self.assertIn("      - prepare\n", images)
+
         publish = container[container.index("\n  publish:\n") :]
+        self.assertIn("GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", publish)
+        target_publish = publish[
+            publish.index('if [[ "$TRANSITION_STAGE" == target_baseline ]]; then')
+            : publish.index('          predecessor_root="$RUNNER_TEMP/predecessor-release"')
+        ]
+        self.assertIn('^container-([0-9a-f]{40})$', target_publish)
+        self.assertIn('predecessor="${BASH_REMATCH[1]}"', target_publish)
+        self.assertNotIn(
+            '[[ "$current_tag" == "container-${predecessor}" ]]', target_publish
+        )
         predecessor_lookup = publish[
             publish.index(
                 '          predecessor_api="$RUNNER_TEMP/predecessor-release-api.json"'
@@ -1204,7 +1252,10 @@ class ReleasePromotionTests(unittest.TestCase):
             '"/repos/${GITHUB_REPOSITORY}/releases/tags/container-${predecessor}"'
         )
         self.assertIn(cleanup_branch, predecessor_lookup)
-        self.assertIn("gh api --paginate", predecessor_lookup)
+        self.assertIn(
+            "gh api --paginate -H 'Accept: application/vnd.github+json'",
+            predecessor_lookup,
+        )
         self.assertIn(paginated_releases, predecessor_lookup)
         self.assertIn(
             'jq -se --arg tag "container-${predecessor}"', predecessor_lookup
@@ -1221,6 +1272,7 @@ class ReleasePromotionTests(unittest.TestCase):
             predecessor_lookup.index(cleanup_branch),
             predecessor_lookup.index(paginated_releases),
         )
+        self.assertLess(predecessor_lookup.index(paginated_releases), cleanup_else)
         self.assertLess(cleanup_else, predecessor_lookup.index(tagged_release))
         jq_program = predecessor_lookup.split(
             'jq -se --arg tag "container-${predecessor}" \'', 1

@@ -54,6 +54,8 @@ jobs:
       - name: Resolve immutable release inputs
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           source_commit="$(git rev-parse HEAD)"
@@ -63,6 +65,23 @@ jobs:
           cognee_revision="$(jq -er '.sources.cognee.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           transition_stage="$(jq -er '.stage | select(. == "bridge" or . == "cleanup" or . == "target_baseline")' docs/contracts/release-transition.json)"
+          if [[ "$transition_stage" == target_baseline ]]; then
+            transition_predecessor="$(jq -er '.predecessor_generation | select(test("^[0-9a-f]{40}$"))' docs/contracts/release-transition.json)"
+            current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+            if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
+              echo "Target baseline latest is not an immutable generation: ${current_tag}" >&2
+              exit 1
+            fi
+            current_generation="${BASH_REMATCH[1]}"
+            git merge-base --is-ancestor "$transition_predecessor" "$current_generation" || {
+              echo "Target baseline is waiting for its canonical Cleanup ancestry: ${current_tag}" >&2
+              exit 1
+            }
+            git merge-base --is-ancestor "$current_generation" "$source_commit" || {
+              echo "Target baseline latest is not an ancestor of this candidate: ${current_tag}" >&2
+              exit 1
+            }
+          fi
           manager_command=./cmd/agent-platform-manager
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
           if [[ "$transition_stage" == bridge ]]; then
