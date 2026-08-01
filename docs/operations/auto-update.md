@@ -360,6 +360,8 @@ control API 在提交 2xx 前完整编码响应。mutation 只返回有界身份
 
 若 current Manager 的旧二进制缺陷使其在启动恢复阶段持续退出，后台轮询本身不可达，不能声称继续推送普通 release 会自动获救。此时只使用[部署文档](deployment.md#manager-失联恢复)定义的校验恢复入口先替换 Manager；恢复成功后由同一 operation journal 补完原 finalize，再恢复普通更新。不得只覆盖 stable 文件而不登记 Manager Current，也不得手工清除 `finalize_pending`。
 
+受控恢复不能把已完成的 Manager activation 证明变成永久无法结算的旁路状态。若普通 plan 已被同一 `recover-current` 事务明确标记为 `superseded_by_recovery`，generation barrier 只可从 manifest 的 Manager artifact SHA-256 推导唯一 takeover journal，并在原 Candidate 与 manifest 完全相等、recovery artifact 与该 Candidate 逐字节相同、takeover journal 与 recovery plan 均为 `committed`、Platform 仍持有 journal 绑定的同一条 `finalize_pending` operation 时，把这条 terminal recovery 视为等价的独立 watchdog 提交证明。旧普通 plan 保持 superseded 审计状态，不得重写成伪造的普通 commit。此时登记 Current 必须是该 recovery commit 本身，或是随后由显式、校验和绑定的外部恢复登记且仍绑定同一 Platform source commit 的唯一直接后继；Current 不可变工件、stable 与运行中 `/proc/self/exe` 必须完整一致。任一 journal、plan、operation、manifest、Current/Previous 链或运行身份不一致都继续保持维护并失败关闭。
+
 ## 验证
 
 发布门至少覆盖：

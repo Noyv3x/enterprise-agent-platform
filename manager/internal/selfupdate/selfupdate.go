@@ -1746,6 +1746,32 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 			plan.HealthTimeoutMS < 1_000 || plan.HealthTimeoutMS > 10*60*1_000 || plan.BootID == "" {
 			return errors.New("Manager activation plan identity conflicts with the committed release")
 		}
+		if plan.Status == recoverySupersededStatus {
+			platformPath := filepath.Join(filepath.Dir(m.StatePath), "state.json")
+			evidence, evidenceErr := readRecoveryFinalizeEvidence(platformPath, manifest.SourceCommit)
+			if evidenceErr != nil {
+				return fmt.Errorf("read committed recovery activation evidence: %w", evidenceErr)
+			}
+			if !reflect.DeepEqual(evidence.manifest, manifest) {
+				return errors.New("committed recovery manifest differs from the generation barrier manifest")
+			}
+			if _, _, evidenceErr = m.committedRecoveryForFinalize(latest, evidence); evidenceErr != nil {
+				return fmt.Errorf("validate committed recovery activation evidence: %w", evidenceErr)
+			}
+			if err := m.validateStartupVersionArtifact(*latest.Current, "Current"); err != nil {
+				return err
+			}
+			if !binaryMatches(installPath, latest.Current.SHA256) || m.RunningVersion != latest.Current.Version {
+				return errors.New("running Manager does not match committed recovery Current")
+			}
+			processCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := m.verifyRecoveryServiceProcess(processCtx, unit, latest.Current.SHA256); err != nil {
+				return fmt.Errorf("verify committed recovery Manager process: %w", err)
+			}
+			committed = true
+			return nil
+		}
 		if latest.Previous == nil || plan.PreviousPath != latest.Previous.Path ||
 			latest.Current.Version != manifest.Manager.Version || latest.Current.Path != expectedCandidatePath ||
 			latest.Current.SHA256 != artifact.SHA256 || !latest.Current.PlatformCommitted || latest.Current.VerifiedAt.IsZero() ||
