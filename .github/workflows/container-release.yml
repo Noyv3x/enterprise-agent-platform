@@ -81,6 +81,7 @@ jobs:
               echo "Target baseline latest is not an ancestor of this candidate: ${current_tag}" >&2
               exit 1
             }
+            echo "Target baseline lineage verified: ${current_generation} -> ${source_commit}"
           fi
           manager_command=./cmd/agent-platform-manager
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'

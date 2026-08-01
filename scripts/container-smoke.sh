@@ -9,6 +9,8 @@ fail() {
   exit 1
 }
 
+command -v grep >/dev/null 2>&1 || fail "portable grep is required"
+
 python3 -m unittest discover -s scripts/tests -v
 
 for path in \
