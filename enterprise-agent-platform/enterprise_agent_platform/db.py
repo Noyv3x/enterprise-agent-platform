@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -10,17 +11,154 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 from .container_contract_generated import DATABASE_SCHEMA_VERSION
-from .secure_fs import ensure_private_directory, ensure_private_file, tighten_sqlite_files
+from .secure_fs import (
+    open_private_directory_fd,
+    open_private_file_fd_at,
+    tighten_sqlite_files_at,
+    verify_private_directory_path_fd,
+    verify_private_file_fd_at,
+    ensure_private_directory,
+)
+from .technical_profile import (
+    SOURCE_DATABASE_BASELINE,
+    SOURCE_TECHNICAL_PROFILE,
+    TechnicalProfile,
+    technical_profile,
+)
 
 
 _DATABASE_BASELINE_VERSION = 2026072901
-_DATABASE_BASELINE_NAME = "ubitech-agent-container-baseline-v2"
+_DATABASE_BASELINE_NAME = SOURCE_DATABASE_BASELINE
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
 
 
 def now_ts() -> int:
     return int(time.time())
+
+
+def _close_database_descriptors(database_fd: int, directory_fd: int) -> None:
+    for fd in (database_fd, directory_fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _sqlite_fd_uri(database_fd: int, *, mode: str) -> str:
+    if mode not in {"ro", "rw"}:  # pragma: no cover - internal programming error
+        raise ValueError("SQLite fd mode is invalid")
+    proc_path = Path(f"/proc/self/fd/{database_fd}")
+    if not proc_path.exists():
+        raise RuntimeError("pinned SQLite file descriptors are unavailable")
+    return f"file:{proc_path}?mode={mode}"
+
+
+def _validate_existing_sqlite_sidecars(parent_fd: int, database_name: str) -> None:
+    for name in (f"{database_name}-wal", f"{database_name}-shm"):
+        try:
+            sidecar_fd = open_private_file_fd_at(
+                parent_fd,
+                name,
+                writable=False,
+                mode=None,
+            )
+        except FileNotFoundError:
+            continue
+        os.close(sidecar_fd)
+
+
+def _assert_pinned_database_profile(
+    parent_fd: int,
+    database_name: str,
+    database_fd: int,
+    selected: TechnicalProfile,
+) -> None:
+    """Read the baseline through one pinned, re-proven database inode."""
+
+    info = verify_private_file_fd_at(
+        parent_fd,
+        database_name,
+        database_fd,
+        mode=None,
+    )
+    if info.st_size == 0:
+        return
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            _sqlite_fd_uri(database_fd, mode="ro"),
+            uri=True,
+        )
+        verify_private_file_fd_at(
+            parent_fd,
+            database_name,
+            database_fd,
+            mode=None,
+        )
+        row = connection.execute(
+            "SELECT version, name FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        verify_private_file_fd_at(
+            parent_fd,
+            database_name,
+            database_fd,
+            mode=None,
+        )
+    except sqlite3.Error as exc:
+        raise sqlite3.DatabaseError(
+            "database does not match the current baseline marker"
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    markers = [(int(version), str(name)) for version, name in row]
+    if markers != [
+        (_DATABASE_BASELINE_VERSION, selected.database_baseline_name)
+    ]:
+        raise sqlite3.DatabaseError(
+            "database does not match the current baseline marker"
+        )
+
+
+def assert_existing_database_profile(
+    path: Path,
+    technical_profile_value: TechnicalProfile | str = SOURCE_TECHNICAL_PROFILE,
+) -> None:
+    """Reject a cross-profile database without opening a writable handle."""
+
+    selected = technical_profile(technical_profile_value)
+    path = Path(path).expanduser()
+    directory_fd = -1
+    database_fd = -1
+    try:
+        try:
+            directory_fd = open_private_directory_fd(path.parent, mode=None)
+        except FileNotFoundError:
+            return
+        verify_private_directory_path_fd(path.parent, directory_fd, mode=None)
+        try:
+            database_fd = open_private_file_fd_at(
+                directory_fd,
+                path.name,
+                writable=False,
+                mode=None,
+            )
+        except FileNotFoundError:
+            return
+        _validate_existing_sqlite_sidecars(directory_fd, path.name)
+        _assert_pinned_database_profile(
+            directory_fd,
+            path.name,
+            database_fd,
+            selected,
+        )
+        verify_private_directory_path_fd(path.parent, directory_fd, mode=None)
+    finally:
+        if database_fd >= 0:
+            os.close(database_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 class _ConnectionHolder:
@@ -58,28 +196,125 @@ class Database:
     request and agent-worker thread platform-wide).
     """
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(
+        self,
+        path: Path,
+        technical_profile_value: TechnicalProfile | str = SOURCE_TECHNICAL_PROFILE,
+    ):
+        self.path = Path(path).expanduser()
+        self.technical_profile = technical_profile(technical_profile_value)
+        self._database_baseline_name = self.technical_profile.database_baseline_name
+        self._directory_fd = -1
+        self._database_fd = -1
+        self._pin_finalizer: weakref.finalize | None = None
         ensure_private_directory(self.path.parent)
-        ensure_private_file(self.path)
-        self._local = threading.local()
-        self._init_lock = threading.RLock()
-        self._holders: "weakref.WeakSet[_ConnectionHolder]" = weakref.WeakSet()
-        self._holders_lock = threading.Lock()
-        self.fts_available = False
-        self.message_fts_available = False
-        self.message_fts_trigram_available = False
-        self._closed = False
-        self.init_schema()
+        try:
+            self._directory_fd = open_private_directory_fd(self.path.parent)
+            verify_private_directory_path_fd(
+                self.path.parent,
+                self._directory_fd,
+            )
+            self._database_fd = open_private_file_fd_at(
+                self._directory_fd,
+                self.path.name,
+                writable=True,
+                create=True,
+                mode=0o600,
+                tighten_mode=True,
+            )
+            self._pin_finalizer = weakref.finalize(
+                self,
+                _close_database_descriptors,
+                self._database_fd,
+                self._directory_fd,
+            )
+            # Existing WAL/SHM leaves are verified before even a read-only
+            # profile query can make SQLite discover them.
+            tighten_sqlite_files_at(
+                self._directory_fd,
+                self.path.name,
+                database_fd=self._database_fd,
+            )
+            _assert_pinned_database_profile(
+                self._directory_fd,
+                self.path.name,
+                self._database_fd,
+                self.technical_profile,
+            )
+            verify_private_directory_path_fd(
+                self.path.parent,
+                self._directory_fd,
+            )
+            self._local = threading.local()
+            self._init_lock = threading.RLock()
+            self._holders: "weakref.WeakSet[_ConnectionHolder]" = weakref.WeakSet()
+            self._holders_lock = threading.Lock()
+            self.fts_available = False
+            self.message_fts_available = False
+            self.message_fts_trigram_available = False
+            self._closed = False
+            self.init_schema()
+        except BaseException:
+            holder = getattr(self, "_local", None)
+            if holder is not None:
+                connection_holder = getattr(holder, "holder", None)
+                if connection_holder is not None:
+                    connection_holder.close()
+            self._close_pinned_files()
+            raise
+
+    def _verify_database_identity(self) -> None:
+        verify_private_directory_path_fd(self.path.parent, self._directory_fd)
+        verify_private_file_fd_at(
+            self._directory_fd,
+            self.path.name,
+            self._database_fd,
+            mode=0o600,
+        )
+
+    def _close_pinned_files(self) -> None:
+        finalizer = self._pin_finalizer
+        self._pin_finalizer = None
+        database_fd, self._database_fd = self._database_fd, -1
+        directory_fd, self._directory_fd = self._directory_fd, -1
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+        _close_database_descriptors(database_fd, directory_fd)
 
     def _new_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=30000")
-        tighten_sqlite_files(self.path)
-        return conn
+        self._verify_database_identity()
+        tighten_sqlite_files_at(
+            self._directory_fd,
+            self.path.name,
+            database_fd=self._database_fd,
+        )
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                _sqlite_fd_uri(self._database_fd, mode="rw"),
+                uri=True,
+                check_same_thread=False,
+                timeout=30,
+            )
+            # sqlite3_open has acquired its own handle to the pinned inode, but
+            # no WAL pragma or schema statement has run yet. Reprove the named
+            # leaf now so a connect-window replacement fails without a writer.
+            self._verify_database_identity()
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._verify_database_identity()
+            tighten_sqlite_files_at(
+                self._directory_fd,
+                self.path.name,
+                database_fd=self._database_fd,
+            )
+            return conn
+        except BaseException:
+            if conn is not None:
+                conn.close()
+            raise
 
     @property
     def _conn(self) -> sqlite3.Connection:
@@ -118,7 +353,15 @@ class Database:
             self._local.holder = None
         except Exception:
             pass
-        tighten_sqlite_files(self.path)
+        try:
+            self._verify_database_identity()
+            tighten_sqlite_files_at(
+                self._directory_fd,
+                self.path.name,
+                database_fd=self._database_fd,
+            )
+        finally:
+            self._close_pinned_files()
 
     def init_schema(self) -> None:
         with self._init_lock:
@@ -134,8 +377,7 @@ class Database:
                 self._assert_current_database_baseline(existing_tables)
             if fresh_database:
                 try:
-                    self._conn.executescript(
-                """
+                    schema = """
                 PRAGMA journal_mode=WAL;
                 PRAGMA foreign_keys=ON;
                 BEGIN IMMEDIATE;
@@ -500,7 +742,7 @@ class Database:
                 INSERT INTO schema_migrations(version, name, applied_at)
                     VALUES (
                         2026072901,
-                        'ubitech-agent-container-baseline-v2',
+                        '__CURRENT_DATABASE_BASELINE__',
                         CAST(strftime('%s', 'now') AS INTEGER)
                     );
                 INSERT INTO settings(key, value, secret, updated_at)
@@ -569,6 +811,13 @@ class Database:
                 END;
                 COMMIT;
                 """
+                    if schema.count("__CURRENT_DATABASE_BASELINE__") != 1:
+                        raise RuntimeError("database baseline placeholder is invalid")
+                    self._conn.executescript(
+                        schema.replace(
+                            "__CURRENT_DATABASE_BASELINE__",
+                            self._database_baseline_name,
+                        )
                     )
                 except BaseException:
                     self._conn.rollback()
@@ -591,7 +840,9 @@ class Database:
                 "SELECT version, name FROM schema_migrations ORDER BY version"
             ).fetchall()
         ] if "schema_migrations" in tables else []
-        if markers != [(_DATABASE_BASELINE_VERSION, _DATABASE_BASELINE_NAME)]:
+        if markers != [
+            (_DATABASE_BASELINE_VERSION, self._database_baseline_name)
+        ]:
             raise sqlite3.DatabaseError(
                 "database does not match the current baseline marker"
             )

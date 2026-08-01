@@ -3,7 +3,7 @@ export const CONTAINER_PLATFORM_SCHEMA_VERSION = 1 as const;
 export const RELEASE_CHANNEL = "main" as const;
 export const DATABASE_SCHEMA_VERSION = 2026072901 as const;
 export const CONTAINER_PATHS = {
-  "data_root": "/var/lib/ubitech-agent",
+  "data_root": "/var/lib/agent-platform",
   "workspace": "/workspace",
   "agent_home": "/home/agent",
   "agent_env": "/opt/agent-env"

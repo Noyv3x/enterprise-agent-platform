@@ -198,7 +198,13 @@ func assembleProductionHandoffHelper(journal handoff.Journal, parsed handoffHelp
 	if hex.EncodeToString(bridgeDigest[:]) != journal.Release.ManifestSHA256 {
 		return productionHelperAssembly{}, errors.New("helper bridge manifest differs from the journal digest")
 	}
-	bridgeManifest, err := release.DecodeManifest(bridgeRaw, sourceConfig.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
+	bridgeManifest, err := release.DecodeManifestForProfile(
+		bridgeRaw,
+		sourceConfig.ReleaseChannel,
+		runtime.GOOS,
+		runtime.GOARCH,
+		sourceActive,
+	)
 	if err != nil {
 		return productionHelperAssembly{}, err
 	}
@@ -221,7 +227,13 @@ func assembleProductionHandoffHelper(journal handoff.Journal, parsed handoffHelp
 	if digest := sha256.Sum256(sourceManifestRaw); hex.EncodeToString(digest[:]) != journal.Source.ManifestSHA256 {
 		return productionHelperAssembly{}, errors.New("bundled source predecessor manifest differs from the journal digest")
 	}
-	sourceManifest, err := release.DecodeManifest(sourceManifestRaw, sourceConfig.ReleaseChannel, runtime.GOOS, runtime.GOARCH)
+	sourceManifest, err := release.DecodeManifestForProfile(
+		sourceManifestRaw,
+		sourceConfig.ReleaseChannel,
+		runtime.GOOS,
+		runtime.GOARCH,
+		sourceActive,
+	)
 	if err != nil {
 		return productionHelperAssembly{}, fmt.Errorf("load source predecessor manifest: %w", err)
 	}

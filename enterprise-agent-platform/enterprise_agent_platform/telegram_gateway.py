@@ -119,7 +119,7 @@ class TelegramBotAPI:
         fields: dict[str, Any],
         files: dict[str, tuple[str, str, bytes]],
     ) -> dict[str, Any]:
-        boundary = f"----enterprise-telegram-{int(time.time() * 1000)}"
+        boundary = f"----agent-platform-telegram-{int(time.time() * 1000)}"
         body = bytearray()
         for key, value in fields.items():
             body.extend(f"--{boundary}\r\n".encode("ascii"))

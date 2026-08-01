@@ -15,7 +15,6 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/attestation"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/executor"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/handoffhelper"
@@ -184,7 +183,6 @@ func (a *API) handoffParticipantStatus(response http.ResponseWriter) {
 		"active_operation_id":           transactionID,
 		"finalize_pending_operation_id": "",
 		"operation_id":                  transactionID,
-		"workspace_schema_commit":       nil,
 		"gate_settlement":               nil,
 		"checked_at":                    time.Now().UTC(),
 	})
@@ -328,10 +326,8 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		cancel()
 	}
 	state, referencedOperation, snapshotErr := a.Store.StateWithReferencedOperation()
-	var workspaceSchemaCommit *workspaceSchemaCommitStatus
 	var gateSettlement *gateSettlementStatus
 	if snapshotErr == nil && referencedOperation != nil {
-		workspaceSchemaCommit = projectWorkspaceSchemaCommit(state, *referencedOperation)
 		gateSettlement = projectGateSettlement(state, *referencedOperation)
 	}
 	activeOperationID := safeStatusToken(state.ActiveOperationID, 160)
@@ -341,7 +337,7 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		operationID = finalizeOperationID
 	}
 	publicState := safePublicState(state.PublicState)
-	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "workspace_schema_commit": workspaceSchemaCommit, "gate_settlement": gateSettlement, "checked_at": state.HeartbeatAt})
+	writeJSON(response, http.StatusOK, map[string]any{"generation": state.Generation, "current": generationStatusProjection(state.Current), "previous": generationStatusProjection(state.Previous), "target": generationStatusProjection(state.Candidate), "public_state": publicState, "phase": safeOperationPhase(state.Phase), "services": services, "error": safeManagerDiagnostic(state.LastError), "maintenance": state.Maintenance, "active_operation_id": activeOperationID, "finalize_pending_operation_id": finalizeOperationID, "operation_id": operationID, "gate_settlement": gateSettlement, "checked_at": state.HeartbeatAt})
 }
 
 type gateSettlementStatus struct {
@@ -358,7 +354,7 @@ func projectGateSettlement(
 		state.PublicState != model.StateUpdating || state.Phase != "" ||
 		state.ActiveOperationID != "" ||
 		state.FinalizePendingOperationID != operation.ID || state.Candidate != nil ||
-		operation.SchemaVersion != 1 || !validWorkspaceSchemaOperationID(operation.ID) ||
+		operation.SchemaVersion != 1 || !validStatusOperationID(operation.ID) ||
 		operation.Status != model.OperationSucceeded || !operation.Finalized ||
 		operation.Phase != model.PhaseCommitting || operation.CompletedAt == nil ||
 		operation.ReservationReleased || operation.SnapshotRestored ||
@@ -408,68 +404,11 @@ func validGateSettlementReservation(state model.ManagerState, operation model.Op
 	}
 }
 
-type workspaceSchemaCommitStatus struct {
-	SchemaVersion         int    `json:"schema_version"`
-	OperationID           string `json:"operation_id"`
-	PredecessorGeneration string `json:"predecessor_generation"`
-	TargetGeneration      string `json:"target_generation"`
-}
-
-func projectWorkspaceSchemaCommit(
-	state model.ManagerState,
-	operation model.Operation,
-) *workspaceSchemaCommitStatus {
-	if state.SchemaVersion != 1 || !state.Maintenance ||
-		state.PublicState != model.StateUpdating || operation.SchemaVersion != 1 ||
-		!validWorkspaceSchemaOperationID(operation.ID) ||
-		operation.Kind != model.OperationUpdate || operation.Finalized ||
-		operation.ReservationStatus != model.ReservationMutationStarted ||
-		operation.ReservationReleased || operation.SnapshotRestored ||
-		operation.TargetGeneration == contract.SourceOwnerCompatGeneration ||
-		safeCommit(operation.TargetGeneration) != operation.TargetGeneration ||
-		operation.PreparedCleanupPending || operation.ManagerActivationRollback ||
-		operation.ManagerRollbackGeneration != "" {
-		return nil
-	}
-
-	active := state.ActiveOperationID == operation.ID &&
-		state.FinalizePendingOperationID == "" &&
-		state.Current != nil &&
-		state.Current.ID == contract.SourceOwnerCompatGeneration &&
-		state.Current.SourceCommit == contract.SourceOwnerCompatGeneration &&
-		generationMatchesTarget(state.Candidate, operation.TargetGeneration) &&
-		operation.Status == model.OperationRunning && operation.CompletedAt == nil &&
-		operation.Phase == state.Phase &&
-		(operation.Phase == model.PhaseStarting ||
-			operation.Phase == model.PhaseProbing ||
-			operation.Phase == model.PhaseCommitting)
-
-	finalize := state.ActiveOperationID == "" &&
-		state.FinalizePendingOperationID == operation.ID &&
-		state.Phase == "" && state.Candidate == nil &&
-		state.Previous != nil &&
-		state.Previous.ID == contract.SourceOwnerCompatGeneration &&
-		state.Previous.SourceCommit == contract.SourceOwnerCompatGeneration &&
-		generationMatchesTarget(state.Current, operation.TargetGeneration) &&
-		operation.Status == model.OperationSucceeded && !operation.Finalized &&
-		operation.Phase == model.PhaseCommitting && operation.CompletedAt != nil
-
-	if !active && !finalize {
-		return nil
-	}
-	return &workspaceSchemaCommitStatus{
-		SchemaVersion:         1,
-		OperationID:           operation.ID,
-		PredecessorGeneration: contract.SourceOwnerCompatGeneration,
-		TargetGeneration:      operation.TargetGeneration,
-	}
-}
-
 func generationMatchesTarget(generation *model.Generation, target string) bool {
 	return generation != nil && generation.ID == target && generation.SourceCommit == target
 }
 
-func validWorkspaceSchemaOperationID(value string) bool {
+func validStatusOperationID(value string) bool {
 	if len(value) != len("op_")+32 || !strings.HasPrefix(value, "op_") {
 		return false
 	}

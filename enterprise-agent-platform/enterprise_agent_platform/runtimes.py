@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import os
+import stat
 import threading
 import time
 import urllib.error
@@ -386,7 +387,8 @@ class PlatformRuntimeManager:
             return (
                 isinstance(payload, dict)
                 and payload.get("status") == "ok"
-                and payload.get("service") == "ubitech-agent-runtime"
+                and payload.get("service")
+                == self.config.technical_profile.agent_runtime_health_service
             )
 
         return self._probe_request(request, healthy)
@@ -539,11 +541,67 @@ class PlatformRuntimeManager:
     def _agent_runtime_token(self) -> str:
         return self.config.agent_runtime_token or self._first_secret(
             "agent_runtime_token",
-            "ENTERPRISE_AGENT_RUNTIME_TOKEN",
+            self.config.technical_profile.environment_variable(
+                "ENTERPRISE_AGENT_RUNTIME_TOKEN"
+            ),
         )
 
     def _camofox_access_key(self) -> str:
-        return self._first_secret("CAMOFOX_ACCESS_KEY")
+        profile = self.config.technical_profile
+        source_value = os.getenv("CAMOFOX_ACCESS_KEY", "")
+        source_file = os.getenv("CAMOFOX_ACCESS_KEY_FILE", "")
+        target_name = "AGENT_PLATFORM_CAMOFOX_ACCESS_KEY"
+        target_file_name = target_name + "_FILE"
+        target_value = os.getenv(target_name, "")
+        target_file = os.getenv(target_file_name, "")
+
+        if not profile.is_target:
+            if target_value or target_file:
+                raise RuntimeError(
+                    "source and target Camoufox secret namespaces cannot be mixed"
+                )
+            return self._first_secret("CAMOFOX_ACCESS_KEY")
+
+        if source_value or source_file:
+            raise RuntimeError(
+                "source and target Camoufox secret namespaces cannot be mixed"
+            )
+        if target_value and target_file:
+            raise RuntimeError(
+                f"{target_name} and {target_file_name} cannot both be set"
+            )
+        if target_file:
+            expected = "/run/secrets/agent-platform/camofox-access-key"
+            if target_file != expected:
+                raise RuntimeError(f"{target_file_name} must be {expected}")
+            return self._read_secret_file(target_file, target_file_name)
+        if target_value:
+            return target_value
+        return self._first_secret(target_name)
+
+    @staticmethod
+    def _read_secret_file(path: str, label: str) -> str:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise RuntimeError(f"{label} does not name a readable secret file") from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 4096:
+                raise RuntimeError(f"{label} does not name a bounded regular secret file")
+            raw = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+        if len(raw) > 4096:
+            raise RuntimeError(f"{label} exceeds the secret size limit")
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"{label} is not valid UTF-8") from exc
+        if not value:
+            raise RuntimeError(f"{label} is empty")
+        return value
 
     def _first_secret(self, *keys: str) -> str:
         for key in keys:

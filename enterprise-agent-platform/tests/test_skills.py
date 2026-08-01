@@ -1043,6 +1043,7 @@ class SkillStoreTests(unittest.TestCase):
 
         first_copy = store.list("private:user-1")[0]
         first_copy["tags"].append("mutated")
+
         first_copy["linked_files"].clear()
         second_copy = store.get("private:user-2", "source-verification")
         self.assertNotIn("mutated", second_copy["tags"])
@@ -1130,6 +1131,15 @@ class SkillStoreTests(unittest.TestCase):
                 ).iterdir()
             }
             self.assertNotIn("source-verification", package_names)
+
+    def test_repository_bundled_skills_use_target_workspace_namespace(self):
+        bundled_root = Path(skills_module.__file__).parent / "bundled_skills"
+        documents = sorted(bundled_root.glob("*/SKILL.md"))
+        self.assertTrue(documents)
+        for document in documents:
+            with self.subTest(document=document.name):
+                instructions = document.read_text(encoding="utf-8")
+                self.assertNotIn(".ubitech/", instructions)
 
     def test_user_skill_shadows_bundled_skill_without_upgrade_overwrite(self):
         bundled_root = Path(self.temporary.name) / "bundled"

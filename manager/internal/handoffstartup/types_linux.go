@@ -197,6 +197,29 @@ func RouteBaselineSourcePaths(paths RuntimePaths) (Decision, error) {
 	return routeBaselineSourcePaths(paths, true)
 }
 
+// RouteCompileTimeBaselinePaths is the no-journal route for the canonical
+// release stage compiled into this Manager. Bridge selects source; Cleanup and
+// target-baseline select target. No caller-controlled value participates in
+// that selection.
+func RouteCompileTimeBaselinePaths(paths RuntimePaths) (Decision, error) {
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return Decision{}, err
+	}
+	return routeBaselineProfilePaths(active, paths, true)
+}
+
+// RouteCompileTimeBaselineAuthorityPaths performs the same compile-time
+// selection for a watchdog or recovery executable whose immutable plan will
+// separately prove its non-stable running inode.
+func RouteCompileTimeBaselineAuthorityPaths(paths RuntimePaths) (Decision, error) {
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return Decision{}, err
+	}
+	return routeBaselineProfilePaths(active, paths, false)
+}
+
 func routeBaselineSource(bindings Bindings, requireStableProcess bool) (Decision, error) {
 	if err := validateBindings(bindings); err != nil {
 		return Decision{}, err
@@ -205,16 +228,28 @@ func routeBaselineSource(bindings Bindings, requireStableProcess bool) (Decision
 }
 
 func routeBaselineSourcePaths(paths RuntimePaths, requireStableProcess bool) (Decision, error) {
-	if err := validateRuntimePaths("source", identity.SourceProfile(), paths); err != nil {
+	return routeBaselineProfilePaths(identity.SourceActiveProfile(), paths, requireStableProcess)
+}
+
+func routeBaselineProfilePaths(active identity.ActiveProfile, paths RuntimePaths, requireStableProcess bool) (Decision, error) {
+	profile, err := active.Profile()
+	if err != nil {
+		return Decision{}, err
+	}
+	label := "target"
+	if profile == identity.SourceProfile() {
+		label = "source"
+	}
+	if err := validateRuntimePaths(label, profile, paths); err != nil {
 		return Decision{}, err
 	}
 	if requireStableProcess {
 		if err := verifyProcessExecutable(currentPID(), paths.StableBinary, ""); err != nil {
-			return Decision{}, fmt.Errorf("verify baseline source Manager executable: %w", err)
+			return Decision{}, fmt.Errorf("verify baseline %s Manager executable: %w", label, err)
 		}
 	}
 	if err := verifyRuntimeLayout(paths); err != nil {
-		return Decision{}, fmt.Errorf("verify baseline source Manager layout: %w", err)
+		return Decision{}, fmt.Errorf("verify baseline %s Manager layout: %w", label, err)
 	}
-	return Decision{ActiveProfile: identity.SourceActiveProfile(), Profile: identity.SourceProfile(), Paths: paths}, nil
+	return Decision{ActiveProfile: active, Profile: profile, Paths: paths}, nil
 }

@@ -12,6 +12,7 @@ if [[ ! -f "$manifest" || -L "$manifest" ]]; then
   exit 1
 fi
 
+schema_version="$(jq -er '.schema_version | select(. == 1 or . == 2)' "$manifest")"
 expected_components=(
   agent-runtime
   agent-sandbox
@@ -21,11 +22,22 @@ expected_components=(
   firecrawl-postgres
   firecrawl-rabbitmq
   firecrawl-redis
-  handoff-fs-helper
   platform
   searxng
 )
-expected_json="$(printf '%s\n' "${expected_components[@]}" | jq -R . | jq -sc .)"
+if [[ "$schema_version" == 1 ]]; then
+  expected_components+=(handoff-fs-helper)
+  jq -e '
+    .protocol_version == 1 and
+    (.namespace_handoff | type == "object")
+  ' "$manifest" >/dev/null
+else
+  jq -e '
+    .protocol_version == 2 and
+    (has("namespace_handoff") | not)
+  ' "$manifest" >/dev/null
+fi
+expected_json="$(printf '%s\n' "${expected_components[@]}" | jq -R . | jq -sc 'sort')"
 jq -e --argjson expected "$expected_json" '
   .images | type == "object" and
   (keys == $expected) and

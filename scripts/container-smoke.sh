@@ -31,12 +31,28 @@ for expected in \
   'This installer supports fresh container installations only.' \
   'docker compose version' \
   'read -r answer </dev/tty' \
-  'systemctl --user enable --now ubitech-agent-manager.service' \
+  'asset="agent-platform-manager-linux-${architecture}"' \
+  'stable_manager="$bin_dir/agent-platform-manager"' \
+  'unit_name="agent-platform-manager.service"' \
+  'socket_path="$runtime_root/agent-platform-manager/manager.sock"' \
+  'systemctl --user enable --now "$unit_name"' \
   '"$stable_manager" preflight --config "$config_path"' \
-  'if ((status != 0 && manager_activated == 0)); then' \
+  'if ((status != 0 && manager_activated == 0 && installation_owned == 1)); then' \
+  'install_lock="$runtime_root/agent-platform-install.lock"' \
+  'flock -n "$install_lock_fd"' \
   'rm -rf --one-file-system -- "$data_root/manager"' \
   '"$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"'; do
   grep -Fq "$expected" install.sh || fail "fresh container installer contract is missing: $expected"
+done
+for retired_installer_identity in \
+  'ubitech-manager-linux-' \
+  '/ubitech-manager' \
+  'ubitech-agent-manager.service' \
+  '/ubitech-agent/manager.toml' \
+  '/ubitech-agent/manager/control'; do
+  if grep -Fq "$retired_installer_identity" install.sh; then
+    fail "target-only fresh installer retains source identity: $retired_installer_identity"
+  fi
 done
 for retired_copy in \
   'Install ubitech agent' \
@@ -89,12 +105,103 @@ case "${1:-}" in
   install)
     mkdir -p "$FAKE_DATA_ROOT/manager/operations"
     printf '%s\n' retained > "$FAKE_DATA_ROOT/manager/operations/install"
-    exit 43
+    if [[ "${FAKE_FAIL_STAGE:-}" == install ]]; then
+      exit 43
+    fi
     ;;
 esac
 exit 0
 EOF
 chmod 0755 "$installer_test/fake-manager"
+python3 - "$installer_test/fake-manager" "$installer_test/release.json" <<'PY'
+import argparse
+import hashlib
+import copy
+import json
+import pathlib
+import sys
+
+repository = pathlib.Path.cwd()
+sys.path.insert(0, str(repository / "scripts"))
+import assemble_release_manifest as assembler
+
+manager = pathlib.Path(sys.argv[1])
+sha = hashlib.sha256(manager.read_bytes()).hexdigest()
+commit = "a" * 40
+image_sha = "b" * 64
+manifest_path = pathlib.Path(sys.argv[2])
+contract = json.loads(
+    (repository / "docs/contracts/release-transition.json").read_text(encoding="utf-8")
+)
+contract["stage"] = "target_baseline"
+contract_path = manifest_path.parent / "target-contract.json"
+contract_path.write_text(json.dumps(contract), encoding="utf-8")
+images = {
+    name: f"registry.example/{name}@sha256:{image_sha}"
+    for name in assembler.MANAGED_V2
+}
+images_path = manifest_path.parent / "target-images.json"
+images_path.write_text(json.dumps(images), encoding="utf-8")
+manifest = assembler.assemble(
+    argparse.Namespace(
+        contract=contract_path,
+        predecessor_manifest=None,
+        images=images_path,
+        generation=commit,
+        # Match the real `git show --format=%cI` producer instead of hand-writing Z.
+        generated_at="2026-08-01T08:00:00+08:00",
+        database_schema_version=2026072901,
+        manager_amd64_url="https://example.invalid/agent-platform-manager-linux-amd64",
+        manager_amd64_sha256=sha,
+        manager_arm64_url="https://example.invalid/agent-platform-manager-linux-arm64",
+        manager_arm64_sha256=sha,
+        compose_url="https://example.invalid/agent-platform-compose.yaml",
+        compose_sha256="c" * 64,
+        output=manifest_path,
+    )
+)
+if manifest["generated_at"] != "2026-08-01T00:00:00Z":
+    raise SystemExit("real assembler did not normalize generated_at to UTC Z")
+manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+bridge = copy.deepcopy(manifest)
+bridge["schema_version"] = 1
+bridge["protocol_version"] = 1
+bridge["namespace_handoff"] = {}
+(manifest_path.parent / "bridge-release.json").write_text(
+    json.dumps(bridge) + "\n", encoding="utf-8"
+)
+
+schema1 = copy.deepcopy(manifest)
+schema1["schema_version"] = 1
+schema1["protocol_version"] = 1
+(manifest_path.parent / "schema1-release.json").write_text(
+    json.dumps(schema1) + "\n", encoding="utf-8"
+)
+
+extra = copy.deepcopy(manifest)
+extra["unexpected"] = True
+(manifest_path.parent / "extra-release.json").write_text(
+    json.dumps(extra) + "\n", encoding="utf-8"
+)
+
+eleven = copy.deepcopy(manifest)
+eleven["images"]["handoff-fs-helper"] = (
+    f"registry.example/handoff-fs-helper@sha256:{image_sha}"
+)
+(manifest_path.parent / "eleven-release.json").write_text(
+    json.dumps(eleven) + "\n", encoding="utf-8"
+)
+
+source_basename = copy.deepcopy(manifest)
+for arch in ("amd64", "arm64"):
+    source_basename["manager"]["artifacts"][arch]["url"] = (
+        f"https://example.invalid/ubitech-manager-linux-{arch}"
+    )
+(manifest_path.parent / "source-basename-release.json").write_text(
+    json.dumps(source_basename) + "\n", encoding="utf-8"
+)
+PY
 cat > "$installer_stubs/curl" <<'EOF'
 #!/usr/bin/env bash
 output=""
@@ -113,8 +220,8 @@ for argument in "$@"; do
   fi
 done
 [[ -n "$output" && -n "$url" ]]
-if [[ "$url" == *.sha256 ]]; then
-  sha256sum "$FAKE_MANAGER" > "$output"
+if [[ "$url" == */release.json ]]; then
+  cp "$FAKE_MANIFEST" "$output"
 else
   cp "$FAKE_MANAGER" "$output"
 fi
@@ -125,46 +232,203 @@ exit 0
 EOF
 cat > "$installer_stubs/systemctl" <<'EOF'
 #!/usr/bin/env bash
+if [[ " $* " == *' enable '* && -n "${FAKE_ENABLE_READY:-}" ]]; then
+  : > "$FAKE_ENABLE_READY"
+  while [[ ! -e "${FAKE_ENABLE_RELEASE:?}" ]]; do
+    sleep 0.02
+  done
+fi
 exit 0
 EOF
 chmod 0755 "$installer_stubs/curl" "$installer_stubs/docker" "$installer_stubs/systemctl"
-installer_data="$installer_test/xdg-data/ubitech-agent"
+
+assert_manifest_rejected_before_paths() {
+  local case_name="$1" manifest="$2" expected_message="${3:-}"
+  local output="$installer_test/${case_name}-install.log" status path
+  set +e
+  cat install.sh | env \
+    PATH="$installer_stubs:$PATH" \
+    FAKE_MANAGER="$installer_test/fake-manager" \
+    FAKE_MANIFEST="$manifest" \
+    XDG_DATA_HOME="$installer_test/${case_name}-data" \
+    XDG_CONFIG_HOME="$installer_test/${case_name}-config" \
+    XDG_BIN_HOME="$installer_test/${case_name}-bin" \
+    XDG_RUNTIME_DIR="$installer_test/${case_name}-runtime" \
+    bash -s -- --yes --manifest-url https://example.invalid/release.json \
+    >"$output" 2>&1
+  status=$?
+  set -e
+  [[ "$status" -ne 0 ]] || fail "$case_name manifest unexpectedly allowed fresh install"
+  if [[ -n "$expected_message" ]]; then
+    grep -Fq "$expected_message" "$output" \
+      || fail "$case_name rejection did not report the expected boundary"
+  fi
+  for path in data config bin runtime; do
+    [[ ! -e "$installer_test/${case_name}-${path}" ]] \
+      || fail "$case_name rejection created target installation path: $path"
+  done
+}
+
+assert_manifest_rejected_before_paths \
+  bridge "$installer_test/bridge-release.json" \
+  'fresh installation is unavailable during the one-time namespace handoff'
+assert_manifest_rejected_before_paths \
+  schema1 "$installer_test/schema1-release.json" \
+  'fresh installation requires manifest schema/protocol 2'
+assert_manifest_rejected_before_paths extra "$installer_test/extra-release.json"
+assert_manifest_rejected_before_paths eleven "$installer_test/eleven-release.json"
+assert_manifest_rejected_before_paths source-basename "$installer_test/source-basename-release.json"
+
+happy_data="$installer_test/happy-data/agent-platform"
+cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
+  FAKE_DATA_ROOT="$happy_data" \
+  FAKE_FAIL_STAGE=none \
+  XDG_DATA_HOME="$installer_test/happy-data" \
+  XDG_CONFIG_HOME="$installer_test/happy-config" \
+  XDG_BIN_HOME="$installer_test/happy-bin" \
+  XDG_RUNTIME_DIR="$installer_test/happy-runtime" \
+  bash -s -- --yes --manifest-url https://example.invalid/release.json
+[[ -x "$installer_test/happy-bin/agent-platform-manager" ]] \
+  || fail "schema-2 fresh install did not activate the target Manager path"
+[[ -f "$installer_test/happy-config/agent-platform/manager.toml" ]] \
+  || fail "schema-2 fresh install did not create the target config path"
+[[ -f "$installer_test/happy-config/systemd/user/agent-platform-manager.service" ]] \
+  || fail "schema-2 fresh install did not create the target unit"
+grep -Fq "$installer_test/happy-runtime/agent-platform-manager/manager.sock" \
+  "$installer_test/happy-config/agent-platform/manager.toml" \
+  || fail "schema-2 fresh install did not bind the target runtime socket"
+[[ ! -e "$installer_test/happy-bin/ubitech-manager" ]] \
+  || fail "schema-2 fresh install created a source Manager path"
+
+concurrent_data="$installer_test/concurrent-data/agent-platform"
+concurrent_ready="$installer_test/concurrent-enable-ready"
+concurrent_release="$installer_test/concurrent-enable-release"
+set +e
+cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
+  FAKE_DATA_ROOT="$concurrent_data" \
+  FAKE_FAIL_STAGE=none \
+  FAKE_ENABLE_READY="$concurrent_ready" \
+  FAKE_ENABLE_RELEASE="$concurrent_release" \
+  XDG_DATA_HOME="$installer_test/concurrent-data" \
+  XDG_CONFIG_HOME="$installer_test/concurrent-config" \
+  XDG_BIN_HOME="$installer_test/concurrent-bin" \
+  XDG_RUNTIME_DIR="$installer_test/concurrent-runtime" \
+  bash -s -- --yes --manifest-url https://example.invalid/release.json \
+  >"$installer_test/concurrent-winner.log" 2>&1 &
+concurrent_winner_pid=$!
+set -e
+for _ in $(seq 1 200); do
+  [[ ! -e "$concurrent_ready" ]] || break
+  sleep 0.02
+done
+if [[ ! -e "$concurrent_ready" ]]; then
+  kill "$concurrent_winner_pid" >/dev/null 2>&1 || true
+  wait "$concurrent_winner_pid" >/dev/null 2>&1 || true
+  fail "first concurrent installer did not reach its held activation boundary"
+fi
+
+set +e
+cat install.sh | env \
+  PATH="$installer_stubs:$PATH" \
+  FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
+  FAKE_DATA_ROOT="$concurrent_data" \
+  FAKE_FAIL_STAGE=none \
+  XDG_DATA_HOME="$installer_test/concurrent-data" \
+  XDG_CONFIG_HOME="$installer_test/concurrent-config" \
+  XDG_BIN_HOME="$installer_test/concurrent-bin" \
+  XDG_RUNTIME_DIR="$installer_test/concurrent-runtime" \
+  bash -s -- --yes --manifest-url https://example.invalid/release.json \
+  >"$installer_test/concurrent-loser.log" 2>&1
+concurrent_loser_status=$?
+set -e
+[[ "$concurrent_loser_status" -eq 75 ]] \
+  || fail "competing fresh installer did not fail at the single-owner lock"
+grep -Fq 'another Agent Platform installation is already running' \
+  "$installer_test/concurrent-loser.log" \
+  || fail "competing fresh installer did not report lock ownership"
+for path in \
+  "$installer_test/concurrent-bin/agent-platform-manager" \
+  "$installer_test/concurrent-config/agent-platform/manager.toml" \
+  "$installer_test/concurrent-config/systemd/user/agent-platform-manager.service" \
+  "$concurrent_data/manager"; do
+  [[ -e "$path" ]] || fail "competing installer removed winner-owned path: $path"
+done
+
+touch "$concurrent_release"
+set +e
+wait "$concurrent_winner_pid"
+concurrent_winner_status=$?
+set -e
+[[ "$concurrent_winner_status" -eq 0 ]] \
+  || fail "single-owner fresh installer failed after its competitor exited"
+[[ -f "$concurrent_data/manager/operations/install" ]] \
+  || fail "single-owner fresh installer did not complete its Manager operation"
+
+installer_data="$installer_test/xdg-data/agent-platform"
+mkdir -p \
+  "$installer_test/xdg-data" \
+  "$installer_test/xdg-bin" \
+  "$installer_test/xdg-config/agent-platform" \
+  "$installer_test/xdg-config/systemd/user" \
+  "$installer_test/xdg-runtime"
+touch \
+  "$installer_test/xdg-data/keep" \
+  "$installer_test/xdg-bin/keep" \
+  "$installer_test/xdg-config/agent-platform/keep" \
+  "$installer_test/xdg-config/systemd/user/keep" \
+  "$installer_test/xdg-runtime/keep"
 if cat install.sh | env \
   PATH="$installer_stubs:$PATH" \
   FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$installer_data" \
   XDG_DATA_HOME="$installer_test/xdg-data" \
   XDG_CONFIG_HOME="$installer_test/xdg-config" \
   XDG_BIN_HOME="$installer_test/xdg-bin" \
+  XDG_RUNTIME_DIR="$installer_test/xdg-runtime" \
   bash -s -- --yes \
-    --manifest-url https://example.invalid/release.json \
-    --manager-url https://example.invalid/manager \
-    --manager-checksum-url https://example.invalid/manager.sha256; then
+    --manifest-url https://example.invalid/release.json; then
   fail "injected Manager preflight failure unexpectedly succeeded"
 fi
 [[ ! -e "$installer_data" ]] || fail "failed fresh install retained its data root"
-[[ ! -e "$installer_test/xdg-bin/ubitech-manager" ]] \
+[[ ! -e "$installer_test/xdg-bin/agent-platform-manager" ]] \
   || fail "failed fresh install retained its Manager binary"
-[[ ! -e "$installer_test/xdg-config/ubitech-agent/manager.toml" ]] \
+[[ ! -e "$installer_test/xdg-config/agent-platform/manager.toml" ]] \
   || fail "failed fresh install retained its Manager config"
-[[ ! -e "$installer_test/xdg-config/systemd/user/ubitech-agent-manager.service" ]] \
+[[ ! -e "$installer_test/xdg-config/systemd/user/agent-platform-manager.service" ]] \
   || fail "failed fresh install retained its systemd unit"
+for marker in \
+  xdg-data/keep \
+  xdg-bin/keep \
+  xdg-config/agent-platform/keep \
+  xdg-config/systemd/user/keep \
+  xdg-runtime/keep; do
+  [[ -f "$installer_test/$marker" ]] \
+    || fail "failed fresh install removed a pre-existing object: $marker"
+done
 
-activated_data="$installer_test/activated-data/ubitech-agent"
+activated_data="$installer_test/activated-data/agent-platform"
 activated_output="$installer_test/activated-install.log"
 set +e
 cat install.sh | env \
   PATH="$installer_stubs:$PATH" \
   FAKE_MANAGER="$installer_test/fake-manager" \
+  FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$activated_data" \
   FAKE_FAIL_STAGE=install \
   XDG_DATA_HOME="$installer_test/activated-data" \
   XDG_CONFIG_HOME="$installer_test/activated-config" \
   XDG_BIN_HOME="$installer_test/activated-bin" \
+  XDG_RUNTIME_DIR="$installer_test/activated-runtime" \
   bash -s -- --yes \
     --manifest-url https://example.invalid/release.json \
-    --manager-url https://example.invalid/manager \
-    --manager-checksum-url https://example.invalid/manager.sha256 \
     >"$activated_output" 2>&1
 activated_status=$?
 set -e
@@ -176,11 +440,11 @@ grep -Fq 'install --config' "$activated_output" \
   || fail "post-activation failure has no exact retry command"
 [[ -f "$activated_data/manager/operations/install" ]] \
   || fail "post-activation failure deleted Manager-owned operation state"
-[[ -x "$installer_test/activated-bin/ubitech-manager" ]] \
+[[ -x "$installer_test/activated-bin/agent-platform-manager" ]] \
   || fail "post-activation failure deleted the active Manager binary"
-[[ -f "$installer_test/activated-config/ubitech-agent/manager.toml" ]] \
+[[ -f "$installer_test/activated-config/agent-platform/manager.toml" ]] \
   || fail "post-activation failure deleted Manager config"
-[[ -f "$installer_test/activated-config/systemd/user/ubitech-agent-manager.service" ]] \
+[[ -f "$installer_test/activated-config/systemd/user/agent-platform-manager.service" ]] \
   || fail "post-activation failure deleted Manager unit"
 rm -rf --one-file-system -- "$installer_test"
 
@@ -190,7 +454,7 @@ for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do
 done
 grep -Fq 'python3 scripts/browser-control-compose-smoke.py' .github/workflows/container-release.yml \
   || fail "release smoke test does not exercise browser control through Platform"
-grep -Fq 'docker network inspect "$UBITECH_CORE_NETWORK"' .github/workflows/container-release.yml \
+grep -Fq 'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' .github/workflows/container-release.yml \
   || fail "release smoke test does not verify the durable core network"
 grep -Fq 'cp install.sh "$stage/install.sh"' .github/workflows/container-release.yml \
   || fail "release assembly does not include install.sh"
@@ -208,6 +472,29 @@ grep -Fq 'scripts/release_promotion.py create-publisher-provenance' .github/work
   || fail "container release does not publish an exact Actions provenance record"
 grep -Fq 'Upload immutable release provenance' .github/workflows/container-release.yml \
   || fail "container release does not retain its publisher provenance as an Actions artifact"
+grep -Fq 'Verify real Manager restart and watchdog cgroups' .github/workflows/container-release.yml \
+  || fail "release publication does not run the real user-systemd Manager gate"
+grep -Fq 'Verify Bridge persistent helper cgroup' .github/workflows/container-release.yml \
+  || fail "Bridge publication does not run the persistent helper user-systemd gate"
+grep -Fq 'AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"' .github/workflows/container-release.yml \
+  || fail "release publication does not explicitly enable real user-systemd integration"
+grep -Fq 'scripts/release_promotion.py verify-receipt' .github/workflows/channel-promotion.yml \
+  || fail "transition promotion does not verify the deployment-signed receipt"
+grep -Fq 'RELEASE_TRANSITION_ED25519_PUBLIC_KEY_PEM' .github/workflows/channel-promotion.yml \
+  || fail "transition promotion does not bind the deployment Ed25519 public key"
+grep -Fq 'elif [[ "$TRANSITION_STAGE" == cleanup ]]; then' .github/workflows/container-release.yml \
+  || fail "Cleanup publication has no explicit predecessor branch"
+grep -Fq '.draft == true and .prerelease == false' .github/workflows/container-release.yml \
+  || fail "Cleanup publication does not require the exact sealed Bridge draft"
+grep -Fq -- '--candidate-stage "$CANDIDATE_STAGE"' .github/workflows/container-release.yml \
+  || fail "publisher provenance does not bind the transition stage"
+for target_asset in \
+  agent-platform-manager-linux-amd64 \
+  agent-platform-manager-linux-arm64 \
+  agent-platform-compose.yaml; do
+  grep -Fq "$target_asset" .github/workflows/container-release.yml \
+    || fail "target-only release asset is absent: $target_asset"
+done
 grep -Fq '"$STAGE/promotion.json"' .github/workflows/container-release.yml \
   || fail "container release does not upload promotion.json last"
 if grep -Eq -- '--draft=false|--latest|--clobber' .github/workflows/container-release.yml; then
@@ -215,16 +502,31 @@ if grep -Eq -- '--draft=false|--latest|--clobber' .github/workflows/container-re
 fi
 grep -Fq "group: container-release-\${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.ref }}" .github/workflows/container-release.yml \
   || fail "container releases are not isolated per source commit"
+grep -Fq 'group: container-publish-main' .github/workflows/container-release.yml \
+  || fail "release sealing is not serialized across target generations"
+grep -Fq 'scripts/release_promotion.py ensure-publication-slot' .github/workflows/container-release.yml \
+  || fail "release sealing does not reject a second same-stage direct-successor draft"
+grep -Fq 'promotion_args+=(--predecessor-generation "$predecessor")' .github/workflows/container-release.yml \
+  || fail "ordinary target promotion does not bind the live public predecessor"
+grep -Fq 'Queue the canonical missing Cleanup release' .github/workflows/channel-promotion.yml \
+  || fail "Bridge evaluation cannot recover an earlier Cleanup publication race"
+grep -Fq 'Queue the latest qualified target-only main generation' .github/workflows/channel-promotion.yml \
+  || fail "ordinary promotion cannot catch the release channel up to main"
+grep -Fq 'scripts/verify_target_baseline_source.py' .github/workflows/quality.yml \
+  || fail "Quality does not enforce the target-only production source boundary"
+grep -Fq 'scripts/verify_target_baseline_source.py' .github/workflows/container-release.yml \
+  || fail "Container release does not recheck the target-only production source boundary"
 grep -Fq 'group: container-channel-main' .github/workflows/channel-promotion.yml \
   || fail "main-channel release promotion is not serialized"
 grep -Fq 'scripts/release_promotion.py select-candidate' .github/workflows/channel-promotion.yml \
   || fail "main-channel release promotion does not enforce a direct predecessor"
 grep -Fq 'scripts/release_promotion.py validate-publisher-provenance' .github/workflows/channel-promotion.yml \
   || fail "main-channel release promotion does not verify exact publisher provenance"
-grep -Fq -- '--current-compat-root "$current_compat_root"' .github/workflows/channel-promotion.yml \
-  || fail "first promotion does not pass the exact P1 release into the evaluator"
-grep -Fq 'source_owner_compat.generation' .github/workflows/channel-promotion.yml \
-  || fail "first promotion is not restricted to the contract-pinned P1 generation"
+grep -Fq 'Current release is not a complete sealed generation' .github/workflows/channel-promotion.yml \
+  || fail "channel promotion does not require a sealed current release"
+if grep -Eq 'current-compat-root|source_owner_compat|canonical P1' .github/workflows/channel-promotion.yml; then
+  fail "channel promotion still contains the retired pre-seal compatibility path"
+fi
 [[ "$(grep -Fc 'scripts/verify-release-images-anonymous.sh' .github/workflows/channel-promotion.yml)" -eq 4 ]] \
   || fail "main-channel promotion must verify all public image digests before and after both visibility paths"
 [[ "$(grep -Fc 'CRITICAL post-visibility registry failure' .github/workflows/channel-promotion.yml)" -eq 2 ]] \
@@ -260,10 +562,12 @@ grep -Fq 'image_repository="${image%@*}"' .github/workflows/container-release.ym
 if rg -q '^[[:space:]]+repository="\$\{image%@\*\}"$' .github/workflows/container-release.yml; then
   fail "release managed-image verification overwrites the package repository variable"
 fi
-grep -Fq "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)" .github/workflows/container-release.yml \
-  || fail "release image verification is not driven by the canonical managed-image directory"
-grep -Fq '[[ "${#components[@]}" -eq 11 && "${#images[@]}" -eq "${#components[@]}" ]]' .github/workflows/container-release.yml \
-  || fail "release does not fail closed when the managed-image catalog is incomplete"
+grep -Fq 'mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE"' .github/workflows/container-release.yml \
+  || fail "release image verification is not driven by the stage-filtered canonical managed-image directory"
+[[ "$(grep -Fc 'expected_count=10' .github/workflows/container-release.yml)" -ge 2 ]] \
+  || fail "release does not bind the target-only managed-image count"
+[[ "$(grep -Fc '[[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11' .github/workflows/container-release.yml)" -ge 2 ]] \
+  || fail "release does not bind the Bridge managed-image count"
 if grep -Fq '"firecrawl-foundationdb"' .github/workflows/container-release.yml; then
   fail "container release still publishes a retired FoundationDB image key"
 fi
@@ -289,14 +593,13 @@ def job(name: str) -> str:
     return match.group(0)
 
 public_images = job("public-images")
-helper_matrix = """          - component: handoff-fs-helper
-            dockerfile: containers/handoff-fs-helper.Dockerfile
-            # Keep this one-shot capability in an already-public package while
-            # preserving a separate immutable image/digest and scratch rootfs.
-            image: platform
-            tag_suffix: '-handoff-fs-helper'"""
-if helper_matrix not in workflow:
-    raise SystemExit("handoff helper is not published as a distinct digest in the existing public Platform package")
+for fragment in (
+    'if [[ "$transition_stage" == bridge ]]; then',
+    'component:"handoff-fs-helper",dockerfile:"containers/handoff-fs-helper.Dockerfile",image:"platform",tag_suffix:"-handoff-fs-helper"',
+    'if [[ "$TRANSITION_STAGE" == bridge ]]; then',
+):
+    if fragment not in workflow:
+        raise SystemExit(f"stage-aware handoff helper publication is missing: {fragment}")
 if workflow.count("package_component=platform") != 2:
     raise SystemExit("handoff helper package mapping is not enforced in both public-image gates")
 if "${{ needs.prepare.outputs.source_commit }}${{ matrix.tag_suffix }}" not in workflow:
@@ -321,8 +624,11 @@ for component in managed_components:
     if f"[{component}]=" not in public_images:
         raise SystemExit(f"public-image capacity catalog omits {component}")
 for fragment in (
-    "mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)",
-    '[[ "${#components[@]}" -eq 11 && "${#images[@]}" -eq "${#components[@]}" ]]',
+    'mapfile -t components < <(jq -er --arg stage "$TRANSITION_STAGE"',
+    'select($stage == "bridge" or . != "handoff-fs-helper")',
+    'expected_count=10',
+    '[[ "$TRANSITION_STAGE" == bridge ]] && expected_count=11',
+    '[[ "${#components[@]}" -eq "$expected_count" && "${#images[@]}" -eq "${#components[@]}" ]]',
     'for component in "${components[@]}"; do',
     'for architecture in amd64 arm64; do',
     'docker buildx imagetools inspect "$image" --raw',
@@ -336,7 +642,9 @@ for fragment in (
     '.[0].Architecture == $architecture',
     'remove_exact_local_image "$image" "$pulled_id"',
     'verified_images="$GITHUB_WORKSPACE/verified-managed-images.json"',
-    "(.managed_image_capacity_estimates | keys) == ($verified[0] | keys)",
+    '([.managed_image_capacity_estimates | keys[] |',
+    'select($stage == "bridge" or . != "handoff-fs-helper")]) ==',
+    '($verified[0] | keys)',
     "name: verified-managed-images",
 ):
     if fragment not in public_images:
@@ -364,8 +672,8 @@ compose_smoke = job("compose-smoke")
 if "    timeout-minutes: 45\n" not in compose_smoke:
     raise SystemExit("compose-smoke must reserve the 45-minute cold/warm Firecrawl budget")
 for fragment in (
-    'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/ubitech-compose-smoke.XXXXXX")"',
-    '"$RUNNER_TEMP"/ubitech-compose-smoke.*) ;;',
+    'root="$(mktemp -d "${RUNNER_TEMP:?RUNNER_TEMP is required}/agent-platform-compose-smoke.XXXXXX")"',
+    '"$RUNNER_TEMP"/agent-platform-compose-smoke.*) ;;',
     'sudo -n rm -rf --one-file-system -- "$root"',
     'http://127.0.0.1:3002/v0/health/liveness',
     "url: 'https://example.com/'",
@@ -376,10 +684,10 @@ for fragment in (
     'Firecrawl ${phase} scrape failed after 3 attempts',
     'firecrawl_scrape cold',
     'firecrawl_scrape warm',
-    'sentinel_key=ubitech_ci_persistence',
-    'CREATE TABLE IF NOT EXISTS ubitech_release_smoke',
-    'INSERT INTO ubitech_release_smoke',
-    'SELECT value FROM ubitech_release_smoke',
+    'sentinel_key=agent_platform_ci_persistence',
+    'CREATE TABLE IF NOT EXISTS agent_platform_release_smoke',
+    'INSERT INTO agent_platform_release_smoke',
+    'SELECT value FROM agent_platform_release_smoke',
     'first_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
     'second_postgres="$(docker compose -f containers/compose.yaml ps -q firecrawl-postgres)"',
     'test "$second_postgres" != "$first_postgres"',
@@ -388,17 +696,17 @@ for fragment in (
     '--wait --wait-timeout 600 firecrawl-api',
     'name: verified-managed-images',
     'verified_images=artifacts/verified-managed-images.json',
-    'UBITECH_PLATFORM_IMAGE="$(jq -er',
-    'UBITECH_AGENT_RUNTIME_IMAGE="$(jq -er',
-    'UBITECH_CAMOFOX_IMAGE="$(jq -er',
-    'UBITECH_AGENT_SANDBOX_IMAGE="$(jq -er',
-    'UBITECH_SEARXNG_IMAGE="$(jq -er',
-    'UBITECH_FIRECRAWL_API_IMAGE="$(jq -er',
-    'UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE="$(jq -er',
-    'UBITECH_FIRECRAWL_POSTGRES_IMAGE="$(jq -er',
-    'UBITECH_FIRECRAWL_REDIS_IMAGE="$(jq -er',
-    'UBITECH_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er',
-    'sandbox_image="$UBITECH_AGENT_SANDBOX_IMAGE"',
+    'AGENT_PLATFORM_PLATFORM_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_AGENT_RUNTIME_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_CAMOFOX_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_AGENT_SANDBOX_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_SEARXNG_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_FIRECRAWL_API_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_FIRECRAWL_PLAYWRIGHT_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE="$(jq -er',
+    'AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE="$(jq -er',
+    'sandbox_image="$AGENT_PLATFORM_AGENT_SANDBOX_IMAGE"',
     'docker compose -f containers/compose.yaml config --format json',
     '} == ($expected[0] | del(."agent-sandbox", ."handoff-fs-helper"))',
     'handoff_helper_image="$(jq -er',
@@ -408,24 +716,24 @@ for fragment in (
     '--env "HANDOFF_FS_IMAGE_DIGEST=$handoff_helper_image"',
     'src=$handoff_helper_root/source/data,dst=/source,readonly',
     'target/copied/payload.txt',
-    '"$UBITECH_FIRECRAWL_REDIS_IMAGE" -c',
-    '"$UBITECH_FIRECRAWL_RABBITMQ_IMAGE" -c',
-    '"$UBITECH_FIRECRAWL_POSTGRES_IMAGE" -c',
-    'browser_fixture_container="${UBITECH_COMPOSE_PROJECT}-browser-fixture"',
+    '"$AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE" -c',
+    '"$AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE" -c',
+    '"$AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE" -c',
+    'browser_fixture_container="${AGENT_PLATFORM_COMPOSE_PROJECT}-browser-fixture"',
     'scripts/fixtures/browser-control.html',
     '--entrypoint python',
     'python3 scripts/browser-control-compose-smoke.py',
-    '--bootstrap-password-file "$UBITECH_DATA_ROOT/data/bootstrap-admin-password.txt"',
-    '--agent-tool-token-file "$UBITECH_SECRETS_DIR/agent-tool-token"',
+    '--bootstrap-password-file "$AGENT_PLATFORM_DATA_ROOT/data/bootstrap-admin-password.txt"',
+    '--agent-tool-token-file "$AGENT_PLATFORM_SECRETS_DIR/agent-tool-token"',
     '--fixture-url "http://${browser_fixture_container}:18081/"',
 ):
     if fragment not in compose_smoke:
         raise SystemExit(f"compose-smoke lacks PostgreSQL Firecrawl acceptance coverage: {fragment}")
 for variable in (
-    "UBITECH_PLATFORM_IMAGE", "UBITECH_AGENT_RUNTIME_IMAGE", "UBITECH_CAMOFOX_IMAGE",
-    "UBITECH_AGENT_SANDBOX_IMAGE", "UBITECH_SEARXNG_IMAGE", "UBITECH_FIRECRAWL_API_IMAGE",
-    "UBITECH_FIRECRAWL_PLAYWRIGHT_IMAGE", "UBITECH_FIRECRAWL_POSTGRES_IMAGE",
-    "UBITECH_FIRECRAWL_REDIS_IMAGE", "UBITECH_FIRECRAWL_RABBITMQ_IMAGE",
+    "AGENT_PLATFORM_PLATFORM_IMAGE", "AGENT_PLATFORM_AGENT_RUNTIME_IMAGE", "AGENT_PLATFORM_CAMOFOX_IMAGE",
+    "AGENT_PLATFORM_AGENT_SANDBOX_IMAGE", "AGENT_PLATFORM_SEARXNG_IMAGE", "AGENT_PLATFORM_FIRECRAWL_API_IMAGE",
+    "AGENT_PLATFORM_FIRECRAWL_PLAYWRIGHT_IMAGE", "AGENT_PLATFORM_FIRECRAWL_POSTGRES_IMAGE",
+    "AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE", "AGENT_PLATFORM_FIRECRAWL_RABBITMQ_IMAGE",
 ):
     if compose_smoke.count(variable) < 2:
         raise SystemExit(f"compose-smoke does not export verified image identity: {variable}")
@@ -463,13 +771,16 @@ for fragment in ("name: verified-managed-images", "pattern: manager-*"):
     if fragment not in publish:
         raise SystemExit(f"publish omits scoped release artifact family: {fragment}")
 for fragment in (
-    "group: container-publish-${{ needs.prepare.outputs.source_commit }}",
+    "group: container-publish-main",
     "cancel-in-progress: false",
-    'image_name = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")',
-    "if not image_name.fullmatch(name):",
-    'if set(data["images"]) != expected_images:',
-    '--argjson images "$verified_images"',
-    "images: $images",
+    'gh release download "container-${predecessor}"',
+    'for asset in release.json ubitech-compose.yaml ubitech-manager-linux-amd64',
+    'assembler_args=(',
+    'scripts/assemble_release_manifest.py',
+    'python3 "${assembler_args[@]}"',
+    '--contract docs/contracts/release-transition.json',
+    '--predecessor-manifest "$predecessor_root/release.json"',
+    '--images "$stage/verified-managed-images.json"',
 ):
     if fragment not in publish:
         raise SystemExit(f"publish lacks resolved-commit serialization: {fragment}")
@@ -480,6 +791,16 @@ PY
 for entrypoint in containers/*-entrypoint.sh; do
   sh -n "$entrypoint"
 done
+for entrypoint in \
+  containers/platform-entrypoint.sh \
+  containers/agent-runtime-entrypoint.sh \
+  containers/camofox-entrypoint.sh \
+  containers/agent-sandbox-entrypoint.sh; do
+  grep -Fq 'AGENT_PLATFORM_TECHNICAL_PROFILE' "$entrypoint" \
+    || fail "$entrypoint does not bind the target technical profile"
+  grep -Fq "env | grep -Eq '^(UBITECH_|ENTERPRISE_)'" "$entrypoint" \
+    || fail "$entrypoint does not reject mixed source-profile environment"
+done
 grep -Fq 'migrate|serve|init-admin|print-agent-token)' containers/platform-entrypoint.sh \
   || fail "Platform entrypoint does not dispatch CLI subcommands"
 
@@ -489,10 +810,11 @@ from pathlib import Path
 
 schema = json.loads(Path("containers/release-manifest.schema.json").read_text(encoding="utf-8"))
 upstream = json.loads(Path("docs/contracts/upstream-sources.json").read_text(encoding="utf-8"))
-if schema.get("properties", {}).get("schema_version", {}).get("const") != 1:
-    raise SystemExit("release manifest schema does not lock schema_version=1")
-if schema.get("properties", {}).get("protocol_version", {}).get("const") != 1:
-    raise SystemExit("release manifest schema does not lock protocol_version=1")
+properties = schema.get("properties", {})
+if properties.get("schema_version", {}).get("enum") != [1, 2]:
+    raise SystemExit("release manifest schema does not expose only schema versions 1 and 2")
+if properties.get("protocol_version", {}).get("enum") != [1, 2]:
+    raise SystemExit("release manifest schema does not expose only protocol versions 1 and 2")
 required = set(schema.get("required", ()))
 expected = {
     "schema_version", "channel", "source_commit", "generated_at",
@@ -503,21 +825,45 @@ if required != expected:
 image_pattern = schema.get("$defs", {}).get("image", {}).get("pattern", "")
 if "@sha256:" not in image_pattern:
     raise SystemExit("release images are not constrained to immutable digests")
-required_images = set(schema.get("properties", {}).get("images", {}).get("required", ()))
-image_name_pattern = schema.get("properties", {}).get("images", {}).get("propertyNames", {}).get("pattern", "")
-if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
-    raise SystemExit("release image property names are not constrained to lowercase kebab-case")
-expected_images = {
+expected_v1 = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
     "firecrawl-redis", "firecrawl-rabbitmq", "handoff-fs-helper",
 }
-if required_images != expected_images:
-    raise SystemExit(f"unexpected required release images: {sorted(required_images)}")
-images_schema = schema.get("properties", {}).get("images", {})
-if images_schema.get("minProperties") != len(expected_images) or images_schema.get("maxProperties") != len(expected_images):
-    raise SystemExit("release image directory is not constrained to the exact current service set")
-if "firecrawl-foundationdb" in required_images:
+expected_v2 = expected_v1 - {"handoff-fs-helper"}
+for version, expected_images in ((1, expected_v1), (2, expected_v2)):
+    images_schema = schema.get("$defs", {}).get(f"images_v{version}", {})
+    required_images = set(images_schema.get("required", ()))
+    if required_images != expected_images:
+        raise SystemExit(
+            f"unexpected schema-v{version} release images: {sorted(required_images)}"
+        )
+    if (
+        images_schema.get("minProperties") != len(expected_images)
+        or images_schema.get("maxProperties") != len(expected_images)
+        or images_schema.get("additionalProperties") is not False
+    ):
+        raise SystemExit(f"schema-v{version} image directory is not an exact closed set")
+    image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
+    if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
+        raise SystemExit(f"schema-v{version} image names are not lowercase kebab-case")
+all_of = schema.get("allOf", [])
+if len(all_of) != 2:
+    raise SystemExit("release manifest schema does not have exactly two version branches")
+branches = {
+    branch.get("if", {}).get("properties", {}).get("schema_version", {}).get("const"): branch
+    for branch in all_of
+}
+for version in (1, 2):
+    branch = branches.get(version, {})
+    then = branch.get("then", {})
+    if then.get("properties", {}).get("protocol_version", {}).get("const") != version:
+        raise SystemExit(f"schema-v{version} does not bind protocol version {version}")
+    if then.get("properties", {}).get("images", {}).get("$ref") != f"#/$defs/images_v{version}":
+        raise SystemExit(f"schema-v{version} does not bind its exact image directory")
+if branches[2].get("then", {}).get("not") != {"required": ["namespace_handoff"]}:
+    raise SystemExit("schema-v2 does not reject the one-shot namespace handoff")
+if "firecrawl-foundationdb" in expected_v1 | expected_v2:
     raise SystemExit("the current release schema still requires FoundationDB")
 managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
 expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
@@ -528,7 +874,7 @@ PY
 for dockerfile in containers/*.Dockerfile; do
   grep -Eq '^FROM .+ AS ' "$dockerfile" || fail "$dockerfile has no named production stage"
   if [[ "$dockerfile" == containers/agent-sandbox.Dockerfile ]]; then
-    grep -Fq 'ENTRYPOINT ["/usr/local/bin/ubitech-agent-sandbox-entrypoint"]' "$dockerfile" \
+    grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-sandbox-entrypoint"]' "$dockerfile" \
       || fail "Agent Sandbox does not use the UID/GID mapping entrypoint"
   elif [[ "$dockerfile" == containers/handoff-fs-helper.Dockerfile ]]; then
     grep -Fq 'FROM scratch' "$dockerfile" \
@@ -549,6 +895,13 @@ grep -Fq 'exec setpriv --reuid="$agent_uid" --regid="$agent_gid" --init-groups -
   || fail "Agent Sandbox entrypoint does not permanently drop privileges"
 grep -Fq 'chown --no-dereference "$agent_uid:$agent_gid" "$mount_root"' containers/agent-sandbox-entrypoint.sh \
   || fail "Agent Sandbox entrypoint does not protect mount roots from symlink traversal"
+grep -Fq 'AGENT_PLATFORM_AGENT_UID' containers/agent-sandbox-entrypoint.sh \
+  || fail "Agent Sandbox does not consume the target UID prefix"
+grep -Fq 'io.agent-platform.role="sandbox"' containers/agent-sandbox.Dockerfile \
+  || fail "Agent Sandbox image does not carry the target ownership label"
+if rg -n 'UBITECH_AGENT_(UID|GID)|io\.ubitech\.agent' containers/agent-sandbox-entrypoint.sh containers/agent-sandbox.Dockerfile; then
+  fail "Agent Sandbox still accepts source UID/GID or ownership labels"
+fi
 if rg -n 'chown[^\n]*(--recursive|-R)' containers/agent-sandbox-entrypoint.sh; then
   fail "Agent Sandbox entrypoint recursively changes persistent ownership"
 fi
@@ -556,8 +909,24 @@ grep -Fq 'browser/version.json' containers/camofox.Dockerfile \
   || fail "Camoufox image does not generate the external bundle version metadata"
 grep -Fq '"release": "beta.25"' containers/camofox.Dockerfile \
   || fail "Camoufox image metadata does not match the pinned GitHub release"
-grep -Fq 'XDG_CACHE_HOME=/var/lib/ubitech-agent/camofox/home/.cache' containers/camofox.Dockerfile \
+grep -Fq 'XDG_CACHE_HOME=/var/lib/agent-platform/camofox/home/.cache' containers/camofox.Dockerfile \
   || fail "Camoufox and camoufox-js cache locations are inconsistent"
+
+if rg -n 'UBITECH_|ENTERPRISE_|/var/lib/ubitech-agent|/run/secrets/ubitech|/run/ubitech-manager|/run/ubitech-agent|org\.ubitech\.agent|ubitech-agent' containers/compose.yaml; then
+  fail "target Compose contains source-profile technical identity"
+fi
+python3 - <<'PY'
+import re
+from pathlib import Path
+
+compose = Path("containers/compose.yaml").read_text(encoding="utf-8")
+interpolated = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)", compose))
+unexpected = sorted(name for name in interpolated if not name.startswith("AGENT_PLATFORM_"))
+if unexpected:
+    raise SystemExit(f"target Compose accepts non-target host environment: {unexpected}")
+if not interpolated:
+    raise SystemExit("target Compose has no generated host environment contract")
+PY
 
 if rg -n '/var/run/docker\.sock|/run/docker\.sock|privileged:[[:space:]]*true' containers; then
   fail "a product container can access Docker or runs privileged"
@@ -569,15 +938,41 @@ docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 zero_digest="sha256:$(printf '0%.0s' {1..64})"
+cat > "$temporary/source-compose.env" <<EOF
+UBITECH_DATA_ROOT=$temporary/source-data-root
+UBITECH_SECRETS_DIR=$temporary/source-data-root/manager/secrets
+UBITECH_MANAGER_CONTROL_DIR=$temporary/source-data-root/manager/control
+UBITECH_PLATFORM_IMAGE=registry.invalid/source/platform@$zero_digest
+UBITECH_AGENT_RUNTIME_IMAGE=registry.invalid/source/agent-runtime@$zero_digest
+UBITECH_CAMOFOX_IMAGE=registry.invalid/source/camofox@$zero_digest
+EOF
+if env \
+  -u AGENT_PLATFORM_DATA_ROOT \
+  -u AGENT_PLATFORM_SECRETS_DIR \
+  -u AGENT_PLATFORM_MANAGER_CONTROL_DIR \
+  -u AGENT_PLATFORM_PLATFORM_IMAGE \
+  -u AGENT_PLATFORM_AGENT_RUNTIME_IMAGE \
+  -u AGENT_PLATFORM_CAMOFOX_IMAGE \
+  docker compose \
+  --env-file "$temporary/source-compose.env" \
+  -f containers/compose.yaml \
+  config --quiet >/dev/null 2>&1; then
+  fail "target Compose accepted a source-only environment"
+fi
+
 cat > "$temporary/compose.env" <<EOF
-UBITECH_COMPOSE_PROJECT=ubitech-agent-validation
-UBITECH_DATA_ROOT=$temporary/data-root
-UBITECH_SECRETS_DIR=$temporary/data-root/manager/secrets
-UBITECH_MANAGER_CONTROL_DIR=$temporary/data-root/manager/control
-UBITECH_CORE_NETWORK=ubitech-agent-validation-core
-UBITECH_PLATFORM_IMAGE=registry.invalid/ubitech/platform@$zero_digest
-UBITECH_AGENT_RUNTIME_IMAGE=registry.invalid/ubitech/agent-runtime@$zero_digest
-UBITECH_CAMOFOX_IMAGE=registry.invalid/ubitech/camofox@$zero_digest
+AGENT_PLATFORM_COMPOSE_PROJECT=agent-platform
+AGENT_PLATFORM_DATA_ROOT=$temporary/data-root
+AGENT_PLATFORM_SECRETS_DIR=$temporary/data-root/manager/secrets
+AGENT_PLATFORM_MANAGER_CONTROL_DIR=$temporary/runtime/agent-platform-manager
+AGENT_PLATFORM_CORE_NETWORK=agent-platform_core
+AGENT_PLATFORM_UID=23456
+AGENT_PLATFORM_GID=23457
+AGENT_PLATFORM_PLATFORM_IMAGE=registry.invalid/agent-platform/platform@$zero_digest
+AGENT_PLATFORM_AGENT_RUNTIME_IMAGE=registry.invalid/agent-platform/agent-runtime@$zero_digest
+AGENT_PLATFORM_CAMOFOX_IMAGE=registry.invalid/agent-platform/camofox@$zero_digest
+UBITECH_UID=999
+UBITECH_GID=999
 EOF
 
 docker compose \
@@ -594,7 +989,9 @@ document = json.load(open(sys.argv[1], encoding="utf-8"))
 services = document.get("services") or {}
 networks = document.get("networks") or {}
 core = networks.get("core") or {}
-if core.get("name") != "ubitech-agent-validation-core" or core.get("external") is not True:
+if document.get("name") != "agent-platform":
+    raise SystemExit(f"target Compose project mismatch: {document.get('name')}")
+if core.get("name") != "agent-platform_core" or core.get("external") is not True:
     raise SystemExit(f"core network must be the Manager-owned external network: {core}")
 required = {
     "platform", "agent-runtime", "camofox", "searxng", "firecrawl-api",
@@ -613,6 +1010,9 @@ for name, service in services.items():
         raise SystemExit(f"{name} image is not an immutable digest: {image}")
     if service.get("privileged"):
         raise SystemExit(f"{name} is privileged")
+    labels = service.get("labels") or {}
+    if labels.get("io.agent-platform.profile") != "agent-platform-v1":
+        raise SystemExit(f"{name} does not carry the target ownership profile")
     for volume in service.get("volumes") or []:
         source = str(volume.get("source") or "")
         target = str(volume.get("target") or "")
@@ -629,8 +1029,9 @@ for name, service in services.items():
 
 platform = services["platform"]
 searxng = services["searxng"]
-if searxng.get("user") != "1000:1000":
-    raise SystemExit("SearXNG must run as the deployment UID/GID")
+for service_name in ("platform", "agent-runtime", "camofox", "searxng"):
+    if services[service_name].get("user") != "23456:23457":
+        raise SystemExit(f"{service_name} must run as the target deployment UID/GID")
 searxng_config = [
     volume for volume in searxng.get("volumes") or []
     if volume.get("target") == "/etc/searxng"
@@ -650,23 +1051,36 @@ if any(
 ):
     raise SystemExit("SearXNG single-file settings mounts leak anonymous volumes")
 environment = platform.get("environment") or {}
-if environment.get("UBITECH_DEPLOYMENT_MODE") != "container":
+if environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
+    raise SystemExit("Platform target technical profile mismatch")
+if environment.get("AGENT_PLATFORM_DEPLOYMENT_MODE") != "container":
     raise SystemExit("Platform is not explicitly in container deployment mode")
-if environment.get("UBITECH_MANAGER_SOCKET") != "/run/ubitech-manager/manager.sock":
+if environment.get("AGENT_PLATFORM_MANAGER_SOCKET") != "/run/agent-platform-manager/manager.sock":
     raise SystemExit("Platform Manager socket contract mismatch")
-if environment.get("UBITECH_MANAGER_TOKEN_FILE") != "/run/secrets/manager-token":
+if environment.get("AGENT_PLATFORM_MANAGER_TOKEN_FILE") != "/run/secrets/agent-platform/manager-token":
     raise SystemExit("Platform Manager token contract mismatch")
 runtime_environment = (services["agent-runtime"].get("environment") or {})
-if runtime_environment.get("AGENT_MANAGER_EXECUTOR_SOCKET") != "/run/ubitech-manager/manager.sock":
+if runtime_environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
+    raise SystemExit("Agent Runtime target technical profile mismatch")
+if runtime_environment.get("AGENT_MANAGER_EXECUTOR_SOCKET") != "/run/agent-platform-manager/manager.sock":
     raise SystemExit("Agent Runtime Manager socket contract mismatch")
-if runtime_environment.get("AGENT_MANAGER_EXECUTOR_TOKEN_FILE") != "/run/secrets/manager-executor-token":
+if runtime_environment.get("AGENT_MANAGER_EXECUTOR_TOKEN_FILE") != "/run/secrets/agent-platform/manager-executor-token":
     raise SystemExit("Agent Runtime executor token contract mismatch")
 if int(runtime_environment.get("AGENT_RUNTIME_MAX_BODY_BYTES") or 0) < 32 * 1024 * 1024:
     raise SystemExit("Agent Runtime request body limit cannot carry inline images")
+camofox_environment = services["camofox"].get("environment") or {}
+if camofox_environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
+    raise SystemExit("Camoufox target technical profile mismatch")
+if camofox_environment.get("AGENT_PLATFORM_CAMOFOX_BIND_HOST") != "0.0.0.0":
+    raise SystemExit("Camoufox target bind contract mismatch")
+if camofox_environment.get("AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE") != "/run/secrets/agent-platform/camofox-access-key":
+    raise SystemExit("Camoufox target secret contract mismatch")
+if camofox_environment.get("CAMOFOX_PROFILE_DIR") != "/var/lib/agent-platform/camofox/profiles":
+    raise SystemExit("Camoufox target profile root mismatch")
 for name in ("platform", "agent-runtime"):
     manager_mounts = [
         volume for volume in services[name].get("volumes") or []
-        if volume.get("target") == "/run/ubitech-manager"
+        if volume.get("target") == "/run/agent-platform-manager"
     ]
     if len(manager_mounts) != 1 or not manager_mounts[0].get("read_only"):
         raise SystemExit(f"{name} must read-only mount the Manager control directory")
@@ -677,13 +1091,21 @@ runtime_secret_targets = {
     str(volume.get("target") or "")
     for volume in services["agent-runtime"].get("volumes") or []
 }
-if "/run/secrets/manager-token" not in platform_secret_targets or "/run/secrets/manager-executor-token" in platform_secret_targets:
+if "/run/secrets/agent-platform/manager-token" not in platform_secret_targets or "/run/secrets/agent-platform/manager-executor-token" in platform_secret_targets:
     raise SystemExit("Platform must receive only the Manager control capability")
-if "/run/secrets/manager-executor-token" not in runtime_secret_targets or "/run/secrets/manager-token" in runtime_secret_targets:
+if "/run/secrets/agent-platform/manager-executor-token" not in runtime_secret_targets or "/run/secrets/agent-platform/manager-token" in runtime_secret_targets:
     raise SystemExit("Agent Runtime must receive only the Manager executor capability")
-platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == "/var/lib/ubitech-agent"]
+platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == "/var/lib/agent-platform"]
 if len(platform_data) != 1 or not str(platform_data[0].get("source") or "").endswith("/data"):
-    raise SystemExit("Platform data must map <manager data root>/data to /var/lib/ubitech-agent")
+    raise SystemExit("Platform data must map <manager data root>/data to /var/lib/agent-platform")
+
+serialized = json.dumps(document, sort_keys=True)
+for source_token in (
+    "UBITECH_", "ENTERPRISE_", "/var/lib/ubitech-agent", "/run/secrets/ubitech",
+    "/run/ubitech-manager", "/run/ubitech-agent", "org.ubitech.agent", "ubitech-agent",
+):
+    if source_token in serialized:
+        raise SystemExit(f"resolved target Compose leaked source token: {source_token}")
 
 firecrawl = services["firecrawl-api"]
 firecrawl_environment = firecrawl.get("environment") or {}

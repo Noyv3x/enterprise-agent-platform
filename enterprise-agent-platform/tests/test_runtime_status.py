@@ -1,14 +1,126 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from enterprise_agent_platform.runtimes import PlatformRuntimeManager, RuntimeStatus
+from enterprise_agent_platform.technical_profile import (
+    SOURCE_TECHNICAL_PROFILE,
+    TARGET_TECHNICAL_PROFILE,
+)
 
 
 class RuntimeStatusContractTests(unittest.TestCase):
+    @staticmethod
+    def _manager(profile, secrets=None):
+        values = dict(secrets or {})
+        return PlatformRuntimeManager(
+            SimpleNamespace(technical_profile=profile),
+            lambda key: values.get(key, ""),
+        )
+
+    def test_camofox_secret_uses_the_active_profile_namespace(self):
+        with mock.patch.dict(
+            os.environ,
+            {"CAMOFOX_ACCESS_KEY": "source-key"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self._manager(SOURCE_TECHNICAL_PROFILE)._camofox_access_key(),
+                "source-key",
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY": "target-key"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self._manager(TARGET_TECHNICAL_PROFILE)._camofox_access_key(),
+                "target-key",
+            )
+
+    def test_target_camofox_secret_accepts_only_the_exact_target_file(self):
+        manager = self._manager(TARGET_TECHNICAL_PROFILE)
+        exact = "/run/secrets/agent-platform/camofox-access-key"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE": exact},
+                clear=True,
+            ),
+            mock.patch.object(
+                manager,
+                "_read_secret_file",
+                return_value="file-key",
+            ) as read_secret,
+        ):
+            self.assertEqual(manager._camofox_access_key(), "file-key")
+            read_secret.assert_called_once_with(
+                exact,
+                "AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE",
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE": "/tmp/source-key"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "must be"):
+                manager._camofox_access_key()
+
+    def test_camofox_secret_mixed_profiles_fail_closed(self):
+        cases = (
+            (
+                SOURCE_TECHNICAL_PROFILE,
+                {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY": "target-key"},
+            ),
+            (
+                TARGET_TECHNICAL_PROFILE,
+                {"CAMOFOX_ACCESS_KEY": "source-key"},
+            ),
+            (
+                TARGET_TECHNICAL_PROFILE,
+                {
+                    "AGENT_PLATFORM_CAMOFOX_ACCESS_KEY": "target-key",
+                    "AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE": (
+                        "/run/secrets/agent-platform/camofox-access-key"
+                    ),
+                },
+            ),
+        )
+        for profile, environment in cases:
+            with self.subTest(profile=profile.profile_id, environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "cannot be mixed|cannot both be set",
+                    ):
+                        self._manager(profile)._camofox_access_key()
+
+    def test_camofox_secret_file_reader_rejects_symlinks_and_empty_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            secret = root / "secret"
+            secret.write_text("secret-value\n", encoding="utf-8")
+            self.assertEqual(
+                PlatformRuntimeManager._read_secret_file(str(secret), "TEST_FILE"),
+                "secret-value",
+            )
+            empty = root / "empty"
+            empty.touch()
+            with self.assertRaisesRegex(RuntimeError, "empty"):
+                PlatformRuntimeManager._read_secret_file(str(empty), "TEST_FILE")
+            link = root / "link"
+            link.symlink_to(secret)
+            with self.assertRaisesRegex(RuntimeError, "readable secret file"):
+                PlatformRuntimeManager._read_secret_file(str(link), "TEST_FILE")
+
     def test_public_shape_contains_only_current_health_fields(self):
         status = RuntimeStatus(
             name="agent",

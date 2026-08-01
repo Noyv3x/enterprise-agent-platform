@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
@@ -217,8 +216,12 @@ func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error 
 	if err != nil {
 		return fmt.Errorf("verify staged manager: %w", err)
 	}
-	if strings.TrimSpace(string(output)) == "" {
+	reportedVersion := strings.TrimSpace(string(output))
+	if reportedVersion == "" {
 		return errors.New("staged manager returned an empty version")
+	}
+	if reportedVersion != manifest.Manager.Version {
+		return fmt.Errorf("staged manager version %q does not match release version %q", reportedVersion, manifest.Manager.Version)
 	}
 	state, err := m.load()
 	if err != nil {
@@ -525,13 +528,10 @@ func (m *Manager) ensureOrdinaryWatchdog(ctx context.Context, plan Plan, previou
 		return fmt.Errorf("inspect ordinary Manager activation watchdog: %w", err)
 	}
 	if !active {
-		watchdogArguments := []string{"self-update-watchdog", "--plan", plan.PlanPath}
-		if previous.SourceCommit != contract.SourceOwnerCompatGeneration {
-			if !validManagerConfigPath(m.ConfigPath) {
-				return errors.New("ordinary Manager watchdog config binding is invalid")
-			}
-			watchdogArguments = append(watchdogArguments, "--config", m.ConfigPath)
+		if !validManagerConfigPath(m.ConfigPath) {
+			return errors.New("ordinary Manager watchdog config binding is invalid")
 		}
+		watchdogArguments := []string{"self-update-watchdog", "--plan", plan.PlanPath, "--config", m.ConfigPath}
 		arguments := append([]string{"--user", "--quiet", "--collect", "--unit", unit, "--property=Type=exec", previous.Path}, watchdogArguments...)
 		if err := m.runner().Run(ctx, "systemd-run", arguments...); err != nil {
 			return fmt.Errorf("start manager activation watchdog: %w", err)
@@ -544,10 +544,10 @@ func (m *Manager) ensureOrdinaryWatchdog(ctx context.Context, plan Plan, previou
 			return errors.New("ordinary Manager activation watchdog was not proven active after launch")
 		}
 	}
-	return m.verifyOrdinaryWatchdogProcess(ctx, unit, previous.Path, previous.SHA256, plan.PlanPath, previous.SourceCommit == contract.SourceOwnerCompatGeneration)
+	return m.verifyOrdinaryWatchdogProcess(ctx, unit, previous.Path, previous.SHA256, plan.PlanPath)
 }
 
-func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, executablePath, expectedSHA, planPath string, allowP1Arguments bool) error {
+func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, executablePath, expectedSHA, planPath string) error {
 	if m.OrdinaryWatchdogVerifier != nil {
 		return m.OrdinaryWatchdogVerifier(ctx, unit, executablePath, expectedSHA, planPath)
 	}
@@ -590,8 +590,7 @@ func (m *Manager) verifyOrdinaryWatchdogProcess(ctx context.Context, unit, execu
 	if validManagerConfigPath(m.ConfigPath) {
 		want = append(want, "--config", m.ConfigPath)
 	}
-	legacy := len(arguments) == 4 && arguments[1] == "self-update-watchdog" && arguments[2] == "--plan" && arguments[3] == planPath
-	if !reflect.DeepEqual(arguments, want) && !(allowP1Arguments && legacy) {
+	if !reflect.DeepEqual(arguments, want) {
 		return errors.New("ordinary Manager watchdog command line does not exactly own the activation plan")
 	}
 	cgroupData, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(mainPID), "cgroup"))
@@ -880,7 +879,7 @@ func RunWatchdog(
 					!validSHA256(committed.Previous.SHA256) {
 					return errors.Join(validationErr, errors.New("committed activation has no immutable watchdog executable owner"), readErr)
 				}
-				if err := binding.verifyCurrentProcess(ctx, plan, committed.Previous.Path, committed.Previous.SHA256, sourceOwnerCompatWatchdog(committed.Previous)); err != nil {
+				if err := binding.verifyCurrentProcess(ctx, plan, committed.Previous.Path, committed.Previous.SHA256); err != nil {
 					return fmt.Errorf("verify committed ordinary watchdog executable: %w", err)
 				}
 				if transferStartupAuthority != nil {
@@ -896,7 +895,7 @@ func RunWatchdog(
 		if state.Current == nil || state.Current.Path != plan.PreviousPath || !validSHA256(state.Current.SHA256) {
 			return errors.New("ordinary watchdog Current does not match its immutable previous executable")
 		}
-		if err := binding.verifyCurrentProcess(ctx, plan, state.Current.Path, state.Current.SHA256, sourceOwnerCompatWatchdog(state.Current)); err != nil {
+		if err := binding.verifyCurrentProcess(ctx, plan, state.Current.Path, state.Current.SHA256); err != nil {
 			return fmt.Errorf("verify ordinary watchdog executable: %w", err)
 		}
 	} else if plan.Mode == recoveryActivationMode && activeStatus {
@@ -904,7 +903,7 @@ func RunWatchdog(
 		if err != nil {
 			return fmt.Errorf("validate current recovery activation watchdog ownership: %w", err)
 		}
-		if err := binding.verifyCurrentProcess(ctx, plan, ownership.RecoveryPath, ownership.RecoverySHA256, false); err != nil {
+		if err := binding.verifyCurrentProcess(ctx, plan, ownership.RecoveryPath, ownership.RecoverySHA256); err != nil {
 			return fmt.Errorf("verify current recovery watchdog executable: %w", err)
 		}
 		lastRecoveryOwnership = &ownership

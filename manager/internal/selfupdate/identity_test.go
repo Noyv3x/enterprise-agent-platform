@@ -1,9 +1,11 @@
 package selfupdate
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 func TestManagerUsesVerifiedTargetTechnicalProfile(t *testing.T) {
@@ -34,5 +36,20 @@ func TestManagerUsesVerifiedTargetTechnicalProfile(t *testing.T) {
 func TestManagerRejectsMissingTechnicalProfile(t *testing.T) {
 	if err := (&Manager{}).ValidateTechnicalProfile(); err == nil {
 		t.Fatal("expected missing technical profile to be rejected")
+	}
+}
+
+func TestSelfUpdateManifestValidationUsesTheRoutedProfile(t *testing.T) {
+	target, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := releasetest.NewTarget(strings.Repeat("a", 40)).Manifest
+	if err := validateSelfUpdateManifest(target, manifest); err != nil {
+		t.Fatalf("routed target rejected schema 2 Candidate: %v", err)
+	}
+	if err := validateSelfUpdateManifest(identity.SourceActiveProfile(), manifest); err == nil ||
+		!strings.Contains(err.Error(), "verified target technical profile") {
+		t.Fatalf("routed source accepted schema 2 Candidate: %v", err)
 	}
 }

@@ -3,8 +3,6 @@ package selfupdate
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,10 +20,10 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 var (
@@ -55,7 +52,7 @@ func testWatchdogBinding(active identity.ActiveProfile, plan Plan) WatchdogBindi
 		installPath: plan.InstallPath, socketPath: plan.SocketPath,
 		controlTokenFile: plan.ControlTokenFile, unitName: plan.UnitName,
 		bindingValidator: func(WatchdogBinding) error { return nil },
-		processVerifier:  func(context.Context, WatchdogBinding, Plan, string, string, bool) error { return nil },
+		processVerifier:  func(context.Context, WatchdogBinding, Plan, string, string) error { return nil },
 	}
 }
 
@@ -152,9 +149,14 @@ func (r *fakeRunner) Run(_ context.Context, name string, args ...string) error {
 
 func candidateManifest(t *testing.T, binary []byte) (release.Manifest, *httptest.Server) {
 	t.Helper()
-	sum := sha256.Sum256(binary)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(binary) }))
-	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40), Manager: release.ManagerRelease{Version: "next", Artifacts: map[string]release.Artifact{runtime.GOARCH: {URL: server.URL, SHA256: hex.EncodeToString(sum[:])}}}}
+	manifest := releasetest.NewSource(
+		strings.Repeat("a", 40),
+		releasetest.WithArtifactBaseURL(server.URL),
+		releasetest.WithManagerVersion("next"),
+		releasetest.WithManagerBinary("amd64", binary),
+		releasetest.WithManagerBinary("arm64", binary),
+	).Manifest
 	return manifest, server
 }
 
@@ -248,6 +250,32 @@ func TestPrepareVerifiesButDoesNotActivateCandidate(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsStagedManagerThatReportsAnotherVersion(t *testing.T) {
+	binary := []byte("#!/bin/sh\necho unexpected\n")
+	manifest, server := candidateManifest(t, binary)
+	defer server.Close()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		Profile:        testActiveProfile,
+		Root:           filepath.Join(root, "manager-binaries"),
+		StatePath:      filepath.Join(root, "manager-binaries.json"),
+		InstallPath:    filepath.Join(root, "bin", "agent-platform-manager"),
+		RunningVersion: "current",
+		Client:         release.Client{HTTP: server.Client()},
+		Now:            func() time.Time { return time.Unix(10, 0) },
+	}
+	err := manager.Prepare(context.Background(), manifest)
+	if err == nil || !strings.Contains(err.Error(), `staged manager version "unexpected" does not match release version "next"`) {
+		t.Fatalf("Prepare with mismatched staged version = %v", err)
+	}
+	if _, statErr := os.Lstat(manager.StatePath); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected staged Manager published Candidate state: %v", statErr)
+	}
+}
+
 func TestDiscardPreparedClearsOnlyExactUncommittedCandidate(t *testing.T) {
 	manager, manifest, _, _ := newPreparedManager(t)
 	state, err := manager.State()
@@ -330,46 +358,6 @@ func TestActivateCreatesOwnerOnlyActivationDirectoryOnFreshRoot(t *testing.T) {
 	if !found {
 		t.Fatalf("new-baseline watchdog omitted the Manager config binding: %#v", runner.calls)
 	}
-}
-
-func TestOrdinaryWatchdogOmitsConfigOnlyForExactP1RetainedCurrent(t *testing.T) {
-	root := t.TempDir()
-	runner := &fakeRunner{activeUnits: map[string]bool{}}
-	manager := &Manager{
-		Profile: testActiveProfile, ConfigPath: "relative-must-not-be-used", Runner: runner,
-		RecoveryUnitActive:       func(_ context.Context, unit string) (bool, error) { return runner.activeUnits[unit], nil },
-		OrdinaryWatchdogVerifier: func(context.Context, string, string, string, string) error { return nil },
-	}
-	plan := Plan{PlatformCommit: strings.Repeat("b", 40), PlanPath: filepath.Join(root, "plan.json")}
-	previous := Version{
-		SourceCommit: contract.SourceOwnerCompatGeneration, Path: filepath.Join(root, "p1", "ubitech-manager"),
-		SHA256: strings.Repeat("a", 64),
-	}
-	if err := manager.ensureOrdinaryWatchdog(context.Background(), plan, previous); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.calls) != 1 || slicesContain(runner.calls[0], "--config") {
-		t.Fatalf("exact P1 watchdog unexpectedly required a new argv binding: %#v", runner.calls)
-	}
-
-	runner.calls = nil
-	runner.activeUnits = map[string]bool{}
-	previous.SourceCommit = strings.Repeat("c", 40)
-	if err := manager.ensureOrdinaryWatchdog(context.Background(), plan, previous); err == nil || !strings.Contains(err.Error(), "config binding") {
-		t.Fatalf("non-P1 watchdog accepted the legacy argv exception: %v", err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("invalid non-P1 watchdog spawned before config validation: %#v", runner.calls)
-	}
-}
-
-func slicesContain(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 func TestActivationRollbackQueryLeavesFreshRootUntouchedBeforeFirstActivate(t *testing.T) {
@@ -723,54 +711,6 @@ func TestWatchdogAuthorityTransferFailurePrecedesEveryMutation(t *testing.T) {
 	}
 	if len(runner.calls) != runnerCalls {
 		t.Fatalf("failed watchdog authority transfer invoked a service mutation: %#v", runner.calls[runnerCalls:])
-	}
-}
-
-func TestWatchdogAcceptsLegacyArgvShapeOnlyForExactSourceOwnerPredecessor(t *testing.T) {
-	manager, manifest, _, runner := newPreparedManager(t)
-	if err := manager.MarkPlatformCommitted(manifest); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Activate(context.Background(), manifest); err != nil {
-		t.Fatal(err)
-	}
-	state, err := manager.State()
-	if err != nil || state.Current == nil || state.Activation == nil {
-		t.Fatalf("activation fixture is incomplete: %#v %v", state, err)
-	}
-	_, plan, err := readRecoveryActivationPlan(state.Activation.PlanPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := errors.New("stop after process proof")
-	for _, test := range []struct {
-		name       string
-		commit     string
-		wantCompat bool
-	}{
-		{name: "exact predecessor", commit: contract.SourceOwnerCompatGeneration, wantCompat: true},
-		{name: "ordinary current", commit: strings.Repeat("d", 40), wantCompat: false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			latest, readErr := manager.State()
-			if readErr != nil || latest.Current == nil {
-				t.Fatalf("read Current: %#v %v", latest, readErr)
-			}
-			latest.Current.SourceCommit = test.commit
-			if writeErr := atomicfile.WriteJSON(manager.StatePath, latest, 0o600); writeErr != nil {
-				t.Fatal(writeErr)
-			}
-			binding := testWatchdogBinding(testActiveProfile, plan)
-			observed := false
-			binding.processVerifier = func(_ context.Context, _ WatchdogBinding, _ Plan, _, _ string, allowCompat bool) error {
-				observed = allowCompat
-				return nil
-			}
-			err := RunWatchdog(context.Background(), binding, plan.PlanPath, runner, func() error { return want })
-			if !errors.Is(err, want) || observed != test.wantCompat {
-				t.Fatalf("compat process proof = %v err=%v, want %v", observed, err, test.wantCompat)
-			}
-		})
 	}
 }
 

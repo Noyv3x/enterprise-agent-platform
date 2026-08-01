@@ -1,6 +1,6 @@
 services:
   platform:
-    image: ubitech-agent/platform:dev
+    image: agent-platform/platform:dev
     build:
       context: ..
       dockerfile: containers/platform.Dockerfile
@@ -9,7 +9,7 @@ services:
         RELEASE_VERSION: development
 
   agent-runtime:
-    image: ubitech-agent/agent-runtime:dev
+    image: agent-platform/agent-runtime:dev
     build:
       context: ..
       dockerfile: containers/agent-runtime.Dockerfile
@@ -18,7 +18,7 @@ services:
         RELEASE_VERSION: development
 
   camofox:
-    image: ubitech-agent/camofox:dev
+    image: agent-platform/camofox:dev
     build:
       context: ..
       dockerfile: containers/camofox.Dockerfile

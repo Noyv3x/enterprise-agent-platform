@@ -36,10 +36,10 @@ from .service import (
     UploadedFile,
     is_safe_inline_attachment_mime,
 )
+from .technical_profile import select_technical_profile
 from .secure_fs import ensure_private_directory
 
 
-COOKIE_NAME = "enterprise_session"
 MAX_BODY_BYTES = 5 * 1024 * 1024
 # Attachment bytes are bounded independently by the service. Keep a small,
 # bounded allowance for multipart headers, boundaries, and the message text so
@@ -79,15 +79,32 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+_IMPORT_TECHNICAL_PROFILE = select_technical_profile()
+
+
+def _profile_env(source_name: str) -> str:
+    return _IMPORT_TECHNICAL_PROFILE.environment_variable(source_name)
+
+
 # Admission control: cap concurrent worker threads (and therefore the per-thread
 # SQLite connections / file descriptors they hold) and cap concurrent long-lived
 # SSE streams both globally and per user, so a scripted client cannot exhaust
 # server resources. Tunable via environment with safe defaults.
-MAX_CONCURRENT_REQUESTS = _env_int("ENTERPRISE_MAX_CONCURRENT_REQUESTS", 64)
-MAX_CONCURRENT_SSE_STREAMS = _env_int("ENTERPRISE_MAX_SSE_STREAMS", 256)
-MAX_SSE_STREAMS_PER_USER = _env_int("ENTERPRISE_MAX_SSE_STREAMS_PER_USER", 4)
-MAX_CONCURRENT_UPLOADS = _env_int("ENTERPRISE_MAX_CONCURRENT_UPLOADS", 4)
-UPLOAD_IDLE_TIMEOUT_SECONDS = _env_int("ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS", 120)
+MAX_CONCURRENT_REQUESTS = _env_int(
+    _profile_env("ENTERPRISE_MAX_CONCURRENT_REQUESTS"), 64
+)
+MAX_CONCURRENT_SSE_STREAMS = _env_int(
+    _profile_env("ENTERPRISE_MAX_SSE_STREAMS"), 256
+)
+MAX_SSE_STREAMS_PER_USER = _env_int(
+    _profile_env("ENTERPRISE_MAX_SSE_STREAMS_PER_USER"), 4
+)
+MAX_CONCURRENT_UPLOADS = _env_int(
+    _profile_env("ENTERPRISE_MAX_CONCURRENT_UPLOADS"), 4
+)
+UPLOAD_IDLE_TIMEOUT_SECONDS = _env_int(
+    _profile_env("ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS"), 120
+)
 UPLOAD_STREAM_CHUNK_BYTES = 64 * 1024
 MAX_MULTIPART_HEADER_BYTES = 64 * 1024
 MAX_MULTIPART_BOUNDARY_BYTES = 200
@@ -493,7 +510,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if method != "GET":
                     self._json({"error": "method not allowed"}, status=405)
                     return
-                self._json({"status": "ok", "service": "ubitech-agent-platform"})
+                self._json(
+                    {
+                        "status": "ok",
+                        "service": self.server.service.config.health_service,
+                    }
+                )
                 return
             if path == "/healthz/search":
                 if method != "GET":
@@ -509,13 +531,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self._json(
                         {
                             "status": "unavailable",
-                            "service": "ubitech-agent-search",
+                            "service": self.server.service.config.search_health_service,
                         },
                         status=503,
                     )
                     return
                 self._json(
-                    {"status": "ok", "service": "ubitech-agent-search"}
+                    {
+                        "status": "ok",
+                        "service": self.server.service.config.search_health_service,
+                    }
                 )
                 return
             if path == "/api/platform/update-status":
@@ -1319,7 +1344,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return None
         cookie = SimpleCookie()
         cookie.load(cookie_header)
-        morsel = cookie.get(COOKIE_NAME)
+        morsel = cookie.get(self.server.service.config.session_cookie_name)
         return morsel.value if morsel else None
 
     def _body_json(self) -> dict[str, Any]:
@@ -2010,13 +2035,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         )
 
     def _session_cookie(self, token: str) -> str:
-        attrs = [f"{COOKIE_NAME}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
+        cookie_name = self.server.service.config.session_cookie_name
+        attrs = [f"{cookie_name}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
         if self._secure_cookie_enabled():
             attrs.append("Secure")
         return "; ".join(attrs)
 
     def _clear_cookie(self) -> str:
-        attrs = [f"{COOKIE_NAME}=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"]
+        cookie_name = self.server.service.config.session_cookie_name
+        attrs = [f"{cookie_name}=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"]
         if self._secure_cookie_enabled():
             attrs.append("Secure")
         return "; ".join(attrs)
@@ -2247,7 +2274,15 @@ def run_server(
     if bootstrap_password_path.exists():
         print(f"Bootstrap admin account is admin; initial password is stored at {bootstrap_password_path}")
     else:
-        print("Bootstrap admin account is admin; password came from ENTERPRISE_ADMIN_PASSWORD or existing database state.")
+        admin_password_name = (
+            server.service.config.technical_profile.environment_variable(
+                "ENTERPRISE_ADMIN_PASSWORD"
+            )
+        )
+        print(
+            "Bootstrap admin account is admin; password came from "
+            f"{admin_password_name} or existing database state."
+        )
     if not getattr(server.service.db, "fts_available", True):
         print(
             "Warning: SQLite was built without FTS5; knowledge search falls back to a slower LIKE scan.",

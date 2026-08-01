@@ -38,7 +38,7 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     assert.equal(health.status, 200);
     const healthBody = await health.json() as Record<string, unknown>;
     assert.equal(healthBody.status, "ok");
-    assert.equal(healthBody.service, "ubitech-agent-runtime");
+    assert.equal(healthBody.service, "agent-platform-runtime");
     assert.equal(healthBody.version, "0.1.0");
     assert.equal(healthBody.pid, process.pid);
     assert.equal(Number.isInteger(healthBody.uptime_seconds), true);

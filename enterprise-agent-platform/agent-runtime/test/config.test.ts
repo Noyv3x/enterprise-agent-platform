@@ -25,6 +25,7 @@ function runtimeEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
     AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     ...overrides,
   };
 }
@@ -46,6 +47,7 @@ test("runtime bearer token accepts trimmed direct and file-backed values but rej
   assert.equal(loadConfig({
     AGENT_RUNTIME_TOKEN: "  direct-token \n",
     AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
   }).bearerToken, "direct-token");
   const home = await temporaryDirectory("agent-runtime-config-token-");
   const tokenFile = join(home, "token");
@@ -54,15 +56,38 @@ test("runtime bearer token accepts trimmed direct and file-backed values but rej
     assert.equal(loadConfig({
       AGENT_RUNTIME_TOKEN_FILE: tokenFile,
       AGENT_RUNTIME_EXECUTOR_MODE: "local",
+      AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     }).bearerToken, "file-token");
     await writeFile(tokenFile, " \n\t", "utf8");
     assert.throws(
-      () => loadConfig({ AGENT_RUNTIME_TOKEN_FILE: tokenFile, AGENT_RUNTIME_EXECUTOR_MODE: "local" }),
+      () => loadConfig({
+        AGENT_RUNTIME_TOKEN_FILE: tokenFile,
+        AGENT_RUNTIME_EXECUTOR_MODE: "local",
+        AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
+      }),
       /AGENT_RUNTIME_TOKEN or AGENT_RUNTIME_TOKEN_FILE to a non-empty value/,
     );
   } finally {
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("runtime accepts only the target technical profile and rejects source-prefixed environment", () => {
+  assert.throws(
+    () => loadConfig({
+      AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
+      AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    }),
+    /AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1/,
+  );
+  assert.throws(
+    () => loadConfig(runtimeEnv({ UBITECH_DATA_ROOT: "/tmp/source" })),
+    /Source-profile environment is not accepted/,
+  );
+  assert.throws(
+    () => loadConfig(runtimeEnv({ ENTERPRISE_PLATFORM_DATA: "/tmp/source" })),
+    /Source-profile environment is not accepted/,
+  );
 });
 
 test("max concurrency defaults to eight and accepts the inclusive 1..64 range", () => {

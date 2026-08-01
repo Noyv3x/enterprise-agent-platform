@@ -35,7 +35,7 @@ const loggingAfter = `function sanitizeLogUrl(value) {
   const text = String(value || '');
   try {
     const absolute = /^[a-z][a-z0-9+.-]*:\\/\\//i.test(text);
-    const parsed = new URL(text, 'http://ubitech.invalid');
+    const parsed = new URL(text, 'http://agent-platform.invalid');
     if (!['http:', 'https:', 'ws:', 'wss:'].includes(parsed.protocol)) {
       return '[redacted-url]';
     }
@@ -347,6 +347,6 @@ applyExactPatch("coordinate-click-branch", coordinateClickBranchBefore, coordina
 
 const source = fs.readFileSync(target, "utf8");
 if (patched === source) process.exit(0);
-const temporary = `${target}.ubitech-patch-${process.pid}`;
+const temporary = `${target}.agent-platform-patch-${process.pid}`;
 fs.writeFileSync(temporary, patched, { encoding: "utf8", mode: 0o644 });
 fs.renameSync(temporary, target);

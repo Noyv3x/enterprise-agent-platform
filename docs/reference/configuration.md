@@ -56,6 +56,8 @@ Manager 为固定服务生成私有网络和下列路径：
 - Camoufox/SearXNG/Firecrawl：各自明确的 `$DATA_ROOT/data/runtimes/*` 子目录；
 - Sandbox：`/workspace`、`/home/agent`、`/opt/agent-env`，分别映射主 Agent 的 workspace、home 和 env。
 
+以上 `/var/lib/ubitech-agent` 只描述技术命名空间交接前的 source profile。Bridge target 与后续唯一基线使用 `/var/lib/agent-platform`、`/run/secrets/agent-platform`、`/run/agent-platform-manager` 和 `AGENT_PLATFORM_*` Compose 环境。Bridge 镜像允许的 source/target technical profile 是编译期闭集，具体 profile 由已验证 Manager/Compose 绑定注入；未知 profile、两套前缀同时出现、target profile 搭配 source 数据库 baseline/marker（或反向搭配）都必须在启动 writer 前拒绝。清理发布删除 source 分支后，本节只保留 target 接口。
+
 Platform 额外接收只读的宿主数据根字符串，用于在当前 scope 的可信系统提示中计算工作区映射；它不能用该值访问宿主文件，不能写入数据库或公共状态，也不能接受模型覆盖。
 
 Platform 的集成服务 URL 与 Runtime 的 Platform URL 使用 Compose service name，不接受部署用户提供的公网 base URL。Runtime 不直接接收 Camoufox、SearXNG、Firecrawl URL 或这些服务的 secret，相关工具统一回调 Platform。Platform 在容器模式下不暴露固定服务的 install/restart API；这些容器只由 Manager operation 管理。内部 bearer 通过 owner-only token file 或 Docker secret 风格只读挂载传入，不能出现在 Compose 命令行、环境 dump 或 Manager 公共状态。Manager control 使用 `manager-token`，仅挂载给 Platform；Manager executor 使用独立的 `manager-executor-token`，仅挂载给 Runtime。宿主 CLI 从 Manager owner-only secret 读取 control token。两枚 token 即使共享同一个 owner-only Unix socket，也不能访问对方的路由集合。
@@ -66,7 +68,7 @@ Manager 配置只记录 control token file 路径，不接受 TOML 中的 `inter
 
 ## Platform 启动配置
 
-Platform 容器接受 Manager 生成的最小环境：
+Platform 容器接受 Manager 生成的最小环境。交接前 source Compose 使用下列现存接口；Bridge target 和清理后基线使用语义一一对应的 `AGENT_PLATFORM_*` 名称及 target 容器路径：
 
 - `ENTERPRISE_PLATFORM_DATA=/var/lib/ubitech-agent`；
 - 内部监听 host/port、public base URL 和 trusted proxy；
@@ -75,11 +77,13 @@ Platform 容器接受 Manager 生成的最小环境：
 - 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制；
 - `ENTERPRISE_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`ENTERPRISE_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
-`ENTERPRISE_` 是现存内部环境前缀，不代表产品名称。它们是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
+`ENTERPRISE_` 是 source profile 的现存内部环境前缀，不代表产品名称。Bridge 只为 source 回滚保留其读取，target Compose 不得继续发出；Cleanup 删除该读取。两侧字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。
 
 Platform 命令行只有当前容器入口使用的 `serve --host --port --data`、无业务 writer 的 `migrate --data`，以及明确的管理子命令。子命令必须显式提供；监听地址不提供隐藏别名；未知参数必须由参数解析器直接拒绝，不能静默映射到另一套启动接口。
 
 若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
+
+target Platform 的 SQLite 机器自有 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。Bridge 从 source 数据库一次性结构化映射对应 `ENTERPRISE_*` 键；target Platform 不提供双读回退，不会在启动或管理员更新时重新写入 source 键。映射只改 `settings.key`，不改值、secret 标志、更新时间、用户配置键或任何自由文本。
 
 ## Platform 动态设置
 

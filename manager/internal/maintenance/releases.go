@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
@@ -37,6 +37,7 @@ type RemovalGuard = release.RemovalGuard
 type ReleasePolicy struct {
 	Root            string
 	Channel         string
+	Profile         identity.ActiveProfile
 	Retention       time.Duration
 	ProtectedIDs    map[string]struct{}
 	ProtectedImages map[string]struct{}
@@ -56,6 +57,13 @@ type verifiedRelease struct {
 // either protected elsewhere or have been removed without force. Unknown,
 // malformed and runtime-held generations remain untouched.
 func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (int, error) {
+	active := policy.Profile
+	if active.Validate() != nil {
+		// The zero value is deliberately source-only. It preserves conservative
+		// cleanup behavior for old internal callers while never granting access to
+		// target-only schema v2; production wiring always supplies the routed value.
+		active = identity.SourceActiveProfile()
+	}
 	retention := policy.Retention
 	if retention <= 0 {
 		retention = 7 * 24 * time.Hour
@@ -96,30 +104,30 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 		containsAtomicResidue, residueScanErr := releaseContainsAtomicResidue(path)
 		if residueScanErr != nil {
 			pruneErr = errors.Join(pruneErr, fmt.Errorf("inspect release %s for atomic residues: %w", entry.Name(), residueScanErr))
-			protectReleaseCoreImages(path, entry.Name(), policy.Channel, protectedImages)
+			protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 			continue
 		}
 		if containsAtomicResidue {
 			directoryInfo, infoErr := entry.Info()
 			if infoErr != nil {
 				pruneErr = errors.Join(pruneErr, fmt.Errorf("inspect release %s directory identity before atomic cleanup: %w", entry.Name(), infoErr))
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, protectedImages)
+				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 				continue
 			}
 			result, admitted, cleanupErr := cleanupReleaseAtomicResidues(path, entry.Name(), directoryInfo, now, retention, policy.RemovalGuard)
 			if cleanupErr != nil {
 				pruneErr = errors.Join(pruneErr, fmt.Errorf("clean release %s atomic residues: %w", entry.Name(), cleanupErr))
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, protectedImages)
+				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 				continue
 			}
 			if !admitted || result.Retained != 0 {
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, protectedImages)
+				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 				continue
 			}
 		}
-		item, verifyErr := verifyRelease(path, entry.Name(), policy.Channel)
+		item, verifyErr := verifyRelease(path, entry.Name(), policy.Channel, active)
 		if verifyErr != nil {
-			protectReleaseCoreImages(path, entry.Name(), policy.Channel, protectedImages)
+			protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 			continue
 		}
 		if item.manifest.GeneratedAt.IsZero() || now.Sub(item.manifest.GeneratedAt) <= retention {
@@ -187,7 +195,7 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 			if !safe {
 				continue
 			}
-			rechecked, verifyErr := verifyRelease(item.path, item.manifest.ID(), policy.Channel)
+			rechecked, verifyErr := verifyRelease(item.path, item.manifest.ID(), policy.Channel, active)
 			if verifyErr != nil || !sameStrings(rechecked.images, item.images) || rechecked.manifest.Compose.SHA256 != item.manifest.Compose.SHA256 {
 				continue
 			}
@@ -343,8 +351,8 @@ func validateReleaseStaging(path string) error {
 	return nil
 }
 
-func verifyRelease(path, expectedID, channel string) (verifiedRelease, error) {
-	item, err := verifyReleaseCore(path, expectedID, channel)
+func verifyRelease(path, expectedID, channel string, active identity.ActiveProfile) (verifiedRelease, error) {
+	item, err := verifyReleaseCore(path, expectedID, channel, active)
 	if err != nil {
 		return verifiedRelease{}, err
 	}
@@ -366,7 +374,7 @@ func verifyRelease(path, expectedID, channel string) (verifiedRelease, error) {
 	return item, nil
 }
 
-func verifyReleaseCore(path, expectedID, channel string) (verifiedRelease, error) {
+func verifyReleaseCore(path, expectedID, channel string, active identity.ActiveProfile) (verifiedRelease, error) {
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return verifiedRelease{}, errors.New("release path is not a regular directory")
@@ -376,20 +384,12 @@ func verifyReleaseCore(path, expectedID, channel string) (verifiedRelease, error
 	if err != nil {
 		return verifiedRelease{}, err
 	}
-	var manifest release.Manifest
-	decoder := json.NewDecoder(strings.NewReader(string(manifestData)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil {
+	manifest, err := release.DecodeManifestForProfile(manifestData, channel, runtime.GOOS, runtime.GOARCH, active)
+	if err != nil {
 		return verifiedRelease{}, err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return verifiedRelease{}, errors.New("release manifest contains trailing JSON")
 	}
 	if manifest.ID() != expectedID {
 		return verifiedRelease{}, errors.New("release identity does not match its directory")
-	}
-	if err := manifest.Validate(channel, runtime.GOOS, runtime.GOARCH); err != nil {
-		return verifiedRelease{}, err
 	}
 	compose, err := readRegularFile(filepath.Join(path, "compose.yaml"), maxComposeBytes)
 	if err != nil {
@@ -423,8 +423,8 @@ func protectImages(images []string, protected map[string]struct{}) {
 	}
 }
 
-func protectReleaseCoreImages(path, expectedID, channel string, protected map[string]struct{}) {
-	item, err := verifyReleaseCore(path, expectedID, channel)
+func protectReleaseCoreImages(path, expectedID, channel string, active identity.ActiveProfile, protected map[string]struct{}) {
+	item, err := verifyReleaseCore(path, expectedID, channel, active)
 	if err == nil {
 		protectImages(item.images, protected)
 	}

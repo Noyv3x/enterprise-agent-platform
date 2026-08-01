@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "scripts": {
+    "test": "node --test test/*.test.cjs"
+  },
   "dependencies": {
     "@askjo/camofox-browser": "1.11.2"
   },

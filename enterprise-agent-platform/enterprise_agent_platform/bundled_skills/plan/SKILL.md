@@ -1,6 +1,6 @@
 ---
 name: "plan"
-description: "Use only when the user requests a plan-only deliverable or says not to implement yet; never when that request authorizes implementation. Investigates the workspace and writes actionable tasks, risks, and checks under .ubitech/plans/."
+description: "Use only when the user requests a plan-only deliverable or says not to implement yet; never when that request authorizes implementation. Investigates the workspace and writes actionable tasks, risks, and checks under .agent-platform/plans/."
 version: "2.0.0"
 category: "software-development"
 tags: ["planning","implementation-plan","design","migration","verification"]
@@ -26,11 +26,11 @@ The only intended write is the requested plan document.
 Save the plan inside the active Agent workspace:
 
 ```text
-.ubitech/plans/YYYY-MM-DD_HHMMSS-short-slug.md
+.agent-platform/plans/YYYY-MM-DD_HHMMSS-short-slug.md
 ```
 
 Use a workspace-relative path. If the user provides a filename, normalize it
-under `.ubitech/plans/` unless they explicitly request another workspace
+under `.agent-platform/plans/` unless they explicitly request another workspace
 location.
 
 ## Investigation

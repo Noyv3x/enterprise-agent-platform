@@ -118,6 +118,7 @@ func (a *application) withHandoffMutation(ctx context.Context, mutate func() err
 
 type liveMaintenanceCleanup struct {
 	config     config.Config
+	profile    identity.ActiveProfile
 	operations *journal.Store
 	snapshots  snapshot.Store
 	selfUpdate *selfupdate.Manager
@@ -134,6 +135,7 @@ func (c liveMaintenanceCleanup) PruneReleases(ctx context.Context, now time.Time
 	return maintenance.PruneReleases(ctx, now, maintenance.ReleasePolicy{
 		Root:            filepath.Join(c.config.StateDir, "releases"),
 		Channel:         c.config.ReleaseChannel,
+		Profile:         c.profile,
 		Retention:       time.Duration(contract.ObsoleteArtifactRetentionSeconds) * time.Second,
 		ProtectedIDs:    protectedIDs,
 		ProtectedImages: protectedImages,
@@ -272,7 +274,13 @@ func run(arguments []string) int {
 	return 1
 }
 func usage() {
-	profile, _ := identity.SourceActiveProfile().Profile()
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, managerDisplayName)
+		fmt.Fprintln(os.Stderr, "Manager technical profile contract is invalid")
+		return
+	}
+	profile, _ := active.Profile()
 	fmt.Fprintln(os.Stderr, managerDisplayName)
 	fmt.Fprintf(os.Stderr, "usage: %s <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|release-transition|logs|version> [options]\n", profile.ManagerBinary)
 }
@@ -283,7 +291,11 @@ func commonFlags(name string) (*flag.FlagSet, *string) {
 	return set, path
 }
 func load(path string) (config.Config, error) {
-	return loadWithProfile(identity.SourceActiveProfile(), path)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return config.Config{}, err
+	}
+	return loadWithProfile(active, path)
 }
 
 func loadWithProfile(active identity.ActiveProfile, path string) (config.Config, error) {
@@ -441,11 +453,19 @@ func buildWithRuntimeConfig(active identity.ActiveProfile, cfg config.Config, ro
 		return nil, err
 	}
 	var handoffStore *handoff.Store
+	journalFreeTarget := false
 	if !helperParticipant {
 		if reflect.DeepEqual(profile, identity.SourceProfile()) {
 			handoffStore, err = handoff.Open(cfg.HandoffRoot(), cfg.DataRoot, cfg.TargetDataRoot())
 		} else {
 			handoffStore, err = handoff.OpenExisting(cfg.HandoffRoot())
+			if errors.Is(err, handoff.ErrNoJournals) || errors.Is(err, os.ErrNotExist) {
+				compiled, compiledErr := identity.CompileTimeActiveProfile()
+				if compiledErr == nil && compiled == active && reflect.DeepEqual(profile, identity.TargetProfile()) {
+					err = nil
+					journalFreeTarget = true
+				}
+			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("open namespace handoff state: %w", err)
@@ -487,6 +507,10 @@ func buildWithRuntimeConfig(active identity.ActiveProfile, cfg config.Config, ro
 	handoffAdmission := &routedHandoffAdmission{}
 	if handoffStore != nil {
 		if err := handoffAdmission.SetStore(handoffStore); err != nil {
+			return nil, err
+		}
+	} else if journalFreeTarget {
+		if err := handoffAdmission.SetCompileTimeTargetBaseline(active); err != nil {
 			return nil, err
 		}
 	}
@@ -564,7 +588,7 @@ func buildWithRuntimeConfig(active identity.ActiveProfile, cfg config.Config, ro
 			}
 		}
 	}
-	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, operations: state, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
+	app.maintenanceJobs = liveMaintenanceCleanup{config: cfg, profile: active, operations: state, snapshots: snapshots, selfUpdate: selfUpdater, images: docker}
 	// Sandbox Ensure is reached only from the executor HTTP boundary, which
 	// retains handoff -> runtime for the complete call. Re-entering routed
 	// handoff admission here would recursively flock the global journal; enter
@@ -621,7 +645,11 @@ func newDockerDriver(active identity.ActiveProfile, cfg config.Config) *driver.D
 }
 
 func preflightCommand(arguments []string) error {
-	return preflightCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return preflightCommandWithProfile(active, arguments)
 }
 
 func preflightCommandWithProfile(active identity.ActiveProfile, arguments []string) error {
@@ -661,19 +689,29 @@ func runPreflightWithConfig(active identity.ActiveProfile, cfg config.Config, pr
 		return err
 	}
 	var store *handoff.Store
+	journalFreeTarget := false
 	if reflect.DeepEqual(profile, identity.SourceProfile()) {
 		store, err = handoff.Open(cfg.HandoffRoot(), cfg.DataRoot, cfg.TargetDataRoot())
 	} else {
 		store, err = handoff.OpenExisting(cfg.HandoffRoot())
+		if errors.Is(err, handoff.ErrNoJournals) || errors.Is(err, os.ErrNotExist) {
+			compiled, compiledErr := identity.CompileTimeActiveProfile()
+			if compiledErr == nil && compiled == active && reflect.DeepEqual(profile, identity.TargetProfile()) {
+				err = nil
+				journalFreeTarget = true
+			}
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("open namespace handoff admission for preflight: %w", err)
 	}
-	defer store.Close()
+	if store != nil {
+		defer store.Close()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	return preflightUnderHandoffAdmission(ctx, store, func() error {
+	action := func() error {
 		docker := newDockerDriver(active, cfg)
 		selfUpdater := &selfupdate.Manager{
 			Profile: active, ConfigPath: cfg.ConfigPath,
@@ -694,7 +732,14 @@ func runPreflightWithConfig(active identity.ActiveProfile, cfg config.Config, pr
 		}
 		fmt.Println("preflight ok")
 		return nil
-	})
+	}
+	if journalFreeTarget {
+		if err := confirmNoTerminalHandoff(cfg.HandoffRoot()); err != nil {
+			return err
+		}
+		return action()
+	}
+	return preflightUnderHandoffAdmission(ctx, store, action)
 }
 
 func serveCommand(arguments []string) error {
@@ -1513,7 +1558,7 @@ func (a *application) reconcileMaintenanceWithProtectionAdmitted(ctx context.Con
 	}
 	jobs := a.maintenanceJobs
 	if jobs == nil {
-		jobs = liveMaintenanceCleanup{config: a.config, operations: a.state, snapshots: a.snapshots, selfUpdate: a.selfUpdate, images: a.docker}
+		jobs = liveMaintenanceCleanup{config: a.config, profile: a.profile, operations: a.state, snapshots: a.snapshots, selfUpdate: a.selfUpdate, images: a.docker}
 	}
 	a.maintenanceMu.Lock()
 	state := a.state.State()
@@ -2229,7 +2274,11 @@ func shutdownListener(server *http.Server, listener net.Listener) {
 }
 
 func managerClient(configPath string) (control.Client, config.Config, error) {
-	return managerClientWithProfile(identity.SourceActiveProfile(), configPath)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return control.Client{}, config.Config{}, err
+	}
+	return managerClientWithProfile(active, configPath)
 }
 
 func managerClientWithProfile(active identity.ActiveProfile, configPath string) (control.Client, config.Config, error) {
@@ -2250,7 +2299,11 @@ func managerClientWithConfig(cfg config.Config) (control.Client, config.Config, 
 }
 
 func releaseTransitionCommand(arguments []string) error {
-	return releaseTransitionCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return releaseTransitionCommandWithProfile(active, arguments)
 }
 
 func releaseTransitionCommandWithProfile(active identity.ActiveProfile, arguments []string) error {
@@ -2330,7 +2383,11 @@ func releaseTransitionCommandWithConfig(cfg config.Config, arguments []string) e
 }
 
 func releaseTransitionAttestCommand(arguments []string) error {
-	return releaseTransitionAttestCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return releaseTransitionAttestCommandWithProfile(active, arguments)
 }
 
 func releaseTransitionAttestCommandWithProfile(active identity.ActiveProfile, arguments []string) error {
@@ -2438,7 +2495,11 @@ func waitForManager(client control.Client) error {
 	}
 }
 func installCommand(arguments []string) error {
-	return installCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return installCommandWithProfile(active, arguments)
 }
 
 func installCommandWithProfile(active identity.ActiveProfile, arguments []string) error {
@@ -2521,7 +2582,11 @@ func awaitOperation(client control.Client, id string) error {
 }
 
 func simpleGetCommand(name string, arguments []string, pathValue string) error {
-	return simpleGetCommandWithProfile(identity.SourceActiveProfile(), name, arguments, pathValue)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return simpleGetCommandWithProfile(active, name, arguments, pathValue)
 }
 
 func simpleGetCommandWithProfile(active identity.ActiveProfile, name string, arguments []string, pathValue string) error {
@@ -2559,7 +2624,11 @@ func simpleGetCommandWithConfig(cfg config.Config, name string, arguments []stri
 	return printJSON(value)
 }
 func checkCommand(arguments []string) error {
-	return checkCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return checkCommandWithProfile(active, arguments)
 }
 
 type releaseCheckResponse struct {
@@ -2616,7 +2685,11 @@ func requestReleaseCheck(client control.Client, manifestURL, idempotencyKey stri
 	return value, nil
 }
 func operationCommand(kind string, arguments []string) error {
-	return operationCommandWithProfile(identity.SourceActiveProfile(), kind, arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return operationCommandWithProfile(active, kind, arguments)
 }
 
 func operationCommandWithProfile(active identity.ActiveProfile, kind string, arguments []string) error {
@@ -2686,7 +2759,11 @@ func operationCommandWithConfig(cfg config.Config, kind string, arguments []stri
 	return awaitOperation(client, response.Operation.ID)
 }
 func logsCommand(arguments []string) error {
-	return logsCommandWithProfile(identity.SourceActiveProfile(), arguments)
+	active, err := identity.CompileTimeActiveProfile()
+	if err != nil {
+		return err
+	}
+	return logsCommandWithProfile(active, arguments)
 }
 
 func logsCommandWithProfile(active identity.ActiveProfile, arguments []string) error {

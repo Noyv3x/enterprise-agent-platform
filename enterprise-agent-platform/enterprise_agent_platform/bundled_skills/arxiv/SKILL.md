@@ -81,7 +81,7 @@ skill({
 
 ```text
 write_file({
-  "path":".ubitech/tools/search_arxiv.py",
+  "path":".agent-platform/tools/search_arxiv.py",
   "content":"<exact content returned by skill read>"
 })
 ```
@@ -90,7 +90,7 @@ write_file({
 
 ```text
 terminal({
-  "command":"python3 .ubitech/tools/search_arxiv.py 'retrieval augmented generation' --max 10 --sort date",
+  "command":"python3 .agent-platform/tools/search_arxiv.py 'retrieval augmented generation' --max 10 --sort date",
   "timeout_ms":60000
 })
 ```
@@ -98,10 +98,10 @@ terminal({
 The script uses only the Python standard library. It supports:
 
 ```text
-python3 .ubitech/tools/search_arxiv.py "topic words"
-python3 .ubitech/tools/search_arxiv.py --author "Author Name" --max 5
-python3 .ubitech/tools/search_arxiv.py --category cs.AI --sort date
-python3 .ubitech/tools/search_arxiv.py --id 2402.03300
+python3 .agent-platform/tools/search_arxiv.py "topic words"
+python3 .agent-platform/tools/search_arxiv.py --author "Author Name" --max 5
+python3 .agent-platform/tools/search_arxiv.py --category cs.AI --sort date
+python3 .agent-platform/tools/search_arxiv.py --id 2402.03300
 ```
 
 ## Citation and related-work data
