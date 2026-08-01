@@ -84,7 +84,7 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
-涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。重复压力门禁固定执行 12 轮、最多同时运行 2 个 Node 进程，并把每个进程内部的 `--test-concurrency` 固定为 `1`；它只能以这个有界并行放大测试自身已经确定性注入的竞态，不能靠占满双核 runner 制造 event-loop 调度饥饿。每个失败 worker 的完整 Node test 输出必须在 job 失败前回放，禁止用 `/dev/null` 隐去唯一诊断证据。
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。使用亚秒真实计时器的用例只在正常 Runtime test suite 中执行一次；Quality 门不得并发重复运行它们来模拟压力，因为共享 runner 调度会把测试阈值变成伪产品语义。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
 
 ## 前端
 
