@@ -444,7 +444,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(contract["stage"], "cleanup")
         self.assertEqual(
             contract["predecessor_generation"],
-            "3a6dd8c0107cec7f6cf8d1b8805b687fc1f3f1a3",
+            "d068bad16d995478024e80bc27f4d8d6cfbeaec1",
         )
         self.assertFalse(
             (
