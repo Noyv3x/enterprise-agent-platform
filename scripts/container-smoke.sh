@@ -581,7 +581,7 @@ for expected in \
   'python3 scripts/browser-control-compose-smoke.py' \
   'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
   'group: container-channel-main' \
-  'scripts/assemble_release_manifest.py' \
+  'python3 scripts/assemble_release_manifest.py' \
   'scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"' \
   'gh release upload "$release_tag" --repo "$GITHUB_REPOSITORY" "$stage/$asset"' \
   'gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest' \

@@ -97,6 +97,7 @@ Docker 空间达到预警阈值时，Manager 优先运行安全清理，再决�
 
 发布前至少验证：
 
+- 发布组装器由 `python3` 显式调用，不依赖源码文件的可执行位；
 - 全新数据根安装，其中 stable Manager 与 manifest 候选同摘要时不创建 activation；
 - 一个普通 Manager 不同摘要自更新在真实 user-systemd 下提交和回滚；
 - 多个正常任务跨过轮询周期时更新保持排队，空闲后自动继续；

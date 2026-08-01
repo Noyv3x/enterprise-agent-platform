@@ -1162,7 +1162,7 @@ jobs:
             "$stage/agent-platform-manager-linux-amd64.sha256"
           grep -Fx "${arm64_sha}  agent-platform-manager-linux-arm64" \
             "$stage/agent-platform-manager-linux-arm64.sha256"
-          scripts/assemble_release_manifest.py \
+          python3 scripts/assemble_release_manifest.py \
             --images "$stage/verified-managed-images.json" \
             --generation "$SOURCE_COMMIT" \
             --generated-at "$generated_at" \
