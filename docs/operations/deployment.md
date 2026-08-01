@@ -35,11 +35,9 @@ target-only 基线的默认位置：
 ~/.local/share/agent-platform/
 ```
 
-这里的 `~` 只能由当前 UID 在操作系统账户数据库中的唯一记录解析。fresh installer、Manager 默认 locator 和生成的 user-systemd unit 必须复用同一个账户 home 快照来派生 `~/.local/bin`、`~/.config`、`~/.config/systemd/user` 与 `~/.local/share`；忽略进程环境中的 `HOME`、`XDG_BIN_HOME`、`XDG_CONFIG_HOME` 和 `XDG_DATA_HOME`。账户记录缺失、重复、UID 不匹配、home 非绝对路径或路径不安全时，在创建安装对象前失败关闭。这样安装位置与 Manager 后续启动解析不会因调用者环境不同而分叉。
-
 这些名称是部署协议的技术身份，不是产品品牌。管理员设置的名称或标识图不得改变这里的路径、Manager 命令、systemd unit、Compose project、网络、容器、label、socket、环境变量、release asset 或数据库与 Sandbox identity。维护页与安装器等面向人的说明使用中性文案；运维命令仍须展示真实技术名称，不能用品牌别名掩盖实际操作对象。
 
-旧的 source 路径只作为已完成 Bridge→Cleanup 发布编排的历史审计输入，不是当前可发现路径或长期基线：
+旧的 source 路径只作为已完成的 source-profile/source-owner 发布与当前 Bridge 可发现的精确交接输入，不是长期基线：
 
 ```text
 ~/.local/bin/ubitech-manager
@@ -48,7 +46,7 @@ target-only 基线的默认位置：
 ~/.local/share/ubitech-agent/
 ```
 
-宿主 control socket 是唯一允许读取 ambient XDG 的默认路径：使用已经验证为规范绝对路径、当前 UID 所有、非符号链接且 owner-only 的 `XDG_RUNTIME_DIR`；该变量缺失时固定回退 `/run/user/<uid>`。socket 位于其下的 `agent-platform-manager/manager.sock`。user-systemd 进程不得尝试在宿主全局 `/run` 下创建目录。该宿主目录只在运行期间存在，并绑定到容器内固定路径 `/run/agent-platform-manager/manager.sock`。已完成的 Bridge preflight 曾把该规范绝对值写入历史 journal 并供 participant、ack、listener challenge、目标配置与 Compose mount 逐字节复用；这只是历史交接证据，不是当前 source 分流能力。容器内数据根固定为 `/var/lib/agent-platform`，secret mount 根固定为 `/run/secrets/agent-platform`；Compose project 与网络分别固定为 `agent-platform`、`agent-platform_core`，环境前缀为 `AGENT_PLATFORM_*`，ownership label 前缀为 `io.agent-platform.*`，Sandbox 容器前缀为 `agent-platform-sandbox-`，内部工作目录为 `.agent-platform`。这些目标值属于发布契约，仍然不能被管理员品牌配置改变。
+宿主 control socket 固定为部署用户 `XDG_RUNTIME_DIR` 下的 `agent-platform-manager/manager.sock`；source preflight 必须先把它解析为规范绝对路径，再把该唯一值写入 journal，participant、ack、listener challenge、目标配置与 Compose mount 都逐字节使用同一路径，不保留 `$XDG_RUNTIME_DIR/...` 形式的第二种身份。user-systemd 进程不得尝试在宿主全局 `/run` 下创建目录。该宿主目录只在运行期间存在，并绑定到容器内固定路径 `/run/agent-platform-manager/manager.sock`。容器内数据根固定为 `/var/lib/agent-platform`，secret mount 根固定为 `/run/secrets/agent-platform`；Compose project 与网络分别固定为 `agent-platform`、`agent-platform_core`，环境前缀为 `AGENT_PLATFORM_*`，ownership label 前缀为 `io.agent-platform.*`，Sandbox 容器前缀为 `agent-platform-sandbox-`，内部工作目录为 `.agent-platform`。这些目标值属于发布契约，仍然不能被管理员品牌配置改变。
 
 安装和运行 Manager 的 Unix 用户必须一致。容器内需要写用户数据的进程映射为同一 UID/GID；服务镜像需要专用 UID 时，Manager 只准备该服务明确的数据子目录，不递归改写整个数据根。
 
@@ -64,13 +62,11 @@ curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/d
 
 Manager 激活前的安装失败必须删除本次创建的配置、二进制、unit 和 Manager 状态根，使同一全新安装命令可以安全重试；不得留下会被下一次安装误判为既有数据的半成品。Manager 已成功激活后，后续容器 operation 失败由常驻 Manager 的 journal 和恢复命令接管，安装器不得越过该所有权边界删除状态。
 
-Manager 已激活但首次容器 operation 失败时，不得重跑安装脚本或删除数据根。修复日志指向的环境问题后，使用安装器报告的原始 manifest URL 执行 `agent-platform-manager install --config <manager.toml> --release-manifest-url <release.json>`；Manager 必须根据 journal 幂等继续或建立新 attempt。当前 target-only CLI 只接受普通 schema 2 install/update，不存在 source Manager 命令或 handoff 绕行入口。
+Manager 已激活但首次容器 operation 失败时，不得重跑安装脚本或删除数据根。修复日志指向的环境问题后，使用安装器报告的原始 manifest URL 执行 `agent-platform-manager install --config <manager.toml> --release-manifest-url <release.json>`；Manager 必须根据 journal 幂等继续或建立新 attempt。Bridge 期间既有 source 部署仍使用 journal 绑定的 source Manager 命令，不能把这里的 target 命令用于绕过 handoff。
 
-<a id="技术命名空间交接"></a>
+## 技术命名空间交接
 
-## Bridge→Cleanup 技术命名空间交接（历史证据）
-
-根据 [ADR 0004](../decisions/0004-configurable-branding-and-neutral-runtime-identity.md)，source-profile、source-owner、Bridge B 与 Cleanup C 发布均已完成。以下内容保留两发布交接的受控编排与审计事实，不描述当前 Manager 的运行职责；当前系统只运行上一节固定的 `agent-platform` target-only 基线，普通启动和更新不能重新触发交接。
+根据 [ADR 0004](../decisions/0004-configurable-branding-and-neutral-runtime-identity.md)，不触发迁移的 source-profile generation 与完整 source-owner generation 已完成；canonical contract 已把当前直接前任固定为最终 source-owner。当前只执行 Bridge B 与 Cleanup C 组成的两发布交接。目标是上一节固定的 `agent-platform` 命名空间，并由桥接 release 的签名清单再次绑定，不能取自管理员品牌字段或任意请求参数。
 
 源、目标技术身份必须按下表精确绑定；管理员品牌设置不参与映射：
 
@@ -88,11 +84,11 @@ Manager 已激活但首次容器 operation 失败时，不得重跑安装脚本�
 | 环境变量 / ownership label | `UBITECH_*`、`org.ubitech.agent.*` | `AGENT_PLATFORM_*`、`io.agent-platform.*` |
 | Sandbox / 内部工作目录 | `ubitech-sandbox-*`、`.ubitech` | `agent-platform-sandbox-*`、`.agent-platform` |
 
-历史 Bridge 发布由当时稳定运行的 source-owner Manager 唯一拥有，并以 source 二进制、unit、release asset 和数据根安全发现。source-owner release 当时只安装并演练 coordinator、owner-only handoff journal、跨重启持久 helper 和恢复入口，不创建 target unit、target root 或 target Docker 对象；Bridge release 的签名 `namespace_handoff` 描述符是该阶段唯一触发条件。它只在 Manager 为 `idle`、`maintenance=false`，且没有 active/finalize operation、Candidate、Activation、watchdog、活动 Sandbox 调用、浏览器接管或宿主执行时建立 journal。journal 绑定上表全部源与目标身份、当时 generation、桥接 artifact 摘要、数据库与 Runtime identity 摘要、初始 unit 启用状态、Docker 对象集合和每个单调阶段；这些对象现在仅是历史发布证据，Cleanup 后二进制不解析或执行它们。
+桥接发布由已经稳定运行的 source-owner Manager 唯一拥有，仍以 source 二进制、unit、release asset 和数据根被现役实例安全发现。source-owner release 本身只安装并演练 coordinator、owner-only handoff journal、跨重启持久 helper 和恢复入口，不创建 target unit、target root 或 target Docker 对象；桥接 release 的签名 `namespace_handoff` 描述符是唯一触发条件。它只能在 Manager 为 `idle`、`maintenance=false`，且没有 active/finalize operation、Candidate、Activation、watchdog、活动 Sandbox 调用、浏览器接管或宿主执行时建立 journal。journal 必须绑定上表全部源与目标身份、当前 generation、桥接 artifact 摘要、数据库与 Runtime identity 摘要、初始 unit 启用状态、Docker 对象集合和每个单调阶段；任何身份不一致都在产生副作用前永久拒绝。
 
-历史桥接 manifest 的顶层 Manager、Compose 和镜像目录属于 target；描述符的 source 侧单独逐字节绑定直接前任公开 release，target 侧逐字段等于顶层工件。target Compose 是签名工件而不是运行时转换模板：它只接受 `AGENT_PLATFORM_*` 环境，使用 `/var/lib/agent-platform`、`/run/secrets/agent-platform`、`/run/agent-platform-manager` 与 target project/network/labels，且必须在发布前以 target Driver 真实生成的环境完成 `docker compose config` 和核心启动。保留旧资产 basename 当时只服务 source Manager 的下载发现，不允许正文继续引用 source 路径。Bridge 阶段的 Platform、Runtime、Camoufox 和 Sandbox technical-profile selector 只接受 source/target 闭集并与数据 baseline、marker 和 Manager 注入身份交叉验证；环境变量本身不能让普通 source Manager 取得 target ownership。当前 target-only 产品树不包含这些 selector。
+桥接 manifest 的顶层 Manager、Compose 和镜像目录属于 target；描述符的 source 侧单独逐字节绑定直接前任公开 release，target 侧逐字段等于顶层工件。target Compose 是签名工件而不是运行时转换模板：它只接受 `AGENT_PLATFORM_*` 环境，使用 `/var/lib/agent-platform`、`/run/secrets/agent-platform`、`/run/agent-platform-manager` 与 target project/network/labels，且必须在发布前以 target Driver 真实生成的环境完成 `docker compose config` 和核心启动。保留旧资产 basename 只服务 source Manager 的下载发现，不允许正文继续引用 source 路径。Platform、Runtime、Camoufox 和 Sandbox 的 technical-profile selector 只接受 source/target 闭集并与数据 baseline、marker 和 Manager 注入身份交叉验证；环境变量本身不能让普通 source Manager 取得 target ownership。
 
-历史桥接曾按以下顺序执行，所有文件写入都使用 owner/type/link 校验、临时文件、fsync、原子 rename 和父目录 fsync。staging 到最终目录的发布必须使用 Linux no-replace 原子 rename，目标在校验后才出现也不得被覆盖；目标已存在、内核不支持或结果不明确时均失败关闭并保留证据，重放只能接受独立完整验证过的既有目标，禁止退化为可覆盖的 rename：
+桥接按以下顺序执行，所有文件写入都使用 owner/type/link 校验、临时文件、fsync、原子 rename 和父目录 fsync。staging 到最终目录的发布必须使用 Linux no-replace 原子 rename，目标在校验后才出现也不得被覆盖；目标已存在、内核不支持或结果不明确时均失败关闭并保留证据，重放只能接受独立完整验证过的既有目标，禁止退化为可覆盖的 rename：
 
 1. 在关闭准入前从 live source 配置闭世界派生 target placement：目标数据根固定为 source 数据根的同级 `agent-platform` 目录，因而自定义 `data_root` 不会退回环境默认盘；目标配置同样从实际 source XDG/config binding 派生。随后验证 target 路径不存在或是本事务创建的空 staging、源与目标位于允许的同文件系统，并按源逻辑大小、已分配块和目标镜像缺失量执行容量门禁。目标数据先写入 target 同级的 owner-only、事务绑定 staging，不能直接填充最终目录。
 2. 关闭业务准入，排空任务、审批、后台工具、浏览器接管和 Sandbox 调用；对 SQLite checkpoint 并建立可验证快照后停止 Platform、Runtime、Camoufox 和全部动态 Sandbox writer。writer-stop 证明必须独立枚举 Docker 的完整容器集合，逐个绑定 profile、Compose project/service、不可变镜像和精确 container id，并只在相关容器明确不存在或 `Running=false` 且 `Pid=0` 时成立；重复 service、同 project 未知容器、额外 profile writer、列表/inspect/daemon/权限/解析错误均属于 unknown 并失败关闭，不能把 health 的 `unavailable` 当作 stopped。source checkpoint 在任一 SQLite 写以前还必须按[Bridge leaf 绑定契约](../reference/data-layout.md#命名空间交接的数据变换)固定 `data/` 父目录与 `platform.db` inode，拒绝错误 owner/type/mode、符号链接和硬链接，并在 checkpoint 前后复核同一目录项；不能把 SQLite 路径 API 的剩余 TOCTOU 窗口误写为已完全消除。此后 source 数据根保持原样，作为唯一回滚证据；所有变换只发生在 target staging。
@@ -113,8 +109,6 @@ Manager 已激活但首次容器 operation 失败时，不得重跑安装脚本�
 Cleanup 与后续 target-baseline Manager 在没有 terminal handoff journal 时仍必须从编译期 canonical stage 选择 target profile；启动、自更新候选校验、finalize 恢复和 fresh install 使用同一个 target identity，不能调用 source 默认校验器。Bridge 二进制只有在已验证 source baseline 或 handoff journal 下使用 source；Cleanup 中不存在通过配置路径、环境或二进制 basename重新选择 source 的入口。安装器必须先读取并严格验证 release manifest：Bridge 拒绝 fresh install，schema 2 只下载中性 `agent-platform-manager-*` 工件并只创建 target 默认路径、配置和 unit。
 
 Cleanup 不是只把 canonical stage 从 `bridge` 改成 `cleanup`。该提交还必须物理删除 Manager/Platform/Runtime 中的 source profile、handoff coordinator/helper、source asset parser 与 source inventory，并把 Python 包/CLI、进程名和 Runtime 生成契约收缩到 target 所需字段。Bridge 已在发布 target 数据根前按数据布局契约原子改写三个精确登记的机器自有设置键（会话签名 secret 与两个 Telegram secret）；Cleanup 只接受中性键，不再执行二次迁移、双读或 source 回退。全新 target 数据库从一开始只写中性键。Cognee 既有 dataset 属于第三方持久数据身份，不能搜索替换；迁移部署保留其实际内部 dataset 并只在管理接口显示中性逻辑名称，全新 target 默认使用 `agent_platform_knowledge`。这些删除和中性基线验证必须在 Cleanup 专属测试与 source 名称扫描通过后才可签发 target 回执，不能依赖入口脚本隐藏仍可调用的 source 分支。
-
-Cleanup Manager 的生产 Go 命令树只保留 `manager/cmd/agent-platform-manager`。普通启动、更新、自更新、恢复、Sandbox 和宿主执行继续由该入口提供；`ubitech-manager`、`handoff-fs-helper`、release-transition/attestation 命令以及 handoff coordinator、participant、listener、transformer 和 source 路由包从生产树物理删除。Cleanup promotion 仍验证 Bridge 部署已经生成的签名回执，但 target Manager 不再持有签名私钥、签发新回执或解析 handoff journal；不得留下不可达命令、空壳包或按配置重新启用旧能力的分支。
 
 ## 唯一管理入口
 
@@ -154,6 +148,10 @@ takeover journal 落盘后，先禁用 Manager 主 unit 的自动启动并证明
 恢复 Manager 仍走标准 pending-activation 协议，但其预提交探针只检查核心 Platform/Runtime 与公网入口，不检查 Firecrawl 等能力服务；启动确认还必须证明 systemd MainPID 执行的文件与 stable 为同一 inode。只有 recovery watchdog 经过认证身份连续确认后，才按标准切换 `Previous=旧 Current`、`Current=recovery` 并清除 Candidate/Activation。recovery watchdog 的 commit 与 rollback 都必须先条件校验 state 中的 plan path、transaction id、mode、Candidate path/SHA 仍归自己所有；失去所有权的旧 watchdog 不得写 stable、state、plan 或重启服务。
 
 旧 activation 结算前失败保持原 state/stable；结算后任何失败统一回到登记 Current，不恢复已证明会循环的旧 Candidate，也不把失败的 recovery Candidate 留给普通 finalize 自动重激活。回滚先清空 Candidate/Activation、恢复 stable=Current、持久化 plan/journal 终态，再恢复主 unit enabled 并验证 Current 的 PID、inode、SHA 与轻量身份健康；终态写入和服务恢复之间中断时，同一命令只补做服务收敛。提交也必须在 `committed` plan/journal 落盘后幂等恢复主 unit enabled、启动登记 recovery Current 并验证其身份和 systemd 进程；主机重启后先行退出的候选不能让外部恢复只等待一个不存在的进程。若 recovery state 已原子提交为新 Current，但 plan 在终态 plan/journal 落盘前丢失或损坏，持有 takeover lock 的 watchdog 只能用最后验证的完整 plan 快照，在 state 精确匹配 recovery Current 且 stable 仍匹配 recovery SHA 时重建 `committed` plan 和 journal，不得误走回滚或再次移动 Current/Previous。恢复进程在 plan、intent、stable 替换、服务重启、watchdog 提交，或 Manager state 已提交但 Platform 已先完成 finalize 的边界中断时，同一不可变二进制和期望 hash 必须识别 `recover_current` 事务并只补齐缺失阶段，不能要求人工编辑 journal，也不能再次移动 Current/Previous。一次 recovery 已明确 `rolled_back` 后不得用同一终态 journal 暗中重开；应先诊断失败原因并使用新的已验证 recovery release 建立新事务。恢复成功后由原 `finalize_pending` 补完 reservation release，再恢复普通自动更新。
+
+若已经提交的 recovery Current 本身健康，但旧 Platform 仍卡在该 recovery journal 精确绑定的原 `finalize_pending` operation，允许另一份经运行文件 SHA-256 校验的 `recover-current` 二进制继续接管。这个例外只适用于 Manager state 精确等于 terminal `committed` recovery checkpoint、原 Candidate 与当前 manifest artifact 逐字节相同、recovery plan 已提交、原普通 plan 仍为同一事务标记的 `superseded_by_recovery`，且 Platform operation/manifest 身份没有变化的情况；它不把健康普通 Current 变成通用旁路更新入口。新 recovery 仍执行既有停止、替换、身份探测和原子 Current 登记协议，并把已提交 recovery Current 保留为直接 Previous。随后 generation barrier 可只读消费旧 terminal recovery 证明完成原 finalize，不修改或伪造旧普通 plan。
+
+这个接力在“旧 recovery Current 仍登记、stable 已替换为新 recovery、主 unit 已从新 inode 启动、外部命令尚未原子提交新 Current”的窗口仍必须可启动身份探针。仅当全局 recovery lock 确认由外部命令持有、旧 state 精确匹配 terminal `committed` journal、stable 与 `/proc/self/exe` 同一 SHA，且该 SHA 对应 `versions/recovery-<sha>/` 中同版本、同摘要的完整不可变工件和 metadata 时，启动门才返回 `external_recovery_probe`。该例外不适用于空闲锁、`rolled_back` journal、普通启动或不完整工件；探针仍只开放认证 `/v1/identity`，外部命令提交 state 并释放锁后才可按正常门禁晋升。
 
 Manager 主进程每次启动都必须在构造会创建宿主布局或 journal 的 application、处理 pending activation、恢复 operation、确认候选或绑定任何监听之前执行 recovery 所有权门禁。门禁以非阻塞方式取得全局 recovery flock，不能排队到所有权边界已变后继续；空闲锁一旦取得，必须作为 startup lease 跨越 application 构造、listener 建立和 pending activation 结算，并在每个边界重新验证后才释放，避免新的 `recover-current` 插入检查与副作用之间。持锁检查必须从 owner-only、非符号链接的状态根安全枚举 `recoveries/`；目录、journal 或配置对象的类型/owner 不安全，JSON 损坏，出现未知工件、多于一条非终态 journal，或 journal 与当前 state/stable/socket/token/unit 配置绑定不一致时全部失败关闭。已完整验证绑定和终态事实的 `committed`/`rolled_back` journal 可作为历史审计记录；后续合法 Current 可以替代 live transaction，且清理策略可删除旧 version、Platform operation 和 manifest 工件，但保留的 journal、recovery plan 与 superseded plan 本身仍须完整绑定。终态 superseded plan 若缺少 `candidate_path`、`platform_commit` 或两者同时缺少，必须视为不可验证的身份篡改并在零状态写入下拒绝启动，不能根据其它 journal 字段补全或推断。
 

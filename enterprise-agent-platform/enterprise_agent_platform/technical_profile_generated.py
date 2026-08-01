@@ -2,6 +2,29 @@
 from __future__ import annotations
 
 TECHNICAL_PROFILES: dict[str, dict[str, object]] = {
+    'source': {
+        'profile_id': 'ubitech-agent-v1',
+        'selector_environment_variable': 'UBITECH_TECHNICAL_PROFILE',
+        'deployment_mode_environment_variable': 'UBITECH_DEPLOYMENT_MODE',
+        'manager_socket_environment_variable': 'UBITECH_MANAGER_SOCKET',
+        'manager_token_file_environment_variable': 'UBITECH_MANAGER_TOKEN_FILE',
+        'host_data_root_environment_variable': 'UBITECH_HOST_DATA_ROOT',
+        'manager_environment_prefix': 'UBITECH',
+        'platform_environment_prefix': 'ENTERPRISE',
+        'default_data_root': None,
+        'default_manager_socket': '/run/ubitech-manager/manager.sock',
+        'default_manager_token_file': '/run/secrets/manager-token',
+        'database_baseline_name': 'ubitech-agent-container-baseline-v2',
+        'instance_lock_name': '.enterprise-platform.lock',
+        'scope_marker_name': '.ubitech-agent-scope.json',
+        'camofox_sidecar_name': '.ubitech-agent-runtime.json',
+        'workspace_internal_directory': '.ubitech',
+        'session_namespace': 'ubitech',
+        'session_cookie_name': 'enterprise_session',
+        'health_service': 'ubitech-agent-platform',
+        'search_health_service': 'ubitech-agent-search',
+        'agent_runtime_health_service': 'ubitech-agent-runtime',
+    },
     'target': {
         'profile_id': 'agent-platform-v1',
         'selector_environment_variable': 'AGENT_PLATFORM_TECHNICAL_PROFILE',

@@ -73,24 +73,42 @@ func TestPruneReleasesRemovesOnlyExpiredVerifiedUnprotectedGeneration(t *testing
 	}
 }
 
-func TestPruneReleasesUsesCompileTimeTargetProfileByDefault(t *testing.T) {
+func TestPruneReleasesConsumesSchemaV2OnlyWithTargetProfile(t *testing.T) {
 	root := t.TempDir()
 	now := time.Unix(20_000, 0).UTC()
 	id := strings.Repeat("d", 40)
-	path := writeReleaseWithSchema(t, root, id, now.Add(-2*time.Hour), "d", release.ManifestSchemaVersion)
-	pruner := &recordingImagePruner{}
+	path := writeReleaseWithSchema(t, root, id, now.Add(-2*time.Hour), "d", release.ManifestSchemaVersionV2)
+	sourcePruner := &recordingImagePruner{}
 	removed, err := PruneReleases(context.Background(), now, ReleasePolicy{
-		Root: root, Channel: "main", Retention: time.Hour, Images: pruner,
+		Root: root, Channel: "main", Retention: time.Hour, Images: sourcePruner,
 		RemovalGuard: acceptingRemovalGuard(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 1 || len(pruner.candidates) != 10 {
-		t.Fatalf("maintenance did not consume exact current set: removed=%d images=%#v", removed, pruner.candidates)
+	if removed != 0 || len(sourcePruner.candidates) != 0 {
+		t.Fatalf("source maintenance consumed schema v2: removed=%d images=%#v", removed, sourcePruner.candidates)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("source maintenance changed target-only release: %v", err)
+	}
+	target, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPruner := &recordingImagePruner{}
+	removed, err = PruneReleases(context.Background(), now, ReleasePolicy{
+		Root: root, Channel: "main", Profile: target, Retention: time.Hour, Images: targetPruner,
+		RemovalGuard: acceptingRemovalGuard(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 || len(targetPruner.candidates) != 10 {
+		t.Fatalf("target maintenance did not consume exact schema-v2 set: removed=%d images=%#v", removed, targetPruner.candidates)
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
-		t.Fatalf("current release remains: %v", err)
+		t.Fatalf("target schema-v2 release remains: %v", err)
 	}
 }
 
@@ -434,7 +452,7 @@ func TestPruneReleasesRetainsGenerationWhenAnyImageCannotBeRemoved(t *testing.T)
 	root := t.TempDir()
 	now := time.Unix(20_000, 0).UTC()
 	path := writeRelease(t, root, strings.Repeat("e", 40), now.Add(-2*time.Hour), "e")
-	verified, err := verifyRelease(path, strings.Repeat("e", 40), "main", identity.CompileTimeActiveProfile())
+	verified, err := verifyRelease(path, strings.Repeat("e", 40), "main", identity.SourceActiveProfile())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +538,7 @@ func TestPruneReleasesRemovesOnlyRecognizedExpiredStaging(t *testing.T) {
 }
 
 func writeRelease(t *testing.T, root, id string, generatedAt time.Time, digestDigit string) string {
-	return writeReleaseWithSchema(t, root, id, generatedAt, digestDigit, release.ManifestSchemaVersion)
+	return writeReleaseWithSchema(t, root, id, generatedAt, digestDigit, release.ManifestSchemaVersionV1)
 }
 
 func writeReleaseWithSchema(t *testing.T, root, id string, generatedAt time.Time, digestDigit string, schemaVersion int) string {
@@ -531,9 +549,15 @@ func writeReleaseWithSchema(t *testing.T, root, id string, generatedAt time.Time
 		releasetest.WithCompose(compose),
 		releasetest.WithImageDigest(strings.Repeat(digestDigit, 64)),
 	}
-	manifest := releasetest.NewTarget(id, options...).Manifest
-	manifest.SchemaVersion = schemaVersion
-	manifest.ProtocolVersion = schemaVersion
+	var manifest release.Manifest
+	switch schemaVersion {
+	case release.ManifestSchemaVersionV1:
+		manifest = releasetest.NewSource(id, options...).Manifest
+	case release.ManifestSchemaVersionV2:
+		manifest = releasetest.NewTarget(id, options...).Manifest
+	default:
+		t.Fatalf("unsupported positive release fixture schema %d", schemaVersion)
+	}
 	data, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)

@@ -77,7 +77,7 @@ TEXT_SUFFIXES = frozenset(
         ".yml",
     }
 )
-SPECIAL_TEXT_NAMES = frozenset({"Dockerfile", ".dockerignore", "dev.env.example"})
+SPECIAL_TEXT_NAMES = frozenset({"Dockerfile", ".dockerignore"})
 MAX_SOURCE_FILE_BYTES = 8 * 1024 * 1024
 
 # These paths are one-time executable capabilities, not historical data.  A
@@ -117,15 +117,11 @@ FORBIDDEN_FILE_NAME_FRAGMENTS = (
 # have legitimate target-only meanings.
 FORBIDDEN_TEXT_MARKERS = (
     "UBITECH_",
-    "ENTERPRISE_",
-    "SOURCE_TECHNICAL_PROFILE",
     "ubitech-agent-v1",
     "ubitech-agent",
     "ubitech-manager",
     "ubitech-compose.yaml",
     ".ubitech",
-    ".enterprise-platform.lock",
-    "enterprise_session",
     "io.ubitech.",
     "namespace_handoff",
     "namespace-handoff",

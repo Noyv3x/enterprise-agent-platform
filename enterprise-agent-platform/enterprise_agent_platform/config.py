@@ -13,7 +13,7 @@ from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
 )
 from .technical_profile import (
-    TARGET_TECHNICAL_PROFILE,
+    SOURCE_TECHNICAL_PROFILE,
     TechnicalProfile,
     select_technical_profile,
 )
@@ -63,7 +63,7 @@ class PlatformConfig:
     manager_socket: Path | None = None
     manager_token_file: Path | None = None
     host_data_root: Path | None = None
-    technical_profile: TechnicalProfile = TARGET_TECHNICAL_PROFILE
+    technical_profile: TechnicalProfile = SOURCE_TECHNICAL_PROFILE
 
     @property
     def db_path(self) -> Path:
@@ -103,7 +103,7 @@ class PlatformConfig:
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
-        del base_dir
+        base = base_dir or Path.cwd()
         profile = select_technical_profile()
         if (
             os.getenv(profile.deployment_mode_environment_variable, "")
@@ -128,23 +128,28 @@ class PlatformConfig:
         ).expanduser()
         if not manager_socket.is_absolute() or not manager_token_file.is_absolute():
             raise ValueError("Manager socket and token file paths must be absolute")
-        data_name = "AGENT_PLATFORM_DATA"
-        data_dir = Path(os.getenv(data_name, profile.default_data_root)).expanduser()
-        exact_data_root = Path(os.path.abspath(os.fspath(data_dir)))
-        if exact_data_root != profile.default_data_root:
-            raise ValueError(
-                f"{data_name} must be {profile.default_data_root}"
-            )
-        if manager_socket != profile.default_manager_socket:
-            raise ValueError(
-                f"{profile.manager_socket_environment_variable} must be "
-                f"{profile.default_manager_socket}"
-            )
-        if manager_token_file != profile.default_manager_token_file:
-            raise ValueError(
-                f"{profile.manager_token_file_environment_variable} must be "
-                f"{profile.default_manager_token_file}"
-            )
+        data_name = profile.environment_variable(
+            "ENTERPRISE_PLATFORM_DATA",
+            target_name="AGENT_PLATFORM_DATA",
+        )
+        data_default = profile.default_data_root or (base / "data")
+        data_dir = Path(os.getenv(data_name, data_default)).expanduser()
+        if profile.is_target:
+            exact_data_root = Path(os.path.abspath(os.fspath(data_dir)))
+            if exact_data_root != profile.default_data_root:
+                raise ValueError(
+                    f"{data_name} must be {profile.default_data_root} for the target profile"
+                )
+            if manager_socket != profile.default_manager_socket:
+                raise ValueError(
+                    f"{profile.manager_socket_environment_variable} must be "
+                    f"{profile.default_manager_socket} for the target profile"
+                )
+            if manager_token_file != profile.default_manager_token_file:
+                raise ValueError(
+                    f"{profile.manager_token_file_environment_variable} must be "
+                    f"{profile.default_manager_token_file} for the target profile"
+                )
         host_data_root_value = os.getenv(
             profile.host_data_root_environment_variable, ""
         ).strip()
@@ -157,104 +162,109 @@ class PlatformConfig:
             raise ValueError(
                 f"{profile.host_data_root_environment_variable} must be absolute"
             )
-        host_name = "AGENT_PLATFORM_HOST"
-        port_name = "AGENT_PLATFORM_PORT"
+        host_name = profile.environment_variable(
+            "ENTERPRISE_PLATFORM_HOST", target_name="AGENT_PLATFORM_HOST"
+        )
+        port_name = profile.environment_variable(
+            "ENTERPRISE_PLATFORM_PORT", target_name="AGENT_PLATFORM_PORT"
+        )
         host = os.getenv(host_name, "127.0.0.1")
         port = _env_int(port_name, 8765, minimum=1, maximum=65535)
         default_public = f"http://{host}:{port}"
-        session_secret_name = "AGENT_PLATFORM_SESSION_SECRET"
+        env_name = profile.environment_variable
+        session_secret_name = env_name("ENTERPRISE_SESSION_SECRET")
         token_secret = os.getenv(session_secret_name) or secrets.token_urlsafe(32)
         return cls(
             data_dir=data_dir,
             host=host,
             port=port,
             public_base_url=os.getenv(
-                "AGENT_PLATFORM_PUBLIC_BASE_URL", default_public
+                env_name("ENTERPRISE_PUBLIC_BASE_URL"), default_public
             ).rstrip("/"),
             token_secret=token_secret,
             token_ttl_seconds=_env_int(
-                "AGENT_PLATFORM_SESSION_TTL_SECONDS",
+                env_name("ENTERPRISE_SESSION_TTL_SECONDS"),
                 8 * 60 * 60,
                 minimum=1,
             ),
-            agent_tool_token=os.getenv("AGENT_PLATFORM_AGENT_TOOL_TOKEN"),
+            agent_tool_token=os.getenv(env_name("ENTERPRISE_AGENT_TOOL_TOKEN")),
             knowledge_backend=os.getenv(
-                "AGENT_PLATFORM_KB_BACKEND", "hybrid"
+                env_name("ENTERPRISE_KB_BACKEND"), "hybrid"
             ).strip().lower()
             or "hybrid",
             cognee_dataset=os.getenv(
-                "AGENT_PLATFORM_COGNEE_DATASET", "agent_platform_knowledge"
+                env_name("ENTERPRISE_COGNEE_DATASET"), "enterprise_knowledge"
             ),
             cognee_ingest_background=os.getenv(
-                "AGENT_PLATFORM_COGNEE_INGEST_BACKGROUND", "1"
+                env_name("ENTERPRISE_COGNEE_INGEST_BACKGROUND"), "1"
             ).strip().lower()
             in {"1", "true", "yes", "on"},
             runtime_startup_wait_seconds=_env_float(
-                "AGENT_PLATFORM_RUNTIME_STARTUP_WAIT_SECONDS",
+                env_name("ENTERPRISE_RUNTIME_STARTUP_WAIT_SECONDS"),
                 8.0,
                 minimum=0.0,
             ),
             camofox_url=os.getenv(
-                "AGENT_PLATFORM_CAMOFOX_URL",
+                env_name("ENTERPRISE_CAMOFOX_URL"),
                 "http://camofox:9377",
             ).strip().rstrip("/"),
             firecrawl_api_url=os.getenv(
-                "AGENT_PLATFORM_FIRECRAWL_API_URL",
+                env_name("ENTERPRISE_FIRECRAWL_API_URL"),
                 "http://firecrawl-api:3002",
             ).strip().rstrip("/"),
             searxng_api_url=os.getenv(
-                "AGENT_PLATFORM_SEARXNG_API_URL",
+                env_name("ENTERPRISE_SEARXNG_API_URL"),
                 "http://searxng:8080",
             ).strip().rstrip("/"),
             searxng_timeout_seconds=_env_float(
-                "AGENT_PLATFORM_SEARXNG_TIMEOUT_SECONDS",
+                env_name("ENTERPRISE_SEARXNG_TIMEOUT_SECONDS"),
                 20.0,
                 minimum=1.0,
                 maximum=120.0,
             ),
             allow_insecure_bootstrap_password=_env_bool(
-                "AGENT_PLATFORM_ALLOW_DEFAULT_ADMIN_PASSWORD", False
+                env_name("ENTERPRISE_ALLOW_DEFAULT_ADMIN_PASSWORD"), False
             ),
             trust_forwarded_headers=_env_bool(
-                "AGENT_PLATFORM_TRUSTED_PROXY", False
+                env_name("ENTERPRISE_TRUSTED_PROXY"), False
             ),
             telegram_enabled=_env_bool(
-                "AGENT_PLATFORM_TELEGRAM_ENABLED", False
+                env_name("ENTERPRISE_TELEGRAM_ENABLED"), False
             ),
             telegram_bot_token=os.getenv(
-                "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN", ""
+                env_name("ENTERPRISE_TELEGRAM_BOT_TOKEN"), ""
             ).strip(),
             telegram_bot_username=os.getenv(
-                "AGENT_PLATFORM_TELEGRAM_BOT_USERNAME", ""
+                env_name("ENTERPRISE_TELEGRAM_BOT_USERNAME"), ""
             ).strip().lstrip("@"),
             telegram_webhook_secret=os.getenv(
-                "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET", ""
+                env_name("ENTERPRISE_TELEGRAM_WEBHOOK_SECRET"), ""
             ).strip(),
             telegram_polling=_env_bool(
-                "AGENT_PLATFORM_TELEGRAM_POLLING", True
+                env_name("ENTERPRISE_TELEGRAM_POLLING"), True
             ),
             agent_runtime_url=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_URL",
+                env_name("ENTERPRISE_AGENT_RUNTIME_URL"),
                 "http://agent-runtime:8766",
             ).strip().rstrip("/"),
             agent_runtime_token=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_TOKEN", ""
+                env_name("ENTERPRISE_AGENT_RUNTIME_TOKEN"), ""
             ).strip(),
             agent_runtime_model=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_MODEL", "gpt-5.5"
+                env_name("ENTERPRISE_AGENT_RUNTIME_MODEL"), "gpt-5.5"
             ).strip()
             or "gpt-5.5",
             agent_runtime_provider=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_PROVIDER", "openai-codex"
+                env_name("ENTERPRISE_AGENT_RUNTIME_PROVIDER"), "openai-codex"
             ).strip().lower() or "openai-codex",
             agent_runtime_idle_timeout_seconds=_env_float(
-                RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
+                env_name(RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE),
                 float(RUN_IDLE_TIMEOUT_DEFAULT_SECONDS),
                 minimum=float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
                 maximum=float(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS),
             ),
             platform_internal_url=os.getenv(
-                "AGENT_PLATFORM_PLATFORM_INTERNAL_URL",
+                env_name("ENTERPRISE_PLATFORM_INTERNAL_URL"),
                 "http://platform:8765",
             ).strip().rstrip("/"),
             manager_socket=manager_socket,

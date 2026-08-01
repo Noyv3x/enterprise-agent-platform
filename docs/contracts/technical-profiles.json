@@ -1,6 +1,67 @@
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "profiles": {
+    "source": {
+      "profile_id": "ubitech-agent-v1",
+      "manager": {
+        "binary": "ubitech-manager",
+        "unit": "ubitech-agent-manager.service",
+        "config_directory": "ubitech-agent",
+        "config_file": "manager.toml",
+        "data_directory": "ubitech-agent",
+        "state_directory": "manager",
+        "data_root_socket_path": "manager/control/manager.sock",
+        "runtime_socket_path": null,
+        "default_socket_path": "/run/ubitech-manager/manager.sock",
+        "default_token_file": "/run/secrets/manager-token"
+      },
+      "container": {
+        "data_root": "/var/lib/ubitech-agent",
+        "secret_root": "/run/secrets/ubitech",
+        "control_socket_path": "/run/ubitech-manager/manager.sock"
+      },
+      "gateway": {
+        "status_path": "/__ubitech/status",
+        "health_path": "/__ubitech/health"
+      },
+      "compose": {
+        "project": "ubitech-agent",
+        "core_network": "ubitech-agent_core"
+      },
+      "environment": {
+        "manager_prefix": "UBITECH",
+        "platform_prefix": "ENTERPRISE",
+        "keys": {
+          "technical_profile": "UBITECH_TECHNICAL_PROFILE",
+          "deployment_mode": "UBITECH_DEPLOYMENT_MODE",
+          "manager_socket": "UBITECH_MANAGER_SOCKET",
+          "manager_token_file": "UBITECH_MANAGER_TOKEN_FILE",
+          "host_data_root": "UBITECH_HOST_DATA_ROOT"
+        }
+      },
+      "labels": {
+        "prefix": "org.ubitech.agent",
+        "sandbox_container_prefix": "ubitech-sandbox-",
+        "migration_container_prefix": "ubitech-migration-",
+        "watchdog_unit_prefix": "ubitech-agent-manager-watchdog-",
+        "recovery_watchdog_unit_prefix": "ubitech-agent-manager-watchdog-current-recovery-"
+      },
+      "workspace": {
+        "internal_directory": ".ubitech",
+        "scope_marker": ".ubitech-agent-scope.json"
+      },
+      "platform": {
+        "default_data_root": null,
+        "database_baseline": "ubitech-agent-container-baseline-v2",
+        "instance_lock": ".enterprise-platform.lock",
+        "camofox_sidecar": ".ubitech-agent-runtime.json",
+        "session_namespace": "ubitech",
+        "session_cookie": "enterprise_session",
+        "health_service": "ubitech-agent-platform",
+        "search_health_service": "ubitech-agent-search",
+        "agent_runtime_health_service": "ubitech-agent-runtime"
+      }
+    },
     "target": {
       "profile_id": "agent-platform-v1",
       "manager": {
@@ -10,6 +71,7 @@
         "config_file": "manager.toml",
         "data_directory": "agent-platform",
         "state_directory": "manager",
+        "data_root_socket_path": null,
         "runtime_socket_path": "agent-platform-manager/manager.sock",
         "default_socket_path": "/run/agent-platform-manager/manager.sock",
         "default_token_file": "/run/secrets/agent-platform/manager-token"

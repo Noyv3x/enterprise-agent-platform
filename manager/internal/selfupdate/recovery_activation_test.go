@@ -24,7 +24,6 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
 type activationTakeoverRunner struct {
@@ -168,10 +167,10 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 			t.Fatal(err)
 		}
 	}
-	currentPath := filepath.Join(currentDir, "agent-platform-manager")
-	candidatePath := filepath.Join(candidateDir, "agent-platform-manager")
-	fixture.stablePath = filepath.Join(binDir, "agent-platform-manager")
-	fixture.executablePath = filepath.Join(downloadDir, "agent-platform-manager")
+	currentPath := filepath.Join(currentDir, "ubitech-manager")
+	candidatePath := filepath.Join(candidateDir, "ubitech-manager")
+	fixture.stablePath = filepath.Join(binDir, "ubitech-manager")
+	fixture.executablePath = filepath.Join(downloadDir, "ubitech-manager")
 	for path, data := range map[string][]byte{
 		currentPath:            fixture.currentBinary,
 		candidatePath:          fixture.candidateBinary,
@@ -205,7 +204,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		InstallPath:      fixture.stablePath,
 		SocketPath:       "",
 		ControlTokenFile: fixture.tokenPath,
-		UnitName:         "agent-platform-manager.service",
+		UnitName:         "ubitech-agent-manager.service",
 		CandidateVersion: fixture.candidateCommit,
 		CandidateSHA:     fixture.candidateSHA,
 		CandidatePath:    candidatePath,
@@ -235,13 +234,23 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		UpdatedAt: completedAt,
 	}
 
-	fixture.originalManifest = releasetest.NewTarget(
-		fixture.candidateCommit,
-		releasetest.WithGeneratedAt(createdAt),
-		releasetest.WithManagerBinary("amd64", fixture.candidateBinary),
-		releasetest.WithManagerBinary("arm64", fixture.candidateBinary),
-	).Manifest
-	images := fixture.originalManifest.Images
+	images := activationTakeoverImages()
+	fixture.originalManifest = release.Manifest{
+		SchemaVersion:         contract.SchemaVersion,
+		Channel:               contract.ReleaseChannel,
+		SourceCommit:          fixture.candidateCommit,
+		GeneratedAt:           createdAt,
+		ProtocolVersion:       contract.SchemaVersion,
+		DatabaseSchemaVersion: contract.DatabaseSchemaVersion,
+		Manager: release.ManagerRelease{
+			Version: fixture.candidateCommit,
+			Artifacts: map[string]release.Artifact{
+				runtime.GOARCH: {URL: "http://127.0.0.1/manager", SHA256: fixture.candidateSHA},
+			},
+		},
+		Compose: release.Artifact{URL: "http://127.0.0.1/compose", SHA256: strings.Repeat("a", 64)},
+		Images:  images,
+	}
 	rollbackSnapshot := filepath.Join(stateDir, "backups", "before-X")
 	fixture.originalPlatform = model.NewState(createdAt)
 	fixture.originalPlatform.Generation = 43898
@@ -334,7 +343,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		InstallPath:              fixture.stablePath,
 		SocketPath:               socketPath,
 		ControlTokenFile:         fixture.tokenPath,
-		UnitName:                 "agent-platform-manager.service",
+		UnitName:                 "ubitech-agent-manager.service",
 		RunningVersion:           fixture.recoveryCommit,
 		Runner:                   fixture.runner,
 		Now:                      func() time.Time { return completedAt.Add(time.Second) },
@@ -372,7 +381,7 @@ func newActivationTakeoverFixture(t *testing.T) *activationTakeoverFixture {
 		defer fixture.mu.Unlock()
 		fixture.watchdogChecks++
 		if unit != testTechnicalProfile.RecoveryWatchdogUnitPrefix+fixture.recoverySHA[:12] ||
-			immutablePath != filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.recoverySHA[:12], "agent-platform-manager") ||
+			immutablePath != filepath.Join(fixture.manager.Root, "versions", "recovery-"+fixture.recoverySHA[:12], "ubitech-manager") ||
 			expectedSHA != fixture.recoverySHA || planPath != fixture.manager.currentRecoveryPlanPath(fixture.candidateCommit, fixture.recoverySHA) {
 			return errors.New("unexpected recovery watchdog process identity")
 		}
@@ -565,6 +574,199 @@ func TestRecoverCurrentTakesOverExactStuckActivationThroughWatchdogCommit(t *tes
 	fixture.mu.Unlock()
 	if processChecks < 2 || watchdogChecks < 2 || fixture.runner.countCommand("systemd-run") != 1 {
 		t.Fatalf("recovery did not prove process/watchdog ownership: processChecks=%d watchdogChecks=%d calls=%#v", processChecks, watchdogChecks, fixture.runner.snapshot())
+	}
+}
+
+func committedSameByteRecoveryFixture(t *testing.T) *activationTakeoverFixture {
+	t.Helper()
+	fixture := newActivationTakeoverFixture(t)
+	fixture.recoveryCommit = fixture.candidateCommit
+	fixture.manager.RunningVersion = fixture.candidateCommit
+	fixture.recoveryBinary = append([]byte(nil), fixture.candidateBinary...)
+	fixture.recoverySHA = fixture.candidateSHA
+	if err := atomicfile.WriteFile(fixture.executablePath, fixture.recoveryBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.recoverySHA); err != nil {
+		t.Fatalf("commit same-byte recovery: %v", err)
+	}
+	return fixture
+}
+
+func TestActivationCommittedAcceptsExactTerminalSameByteRecoveryWithoutRewritingOriginalPlan(t *testing.T) {
+	fixture := committedSameByteRecoveryFixture(t)
+	before := activationTakeoverFileSHA(t, fixture.oldPlanPath)
+	committed, err := fixture.manager.ActivationCommitted(fixture.originalManifest)
+	if err != nil || !committed {
+		t.Fatalf("terminal recovery barrier = committed %v, err %v", committed, err)
+	}
+	if after := activationTakeoverFileSHA(t, fixture.oldPlanPath); after != before {
+		t.Fatalf("terminal recovery barrier rewrote superseded plan: before=%s after=%s", before, after)
+	}
+}
+
+func TestActivationCommittedRejectsIncompleteTerminalRecoveryEvidence(t *testing.T) {
+	tests := map[string]func(*testing.T, *activationTakeoverFixture){
+		"platform left finalize boundary": func(t *testing.T, fixture *activationTakeoverFixture) {
+			state := fixture.originalPlatform
+			state.Maintenance = false
+			state.PublicState = model.StateIdle
+			activationTakeoverWriteJSON(t, fixture.platformPath, state)
+		},
+		"recovery plan is not committed": func(t *testing.T, fixture *activationTakeoverFixture) {
+			journal, exists, err := fixture.manager.readRecoveryTakeoverJournal(fixture.manager.recoveryTakeoverJournalPath(fixture.candidateCommit, fixture.candidateSHA))
+			if err != nil || !exists {
+				t.Fatalf("read recovery journal: exists=%v err=%v", exists, err)
+			}
+			_, plan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Status = "acknowledged"
+			activationTakeoverWriteJSON(t, journal.RecoveryPlanPath, plan)
+		},
+		"superseded plan lost transaction": func(t *testing.T, fixture *activationTakeoverFixture) {
+			_, plan, err := readRecoveryActivationPlan(fixture.oldPlanPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan.Error = "unbound supersession"
+			activationTakeoverWriteJSON(t, fixture.oldPlanPath, plan)
+		},
+		"stable no longer matches Current": func(t *testing.T, fixture *activationTakeoverFixture) {
+			if err := atomicfile.WriteFile(fixture.stablePath, []byte("tampered stable\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := committedSameByteRecoveryFixture(t)
+			before := activationTakeoverFileSHA(t, fixture.oldPlanPath)
+			mutate(t, fixture)
+			committed, err := fixture.manager.ActivationCommitted(fixture.originalManifest)
+			if err == nil || committed {
+				t.Fatalf("incomplete recovery evidence was accepted: committed=%v err=%v", committed, err)
+			}
+			if name != "superseded plan lost transaction" {
+				if after := activationTakeoverFileSHA(t, fixture.oldPlanPath); after != before {
+					t.Fatalf("rejected recovery evidence rewrote superseded plan: before=%s after=%s", before, after)
+				}
+			}
+		})
+	}
+}
+
+func committedRecoveryDirectSuccessorFixture(t *testing.T) *activationTakeoverFixture {
+	t.Helper()
+	fixture := committedSameByteRecoveryFixture(t)
+	previousRecoverySHA := fixture.recoverySHA
+	nextBinary := []byte("checksum-verified-follow-up-recovery\n")
+	nextSHA := activationTakeoverSHA(nextBinary)
+	if err := atomicfile.WriteFile(fixture.executablePath, nextBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fixture.recoveryBinary = nextBinary
+	fixture.recoverySHA = nextSHA
+	originalHook := fixture.runner.hook
+	fixture.runner.hook = func(name string, arguments []string) error {
+		if name == "systemctl" && len(arguments) >= 3 && arguments[0] == "--user" {
+			switch arguments[1] {
+			case "stop":
+				fixture.identity.set(false, "", "")
+				return nil
+			case "start":
+				fixture.identity.set(true, fixture.recoveryCommit, nextSHA)
+				return nil
+			}
+		}
+		return originalHook(name, arguments)
+	}
+	fixture.manager.RecoveryProcessVerifier = func(_ context.Context, unit, stable, expectedSHA string) error {
+		if unit != fixture.manager.UnitName || stable != fixture.stablePath ||
+			(expectedSHA != previousRecoverySHA && expectedSHA != nextSHA) || !binaryMatches(stable, expectedSHA) {
+			return errors.New("unexpected recovered Manager process identity")
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, nextSHA); err != nil {
+		t.Fatalf("replace healthy committed recovery: %v", err)
+	}
+	return fixture
+}
+
+func TestRecoverCurrentAllowsHealthyCommittedRecoveryDirectSuccessorAndBarrierRecognizesIt(t *testing.T) {
+	fixture := committedRecoveryDirectSuccessorFixture(t)
+	state := activationTakeoverReadState(fixture.statePath)
+	if state.Current == nil || state.Current.SHA256 != fixture.recoverySHA || state.Previous == nil || state.Previous.SHA256 != fixture.candidateSHA {
+		t.Fatalf("follow-up recovery lost the direct recovery chain: %#v", state)
+	}
+	committed, err := fixture.manager.ActivationCommitted(fixture.originalManifest)
+	if err != nil || !committed {
+		t.Fatalf("direct recovery successor barrier = committed %v, err %v", committed, err)
+	}
+}
+
+func TestActivationCommittedRejectsTamperedDirectRecoverySuccessor(t *testing.T) {
+	tests := map[string]func(*testing.T, *activationTakeoverFixture, *State){
+		"Previous path": func(_ *testing.T, fixture *activationTakeoverFixture, state *State) {
+			state.Previous.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "ubitech-manager")
+		},
+		"Previous hash": func(_ *testing.T, _ *activationTakeoverFixture, state *State) {
+			state.Previous.SHA256 = strings.Repeat("e", 64)
+		},
+		"Current path": func(_ *testing.T, fixture *activationTakeoverFixture, state *State) {
+			state.Current.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "ubitech-manager")
+		},
+		"Current hash": func(_ *testing.T, _ *activationTakeoverFixture, state *State) {
+			state.Current.SHA256 = strings.Repeat("e", 64)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := committedRecoveryDirectSuccessorFixture(t)
+			state := activationTakeoverReadState(fixture.statePath)
+			mutate(t, fixture, &state)
+			activationTakeoverWriteJSON(t, fixture.statePath, state)
+			if committed, err := fixture.manager.ActivationCommitted(fixture.originalManifest); err == nil || committed {
+				t.Fatalf("tampered successor was accepted: committed=%v err=%v", committed, err)
+			}
+		})
+	}
+	t.Run("operation bytes", func(t *testing.T) {
+		fixture := committedRecoveryDirectSuccessorFixture(t)
+		operation := fixture.originalOperation
+		operation.Error = "changed after recovery commit"
+		activationTakeoverWriteJSON(t, fixture.operationPath, operation)
+		if committed, err := fixture.manager.ActivationCommitted(fixture.originalManifest); err == nil || committed {
+			t.Fatalf("changed operation evidence was accepted: committed=%v err=%v", committed, err)
+		}
+	})
+}
+
+func TestRecoverCurrentRejectsHealthyCommittedRecoveryWhenFinalizeOperationChanged(t *testing.T) {
+	fixture := committedSameByteRecoveryFixture(t)
+	operation := fixture.originalOperation
+	operation.Error = "changed after recovery commit"
+	activationTakeoverWriteJSON(t, fixture.operationPath, operation)
+	nextBinary := []byte("next recovery must not be installed\n")
+	nextSHA := activationTakeoverSHA(nextBinary)
+	if err := atomicfile.WriteFile(fixture.executablePath, nextBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := len(fixture.runner.snapshot())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, nextSHA)
+	if err == nil || !strings.Contains(err.Error(), "normal update path") {
+		t.Fatalf("changed finalize operation healthy recovery result = %v", err)
+	}
+	if after := len(fixture.runner.snapshot()); after != before {
+		t.Fatalf("rejected healthy recovery changed service state: before=%d after=%d", before, after)
 	}
 }
 
@@ -2059,7 +2261,17 @@ func activationTakeoverSHA(data []byte) string {
 }
 
 func activationTakeoverImages() map[string]string {
-	return releasetest.NewTarget(strings.Repeat("a", 40)).Manifest.Images
+	names := []string{
+		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis",
+		"firecrawl-rabbitmq", "handoff-fs-helper",
+	}
+	images := make(map[string]string, len(names))
+	for index, name := range names {
+		digit := "abcdef0123456789"[index%16]
+		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat(string(digit), 64)
+	}
+	return images
 }
 
 func activationTakeoverArtifacts(source map[string]release.Artifact) map[string]release.Artifact {

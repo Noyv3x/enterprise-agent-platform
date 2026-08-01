@@ -29,10 +29,22 @@ const (
 	recoveryIdentityChecks = 7
 )
 
-// RecoverCurrent is the deliberately external escape hatch for a Current
-// Manager which cannot stay alive long enough to self-update. Normal updates
-// use Prepare/Activate and the independent watchdog.
-func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformStatePath, expectedSHA256 string) error {
+// RecoverCurrentWithAuthorityTransfer acquires recovery.lock while the caller
+// still owns its retained handoff observation. transfer must re-read and close
+// that same observation; only after it succeeds may recovery proceed while
+// holding recovery.lock alone. This is the deliberately external escape hatch
+// for a Current Manager which cannot stay alive long enough to self-update;
+// normal updates use Prepare/Activate and the independent watchdog. The
+// mandatory callback makes the global handoff -> recovery lock order part of
+// the production API rather than a caller convention.
+func (m *Manager) RecoverCurrentWithAuthorityTransfer(
+	ctx context.Context,
+	executablePath, platformStatePath, expectedSHA256 string,
+	transfer func() error,
+) error {
+	if transfer == nil {
+		return errors.New("external recovery requires a retained handoff authority transfer")
+	}
 	if !validSHA256(expectedSHA256) {
 		return errors.New("expected Manager SHA-256 must be 64 lowercase hexadecimal characters")
 	}
@@ -98,6 +110,12 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	}
 	if !pathWithin(filepath.Join(m.Root, "versions"), oldCurrent.Path) {
 		return errors.New("registered Current Manager path is outside the Manager versions directory")
+	}
+	if transfer != nil {
+		if err := transfer(); err != nil {
+			return fmt.Errorf("transfer handoff authority to external recovery ownership: %w", err)
+		}
+		transfer = nil
 	}
 	activationRequest := recoveryActivationRequest{
 		executablePath:    executablePath,
@@ -172,8 +190,20 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	if _, err := readRecoveryControlToken(m.ControlTokenFile); err != nil {
 		return err
 	}
+	var healthyRecoveryEvidence *recoveryFinalizeEvidence
 	if oldCurrent.SHA256 != newSHA && recoveryManagerIdentityMatches(ctx, m.SocketPath, m.ControlTokenFile, oldCurrent.Version, oldCurrent.SHA256) {
-		return errors.New("Current Manager control is healthy; use the normal update path instead of external recovery")
+		evidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformStatePath, platformCommit)
+		if evidenceErr != nil {
+			return errors.New("Current Manager control is healthy; use the normal update path instead of external recovery")
+		}
+		_, exactRecovery, recoveryErr := m.committedRecoveryForFinalize(state, evidence)
+		if recoveryErr != nil || !exactRecovery {
+			return errors.New("Current Manager control is healthy; use the normal update path instead of external recovery")
+		}
+		if err := m.verifyRecoveryServiceProcess(ctx, unit, oldCurrent.SHA256); err != nil {
+			return fmt.Errorf("verify healthy committed recovery Current before replacement: %w", err)
+		}
+		healthyRecoveryEvidence = &evidence
 	}
 
 	stagedPath, err := m.stageRecoveryBinary(newBinary, newSHA)
@@ -205,6 +235,15 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 	}
 	rollback := func(cause error) error {
 		return errors.Join(cause, m.restoreRecoveryCurrent(oldBinary, unit))
+	}
+	if healthyRecoveryEvidence != nil {
+		latestEvidence, evidenceErr := readRecoveryFinalizeEvidence(m.Profile, platformStatePath, platformCommit)
+		if evidenceErr != nil || !sameRecoveryFinalize(*healthyRecoveryEvidence, latestEvidence) {
+			if evidenceErr == nil {
+				evidenceErr = errors.New("committed recovery finalize evidence changed before replacement")
+			}
+			return rollback(fmt.Errorf("revalidate healthy committed recovery after stopping Manager: %w", evidenceErr))
+		}
 	}
 	if stableSHA != newSHA {
 		if err := validateRecoveryWritableTarget(m.InstallPath); err != nil {

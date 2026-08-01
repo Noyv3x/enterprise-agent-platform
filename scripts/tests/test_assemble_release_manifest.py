@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import assemble_release_manifest as assembler  # noqa: E402
 
 
-PREDECESSOR = "3fa84952c56a6daf2a9a18825778c54b2d150cf1"
+PREDECESSOR = "5f927197f17a05e906a0bf11cdb7b4e3c8944ed0"
 CANDIDATE = "b" * 40
 
 
@@ -34,25 +34,12 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         self.predecessor_path.write_text(json.dumps(self.predecessor), encoding="utf-8")
         self.images = {
             name: f"ghcr.io/example/{name}@sha256:{index:064x}"
-            for index, name in enumerate(sorted(assembler.MANAGED_V2), 1)
+            for index, name in enumerate(sorted(assembler.MANAGED_V1), 1)
         }
         self.images_path.write_text(json.dumps(self.images), encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
-
-    def set_stage(self, stage: str) -> None:
-        contract = dict(self.contract)
-        contract["stage"] = stage
-        if stage == "bridge":
-            contract["predecessor_generation"] = PREDECESSOR
-        self.contract_path.write_text(json.dumps(contract), encoding="utf-8")
-        managed = assembler.MANAGED_V1 if stage == "bridge" else assembler.MANAGED_V2
-        self.images = {
-            name: f"ghcr.io/example/{name}@sha256:{index:064x}"
-            for index, name in enumerate(sorted(managed), 1)
-        }
-        self.images_path.write_text(json.dumps(self.images), encoding="utf-8")
 
     @staticmethod
     def _manifest(generation: str) -> dict[str, object]:
@@ -80,7 +67,7 @@ class AssembleReleaseManifestTests(unittest.TestCase):
     def args(self) -> argparse.Namespace:
         return argparse.Namespace(
             contract=self.contract_path,
-            predecessor_manifest=None,
+            predecessor_manifest=self.predecessor_path,
             images=self.images_path,
             generation=CANDIDATE,
             generated_at="2026-08-01T00:00:00+00:00",
@@ -95,10 +82,7 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         )
 
     def test_bridge_binds_exact_predecessor_and_target(self) -> None:
-        self.set_stage("bridge")
-        args = self.args()
-        args.predecessor_manifest = self.predecessor_path
-        manifest = assembler.assemble(args)
+        manifest = assembler.assemble(self.args())
         handoff = manifest["namespace_handoff"]
         self.assertEqual(set(manifest), assembler.ORDINARY_KEYS | {"namespace_handoff"})
         self.assertEqual(handoff["predecessor_generation"], PREDECESSOR)
@@ -109,7 +93,6 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         self.assertEqual(handoff["target"]["compose"], manifest["compose"])
 
     def test_rejects_predecessor_projection_or_wrong_generation(self) -> None:
-        self.set_stage("bridge")
         for mutation in ("extra", "generation"):
             with self.subTest(mutation=mutation):
                 value = copy.deepcopy(self.predecessor)
@@ -119,12 +102,9 @@ class AssembleReleaseManifestTests(unittest.TestCase):
                     value["source_commit"] = "a" * 40
                 self.predecessor_path.write_text(json.dumps(value), encoding="utf-8")
                 with self.assertRaises(assembler.ManifestAssemblyError):
-                    args = self.args()
-                    args.predecessor_manifest = self.predecessor_path
-                    assembler.assemble(args)
+                    assembler.assemble(self.args())
 
     def test_rejects_missing_helper_or_unverified_image(self) -> None:
-        self.set_stage("bridge")
         for mutation in ("missing", "tag"):
             with self.subTest(mutation=mutation):
                 images = dict(self.images)
@@ -134,14 +114,19 @@ class AssembleReleaseManifestTests(unittest.TestCase):
                     images["platform"] = "ghcr.io/example/platform:latest"
                 self.images_path.write_text(json.dumps(images), encoding="utf-8")
                 with self.assertRaises(assembler.ManifestAssemblyError):
-                    args = self.args()
-                    args.predecessor_manifest = self.predecessor_path
-                    assembler.assemble(args)
+                    assembler.assemble(self.args())
 
     def test_cleanup_and_target_baseline_are_schema_v2_without_source_inputs(self) -> None:
         for stage in ("cleanup", "target_baseline"):
             with self.subTest(stage=stage):
-                self.set_stage(stage)
+                contract = dict(self.contract)
+                contract["stage"] = stage
+                self.contract_path.write_text(json.dumps(contract), encoding="utf-8")
+                images = {
+                    name: f"ghcr.io/example/{name}@sha256:{index:064x}"
+                    for index, name in enumerate(sorted(assembler.MANAGED_V2), 1)
+                }
+                self.images_path.write_text(json.dumps(images), encoding="utf-8")
                 args = self.args()
                 args.predecessor_manifest = None
                 manifest = assembler.assemble(args)
@@ -158,13 +143,11 @@ class AssembleReleaseManifestTests(unittest.TestCase):
                     assembler.assemble(args)
 
     def test_target_only_rejects_helper(self) -> None:
-        self.set_stage("cleanup")
-        images = dict(self.images)
-        images["handoff-fs-helper"] = (
-            "ghcr.io/example/handoff-fs-helper@sha256:" + "7" * 64
-        )
-        self.images_path.write_text(json.dumps(images), encoding="utf-8")
+        contract = dict(self.contract)
+        contract["stage"] = "cleanup"
+        self.contract_path.write_text(json.dumps(contract), encoding="utf-8")
         args = self.args()
+        args.predecessor_manifest = None
         with self.assertRaisesRegex(
             assembler.ManifestAssemblyError, "schema-v2 managed digest set"
         ):

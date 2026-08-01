@@ -9,6 +9,12 @@ const net = require("node:net");
 const http = require("node:http");
 const dns = require("node:dns").promises;
 
+const sourceEnvironment = Object.keys(process.env)
+  .filter((name) => name.startsWith("UBITECH_") || name.startsWith("ENTERPRISE_"))
+  .sort();
+if (sourceEnvironment.length > 0) {
+  throw new Error(`Source-profile environment is not accepted by the target Camoufox runtime: ${sourceEnvironment.join(", ")}`);
+}
 if (process.env.AGENT_PLATFORM_TECHNICAL_PROFILE !== "agent-platform-v1") {
   throw new Error("AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1");
 }

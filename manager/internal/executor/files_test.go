@@ -232,7 +232,7 @@ func TestManagedPatchKeepsTheVerifiedParentDirectoryPinned(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "file.txt"), []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeManagedFileAt(parent, leaf, []byte("patched"), 0o600, ".agent-platform"); err != nil {
+	if err := writeManagedFileAt(parent, leaf, []byte("patched"), 0o600, ".ubitech"); err != nil {
 		t.Fatal(err)
 	}
 	if content, err := os.ReadFile(filepath.Join(pinned, "file.txt")); err != nil || string(content) != "patched" {
@@ -254,7 +254,7 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	if err := os.WriteFile(attachmentPath, []byte("actual-attachment"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	shadowRoot := filepath.Join(root, "data", "workspaces", "user-1", ".agent-platform", "attachments")
+	shadowRoot := filepath.Join(root, "data", "workspaces", "user-1", ".ubitech", "attachments")
 	if err := os.MkdirAll(shadowRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 		t.Fatal(err)
 	}
 
-	logicalPath := "/workspace/.agent-platform/attachments/note.txt"
+	logicalPath := "/workspace/.ubitech/attachments/note.txt"
 	content, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: logicalPath})
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +270,7 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	if content != "actual-attachment" {
 		t.Fatalf("attachment overlay did not take precedence: %q", content)
 	}
-	result, _, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.agent-platform/attachments", Query: "actual-attachment"})
+	result, _, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.ubitech/attachments", Query: "actual-attachment"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,10 +302,10 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	if err := os.Symlink(outside, filepath.Join(attachmentRoot, "escape")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: "/workspace/.agent-platform/attachments/escape/secret.txt"}); err == nil {
+	if _, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: "/workspace/.ubitech/attachments/escape/secret.txt"}); err == nil {
 		t.Fatal("attachment read followed a parent symbolic link")
 	}
-	result, _, err = executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.agent-platform/attachments", Query: "attachment-outside-secret"})
+	result, _, err = executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.ubitech/attachments", Query: "attachment-outside-secret"})
 	if err != nil {
 		t.Fatal(err)
 	}

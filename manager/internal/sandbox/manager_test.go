@@ -17,10 +17,13 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
-var testActiveProfile = identity.CompileTimeActiveProfile()
+var testActiveProfile = identity.SourceActiveProfile()
 
 func TestVerifiedTargetProfileCreatesNeutralSandboxIdentity(t *testing.T) {
-	active := identity.CompileTimeActiveProfile()
+	active, err := identity.ActivateVerifiedHandoffTarget(identity.TargetProfile())
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	engine := &sandboxEngine{}
 	manager, err := Open(active, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "agent-platform_core", time.Hour)
@@ -289,7 +292,7 @@ func TestReapSerializesContainerStopWithANewCall(t *testing.T) {
 	if err := <-ensureDone; err != nil {
 		t.Fatal(err)
 	}
-	name := "agent-platform-sandbox-" + stableHash("private-1")[:16]
+	name := "ubitech-sandbox-" + stableHash("private-1")[:16]
 	engine.mu.Lock()
 	running := engine.running[name]
 	engine.mu.Unlock()
@@ -649,6 +652,157 @@ func TestOpenRejectsCorruptSandboxIdentityRegistry(t *testing.T) {
 			writeRegistryFixture(t, statePath, corrupted)
 			if _, err := Open(testActiveProfile, &sandboxEngine{}, data, statePath, image, "network", time.Hour); err == nil {
 				t.Fatal("corrupt sandbox registry was accepted")
+			}
+		})
+	}
+}
+
+func TestOpenUpgradesProvenV1RegistryToVersionedPersistentBindings(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	statePath := filepath.Join(root, "manager", "sandboxes.json")
+	id := "private-1"
+	hash := stableHash(id)
+	image := "sandbox@sha256:" + strings.Repeat("a", 64)
+	for _, relative := range []string{
+		filepath.Join("workspaces", "user-1"),
+		filepath.Join("agent-envs", hash, "home"),
+		filepath.Join("agent-envs", hash, "env"),
+		filepath.Join("attachments", "private", "1"),
+	} {
+		if err := os.MkdirAll(filepath.Join(data, relative), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacy := registryV1{SchemaVersion: 1, Records: map[string]recordV1{
+		id: {
+			SandboxID: id, SandboxHash: hash, WorkspaceID: "user-1",
+			ContainerName: "ubitech-sandbox-" + hash[:16], Image: image,
+			LastActivityAt: time.Unix(12, 0).UTC(),
+		},
+	}}
+	writeRegistryFixture(t, statePath, legacy)
+
+	manager, err := Open(testActiveProfile, &sandboxEngine{}, data, statePath, image, "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCommit, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stillLegacy registryV1
+	if err := json.Unmarshal(beforeCommit, &stillLegacy); err != nil || stillLegacy.SchemaVersion != 1 {
+		t.Fatalf("candidate startup rewrote the rollback-compatible registry: %v %#v", err, stillLegacy)
+	}
+	if err := manager.CommitRegistryUpgrade(); err != nil {
+		t.Fatal(err)
+	}
+	var upgraded registry
+	contents, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(contents, &upgraded); err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.SchemaVersion != 2 || upgraded.TechnicalProfile != "ubitech-agent-v1" {
+		t.Fatalf("upgraded registry identity = %#v", upgraded)
+	}
+	record := upgraded.Records[id]
+	if record.UID != os.Getuid() || record.GID != os.Getgid() ||
+		record.WorkspacePath != "workspaces/user-1" ||
+		record.HomePath != "agent-envs/"+hash+"/home" ||
+		record.EnvironmentPath != "agent-envs/"+hash+"/env" ||
+		record.AttachmentsPath != "attachments/private/1" {
+		t.Fatalf("upgraded persistent binding = %#v", record)
+	}
+	spec, err := manager.Spec(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Workspace != filepath.Join(data, "workspaces", "user-1") ||
+		spec.Home != filepath.Join(data, "agent-envs", hash, "home") ||
+		spec.Attachments != filepath.Join(data, "attachments", "private", "1") ||
+		spec.UID != os.Getuid() || spec.GID != os.Getgid() {
+		t.Fatalf("upgraded Sandbox spec = %#v", spec)
+	}
+}
+
+func TestOpenDoesNotUpgradeV1RegistryWithMissingOrUnknownEvidence(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, data, statePath, hash, image string) []byte
+	}{
+		{
+			name: "missing attachment directory",
+			prepare: func(t *testing.T, data, statePath, hash, image string) []byte {
+				t.Helper()
+				for _, relative := range []string{
+					filepath.Join("workspaces", "user-1"),
+					filepath.Join("agent-envs", hash, "home"),
+					filepath.Join("agent-envs", hash, "env"),
+				} {
+					if err := os.MkdirAll(filepath.Join(data, relative), 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				legacy := registryV1{SchemaVersion: 1, Records: map[string]recordV1{
+					"private-1": {
+						SandboxID: "private-1", SandboxHash: hash, WorkspaceID: "user-1",
+						ContainerName: "ubitech-sandbox-" + hash[:16], Image: image,
+					},
+				}}
+				return writeRegistryFixture(t, statePath, legacy)
+			},
+		},
+		{
+			name: "unknown v1 field",
+			prepare: func(t *testing.T, _ string, statePath, _ string, _ string) []byte {
+				t.Helper()
+				contents := []byte(`{"schema_version":1,"unknown":true,"records":{}}`)
+				if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(statePath, contents, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return contents
+			},
+		},
+		{
+			name: "duplicate v1 field",
+			prepare: func(t *testing.T, _ string, statePath, _ string, _ string) []byte {
+				t.Helper()
+				contents := []byte(`{"schema_version":1,"schema_version":1,"records":{}}`)
+				if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(statePath, contents, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return contents
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			data := filepath.Join(root, "data")
+			statePath := filepath.Join(root, "manager", "sandboxes.json")
+			hash := stableHash("private-1")
+			image := "sandbox@sha256:" + strings.Repeat("a", 64)
+			original := test.prepare(t, data, statePath, hash, image)
+
+			if _, err := Open(testActiveProfile, &sandboxEngine{}, data, statePath, image, "network", time.Hour); err == nil {
+				t.Fatal("unproven v1 registry was upgraded")
+			}
+			after, err := os.ReadFile(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(original) {
+				t.Fatal("failed v1 upgrade rewrote the source registry")
 			}
 		})
 	}

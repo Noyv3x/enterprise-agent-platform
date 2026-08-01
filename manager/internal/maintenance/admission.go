@@ -16,6 +16,12 @@ type Admission struct {
 
 func (a *Admission) Lock() { a.mu.Lock() }
 
+// TryLock is used by bounded admission owners such as the one-time namespace
+// handoff. Ordinary callers continue to use the sync.Locker surface; exposing
+// this narrow non-blocking operation lets a context deadline remain effective
+// without leaking a goroutine that eventually acquires the lock.
+func (a *Admission) TryLock() bool { return a.mu.TryLock() }
+
 func (a *Admission) Unlock() {
 	a.epoch.Add(1)
 	a.mu.Unlock()

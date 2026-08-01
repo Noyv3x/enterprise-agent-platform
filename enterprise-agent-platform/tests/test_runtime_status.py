@@ -11,6 +11,7 @@ from unittest import mock
 
 from enterprise_agent_platform.runtimes import PlatformRuntimeManager, RuntimeStatus
 from enterprise_agent_platform.technical_profile import (
+    SOURCE_TECHNICAL_PROFILE,
     TARGET_TECHNICAL_PROFILE,
 )
 
@@ -24,7 +25,16 @@ class RuntimeStatusContractTests(unittest.TestCase):
             lambda key: values.get(key, ""),
         )
 
-    def test_camofox_secret_uses_only_the_current_namespace(self):
+    def test_camofox_secret_uses_the_active_profile_namespace(self):
+        with mock.patch.dict(
+            os.environ,
+            {"CAMOFOX_ACCESS_KEY": "source-key"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self._manager(SOURCE_TECHNICAL_PROFILE)._camofox_access_key(),
+                "source-key",
+            )
         with mock.patch.dict(
             os.environ,
             {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY": "target-key"},
@@ -64,8 +74,16 @@ class RuntimeStatusContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "must be"):
                 manager._camofox_access_key()
 
-    def test_camofox_secret_rejects_direct_and_file_values_together(self):
+    def test_camofox_secret_mixed_profiles_fail_closed(self):
         cases = (
+            (
+                SOURCE_TECHNICAL_PROFILE,
+                {"AGENT_PLATFORM_CAMOFOX_ACCESS_KEY": "target-key"},
+            ),
+            (
+                TARGET_TECHNICAL_PROFILE,
+                {"CAMOFOX_ACCESS_KEY": "source-key"},
+            ),
             (
                 TARGET_TECHNICAL_PROFILE,
                 {
@@ -81,7 +99,7 @@ class RuntimeStatusContractTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, environment, clear=True):
                     with self.assertRaisesRegex(
                         RuntimeError,
-                        "cannot both be set",
+                        "cannot be mixed|cannot both be set",
                     ):
                         self._manager(profile)._camofox_access_key()
 

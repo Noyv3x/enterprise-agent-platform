@@ -50,7 +50,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                 workspace = Path(scope.workspace_path)
                 marker = workspace / ".agent-platform-scope.json"
                 self.assertTrue(marker.is_file())
-                self.assertFalse((workspace / ".retired-scope-marker.json").exists())
+                self.assertFalse((workspace / ".ubitech-agent-scope.json").exists())
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 self.assertEqual(payload["technical_profile"], "agent-platform-v1")
             finally:
@@ -94,27 +94,76 @@ class AgentScopeSessionTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_workspace_profile_mismatch_fails_unchanged(self):
+    def test_database_and_workspace_profile_mismatches_fail_unchanged(self):
         with tempfile.TemporaryDirectory() as td:
-            config = make_config(Path(td))
-            db = Database(config.db_path)
+            root = Path(td)
+            source_config = make_config(root)
+            source_db = Database(source_config.db_path)
             try:
-                scope = AgentScopeManager(config, db).ensure_private_scope(1)
-                marker = Path(scope.workspace_path) / ".agent-platform-scope.json"
-                payload = json.loads(marker.read_text(encoding="utf-8"))
-                payload["technical_profile"] = "retired-profile-v1"
-                original = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-                marker.write_bytes(original)
-                marker.chmod(0o600)
+                source_scope = AgentScopeManager(
+                    source_config, source_db
+                ).ensure_private_scope(1)
+            finally:
+                source_db.close()
 
+            database_before = source_config.db_path.read_bytes()
+            with self.assertRaisesRegex(
+                sqlite3.DatabaseError,
+                "baseline marker",
+            ):
+                Database(source_config.db_path, TARGET_TECHNICAL_PROFILE)
+            self.assertEqual(source_config.db_path.read_bytes(), database_before)
+
+            source_marker = (
+                Path(source_scope.workspace_path) / ".ubitech-agent-scope.json"
+            )
+            source_marker_before = source_marker.read_bytes()
+            target_config = replace(
+                source_config,
+                technical_profile=TARGET_TECHNICAL_PROFILE,
+            )
+            target_db_path = root / "target.db"
+            target_db = Database(target_db_path, TARGET_TECHNICAL_PROFILE)
+            try:
+                # Reuse the authoritative scope rows only to exercise the
+                # marker/profile boundary; the source marker must never be
+                # guessed or rewritten as target state.
+                source_connection = sqlite3.connect(str(source_config.db_path))
+                source_connection.row_factory = sqlite3.Row
+                try:
+                    for table in (
+                        "agent_scopes",
+                        "agent_runtime_scopes",
+                        "agent_runtime_scope_sessions",
+                    ):
+                        rows = source_connection.execute(
+                            f"SELECT * FROM {table}"
+                        ).fetchall()
+                        if not rows:
+                            continue
+                        columns = tuple(rows[0].keys())
+                        placeholders = ",".join("?" for _ in columns)
+                        target_db.executemany(
+                            f"INSERT INTO {table} ({','.join(columns)}) "
+                            f"VALUES ({placeholders})",
+                            [tuple(row[column] for column in columns) for row in rows],
+                        )
+                finally:
+                    source_connection.close()
                 with self.assertRaisesRegex(
                     sqlite3.DatabaseError,
-                    "scope marker does not match",
+                    "another technical profile marker",
                 ):
-                    AgentScopeManager(config, db)
-                self.assertEqual(marker.read_bytes(), original)
+                    AgentScopeManager(target_config, target_db)
+                self.assertEqual(source_marker.read_bytes(), source_marker_before)
+                self.assertFalse(
+                    (
+                        Path(source_scope.workspace_path)
+                        / ".agent-platform-scope.json"
+                    ).exists()
+                )
             finally:
-                db.close()
+                target_db.close()
 
     def test_marker_staging_open_failure_does_not_leak_directory_fds(self):
         if not Path("/proc/self/fd").is_dir():
@@ -125,7 +174,7 @@ class AgentScopeSessionTests(unittest.TestCase):
             try:
                 manager = AgentScopeManager(config, db)
                 scope = manager.ensure_private_scope(1)
-                marker = Path(scope.workspace_path) / ".agent-platform-scope.json"
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
                 real_open = agent_scopes_module.open_private_directory_fd
 
                 def fail_machine_staging(path):
@@ -204,11 +253,11 @@ class AgentScopeSessionTests(unittest.TestCase):
             db = Database(config.db_path)
             try:
                 scope = AgentScopeManager(config, db).ensure_private_scope(1)
-                marker = Path(scope.workspace_path) / ".agent-platform-scope.json"
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 self.assertEqual(payload["schema_version"], 1)
                 self.assertEqual(payload["kind"], "agent-workspace-scope")
-                self.assertEqual(payload["technical_profile"], "agent-platform-v1")
+                self.assertEqual(payload["technical_profile"], "ubitech-agent-v1")
                 self.assertEqual(payload["workspace_id"], "user-1")
                 self.assertEqual(
                     payload["workspace_relative_path"],
@@ -228,7 +277,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                         scope = AgentScopeManager(config, db).ensure_private_scope(1)
                         marker = (
                             Path(scope.workspace_path)
-                            / ".agent-platform-scope.json"
+                            / ".ubitech-agent-scope.json"
                         )
                         payload = json.loads(marker.read_text(encoding="utf-8"))
                         payload["schema_version"] = invalid_version
@@ -258,7 +307,7 @@ class AgentScopeSessionTests(unittest.TestCase):
             try:
                 manager = AgentScopeManager(config, db)
                 original = manager.ensure_private_scope(1)
-                marker = Path(original.workspace_path) / ".agent-platform-scope.json"
+                marker = Path(original.workspace_path) / ".ubitech-agent-scope.json"
                 def crash_before_exchange(left_fd, left_name, right_fd, right_name):
                     raise RuntimeError("simulated rotate pre-exchange crash")
 
@@ -302,7 +351,7 @@ class AgentScopeSessionTests(unittest.TestCase):
             try:
                 manager = AgentScopeManager(config, db)
                 original = manager.ensure_private_scope(1)
-                marker = Path(original.workspace_path) / ".agent-platform-scope.json"
+                marker = Path(original.workspace_path) / ".ubitech-agent-scope.json"
                 real_unlink = secure_fs.os.unlink
 
                 def crash_before_old_cleanup(name, *args, **kwargs):
@@ -350,7 +399,7 @@ class AgentScopeSessionTests(unittest.TestCase):
             db = Database(config.db_path)
             try:
                 scope = AgentScopeManager(config, db).ensure_private_scope(1)
-                marker = Path(scope.workspace_path) / ".agent-platform-scope.json"
+                marker = Path(scope.workspace_path) / ".ubitech-agent-scope.json"
                 payload = json.loads(marker.read_text(encoding="utf-8"))
                 payload.pop("schema_version")
                 payload.pop("kind")
@@ -406,7 +455,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                         scope = manager.ensure_private_scope(1)
                         marker = (
                             Path(scope.workspace_path)
-                            / ".agent-platform-scope.json"
+                            / ".ubitech-agent-scope.json"
                         )
                         if not cached:
                             manager._scope_cache.clear()
@@ -457,7 +506,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                         scope = manager.ensure_private_scope(1)
                         marker = (
                             Path(scope.workspace_path)
-                            / ".agent-platform-scope.json"
+                            / ".ubitech-agent-scope.json"
                         )
                         before = db.query_one(
                             "SELECT session_id, lifecycle_id, updated_at "
@@ -642,7 +691,7 @@ class AgentScopeSessionTests(unittest.TestCase):
                     ),
                     {
                         "version": DATABASE_SCHEMA_VERSION,
-                        "name": "agent-platform-container-baseline-v1",
+                        "name": "ubitech-agent-container-baseline-v2",
                     },
                 )
                 self.assertFalse(db.query("PRAGMA foreign_key_check"))

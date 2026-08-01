@@ -26,7 +26,7 @@ test("target Camoufox preload accepts the target technical profile", () => {
   assert.equal(result.stdout, "ready");
 });
 
-test("target Camoufox preload rejects missing and unknown identity", () => {
+test("target Camoufox preload rejects missing, unknown, and source-prefixed identity", () => {
   const missing = runPreload({ AGENT_PLATFORM_TECHNICAL_PROFILE: "" });
   assert.notEqual(missing.status, 0);
   assert.match(missing.stderr, /AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1/);
@@ -35,4 +35,11 @@ test("target Camoufox preload rejects missing and unknown identity", () => {
   assert.notEqual(unknown.status, 0);
   assert.match(unknown.stderr, /AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1/);
 
+  const source = runPreload({ UBITECH_CAMOFOX_BIND_HOST: "0.0.0.0" });
+  assert.notEqual(source.status, 0);
+  assert.match(source.stderr, /Source-profile environment is not accepted/);
+
+  const mixed = runPreload({ ENTERPRISE_PLATFORM_DATA: "/tmp/source" });
+  assert.notEqual(mixed.status, 0);
+  assert.match(mixed.stderr, /Source-profile environment is not accepted/);
 });

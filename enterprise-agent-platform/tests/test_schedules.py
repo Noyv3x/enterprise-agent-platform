@@ -1206,7 +1206,7 @@ class ScheduleServiceTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_setting("telegram_enabled", "1")
-                service.set_setting("AGENT_PLATFORM_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
+                service.set_setting("ENTERPRISE_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
                 challenge = service.update_telegram_private_config(admin, {})
                 service.complete_telegram_link(
                     challenge["pending"]["code"],
@@ -1232,7 +1232,7 @@ class ScheduleServiceTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_setting("telegram_enabled", "1")
-                service.set_setting("AGENT_PLATFORM_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
+                service.set_setting("ENTERPRISE_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
                 challenge = service.update_telegram_private_config(admin, {})
                 service.complete_telegram_link(
                     challenge["pending"]["code"],
@@ -1307,7 +1307,7 @@ class ScheduleServiceTests(unittest.TestCase):
                     permission_group="member",
                 )
                 service.set_setting("telegram_enabled", "1")
-                service.set_setting("AGENT_PLATFORM_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
+                service.set_setting("ENTERPRISE_TELEGRAM_BOT_TOKEN", "123456:token", secret=True)
                 challenge = service.update_telegram_private_config(member, {})
                 service.complete_telegram_link(
                     challenge["pending"]["code"],

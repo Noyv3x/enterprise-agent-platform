@@ -59,7 +59,10 @@ type verifiedRelease struct {
 func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (int, error) {
 	active := policy.Profile
 	if active.Validate() != nil {
-		active = identity.CompileTimeActiveProfile()
+		// The zero value is deliberately source-only. It preserves conservative
+		// cleanup behavior for old internal callers while never granting access to
+		// target-only schema v2; production wiring always supplies the routed value.
+		active = identity.SourceActiveProfile()
 	}
 	retention := policy.Retention
 	if retention <= 0 {

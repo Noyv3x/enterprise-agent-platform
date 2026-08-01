@@ -262,6 +262,81 @@ func sameRecoveryFinalize(left, right recoveryFinalizeEvidence) bool {
 		bytes.Equal(left.manifestData, right.manifestData)
 }
 
+// committedRecoveryForFinalize verifies the only recovery proof which may
+// replace an ordinary watchdog commit at the generation barrier. The recovery
+// executable must be byte-identical to the manifest Candidate, while the live
+// Current may be that recovery or its one explicitly recovered successor.
+func (m *Manager) committedRecoveryForFinalize(state State, evidence recoveryFinalizeEvidence) (recoveryTakeoverJournal, bool, error) {
+	var zero recoveryTakeoverJournal
+	artifact, ok := evidence.manifest.Manager.Artifacts[runtime.GOARCH]
+	if !ok || !validSHA256(artifact.SHA256) {
+		return zero, false, errors.New("committed recovery manifest has no valid Manager artifact")
+	}
+	journalPath := m.recoveryTakeoverJournalPath(evidence.manifest.SourceCommit, artifact.SHA256)
+	journal, exists, err := m.readRecoveryTakeoverJournal(journalPath)
+	if err != nil {
+		return zero, false, err
+	}
+	if !exists || journal.Phase != recoveryTakeoverCommitted {
+		return zero, false, errors.New("manifest-bound Manager recovery journal is not committed")
+	}
+	expectedCandidatePath := filepath.Join(m.Root, "versions", safeID(evidence.manifest.Manager.Version+"-"+evidence.manifest.SourceCommit[:12]), m.managerBinaryName())
+	candidate := journal.OriginalCandidate
+	if journal.PlatformCommit != evidence.manifest.SourceCommit || journal.RecoveryVersion != evidence.manifest.Manager.Version ||
+		journal.RecoverySHA256 != artifact.SHA256 ||
+		candidate.Version != evidence.manifest.Manager.Version || candidate.SourceCommit != evidence.manifest.SourceCommit ||
+		candidate.Path != expectedCandidatePath || candidate.SHA256 != artifact.SHA256 ||
+		!candidate.PlatformCommitted || candidate.VerifiedAt.IsZero() || journal.OriginalPlanPath != filepath.Join(m.Root, "activations", safeID(evidence.manifest.SourceCommit)+".json") ||
+		journal.OperationID != evidence.operation.ID || journal.OperationPath != evidence.operationPath ||
+		journal.OperationSHA256 != sha256Hex(evidence.operationData) || journal.ManifestPath != evidence.manifestPath ||
+		journal.ManifestSHA256 != sha256Hex(evidence.manifestData) {
+		return zero, false, errors.New("committed Manager recovery does not match the finalize-pending release")
+	}
+	if !binaryMatches(candidate.Path, candidate.SHA256) || !binaryMatches(journal.RecoveryPath, journal.RecoverySHA256) {
+		return zero, false, errors.New("committed Manager recovery artifact no longer matches its manifest Candidate")
+	}
+	_, recoveryPlan, err := readRecoveryActivationPlan(journal.RecoveryPlanPath)
+	if err != nil {
+		return zero, false, err
+	}
+	if err := validateRecoveryPlanOwnership(recoveryPlan, journal); err != nil {
+		return zero, false, err
+	}
+	if recoveryPlan.Status != "committed" || !recoveryPlan.Activated || !recoveryPlan.Acknowledged {
+		return zero, false, errors.New("manifest-bound Manager recovery plan is not committed")
+	}
+	_, originalPlan, err := readRecoveryActivationPlan(journal.OriginalPlanPath)
+	if err != nil {
+		return zero, false, err
+	}
+	if err := validateSupersededRecoveryPlanConfiguration(recoveryPlan, journal); err != nil {
+		return zero, false, err
+	}
+	if originalPlan.Error != "ordinary Manager activation was superseded by controlled Current recovery transaction "+journal.TransactionID {
+		return zero, false, errors.New("superseded Manager activation is not bound to its recovery transaction")
+	}
+	if recoveryCommittedStateMatches(state, journal) {
+		return journal, true, nil
+	}
+	if !recoveryDirectSuccessorStateMatches(state, journal, m) {
+		return zero, false, errors.New("Manager Current is neither the committed recovery nor its explicit direct successor")
+	}
+	return journal, false, nil
+}
+
+func recoveryDirectSuccessorStateMatches(state State, journal recoveryTakeoverJournal, manager *Manager) bool {
+	current, previous := state.Current, state.Previous
+	if state.SchemaVersion != journal.OriginalState.SchemaVersion || current == nil || previous == nil ||
+		state.Candidate != nil || state.Activation != nil || current.SourceCommit != journal.PlatformCommit ||
+		!validSourceCommit(current.Version) || !validSHA256(current.SHA256) || !current.PlatformCommitted || current.VerifiedAt.IsZero() ||
+		current.Path != filepath.Join(manager.Root, "versions", "recovery-"+current.SHA256[:12], manager.managerBinaryName()) {
+		return false
+	}
+	return previous.Version == journal.RecoveryVersion && previous.SourceCommit == journal.PlatformCommit &&
+		previous.Path == journal.RecoveryPath && previous.SHA256 == journal.RecoverySHA256 &&
+		previous.PlatformCommitted && !previous.VerifiedAt.IsZero()
+}
+
 func validRecoveryOperationID(value string) bool {
 	if len(value) < 4 || len(value) > 128 {
 		return false

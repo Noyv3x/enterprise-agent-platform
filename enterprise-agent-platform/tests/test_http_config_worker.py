@@ -28,6 +28,7 @@ from enterprise_agent_platform.internal_config import (
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService
 from enterprise_agent_platform.technical_profile import (
+    SOURCE_TECHNICAL_PROFILE,
     TARGET_TECHNICAL_PROFILE,
 )
 
@@ -121,7 +122,7 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     payload,
-                    {"status": "ok", "service": "agent-platform"},
+                    {"status": "ok", "service": "ubitech-agent-platform"},
                 )
                 self.assertIn("application/json", response.getheader("Content-Type"))
 
@@ -137,7 +138,7 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     payload,
-                    {"status": "ok", "service": "agent-platform-search"},
+                    {"status": "ok", "service": "ubitech-agent-search"},
                 )
                 service.runtimes.cached_searxng_status.assert_called_once_with(
                     max_age_seconds=1.0
@@ -155,7 +156,7 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                     payload,
                     {
                         "status": "unavailable",
-                        "service": "agent-platform-search",
+                        "service": "ubitech-agent-search",
                     },
                 )
 
@@ -171,7 +172,7 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                     payload,
                     {
                         "status": "unavailable",
-                        "service": "agent-platform-search",
+                        "service": "ubitech-agent-search",
                     },
                 )
             finally:
@@ -353,7 +354,7 @@ class ConfigFromEnvTests(unittest.TestCase):
     def setUp(self):
         self._container_env = mock.patch.dict(
             os.environ,
-            {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
         )
         self._container_env.start()
 
@@ -363,14 +364,14 @@ class ConfigFromEnvTests(unittest.TestCase):
     def test_container_mode_requires_and_exposes_absolute_manager_paths(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            socket_path = Path("/run/agent-platform-manager/manager.sock")
-            token_path = Path("/run/secrets/agent-platform/manager-token")
+            socket_path = root / "manager" / "control" / "manager.sock"
+            token_path = root / "manager" / "secrets" / "manager-token"
             with mock.patch.dict(
                 os.environ,
                 {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_MANAGER_SOCKET": str(socket_path),
-                    "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_MANAGER_SOCKET": str(socket_path),
+                    "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
                 },
                 clear=True,
             ):
@@ -382,9 +383,9 @@ class ConfigFromEnvTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_MANAGER_SOCKET": "relative.sock",
-                    "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_MANAGER_SOCKET": "relative.sock",
+                    "UBITECH_MANAGER_TOKEN_FILE": str(token_path),
                 },
                 clear=True,
             ):
@@ -420,30 +421,32 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(config.token_secret, "target-secret")
         self.assertEqual(config.session_cookie_name, "agent_platform_session")
 
-    def test_target_profile_is_the_only_default_and_accepts_exact_selector(self):
+    def test_source_profile_remains_the_default_and_accepts_exact_selector(self):
         for environment in (
-            {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
+            {"UBITECH_DEPLOYMENT_MODE": "container"},
             {
-                "AGENT_PLATFORM_TECHNICAL_PROFILE": "agent-platform-v1",
-                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "UBITECH_TECHNICAL_PROFILE": "ubitech-agent-v1",
+                "UBITECH_DEPLOYMENT_MODE": "container",
             },
         ):
             with self.subTest(environment=environment):
                 with mock.patch.dict(os.environ, environment, clear=True):
-                    config = PlatformConfig.from_env(Path("/ignored"))
-                self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
-                self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
+                    config = PlatformConfig.from_env(Path("/source"))
+                self.assertEqual(config.technical_profile, SOURCE_TECHNICAL_PROFILE)
+                self.assertEqual(config.data_dir, Path("/source/data"))
 
-    def test_release_transition_contract_has_no_platform_runtime_projection(self):
-        package_root = Path(__file__).resolve().parents[1] / "enterprise_agent_platform"
-        self.assertFalse(
-            (package_root / "release_transition_contract_generated.py").exists()
-        )
-
-    def test_unknown_technical_profile_is_rejected(self):
+    def test_unknown_or_mixed_technical_profile_environment_is_rejected(self):
         environments = (
             {
                 "AGENT_PLATFORM_TECHNICAL_PROFILE": "unknown-profile",
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+            },
+            {
+                "AGENT_PLATFORM_TECHNICAL_PROFILE": "agent-platform-v1",
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "ENTERPRISE_PLATFORM_PORT": "8765",
+            },
+            {
                 "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
             },
         )
@@ -452,7 +455,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, environment, clear=True):
                     with self.assertRaisesRegex(
                         ValueError,
-                        "technical profile",
+                        "technical profile|cannot be mixed|required",
                     ):
                         PlatformConfig.from_env(Path("/tmp"))
 
@@ -469,7 +472,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                     key: value,
                 }
                 with mock.patch.dict(os.environ, environment, clear=True):
-                    with self.assertRaisesRegex(ValueError, "must be"):
+                    with self.assertRaisesRegex(ValueError, "target profile"):
                         PlatformConfig.from_env(Path("/tmp"))
 
     def test_container_mode_exposes_only_an_absolute_trusted_host_data_root(self):
@@ -479,8 +482,8 @@ class ConfigFromEnvTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_HOST_DATA_ROOT": str(host_data_root),
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_HOST_DATA_ROOT": str(host_data_root),
                 },
                 clear=True,
             ):
@@ -492,13 +495,13 @@ class ConfigFromEnvTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_HOST_DATA_ROOT": "relative-data",
+                    "UBITECH_DEPLOYMENT_MODE": "container",
+                    "UBITECH_HOST_DATA_ROOT": "relative-data",
                 },
                 clear=True,
             ):
                 with self.assertRaisesRegex(
-                    ValueError, "AGENT_PLATFORM_HOST_DATA_ROOT must be absolute"
+                    ValueError, "UBITECH_HOST_DATA_ROOT must be absolute"
                 ):
                     PlatformConfig.from_env(root)
 
@@ -508,34 +511,34 @@ class ConfigFromEnvTests(unittest.TestCase):
                 PlatformConfig.from_env(Path("/tmp"))
 
     def test_non_numeric_port_raises_descriptive_value_error(self):
-        previous = os.environ.get("AGENT_PLATFORM_PORT")
-        os.environ["AGENT_PLATFORM_PORT"] = "not-a-number"
+        previous = os.environ.get("ENTERPRISE_PLATFORM_PORT")
+        os.environ["ENTERPRISE_PLATFORM_PORT"] = "not-a-number"
         try:
             with self.assertRaises(ValueError) as ctx:
                 PlatformConfig.from_env(Path("/tmp"))
             message = str(ctx.exception)
             # The error must name the offending variable and explain it clearly,
             # not surface a bare int() ValueError.
-            self.assertIn("AGENT_PLATFORM_PORT", message)
+            self.assertIn("ENTERPRISE_PLATFORM_PORT", message)
             self.assertIn("integer", message)
         finally:
             if previous is None:
-                os.environ.pop("AGENT_PLATFORM_PORT", None)
+                os.environ.pop("ENTERPRISE_PLATFORM_PORT", None)
             else:
-                os.environ["AGENT_PLATFORM_PORT"] = previous
+                os.environ["ENTERPRISE_PLATFORM_PORT"] = previous
 
     def test_out_of_range_port_raises_descriptive_value_error(self):
-        previous = os.environ.get("AGENT_PLATFORM_PORT")
-        os.environ["AGENT_PLATFORM_PORT"] = "99999"
+        previous = os.environ.get("ENTERPRISE_PLATFORM_PORT")
+        os.environ["ENTERPRISE_PLATFORM_PORT"] = "99999"
         try:
             with self.assertRaises(ValueError) as ctx:
                 PlatformConfig.from_env(Path("/tmp"))
-            self.assertIn("AGENT_PLATFORM_PORT", str(ctx.exception))
+            self.assertIn("ENTERPRISE_PLATFORM_PORT", str(ctx.exception))
         finally:
             if previous is None:
-                os.environ.pop("AGENT_PLATFORM_PORT", None)
+                os.environ.pop("ENTERPRISE_PLATFORM_PORT", None)
             else:
-                os.environ["AGENT_PLATFORM_PORT"] = previous
+                os.environ["ENTERPRISE_PLATFORM_PORT"] = previous
 
     def test_agent_idle_timeout_uses_contract_default_and_allows_contract_minimum(self):
         key = RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE
