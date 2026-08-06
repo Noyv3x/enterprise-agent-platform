@@ -332,7 +332,9 @@ test("an uncooperative provider cannot hold the run slot past idle cleanup grace
     fauxAssistantMessage("the next run acquired the released slot"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 30, cleanupGraceMs: 40, maxConcurrency: 1 }),
+    // Keep the idle window well above shared-runner scheduling jitter. The
+    // provider never settles, so the test still proves bounded slot release.
+    config: testConfig(home, { runIdleTimeoutMs: 1_000, cleanupGraceMs: 100, maxConcurrency: 1 }),
     streamFn: faux.provider.streamSimple,
   });
   try {
