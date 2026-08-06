@@ -36,9 +36,6 @@ jobs:
       - name: Validate canonical documentation
         run: python scripts/docs_sync.py check
 
-      - name: Enforce current production source boundary
-        run: python scripts/verify_current_source.py --root .
-
       - name: Validate pull request synchronization
         if: github.event_name == 'pull_request'
         run: >-

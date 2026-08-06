@@ -3,8 +3,6 @@ package logstore
 import (
 	"bufio"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -139,21 +137,4 @@ type Event struct {
 	Details     any       `json:"details,omitempty"`
 	Result      any       `json:"result,omitempty"`
 	Error       string    `json:"error,omitempty"`
-}
-
-func ValidateLogPermissions(path string) error {
-	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%s must be owner-only", path)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("log path is not a regular file")
-	}
-	return nil
 }

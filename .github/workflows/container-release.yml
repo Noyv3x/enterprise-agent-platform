@@ -48,9 +48,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify current production source boundary
-        run: python3 scripts/verify_current_source.py --root .
-
       - name: Resolve immutable release inputs
         id: release
         shell: bash

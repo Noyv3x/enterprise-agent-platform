@@ -96,7 +96,6 @@
         "scripts/ensure-release-candidate-tag.sh",
         "scripts/fixtures/**",
         "scripts/verify-release-images-anonymous.sh",
-        "scripts/verify_current_source.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py"

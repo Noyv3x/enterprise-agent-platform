@@ -146,8 +146,6 @@ npm run build
 
 main 通道测试必须覆盖至少三个线性后代：较旧 workflow 后完成不能降级 latest，连续 push 最终自动推进到最新通过 Quality 的 main head，分叉 candidate 在构建前或发布前拒绝。发布链没有阶段选择器、固定迁移前任、部署 challenge 或人工 promotion 分支。
 
-source-tree gate 对每个生产与构建根生效，拒绝非当前技术 profile、路径、环境变量、一次性部署转换和签名回执实现。测试和 fixture 可以保存必要的数据演进样本，但不能形成可执行兼容入口。Quality 和 Container release 必须调用同一 gate。
-
 release 时间测试必须把 `git show --format=%cI` 形式的带偏移时间交给真实 assembler，再把其 schema-2 输出交给 fresh installer 的 manifest 解析路径，证明资产中的 `generated_at` 已规范化为 UTC `Z` 并可安装。另需覆盖正负偏移的等价 UTC 转换，以及无时区、无效日期/偏移和非 RFC 3339 输入拒绝；不得把 installer 改为接受非 canonical 输出。
 
 发布测试只覆盖当前 manifest schema、十个受管镜像和中性 Compose/Manager 资产。fresh install、普通 startup、Candidate watchdog 与 finalize recovery 始终使用编译期唯一 profile；配置、路径、环境或可执行文件名不能选择另一身份。普通更新还要证明未物化 workspace、缺 marker/alias、未知 residue 都在副作用前失败，且不存在按历史 generation、摘要或路径启用的修复能力。

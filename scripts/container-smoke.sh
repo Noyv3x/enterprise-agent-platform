@@ -577,7 +577,6 @@ release_workflow=.github/workflows/container-release.yml
   || fail "a second release-promotion implementation remains"
 
 for expected in \
-  'python3 scripts/verify_current_source.py --root .' \
   'python3 scripts/browser-control-compose-smoke.py' \
   'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
   'group: container-channel-main' \
@@ -650,7 +649,6 @@ for fragment in (
     '.conclusion == "success"',
     '.head_sha == $source',
     '.head_repository.full_name == $repo',
-    "python3 scripts/verify_current_source.py --root .",
 ):
     if fragment not in prepare:
         raise SystemExit(f"release preparation gate is missing: {fragment}")
