@@ -63,7 +63,9 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 记忆有两个 target：
 
 - `memory`：属于一个 Agent scope 的事实、规则与工作偏好；
-- `user`：属于用户的资料，可被该用户的相关 Agent 使用。
+- `user`：该 Agent scope 对当前用户资料的长期认识。
+
+两个 target 只是同一 Agent 内的语义分区，不是共享层；它们都以完整 `scope_key` 作为首要所有权边界。任何查询、召回、人工维护和回复后复盘都只能读取或修改当前 Agent scope 的记录，即使另一 Agent 面向同一用户，也不能读取前者的 `memory` 或 `user` target。跨 Agent、面向全体的公共资料只属于知识库，不能通过省略、替换或弱化 memory scope 构造共享记忆。
 
 每条记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual` 或 `automatic`。所有权和是否允许自动写入从可信 Run context 派生；模型参数不能覆盖 owner 或把 unattended/channel/delegated Run 提升为可写。写入有配额、长度、注入扫描和去重约束，精确限制由代码契约和测试维护。
 
@@ -81,11 +83,11 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 ## 召回与搜索
 
-顶层 Run 启动前进行 query recall，并列出当前用户资料记忆。空结果不注入；失败不使 Run 失败。注入内容按记录边界裁剪，并包在明确的不可信数据标签中。
+顶层 Run 启动前只在当前 Agent scope 内进行 query recall，并列出该 Agent 保存的当前用户资料记忆。空结果不注入；失败不使 Run 失败。注入内容按记录边界裁剪，并包在明确的不可信数据标签中。
 
 `session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有带当前 `session_id` 元数据或可由当前 reply 关系明确归属到该 session 的消息才进入索引，不为缺少会话来源的行合成兼容 session。只有规范私人 Agent 与频道主 Agent 可以使用，响应有统一字符预算。
 
-知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，记忆属于 Agent 或用户，不能互相冒充来源。可选 Cognee 增强使用 Platform 镜像内经过构建验证的 Python distribution；运行时不加载构建 checkout，也不向镜像代码层写入字节码缓存。
+知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。可选 Cognee 增强使用 Platform 镜像内经过构建验证的 Python distribution；运行时不加载构建 checkout，也不向镜像代码层写入字节码缓存。
 
 ## 技能数据
 

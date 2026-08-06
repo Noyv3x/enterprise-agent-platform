@@ -4,7 +4,7 @@
 
 ## 信任模型
 
-平台面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个私人 Agent 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
+平台面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个私人 Agent 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；memory 的 `memory` 与 `user` target 都受同一 Agent scope 隔离，不能作为跨 Agent 共享层，公共资料必须进入知识库。委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
 
 默认工具在 Sandbox 执行并免人工审批，但仍受不可绕过的 hard-block。模型可以为单次 terminal、文件或进程调用显式选择宿主目标；任何 `target=host` 调用都必须由用户逐次批准，不能形成会话或永久授权。管理器随后才以部署用户执行；terminal 还允许使用该用户已有的免密 `sudo`。这等同把该次操作授予部署用户乃至 root 能力。部署方必须只给可信成员使用，并把部署用户、宿主文件和网络权限控制在可接受范围。
 

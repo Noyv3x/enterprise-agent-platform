@@ -122,6 +122,58 @@ class MemoryAndSessionSearchTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_both_memory_targets_are_isolated_by_agent_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                private = service.agent_scopes.ensure_private_scope(int(admin["id"]))
+                channel = service.agent_scopes.ensure_channel_scope("1")
+
+                for scope, label in ((private, "private"), (channel, "channel")):
+                    service.agent_memory_mutate(
+                        {
+                            "scope_key": scope.scope_key,
+                            "owner_user_id": admin["id"],
+                            "target": "memory",
+                            "content": f"{label} Agent fact",
+                        }
+                    )
+                    service.agent_memory_mutate(
+                        {
+                            "scope_key": scope.scope_key,
+                            "owner_user_id": admin["id"],
+                            "target": "user",
+                            "content": f"{label} Agent user profile",
+                        }
+                    )
+
+                private_recall = service.agent_memory_search(
+                    {
+                        "scope_key": private.scope_key,
+                        "owner_user_id": admin["id"],
+                        "target": "all",
+                    }
+                )
+                channel_recall = service.agent_memory_search(
+                    {
+                        "scope_key": channel.scope_key,
+                        "owner_user_id": admin["id"],
+                        "target": "all",
+                    }
+                )
+
+                self.assertEqual(
+                    {row["content"] for row in private_recall["memories"]},
+                    {"private Agent fact", "private Agent user profile"},
+                )
+                self.assertEqual(
+                    {row["content"] for row in channel_recall["memories"]},
+                    {"channel Agent fact", "channel Agent user profile"},
+                )
+            finally:
+                service.close()
+
     def test_memory_fts_searches_the_tags_json_projection(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))

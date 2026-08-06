@@ -841,6 +841,8 @@ test("memory schema strictly describes automatic durable-memory actions", () => 
     assert.equal(contentSchema.maxLength, 4_000);
   }
   assert.match(memory.description, /at most 4,000 characters/);
+  assert.match(memory.description, /Both memory and user targets remain inside this Agent scope/);
+  assert.match(memory.description, /shared knowledge belongs in the platform knowledge base/);
   assert.equal(collectObjectSchemas(memory.parameters).every((entry) => entry.additionalProperties === false), true);
 });
 

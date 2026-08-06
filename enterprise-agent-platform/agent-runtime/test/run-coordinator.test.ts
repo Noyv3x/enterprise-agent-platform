@@ -486,12 +486,15 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     assert.match(rootPrompt, /<execution_discipline>/);
     assert.match(rootPrompt, /take the concrete action before claiming it has started or completed/);
     assert.match(rootPrompt, /collapsing unrelated work into an ad-hoc script/);
+    assert.match(rootPrompt, /Both memory targets are isolated to this Agent scope/);
+    assert.match(rootPrompt, /shared knowledge belongs in the platform knowledge base/);
     assert.match(rootPrompt, /"id":"code-review"/);
     assert.match(rootPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(rootPrompt, /unloaded secret instructions/);
     assert.ok(rootPrompt.indexOf("</memory_policy>") < rootPrompt.indexOf("<skill_policy>"));
     assert.match(childPrompt, /^Custom child prompt\./);
     assert.match(childPrompt, /<execution_discipline>/);
+    assert.match(childPrompt, /Both memory targets are isolated to this Agent scope/);
     assert.match(childPrompt, /"id":"code-review"/);
     assert.match(childPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(childPrompt, /unloaded secret instructions/);
