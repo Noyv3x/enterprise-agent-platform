@@ -27,7 +27,6 @@ from .technical_profile import (
 )
 
 
-_LEGACY_KNOWLEDGE_DATABASE_BASELINE_VERSION = 2026072901
 _SOURCE_DATABASE_BASELINE_VERSION = 2026080601
 _DATABASE_BASELINE_VERSION = 2026080602
 _DATABASE_BASELINE_NAME = TARGET_DATABASE_BASELINE
@@ -63,18 +62,6 @@ _AGENT_MEMORY_FTS_TRIGGER_SQL = {
         END
     """.strip(),
 }
-
-
-_RETIRED_KNOWLEDGE_SETTING_KEYS = (
-    "cognee_backend",
-    "cognee_dataset",
-    "cognee_ingest_background",
-    "cognee_data_root_directory",
-    "cognee_system_root_directory",
-    "cognee_cache_root_directory",
-    "cognee_logs_dir",
-    "cognee_skip_connection_test",
-)
 
 
 _KNOWLEDGE_SCHEMA_SQL = """
@@ -271,12 +258,6 @@ def _assert_pinned_database_profile(
     if allow_source_migration:
         allowed_markers.add(
             (_SOURCE_DATABASE_BASELINE_VERSION, selected.database_baseline_name)
-        )
-        allowed_markers.add(
-            (
-                _LEGACY_KNOWLEDGE_DATABASE_BASELINE_VERSION,
-                selected.database_baseline_name,
-            )
         )
     if len(markers) != 1 or markers[0] not in allowed_markers:
         raise sqlite3.DatabaseError(
@@ -542,26 +523,16 @@ class Database:
             fresh_database = not existing_tables
             if not fresh_database:
                 marker = self._database_marker(existing_tables)
-                migration_sources = {
-                    (
-                        _LEGACY_KNOWLEDGE_DATABASE_BASELINE_VERSION,
-                        self._database_baseline_name,
-                    ),
-                    (
-                        _SOURCE_DATABASE_BASELINE_VERSION,
-                        self._database_baseline_name,
-                    ),
-                }
-                if marker in migration_sources and self._allow_source_migration:
-                    legacy_knowledge_baseline = (
-                        marker[0] == _LEGACY_KNOWLEDGE_DATABASE_BASELINE_VERSION
-                    )
+                source_marker = (
+                    _SOURCE_DATABASE_BASELINE_VERSION,
+                    self._database_baseline_name,
+                )
+                if marker == source_marker and self._allow_source_migration:
                     self._assert_database_structure(
                         existing_tables,
                         source_database_baseline=True,
-                        legacy_knowledge_baseline=legacy_knowledge_baseline,
                     )
-                    self._migrate_source_database_baseline(marker[0])
+                    self._migrate_source_database_baseline()
                 else:
                     self._assert_current_database_baseline(existing_tables)
             if fresh_database:
@@ -1043,26 +1014,11 @@ class Database:
             return None
         return int(rows[0]["version"]), str(rows[0]["name"])
 
-    def _migrate_source_database_baseline(self, source_version: int) -> None:
-        """Atomically advance an explicitly validated knowledge baseline."""
+    def _migrate_source_database_baseline(self) -> None:
+        """Atomically add immutable knowledge source-file storage."""
 
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            if source_version == _LEGACY_KNOWLEDGE_DATABASE_BASELINE_VERSION:
-                for trigger_name in ("knowledge_ai", "knowledge_ad", "knowledge_au"):
-                    self._conn.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
-                self._conn.execute('DROP TABLE IF EXISTS "knowledge_fts"')
-                self._conn.execute("DELETE FROM durable_jobs WHERE kind = 'cognee'")
-                placeholders = ", ".join(
-                    "?" for _ in _RETIRED_KNOWLEDGE_SETTING_KEYS
-                )
-                self._conn.execute(
-                    f"DELETE FROM settings WHERE key IN ({placeholders})",
-                    _RETIRED_KNOWLEDGE_SETTING_KEYS,
-                )
-                _execute_transactional_schema(self._conn, _KNOWLEDGE_SCHEMA_SQL)
-            elif source_version != _SOURCE_DATABASE_BASELINE_VERSION:
-                raise sqlite3.DatabaseError("database migration source changed")
             _execute_transactional_schema(self._conn, _KNOWLEDGE_FILE_SCHEMA_SQL)
             self._conn.execute(
                 "UPDATE schema_migrations SET version = ?, applied_at = ? "
@@ -1070,7 +1026,7 @@ class Database:
                 (
                     _DATABASE_BASELINE_VERSION,
                     now_ts(),
-                    source_version,
+                    _SOURCE_DATABASE_BASELINE_VERSION,
                     self._database_baseline_name,
                 ),
             )
@@ -1081,7 +1037,7 @@ class Database:
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(
-                    f"knowledge baseline migration produced {len(violations)} "
+                    f"knowledge file migration produced {len(violations)} "
                     "foreign-key violations"
                 )
             self._assert_current_database_baseline()
@@ -1128,10 +1084,7 @@ class Database:
         tables: set[str],
         *,
         source_database_baseline: bool = False,
-        legacy_knowledge_baseline: bool = False,
     ) -> None:
-        if legacy_knowledge_baseline and not source_database_baseline:
-            raise ValueError("legacy knowledge baseline must be a migration source")
         agent_scope_columns = {
             "scope_key", "scope_type", "scope_id", "session_id",
             "lifecycle_id", "workspace_path", "sandbox_id", "created_at",
@@ -1230,30 +1183,29 @@ class Database:
         required_columns["mail_account_credentials"] = {
             "account_id", "password", "updated_at",
         }
-        if not legacy_knowledge_baseline:
-            required_columns.update({
-                "knowledge_index_generations": {
-                    "id", "config_hash", "embedding_base_url",
-                    "embedding_model", "embedding_dimensions",
-                    "chunker_version", "status", "document_count",
-                    "ready_document_count", "last_error", "created_at",
-                    "updated_at", "activated_at",
-                },
-                "knowledge_document_index": {
-                    "generation_id", "document_id", "expected_hash",
-                    "status", "chunk_count", "last_error", "created_at",
-                    "updated_at",
-                },
-                "knowledge_chunks": {
-                    "generation_id", "chunk_id", "document_id",
-                    "chunk_index", "title_path", "content", "char_start",
-                    "char_end", "chunk_hash", "created_at",
-                },
-                "knowledge_chunk_embeddings": {
-                    "generation_id", "chunk_id", "dimensions", "vector",
-                    "norm", "created_at",
-                },
-            })
+        required_columns.update({
+            "knowledge_index_generations": {
+                "id", "config_hash", "embedding_base_url",
+                "embedding_model", "embedding_dimensions",
+                "chunker_version", "status", "document_count",
+                "ready_document_count", "last_error", "created_at",
+                "updated_at", "activated_at",
+            },
+            "knowledge_document_index": {
+                "generation_id", "document_id", "expected_hash",
+                "status", "chunk_count", "last_error", "created_at",
+                "updated_at",
+            },
+            "knowledge_chunks": {
+                "generation_id", "chunk_id", "document_id",
+                "chunk_index", "title_path", "content", "char_start",
+                "char_end", "chunk_hash", "created_at",
+            },
+            "knowledge_chunk_embeddings": {
+                "generation_id", "chunk_id", "dimensions", "vector",
+                "norm", "created_at",
+            },
+        })
         if not source_database_baseline:
             required_columns["knowledge_document_files"] = {
                 "document_id", "filename", "media_type", "size_bytes",
@@ -1264,8 +1216,6 @@ class Database:
             "message_fts",
             "message_fts_trigram",
         ]
-        if legacy_knowledge_baseline:
-            fts_prefixes.append("knowledge_fts")
         fts_tables = {
             f"{prefix}{suffix}"
             for prefix in fts_prefixes
@@ -1343,18 +1293,17 @@ class Database:
             "agent_memories",
             "check(source_typein('manual','automatic'))",
         )
-        if not legacy_knowledge_baseline:
-            self._assert_table_sql(
-                "knowledge_index_generations",
-                "check(statusin('building','active','failed','superseded'))",
-            )
-            self._assert_table_sql(
-                "knowledge_document_index",
-                "check(statusin('pending','ready','failed'))",
-            )
-            self._assert_table_sql(
-                "knowledge_chunks", "check(char_end>char_start)"
-            )
+        self._assert_table_sql(
+            "knowledge_index_generations",
+            "check(statusin('building','active','failed','superseded'))",
+        )
+        self._assert_table_sql(
+            "knowledge_document_index",
+            "check(statusin('pending','ready','failed'))",
+        )
+        self._assert_table_sql(
+            "knowledge_chunks", "check(char_end>char_start)"
+        )
         if not source_database_baseline:
             self._assert_table_sql(
                 "knowledge_document_files", "check(length(content)=size_bytes)"
@@ -1385,13 +1334,12 @@ class Database:
             "idx_agent_schedule_runs_schedule",
             "idx_agent_schedule_runs_job",
         }
-        if not legacy_knowledge_baseline:
-            required_indexes.update({
-                "idx_knowledge_index_generations_status",
-                "uq_knowledge_index_generations_active",
-                "idx_knowledge_document_index_status",
-                "idx_knowledge_chunks_document",
-            })
+        required_indexes.update({
+            "idx_knowledge_index_generations_status",
+            "uq_knowledge_index_generations_active",
+            "idx_knowledge_document_index_status",
+            "idx_knowledge_chunks_document",
+        })
         required_indexes.update({
             "idx_mail_accounts_poll",
             "idx_mail_accounts_owner",
@@ -1419,8 +1367,7 @@ class Database:
             ("idx_agent_schedule_runs_schedule", "agent_schedule_runs", ("schedule_id", "id")),
             ("idx_agent_schedule_runs_job", "agent_schedule_runs", ("durable_job_id",)),
         ]
-        if not legacy_knowledge_baseline:
-            named_indexes.extend([
+        named_indexes.extend([
                 (
                     "idx_knowledge_index_generations_status",
                     "knowledge_index_generations",
@@ -1441,7 +1388,7 @@ class Database:
                     "knowledge_chunks",
                     ("generation_id", "document_id", "chunk_index"),
                 ),
-            ])
+        ])
         named_indexes.extend([
             ("idx_mail_accounts_poll", "mail_accounts", ("enabled", "wake_enabled", "last_checked_at", "id")),
             ("idx_mail_accounts_owner", "mail_accounts", ("owner_user_id", "id")),
@@ -1455,23 +1402,22 @@ class Database:
             "agent_schedule_runs",
             ("schedule_id", "schedule_revision", "occurrence_key"),
         )
-        if not legacy_knowledge_baseline:
-            self._assert_unique_columns(
-                "knowledge_index_generations", ("status",)
-            )
-            self._assert_unique_columns(
-                "knowledge_document_index", ("generation_id", "document_id")
-            )
-            self._assert_unique_columns(
-                "knowledge_chunks", ("generation_id", "chunk_id")
-            )
-            self._assert_unique_columns(
-                "knowledge_chunks",
-                ("generation_id", "document_id", "chunk_index"),
-            )
-            self._assert_unique_columns(
-                "knowledge_chunk_embeddings", ("generation_id", "chunk_id")
-            )
+        self._assert_unique_columns(
+            "knowledge_index_generations", ("status",)
+        )
+        self._assert_unique_columns(
+            "knowledge_document_index", ("generation_id", "document_id")
+        )
+        self._assert_unique_columns(
+            "knowledge_chunks", ("generation_id", "chunk_id")
+        )
+        self._assert_unique_columns(
+            "knowledge_chunks",
+            ("generation_id", "document_id", "chunk_index"),
+        )
+        self._assert_unique_columns(
+            "knowledge_chunk_embeddings", ("generation_id", "chunk_id")
+        )
 
         self._assert_foreign_keys("durable_jobs", set())
         self._assert_foreign_keys(
@@ -1496,38 +1442,37 @@ class Database:
                 ("response_message_id", "messages", "id", "NO ACTION"),
             },
         )
-        if not legacy_knowledge_baseline:
-            self._assert_foreign_keys("knowledge_index_generations", set())
-            self._assert_foreign_keys(
-                "knowledge_document_index",
-                {
-                    (
-                        "generation_id", "knowledge_index_generations", "id",
-                        "CASCADE",
-                    ),
-                    ("document_id", "knowledge_documents", "id", "CASCADE"),
-                },
-            )
-            self._assert_foreign_keys(
-                "knowledge_chunks",
-                {
-                    (
-                        "generation_id", "knowledge_index_generations", "id",
-                        "CASCADE",
-                    ),
-                    ("document_id", "knowledge_documents", "id", "CASCADE"),
-                },
-            )
-            self._assert_foreign_keys(
-                "knowledge_chunk_embeddings",
-                {
-                    (
-                        "generation_id", "knowledge_chunks", "generation_id",
-                        "CASCADE",
-                    ),
-                    ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
-                },
-            )
+        self._assert_foreign_keys("knowledge_index_generations", set())
+        self._assert_foreign_keys(
+            "knowledge_document_index",
+            {
+                (
+                    "generation_id", "knowledge_index_generations", "id",
+                    "CASCADE",
+                ),
+                ("document_id", "knowledge_documents", "id", "CASCADE"),
+            },
+        )
+        self._assert_foreign_keys(
+            "knowledge_chunks",
+            {
+                (
+                    "generation_id", "knowledge_index_generations", "id",
+                    "CASCADE",
+                ),
+                ("document_id", "knowledge_documents", "id", "CASCADE"),
+            },
+        )
+        self._assert_foreign_keys(
+            "knowledge_chunk_embeddings",
+            {
+                (
+                    "generation_id", "knowledge_chunks", "generation_id",
+                    "CASCADE",
+                ),
+                ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
+            },
+        )
         if not source_database_baseline:
             self._assert_foreign_keys(
                 "knowledge_document_files",
@@ -1552,10 +1497,6 @@ class Database:
                 "message_fts_trigram_au",
             },
         }
-        if legacy_knowledge_baseline:
-            optional_fts_triggers["knowledge_fts"] = {
-                "knowledge_ai", "knowledge_ad", "knowledge_au",
-            }
         allowed_triggers = set(required_triggers)
         for table_name, names in optional_fts_triggers.items():
             if table_name in tables:
