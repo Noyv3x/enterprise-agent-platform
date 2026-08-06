@@ -1,0 +1,54 @@
+name: Bounded GHCR login
+description: Retry transient GHCR authentication failures without weakening release gates.
+
+inputs:
+  username:
+    description: Registry username
+    required: true
+  token:
+    description: Registry token
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to GHCR (attempt 1 of 3)
+      id: login_1
+      continue-on-error: true
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.username }}
+        password: ${{ inputs.token }}
+
+    - name: Back off after the first GHCR login failure
+      if: steps.login_1.outcome == 'failure'
+      shell: bash
+      run: sleep 5
+
+    - name: Log in to GHCR (attempt 2 of 3)
+      id: login_2
+      if: steps.login_1.outcome == 'failure'
+      continue-on-error: true
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.username }}
+        password: ${{ inputs.token }}
+
+    - name: Back off after the second GHCR login failure
+      if: >-
+        steps.login_1.outcome == 'failure' &&
+        steps.login_2.outcome == 'failure'
+      shell: bash
+      run: sleep 15
+
+    - name: Log in to GHCR (attempt 3 of 3)
+      if: >-
+        steps.login_1.outcome == 'failure' &&
+        steps.login_2.outcome == 'failure'
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.username }}
+        password: ${{ inputs.token }}
