@@ -55,6 +55,7 @@ type managedProcess struct {
 	hostStdoutFile string
 	hostStderrFile string
 	stateFile      string
+	done           chan struct{}
 	stopMu         sync.Mutex
 	stdout, stderr *boundedBuffer
 }
@@ -387,7 +388,7 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	if call.Target == "sandbox" {
 		stateFile = filepath.Join(filepath.Dir(m.Sandboxes.StatePath), "processes", spec.AgentHash, id+".json")
 	}
-	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: args.Command, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, stateFile: stateFile, stdout: stdout, stderr: stderr}
+	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: args.Command, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, stateFile: stateFile, done: make(chan struct{}), stdout: stdout, stderr: stderr}
 	if err := command.Start(); err != nil {
 		cancel()
 		return ProcessSnapshot{}, err
@@ -429,6 +430,7 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 }
 
 func (m *ProcessManager) wait(process *managedProcess) {
+	defer close(process.done)
 	err := process.command.Wait()
 	contextErr := process.context.Err()
 	confirmed := true
@@ -601,7 +603,7 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 			stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
 			_, _ = stdout.Write([]byte(state.Snapshot.Stdout))
 			_, _ = stderr.Write([]byte(state.Snapshot.Stderr))
-			process := &managedProcess{snapshot: state.Snapshot, cancel: func() {}, context: context.Background(), sandboxID: state.SandboxID, spec: spec, pidFile: state.PIDFile, hostPIDFile: state.HostPIDFile, hostStdoutFile: state.StdoutFile, hostStderrFile: state.StderrFile, stateFile: stateFile, stdout: stdout, stderr: stderr}
+			process := &managedProcess{snapshot: state.Snapshot, cancel: func() {}, context: context.Background(), sandboxID: state.SandboxID, spec: spec, pidFile: state.PIDFile, hostPIDFile: state.HostPIDFile, hostStdoutFile: state.StdoutFile, hostStderrFile: state.StderrFile, stateFile: stateFile, done: make(chan struct{}), stdout: stdout, stderr: stderr}
 			if activeProcessStatus(process.snapshot.Status) {
 				running, statusErr := m.sandboxProcessRunning(process)
 				if statusErr != nil {
@@ -619,7 +621,10 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 					process.snapshot.FinishedAt = &now
 					process.snapshot.StopConfirmed = nil
 					_ = m.persistProcess(process)
+					close(process.done)
 				}
+			} else {
+				close(process.done)
 			}
 			m.processes[process.snapshot.ID] = process
 		}
@@ -628,6 +633,7 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 }
 
 func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
+	defer close(process.done)
 	for {
 		time.Sleep(time.Second)
 		running, err := m.sandboxProcessRunning(process)
@@ -889,10 +895,7 @@ func (m *ProcessManager) Kill(scope, lifecycle, target, id string) (ProcessSnaps
 	if s.ScopeKey != scope || s.Target != target || (lifecycle != "" && s.LifecycleID != lifecycle) {
 		return ProcessSnapshot{}, errors.New("process not found")
 	}
-	if !activeProcessStatus(s.Status) {
-		return s, nil
-	}
-	if !m.stopProcess(p) {
+	if activeProcessStatus(s.Status) && !m.stopProcess(p) {
 		return m.snapshot(p), errors.New("process termination could not be confirmed")
 	}
 	if !confirmStopped([]*managedProcess{p}, 3*time.Second) {
@@ -910,8 +913,8 @@ func (m *ProcessManager) CancelRun(runID, scope, lifecycle string) bool {
 	matched := make([]*managedProcess, 0)
 	for _, p := range values {
 		s := m.snapshot(p)
-		if s.RunID == runID && s.ScopeKey == scope && s.LifecycleID == lifecycle && activeProcessStatus(s.Status) {
-			if !m.stopProcess(p) {
+		if s.RunID == runID && s.ScopeKey == scope && s.LifecycleID == lifecycle {
+			if activeProcessStatus(s.Status) && !m.stopProcess(p) {
 				return false
 			}
 			matched = append(matched, p)
@@ -929,8 +932,8 @@ func (m *ProcessManager) CleanupScope(scope, lifecycle string) bool {
 	matched := make([]*managedProcess, 0)
 	for _, p := range values {
 		s := m.snapshot(p)
-		if scopeFamilyOwns(scope, s.ScopeKey) && (lifecycle == "" || s.LifecycleID == lifecycle) && activeProcessStatus(s.Status) {
-			if !m.stopProcess(p) {
+		if scopeFamilyOwns(scope, s.ScopeKey) && (lifecycle == "" || s.LifecycleID == lifecycle) {
+			if activeProcessStatus(s.Status) && !m.stopProcess(p) {
 				return false
 			}
 			matched = append(matched, p)
@@ -953,8 +956,8 @@ func (m *ProcessManager) ShutdownHost() bool {
 	matched := make([]*managedProcess, 0)
 	for _, process := range values {
 		snapshot := m.snapshot(process)
-		if snapshot.Target == "host" && activeProcessStatus(snapshot.Status) {
-			if !m.stopProcess(process) {
+		if snapshot.Target == "host" {
+			if activeProcessStatus(snapshot.Status) && !m.stopProcess(process) {
 				return false
 			}
 			matched = append(matched, process)
@@ -974,9 +977,20 @@ func confirmStopped(processes []*managedProcess, timeout time.Duration) bool {
 		for _, process := range processes {
 			process.mu.Lock()
 			running := activeProcessStatus(process.snapshot.Status)
+			done := process.done
 			process.mu.Unlock()
 			if running {
 				all = false
+				break
+			}
+			if done != nil {
+				select {
+				case <-done:
+				default:
+					all = false
+				}
+			}
+			if !all {
 				break
 			}
 		}

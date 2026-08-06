@@ -121,9 +121,9 @@ func TestCleanupScopeStopsRootAndDelegateFamilyOnly(t *testing.T) {
 		}
 		return result
 	}
-	start("private:1")
-	start("private:1/delegate/child")
-	start("private:10/delegate/child")
+	root := start("private:1")
+	delegate := start("private:1/delegate/child")
+	similarPrefix := start("private:10/delegate/child")
 	defer processes.CleanupScope("private:1", "life-1")
 	defer processes.CleanupScope("private:10", "life-1")
 
@@ -138,6 +138,50 @@ func TestCleanupScopeStopsRootAndDelegateFamilyOnly(t *testing.T) {
 	}
 	if count := processes.RunningCount("private:10", "life-1"); count != 1 {
 		t.Fatalf("similar-prefix scope was affected by cleanup: count=%d", count)
+	}
+	for _, id := range []string{root.ID, delegate.ID} {
+		select {
+		case <-processes.processes[id].done:
+		default:
+			t.Fatalf("cleanup returned before process %s bookkeeping settled", id)
+		}
+	}
+	select {
+	case <-processes.processes[similarPrefix.ID].done:
+		t.Fatal("similar-prefix process was unexpectedly settled")
+	default:
+	}
+}
+
+func TestCleanupScopeWaitsForTerminalControllerSettlement(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	settled := make(chan struct{})
+	processes.processes["settling"] = &managedProcess{
+		snapshot: ProcessSnapshot{
+			ID: "settling", ScopeKey: "private:1", LifecycleID: "life-1",
+			Target: "host", Status: "cancelled", StartedAt: time.Now().UTC(),
+		},
+		done: settled, stdout: &boundedBuffer{limit: 1024},
+		stderr: &boundedBuffer{limit: 1024},
+	}
+	result := make(chan bool, 1)
+	go func() {
+		result <- processes.CleanupScope("private:1", "life-1")
+	}()
+	select {
+	case <-result:
+		t.Fatal("cleanup returned before terminal controller settlement")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(settled)
+	select {
+	case confirmed := <-result:
+		if !confirmed {
+			t.Fatal("cleanup did not confirm settled terminal controller")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not return after terminal controller settlement")
 	}
 }
 

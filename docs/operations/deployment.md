@@ -111,6 +111,8 @@ Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、�
 
 Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
 
+Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回确认前必须等待匹配进程退出及其控制器完成输出、进程登记与 Sandbox 活动计数落盘。更新、reset、测试目录回收和 Sandbox 停止都不能在该屏障返回后再次收到旧 wait/watch goroutine 的迟到写入。
+
 ## 验收
 
 安装或更新至少验证：
