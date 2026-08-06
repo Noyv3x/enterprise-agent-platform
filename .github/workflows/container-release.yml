@@ -56,7 +56,14 @@ jobs:
           set -euo pipefail
           source_commit="$(git rev-parse HEAD)"
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$source_commit" origin/main
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$source_commit" == "$(git rev-parse origin/main)" ]] || {
+              echo "Manual release candidate is no longer the current main HEAD" >&2
+              exit 1
+            }
+          else
+            git merge-base --is-ancestor "$source_commit" origin/main
+          fi
           image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
@@ -101,11 +108,12 @@ jobs:
             ' "$run_json" >/dev/null
           else
             gh api --paginate \
-              "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
+              "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&status=completed&per_page=100" |
               jq -se --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
                 [.[].workflow_runs[] | select(
                   .path == ".github/workflows/quality.yml" and
-                  .event == "push" and .conclusion == "success" and
+                  (.event == "push" or .event == "workflow_dispatch") and
+                  .conclusion == "success" and
                   .head_branch == "main" and .head_sha == $source and
                   .head_repository.full_name == $repo and
                   (.id | type == "number" and . > 0) and
@@ -1225,11 +1233,12 @@ jobs:
               ' "$result" >/dev/null
             else
               gh api --paginate \
-                "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&event=push&status=completed&per_page=100" |
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&status=completed&per_page=100" |
                 jq -se --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
                   [.[].workflow_runs[] | select(
                     .path == ".github/workflows/quality.yml" and
-                    .event == "push" and .conclusion == "success" and
+                    (.event == "push" or .event == "workflow_dispatch") and
+                    .conclusion == "success" and
                     .head_branch == "main" and .head_sha == $source and
                     .head_repository.full_name == $repo and
                     (.id | type == "number" and . > 0) and
@@ -1253,7 +1262,14 @@ jobs:
           verify_forward() {
             local current="$1"
             git fetch --no-tags origin main
-            git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+              [[ "$SOURCE_COMMIT" == "$(git rev-parse origin/main)" ]] || {
+                echo "Manual release candidate is no longer the current main HEAD" >&2
+                exit 1
+              }
+            else
+              git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+            fi
             git merge-base --is-ancestor "$current" "$SOURCE_COMMIT" || {
               echo "Refusing to move main from a non-ancestor generation: ${current}" >&2
               exit 1

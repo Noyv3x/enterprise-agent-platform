@@ -17,7 +17,7 @@
 
 温热工作区的目标是 `affected` 在 3 分钟内给出反馈、`full` 在 10 分钟内完成；Quality CI 继续以独立 job 全量并行。顶层脚本必须输出选中组件和每组耗时；普通变更连续超出目标时，先定位回归或拆分过宽测试域，不把增大全局超时当作默认解法。
 
-每个可发布提交的 Manager 全量测试只在对应的成功 Quality run 中以 `go test -count=1 ./...` 真实执行一次。Container release 必须绑定该精确提交的成功 Quality 证据；其两个 Manager 工件 job 只分别交叉编译 `linux/amd64` 与 `linux/arm64`、生成校验和并上传，不得再次运行全量测试。发布工作流在镜像构建前证明当前公开 generation 是候选提交的 Git 祖先，防止分叉或降级通道。Go 模块与构建缓存以 `manager/go.sum` 为精确依赖入口，仅用于加速且不替代测试、编译或工件校验。真实 user-systemd 集成测试仍是独立发布门禁，必须使用 `-count=1` 执行，不能由全量单元测试或缓存命中代替。
+每个可发布提交的 Manager 全量测试只在对应的成功 Quality run 中以 `go test -count=1 ./...` 真实执行一次。Container release 必须绑定该精确提交的成功 Quality 证据；自动入口只接受同仓库 `main` push，人工恢复入口可接受对当前 `origin/main` 精确 HEAD 显式触发的 Quality，但在发布开始和最终推进通道前都必须重新确认候选仍等于远端 HEAD。其两个 Manager 工件 job 只分别交叉编译 `linux/amd64` 与 `linux/arm64`、生成校验和并上传，不得再次运行全量测试。发布工作流在镜像构建前证明当前公开 generation 是候选提交的 Git 祖先，防止分叉或降级通道。Go 模块与构建缓存以 `manager/go.sum` 为精确依赖入口，仅用于加速且不替代测试、编译或工件校验。真实 user-systemd 集成测试仍是独立发布门禁，必须使用 `-count=1` 执行，不能由全量单元测试或缓存命中代替。
 
 CI 中的 Python 仓库工具必须显式通过 `python3` 调用，不能依赖 Git 可执行位或 runner 的隐式命令解析；静态发布验收需要锁定这一调用形式。
 
