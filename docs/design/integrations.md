@@ -1,11 +1,11 @@
 # 外部集成
 
-本文定义平台与模型 OAuth、SearXNG、Firecrawl、Camoufox、Cognee、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
+本文定义平台与模型 OAuth、Knowledge Embeddings API、SearXNG、Firecrawl、Camoufox、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
 
 ## 发布与通用原则
 
 - 集成适配器属于产品代码；上游 Git 仓库和缓存不属于产品运行数据。
-- Cognee 与 Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。发布工作流和容器验收直接读取并校验该 JSON，在隔离构建上下文中获取、验证和构建；Platform 运行时不生成、导入或携带其 Python 副本，部署机只按 release manifest 拉取镜像，不下载上游源码。
+- Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。发布工作流和容器验收直接读取并校验该 JSON，在隔离构建上下文中获取、验证和构建；部署机只按 release manifest 拉取镜像，不下载上游源码。
 - Platform、Runtime 和集成容器不得访问 Docker socket；生命周期由宿主管理器统一控制。
 - 容器模式下 Platform 只读取 Manager 注入的 Camoufox、SearXNG、Firecrawl 私有 service URL。SQLite 中任何 manage、URL、command 或 source repo 行都不参与解析，Platform API 也不提供安装或重启这些固定服务的入口；修复和重启通过 Manager operation 完成。
 - Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
@@ -50,11 +50,11 @@ Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依�
 
 同一界面提交新消息时，前端立即把该 scope 的本地接管状态降为只读，并等待已经在途的 acquire/input 及其对应 release 收敛后再发送消息；凡该消息将触发 Agent，Platform 还必须在任务入队前、同一浏览器操作门内撤销发送者本人持有的该 root scope 租约。不同用户持有的租约不能被消息发送者夺取，未触发 Agent 的普通频道消息也不能由服务端隐式撤销他人的协助。这样“人工处理后让 Agent 再试”不依赖 90 秒自然过期，也不会让异步前端释放与 Agent 导航形成竞态。明确结束、失焦、页面隐藏、到期、tab 变化、服务端租约冲突、tab 关闭或 scope cleanup 同样立即把界面降为只读，并尽力释放原租约。共享 Xvfb 不直接暴露为远程桌面。
 
-## Cognee
+## Knowledge Embeddings API
 
-本地 SQLite/FTS 知识库始终可用。`local` 模式不调用 Cognee；`hybrid` 和 `cognee` 模式尝试摄取到指定 dataset，并合并 Cognee 与本地结果。
+知识库是 Platform 内建能力，不运行第三方知识服务或本地模型。管理员只配置一组 OpenAI-compatible Embeddings endpoint、model、可选维度、批大小和 secret API key。缺少 key 时知识能力明确 disabled，不回退到本地 FTS、`LIKE` 或其它 provider。
 
-Cognee 精确 revision 在 Platform 镜像构建时安装为分发版，运行时不把源码加入 `sys.path`。其 data、system、cache、logs 与 `.env` 位于 bind mount。Platform 后台 worker 是摄取异步边界；调用要等待 graph construction 的真实终态，不能留下短生命周期 event loop 的伪成功任务。
+Platform 对 Embeddings 请求使用有界 connect/read/body 预算，禁止带 Authorization 的重定向，校验响应 content type、index 顺序、数量、有限数值和维度，不把 key、原文或完整 provider 错误写入日志。`429` 和可重试的 `5xx` 通过持久 job 有界退避；认证、结构、模型或维度错误为明确配置失败。配置更新先用最小探测验证，再原子保存并创建 shadow generation；旧 active generation 在新代完整就绪前继续服务。
 
 ## 不可信内容
 
@@ -92,9 +92,9 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 ## 上游边界
 
-本仓库不包含 Cognee 或 Firecrawl 的 gitlink、vendored tree 或镜像副本。临时构建 checkout 不得承载产品修改或被推送。平台行为实现于 Python adapter、Agent Runtime、Manager 或平台生成配置；浏览器补丁实现于 `camofox-runtime/`。升级上游先修改源码契约并通过镜像集成验证。
+本仓库不包含 Firecrawl 的 gitlink、vendored tree 或镜像副本。临时构建 checkout 不得承载产品修改或被推送。平台行为实现于 Python adapter、Agent Runtime、Manager 或平台生成配置；浏览器补丁实现于 `camofox-runtime/`。升级上游先修改源码契约并通过镜像集成验证。
 
-Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，Cognee 摄取、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
+Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，知识索引、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
 
 候选启动期间对 workspace、Runtime 与集成 checkpoint 的只读验证不构成解除预约，也不能唤醒邮件、Telegram、计划任务、学习或知识摄取；只有同一 operation 的 Gate 结算明确释放 reservation 后，这些 worker 才按原 checkpoint 恢复。
 

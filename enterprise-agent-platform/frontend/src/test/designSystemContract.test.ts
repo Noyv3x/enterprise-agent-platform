@@ -16,7 +16,6 @@ const NATIVE_CONTROL_ALLOWLIST = new Set([
   "components/chat/ComposerField.tsx",
   "components/chat/ComposerTextarea.tsx",
   "components/chat/MentionMenu.tsx",
-  "components/common/ConfigFieldControl.tsx",
 ]);
 
 function sourcePath(path: string): string {

@@ -8,7 +8,7 @@
      updates  → <AutoUpdateConfig/>
      security → <SecuritySettings/>
      runtime  → <RuntimeSettings/>
-     cognee   → <CogneeInternalConfig/>
+     knowledge → <KnowledgeEmbeddingConfig/>
      secrets  → <SecretsSettings/> */
 
 import { lazy, Suspense, type ReactNode } from "react";
@@ -29,8 +29,8 @@ const AutoUpdateConfig = lazy(() => import("./config/AutoUpdateConfig").then(
 const BrandingSettings = lazy(() => import("./config/BrandingSettings").then(
   (module) => ({ default: module.BrandingSettings }),
 ));
-const CogneeInternalConfig = lazy(() => import("./config/CogneeInternalConfig").then(
-  (module) => ({ default: module.CogneeInternalConfig }),
+const KnowledgeEmbeddingConfig = lazy(() => import("./config/KnowledgeEmbeddingConfig").then(
+  (module) => ({ default: module.KnowledgeEmbeddingConfig }),
 ));
 const AgentRuntimeConfig = lazy(() => import("./config/AgentRuntimeConfig").then(
   (module) => ({ default: module.AgentRuntimeConfig }),
@@ -106,8 +106,8 @@ export function AdminPageContent({
     case "runtime":
       content = <RuntimeSettings />;
       break;
-    case "cognee":
-      content = <CogneeInternalConfig />;
+    case "knowledge":
+      content = <KnowledgeEmbeddingConfig />;
       break;
     case "secrets":
       content = <SecretsSettings />;

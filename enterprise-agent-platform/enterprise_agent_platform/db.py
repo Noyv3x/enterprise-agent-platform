@@ -27,7 +27,8 @@ from .technical_profile import (
 )
 
 
-_DATABASE_BASELINE_VERSION = 2026072901
+_SOURCE_DATABASE_BASELINE_VERSION = 2026072901
+_DATABASE_BASELINE_VERSION = 2026080601
 _DATABASE_BASELINE_NAME = TARGET_DATABASE_BASELINE
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
@@ -63,12 +64,110 @@ _AGENT_MEMORY_FTS_TRIGGER_SQL = {
 }
 
 
+_RETIRED_KNOWLEDGE_SETTING_KEYS = (
+    "cognee_backend",
+    "cognee_dataset",
+    "cognee_ingest_background",
+    "cognee_data_root_directory",
+    "cognee_system_root_directory",
+    "cognee_cache_root_directory",
+    "cognee_logs_dir",
+    "cognee_skip_connection_test",
+)
+
+
+_KNOWLEDGE_SCHEMA_SQL = """
+CREATE TABLE knowledge_index_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    config_hash TEXT NOT NULL,
+    embedding_base_url TEXT NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER
+        CHECK(embedding_dimensions IS NULL OR embedding_dimensions BETWEEN 1 AND 65536),
+    chunker_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'building'
+        CHECK(status IN ('building', 'active', 'failed', 'superseded')),
+    document_count INTEGER NOT NULL DEFAULT 0 CHECK(document_count >= 0),
+    ready_document_count INTEGER NOT NULL DEFAULT 0
+        CHECK(ready_document_count >= 0 AND ready_document_count <= document_count),
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    activated_at INTEGER
+);
+CREATE INDEX idx_knowledge_index_generations_status
+    ON knowledge_index_generations(status, id DESC);
+CREATE UNIQUE INDEX uq_knowledge_index_generations_active
+    ON knowledge_index_generations(status) WHERE status = 'active';
+
+CREATE TABLE knowledge_document_index (
+    generation_id INTEGER NOT NULL
+        REFERENCES knowledge_index_generations(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL
+        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    expected_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'ready', 'failed')),
+    chunk_count INTEGER NOT NULL DEFAULT 0 CHECK(chunk_count >= 0),
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(generation_id, document_id)
+);
+CREATE INDEX idx_knowledge_document_index_status
+    ON knowledge_document_index(generation_id, status, document_id);
+
+CREATE TABLE knowledge_chunks (
+    generation_id INTEGER NOT NULL
+        REFERENCES knowledge_index_generations(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL,
+    document_id INTEGER NOT NULL
+        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
+    title_path TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    char_start INTEGER NOT NULL CHECK(char_start >= 0),
+    char_end INTEGER NOT NULL CHECK(char_end > char_start),
+    chunk_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(generation_id, chunk_id),
+    UNIQUE(generation_id, document_id, chunk_index)
+);
+CREATE INDEX idx_knowledge_chunks_document
+    ON knowledge_chunks(generation_id, document_id, chunk_index);
+
+CREATE TABLE knowledge_chunk_embeddings (
+    generation_id INTEGER NOT NULL,
+    chunk_id TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK(dimensions BETWEEN 1 AND 65536),
+    vector BLOB NOT NULL,
+    norm REAL NOT NULL CHECK(norm > 0),
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(generation_id, chunk_id),
+    FOREIGN KEY(generation_id, chunk_id)
+        REFERENCES knowledge_chunks(generation_id, chunk_id) ON DELETE CASCADE
+);
+"""
+
+
 def now_ts() -> int:
     return int(time.time())
 
 
 def _normalized_schema_sql(value: object) -> str:
     return "".join(str(value or "").casefold().split())
+
+
+def _execute_transactional_schema(
+    connection: sqlite3.Connection,
+    schema: str,
+) -> None:
+    """Execute the owned DDL without ``executescript``'s implicit COMMIT."""
+
+    for statement in schema.split(";"):
+        sql = statement.strip()
+        if sql:
+            connection.execute(sql)
 
 
 def _close_database_descriptors(database_fd: int, directory_fd: int) -> None:
@@ -107,6 +206,8 @@ def _assert_pinned_database_profile(
     database_name: str,
     database_fd: int,
     selected: TechnicalProfile,
+    *,
+    allow_source_migration: bool = False,
 ) -> None:
     """Read the baseline through one pinned, re-proven database inode."""
 
@@ -147,9 +248,14 @@ def _assert_pinned_database_profile(
         if connection is not None:
             connection.close()
     markers = [(int(version), str(name)) for version, name in row]
-    if markers != [
-        (_DATABASE_BASELINE_VERSION, selected.database_baseline_name)
-    ]:
+    allowed_markers = {
+        (_DATABASE_BASELINE_VERSION, selected.database_baseline_name),
+    }
+    if allow_source_migration:
+        allowed_markers.add(
+            (_SOURCE_DATABASE_BASELINE_VERSION, selected.database_baseline_name)
+        )
+    if len(markers) != 1 or markers[0] not in allowed_markers:
         raise sqlite3.DatabaseError(
             "database does not match the current baseline marker"
         )
@@ -234,10 +340,13 @@ class Database:
         self,
         path: Path,
         technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
+        *,
+        allow_source_migration: bool = False,
     ):
         self.path = Path(path).expanduser()
         self.technical_profile = technical_profile(technical_profile_value)
         self._database_baseline_name = self.technical_profile.database_baseline_name
+        self._allow_source_migration = bool(allow_source_migration)
         self._directory_fd = -1
         self._database_fd = -1
         self._pin_finalizer: weakref.finalize | None = None
@@ -274,6 +383,7 @@ class Database:
                 self.path.name,
                 self._database_fd,
                 self.technical_profile,
+                allow_source_migration=self._allow_source_migration,
             )
             verify_private_directory_path_fd(
                 self.path.parent,
@@ -408,7 +518,19 @@ class Database:
             }
             fresh_database = not existing_tables
             if not fresh_database:
-                self._assert_current_database_baseline(existing_tables)
+                marker = self._database_marker(existing_tables)
+                source_marker = (
+                    _SOURCE_DATABASE_BASELINE_VERSION,
+                    self._database_baseline_name,
+                )
+                if marker == source_marker and self._allow_source_migration:
+                    self._assert_database_structure(
+                        existing_tables,
+                        source_knowledge_baseline=True,
+                    )
+                    self._migrate_source_database_baseline()
+                else:
+                    self._assert_current_database_baseline(existing_tables)
             if fresh_database:
                 try:
                     schema = """
@@ -590,6 +712,8 @@ class Database:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_content_hash
                     ON knowledge_documents(content_hash) WHERE content_hash != '';
+
+                __KNOWLEDGE_SCHEMA__
 
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -775,7 +899,7 @@ class Database:
 
                 INSERT INTO schema_migrations(version, name, applied_at)
                     VALUES (
-                        2026072901,
+                        2026080601,
                         '__CURRENT_DATABASE_BASELINE__',
                         CAST(strftime('%s', 'now') AS INTEGER)
                     );
@@ -847,11 +971,13 @@ class Database:
                 """
                     if schema.count("__CURRENT_DATABASE_BASELINE__") != 1:
                         raise RuntimeError("database baseline placeholder is invalid")
+                    if schema.count("__KNOWLEDGE_SCHEMA__") != 1:
+                        raise RuntimeError("knowledge schema placeholder is invalid")
                     self._conn.executescript(
                         schema.replace(
                             "__CURRENT_DATABASE_BASELINE__",
                             self._database_baseline_name,
-                        )
+                        ).replace("__KNOWLEDGE_SCHEMA__", _KNOWLEDGE_SCHEMA_SQL)
                     )
                 except BaseException:
                     self._conn.rollback()
@@ -860,6 +986,65 @@ class Database:
             self._ensure_message_fts()
             self._assert_current_database_baseline()
             self._conn.commit()
+
+    def _database_marker(self, tables: set[str] | None = None) -> tuple[int, str] | None:
+        known_tables = tables or self._database_tables()
+        if "schema_migrations" not in known_tables:
+            return None
+        rows = self._conn.execute(
+            "SELECT version, name FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return int(rows[0]["version"]), str(rows[0]["name"])
+
+    def _migrate_source_database_baseline(self) -> None:
+        """Atomically replace the retired knowledge index with the current one."""
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            for trigger_name in ("knowledge_ai", "knowledge_ad", "knowledge_au"):
+                self._conn.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
+            self._conn.execute('DROP TABLE IF EXISTS "knowledge_fts"')
+            self._conn.execute(
+                "DELETE FROM durable_jobs WHERE kind = 'cognee'"
+            )
+            placeholders = ", ".join(
+                "?" for _ in _RETIRED_KNOWLEDGE_SETTING_KEYS
+            )
+            self._conn.execute(
+                f"DELETE FROM settings WHERE key IN ({placeholders})",
+                _RETIRED_KNOWLEDGE_SETTING_KEYS,
+            )
+            _execute_transactional_schema(self._conn, _KNOWLEDGE_SCHEMA_SQL)
+            self._conn.execute(
+                "UPDATE schema_migrations SET version = ?, applied_at = ? "
+                "WHERE version = ? AND name = ?",
+                (
+                    _DATABASE_BASELINE_VERSION,
+                    now_ts(),
+                    _SOURCE_DATABASE_BASELINE_VERSION,
+                    self._database_baseline_name,
+                ),
+            )
+            if self._conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise sqlite3.DatabaseError(
+                    "database source baseline marker changed during migration"
+                )
+            violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise sqlite3.IntegrityError(
+                    f"knowledge baseline migration produced {len(violations)} "
+                    "foreign-key violations"
+                )
+            self._assert_current_database_baseline()
+        except BaseException:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            raise
+        self._commit_or_rollback(self._conn)
 
     def _assert_current_database_baseline(
         self,
@@ -891,7 +1076,12 @@ class Database:
             ).fetchall()
         }
 
-    def _assert_database_structure(self, tables: set[str]) -> None:
+    def _assert_database_structure(
+        self,
+        tables: set[str],
+        *,
+        source_knowledge_baseline: bool = False,
+    ) -> None:
         agent_scope_columns = {
             "scope_key", "scope_type", "scope_id", "session_id",
             "lifecycle_id", "workspace_path", "sandbox_id", "created_at",
@@ -990,14 +1180,40 @@ class Database:
         required_columns["mail_account_credentials"] = {
             "account_id", "password", "updated_at",
         }
+        if not source_knowledge_baseline:
+            required_columns.update({
+                "knowledge_index_generations": {
+                    "id", "config_hash", "embedding_base_url",
+                    "embedding_model", "embedding_dimensions",
+                    "chunker_version", "status", "document_count",
+                    "ready_document_count", "last_error", "created_at",
+                    "updated_at", "activated_at",
+                },
+                "knowledge_document_index": {
+                    "generation_id", "document_id", "expected_hash",
+                    "status", "chunk_count", "last_error", "created_at",
+                    "updated_at",
+                },
+                "knowledge_chunks": {
+                    "generation_id", "chunk_id", "document_id",
+                    "chunk_index", "title_path", "content", "char_start",
+                    "char_end", "chunk_hash", "created_at",
+                },
+                "knowledge_chunk_embeddings": {
+                    "generation_id", "chunk_id", "dimensions", "vector",
+                    "norm", "created_at",
+                },
+            })
+        fts_prefixes = [
+            "agent_memory_fts",
+            "message_fts",
+            "message_fts_trigram",
+        ]
+        if source_knowledge_baseline:
+            fts_prefixes.append("knowledge_fts")
         fts_tables = {
             f"{prefix}{suffix}"
-            for prefix in (
-                "knowledge_fts",
-                "agent_memory_fts",
-                "message_fts",
-                "message_fts_trigram",
-            )
+            for prefix in fts_prefixes
             for suffix in ("", "_data", "_idx", "_docsize", "_config")
         }
         unexpected_tables = sorted(
@@ -1072,6 +1288,18 @@ class Database:
             "agent_memories",
             "check(source_typein('manual','automatic'))",
         )
+        if not source_knowledge_baseline:
+            self._assert_table_sql(
+                "knowledge_index_generations",
+                "check(statusin('building','active','failed','superseded'))",
+            )
+            self._assert_table_sql(
+                "knowledge_document_index",
+                "check(statusin('pending','ready','failed'))",
+            )
+            self._assert_table_sql(
+                "knowledge_chunks", "check(char_end>char_start)"
+            )
         memory_sources = ("manual", "automatic")
         placeholders = ", ".join("?" for _ in memory_sources)
         invalid_sources = int(self._conn.execute(
@@ -1098,6 +1326,13 @@ class Database:
             "idx_agent_schedule_runs_schedule",
             "idx_agent_schedule_runs_job",
         }
+        if not source_knowledge_baseline:
+            required_indexes.update({
+                "idx_knowledge_index_generations_status",
+                "uq_knowledge_index_generations_active",
+                "idx_knowledge_document_index_status",
+                "idx_knowledge_chunks_document",
+            })
         required_indexes.update({
             "idx_mail_accounts_poll",
             "idx_mail_accounts_owner",
@@ -1125,6 +1360,29 @@ class Database:
             ("idx_agent_schedule_runs_schedule", "agent_schedule_runs", ("schedule_id", "id")),
             ("idx_agent_schedule_runs_job", "agent_schedule_runs", ("durable_job_id",)),
         ]
+        if not source_knowledge_baseline:
+            named_indexes.extend([
+                (
+                    "idx_knowledge_index_generations_status",
+                    "knowledge_index_generations",
+                    ("status", "id"),
+                ),
+                (
+                    "uq_knowledge_index_generations_active",
+                    "knowledge_index_generations",
+                    ("status",),
+                ),
+                (
+                    "idx_knowledge_document_index_status",
+                    "knowledge_document_index",
+                    ("generation_id", "status", "document_id"),
+                ),
+                (
+                    "idx_knowledge_chunks_document",
+                    "knowledge_chunks",
+                    ("generation_id", "document_id", "chunk_index"),
+                ),
+            ])
         named_indexes.extend([
             ("idx_mail_accounts_poll", "mail_accounts", ("enabled", "wake_enabled", "last_checked_at", "id")),
             ("idx_mail_accounts_owner", "mail_accounts", ("owner_user_id", "id")),
@@ -1138,6 +1396,23 @@ class Database:
             "agent_schedule_runs",
             ("schedule_id", "schedule_revision", "occurrence_key"),
         )
+        if not source_knowledge_baseline:
+            self._assert_unique_columns(
+                "knowledge_index_generations", ("status",)
+            )
+            self._assert_unique_columns(
+                "knowledge_document_index", ("generation_id", "document_id")
+            )
+            self._assert_unique_columns(
+                "knowledge_chunks", ("generation_id", "chunk_id")
+            )
+            self._assert_unique_columns(
+                "knowledge_chunks",
+                ("generation_id", "document_id", "chunk_index"),
+            )
+            self._assert_unique_columns(
+                "knowledge_chunk_embeddings", ("generation_id", "chunk_id")
+            )
 
         self._assert_foreign_keys("durable_jobs", set())
         self._assert_foreign_keys(
@@ -1162,6 +1437,38 @@ class Database:
                 ("response_message_id", "messages", "id", "NO ACTION"),
             },
         )
+        if not source_knowledge_baseline:
+            self._assert_foreign_keys("knowledge_index_generations", set())
+            self._assert_foreign_keys(
+                "knowledge_document_index",
+                {
+                    (
+                        "generation_id", "knowledge_index_generations", "id",
+                        "CASCADE",
+                    ),
+                    ("document_id", "knowledge_documents", "id", "CASCADE"),
+                },
+            )
+            self._assert_foreign_keys(
+                "knowledge_chunks",
+                {
+                    (
+                        "generation_id", "knowledge_index_generations", "id",
+                        "CASCADE",
+                    ),
+                    ("document_id", "knowledge_documents", "id", "CASCADE"),
+                },
+            )
+            self._assert_foreign_keys(
+                "knowledge_chunk_embeddings",
+                {
+                    (
+                        "generation_id", "knowledge_chunks", "generation_id",
+                        "CASCADE",
+                    ),
+                    ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
+                },
+            )
 
         required_triggers = {
             "conversation_revision_ai",
@@ -1169,6 +1476,27 @@ class Database:
             "conversation_revision_metadata_au",
             "conversation_revision_ad",
         }
+        optional_fts_triggers: dict[str, set[str]] = {
+            "agent_memory_fts": {
+                "agent_memory_ai", "agent_memory_ad", "agent_memory_au",
+            },
+            "message_fts": {
+                "message_fts_ai", "message_fts_ad", "message_fts_au",
+            },
+            "message_fts_trigram": {
+                "message_fts_trigram_ai", "message_fts_trigram_ad",
+                "message_fts_trigram_au",
+            },
+        }
+        if source_knowledge_baseline:
+            optional_fts_triggers["knowledge_fts"] = {
+                "knowledge_ai", "knowledge_ad", "knowledge_au",
+            }
+        allowed_triggers = set(required_triggers)
+        for table_name, names in optional_fts_triggers.items():
+            if table_name in tables:
+                required_triggers.update(names)
+                allowed_triggers.update(names)
         triggers = {
             str(row["name"])
             for row in self._conn.execute(
@@ -1180,6 +1508,12 @@ class Database:
             raise sqlite3.DatabaseError(
                 "database is missing current baseline triggers: "
                 + ", ".join(missing_triggers)
+            )
+        unexpected_triggers = sorted(triggers - allowed_triggers)
+        if unexpected_triggers:
+            raise sqlite3.DatabaseError(
+                "database contains triggers outside the current baseline: "
+                + ", ".join(unexpected_triggers)
             )
 
         durable_start = self._conn.execute(
@@ -1305,46 +1639,7 @@ class Database:
 
     def _ensure_fts(self) -> None:
         try:
-            self._conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts "
-                "USING fts5(title, summary, content, content='knowledge_documents', content_rowid='id')"
-            )
-            self._conn.executescript(
-                """
-                CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge_documents BEGIN
-                    INSERT INTO knowledge_fts(rowid, title, summary, content)
-                    VALUES (new.id, new.title, new.summary, new.content);
-                END;
-                CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge_documents BEGIN
-                    INSERT INTO knowledge_fts(knowledge_fts, rowid, title, summary, content)
-                    VALUES ('delete', old.id, old.title, old.summary, old.content);
-                END;
-                CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge_documents BEGIN
-                    INSERT INTO knowledge_fts(knowledge_fts, rowid, title, summary, content)
-                    VALUES ('delete', old.id, old.title, old.summary, old.content);
-                    INSERT INTO knowledge_fts(rowid, title, summary, content)
-                    VALUES (new.id, new.title, new.summary, new.content);
-                END;
-                """
-            )
             memory_fts_rebuilt = self._ensure_agent_memory_fts_contract()
-            # The AFTER triggers only sync rows changed after they exist, so an
-            # index created on a DB that already has documents (migrated from a
-            # build without FTS5, or where FTS5 was unavailable on a prior boot)
-            # starts empty and never backfills. Detect that divergence and
-            # rebuild once. Note: count(*) on an external-content FTS5 table
-            # reflects the source table's rowids, not what is actually indexed,
-            # so it can never be used to spot an empty index. The internal
-            # knowledge_fts_docsize shadow table holds one row per indexed
-            # document, which is the reliable signal. 'rebuild' is idempotent
-            # and cheap when the index is already in sync.
-            doc_count = self._conn.execute(
-                "SELECT count(*) FROM knowledge_documents"
-            ).fetchone()[0]
-            if doc_count > 0 and self._fts_index_is_stale(doc_count):
-                self._conn.execute(
-                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('rebuild')"
-                )
             memory_count = self._conn.execute(
                 "SELECT count(*) FROM agent_memories"
             ).fetchone()[0]
@@ -1359,7 +1654,8 @@ class Database:
                     )
             self.fts_available = True
         except sqlite3.OperationalError:
-            # SQLite build lacks FTS5; KnowledgeBase.search falls back to LIKE.
+            # Memory recall has its own optional FTS capability. Knowledge
+            # retrieval never uses SQLite FTS or LIKE.
             self.fts_available = False
 
     def _ensure_agent_memory_fts_contract(self) -> bool:
@@ -1424,9 +1720,8 @@ class Database:
         except sqlite3.OperationalError as exc:
             self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            # Knowledge FTS creation above has already proved that this SQLite
-            # connection supports FTS5. A failure here is therefore a broken
-            # derived schema, not an optional-capability fallback.
+            # A partially present memory FTS schema is a broken derived
+            # contract, not an optional-capability fallback.
             raise sqlite3.DatabaseError(
                 "agent memory FTS contract repair failed"
             ) from exc
@@ -1522,24 +1817,6 @@ class Database:
         except sqlite3.OperationalError:
             self.message_fts_trigram_available = False
 
-    def _fts_index_is_stale(self, doc_count: int) -> bool:
-        """Report whether the FTS index is missing rows that exist in the source.
-
-        Uses the internal knowledge_fts_docsize shadow table, which holds one
-        row per indexed document, because count(*) on an external-content FTS5
-        table mirrors the source table and so always matches doc_count. If the
-        shadow table cannot be read (an unexpected FTS5 internal layout), assume
-        a rebuild is warranted; 'rebuild' is idempotent so the worst case is one
-        extra cheap pass.
-        """
-        try:
-            indexed = self._conn.execute(
-                "SELECT count(*) FROM knowledge_fts_docsize"
-            ).fetchone()[0]
-        except sqlite3.OperationalError:
-            return True
-        return indexed < doc_count
-
     @contextmanager
     def transaction(
         self, *, immediate: bool = False
@@ -1624,6 +1901,33 @@ class Database:
         cur = conn.execute(sql, tuple(params))
         conn.commit()
         return int(cur.lastrowid)
+
+
+def migrate_database(
+    path: Path,
+    technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
+) -> int:
+    """Apply the sole supported direct baseline migration and verify its result.
+
+    Normal ``Database`` construction never accepts a previous marker. The
+    deployment-only migrate command must opt into this function after Manager
+    has stopped the current writer and created its rollback snapshot.
+    """
+
+    database = Database(
+        path,
+        technical_profile_value,
+        allow_source_migration=True,
+    )
+    try:
+        return int(
+            database.scalar(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+            )
+            or 0
+        )
+    finally:
+        database.close()
 
 
 def encode_json(value: dict[str, Any] | list[Any] | None) -> str:

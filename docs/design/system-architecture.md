@@ -70,7 +70,7 @@ React 应用随 Platform 镜像发布，由 Python 作为静态资源服务。�
 
 ## 外部能力
 
-Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖构建进 Platform 镜像。上游 URL 与 revision 由 canonical 契约锁定，CI 在构建时验证并产出不可变镜像；部署机不保留或更新上游 Git checkout。详见[外部集成](integrations.md)。
+Camoufox、SearXNG 和 Firecrawl 是固定受管容器。知识索引属于 Platform 业务能力，只通过管理员配置的 OpenAI-compatible Embeddings API 获取向量，不增加知识容器或本地模型。上游 URL 与 revision 由 canonical 契约锁定，CI 在构建时验证并产出不可变镜像；部署机不保留或更新上游 Git checkout。详见[外部集成](integrations.md)。
 
 ## 关键数据流
 
@@ -109,6 +109,6 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器；Cognee 代码与依赖�
 - Runtime 重启通过幂等记录和会话日志区分可重放结果与 `needs_review`。
 - 管理器重启从 operation journal 和容器 label 对账，不从容器名称猜测状态。
 - 启动只能使用当前技术 profile 和配置根；旧目录、进程名或普通 operation 都不能改变技术身份。
-- 搜索、抓取、浏览器和 Cognee 失败只影响对应工具，不能破坏本地消息和知识数据。
+- 搜索、抓取、浏览器和 Embeddings provider 失败只影响对应能力，不能破坏本地消息和知识原文；知识检索必须报告 disabled/degraded，不能静默改走其它后端。
 - 邮件轮询和回复通知失败只降级对应集成，不阻断对话；更新维护期间不启动新的邮件副作用或唤醒。
 - Run 空闲、模型轮次和 terminal 默认超时只在 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义；容器与更新状态只在 [`container-platform.json`](../contracts/container-platform.json) 定义。

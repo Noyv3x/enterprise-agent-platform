@@ -37,7 +37,7 @@ class AssembleReleaseManifestTests(unittest.TestCase):
             images=self.images_path,
             generation=CANDIDATE,
             generated_at="2026-08-01T00:00:00+00:00",
-            database_schema_version=2026072901,
+            database_schema_version=2026080601,
             manager_amd64_url=base + "/agent-platform-manager-linux-amd64",
             manager_amd64_sha256="4" * 64,
             manager_arm64_url=base + "/agent-platform-manager-linux-arm64",

@@ -11,10 +11,11 @@ import type {
   AutoUpdateConfigState,
   Channel,
   ChatMode,
-  CogneeConfigState,
   FullDocument,
   Id,
+  KnowledgeConfigState,
   KnowledgeDocument,
+  KnowledgeIndexStatus,
   KnowledgeSearch,
   MentionTarget,
   Message,
@@ -78,7 +79,8 @@ export interface AppState {
   telegramConfig: TelegramConfigState | null;
   autoUpdateConfig: AutoUpdateConfigState | null;
   brandingConfig: BrandingSnapshot | null;
-  cogneeConfig: CogneeConfigState | null;
+  knowledgeConfig: KnowledgeConfigState | null;
+  knowledgeStatus: KnowledgeIndexStatus | null;
   securityConfig: SecurityConfigState | null;
   oauthProviders: OAuthProvidersState | null;
   oauthFlows: Record<string, OAuthFlow>;
@@ -171,7 +173,8 @@ export type AdminSliceState = Pick<
   | "telegramConfig"
   | "autoUpdateConfig"
   | "brandingConfig"
-  | "cogneeConfig"
+  | "knowledgeConfig"
+  | "knowledgeStatus"
   | "securityConfig"
   | "oauthProviders"
   | "oauthFlows"
@@ -396,9 +399,13 @@ interface SetBrandingConfigAction {
   type: "SET_BRANDING_CONFIG";
   payload: BrandingSnapshot | null;
 }
-interface SetCogneeConfigAction {
-  type: "SET_COGNEE_CONFIG";
-  payload: CogneeConfigState | null;
+interface SetKnowledgeConfigAction {
+  type: "SET_KNOWLEDGE_CONFIG";
+  payload: KnowledgeConfigState | null;
+}
+interface SetKnowledgeStatusAction {
+  type: "SET_KNOWLEDGE_STATUS";
+  payload: KnowledgeIndexStatus | null;
 }
 interface SetSecurityConfigAction {
   type: "SET_SECURITY_CONFIG";
@@ -502,7 +509,8 @@ export type Action =
   | SetTelegramConfigAction
   | SetAutoUpdateConfigAction
   | SetBrandingConfigAction
-  | SetCogneeConfigAction
+  | SetKnowledgeConfigAction
+  | SetKnowledgeStatusAction
   | SetSecurityConfigAction
   | SetOAuthProvidersAction
   | SetOAuthStateAction

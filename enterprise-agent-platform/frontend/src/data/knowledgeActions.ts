@@ -7,7 +7,6 @@ import { endpoints } from "../lib/endpoints";
 import type {
   CreateDocumentRequest,
   DocumentResponse,
-  Id,
   KnowledgeSearchResponse,
 } from "../types";
 import { loadDocuments, type AppStore } from "./loaders";
@@ -20,13 +19,6 @@ const searchRequestGenerations = new WeakMap<AppStore, number>();
    implementation. Re-exported here so the knowledge view imports its whole data
    surface from one place. */
 export { loadDocuments };
-
-/** The by-id GET route is numeric-only server-side
- *  (`/api/knowledge/documents/(\d+)`), so a Cognee search hit whose id is not a
- *  local numeric row id must never call it (spec §6/§7). */
-export function isNumericDocumentId(id: Id): boolean {
-  return /^\d+$/.test(String(id));
-}
 
 /** POST a new knowledge document. The four keys are sent verbatim
  *  (title/source/summary/content); the server response is intentionally ignored
@@ -58,10 +50,8 @@ export function clearSearch(store: AppStore): void {
   store.dispatch({ type: "SET_KNOWLEDGE_SEARCH", payload: { query: "", results: null } });
 }
 
-/** GET the full document by id and select it for the inline viewer. No-ops on a non-numeric
- *  id so a Cognee hit cannot hit the numeric-only route. */
-export async function openDocument(store: AppStore, id: Id): Promise<void> {
-  if (!isNumericDocumentId(id)) return;
+/** GET the authoritative document by its stable numeric id and select it for the viewer. */
+export async function openDocument(store: AppStore, id: number): Promise<void> {
   const generation = (documentRequestGenerations.get(store) || 0) + 1;
   documentRequestGenerations.set(store, generation);
   const ownerId = store.getState().user?.id;

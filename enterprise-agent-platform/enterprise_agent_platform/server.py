@@ -613,7 +613,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             self._serve_static(path)
         except ServiceError as exc:
-            self._json({"error": exc.message}, status=exc.status)
+            payload = {"error": exc.message}
+            if exc.code:
+                payload["code"] = exc.code
+            self._json(payload, status=exc.status)
         except Exception as exc:
             traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             self._json({"error": "internal server error"}, status=500)
@@ -1225,11 +1228,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                 status=202,
             )
             return
-        if path == "/api/system/cognee/config" and method == "GET":
-            self._json(service.cognee_config(actor))
+        if path == "/api/system/knowledge/config" and method == "GET":
+            self._json(service.knowledge_config(actor))
             return
-        if path == "/api/system/cognee/config" and method == "PUT":
-            self._json(service.update_cognee_config(actor, self._body_json()))
+        if path == "/api/system/knowledge/config" and method == "PUT":
+            self._json(service.update_knowledge_config(actor, self._body_json()))
+            return
+        if path == "/api/system/knowledge/reindex" and method == "POST":
+            self._json(service.reindex_knowledge(actor), status=202)
             return
         if path == "/api/system/oauth/providers" and method == "GET":
             self._json(service.oauth_provider_status(actor))
@@ -2250,11 +2256,6 @@ def run_server(
         print(
             "Bootstrap admin account is admin; password came from "
             f"{admin_password_name} or existing database state."
-        )
-    if not getattr(server.service.db, "fts_available", True):
-        print(
-            "Warning: SQLite was built without FTS5; knowledge search falls back to a slower LIKE scan.",
-            file=sys.stderr,
         )
     previous_handlers: dict[int, signal.Handlers] = {}
 

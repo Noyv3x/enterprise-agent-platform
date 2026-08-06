@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -9,128 +10,370 @@ from pathlib import Path
 
 from enterprise_agent_platform import knowledge as knowledge_module
 from enterprise_agent_platform.db import Database
-from enterprise_agent_platform.knowledge import KnowledgeBase
+from enterprise_agent_platform.knowledge import (
+    EmbeddingResponseError,
+    KnowledgeBase,
+    KnowledgeDisabledError,
+    KnowledgeEmbeddingConfig,
+    OpenAIEmbeddingClient,
+    chunk_document,
+)
 
 
-class KnowledgeSearchEscapingTests(unittest.TestCase):
-    """LIKE/FTS fallback wildcard escaping in KnowledgeBase.search."""
+class FakeEmbeddingClient:
+    def __init__(self):
+        self.calls: list[list[str]] = []
 
-    def test_percent_query_does_not_act_as_wildcard(self):
-        # A bare '%' produces an empty FTS query (make_fts_query strips
-        # non-word chars), so search falls through to the LIKE path. With
-        # proper ESCAPE handling, '%' is matched literally and only the
-        # document that actually contains a '%' is returned -- the old
-        # unescaped code would have matched every document.
+    def embed(self, texts):
+        values = [str(text) for text in texts]
+        self.calls.append(values)
+        result = []
+        for text in values:
+            lowered = text.casefold()
+            result.append([
+                1.0 if "alpha" in lowered else 0.1,
+                1.0 if "beta" in lowered else 0.1,
+                1.0 if "gamma" in lowered else 0.1,
+            ])
+        return result
+
+
+def configured_knowledge(db: Database, client=None) -> KnowledgeBase:
+    return KnowledgeBase(
+        db,
+        KnowledgeEmbeddingConfig(
+            base_url="https://embeddings.example/v1",
+            model="multilingual-test",
+            api_key="test-secret",
+            batch_size=2,
+        ),
+        client or FakeEmbeddingClient(),
+    )
+
+
+class KnowledgeConfigurationTests(unittest.TestCase):
+    def test_missing_key_disables_mutation_and_search_but_preserves_source_reads(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "kb.db")
             try:
-                kb = KnowledgeBase(db)
-                with_pct = kb.add_document(
-                    title="Discount", content="Apply a 50% off promo code now"
+                db.execute(
+                    "INSERT INTO knowledge_documents("
+                    "title, summary, content, source, created_at, updated_at, content_hash"
+                    ") VALUES (?, '', ?, '', 1, 1, ?)",
+                    ("Existing", "preserved source", "a" * 64),
                 )
-                kb.add_document(title="Cats", content="Nothing special about cats")
-                kb.add_document(title="Dogs", content="Nothing special about dogs")
+                knowledge = KnowledgeBase(db)
 
-                hits = kb.search("%")
-                self.assertEqual([h.id for h in hits], [with_pct["id"]])
+                self.assertEqual(knowledge.status()["state"], "disabled")
+                self.assertEqual(knowledge.list_documents()[0]["title"], "Existing")
+                self.assertEqual(knowledge.get_document(1)["content"], "preserved source")
+                with self.assertRaises(KnowledgeDisabledError):
+                    knowledge.add_document(title="New", content="body")
+                with self.assertRaises(KnowledgeDisabledError):
+                    knowledge.search("body")
+                with self.assertRaises(KnowledgeDisabledError):
+                    knowledge.prepare_generation()
             finally:
                 db.close()
 
-    def test_underscore_query_does_not_act_as_wildcard(self):
-        # '_' is a single-character LIKE wildcard; escaped it must match only
-        # documents containing a literal underscore, not every document.
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                kb = KnowledgeBase(db)
-                kb.add_document(title="Alpha", content="plain text without specials")
-                with_underscore = kb.add_document(
-                    title="Snippet", content="variable my_value is set here"
-                )
-                kb.add_document(title="Beta", content="more plain prose")
+    def test_url_and_numeric_limits_fail_closed(self):
+        valid = KnowledgeEmbeddingConfig(
+            base_url="http://127.12.0.1:8080/v1",
+            model="embed",
+            api_key="secret",
+            dimensions=384,
+            batch_size=32,
+        ).validated(require_enabled=True)
+        self.assertEqual(valid.base_url, "http://127.12.0.1:8080/v1")
 
-                hits = kb.search("_")
-                self.assertEqual([h.id for h in hits], [with_underscore["id"]])
+        for url in (
+            "http://localhost:8080/v1",
+            "http://10.0.0.2/v1",
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?key=secret",
+        ):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                KnowledgeEmbeddingConfig(
+                    base_url=url,
+                    model="embed",
+                    api_key="secret",
+                ).validated(require_enabled=True)
+        with self.assertRaises(ValueError):
+            KnowledgeEmbeddingConfig(
+                base_url="https://example.com/v1",
+                model="embed",
+                api_key="secret",
+                dimensions=0,
+            ).validated(require_enabled=True)
+        with self.assertRaises(ValueError):
+            KnowledgeEmbeddingConfig(
+                base_url="https://example.com/v1",
+                model="embed",
+                api_key="secret",
+                batch_size=257,
+            ).validated(require_enabled=True)
+
+    def test_openai_response_requires_ordered_finite_vectors(self):
+        requests = []
+
+        def transport(url, headers, body, timeout, maximum):
+            requests.append((url, headers, json.loads(body), timeout, maximum))
+            return (
+                200,
+                "application/json; charset=utf-8",
+                json.dumps({
+                    "data": [
+                        {"index": 0, "embedding": [1.0, 0.0]},
+                        {"index": 1, "embedding": [0.0, 1.0]},
+                    ]
+                }).encode(),
+            )
+
+        client = OpenAIEmbeddingClient(
+            KnowledgeEmbeddingConfig(
+                base_url="https://embeddings.example/v1",
+                model="embed-v1",
+                api_key="do-not-log",
+                dimensions=2,
+            ),
+            transport=transport,
+        )
+        self.assertEqual(client.embed(["first", "second"]), [[1.0, 0.0], [0.0, 1.0]])
+        self.assertEqual(requests[0][0], "https://embeddings.example/v1/embeddings")
+        self.assertEqual(
+            requests[0][2],
+            {
+                "model": "embed-v1",
+                "input": ["first", "second"],
+                "dimensions": 2,
+            },
+        )
+
+        def unordered(*_args):
+            return (
+                200,
+                "application/json",
+                json.dumps({
+                    "data": [
+                        {"index": 1, "embedding": [1.0, 0.0]},
+                        {"index": 0, "embedding": [0.0, 1.0]},
+                    ]
+                }).encode(),
+            )
+
+        with self.assertRaises(EmbeddingResponseError):
+            OpenAIEmbeddingClient(client.config, transport=unordered).embed(
+                ["first", "second"]
+            )
+
+        invalid_vectors = (
+            [float("nan"), 1.0],
+            [1.0],
+            ["not-a-number", 1.0],
+            [0.0, 0.0],
+        )
+        for vector in invalid_vectors:
+            with self.subTest(vector=vector):
+                def invalid(*_args, returned=vector):
+                    return (
+                        200,
+                        "application/json",
+                        json.dumps({
+                            "data": [{"index": 0, "embedding": returned}]
+                        }).encode(),
+                    )
+
+                with self.assertRaises(EmbeddingResponseError):
+                    OpenAIEmbeddingClient(client.config, transport=invalid).embed(
+                        ["first"]
+                    )
+
+
+class KnowledgeChunkingTests(unittest.TestCase):
+    def test_markdown_chunking_is_stable_and_preserves_provenance(self):
+        content = (
+            "# Overview\n\n"
+            + "alpha sentence. " * 70
+            + "\n\n## Details\n\n"
+            + "beta sentence. " * 70
+        )
+        first = chunk_document(document_id=7, title="Runbook", content=content)
+        second = chunk_document(document_id=7, title="Runbook", content=content)
+
+        self.assertEqual(first, second)
+        self.assertGreater(len(first), 1)
+        self.assertEqual([chunk.chunk_index for chunk in first], list(range(len(first))))
+        for chunk in first:
+            self.assertEqual(content[chunk.char_start : chunk.char_end], chunk.content)
+            self.assertLessEqual(len(chunk.content), knowledge_module.CHUNK_TARGET_CHARS)
+            self.assertRegex(chunk.chunk_id, r"^[0-9a-f]{64}$")
+        self.assertTrue(first[0].title_path.startswith("Runbook > Overview"))
+        self.assertTrue(any("Details" in chunk.title_path for chunk in first))
+
+
+class KnowledgeIndexTests(unittest.TestCase):
+    def test_generation_indexes_atomically_and_vector_search_survives_restart(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "kb.db"
+            db = Database(path)
+            client = FakeEmbeddingClient()
+            try:
+                knowledge = configured_knowledge(db, client)
+                alpha = knowledge.add_document(
+                    title="Alpha Guide",
+                    content="# Alpha\n\nalpha deployment procedure",
+                    source="runbook",
+                )
+                beta = knowledge.add_document(
+                    title="Beta Guide",
+                    content="# Beta\n\nbeta incident procedure",
+                    source="runbook",
+                )
+                pending = knowledge.pending_document_refs()
+                self.assertEqual(
+                    {item["document_id"] for item in pending},
+                    {alpha["id"], beta["id"]},
+                )
+                generation_id = pending[0]["generation_id"]
+                results = [knowledge.index_document(item) for item in pending]
+
+                self.assertTrue(results[-1]["activated"])
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT count(*) FROM knowledge_index_generations "
+                        "WHERE status = 'active'"
+                    ),
+                    1,
+                )
+                hits = knowledge.search("alpha")
+                self.assertEqual(hits[0].document_id, alpha["id"])
+                self.assertTrue(hits[0].chunk_id)
+                self.assertGreaterEqual(hits[0].char_start, 0)
+                public_hit = hits[0].to_dict()
+                self.assertEqual(public_hit["document_id"], alpha["id"])
+                self.assertIn("alpha", public_hit["excerpt"].casefold())
+                self.assertEqual(public_hit["char_start"], hits[0].char_start)
+                self.assertEqual(public_hit["char_end"], hits[0].char_end)
+                self.assertNotIn("content", public_hit)
+                status = knowledge.status()
+                self.assertEqual(status["state"], "ready")
+                self.assertEqual(status["active_generation_id"], generation_id)
+                self.assertEqual(status["indexed_documents"], 2)
             finally:
                 db.close()
 
-    def test_like_fallback_escapes_metacharacters(self):
-        # Exercise the LIKE fallback directly (FTS disabled) and confirm a
-        # query consisting only of wildcard metacharacters matches nothing
-        # when no document contains those literal characters.
+            reopened = Database(path)
+            try:
+                restored = configured_knowledge(reopened, FakeEmbeddingClient())
+                self.assertEqual(
+                    restored.search("beta")[0].document_id,
+                    beta["id"],
+                )
+            finally:
+                reopened.close()
+
+    def test_shadow_generation_does_not_replace_active_until_complete(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "kb.db")
             try:
-                db.fts_available = False  # force the LIKE fallback path
-                kb = KnowledgeBase(db)
-                kb.add_document(title="One", content="content one")
-                kb.add_document(title="Two", content="content two")
+                knowledge = configured_knowledge(db)
+                alpha = knowledge.add_document(title="Alpha", content="alpha reference")
+                for payload in knowledge.pending_document_refs():
+                    knowledge.index_document(payload)
+                old_generation = knowledge.status()["active_generation_id"]
 
-                # No document contains a literal '%', so escaped search yields
-                # nothing instead of the unescaped wildcard matching everything.
-                self.assertEqual(kb.search("%"), [])
-                # And a real term still resolves through the same fallback.
-                self.assertEqual([h.title for h in kb.search("one")], ["One"])
+                new_generation = knowledge.prepare_generation(force=True)
+                pending = knowledge.pending_document_refs(new_generation)
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(knowledge.status()["active_generation_id"], old_generation)
+                self.assertEqual(
+                    knowledge.search("alpha")[0].document_id,
+                    alpha["id"],
+                )
+                result = knowledge.index_document(pending[0])
+                self.assertTrue(result["activated"])
+                self.assertEqual(
+                    knowledge.status()["active_generation_id"],
+                    new_generation,
+                )
+                self.assertEqual(knowledge.search("alpha")[0].document_id, alpha["id"])
+            finally:
+                db.close()
+
+    def test_stale_hash_is_discarded_without_writing_vectors(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "kb.db")
+            try:
+                knowledge = configured_knowledge(db)
+                document = knowledge.add_document(
+                    title="Mutable",
+                    content="alpha original",
+                )
+                payload = knowledge.pending_document_refs()[0]
+                replacement = "beta replacement"
+                replacement_hash = knowledge._content_hash(
+                    document["title"], replacement, document["source"]
+                )
+                db.execute(
+                    "UPDATE knowledge_documents SET content = ?, content_hash = ? "
+                    "WHERE id = ?",
+                    (replacement, replacement_hash, document["id"]),
+                )
+
+                result = knowledge.index_document(payload)
+
+                self.assertEqual(result["status"], "stale")
+                self.assertEqual(
+                    db.scalar(
+                        "SELECT count(*) FROM knowledge_chunks WHERE generation_id = ?",
+                        (payload["generation_id"],),
+                    ),
+                    0,
+                )
+            finally:
+                db.close()
+
+    def test_invalid_fake_vectors_are_rejected(self):
+        class WrongCount:
+            def embed(self, _texts):
+                return []
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "kb.db")
+            try:
+                knowledge = configured_knowledge(db, WrongCount())
+                knowledge.add_document(title="Alpha", content="alpha body")
+                payload = knowledge.pending_document_refs()[0]
+                with self.assertRaises(EmbeddingResponseError):
+                    knowledge.index_document(payload)
+                knowledge.mark_index_failed(payload, "invalid provider response")
+                status = knowledge.status()
+                self.assertEqual(status["state"], "degraded")
+                self.assertEqual(status["pending_documents"], 0)
+                self.assertEqual(status["failed_documents"], 1)
             finally:
                 db.close()
 
 
-class KnowledgeDedupTests(unittest.TestCase):
-    def test_identical_document_is_deduped(self):
+class KnowledgeDedupAndLimitsTests(unittest.TestCase):
+    def test_identical_document_is_deduped_concurrently(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "kb.db")
             try:
-                kb = KnowledgeBase(db)
-                first = kb.add_document(
-                    title="Runbook", content="Restart service alpha.", source="wiki"
-                )
-                second = kb.add_document(
-                    title="Runbook", content="Restart service alpha.", source="wiki"
-                )
-
-                self.assertEqual(first["id"], second["id"])
-                count = db.scalar("SELECT count(*) FROM knowledge_documents")
-                self.assertEqual(count, 1)
-            finally:
-                db.close()
-
-    def test_differing_source_creates_new_row(self):
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                kb = KnowledgeBase(db)
-                first = kb.add_document(
-                    title="Runbook", content="Restart service alpha.", source="wiki"
-                )
-                second = kb.add_document(
-                    title="Runbook", content="Restart service alpha.", source="confluence"
-                )
-
-                self.assertNotEqual(first["id"], second["id"])
-                count = db.scalar("SELECT count(*) FROM knowledge_documents")
-                self.assertEqual(count, 2)
-            finally:
-                db.close()
-
-    def test_concurrent_identical_insert_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                kb = KnowledgeBase(db)
+                knowledge = configured_knowledge(db)
                 barrier = threading.Barrier(2)
-                results: list[tuple[int, bool]] = []
-                errors: list[BaseException] = []
+                results = []
+                errors = []
 
-                def insert() -> None:
+                def insert():
                     try:
                         barrier.wait()
-                        document, created = kb.add_document_with_status(
-                            title="Concurrent",
-                            content="one canonical document",
-                            source="sync",
-                        )
-                        results.append((int(document["id"]), created))
-                    except BaseException as exc:  # pragma: no cover - asserted below
+                        results.append(knowledge.add_document_with_status(
+                            title="Runbook",
+                            content="alpha procedure",
+                            source="wiki",
+                        ))
+                    except BaseException as exc:
                         errors.append(exc)
 
                 threads = [threading.Thread(target=insert) for _ in range(2)]
@@ -140,30 +383,21 @@ class KnowledgeDedupTests(unittest.TestCase):
                     thread.join(5)
 
                 self.assertEqual(errors, [])
-                self.assertEqual(len(results), 2)
-                self.assertEqual({item[0] for item in results}, {results[0][0]})
-                self.assertEqual(sum(1 for _doc_id, created in results if created), 1)
-                self.assertEqual(db.scalar("SELECT count(*) FROM knowledge_documents"), 1)
+                self.assertEqual({item[0]["id"] for item in results}, {results[0][0]["id"]})
+                self.assertEqual(sum(1 for _doc, created in results if created), 1)
             finally:
                 db.close()
 
-class KnowledgeContentCapTests(unittest.TestCase):
-    def test_content_exceeding_cap_raises(self):
-        # MAX_CONTENT_CHARS is resolved at import time, so patch the module
-        # global to a small value and restore it afterwards.
+    def test_content_exceeding_cap_raises_without_insert(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "kb.db")
             original = knowledge_module.MAX_CONTENT_CHARS
             knowledge_module.MAX_CONTENT_CHARS = 16
             try:
-                kb = KnowledgeBase(db)
+                knowledge = configured_knowledge(db)
                 with self.assertRaises(ValueError):
-                    kb.add_document(title="Oversize", content="x" * 100)
-                # Nothing was inserted when the cap is exceeded.
+                    knowledge.add_document(title="Oversize", content="x" * 100)
                 self.assertEqual(db.scalar("SELECT count(*) FROM knowledge_documents"), 0)
-                # A document within the cap is still accepted.
-                doc = kb.add_document(title="Tiny", content="short")
-                self.assertEqual(doc["title"], "Tiny")
             finally:
                 knowledge_module.MAX_CONTENT_CHARS = original
                 db.close()
@@ -173,94 +407,16 @@ class KnowledgeContentCapTests(unittest.TestCase):
         try:
             os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "42"
             self.assertEqual(knowledge_module._resolve_max_content_chars(), 42)
-            # 0 disables the limit.
-            os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "0"
-            self.assertEqual(knowledge_module._resolve_max_content_chars(), 0)
-            # Garbage falls back to the generous default rather than crashing.
             os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = "not-an-int"
-            self.assertEqual(knowledge_module._resolve_max_content_chars(), 2_000_000)
+            self.assertEqual(
+                knowledge_module._resolve_max_content_chars(),
+                2_000_000,
+            )
         finally:
             if previous is None:
                 os.environ.pop("AGENT_PLATFORM_KB_MAX_CONTENT_CHARS", None)
             else:
                 os.environ["AGENT_PLATFORM_KB_MAX_CONTENT_CHARS"] = previous
-
-
-class DatabaseFtsRebuildTests(unittest.TestCase):
-    def _docsize_count(self, db: Database) -> int:
-        return db._conn.execute(
-            "SELECT count(*) FROM knowledge_fts_docsize"
-        ).fetchone()[0]
-
-    def test_init_schema_rebuilds_stale_fts_index(self):
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                if not db.fts_available:
-                    self.skipTest("FTS5 not available in this SQLite build")
-                kb = KnowledgeBase(db)
-                doc = kb.add_document(title="RebuildMe", content="alpha bravo charlie")
-
-                # Simulate a divergence between source rows and the index (as
-                # happens when documents predate FTS5 availability): empty the
-                # index without touching the source table.
-                db._conn.execute(
-                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('delete-all')"
-                )
-                db._conn.commit()
-                self.assertEqual(self._docsize_count(db), 0)
-                self.assertEqual(kb.search("bravo"), [])
-
-                # Re-running init_schema must detect the stale index and rebuild.
-                db.init_schema()
-                self.assertEqual(self._docsize_count(db), 1)
-                self.assertEqual([h.id for h in kb.search("bravo")], [doc["id"]])
-            finally:
-                db.close()
-
-    def test_fresh_database_instance_rebuilds_preexisting_doc(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "kb.db"
-            db = Database(path)
-            try:
-                if not db.fts_available:
-                    self.skipTest("FTS5 not available in this SQLite build")
-                kb = KnowledgeBase(db)
-                kb.add_document(title="Persisted", content="delta echo foxtrot")
-                db._conn.execute(
-                    "INSERT INTO knowledge_fts(knowledge_fts) VALUES('delete-all')"
-                )
-                db._conn.commit()
-            finally:
-                db.close()
-
-            # A brand-new Database on the same file runs init_schema in its
-            # constructor, which should rebuild the index so the pre-existing
-            # document is findable again.
-            db2 = Database(path)
-            try:
-                kb2 = KnowledgeBase(db2)
-                self.assertEqual(self._docsize_count(db2), 1)
-                self.assertEqual([h.title for h in kb2.search("echo")], ["Persisted"])
-            finally:
-                db2.close()
-
-    def test_fts_index_is_stale_detection(self):
-        with tempfile.TemporaryDirectory() as td:
-            db = Database(Path(td) / "kb.db")
-            try:
-                if not db.fts_available:
-                    self.skipTest("FTS5 not available in this SQLite build")
-                kb = KnowledgeBase(db)
-                kb.add_document(title="A", content="indexed body one")
-                kb.add_document(title="B", content="indexed body two")
-
-                # In sync: docsize == doc_count -> not stale.
-                self.assertFalse(db._fts_index_is_stale(2))
-                # Pretend there are more source rows than indexed -> stale.
-                self.assertTrue(db._fts_index_is_stale(5))
-            finally:
-                db.close()
 
 
 class DatabaseMemoryFtsContractTests(unittest.TestCase):

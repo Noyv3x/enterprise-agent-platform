@@ -27,6 +27,7 @@ from enterprise_agent_platform.agent_runtime_client import (
     AgentRuntimeRunError,
 )
 from enterprise_agent_platform.config import PlatformConfig
+from enterprise_agent_platform.knowledge import KnowledgeBase, KnowledgeEmbeddingConfig
 from enterprise_agent_platform.oauth_flows import OAuthHTTPResponse
 from enterprise_agent_platform.runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
@@ -125,6 +126,74 @@ class RecordingAgent:
             "message_id": kwargs["message_id"],
             "state": "accepted",
         }
+
+
+class RecordingEmbeddingClient:
+    def __init__(self, dimensions: int = 3):
+        self.dimensions = dimensions
+        self.calls: list[list[str]] = []
+
+    def embed(self, texts):
+        batch = [str(text) for text in texts]
+        self.calls.append(batch)
+        return [[1.0] + [0.0] * (self.dimensions - 1) for _ in batch]
+
+
+def configure_test_knowledge(
+    service: EnterpriseService,
+    client: RecordingEmbeddingClient | None = None,
+) -> RecordingEmbeddingClient:
+    embedding_client = client or RecordingEmbeddingClient()
+    config = KnowledgeEmbeddingConfig(
+        base_url="https://embeddings.test/v1",
+        model="test-embedding",
+        api_key="test-embedding-secret",
+        dimensions=embedding_client.dimensions,
+        batch_size=8,
+    )
+    # Test injection deliberately bypasses outbound HTTP while exercising the
+    # same persisted configuration, generation, durable job, and vector paths.
+    service.knowledge = KnowledgeBase(
+        service.db,
+        config=config,
+        embedding_client=embedding_client,
+    )
+    service.knowledge.save_configuration(
+        config,
+        embedding_client=embedding_client,
+    )
+    return embedding_client
+
+
+def install_test_embedding_client(
+    service: EnterpriseService,
+    client: RecordingEmbeddingClient,
+) -> None:
+    service.knowledge = KnowledgeBase(
+        service.db,
+        config=service.knowledge.configuration(),
+        embedding_client=client,
+    )
+
+
+def wait_for_knowledge_index(
+    service: EnterpriseService,
+    document_id: int,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        row = service.db.query_one(
+            "SELECT status, last_error FROM durable_jobs "
+            "WHERE kind = 'knowledge_index' AND scope_type = 'knowledge' "
+            "AND scope_id = ? ORDER BY id DESC LIMIT 1",
+            (str(document_id),),
+        )
+        if row and row["status"] in {"succeeded", "failed", "needs_review"}:
+            return row
+        time.sleep(0.01)
+    raise AssertionError(f"knowledge index did not settle for document {document_id}")
 
 
 class NeedsReviewAgent(RecordingAgent):
@@ -594,9 +663,6 @@ def make_config(tmp: Path) -> PlatformConfig:
         token_secret="test-secret",
         token_ttl_seconds=3600,
         agent_tool_token="agent-token",
-        knowledge_backend="local",
-        cognee_dataset="enterprise_knowledge",
-        cognee_ingest_background=True,
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
         runtime_startup_wait_seconds=0,
@@ -1489,7 +1555,8 @@ class PlatformServiceTests(unittest.TestCase):
             agent = ProgressAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             _, user = service.authenticate("admin", "admin")
-            service.add_knowledge_document(
+            configure_test_knowledge(service)
+            document = service.add_knowledge_document(
                 user,
                 {
                     "title": "VPN Access Policy",
@@ -1498,6 +1565,8 @@ class PlatformServiceTests(unittest.TestCase):
                     "source": "policy",
                 },
             )
+            indexed = wait_for_knowledge_index(service, document["id"])
+            self.assertEqual(indexed["status"], "succeeded")
             alice = service.create_user(
                 username="alice",
                 password="alice-pass",
@@ -4507,6 +4576,7 @@ class PlatformServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             _, user = service.authenticate("admin", "admin")
+            configure_test_knowledge(service)
             doc = service.add_knowledge_document(user, {"title": "Runbook", "content": "Restart service alpha."})
 
             self.assertFalse(service.validate_agent_tool_token("wrong"))
@@ -4532,7 +4602,6 @@ class PlatformServiceTests(unittest.TestCase):
                     }
                     for name in (
                         "agent",
-                        "cognee",
                         "camofox",
                         "searxng",
                         "firecrawl",
@@ -4565,7 +4634,6 @@ class PlatformServiceTests(unittest.TestCase):
                     set(status),
                     {
                         "agent",
-                        "cognee",
                         "camofox",
                         "searxng",
                         "firecrawl",
@@ -4601,6 +4669,50 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_knowledge_config_is_admin_managed_and_keeps_api_key_write_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)), agent_client=RecordingAgent()
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                current = service.knowledge_config(admin)["config"]
+                self.assertFalse(current["credential_configured"])
+                self.assertNotIn("api_key", current)
+
+                client = RecordingEmbeddingClient(dimensions=4)
+                install_test_embedding_client(service, client)
+                updated = service.update_knowledge_config(
+                    admin,
+                    {
+                        "base_url": "https://embeddings.test/v1",
+                        "model": "test-embedding-v2",
+                        "api_key": "write-only-secret",
+                        "dimensions": 4,
+                        "batch_size": 16,
+                    },
+                )["config"]
+
+                self.assertEqual(updated["base_url"], "https://embeddings.test/v1")
+                self.assertEqual(updated["model"], "test-embedding-v2")
+                self.assertEqual(updated["dimensions"], 4)
+                self.assertEqual(updated["batch_size"], 16)
+                self.assertTrue(updated["credential_configured"])
+                self.assertNotEqual(updated["credential_masked"], "write-only-secret")
+                self.assertNotIn("api_key", updated)
+                stored = service.db.query_one(
+                    "SELECT value, secret FROM settings "
+                    "WHERE key = 'KNOWLEDGE_EMBEDDING_API_KEY'"
+                )
+                self.assertEqual(stored["value"], "write-only-secret")
+                self.assertEqual(stored["secret"], 1)
+
+                rebuilt = service.reindex_knowledge(admin)
+                self.assertIsInstance(rebuilt["generation_id"], int)
+                self.assertGreater(rebuilt["generation_id"], 0)
+            finally:
+                service.close()
+
     def test_agent_tool_token_rotation_refreshes_owned_runtime_client(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -4621,43 +4733,6 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 
-
-
-
-
-    def test_cognee_internal_config_exposes_and_updates_managed_env(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-            try:
-                _, admin = service.authenticate("admin", "admin")
-
-                current = service.cognee_config(admin)
-                env_keys = {item["key"] for item in current["internal"]["env"]}
-                self.assertIn("LLM_MODEL", env_keys)
-                self.assertIn("VECTOR_DB_PROVIDER", env_keys)
-                self.assertIn("DATA_ROOT_DIRECTORY", env_keys)
-
-                updated = service.update_cognee_config(
-                    admin,
-                    {
-                        "env": {
-                            "LLM_MODEL": "openai/gpt-5-mini",
-                            "VECTOR_DB_PROVIDER": "lancedb",
-                            "LLM_API_KEY": "llm-secret",
-                        }
-                    },
-                )
-                env = {item["key"]: item for item in updated["internal"]["env"]}
-                env_text = (tmp / "runtimes" / "cognee" / ".env").read_text(encoding="utf-8")
-
-                self.assertEqual(env["LLM_MODEL"]["value"], "openai/gpt-5-mini")
-                self.assertEqual(env["VECTOR_DB_PROVIDER"]["value"], "lancedb")
-                self.assertEqual(env["LLM_API_KEY"]["value"], "")
-                self.assertTrue(env["LLM_API_KEY"]["masked"])
-                self.assertIn('LLM_MODEL="openai/gpt-5-mini"', env_text)
-            finally:
-                service.close()
 
 
 
@@ -5560,68 +5635,41 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 recovered.close()
 
-    def test_cognee_ingest_runs_in_background(self):
-        from enterprise_agent_platform.cognee_bridge import CogneeStatus
-
+    def test_knowledge_index_runs_in_background(self):
         with tempfile.TemporaryDirectory() as td:
-            config = replace(make_config(Path(td)), knowledge_backend="hybrid")
-            service = EnterpriseService(config, agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)), agent_client=RecordingAgent()
+            )
+            release = threading.Event()
             try:
-                done = threading.Event()
-                calls: list[str] = []
+                started = threading.Event()
 
-                class FakeCognee:
-                    def ingest_document(self, *, title, content, source=""):
-                        calls.append(title)
-                        done.set()
-                        return {"attempted": True, "available": True, "dataset": "x"}
+                class BlockingEmbeddingClient(RecordingEmbeddingClient):
+                    def embed(self, texts):
+                        batch = [str(text) for text in texts]
+                        if batch != ["knowledge embedding configuration probe"]:
+                            started.set()
+                            release.wait(timeout=5)
+                        return super().embed(batch)
 
-                    def search(self, query, limit=5):
-                        return []
-
-                    def status(self):
-                        return CogneeStatus(True, "hybrid")
-
-                service.cognee = FakeCognee()
+                configure_test_knowledge(service, BlockingEmbeddingClient())
                 _, user = service.authenticate("admin", "admin")
                 doc = service.add_knowledge_document(user, {"title": "Async Doc", "content": "body"})
-                # The request returns immediately with a "queued" marker.
-                self.assertTrue(doc["cognee"].get("queued"))
-                # The heavy ingest happens on the background worker.
-                self.assertTrue(done.wait(timeout=5))
-                self.assertEqual(calls, ["Async Doc"])
-                result = service.cognee_ingest_result(doc["id"])
-                self.assertTrue(result and result.get("available"))
+                self.assertTrue(started.wait(timeout=2))
+                job_counts = service.jobs.counts(kind="knowledge_index")
+                self.assertEqual(job_counts["running"], 1)
+
+                release.set()
+                result = wait_for_knowledge_index(service, doc["id"])
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(service.knowledge_status()["state"], "ready")
+                self.assertEqual(
+                    service.jobs.counts(kind="knowledge_index")["succeeded"],
+                    1,
+                )
             finally:
+                release.set()
                 service.close()
-
-    def test_cognee_bridge_waits_for_cognify_inside_platform_worker(self):
-        from enterprise_agent_platform.cognee_bridge import CogneeBridge, CogneeStatus
-
-        class FakeCognee:
-            def __init__(self):
-                self.background_flags = []
-
-            async def add(self, payload, *, dataset_name, run_in_background):
-                self.background_flags.append(("add", run_in_background))
-                return {"added": True}
-
-            async def cognify(self, *, datasets, run_in_background):
-                self.background_flags.append(("cognify", run_in_background))
-                return {"completed": True}
-
-        with tempfile.TemporaryDirectory() as td:
-            config = replace(make_config(Path(td)), knowledge_backend="hybrid", cognee_ingest_background=True)
-            bridge = CogneeBridge(config, lambda key: "")
-            fake = FakeCognee()
-            bridge._module = fake
-            bridge._status = CogneeStatus(True, "hybrid")
-            bridge._status_checked_at = time.time()
-
-            result = bridge.ingest_document(title="Policy", content="Body", source="test")
-
-            self.assertNotIn("error", result)
-            self.assertEqual(fake.background_flags, [("add", False), ("cognify", False)])
 
     def test_channel_and_private_reads_enforce_authorization(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5656,6 +5704,7 @@ class PlatformServiceTests(unittest.TestCase):
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
+                configure_test_knowledge(service)
                 doc = service.add_knowledge_document(admin, {"title": "Policy", "content": "secret policy"})
                 for call in (
                     lambda: service.list_knowledge_documents({"id": 0}),
@@ -5670,16 +5719,17 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_knowledge_status_reports_fts_and_ingest_state(self):
+    def test_knowledge_status_reports_native_index_state(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 status = service.knowledge_status()
-                self.assertTrue(status["local"]["available"])
-                self.assertEqual(status["local"]["fts5"], service.db.fts_available)
-                self.assertEqual(status["local"]["backend"], "sqlite-fts" if service.db.fts_available else "sqlite-like")
-                self.assertIn("ingest_pending", status)
-                self.assertEqual(status["mode"], "local")
+                self.assertEqual(status["state"], "disabled")
+                self.assertFalse(status["available"])
+                self.assertEqual(status["pending_documents"], 0)
+                self.assertEqual(status["failed_documents"], 0)
+                for retired_key in ("local", "mode", "dataset"):
+                    self.assertNotIn(retired_key, status)
             finally:
                 service.close()
 
@@ -6088,32 +6138,6 @@ class PlatformServiceTests(unittest.TestCase):
             EnterpriseService._validate_browser_url(
                 "https://internal.example/reset?token=signed-value&password=temporary"
             )
-
-    def test_cognee_environment_is_seeded_from_platform_image_config(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            old_env = {key: os.environ.get(key) for key in ("DATA_ROOT_DIRECTORY", "SYSTEM_ROOT_DIRECTORY", "CACHE_ROOT_DIRECTORY", "COGNEE_LOGS_DIR", "LLM_API_KEY")}
-            for key in old_env:
-                os.environ.pop(key, None)
-            service = None
-            try:
-                service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
-                service.runtimes.ensure_cognee_ready()
-
-                self.assertEqual(os.environ["DATA_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "data"))
-                self.assertEqual(os.environ["SYSTEM_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "system"))
-                self.assertEqual(os.environ["CACHE_ROOT_DIRECTORY"], str(tmp / "runtimes" / "cognee" / "cache"))
-                self.assertEqual(os.environ["COGNEE_LOGS_DIR"], str(tmp / "runtimes" / "cognee" / "logs"))
-                self.assertNotIn("LLM_API_KEY", os.environ)
-            finally:
-                if service is not None:
-                    service.close()
-                for key, value in old_env.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
-
 
 class PlatformHTTPTests(unittest.TestCase):
     def test_branding_http_is_publicly_readable_and_admin_mutations_are_revisioned(self):
@@ -7040,7 +7064,6 @@ class PlatformHTTPTests(unittest.TestCase):
                 runtime = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
                 self.assertIn("agent", runtime)
-                self.assertIn("cognee", runtime)
 
                 conn.request("GET", "/api/system/agent-runtime/config", headers={"Cookie": cookie})
                 res = conn.getresponse()

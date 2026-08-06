@@ -12,13 +12,13 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 - `agent_scopes`、`agent_runtime_scopes`、`agent_runtime_scope_sessions`；
 - `durable_jobs`、`agent_run_inputs`；
 - `agent_memories` 及其 FTS；
-- `knowledge_documents` 及其 FTS；
+- `knowledge_documents`、`knowledge_chunks`、`knowledge_index_generations`、`knowledge_document_index` 与 `knowledge_chunk_embeddings`；
 - `agent_schedules`、`agent_schedule_runs`；
 - `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
 数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
-Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；非空数据库必须同时精确匹配当前 marker 和声明结构；全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。任何其它 marker、未知业务表、额外列、缺失结构或退役表都必须在修改数据库前明确拒绝，当前版本不携带历史 baseline 升级入口。
+Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
 ## Agent scope
 
@@ -87,7 +87,13 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 `session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有带当前 `session_id` 元数据或可由当前 reply 关系明确归属到该 session 的消息才进入索引，不为缺少会话来源的行合成兼容 session。只有规范私人 Agent 与频道主 Agent 可以使用，响应有统一字符预算。
 
-知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。可选 Cognee 增强使用 Platform 镜像内经过构建验证的 Python distribution；运行时不加载构建 checkout，也不向镜像代码层写入字节码缓存。
+知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。
+
+`knowledge_documents` 是知识原文的唯一权威来源。Platform 使用稳定 content hash 和版本化分块器生成带文档 ID、字符偏移、标题路径与 chunk hash 的派生块，再通过管理员配置的 OpenAI-compatible Embeddings API 批量生成向量。向量维度从首个合法响应锁定或与显式配置精确比对；数量、顺序、数值、维度或响应大小不合法时整批失败。
+
+索引以 generation 构建：文档与待摄取 job 同事务落库，job 只引用 `document_id + expected_hash + generation_id`，不复制原文。worker 重新读取权威文档，在完整写入所有块与向量时再原子标记该文档 ready；只有覆盖全部当前文档的 ready generation 可原子切为 active。配置或模型变化时在 shadow generation 重建，不让半成品混入查询。
+
+检索只走 active generation 的查询向量与 cosine 相似度，然后按文档限额去重并在字符预算内返回邻接证据；结果始终包含可读的数字 `document_id`、稳定 `chunk_id`、来源偏移和 score。不存在 FTS、`LIKE`、第二检索后端或静默回退。缺少 API key 时知识库标记为 disabled；创建、重建和显式检索返回可诊断错误，文档列表/原文仍可用于配置与恢复。顶层 Run 的被动建议在未配置或 provider 短暂失败时 fail-open 并记录 degraded，不得返回伪装成“无命中”的空结果。
 
 ## 技能数据
 
@@ -103,10 +109,10 @@ bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示�
 
 ## 备份与迁移
 
-备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。
+备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。知识原文、分块、索引状态与 active generation 位于同一 SQLite 恢复点；向量可由原文重建，但恢复后不得把未完整 generation 标记为 active。
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。当前版本只接受当前 baseline，不扫描旧源码布局、不猜测结构，也不携带历史升级入口。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何未知业务表、额外列、缺失结构或退役表都拒绝启动。
+数据库 schema version 单调递增。本次发布只支持从直接前一 baseline 到当前 baseline 的精确迁移：保留 `knowledge_documents` 的原行与 ID，删除知识 FTS 虚拟表/触发器、全部退役知识派生任务及其已复制的正文 payload，创建当前知识索引结构并将文档置为待重建。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、job 结算、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列、缺失结构或退役表都拒绝。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

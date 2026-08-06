@@ -46,7 +46,6 @@ from .agent_scopes import (
     assert_existing_workspace_profile,
 )
 from .camofox_state import ensure_camofox_runtime_sidecar
-from .cognee_bridge import CogneeBridge
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .container_contract_generated import CONTAINER_PATHS, DATABASE_SCHEMA_VERSION
 from .db import (
@@ -68,10 +67,6 @@ from .agent_runtime_client import (
     AgentRuntimeError,
     AgentRuntimeRunError,
 )
-from .internal_config import (
-    read_cognee_internal_config,
-    update_env_file,
-)
 from .jobs import DurableJob, DurableJobStore
 from .learning import (
     LEARNING_REVIEW_JOB_KIND,
@@ -80,7 +75,14 @@ from .learning import (
     LearningReviewBudgetExceeded,
     LearningReviewStore,
 )
-from .knowledge import KnowledgeBase
+from .knowledge import (
+    EmbeddingProviderError,
+    KnowledgeBase,
+    KnowledgeDisabledError,
+    KnowledgeEmbeddingConfig,
+    KnowledgeError,
+    KnowledgeUnavailableError,
+)
 from .loopback_http import (
     open_loopback_url,
     open_private_service_url,
@@ -149,10 +151,11 @@ from .skills import MAX_SKILL_LIST_RESULTS, SkillStore, SkillStoreError
 
 
 class ServiceError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, *, code: str = ""):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.code = str(code or "")
 
 
 def _close_instance_lock_descriptors(lock_fd: int, directory_fd: int) -> None:
@@ -349,11 +352,7 @@ MAX_CONCURRENT_AGENT_RUNS = max(
         ),
     ),
 )
-# Cognee ingestion is heavy; it runs on a background worker so document creation
-# never blocks the request thread (and, via the DB, every other request).
-MAX_INGEST_QUEUE_DEPTH = 256
-MAX_TRACKED_INGEST_RESULTS = 1000
-# Bounded retry for transient Cognee ingest failures. A failed job is re-queued
+# Bounded retry for transient knowledge indexing failures. A failed job is re-queued
 # with a short capped backoff up to this many attempts before it is dropped and
 # counted as a permanent failure (surfaced in knowledge_status).
 MAX_INGEST_ATTEMPTS = max(
@@ -365,9 +364,12 @@ AGENT_JOB_LEASE_SECONDS = max(
     60,
     int(os.getenv("AGENT_PLATFORM_AGENT_JOB_LEASE_SECONDS", "3600") or "3600"),
 )
-COGNEE_JOB_LEASE_SECONDS = max(
+KNOWLEDGE_INDEX_JOB_LEASE_SECONDS = max(
     60,
-    int(os.getenv("AGENT_PLATFORM_COGNEE_JOB_LEASE_SECONDS", "3600") or "3600"),
+    int(
+        os.getenv("AGENT_PLATFORM_KNOWLEDGE_INDEX_JOB_LEASE_SECONDS", "3600")
+        or "3600"
+    ),
 )
 TELEGRAM_LINK_TTL_SECONDS = max(
     60,
@@ -626,7 +628,6 @@ class EnterpriseService:
             self.get_secret,
             setting_provider=self.get_setting,
         )
-        self.cognee = CogneeBridge(config, self.get_secret, self.runtimes)
         self.agent_scopes = AgentScopeManager(
             config,
             self.db,
@@ -731,13 +732,9 @@ class EnterpriseService:
         # whether or not the username exists, eliminating a timing oracle.
         self._dummy_password_hash = hash_password(secrets.token_urlsafe(16))
         self._ingest_lock = threading.Lock()
-        self._ingest_condition = threading.Condition(self._ingest_lock)
         self._ingest_queue: Deque[dict[str, Any]] = deque()
         self._ingest_thread: threading.Thread | None = None
         self._ingest_wakeup = threading.Event()
-        self._ingest_results: dict[int, dict[str, Any]] = {}
-        # Operator-visible counters for documents that exhausted ingest retries.
-        self._ingest_failed_count = 0
         self._ingest_last_error = ""
         self._telegram_gateway = None
         self._telegram_delivery_lock = threading.Lock()
@@ -1613,17 +1610,20 @@ class EnterpriseService:
             task["_job_id"] = job.id
             self._schedule_agent_task(task, enforce_limit=False)
 
-        recovered_ingest = []
-        for job in self.jobs.queued("cognee", limit=None):
+        recovered_index_jobs = []
+        for job in self.jobs.queued("knowledge_index", limit=None):
             payload = dict(job.payload)
-            if not payload.get("document_id"):
-                self.jobs.mark_failed(job.id, "durable Cognee payload is missing document_id")
+            if not self._valid_knowledge_index_payload(payload):
+                self.jobs.mark_failed(
+                    job.id,
+                    "durable knowledge index payload is invalid",
+                )
                 continue
             payload["_job_id"] = job.id
-            recovered_ingest.append(payload)
-        if recovered_ingest:
+            recovered_index_jobs.append(payload)
+        if recovered_index_jobs:
             with self._ingest_lock:
-                self._ingest_queue.extend(recovered_ingest)
+                self._ingest_queue.extend(recovered_index_jobs)
                 self._start_ingest_worker_locked()
 
     def _surface_interrupted_agent_jobs(
@@ -5830,7 +5830,7 @@ class EnterpriseService:
         generation = task["generation"]
         user_msg = task["user_message"]
         self._record_agent_activity("channel", scope_id, "preparing", "准备 Agent 请求", "整理频道上下文")
-        suggestions = self.knowledge.suggest(
+        suggestions = self._knowledge_suggestions(
             self._recent_context_before(
                 "channel",
                 scope_id,
@@ -6137,7 +6137,14 @@ class EnterpriseService:
         task["_agent_scope_key"] = agent_scope.scope_key
         task["_agent_lifecycle_id"] = agent_scope.lifecycle_id
         execution = self._agent_execution_metadata(agent_scope)
-        suggestions = self.knowledge.suggest(self._recent_context_before("private", scope_id, prompt_content, int(user_msg["id"])))
+        suggestions = self._knowledge_suggestions(
+            self._recent_context_before(
+                "private",
+                scope_id,
+                prompt_content,
+                int(user_msg["id"]),
+            )
+        )
         system_prompt = self._private_system_prompt(actor, agent_scope, suggestions)
         self._record_agent_activity(
             "private",
@@ -8052,7 +8059,6 @@ class EnterpriseService:
             }
             for name in (
                 "agent",
-                "cognee",
                 "camofox",
                 "searxng",
                 "firecrawl",
@@ -8168,38 +8174,92 @@ class EnterpriseService:
                 self.model_catalogs.invalidate_runtime()
             return self.agent_runtime_config(actor)
 
-    def cognee_config(self, actor: dict[str, Any]) -> dict[str, Any]:
+    def knowledge_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        runtime_config = self.runtimes.cognee_runtime_config()
-        internal = read_cognee_internal_config(
-            Path(runtime_config["env_path"]),
-            {
-                "DATA_ROOT_DIRECTORY": str(runtime_config.get("data_root_directory", "")),
-                "SYSTEM_ROOT_DIRECTORY": str(runtime_config.get("system_root_directory", "")),
-                "CACHE_ROOT_DIRECTORY": str(runtime_config.get("cache_root_directory", "")),
-                "COGNEE_LOGS_DIR": str(runtime_config.get("logs_dir", "")),
-                "COGNEE_SKIP_CONNECTION_TEST": "true" if runtime_config.get("skip_connection_test") else "false",
-            },
-        )
+        config = self.knowledge.configuration()
         return {
-            "config": runtime_config,
-            "internal": internal,
-            "runtime": self.runtimes.cognee_status().to_dict(),
-            "knowledge": self.knowledge_status(),
+            "config": {
+                "base_url": config.base_url,
+                "model": config.model,
+                "dimensions": config.dimensions,
+                "batch_size": config.batch_size,
+                "credential_configured": bool(config.api_key),
+                "credential_masked": mask_secret(config.api_key),
+            }
         }
 
-    def update_cognee_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    def update_knowledge_config(
+        self, actor: dict[str, Any], body: dict[str, Any]
+    ) -> dict[str, Any]:
         require_admin(actor)
-        runtime_config = self.runtimes.cognee_runtime_config()
-        env_updates = body.get("env")
-        if isinstance(env_updates, dict):
-            try:
-                update_env_file(Path(runtime_config["env_path"]), env_updates)
-            except ValueError as exc:
-                raise ServiceError(400, str(exc)) from exc
-        self.cognee.refresh_status()
-        self.runtimes.ensure_cognee_ready()
-        return self.cognee_config(actor)
+        if not isinstance(body, dict):
+            raise ServiceError(400, "knowledge configuration must be a JSON object")
+        unknown = set(body) - {
+            "base_url",
+            "model",
+            "dimensions",
+            "batch_size",
+            "api_key",
+        }
+        if unknown:
+            raise ServiceError(
+                400,
+                "knowledge configuration contains unsupported fields: "
+                + ", ".join(sorted(str(key) for key in unknown)),
+            )
+        current = self.knowledge.configuration()
+        api_key = str(body.get("api_key") or "").strip() or current.api_key
+        if not api_key:
+            raise ServiceError(
+                503,
+                "knowledge embeddings API key is required",
+                code="knowledge_embedding_unconfigured",
+            )
+        dimensions = (
+            current.dimensions
+            if "dimensions" not in body
+            else body.get("dimensions")
+        )
+        batch_size = (
+            current.batch_size
+            if "batch_size" not in body
+            else body.get("batch_size")
+        )
+        if dimensions is not None and (
+            isinstance(dimensions, bool) or not isinstance(dimensions, int)
+        ):
+            raise ServiceError(400, "knowledge embedding dimensions must be an integer or null")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise ServiceError(400, "knowledge embedding batch size must be an integer")
+        try:
+            config = KnowledgeEmbeddingConfig(
+                base_url=str(body.get("base_url", current.base_url) or "").strip(),
+                model=str(body.get("model", current.model) or "").strip(),
+                api_key=api_key,
+                dimensions=dimensions,
+                batch_size=batch_size,
+            )
+            self.knowledge.save_configuration(config)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, str(exc)) from exc
+        except KnowledgeError as exc:
+            raise self._knowledge_service_error(exc, configuring=True) from exc
+        self._wake_knowledge_index_worker()
+        return self.knowledge_config(actor)
+
+    def reindex_knowledge(self, actor: dict[str, Any]) -> dict[str, Any]:
+        require_admin(actor)
+        try:
+            generation_id = self.knowledge.prepare_generation(force=True)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, str(exc)) from exc
+        except KnowledgeError as exc:
+            raise self._knowledge_service_error(exc) from exc
+        self._wake_knowledge_index_worker()
+        return {
+            "generation_id": generation_id,
+            "status": self.knowledge_status(),
+        }
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -8482,72 +8542,60 @@ class EnterpriseService:
         except ValueError as exc:
             message = str(exc)
             raise ServiceError(413 if message.startswith("content exceeds ") else 400, message) from exc
-        # Only enqueue Cognee ingestion for a genuinely new document; a dedup hit
-        # (identical re-submit) must not re-flood the graph backend with a
-        # duplicate add+cognify of content it already holds.
+        except KnowledgeError as exc:
+            raise self._knowledge_service_error(exc) from exc
         if created:
-            doc["cognee"] = self._queue_cognee_ingest(doc)
-        else:
-            doc["cognee"] = {"attempted": False, "available": True, "deduplicated": True}
+            self._wake_knowledge_index_worker()
         return doc
 
-    def _queue_cognee_ingest(self, doc: dict[str, Any]) -> dict[str, Any]:
-        """Schedule Cognee ingestion off the request thread.
-
-        Cognee's add+cognify can take many seconds; running it inline would hold
-        the request thread (and contend on the database) for the whole graph
-        build. For the local backend ingestion is a no-op, so we return the
-        immediate (synchronous) result and skip the worker entirely.
-        """
-        if self.config.knowledge_backend not in {"hybrid", "cognee"}:
-            return self.cognee.ingest_document(
-                title=doc["title"], content=doc["content"], source=doc.get("source", "")
-            )
-        document_id = int(doc.get("id") or 0)
-        job, _ = self.jobs.enqueue(
-            kind="cognee",
-            dedupe_key=f"document:{document_id}",
-            scope_type="knowledge",
-            scope_id=str(document_id),
-            payload={
-                "document_id": document_id,
-                "title": doc["title"],
-                "content": doc["content"],
-                "source": doc.get("source", ""),
-            },
+    @staticmethod
+    def _valid_knowledge_index_payload(payload: dict[str, Any]) -> bool:
+        if set(payload) != {"document_id", "expected_hash", "generation_id"}:
+            return False
+        document_id = payload.get("document_id")
+        generation_id = payload.get("generation_id")
+        expected_hash = str(payload.get("expected_hash") or "")
+        return (
+            isinstance(document_id, int)
+            and not isinstance(document_id, bool)
+            and document_id > 0
+            and isinstance(generation_id, int)
+            and not isinstance(generation_id, bool)
+            and generation_id > 0
+            and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is not None
         )
-        if job.status != "queued":
-            return {
-                "attempted": True,
-                "available": True,
-                "queued": False,
-                "document_id": document_id,
-                "job_id": job.id,
-                "job_status": job.status,
-            }
-        payload = dict(job.payload)
-        payload["_job_id"] = job.id
+
+    def _wake_knowledge_index_worker(self) -> None:
+        queued: list[dict[str, Any]] = []
+        for job in self.jobs.queued("knowledge_index", limit=None):
+            payload = dict(job.payload)
+            if not self._valid_knowledge_index_payload(payload):
+                self.jobs.mark_failed(
+                    job.id,
+                    "durable knowledge index payload is invalid",
+                )
+                continue
+            payload["_job_id"] = job.id
+            queued.append(payload)
         with self._ingest_lock:
             if self._closed:
-                return {"attempted": False, "available": False, "error": "service shutting down"}
-            if not any(int(item.get("_job_id") or 0) == job.id for item in self._ingest_queue):
-                self._ingest_queue.append(payload)
+                return
+            present = {
+                int(item.get("_job_id") or 0) for item in self._ingest_queue
+            }
+            for payload in queued:
+                if int(payload["_job_id"]) not in present:
+                    self._ingest_queue.append(payload)
             self._ingest_wakeup.set()
-            self._start_ingest_worker_locked()
-        return {
-            "attempted": True,
-            "available": True,
-            "queued": True,
-            "document_id": document_id,
-            "job_id": job.id,
-        }
+            if self._ingest_queue:
+                self._start_ingest_worker_locked()
 
     def _start_ingest_worker_locked(self) -> None:
         if self._closed or self._auto_update_reserved:
             return
         if self._ingest_thread is None or not self._ingest_thread.is_alive():
             self._ingest_thread = threading.Thread(
-                target=self._ingest_worker, name="cognee-ingest", daemon=True
+                target=self._ingest_worker, name="knowledge-index", daemon=True
             )
             self._ingest_thread.start()
 
@@ -8583,78 +8631,113 @@ class EnterpriseService:
                 self._ingest_wakeup.wait(TELEGRAM_DELIVERY_POLL_SECONDS)
                 continue
             try:
-                self._process_cognee_ingest_job(job_id, job)
+                self._process_knowledge_index_job(job_id)
             finally:
                 self._end_agent_update_admission()
 
-    def _process_cognee_ingest_job(
-        self, job_id: int, job: dict[str, Any]
-    ) -> None:
-        claimed = self.jobs.mark_running(job_id, lease_seconds=COGNEE_JOB_LEASE_SECONDS)
+    def _process_knowledge_index_job(self, job_id: int) -> None:
+        claimed = self.jobs.mark_running(
+            job_id,
+            lease_seconds=KNOWLEDGE_INDEX_JOB_LEASE_SECONDS,
+        )
         if claimed is None:
             return
+        payload = dict(claimed.payload)
+        if not self._valid_knowledge_index_payload(payload):
+            self.jobs.mark_failed(job_id, "durable knowledge index payload is invalid")
+            return
         try:
-            result = self.cognee.ingest_document(
-                title=job["title"], content=job["content"], source=job["source"]
+            self.knowledge.index_document(payload)
+        except Exception as exc:  # provider failures must not kill the worker
+            error = str(exc)
+            retryable = bool(
+                isinstance(exc, EmbeddingProviderError) and exc.retryable
             )
-        except Exception as exc:  # never let a bad ingest kill the worker
-            result = {"attempted": True, "available": True, "error": str(exc)}
-        error = result.get("error")
-        if error and claimed.attempts < MAX_INGEST_ATTEMPTS:
-            backoff = min(2 ** claimed.attempts, INGEST_RETRY_BACKOFF_CAP_SECONDS)
+            if retryable and claimed.attempts < MAX_INGEST_ATTEMPTS:
+                backoff = min(
+                    2 ** claimed.attempts,
+                    INGEST_RETRY_BACKOFF_CAP_SECONDS,
+                )
+                print(
+                    "Knowledge index attempt "
+                    f"{claimed.attempts} failed for document "
+                    f"{payload['document_id']}: {error}; retrying in {backoff}s",
+                    file=sys.stderr,
+                )
+                self.jobs.requeue(job_id, delay_seconds=backoff, error=error)
+                retry_payload = dict(payload)
+                retry_payload["_job_id"] = job_id
+                with self._ingest_lock:
+                    if not self._closed:
+                        self._ingest_queue.append(retry_payload)
+                return
+            try:
+                self.knowledge.mark_index_failed(payload, error)
+            except Exception as state_exc:
+                error = f"{error}; failed to persist index state: {state_exc}"
+            self.jobs.mark_failed(job_id, error)
             print(
-                f"Cognee ingest attempt {claimed.attempts} failed for document {job.get('document_id')}: "
-                f"{error}; retrying in {backoff}s",
+                f"Knowledge index failed for document {payload['document_id']}: {error}",
                 file=sys.stderr,
             )
-            self.jobs.requeue(job_id, delay_seconds=backoff, error=str(error))
             with self._ingest_lock:
-                if not self._closed:
-                    self._ingest_queue.append(job)
-            return
-        if error:
-            self.jobs.mark_failed(job_id, str(error))
-            print(f"Cognee ingest failed for document {job.get('document_id')}: {error}", file=sys.stderr)
-            with self._ingest_lock:
-                self._ingest_failed_count += 1
-                self._ingest_last_error = str(error)
+                self._ingest_last_error = error
         else:
             self.jobs.mark_succeeded(job_id)
-        doc_id = job.get("document_id")
-        if doc_id is not None:
             with self._ingest_lock:
-                self._ingest_results[int(doc_id)] = result
-                while len(self._ingest_results) > MAX_TRACKED_INGEST_RESULTS:
-                    self._ingest_results.pop(next(iter(self._ingest_results)), None)
-                self._ingest_condition.notify_all()
-
-    def cognee_ingest_result(self, document_id: int) -> dict[str, Any] | None:
-        document_id = int(document_id)
-        deadline = time.monotonic() + 0.25
-        with self._ingest_condition:
-            while document_id not in self._ingest_results and time.monotonic() < deadline:
-                if self._ingest_thread is None or not self._ingest_thread.is_alive():
-                    break
-                self._ingest_condition.wait(timeout=max(0, deadline - time.monotonic()))
-            result = self._ingest_results.get(document_id)
-            return dict(result) if result else None
+                self._ingest_last_error = ""
 
     def search_knowledge(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        local = [hit.to_dict() for hit in self.knowledge.search(query, limit)]
-        if len(local) >= limit and self.config.knowledge_backend != "cognee":
-            return local[:limit]
-        if self.config.knowledge_backend == "cognee":
-            # Pure Cognee mode requests the full caller budget. Local hits are
-            # only a fallback and must not shrink a result set that replaces
-            # them when the graph backend succeeds.
-            cognee_hits = self.cognee.search(query, limit=limit)
-            return _dedupe_knowledge_hits(cognee_hits or local)[:limit]
-        cognee_hits = self.cognee.search(query, limit=max(0, limit - len(local)))
-        # Local (bm25-ranked) results lead; cognee graph results follow. Dedupe
-        # only removes same-keyspace duplicates (e.g. a repeated local id);
-        # local and cognee hits use disjoint id keyspaces and are never collapsed
-        # together (see _dedupe_knowledge_hits).
-        return _dedupe_knowledge_hits(local + cognee_hits)[:limit]
+        try:
+            hits = [hit.to_dict() for hit in self.knowledge.search(query, limit)]
+        except KnowledgeError as exc:
+            with self._ingest_lock:
+                self._ingest_last_error = str(exc)
+            raise self._knowledge_service_error(exc) from exc
+        with self._ingest_lock:
+            self._ingest_last_error = ""
+        return hits
+
+    def _knowledge_suggestions(self, context: str, *, limit: int = 3) -> list[Any]:
+        try:
+            suggestions = self.knowledge.suggest(context, limit=limit)
+        except KnowledgeError as exc:
+            # Recall enriches a Run, but provider/configuration failures must
+            # never prevent an otherwise valid conversation from running.
+            with self._ingest_lock:
+                self._ingest_last_error = str(exc)
+            return []
+        with self._ingest_lock:
+            self._ingest_last_error = ""
+        return suggestions
+
+    @staticmethod
+    def _knowledge_service_error(
+        exc: KnowledgeError,
+        *,
+        configuring: bool = False,
+    ) -> ServiceError:
+        if isinstance(exc, KnowledgeDisabledError):
+            return ServiceError(
+                503,
+                str(exc),
+                code="knowledge_embedding_unconfigured",
+            )
+        if isinstance(exc, KnowledgeUnavailableError):
+            return ServiceError(409, str(exc), code="knowledge_indexing")
+        if isinstance(exc, EmbeddingProviderError):
+            if configuring and not exc.retryable:
+                return ServiceError(400, str(exc), code="knowledge_config_invalid")
+            return ServiceError(
+                502 if exc.retryable else 503,
+                str(exc),
+                code="knowledge_provider_unavailable",
+            )
+        return ServiceError(
+            502,
+            str(exc),
+            code="knowledge_provider_unavailable",
+        )
 
     def get_knowledge_document(self, document_id: int) -> dict[str, Any]:
         doc = self.knowledge.get_document(document_id)
@@ -13303,26 +13386,14 @@ class EnterpriseService:
         return self.get_knowledge_document(document_id)
 
     def knowledge_status(self) -> dict[str, Any]:
-        durable = self.jobs.counts(kind="cognee")
+        status = dict(self.knowledge.status())
         with self._ingest_lock:
-            ingest_pending = durable["queued"] + durable["running"]
-            ingest_failed = max(self._ingest_failed_count, durable["failed"] + durable["needs_review"])
-            ingest_last_error = self._ingest_last_error
-        fts = bool(getattr(self.db, "fts_available", False))
-        return {
-            "local": {
-                "available": True,
-                "backend": "sqlite-fts" if fts else "sqlite-like",
-                "fts5": fts,
-            },
-            "cognee": self.cognee.status().to_dict(),
-            "mode": self.config.knowledge_backend,
-            "dataset": self.config.cognee_dataset,
-            "ingest_pending": ingest_pending,
-            "ingest_failed": ingest_failed,
-            "ingest_last_error": ingest_last_error,
-            "ingest_jobs": durable,
-        }
+            last_error = self._ingest_last_error
+        if last_error:
+            status["last_error"] = last_error
+            if status.get("state") == "ready":
+                status["state"] = "degraded"
+        return status
 
     def get_setting(self, key: str) -> str | None:
         row = self.db.query_one("SELECT value FROM settings WHERE key = ?", (key,))
@@ -16884,28 +16955,6 @@ def _fully_decode_brand_logo(
         ) from exc
 
 
-def _dedupe_knowledge_hits(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop hits that share the same id key, preserving order.
-
-    This only collapses duplicates within a single keyspace (e.g. a local
-    document id repeated in the local results). Local hits use integer document
-    ids while Cognee hits use synthetic ``cognee:N`` string ids, so the two
-    keyspaces never collide and local vs Cognee results are NEVER collapsed
-    together. True cross-backend dedup is not possible here because Cognee
-    returns synthesized graph chunks with no recoverable source-document
-    identity (constant title/source), so there is no key to match them on.
-    """
-    seen: set[str] = set()
-    result: list[dict[str, Any]] = []
-    for hit in hits:
-        key = str(hit.get("id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(hit)
-    return result
-
-
 _USAGE_INPUT_KEYS = ("input_tokens", "prompt_tokens", "inputTokens", "promptTokens")
 _USAGE_OUTPUT_KEYS = ("output_tokens", "completion_tokens", "outputTokens", "completionTokens")
 _USAGE_TOTAL_KEYS = ("total_tokens", "totalTokens")
@@ -17741,7 +17790,7 @@ def parse_bool(value: Any) -> bool:
 def mask_secret(value: str) -> str:
     # Fixed-width mask so the rendered hint never encodes the secret's length and
     # never reveals a prefix; only long values expose a short trailing suffix as a
-    # recognition hint. Kept consistent with internal_config.mask_value.
+    # recognition hint without exposing the credential itself.
     if not value:
         return ""
     if len(value) < 12:

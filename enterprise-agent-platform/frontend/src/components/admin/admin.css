@@ -354,6 +354,16 @@
   margin-bottom: 12px;
 }
 
+.knowledge-embedding-config > .eap-alert,
+.knowledge-embedding-config__status,
+.knowledge-embedding-config > .eap-progress {
+  margin-bottom: 16px;
+}
+
+.knowledge-embedding-config .eap-input-number {
+  width: 100%;
+}
+
 .eap-admin-page .config-grid,
 .eap-admin-page .config-group__body,
 .eap-admin-page .oauth-grid {

@@ -59,7 +59,7 @@ Manager 定时读取 latest manifest，也可由签名 webhook 唤醒。检查�
 
 ## 提交、回滚与能力降级
 
-核心提交门只有 Manager、Platform、Agent Runtime 和公共入口。Camoufox、SearXNG、Firecrawl 与 Cognee 单项失败记录为 degraded，并由后台指数退避恢复；不得让已经健康的核心 generation 长期停在维护页。
+核心提交门只有 Manager、Platform、Agent Runtime 和公共入口。Camoufox、SearXNG、Firecrawl 与知识 Embeddings provider 单项失败记录为 degraded，并由后台指数退避恢复；不得让已经健康的核心 generation 长期停在维护页。知识未配置 key 直接保持 disabled，不应被自动更新误判为可恢复容器故障。
 
 数据库迁移、核心启动或核心 readiness 在提交前失败时，Manager 停止候选、恢复快照和 previous generation、结算 reservation，并把 operation 标为可重试失败。提交后的业务数据不得自动回滚到可能已经分叉的 previous 数据；后续恢复使用新的快照 operation。
 

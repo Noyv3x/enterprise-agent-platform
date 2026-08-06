@@ -26,7 +26,6 @@ workspaces/
 logs/
 
 # Optional local upstream reference checkouts. Production consumes CI-built images.
-/cognee/
 /firecrawl/
 
 # Secrets and local overrides

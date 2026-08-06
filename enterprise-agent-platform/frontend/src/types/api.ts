@@ -11,11 +11,12 @@ import type {
   AgentScheduleRun,
   AutoUpdateConfigState,
   Channel,
-  CogneeConfigState,
   FullDocument,
   Id,
+  KnowledgeConfigState,
   KnowledgeDocument,
   KnowledgeHit,
+  KnowledgeIndexStatus,
   MentionTarget,
   MailAccount,
   MailSecurityMode,
@@ -472,10 +473,16 @@ export interface ManagerOperationRequest {
   expected_generation?: number;
 }
 
-export type CogneeConfigResponse = CogneeConfigState;
+export type KnowledgeConfigResponse = KnowledgeConfigState;
 
-export interface CogneeConfigUpdateRequest {
-  env: Record<string, string>;
+export type KnowledgeStatusResponse = KnowledgeIndexStatus;
+
+export interface KnowledgeConfigUpdateRequest {
+  base_url: string;
+  model: string;
+  dimensions: number | null;
+  batch_size: number;
+  api_key: string;
 }
 
 /* ------------------------------------------------------------------ oauth */

@@ -35,9 +35,6 @@ class PlatformConfig:
     token_secret: str
     token_ttl_seconds: int
     agent_tool_token: str | None
-    knowledge_backend: str
-    cognee_dataset: str
-    cognee_ingest_background: bool
     runtime_startup_wait_seconds: float = 8.0
     camofox_url: str = "http://camofox:9377"
     firecrawl_api_url: str = "http://firecrawl-api:3002"
@@ -80,10 +77,6 @@ class PlatformConfig:
     @property
     def agent_runtime_data_dir(self) -> Path:
         return self.runtime_dir / "agent"
-
-    @property
-    def cognee_runtime_dir(self) -> Path:
-        return self.runtime_dir / "cognee"
 
     @property
     def workspace_internal_directory(self) -> str:
@@ -178,17 +171,6 @@ class PlatformConfig:
                 minimum=1,
             ),
             agent_tool_token=os.getenv("AGENT_PLATFORM_AGENT_TOOL_TOKEN"),
-            knowledge_backend=os.getenv(
-                "AGENT_PLATFORM_KB_BACKEND", "hybrid"
-            ).strip().lower()
-            or "hybrid",
-            cognee_dataset=os.getenv(
-                "AGENT_PLATFORM_COGNEE_DATASET", "agent_platform_knowledge"
-            ),
-            cognee_ingest_background=os.getenv(
-                "AGENT_PLATFORM_COGNEE_INGEST_BACKGROUND", "1"
-            ).strip().lower()
-            in {"1", "true", "yes", "on"},
             runtime_startup_wait_seconds=_env_float(
                 "AGENT_PLATFORM_RUNTIME_STARTUP_WAIT_SECONDS",
                 8.0,

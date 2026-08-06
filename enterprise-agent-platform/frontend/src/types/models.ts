@@ -439,11 +439,16 @@ export interface FullDocument extends KnowledgeDocument {
 }
 
 export interface KnowledgeHit {
-  id: number | string;
+  id: number;
   title: string;
   summary: string;
   source: string;
   score: number;
+  chunk_id?: string;
+  char_start?: number;
+  char_end?: number;
+  excerpt?: string;
+  title_path?: string;
 }
 
 export interface KnowledgeSearch {
@@ -629,7 +634,7 @@ export type AdminPageId =
   | "security"
   | "runtime"
   | "agent-runtime"
-  | "cognee"
+  | "knowledge"
   | "secrets";
 
 export interface AdminPage {
@@ -641,20 +646,6 @@ export interface AdminPage {
 
 /** [value, label] tuple used by THINKING_DEPTH_OPTIONS. */
 export type ThinkingDepthOption = [value: string, label: string];
-
-/** Descriptor-driven config field used by managed service editors. */
-export interface ConfigFieldDescriptor {
-  key: string;
-  label?: string;
-  group?: string;
-  kind?: "boolean" | "number" | "json" | "text";
-  options?: string[];
-  value?: unknown;
-  configured?: boolean;
-  defaulted?: boolean;
-  secret?: boolean;
-  masked?: string;
-}
 
 /* security config */
 export interface SecurityConfigValues {
@@ -792,14 +783,32 @@ export interface AutoUpdateConfigState {
   status: AutoUpdateStatus;
 }
 
-/* cognee internal config */
-export interface CogneeInternalValues {
-  env?: ConfigFieldDescriptor[];
-  env_path?: string;
+/* knowledge embeddings configuration and derived-index status */
+export interface KnowledgeEmbeddingConfigValues {
+  base_url: string;
+  model: string;
+  dimensions: number | null;
+  batch_size: number;
+  credential_configured: boolean;
+  credential_masked?: string;
 }
 
-export interface CogneeConfigState {
-  internal: CogneeInternalValues;
+export interface KnowledgeConfigState {
+  config: KnowledgeEmbeddingConfigValues;
+}
+
+export type KnowledgeIndexState = "disabled" | "indexing" | "ready" | "degraded";
+
+export interface KnowledgeIndexStatus {
+  state: KnowledgeIndexState;
+  detail?: string;
+  last_error?: string;
+  active_generation_id?: number | null;
+  indexed_documents?: number;
+  total_documents?: number;
+  pending_documents?: number;
+  failed_documents?: number;
+  model?: string;
 }
 
 /* ----------------------------------------------------------- message audit */

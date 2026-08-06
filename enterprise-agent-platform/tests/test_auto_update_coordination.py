@@ -24,7 +24,12 @@ from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
 )
-from test_platform import RecordingAgent
+from test_platform import (
+    RecordingAgent,
+    RecordingEmbeddingClient,
+    configure_test_knowledge,
+    install_test_embedding_client,
+)
 
 
 class _BlockingAgent(RecordingAgent):
@@ -111,9 +116,6 @@ def _config(data_dir: Path) -> PlatformConfig:
         token_secret="test-secret",
         token_ttl_seconds=3600,
         agent_tool_token="agent-token",
-        knowledge_backend="local",
-        cognee_dataset="test",
-        cognee_ingest_background=True,
         camofox_url="http://127.0.0.1:19377",
         firecrawl_api_url="http://127.0.0.1:13002",
         runtime_startup_wait_seconds=0,
@@ -718,19 +720,17 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 scope_id=str(actor["id"]),
             )
             self.assertTrue(created)
-            ingest_job, created = seed.jobs.enqueue(
-                kind="cognee",
-                dedupe_key="document:991",
-                payload={
-                    "document_id": 991,
-                    "title": "deferred ingest",
-                    "content": "candidate must not ingest this before release",
-                    "source": "test",
-                },
-                scope_type="knowledge",
-                scope_id="991",
+            embedding_client = RecordingEmbeddingClient()
+            configure_test_knowledge(seed, embedding_client)
+            document, created = seed.knowledge.add_document_with_status(
+                title="deferred index",
+                content="candidate must not index this before release",
+                source="test",
+                created_by=int(actor["id"]),
             )
             self.assertTrue(created)
+            ingest_job = seed.jobs.queued("knowledge_index", limit=None)[0]
+            self.assertEqual(ingest_job.scope_id, str(document["id"]))
             seed.close()
 
             operation_id = "operation-finalize-1"
@@ -749,16 +749,20 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             recovered_agent = _BlockingAgent()
             ingest_started = threading.Event()
 
-            def ingest_document(**_kwargs):
-                ingest_started.set()
-                return {"attempted": True, "available": True}
+            class SignalingEmbeddingClient(RecordingEmbeddingClient):
+                def embed(self, texts):
+                    ingest_started.set()
+                    return super().embed(texts)
 
             recovered = EnterpriseService(
                 _container_config(data_dir),
                 agent_client=recovered_agent,
                 manager_client=manager,
             )
-            recovered.cognee.ingest_document = ingest_document
+            install_test_embedding_client(
+                recovered,
+                SignalingEmbeddingClient(),
+            )
             try:
                 time.sleep(0.1)
                 self.assertTrue(recovered.platform_update_is_blocking())

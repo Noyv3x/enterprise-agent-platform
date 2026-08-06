@@ -29,7 +29,7 @@
 │   ├── runtimes/
 │   │   ├── agent/{sessions,approvals,idempotency,logs}/
 │   │   ├── camofox/{profiles,cookies,traces,cache,logs}/
-│   │   ├── cognee/{data,system,cache,logs}/
+│   │   ├── knowledge/{cache,logs}/
 │   │   ├── searxng/{config,cache,logs}/
 │   │   └── firecrawl/{redis,rabbitmq,postgres}/
 │   └── logs/
@@ -70,7 +70,7 @@ Sandbox 系统层修改随容器重建丢失。需持久的软件和文件放入
 
 Agent Runtime 的 session、approval 与 idempotency 位于 `runtimes/agent`。程序和依赖在镜像内。
 
-Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。Cognee 的数据、system、cache 和日志位于对应目录。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
+Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。知识原文、分块、向量和 generation 状态都在 `platform.db`，`runtimes/knowledge` 只允许有界的缓存与日志，不是权威数据。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
 
 ## Manager 状态、快照与清理
 
@@ -84,6 +84,6 @@ Manager 保存 Current/Previous/Candidate、operation journal、不可变 releas
 
 ## 备份与恢复
 
-一致备份至少包含 SQLite backup、attachments、workspaces、agent-envs、agent-skills、Runtime session/approval/idempotency 与 Manager release/operation state。需要保留网页登录态时包含 Camoufox Profile；Cognee 和 Firecrawl 数据按恢复成本纳入。
+一致备份至少包含 SQLite backup、attachments、workspaces、agent-envs、agent-skills、Runtime session/approval/idempotency 与 Manager release/operation state。需要保留网页登录态时包含 Camoufox Profile；Firecrawl 数据按恢复成本纳入。知识原文和当前索引状态已随 SQLite backup 保存，不备份知识运行缓存。
 
 恢复先停止 Platform writer，完整验证快照 manifest、文件类型、大小和 SHA-256，再在同文件系统 staging 中准备全部文件，最后原子切换并同步目录。任一步失败必须补偿回提交前完整集合。不得手工编辑 Runtime JSONL、幂等记录或 Manager journal。

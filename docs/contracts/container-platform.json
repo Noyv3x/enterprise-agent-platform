@@ -2,7 +2,7 @@
   "schema_version": 2,
   "policy": "container-platform",
   "release_channel": "main",
-  "database_schema_version": 2026072901,
+  "database_schema_version": 2026080601,
   "container_paths": {
     "data_root": "/var/lib/agent-platform",
     "workspace": "/workspace",
@@ -14,7 +14,6 @@
     "host"
   ],
   "persistent_data_owners": {
-    "cognee": [],
     "searxng": [],
     "firecrawl-redis": [
       {

@@ -4,7 +4,7 @@ package contract
 const (
 	SchemaVersion                    = 2
 	ReleaseChannel                   = "main"
-	DatabaseSchemaVersion            = 2026072901
+	DatabaseSchemaVersion            = 2026080601
 	ContainerDataRoot                = "/var/lib/agent-platform"
 	ContainerWorkspace               = "/workspace"
 	ContainerAgentHome               = "/home/agent"
@@ -71,7 +71,6 @@ type PersistentDataOwner struct {
 }
 
 var PersistentDataOwners = map[string][]PersistentDataOwner{
-	"cognee":             {},
 	"firecrawl-postgres": {{UID: 999, GID: 0}, {UID: 999, GID: 999}},
 	"firecrawl-rabbitmq": {{UID: 999, GID: 0}, {UID: 999, GID: 999}},
 	"firecrawl-redis":    {{UID: 999, GID: 0}, {UID: 999, GID: 1000}},

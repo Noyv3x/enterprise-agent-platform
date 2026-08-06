@@ -64,4 +64,4 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 `documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`。共享门禁脚本只能依赖对应 CI runner 明确提供的基础命令；可选的本地搜索工具不得成为流水线正确性前提。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。仓库级回归测试直接锁定这些 owner 关系，避免调整 manifest 时使迁移或发布验收失去规范文档。
 
-Cognee 与 Firecrawl 不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；该 validation-only contract 由发布工作流和容器验收直接消费，不生成 Platform Python 模块。修改契约必须同步部署实现或验收测试。数据目录中的受管 checkout 不是 canonical 文档或受管产品代码。
+Firecrawl 不进入产品 Git tree。其 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；该 validation-only contract 由发布工作流和容器验收直接消费，不生成 Platform Python 模块。修改契约必须同步部署实现或验收测试。研究用第三方 checkout 不属于产品源码、运行数据或发布输入。

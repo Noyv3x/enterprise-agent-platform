@@ -31,9 +31,10 @@ import type {
   ChannelMessagesResponse,
   ChannelsResponse,
   ChatMode,
-  CogneeConfigResponse,
   DocumentsResponse,
   Id,
+  KnowledgeConfigResponse,
+  KnowledgeStatusResponse,
   MentionTargetsResponse,
   Message,
   OAuthProvidersResponse,
@@ -578,11 +579,22 @@ export async function loadBrandingConfig(store: AppStore): Promise<void> {
   });
 }
 
-export async function loadCogneeConfig(store: AppStore): Promise<void> {
+export async function loadKnowledgeConfig(store: AppStore): Promise<void> {
   store.dispatch({
-    type: "SET_COGNEE_CONFIG",
-    payload: await api<CogneeConfigResponse>(endpoints.cogneeConfig.path()),
+    type: "SET_KNOWLEDGE_CONFIG",
+    payload: await api<KnowledgeConfigResponse>(endpoints.knowledgeConfig.path()),
   });
+}
+
+export async function loadKnowledgeStatus(store: AppStore): Promise<void> {
+  store.dispatch({
+    type: "SET_KNOWLEDGE_STATUS",
+    payload: await api<KnowledgeStatusResponse>(endpoints.knowledgeStatus.path()),
+  });
+}
+
+export async function loadKnowledgeAdmin(store: AppStore): Promise<void> {
+  await Promise.all([loadKnowledgeConfig(store), loadKnowledgeStatus(store)]);
 }
 
 export async function loadTokenUsage(store: AppStore): Promise<void> {
@@ -605,7 +617,7 @@ export async function loadSettings(store: AppStore): Promise<void> {
     loadAgentRuntimeConfig(store),
     loadTelegramConfig(store),
     loadAutoUpdateConfig(store),
-    loadCogneeConfig(store),
+    loadKnowledgeAdmin(store),
     loadOAuthProviders(store),
   ]);
 }

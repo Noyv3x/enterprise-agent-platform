@@ -66,6 +66,6 @@ export const ADMIN_PAGES: AdminPage[] = [
   { id: "updates", label: "updates", icon: "refresh", description: "updates" },
   { id: "security", label: "security", icon: "key", description: "security" },
   { id: "runtime", label: "runtime", icon: "server", description: "runtime" },
-  { id: "cognee", label: "Cognee", icon: "library", description: "cognee" },
+  { id: "knowledge", label: "knowledge", icon: "library", description: "knowledge" },
   { id: "secrets", label: "secrets", icon: "key", description: "secrets" },
 ];

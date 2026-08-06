@@ -1,24 +1,7 @@
 import { describe, expect, it } from "vitest";
-import {
-  CONFIG_FIELD_GROUP_KEYS,
-  CONFIG_FIELD_LABEL_KEYS,
-  CONFIG_FIELD_OPTION_KEYS,
-} from "./messages/admin";
-import { messages } from "./catalog";
 import { translate } from ".";
 
 describe("admin translations", () => {
-  it("covers every managed config field with a valid catalog key", () => {
-    expect(Object.keys(CONFIG_FIELD_LABEL_KEYS).length).toBeGreaterThan(100);
-    for (const key of [
-      ...Object.values(CONFIG_FIELD_LABEL_KEYS),
-      ...Object.values(CONFIG_FIELD_GROUP_KEYS),
-      ...Object.values(CONFIG_FIELD_OPTION_KEYS),
-    ]) {
-      expect(messages[key]).toBeDefined();
-    }
-  });
-
   it("uses English singular and plural forms for admin counts", () => {
     expect(translate("en", "admin.model.count", { count: 1 })).toBe("1 available model");
     expect(translate("en", "admin.model.count", { count: 2 })).toBe("2 available models");
@@ -37,5 +20,11 @@ describe("admin translations", () => {
     expect(translate("en", "admin.group.agents")).toBe("Agents & access");
     expect(translate("en", "admin.accounts.impersonateConfirm", { name: "Avery" }))
       .toContain("Avery");
+  });
+
+  it("localizes the knowledge embedding states in all interface languages", () => {
+    expect(translate("zh-CN", "admin.knowledge.status.disabled")).toBe("已禁用");
+    expect(translate("en", "admin.knowledge.status.indexing")).toBe("Indexing");
+    expect(translate("zh-TW", "admin.knowledge.status.degraded")).toBe("異常");
   });
 });

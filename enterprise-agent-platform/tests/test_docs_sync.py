@@ -269,7 +269,6 @@ class DocsSyncTests(unittest.TestCase):
                     },
                     "execution_targets": ["sandbox", "host"],
                     "persistent_data_owners": {
-                        "cognee": [],
                         "searxng": [],
                         "firecrawl-redis": [
                             {"uid": 999, "gid": 0},
@@ -359,11 +358,6 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "sources": {
-                        "cognee": {
-                            "repository_url": "https://example.invalid/cognee.git",
-                            "revision": "1" * 40,
-                            "required_paths": ["pyproject.toml", "cognee/__init__.py"],
-                        },
                         "firecrawl": {
                             "repository_url": "https://example.invalid/firecrawl.git",
                             "revision": "2" * 40,
@@ -386,7 +380,7 @@ class DocsSyncTests(unittest.TestCase):
             "README.md": "# Project\n\n[Docs](docs/README.md)\n",
             "enterprise-agent-platform/README.md": "# Platform\n\n[Docs](../docs/README.md)\n",
             "enterprise-agent-platform/agent-runtime/README.md": "# Runtime\n\n[Docs](../../docs/README.md)\n",
-            ".gitignore": "data/\n/cognee/\n/firecrawl/\n",
+            ".gitignore": "data/\n/firecrawl/\n",
             ".github/workflows/quality.yml": "name: fixture\n",
             "scripts/policy.py": "POLICY = True\n",
             "enterprise-agent-platform/pyproject.toml": "[project]\nname = 'fixture'\nversion = '0'\n",
@@ -785,7 +779,7 @@ class DocsSyncTests(unittest.TestCase):
 
     def test_index_snapshot_tolerates_historical_gitlink_outside_owned_tree(self) -> None:
         base = self.ready_repository()
-        self.git("update-index", "--add", "--cacheinfo", "160000", base, "cognee")
+        self.git("update-index", "--add", "--cacheinfo", "160000", base, "retired-upstream")
 
         self.run_command(
             "check-change",
@@ -1265,12 +1259,12 @@ class DocsSyncTests(unittest.TestCase):
         )
         path = self.root / "docs/contracts/upstream-sources.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["sources"]["cognee"]["revision"] = "main"
+        contract["sources"]["firecrawl"]["revision"] = "main"
         path.write_text(json.dumps(contract), encoding="utf-8")
         floating = self.run_command("sync", expect=1)
         self.assertIn("40-character commit SHA", floating.stderr)
 
-        contract["sources"]["cognee"]["revision"] = "1" * 40
+        contract["sources"]["firecrawl"]["revision"] = "2" * 40
         contract["sources"]["firecrawl"]["repository_url"] = (
             "https://token@example.invalid/firecrawl.git"
         )

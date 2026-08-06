@@ -5,7 +5,7 @@
 import { List, Spin } from "antd";
 import type { ReactNode } from "react";
 import { useI18n } from "../../i18n";
-import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
+import type { KnowledgeDocument, KnowledgeHit } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { DocumentCard } from "./DocumentCard";
 
@@ -14,8 +14,8 @@ export interface DocumentListProps {
   isSearching: boolean;
   searchQuery: string;
   loading: boolean;
-  selectedId?: Id;
-  onView: (id: Id, button: HTMLButtonElement) => void;
+  selectedId?: number;
+  onView: (id: number, button: HTMLButtonElement) => void;
 }
 
 export function DocumentList({
@@ -45,7 +45,7 @@ export function DocumentList({
           <List.Item className="knowledge-list__item" key={String(doc.id)}>
             <DocumentCard
               doc={doc}
-              selected={selectedId != null && String(selectedId) === String(doc.id)}
+              selected={selectedId === doc.id}
               onView={onView}
             />
           </List.Item>

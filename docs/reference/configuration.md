@@ -77,7 +77,7 @@ Platform 容器只接受 Manager 生成的 target-only 最小环境：
 - 内部监听 host/port、public base URL 和 trusted proxy；
 - Agent Runtime、Camoufox、SearXNG 与 Firecrawl 的私有 service URL；
 - 对应内部 token file；
-- 媒体、HTTP/SSE 并发、附件配额、job lease、Cognee retry、Telegram delivery 与 schedule poll 等运行限制；
+- 媒体、HTTP/SSE 并发、附件配额、job lease、知识索引 retry、Telegram delivery 与 schedule poll 等运行限制；
 - `AGENT_PLATFORM_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`AGENT_PLATFORM_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
 这些字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。Platform 不读取其它环境前缀，也不提供双读或自动转换。
@@ -116,7 +116,9 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 
 ### 知识与集成
 
-Cognee backend、dataset 与内部设置由管理入口持久化。托管 Cognee/Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、Cognee provider secret 和 Telegram secret仍由 Platform secret store 管理。
+知识配置只包含 `knowledge_embedding_base_url`、`knowledge_embedding_model`、可选 `knowledge_embedding_dimensions`、`knowledge_embedding_batch_size` 和 secret `KNOWLEDGE_EMBEDDING_API_KEY`。base URL 必须是不含凭据的 HTTPS URL（测试只允许精确回环 HTTP），model 和数值字段有服务端长度/范围上限。API 只回传 `credential_configured` 和有界 mask，不回填 key。保存新配置前先执行最小 embedding 探测，成功后原子保存并调度新 generation 重建。缺少 API key 时知识功能 disabled，不启动本地模型也不改走 FTS/LIKE。
+
+托管 Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、知识 Embeddings API key 和 Telegram secret 由 Platform secret store 管理。
 
 私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。
 
@@ -139,7 +141,7 @@ Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.j
 
 ## Secret
 
-Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Cognee 和 Telegram secret。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
+Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Knowledge Embeddings 和 Telegram secret。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
 
 `secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限；界面不得宣称“加密存储”。secret 值不能进入文档、日志、Run metadata、release manifest、operation journal 或 Git。
 

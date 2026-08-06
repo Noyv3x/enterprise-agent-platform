@@ -44,7 +44,7 @@ describe("RuntimeSettings", () => {
     expect(screen.getByText("SearXNG search")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Health of the Agent runtime, Cognee, Camofox, SearXNG search, and Firecrawl web extraction.",
+        "Health of the Agent runtime, Camofox, SearXNG search, and Firecrawl web extraction.",
       ),
     ).toBeInTheDocument();
 

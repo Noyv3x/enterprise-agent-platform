@@ -1,12 +1,10 @@
-/* <DocumentCard/> — one entry in the document list. "查看正文" fetches the full
-   document by id. The button is disabled for hits
-   whose id is non-numeric (Cognee graph hits): the by-id route is numeric-only,
-   so calling it would 404 — disabling it is the documented improvement (spec §7). */
+/* <DocumentCard/> — one entry in the document list. Search hits and library
+   rows share the same stable numeric document id, so either can open the
+   authoritative source document. */
 
 import { Button, Card } from "antd";
-import { isNumericDocumentId } from "../../data/knowledgeActions";
 import { useI18n } from "../../i18n";
-import type { Id, KnowledgeDocument, KnowledgeHit } from "../../types";
+import type { KnowledgeDocument, KnowledgeHit } from "../../types";
 import { formatTimestamp } from "../../utils/format";
 import { Icon } from "../common/Icon";
 import { DOC_VIEWER_ID } from "./DocumentViewer";
@@ -15,12 +13,11 @@ export interface DocumentCardProps {
   doc: KnowledgeDocument | KnowledgeHit;
   /** true when this card's document is the one currently open in the viewer. */
   selected: boolean;
-  onView: (id: Id, button: HTMLButtonElement) => void;
+  onView: (id: number, button: HTMLButtonElement) => void;
 }
 
 export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
   const { t } = useI18n();
-  const canView = isNumericDocumentId(doc.id);
   return (
     <Card
       className={`knowledge-document-card${selected ? " is-selected" : ""}`}
@@ -40,7 +37,6 @@ export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
         <Button
           size="small"
           icon={<Icon name="doc" size={14} />}
-          disabled={!canView}
           aria-controls={DOC_VIEWER_ID}
           aria-expanded={selected}
           onClick={(event) => onView(doc.id, event.currentTarget as HTMLButtonElement)}

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import math
 import os
@@ -13,7 +12,6 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from .config import PlatformConfig
@@ -34,15 +32,6 @@ AGENT_SETTING_PROVIDER = "agent_runtime_provider"
 AGENT_SETTING_IDLE_TIMEOUT = "agent_runtime_idle_timeout_seconds"
 AGENT_SETTING_MAX_CONCURRENCY = "agent_runtime_max_concurrency"
 AGENT_SETTING_COMPACTION_THRESHOLD = "agent_runtime_compaction_threshold"
-
-COGNEE_SETTING_BACKEND = "cognee_backend"
-COGNEE_SETTING_DATASET = "cognee_dataset"
-COGNEE_SETTING_INGEST_BACKGROUND = "cognee_ingest_background"
-COGNEE_SETTING_DATA_ROOT = "cognee_data_root_directory"
-COGNEE_SETTING_SYSTEM_ROOT = "cognee_system_root_directory"
-COGNEE_SETTING_CACHE_ROOT = "cognee_cache_root_directory"
-COGNEE_SETTING_LOGS_DIR = "cognee_logs_dir"
-COGNEE_SETTING_SKIP_CONNECTION_TEST = "cognee_skip_connection_test"
 
 RUNTIME_STATUS_CACHE_SECONDS = 10.0
 _MAX_HEALTH_BODY_BYTES = 64 * 1024
@@ -110,7 +99,6 @@ class PlatformRuntimeManager:
                 "searxng": self.searxng_status(refresh=False),
                 "firecrawl": self.firecrawl_status(refresh=False),
             }
-        statuses["cognee"] = self.cognee_status()
         return {name: status.to_dict() for name, status in statuses.items()}
 
     def cached_status(
@@ -236,46 +224,6 @@ class PlatformRuntimeManager:
             "agent",
             available,
             "Agent Runtime is managed by the platform manager",
-        )
-
-    def cognee_runtime_config(self) -> dict[str, Any]:
-        values = self._cognee_env_values()
-        return {
-            "runtime_dir": str(self.config.cognee_runtime_dir),
-            "backend": self._effective_cognee_backend(),
-            "dataset": self._effective_cognee_dataset(),
-            "ingest_background": self._effective_cognee_ingest_background(),
-            "data_root_directory": values["DATA_ROOT_DIRECTORY"],
-            "system_root_directory": values["SYSTEM_ROOT_DIRECTORY"],
-            "cache_root_directory": values["CACHE_ROOT_DIRECTORY"],
-            "logs_dir": values["COGNEE_LOGS_DIR"],
-            "skip_connection_test": values[
-                "COGNEE_SKIP_CONNECTION_TEST"
-            ].lower()
-            in {"1", "true", "yes", "on"},
-            "env_path": str(self._cognee_env_path()),
-        }
-
-    def ensure_cognee_ready(self) -> RuntimeStatus:
-        try:
-            self._seed_cognee_env()
-        except OSError as exc:
-            return RuntimeStatus(
-                name="cognee",
-                available=False,
-                state="error",
-                error=str(exc),
-            )
-        return self.cognee_status()
-
-    def cognee_status(self) -> RuntimeStatus:
-        available = importlib.util.find_spec("cognee") is not None
-        return RuntimeStatus(
-            name="cognee",
-            available=available,
-            state="available" if available else "missing",
-            detail="Cognee is built into the Platform image" if available else "",
-            error="" if available else "Cognee package is missing from the Platform image",
         )
 
     def ensure_camofox_ready(self, *, wait: bool = True) -> RuntimeStatus:
@@ -600,58 +548,6 @@ class PlatformRuntimeManager:
                 return value
         return ""
 
-    def _effective_cognee_backend(self) -> str:
-        value = (
-            self._runtime_setting(COGNEE_SETTING_BACKEND)
-            or self.config.knowledge_backend
-        ).strip().lower()
-        return value if value in {"local", "hybrid", "cognee"} else "hybrid"
-
-    def _effective_cognee_dataset(self) -> str:
-        return self._runtime_setting(COGNEE_SETTING_DATASET) or self.config.cognee_dataset
-
-    def _effective_cognee_ingest_background(self) -> bool:
-        value = self._runtime_setting(COGNEE_SETTING_INGEST_BACKGROUND)
-        if value is None:
-            return self.config.cognee_ingest_background
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-
-    def _cognee_env_values(self) -> dict[str, str]:
-        root = self.config.cognee_runtime_dir
-        values = {
-            "DATA_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_DATA_ROOT)
-            or str(root / "data"),
-            "SYSTEM_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_SYSTEM_ROOT)
-            or str(root / "system"),
-            "CACHE_ROOT_DIRECTORY": self._runtime_setting(COGNEE_SETTING_CACHE_ROOT)
-            or str(root / "cache"),
-            "COGNEE_LOGS_DIR": self._runtime_setting(COGNEE_SETTING_LOGS_DIR)
-            or str(root / "logs"),
-            "COGNEE_SKIP_CONNECTION_TEST": self._runtime_setting(
-                COGNEE_SETTING_SKIP_CONNECTION_TEST
-            )
-            or "true",
-        }
-        values.update(_read_env_file(self._cognee_env_path()))
-        return values
-
-    def _cognee_env_path(self) -> Path:
-        return self.config.cognee_runtime_dir / ".env"
-
-    def _seed_cognee_env(self) -> None:
-        values = self._cognee_env_values()
-        for key in (
-            "DATA_ROOT_DIRECTORY",
-            "SYSTEM_ROOT_DIRECTORY",
-            "CACHE_ROOT_DIRECTORY",
-            "COGNEE_LOGS_DIR",
-        ):
-            value = values.get(key, "")
-            if value:
-                Path(value).expanduser().mkdir(parents=True, exist_ok=True)
-        for key, value in values.items():
-            os.environ[key] = value
-
     def _runtime_setting(self, key: str) -> str | None:
         if self.setting_provider is None:
             return None
@@ -660,20 +556,3 @@ class PlatformRuntimeManager:
         except Exception:
             return None
         return str(value) if value not in {None, ""} else None
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return {}
-    values: dict[str, str] = {}
-    for line in lines:
-        clean = line.strip()
-        if not clean or clean.startswith("#") or "=" not in clean:
-            continue
-        key, value = clean.split("=", 1)
-        key = key.strip()
-        if key and key.replace("_", "").isalnum():
-            values[key] = value.strip()
-    return values

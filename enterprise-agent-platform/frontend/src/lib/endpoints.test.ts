@@ -21,6 +21,19 @@ describe("Agent runtime configuration endpoint", () => {
   });
 });
 
+describe("knowledge embeddings administration endpoints", () => {
+  it("uses the platform-owned config, status, and rebuild resources", () => {
+    expect(endpoints.knowledgeConfig).toMatchObject({ method: "GET" });
+    expect(endpoints.updateKnowledgeConfig).toMatchObject({ method: "PUT" });
+    expect(endpoints.knowledgeStatus).toMatchObject({ method: "GET" });
+    expect(endpoints.reindexKnowledge).toMatchObject({ method: "POST" });
+    expect(endpoints.knowledgeConfig.path()).toBe("/api/system/knowledge/config");
+    expect(endpoints.updateKnowledgeConfig.path()).toBe("/api/system/knowledge/config");
+    expect(endpoints.knowledgeStatus.path()).toBe("/api/knowledge/status");
+    expect(endpoints.reindexKnowledge.path()).toBe("/api/system/knowledge/reindex");
+  });
+});
+
 describe("read-only Agent preview endpoints", () => {
   it("encodes scope and optional browser tab without exposing path fragments", () => {
     expect(endpoints.previewStatus.path("private", "user 7")).toBe(

@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .config import PlatformConfig
-from .db import Database
+from .db import Database, migrate_database
 from .server import run_server
 from .service import EnterpriseService
 
@@ -45,17 +45,8 @@ def main() -> None:
         run_server(config)
         return
     if cmd == "migrate":
-        database = Database(config.db_path, config.technical_profile)
-        try:
-            version = int(
-                database.scalar(
-                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
-                )
-                or 0
-            )
-            print(json.dumps({"ok": True, "schema_version": version}))
-        finally:
-            database.close()
+        version = migrate_database(config.db_path, config.technical_profile)
+        print(json.dumps({"ok": True, "schema_version": version}))
         return
 
     service = EnterpriseService(config)

@@ -1,7 +1,7 @@
 // Generated from docs/contracts/container-platform.json by scripts/docs_sync.py; do not edit.
 export const CONTAINER_PLATFORM_SCHEMA_VERSION = 2 as const;
 export const RELEASE_CHANNEL = "main" as const;
-export const DATABASE_SCHEMA_VERSION = 2026072901 as const;
+export const DATABASE_SCHEMA_VERSION = 2026080601 as const;
 export const CONTAINER_PATHS = {
   "data_root": "/var/lib/agent-platform",
   "workspace": "/workspace",
@@ -11,7 +11,6 @@ export const CONTAINER_PATHS = {
 export const EXECUTION_TARGETS = ["sandbox", "host"] as const;
 export type ExecutionTarget = (typeof EXECUTION_TARGETS)[number];
 export const PERSISTENT_DATA_OWNERS = {
-  "cognee": [],
   "searxng": [],
   "firecrawl-redis": [
     {

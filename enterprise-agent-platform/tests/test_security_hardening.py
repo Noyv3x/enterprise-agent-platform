@@ -6,7 +6,6 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform import service as service_module
-from enterprise_agent_platform.internal_config import mask_value
 from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
@@ -25,14 +24,11 @@ class MaskSecretTests(unittest.TestCase):
         # hint encodes neither the length nor any character of the secret.
         self.assertEqual(mask_secret("abc"), "********")
         self.assertEqual(mask_secret("hunter2"), "********")
-        self.assertEqual(mask_value("abc"), "********")
-        self.assertEqual(mask_value("hunter2"), "********")
 
     def test_two_different_short_secrets_mask_identically(self):
         # Different short secrets of different lengths must be indistinguishable
         # once masked (no length oracle, no prefix leak).
         self.assertEqual(mask_secret("a"), mask_secret("abcdefghijk"))
-        self.assertEqual(mask_value("a"), mask_value("abcdefghijk"))
         self.assertEqual(mask_secret("short"), mask_secret("other"))
 
     def test_long_secret_only_shows_suffix_and_no_prefix(self):
@@ -44,8 +40,6 @@ class MaskSecretTests(unittest.TestCase):
         self.assertEqual(masked, "...9999")
         self.assertNotIn("PREFIX", masked)
         self.assertNotIn("sk-", masked)
-        # Same contract from internal_config.mask_value.
-        self.assertEqual(mask_value(secret), "...9999")
 
     def test_long_secrets_of_different_length_do_not_reveal_length(self):
         # Two long secrets that share a 4-char suffix mask identically even though
@@ -57,7 +51,6 @@ class MaskSecretTests(unittest.TestCase):
 
     def test_empty_secret_masks_to_empty(self):
         self.assertEqual(mask_secret(""), "")
-        self.assertEqual(mask_value(""), "")
 
     def test_list_secrets_never_emits_plaintext_or_length(self):
         with tempfile.TemporaryDirectory() as td:

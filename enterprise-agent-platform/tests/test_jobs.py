@@ -31,7 +31,7 @@ class DurableJobStoreTests(unittest.TestCase):
         self.assertEqual(second.payload, {"value": 1})
 
     def test_claim_and_success_transition(self):
-        job, _ = self.jobs.enqueue(kind="cognee", dedupe_key="doc:3", payload={"id": 3})
+        job, _ = self.jobs.enqueue(kind="knowledge_index", dedupe_key="doc:3", payload={"id": 3})
         claimed = self.jobs.mark_running(job.id, lease_seconds=60)
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed.status, "running")
@@ -63,22 +63,24 @@ class DurableJobStoreTests(unittest.TestCase):
 
     def test_restart_recovery_does_not_repeat_unsafe_agent_job(self):
         agent, _ = self.jobs.enqueue(kind="agent", dedupe_key="message:1", payload={})
-        cognee, _ = self.jobs.enqueue(kind="cognee", dedupe_key="doc:1", payload={})
+        knowledge_index, _ = self.jobs.enqueue(
+            kind="knowledge_index", dedupe_key="doc:1", payload={}
+        )
         telegram, _ = self.jobs.enqueue(kind="telegram_delivery", dedupe_key="message:1", payload={})
         self.jobs.mark_running(agent.id, lease_seconds=60)
-        self.jobs.mark_running(cognee.id, lease_seconds=60)
+        self.jobs.mark_running(knowledge_index.id, lease_seconds=60)
         self.jobs.mark_running(telegram.id, lease_seconds=60)
 
         counts = self.jobs.recover_interrupted(unsafe_kinds={"agent", "telegram_delivery"})
 
         self.assertEqual(counts, {"queued": 1, "needs_review": 2})
         self.assertEqual(self.jobs.get(agent.id).status, "needs_review")
-        self.assertEqual(self.jobs.get(cognee.id).status, "queued")
+        self.assertEqual(self.jobs.get(knowledge_index.id).status, "queued")
         self.assertEqual(self.jobs.get(telegram.id).status, "needs_review")
 
     def test_queued_includes_delayed_retry_and_counts_can_be_scoped(self):
         first, _ = self.jobs.enqueue(
-            kind="cognee",
+            kind="knowledge_index",
             dedupe_key="doc:future",
             payload={"id": 8},
             scope_type="knowledge",
@@ -93,18 +95,26 @@ class DurableJobStoreTests(unittest.TestCase):
             scope_id="9",
         )
 
-        self.assertEqual([job.id for job in self.jobs.queued("cognee")], [first.id])
-        self.assertEqual(self.jobs.ready("cognee"), [])
-        scoped = self.jobs.counts(kind="cognee", scope_type="knowledge", scope_id="8")
+        self.assertEqual(
+            [job.id for job in self.jobs.queued("knowledge_index")], [first.id]
+        )
+        self.assertEqual(self.jobs.ready("knowledge_index"), [])
+        scoped = self.jobs.counts(
+            kind="knowledge_index", scope_type="knowledge", scope_id="8"
+        )
         self.assertEqual(scoped["queued"], 1)
         self.assertEqual(sum(scoped.values()), 1)
 
     def test_unbounded_recovery_read_does_not_strand_jobs_after_default_page(self):
         for index in range(1005):
-            self.jobs.enqueue(kind="cognee", dedupe_key=f"doc:{index}", payload={"id": index})
+            self.jobs.enqueue(
+                kind="knowledge_index",
+                dedupe_key=f"doc:{index}",
+                payload={"id": index},
+            )
 
-        self.assertEqual(len(self.jobs.queued("cognee")), 1000)
-        recovered = self.jobs.queued("cognee", limit=None)
+        self.assertEqual(len(self.jobs.queued("knowledge_index")), 1000)
+        recovered = self.jobs.queued("knowledge_index", limit=None)
         self.assertEqual(len(recovered), 1005)
         self.assertEqual(recovered[-1].dedupe_key, "doc:1004")
 

@@ -38,7 +38,6 @@ jobs:
       source_commit: ${{ steps.release.outputs.source_commit }}
       image_matrix: ${{ steps.release.outputs.image_matrix }}
       image_namespace: ${{ steps.release.outputs.image_namespace }}
-      cognee_revision: ${{ steps.release.outputs.cognee_revision }}
       firecrawl_revision: ${{ steps.release.outputs.firecrawl_revision }}
     steps:
       - name: Check out qualified source
@@ -59,7 +58,6 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$source_commit" origin/main
           image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          cognee_revision="$(jq -er '.sources.cognee.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           firecrawl_revision="$(jq -er '.sources.firecrawl.revision | select(test("^[0-9a-f]{40}$"))' docs/contracts/upstream-sources.json)"
           current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
           if [[ ! "$current_tag" =~ ^container-([0-9a-f]{40})$ ]]; then
@@ -76,7 +74,6 @@ jobs:
             echo "source_commit=$source_commit"
             echo "image_matrix=$image_matrix"
             echo "image_namespace=$image_namespace"
-            echo "cognee_revision=$cognee_revision"
             echo "firecrawl_revision=$firecrawl_revision"
           } >> "$GITHUB_OUTPUT"
 
@@ -129,20 +126,12 @@ jobs:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
 
-      - name: Validate exact Cognee and Firecrawl revisions
+      - name: Validate exact Firecrawl revision
         shell: bash
         run: |
           set -euo pipefail
           root="$(mktemp -d)"
           trap 'rm -rf "$root"' EXIT
-          git -C "$root" init cognee
-          git -C "$root/cognee" remote add origin https://github.com/topoteretes/cognee.git
-          git -C "$root/cognee" fetch --depth=1 origin '${{ needs.prepare.outputs.cognee_revision }}'
-          git -C "$root/cognee" checkout --detach FETCH_HEAD
-          test "$(git -C "$root/cognee" rev-parse HEAD)" = '${{ needs.prepare.outputs.cognee_revision }}'
-          test -f "$root/cognee/pyproject.toml"
-          test -f "$root/cognee/cognee/__init__.py"
-
           git -C "$root" init firecrawl
           git -C "$root/firecrawl" remote add origin https://github.com/firecrawl/firecrawl.git
           git -C "$root/firecrawl" fetch --depth=1 origin '${{ needs.prepare.outputs.firecrawl_revision }}'
@@ -225,7 +214,6 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ needs.prepare.outputs.source_commit }}
             RELEASE_VERSION=${{ needs.prepare.outputs.source_commit }}
-            COGNEE_REVISION=${{ needs.prepare.outputs.cognee_revision }}
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 

@@ -14,7 +14,8 @@ import {
   loadBrandingConfig,
   loadChannelMessages,
   loadChannels,
-  loadCogneeConfig,
+  loadKnowledgeAdmin,
+  loadKnowledgeStatus,
   loadInitial,
   loadMessageAudit,
   loadPrivateConversations,
@@ -45,6 +46,7 @@ import type {
   AgentRuntimeConfigUpdateRequest,
   Id,
   ImpersonateUserResponse,
+  KnowledgeConfigUpdateRequest,
   OAuthFlowResponse,
   OAuthImportResponse,
   SecurityConfigResponse,
@@ -473,19 +475,33 @@ export async function runManagerOperation(
   });
 }
 
-/** Save Cognee configuration and reload runtime health because env changes can affect it. */
-export async function saveCogneeEnv(
+/** Validate and save the external embeddings configuration, then refresh index state. */
+export async function saveKnowledgeConfig(
   store: AppStore,
-  updates: Record<string, string>,
+  body: KnowledgeConfigUpdateRequest,
 ): Promise<void> {
-  await runBusy(store, "admin:cognee:save", async () => {
-    await api(endpoints.updateCogneeConfig.path(), {
+  await runBusy(store, "admin:knowledge:save", async () => {
+    await api(endpoints.updateKnowledgeConfig.path(), {
       method: "PUT",
-      body: JSON.stringify({ env: updates }),
+      body: JSON.stringify(body),
     });
-    await loadCogneeConfig(store);
-    await loadRuntime(store);
-    toast(t("admin.toast.cogneeSaved"), { type: "ok", title: t("admin.toast.complete") });
+    await loadKnowledgeAdmin(store);
+    toast(t("admin.toast.knowledgeSaved"), { type: "ok", title: t("admin.toast.complete") });
+  });
+}
+
+/** Rebuild a shadow knowledge generation from the authoritative documents. */
+export async function reindexKnowledge(store: AppStore): Promise<void> {
+  await runBusy(store, "admin:knowledge:reindex", async () => {
+    await api(endpoints.reindexKnowledge.path(), {
+      method: "POST",
+      body: EMPTY_BODY,
+    });
+    await loadKnowledgeStatus(store);
+    toast(t("admin.toast.knowledgeReindexQueued"), {
+      type: "ok",
+      title: t("admin.toast.sent"),
+    });
   });
 }
 

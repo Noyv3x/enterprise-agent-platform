@@ -85,7 +85,7 @@ Manager 持有所有产品监听。正常时代理 current Platform；更新、�
 
 ## 发布物、启动与健康
 
-release manifest 固定 source commit、数据库版本、Manager SHA-256、Compose SHA-256 与全部镜像 digest。Manager 不运行清单中的 shell，也不以 mutable tag 作为运行身份。部署机不拉取 Cognee、Firecrawl 或其它上游 Git 仓库。
+release manifest 固定 source commit、数据库版本、Manager SHA-256、Compose SHA-256 与全部镜像 digest。Manager 不运行清单中的 shell，也不以 mutable tag 作为运行身份。部署机不拉取 Firecrawl 或其它上游 Git 仓库。
 
 发布冒烟只组装和验证当前 schema 的十镜像清单、八个公开资产以及单一 main 发布工作流；它不接受迁移阶段、前任清单或第二套提升协议作为输入。
 
@@ -93,7 +93,7 @@ release manifest 固定 source commit、数据库版本、Manager SHA-256、Comp
 
 Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_agent_platform/static/`；镜像只接受本次 frontend build stage 从受控源码生成的完整资产树，不能让本地旧 bundle 通过 Docker context 混入 wheel。
 
-Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与 Cognee 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。
+Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与知识 Embeddings provider 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。未配置 Embeddings API key 是明确的知识 disabled 状态，不是容器 readiness 失败。
 
 任何时刻最多一个可写 Platform 打开 SQLite。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
 
@@ -101,7 +101,7 @@ Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 genera
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```
 
-成功后才启动候选 writer。迁移和启动失败由同一 operation 使用更新前快照回滚。
+成功后才启动候选 writer。迁移和启动失败由同一 operation 使用更新前快照回滚。知识库基线切换只接受契约声明的直接前版本，保留权威文档并移除可重建的旧索引；新向量在 generation 提交后由持久 worker 重建。
 
 Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、启动或挂载 FoundationDB。SearXNG 的完整配置目录只读挂载到 `/etc/searxng`，不能依赖匿名 volume。
 

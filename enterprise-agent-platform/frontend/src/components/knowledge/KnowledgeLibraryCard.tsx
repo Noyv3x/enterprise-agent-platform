@@ -10,7 +10,6 @@ import { resourceKeys, runResourceLoad } from "../../data/resourceState";
 import { useI18n } from "../../i18n";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import type { Id } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { Drawer } from "../common/Drawer";
 import { ResourceStatusView } from "../common/ResourceStatusView";
@@ -25,7 +24,7 @@ export function KnowledgeLibraryCard() {
   const documents = useStore((state) => state.documents);
   const search = useStore((state) => state.knowledgeSearch);
   const selectedDocument = useStore((state) => state.selectedDocument);
-  const [requestedId, setRequestedId] = useState<Id | null>(null);
+  const [requestedId, setRequestedId] = useState<number | null>(null);
 
   // The button that opened the current viewer, so we can return focus to it on
   // close (an inline panel, not a modal).
@@ -37,7 +36,7 @@ export function KnowledgeLibraryCard() {
   );
   const results = search.results;
   const items = isSearching ? results ?? [] : documents;
-  const handleView = (id: Id, button: HTMLButtonElement) => {
+  const handleView = (id: number, button: HTMLButtonElement) => {
     triggerRef.current = button;
     setRequestedId(id);
     void runResourceLoad(store, resourceKeys.knowledgeDocument(id), () => openDocument(store, id));
@@ -101,10 +100,10 @@ export function KnowledgeLibraryCard() {
             {requestedId ? (
               <ResourceStatusView
                 resourceKey={resourceKeys.knowledgeDocument(requestedId)}
-                hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
+                hasData={selectedDocument?.id === requestedId}
                 onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
               >
-                {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
+                {selectedDocument?.id === requestedId ? (
                   <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} />
                 ) : null}
               </ResourceStatusView>
@@ -127,10 +126,10 @@ export function KnowledgeLibraryCard() {
         {requestedId ? (
           <ResourceStatusView
             resourceKey={resourceKeys.knowledgeDocument(requestedId)}
-            hasData={!!selectedDocument && String(selectedDocument.id) === String(requestedId)}
+            hasData={selectedDocument?.id === requestedId}
             onRetry={() => void runResourceLoad(store, resourceKeys.knowledgeDocument(requestedId), () => openDocument(store, requestedId))}
           >
-            {selectedDocument && String(selectedDocument.id) === String(requestedId) ? (
+            {selectedDocument?.id === requestedId ? (
               <DocumentViewer document={selectedDocument} onClose={handleCloseViewer} showClose={false} />
             ) : null}
           </ResourceStatusView>

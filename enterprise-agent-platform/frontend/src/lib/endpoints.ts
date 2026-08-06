@@ -38,8 +38,6 @@ import type {
   ChannelCreateRequest,
   ChannelMessagesResponse,
   ChannelsResponse,
-  CogneeConfigResponse,
-  CogneeConfigUpdateRequest,
   CreateDocumentRequest,
   CreateUserRequest,
   DeleteBeforeRequest,
@@ -52,6 +50,9 @@ import type {
   DocumentsResponse,
   ImpersonateUserResponse,
   KnowledgeSearchResponse,
+  KnowledgeConfigResponse,
+  KnowledgeConfigUpdateRequest,
+  KnowledgeStatusResponse,
   LoginRequest,
   LoginResponse,
   MailAccountCheckResponse,
@@ -504,10 +505,18 @@ export const endpoints = {
     "POST",
     (operation) => `/api/system/auto-update/operations/${encodeURIComponent(operation)}`,
   ),
-  cogneeConfig: ep<void, CogneeConfigResponse>("GET", () => "/api/system/cognee/config"),
-  updateCogneeConfig: ep<CogneeConfigUpdateRequest, unknown>(
+  knowledgeConfig: ep<void, KnowledgeConfigResponse>(
+    "GET",
+    () => "/api/system/knowledge/config",
+  ),
+  updateKnowledgeConfig: ep<KnowledgeConfigUpdateRequest, KnowledgeConfigResponse>(
     "PUT",
-    () => "/api/system/cognee/config",
+    () => "/api/system/knowledge/config",
+  ),
+  knowledgeStatus: ep<void, KnowledgeStatusResponse>("GET", () => "/api/knowledge/status"),
+  reindexKnowledge: ep<Record<string, never>, unknown>(
+    "POST",
+    () => "/api/system/knowledge/reindex",
   ),
 
   /* system: oauth */

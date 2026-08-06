@@ -3,16 +3,12 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import stat
 import tempfile
-import threading
-import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from enterprise_agent_platform import internal_config as internal_config_module
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.agent_runtime_client import AgentResult
 from enterprise_agent_platform.design_contract_generated import (
@@ -20,10 +16,6 @@ from enterprise_agent_platform.design_contract_generated import (
     RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
     RUN_IDLE_TIMEOUT_MINIMUM_SECONDS,
     RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
-)
-from enterprise_agent_platform.internal_config import (
-    read_env_file,
-    update_env_file,
 )
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService
@@ -201,7 +193,9 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 self.assertEqual(body["error"], "invalid limit parameter")
                 self.assertIn("application/json", res.getheader("Content-Type"))
 
-                # A well-formed limit on the same route still succeeds.
+                # Once query parsing succeeds, the unconfigured strong
+                # dependency is reported explicitly rather than disguised as
+                # an empty local-search result.
                 conn.request(
                     "GET",
                     "/api/knowledge/search?q=vpn&limit=3",
@@ -209,8 +203,11 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 )
                 res = conn.getresponse()
                 ok_body = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(res.status, 200)
-                self.assertIn("results", ok_body)
+                self.assertEqual(res.status, 503)
+                self.assertEqual(
+                    ok_body["code"],
+                    "knowledge_embedding_unconfigured",
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -261,93 +258,6 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
-
-class InternalConfigTests(unittest.TestCase):
-    @staticmethod
-    def _run_concurrently(operations) -> list[BaseException]:
-        barrier = threading.Barrier(len(operations) + 1)
-        errors: list[BaseException] = []
-
-        def run(operation) -> None:
-            try:
-                barrier.wait(timeout=5)
-                operation()
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=run, args=(operation,)) for operation in operations]
-        for thread in threads:
-            thread.start()
-        barrier.wait(timeout=5)
-        for thread in threads:
-            thread.join(timeout=5)
-        if any(thread.is_alive() for thread in threads):
-            errors.append(TimeoutError("concurrent config update did not finish"))
-        return errors
-
-
-
-
-
-    def test_env_atomic_write_failure_keeps_old_file(self):
-        with tempfile.TemporaryDirectory() as td:
-            env = Path(td) / ".env"
-            original = 'API_SERVER_HOST="127.0.0.1"\n'
-            env.write_text(original, encoding="utf-8")
-
-            with mock.patch.object(
-                internal_config_module.os,
-                "fsync",
-                side_effect=OSError("injected fsync failure"),
-            ):
-                with self.assertRaisesRegex(OSError, "injected fsync failure"):
-                    update_env_file(env, {"API_SERVER_PORT": "8642"})
-
-            self.assertEqual(env.read_text(encoding="utf-8"), original)
-            self.assertEqual(list(env.parent.glob(f".{env.name}.tmp-*")), [])
-
-    @unittest.skipUnless(os.name == "posix", "POSIX mode bits are required")
-    def test_successful_env_updates_are_owner_only(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            env = root / ".env"
-            env.write_text('API_SERVER_HOST="127.0.0.1"\n', encoding="utf-8")
-            env.chmod(0o644)
-
-            update_env_file(env, {"API_SERVER_PORT": "8642"})
-
-            self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
-
-
-    def test_concurrent_env_updates_do_not_lose_keys(self):
-        with tempfile.TemporaryDirectory() as td:
-            env = Path(td) / ".env"
-            env.write_text('BASE_VALUE="kept"\n', encoding="utf-8")
-            updates = {f"WORKER_{index}": str(index) for index in range(12)}
-            real_atomic_write = internal_config_module._atomic_write_text
-
-            def slow_atomic_write(path, text, **kwargs):
-                # As above, keep writers in the read/write window long enough
-                # for a missing transaction lock to deterministically lose keys.
-                time.sleep(0.01)
-                return real_atomic_write(path, text, **kwargs)
-
-            operations = [
-                lambda key=key, value=value: update_env_file(env, {key: value})
-                for key, value in updates.items()
-            ]
-            with mock.patch.object(
-                internal_config_module,
-                "_atomic_write_text",
-                side_effect=slow_atomic_write,
-            ):
-                errors = self._run_concurrently(operations)
-
-            self.assertEqual(errors, [])
-            values = read_env_file(env)
-            self.assertEqual(values["BASE_VALUE"], "kept")
-            for key, expected in updates.items():
-                self.assertEqual(values.get(key), expected, key)
 
 class ConfigFromEnvTests(unittest.TestCase):
     def setUp(self):

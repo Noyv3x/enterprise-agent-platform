@@ -116,7 +116,6 @@
         "enterprise-agent-platform/enterprise_agent_platform/db.py",
         "containers/compose.yaml",
         "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
-        "enterprise-agent-platform/enterprise_agent_platform/cognee_bridge.py",
         "enterprise-agent-platform/enterprise_agent_platform/memory_security.py",
         "enterprise-agent-platform/enterprise_agent_platform/learning.py",
         "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",

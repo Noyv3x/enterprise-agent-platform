@@ -82,7 +82,6 @@ describe("loadRuntime", () => {
       });
       return {
         agent: row("agent"),
-        cognee: row("cognee"),
         camofox: row("camofox"),
         searxng: row("searxng"),
         firecrawl: row("firecrawl"),

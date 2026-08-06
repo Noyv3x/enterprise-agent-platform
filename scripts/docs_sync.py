@@ -1311,7 +1311,6 @@ def _validate_container_platform_contract(raw: Any, label: str) -> dict[str, Any
         f"{label}.persistent_data_owners",
     )
     expected_owner_sets = {
-        "cognee",
         "searxng",
         "firecrawl-redis",
         "firecrawl-rabbitmq",
@@ -1947,9 +1946,9 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     if contract.get("schema_version") != 1:
         raise DocsSyncError(f"{label}.schema_version must be 1")
     sources = _expect_object(contract.get("sources"), f"{label}.sources")
-    if set(sources) != {"cognee", "firecrawl"}:
+    if set(sources) != {"firecrawl"}:
         raise DocsSyncError(
-            f"{label}.sources must contain exactly cognee and firecrawl"
+            f"{label}.sources must contain exactly firecrawl"
         )
     for name in sorted(sources):
         source_label = f"{label}.sources.{name}"
