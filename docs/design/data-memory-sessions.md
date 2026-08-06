@@ -117,6 +117,6 @@ bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示�
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。本次发布只支持从直接前一 baseline 到当前 baseline 的精确迁移：保留现有知识文档、索引 generation、chunk、embedding 和 ID，新增一对一原件表；既有手工条目不伪造文件元数据，下载时按当前规范动态导出 Markdown。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
+数据库 schema version 单调递增。本次恢复发布除直接前一 baseline 外，还临时接受唯一仍在运行的 `2026072901` 精确 baseline，以跨过未成功发布的两个知识库版本：在同一事务中移除退役 Cognee 派生索引、任务与设置，建立原生向量索引及一对一原件表，并将 marker 直接推进到当前版本。该入口只允许契约声明的完整旧结构；部署机推进后必须立即从下一发布和本文移除。直接前一 baseline 的迁移继续保留现有知识文档、索引 generation、chunk、embedding 和 ID，仅新增一对一原件表；既有手工条目不伪造文件元数据，下载时按当前规范动态导出 Markdown。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。
