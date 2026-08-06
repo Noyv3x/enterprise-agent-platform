@@ -40,6 +40,7 @@ logs/
 node_modules/
 dist/
 build/
+/enterprise-agent-platform/enterprise_agent_platform/static/
 .DS_Store
 .idea/
 .vscode/

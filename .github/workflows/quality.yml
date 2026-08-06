@@ -146,18 +146,6 @@ jobs:
       - name: Build browser assets
         run: npm run build
 
-      - name: Verify generated assets are committed
-        working-directory: .
-        shell: bash
-        run: |
-          static_dir="enterprise-agent-platform/enterprise_agent_platform/static"
-          git diff --exit-code -- "$static_dir"
-          if [[ -n "$(git status --porcelain --untracked-files=all -- "$static_dir")" ]]; then
-            echo "Generated browser assets are not in sync with frontend source." >&2
-            git status --short --untracked-files=all -- "$static_dir" >&2
-            exit 1
-          fi
-
       - name: Audit frontend dependencies
         run: npm audit --audit-level=high
 

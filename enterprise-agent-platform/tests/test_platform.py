@@ -6631,10 +6631,10 @@ class PlatformHTTPTests(unittest.TestCase):
             host, port = server.server_address
             try:
                 conn = http.client.HTTPConnection(host, port, timeout=5)
-                conn.request("GET", "/")
+                conn.request("GET", "/api/auth/me")
                 res = conn.getresponse()
                 res.read()
-                self.assertEqual(res.status, 200)
+                self.assertEqual(res.status, 401)
                 self.assertEqual(res.getheader("X-Frame-Options"), "DENY")
                 self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
                 self.assertIn("frame-ancestors 'none'", res.getheader("Content-Security-Policy"))

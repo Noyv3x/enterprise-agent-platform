@@ -15,3 +15,4 @@ enterprise-agent-platform/**/dist/
 enterprise-agent-platform/**/.cache/
 enterprise-agent-platform/**/coverage/
 enterprise-agent-platform/**/*.log
+enterprise-agent-platform/enterprise_agent_platform/static/

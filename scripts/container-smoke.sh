@@ -66,7 +66,8 @@ for excluded in \
   'enterprise-agent-platform/*.egg-info/' \
   'enterprise-agent-platform/**/__pycache__/' \
   'enterprise-agent-platform/**/*.pyc' \
-  'enterprise-agent-platform/.venv/'; do
+  'enterprise-agent-platform/.venv/' \
+  'enterprise-agent-platform/enterprise_agent_platform/static/'; do
   grep -Fxq "$excluded" containers/platform.Dockerfile.dockerignore \
     || fail "Platform image context can include local build residue: $excluded"
 done

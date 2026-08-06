@@ -10,7 +10,7 @@
 ├── manager/                      # 宿主管理器、Gateway、更新与执行路由
 ├── containers/                   # 镜像、Compose 与安装模板
 ├── enterprise-agent-platform/
-│   ├── enterprise_agent_platform/ # Python 平台与生成 static
+│   ├── enterprise_agent_platform/ # Python 平台包
 │   ├── frontend/                  # React/TypeScript 源码
 │   ├── agent-runtime/             # 平台自有 Node Runtime
 │   ├── camofox-runtime/           # 平台自有浏览器补丁/安装描述
@@ -43,8 +43,8 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 - Runtime 使用严格 TypeScript 和 Node 22.19+；模型、工具、审批、session、进程和委派逻辑归 `agent-runtime/src`。
 - Manager 使用 Go；唯一生产命令是 `manager/cmd/agent-platform-manager`，公网 Gateway、Docker 编排、operation journal、release 校验、自更新/恢复和宿主执行归 `manager/`，业务容器不得复制这些职责。生产树不保留一次性部署转换或部署签名命令与包。
 - 前端使用 React + TypeScript；组件按 chat、shell、admin、preview、memory、skills 等领域组织。
-- Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
-- `enterprise_agent_platform/static/` 是生成资源，禁止手改。
+- Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。容器内的前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
+- `enterprise_agent_platform/static/` 是忽略的生成资源，禁止手改或提交；本地前端构建可随时完整重建它。
 - bundled skills 是产品资产，不是项目说明文档；只有技能功能变更才修改。
 
 ## 实现原则
@@ -80,6 +80,6 @@ Cognee 与 Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。�
 - `git status --short` 中没有意外运行数据或生成源码；
 - 文档映射和相对链接通过；
 - 相关 component test/check/build 通过；
-- 前端变化已包含重新生成 static；
+- 前端变化已通过 static 重新生成验证，且产物没有进入 Git；
 - 管理器、Compose 或 Dockerfile 变化已通过空数据启动和更新/回滚 smoke test；
 - 配置、secret 和数据迁移变化已在文档明确说明。

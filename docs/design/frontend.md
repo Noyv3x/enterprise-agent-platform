@@ -4,7 +4,7 @@
 
 ## 技术与发布边界
 
-前端使用 React、TypeScript、Vite 和 Ant Design 6。可编辑源代码位于 `enterprise-agent-platform/frontend/`；`enterprise_agent_platform/static/` 是构建产物，只能通过前端构建脚本生成。
+前端使用 React、TypeScript、Vite 和 Ant Design 6。可编辑源代码位于 `enterprise-agent-platform/frontend/`；`enterprise_agent_platform/static/` 是可重现的构建产物，只能通过前端构建脚本生成，不进入 Git 源码树。Quality 从前端源码重建并验证资产，Platform 容器构建再把同一输出覆盖进 wheel。
 
 构建脚本在同一文件系统的暂存目录中完成 Vite 构建、资源完整性验证、压缩和原子发布。带 hash 的依赖先安装，`index.html` 最后提交。发布清单只声明当前构建资产；提交当前入口后必须删除所有不在当前清单中的受管文件，不保留上一代 bundle，也不提供跨 generation 的静态资源兼容层。
 

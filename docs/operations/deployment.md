@@ -91,6 +91,8 @@ release manifest 固定 source commit、数据库版本、Manager SHA-256、Comp
 
 发布资格由当前源码的真实构建图、canonical 文档同步、各语言门禁、容器冒烟和闭世界 manifest 校验共同证明。当前基线不另外维护一份已退役路径或历史技术名称的源码黑名单；无消费者的历史实现应直接从产品树删除。
 
+Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_agent_platform/static/`；镜像只接受本次 frontend build stage 从受控源码生成的完整资产树，不能让本地旧 bundle 通过 Docker context 混入 wheel。
+
 Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与 Cognee 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。
 
 任何时刻最多一个可写 Platform 打开 SQLite。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
