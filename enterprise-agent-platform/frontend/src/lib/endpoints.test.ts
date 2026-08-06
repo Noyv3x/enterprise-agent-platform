@@ -34,6 +34,17 @@ describe("knowledge embeddings administration endpoints", () => {
   });
 });
 
+describe("knowledge document file endpoints", () => {
+  it("uses multipart import and stable original download paths", () => {
+    expect(endpoints.importKnowledgeDocuments).toMatchObject({ method: "POST" });
+    expect(endpoints.importKnowledgeDocuments.path()).toBe("/api/knowledge/documents/import");
+    expect(endpoints.knowledgeDocumentDownload).toMatchObject({ method: "GET" });
+    expect(endpoints.knowledgeDocumentDownload.path(42)).toBe(
+      "/api/knowledge/documents/42/download",
+    );
+  });
+});
+
 describe("read-only Agent preview endpoints", () => {
   it("encodes scope and optional browser tab without exposing path fragments", () => {
     expect(endpoints.previewStatus.path("private", "user 7")).toBe(

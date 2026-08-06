@@ -56,6 +56,8 @@ Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依�
 
 Platform 对 Embeddings 请求使用有界 connect/read/body 预算，禁止带 Authorization 的重定向，校验响应 content type、index 顺序、数量、有限数值和维度，不把 key、原文或完整 provider 错误写入日志。`429` 和可重试的 `5xx` 通过持久 job 有界退避；认证、结构、模型或维度错误为明确配置失败。配置更新先用最小探测验证，再原子保存并创建 shadow generation；旧 active generation 在新代完整就绪前继续服务。
 
+知识文件解析属于 Platform 内建的确定性导入边界，不把原件发送给 Embeddings provider；provider 只接收有界的提取文本批次。PDF 解析器与标准库 ZIP/XML/HTML/JSON/CSV 解析器只读取本地临时上传，禁止宏、外链和嵌入对象执行，并在进入库代码前执行格式签名、条目数量、声明/实际展开大小与正文字符预算校验。解析失败不得留下部分文档或原件。
+
 ## 不可信内容
 
 搜索、提取、浏览器文本、邮件、知识结果、记忆、历史会话、计划定义/历史和 Skill 附件都可能包含间接提示词注入。返回模型前必须进入防伪闭合的 `untrusted_tool_result` 数据边界，并先中和载荷伪造的同名标签；图片保持图片块，伴随文本仍使用相同边界。

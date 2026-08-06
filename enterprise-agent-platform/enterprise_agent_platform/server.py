@@ -35,6 +35,7 @@ from .service import (
     ServiceError,
     UploadedFile,
     is_safe_inline_attachment_mime,
+    sanitize_attachment_filename,
 )
 from .secure_fs import ensure_private_directory
 
@@ -1156,8 +1157,19 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/knowledge/documents" and method == "POST":
             self._json({"document": service.add_knowledge_document(actor, self._body_json())}, status=201)
             return
+        if path == "/api/knowledge/documents/import" and method == "POST":
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data"):
+                raise ServiceError(415, "knowledge import requires multipart/form-data")
+            _content, uploads = self._body_multipart_message(content_type)
+            self._json(service.import_knowledge_documents(actor, uploads), status=201)
+            return
         if path == "/api/knowledge/search" and method == "GET":
             self._json({"results": service.user_search_knowledge(actor, first(query, "q", ""), int_arg(query, "limit", 5))})
+            return
+        m = re.fullmatch(r"/api/knowledge/documents/(\d+)/download", path)
+        if m and method == "GET":
+            self._serve_knowledge_download(actor, int(m.group(1)))
             return
         m = re.fullmatch(r"/api/knowledge/documents/(\d+)", path)
         if m and method == "GET":
@@ -1678,6 +1690,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self._stream_file_handle(fh)
+
+    def _serve_knowledge_download(
+        self,
+        actor: dict[str, Any],
+        document_id: int,
+    ) -> None:
+        download = self.server.service.user_knowledge_download(actor, document_id)
+        content = download.get("content")
+        if not isinstance(content, bytes):
+            raise ServiceError(500, "knowledge download is invalid")
+        size_bytes = int(download.get("size_bytes") or -1)
+        sha256 = str(download.get("sha256") or "").casefold()
+        if (
+            size_bytes != len(content)
+            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+            or not hmac.compare_digest(hashlib.sha256(content).hexdigest(), sha256)
+        ):
+            raise ServiceError(500, "knowledge download integrity check failed")
+        filename = sanitize_attachment_filename(str(download.get("filename") or "knowledge.md"))
+        ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "knowledge"
+        media_type = str(download.get("media_type") or "application/octet-stream")
+        if re.search(r"[\r\n\x00]", media_type) or "/" not in media_type:
+            raise ServiceError(500, "knowledge download media type is invalid")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(size_bytes))
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}",
+        )
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("ETag", f'"{sha256}"')
+        self._send_security_headers()
+        self.end_headers()
+        try:
+            self.wfile.write(content)
+        except (BrokenPipeError, ConnectionError):
+            return
 
     def _stream_scope_events(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> None:
         service = self.server.service

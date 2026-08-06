@@ -82,7 +82,9 @@ from .knowledge import (
     KnowledgeEmbeddingConfig,
     KnowledgeError,
     KnowledgeUnavailableError,
+    MAX_CONTENT_CHARS,
 )
+from .knowledge_files import KnowledgeFileError, extract_knowledge_file
 from .loopback_http import (
     open_loopback_url,
     open_private_service_url,
@@ -8548,6 +8550,60 @@ class EnterpriseService:
             self._wake_knowledge_index_worker()
         return doc
 
+    def import_knowledge_documents(
+        self,
+        actor: dict[str, Any],
+        uploads: list[UploadedFile],
+    ) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_MANAGE_KNOWLEDGE)
+        self._begin_agent_update_admission()
+        try:
+            normalized = self._normalize_uploaded_files(uploads)
+            if not normalized:
+                raise ServiceError(400, "at least one knowledge file is required")
+            self.knowledge.ensure_enabled()
+            self._enforce_upload_rate_limit(int(actor["id"]))
+            extracted = []
+            for item in normalized:
+                if item.staged_path is not None:
+                    try:
+                        with Path(item.staged_path).open("rb") as handle:
+                            data = handle.read(MAX_ATTACHMENT_BYTES + 1)
+                    except OSError as exc:
+                        raise ServiceError(400, "staged knowledge file is unavailable") from exc
+                else:
+                    data = bytes(item.data or b"")
+                if len(data) != item.byte_size or len(data) > MAX_ATTACHMENT_BYTES:
+                    raise ServiceError(400, "staged knowledge file changed during import")
+                digest = hashlib.sha256(data).hexdigest()
+                if digest != item.sha256:
+                    raise ServiceError(400, "staged knowledge file digest changed")
+                try:
+                    extracted.append(
+                        extract_knowledge_file(
+                            filename=item.filename,
+                            declared_media_type=item.content_type,
+                            data=data,
+                            sha256=digest,
+                            maximum_chars=MAX_CONTENT_CHARS,
+                        )
+                    )
+                except KnowledgeFileError as exc:
+                    raise ServiceError(422, f"{item.filename}: {exc}") from exc
+            results = self.knowledge.import_files(
+                extracted,
+                created_by=int(actor["id"]),
+            )
+        except KnowledgeError as exc:
+            raise self._knowledge_service_error(exc) from exc
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(422, str(exc)) from exc
+        finally:
+            self._end_agent_update_admission()
+        if any(bool(item.get("created")) for item in results):
+            self._wake_knowledge_index_worker()
+        return {"documents": results}
+
     @staticmethod
     def _valid_knowledge_index_payload(payload: dict[str, Any]) -> bool:
         if set(payload) != {"document_id", "expected_hash", "generation_id"}:
@@ -13384,6 +13440,17 @@ class EnterpriseService:
     def user_knowledge_document(self, actor: dict[str, Any], document_id: int) -> dict[str, Any]:
         require_permission(actor, PERMISSION_READ_WORKSPACE)
         return self.get_knowledge_document(document_id)
+
+    def user_knowledge_download(
+        self,
+        actor: dict[str, Any],
+        document_id: int,
+    ) -> dict[str, Any]:
+        require_permission(actor, PERMISSION_READ_WORKSPACE)
+        download = self.knowledge.download_document(document_id)
+        if download is None:
+            raise ServiceError(404, "knowledge document not found")
+        return download
 
     def knowledge_status(self) -> dict[str, Any]:
         status = dict(self.knowledge.status())

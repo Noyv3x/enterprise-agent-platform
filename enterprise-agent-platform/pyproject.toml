@@ -12,6 +12,7 @@ authors = [{ name = "Agent Platform contributors" }]
 license = { text = "MIT" }
 dependencies = [
   "Pillow>=10.4.0,<13",
+  "pypdf>=6.0.0,<7",
 ]
 
 [project.scripts]

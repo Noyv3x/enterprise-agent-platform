@@ -27,8 +27,8 @@ from .technical_profile import (
 )
 
 
-_SOURCE_DATABASE_BASELINE_VERSION = 2026072901
-_DATABASE_BASELINE_VERSION = 2026080601
+_SOURCE_DATABASE_BASELINE_VERSION = 2026080601
+_DATABASE_BASELINE_VERSION = 2026080602
 _DATABASE_BASELINE_NAME = TARGET_DATABASE_BASELINE
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
@@ -62,18 +62,6 @@ _AGENT_MEMORY_FTS_TRIGGER_SQL = {
         END
     """.strip(),
 }
-
-
-_RETIRED_KNOWLEDGE_SETTING_KEYS = (
-    "cognee_backend",
-    "cognee_dataset",
-    "cognee_ingest_background",
-    "cognee_data_root_directory",
-    "cognee_system_root_directory",
-    "cognee_cache_root_directory",
-    "cognee_logs_dir",
-    "cognee_skip_connection_test",
-)
 
 
 _KNOWLEDGE_SCHEMA_SQL = """
@@ -146,6 +134,22 @@ CREATE TABLE knowledge_chunk_embeddings (
     PRIMARY KEY(generation_id, chunk_id),
     FOREIGN KEY(generation_id, chunk_id)
         REFERENCES knowledge_chunks(generation_id, chunk_id) ON DELETE CASCADE
+);
+"""
+
+
+_KNOWLEDGE_FILE_SCHEMA_SQL = """
+CREATE TABLE knowledge_document_files (
+    document_id INTEGER PRIMARY KEY
+        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    filename TEXT NOT NULL CHECK(length(filename) BETWEEN 1 AND 255),
+    media_type TEXT NOT NULL CHECK(length(media_type) BETWEEN 1 AND 255),
+    size_bytes INTEGER NOT NULL
+        CHECK(size_bytes > 0 AND size_bytes <= 52428800),
+    sha256 TEXT NOT NULL
+        CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    content BLOB NOT NULL CHECK(length(content) = size_bytes),
+    created_at INTEGER NOT NULL
 );
 """
 
@@ -526,7 +530,7 @@ class Database:
                 if marker == source_marker and self._allow_source_migration:
                     self._assert_database_structure(
                         existing_tables,
-                        source_knowledge_baseline=True,
+                        source_database_baseline=True,
                     )
                     self._migrate_source_database_baseline()
                 else:
@@ -714,6 +718,7 @@ class Database:
                     ON knowledge_documents(content_hash) WHERE content_hash != '';
 
                 __KNOWLEDGE_SCHEMA__
+                __KNOWLEDGE_FILE_SCHEMA__
 
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -899,7 +904,7 @@ class Database:
 
                 INSERT INTO schema_migrations(version, name, applied_at)
                     VALUES (
-                        2026080601,
+                        __CURRENT_DATABASE_BASELINE_VERSION__,
                         '__CURRENT_DATABASE_BASELINE__',
                         CAST(strftime('%s', 'now') AS INTEGER)
                     );
@@ -971,13 +976,24 @@ class Database:
                 """
                     if schema.count("__CURRENT_DATABASE_BASELINE__") != 1:
                         raise RuntimeError("database baseline placeholder is invalid")
+                    if schema.count("__CURRENT_DATABASE_BASELINE_VERSION__") != 1:
+                        raise RuntimeError("database baseline version placeholder is invalid")
                     if schema.count("__KNOWLEDGE_SCHEMA__") != 1:
                         raise RuntimeError("knowledge schema placeholder is invalid")
+                    if schema.count("__KNOWLEDGE_FILE_SCHEMA__") != 1:
+                        raise RuntimeError("knowledge file schema placeholder is invalid")
                     self._conn.executescript(
                         schema.replace(
                             "__CURRENT_DATABASE_BASELINE__",
                             self._database_baseline_name,
-                        ).replace("__KNOWLEDGE_SCHEMA__", _KNOWLEDGE_SCHEMA_SQL)
+                        ).replace(
+                            "__CURRENT_DATABASE_BASELINE_VERSION__",
+                            str(_DATABASE_BASELINE_VERSION),
+                        ).replace(
+                            "__KNOWLEDGE_SCHEMA__", _KNOWLEDGE_SCHEMA_SQL
+                        ).replace(
+                            "__KNOWLEDGE_FILE_SCHEMA__", _KNOWLEDGE_FILE_SCHEMA_SQL
+                        )
                     )
                 except BaseException:
                     self._conn.rollback()
@@ -999,24 +1015,11 @@ class Database:
         return int(rows[0]["version"]), str(rows[0]["name"])
 
     def _migrate_source_database_baseline(self) -> None:
-        """Atomically replace the retired knowledge index with the current one."""
+        """Atomically add immutable knowledge source-file storage."""
 
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            for trigger_name in ("knowledge_ai", "knowledge_ad", "knowledge_au"):
-                self._conn.execute(f'DROP TRIGGER IF EXISTS "{trigger_name}"')
-            self._conn.execute('DROP TABLE IF EXISTS "knowledge_fts"')
-            self._conn.execute(
-                "DELETE FROM durable_jobs WHERE kind = 'cognee'"
-            )
-            placeholders = ", ".join(
-                "?" for _ in _RETIRED_KNOWLEDGE_SETTING_KEYS
-            )
-            self._conn.execute(
-                f"DELETE FROM settings WHERE key IN ({placeholders})",
-                _RETIRED_KNOWLEDGE_SETTING_KEYS,
-            )
-            _execute_transactional_schema(self._conn, _KNOWLEDGE_SCHEMA_SQL)
+            _execute_transactional_schema(self._conn, _KNOWLEDGE_FILE_SCHEMA_SQL)
             self._conn.execute(
                 "UPDATE schema_migrations SET version = ?, applied_at = ? "
                 "WHERE version = ? AND name = ?",
@@ -1034,7 +1037,7 @@ class Database:
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(
-                    f"knowledge baseline migration produced {len(violations)} "
+                    f"knowledge file migration produced {len(violations)} "
                     "foreign-key violations"
                 )
             self._assert_current_database_baseline()
@@ -1080,7 +1083,7 @@ class Database:
         self,
         tables: set[str],
         *,
-        source_knowledge_baseline: bool = False,
+        source_database_baseline: bool = False,
     ) -> None:
         agent_scope_columns = {
             "scope_key", "scope_type", "scope_id", "session_id",
@@ -1180,37 +1183,39 @@ class Database:
         required_columns["mail_account_credentials"] = {
             "account_id", "password", "updated_at",
         }
-        if not source_knowledge_baseline:
-            required_columns.update({
-                "knowledge_index_generations": {
-                    "id", "config_hash", "embedding_base_url",
-                    "embedding_model", "embedding_dimensions",
-                    "chunker_version", "status", "document_count",
-                    "ready_document_count", "last_error", "created_at",
-                    "updated_at", "activated_at",
-                },
-                "knowledge_document_index": {
-                    "generation_id", "document_id", "expected_hash",
-                    "status", "chunk_count", "last_error", "created_at",
-                    "updated_at",
-                },
-                "knowledge_chunks": {
-                    "generation_id", "chunk_id", "document_id",
-                    "chunk_index", "title_path", "content", "char_start",
-                    "char_end", "chunk_hash", "created_at",
-                },
-                "knowledge_chunk_embeddings": {
-                    "generation_id", "chunk_id", "dimensions", "vector",
-                    "norm", "created_at",
-                },
-            })
+        required_columns.update({
+            "knowledge_index_generations": {
+                "id", "config_hash", "embedding_base_url",
+                "embedding_model", "embedding_dimensions",
+                "chunker_version", "status", "document_count",
+                "ready_document_count", "last_error", "created_at",
+                "updated_at", "activated_at",
+            },
+            "knowledge_document_index": {
+                "generation_id", "document_id", "expected_hash",
+                "status", "chunk_count", "last_error", "created_at",
+                "updated_at",
+            },
+            "knowledge_chunks": {
+                "generation_id", "chunk_id", "document_id",
+                "chunk_index", "title_path", "content", "char_start",
+                "char_end", "chunk_hash", "created_at",
+            },
+            "knowledge_chunk_embeddings": {
+                "generation_id", "chunk_id", "dimensions", "vector",
+                "norm", "created_at",
+            },
+        })
+        if not source_database_baseline:
+            required_columns["knowledge_document_files"] = {
+                "document_id", "filename", "media_type", "size_bytes",
+                "sha256", "content", "created_at",
+            }
         fts_prefixes = [
             "agent_memory_fts",
             "message_fts",
             "message_fts_trigram",
         ]
-        if source_knowledge_baseline:
-            fts_prefixes.append("knowledge_fts")
         fts_tables = {
             f"{prefix}{suffix}"
             for prefix in fts_prefixes
@@ -1288,17 +1293,20 @@ class Database:
             "agent_memories",
             "check(source_typein('manual','automatic'))",
         )
-        if not source_knowledge_baseline:
+        self._assert_table_sql(
+            "knowledge_index_generations",
+            "check(statusin('building','active','failed','superseded'))",
+        )
+        self._assert_table_sql(
+            "knowledge_document_index",
+            "check(statusin('pending','ready','failed'))",
+        )
+        self._assert_table_sql(
+            "knowledge_chunks", "check(char_end>char_start)"
+        )
+        if not source_database_baseline:
             self._assert_table_sql(
-                "knowledge_index_generations",
-                "check(statusin('building','active','failed','superseded'))",
-            )
-            self._assert_table_sql(
-                "knowledge_document_index",
-                "check(statusin('pending','ready','failed'))",
-            )
-            self._assert_table_sql(
-                "knowledge_chunks", "check(char_end>char_start)"
+                "knowledge_document_files", "check(length(content)=size_bytes)"
             )
         memory_sources = ("manual", "automatic")
         placeholders = ", ".join("?" for _ in memory_sources)
@@ -1326,13 +1334,12 @@ class Database:
             "idx_agent_schedule_runs_schedule",
             "idx_agent_schedule_runs_job",
         }
-        if not source_knowledge_baseline:
-            required_indexes.update({
-                "idx_knowledge_index_generations_status",
-                "uq_knowledge_index_generations_active",
-                "idx_knowledge_document_index_status",
-                "idx_knowledge_chunks_document",
-            })
+        required_indexes.update({
+            "idx_knowledge_index_generations_status",
+            "uq_knowledge_index_generations_active",
+            "idx_knowledge_document_index_status",
+            "idx_knowledge_chunks_document",
+        })
         required_indexes.update({
             "idx_mail_accounts_poll",
             "idx_mail_accounts_owner",
@@ -1360,8 +1367,7 @@ class Database:
             ("idx_agent_schedule_runs_schedule", "agent_schedule_runs", ("schedule_id", "id")),
             ("idx_agent_schedule_runs_job", "agent_schedule_runs", ("durable_job_id",)),
         ]
-        if not source_knowledge_baseline:
-            named_indexes.extend([
+        named_indexes.extend([
                 (
                     "idx_knowledge_index_generations_status",
                     "knowledge_index_generations",
@@ -1382,7 +1388,7 @@ class Database:
                     "knowledge_chunks",
                     ("generation_id", "document_id", "chunk_index"),
                 ),
-            ])
+        ])
         named_indexes.extend([
             ("idx_mail_accounts_poll", "mail_accounts", ("enabled", "wake_enabled", "last_checked_at", "id")),
             ("idx_mail_accounts_owner", "mail_accounts", ("owner_user_id", "id")),
@@ -1396,23 +1402,22 @@ class Database:
             "agent_schedule_runs",
             ("schedule_id", "schedule_revision", "occurrence_key"),
         )
-        if not source_knowledge_baseline:
-            self._assert_unique_columns(
-                "knowledge_index_generations", ("status",)
-            )
-            self._assert_unique_columns(
-                "knowledge_document_index", ("generation_id", "document_id")
-            )
-            self._assert_unique_columns(
-                "knowledge_chunks", ("generation_id", "chunk_id")
-            )
-            self._assert_unique_columns(
-                "knowledge_chunks",
-                ("generation_id", "document_id", "chunk_index"),
-            )
-            self._assert_unique_columns(
-                "knowledge_chunk_embeddings", ("generation_id", "chunk_id")
-            )
+        self._assert_unique_columns(
+            "knowledge_index_generations", ("status",)
+        )
+        self._assert_unique_columns(
+            "knowledge_document_index", ("generation_id", "document_id")
+        )
+        self._assert_unique_columns(
+            "knowledge_chunks", ("generation_id", "chunk_id")
+        )
+        self._assert_unique_columns(
+            "knowledge_chunks",
+            ("generation_id", "document_id", "chunk_index"),
+        )
+        self._assert_unique_columns(
+            "knowledge_chunk_embeddings", ("generation_id", "chunk_id")
+        )
 
         self._assert_foreign_keys("durable_jobs", set())
         self._assert_foreign_keys(
@@ -1437,37 +1442,41 @@ class Database:
                 ("response_message_id", "messages", "id", "NO ACTION"),
             },
         )
-        if not source_knowledge_baseline:
-            self._assert_foreign_keys("knowledge_index_generations", set())
+        self._assert_foreign_keys("knowledge_index_generations", set())
+        self._assert_foreign_keys(
+            "knowledge_document_index",
+            {
+                (
+                    "generation_id", "knowledge_index_generations", "id",
+                    "CASCADE",
+                ),
+                ("document_id", "knowledge_documents", "id", "CASCADE"),
+            },
+        )
+        self._assert_foreign_keys(
+            "knowledge_chunks",
+            {
+                (
+                    "generation_id", "knowledge_index_generations", "id",
+                    "CASCADE",
+                ),
+                ("document_id", "knowledge_documents", "id", "CASCADE"),
+            },
+        )
+        self._assert_foreign_keys(
+            "knowledge_chunk_embeddings",
+            {
+                (
+                    "generation_id", "knowledge_chunks", "generation_id",
+                    "CASCADE",
+                ),
+                ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
+            },
+        )
+        if not source_database_baseline:
             self._assert_foreign_keys(
-                "knowledge_document_index",
-                {
-                    (
-                        "generation_id", "knowledge_index_generations", "id",
-                        "CASCADE",
-                    ),
-                    ("document_id", "knowledge_documents", "id", "CASCADE"),
-                },
-            )
-            self._assert_foreign_keys(
-                "knowledge_chunks",
-                {
-                    (
-                        "generation_id", "knowledge_index_generations", "id",
-                        "CASCADE",
-                    ),
-                    ("document_id", "knowledge_documents", "id", "CASCADE"),
-                },
-            )
-            self._assert_foreign_keys(
-                "knowledge_chunk_embeddings",
-                {
-                    (
-                        "generation_id", "knowledge_chunks", "generation_id",
-                        "CASCADE",
-                    ),
-                    ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
-                },
+                "knowledge_document_files",
+                {("document_id", "knowledge_documents", "id", "CASCADE")},
             )
 
         required_triggers = {
@@ -1488,10 +1497,6 @@ class Database:
                 "message_fts_trigram_au",
             },
         }
-        if source_knowledge_baseline:
-            optional_fts_triggers["knowledge_fts"] = {
-                "knowledge_ai", "knowledge_ad", "knowledge_au",
-            }
         allowed_triggers = set(required_triggers)
         for table_name, names in optional_fts_triggers.items():
             if table_name in tables:

@@ -44,7 +44,7 @@
 
 ## 权威数据与文件安全
 
-`platform.db` 是账号、凭据、消息、记忆、知识、任务和设置的权威存储。SQLite 使用 WAL。备份必须使用 SQLite backup，或先停止唯一 writer 并 checkpoint；不得只复制主文件。
+`platform.db` 是账号、凭据、消息、记忆、知识规范文本与导入原件、任务和设置的权威存储。SQLite 使用 WAL。备份必须使用 SQLite backup，或先停止唯一 writer 并 checkpoint；不得只复制主文件。
 
 Platform 从逐段 no-follow 打开的数据根 fd 打开数据库。既有数据库、WAL 与 SHM 必须是当前 UID 所有、单硬链接的普通文件；缺失数据库只在固定父目录以 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建为 `0600`。符号链接、硬链接、特殊文件、owner 异常或 inode 置换在 writer 启动前失败关闭。`.agent-platform.lock` 的独占 flock 贯穿 Platform 生命周期。
 
@@ -70,7 +70,7 @@ Sandbox 系统层修改随容器重建丢失。需持久的软件和文件放入
 
 Agent Runtime 的 session、approval 与 idempotency 位于 `runtimes/agent`。程序和依赖在镜像内。
 
-Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。知识原文、分块、向量和 generation 状态都在 `platform.db`，`runtimes/knowledge` 只允许有界的缓存与日志，不是权威数据。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
+Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。知识规范文本、导入原件 BLOB、文件摘要、分块、向量和 generation 状态都在 `platform.db`，`runtimes/knowledge` 只允许有界的缓存与日志，不是权威数据；上传暂存位于受控 `upload-staging/` 并在请求完成或服务启动时清理。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
 
 ## Manager 状态、快照与清理
 

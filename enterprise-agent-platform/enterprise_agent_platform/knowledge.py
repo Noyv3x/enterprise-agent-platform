@@ -14,6 +14,12 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol, Sequence
 
 from .db import Database, encode_json, now_ts
+from .knowledge_files import (
+    MAX_KNOWLEDGE_FILE_BYTES,
+    MAX_KNOWLEDGE_FILES_PER_IMPORT,
+    MAX_KNOWLEDGE_IMPORT_BYTES,
+    ExtractedKnowledgeFile,
+)
 
 
 CHUNKER_VERSION = "markdown-structure-v1"
@@ -524,6 +530,9 @@ class KnowledgeBase:
             )
         return self._client
 
+    def ensure_enabled(self) -> None:
+        self._require_enabled()
+
     def probe_configuration(
         self,
         config: KnowledgeEmbeddingConfig,
@@ -587,8 +596,16 @@ class KnowledgeBase:
         return {"config": self.configuration_public(), "generation": generation}
 
     @staticmethod
-    def _content_hash(title: str, content: str, source: str) -> str:
-        payload = "\x00".join((title, content, source)).encode("utf-8")
+    def _content_hash(
+        title: str,
+        content: str,
+        source: str,
+        identity_extra: str = "",
+    ) -> str:
+        identity = (title, content, source)
+        if identity_extra:
+            identity += (identity_extra,)
+        payload = "\x00".join(identity).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
     def add_document(
@@ -664,10 +681,156 @@ class KnowledgeBase:
 
     def get_document(self, document_id: int) -> dict[str, Any] | None:
         return self.db.query_one(
-            "SELECT id, title, summary, content, source, created_by, created_at, "
-            "updated_at, content_hash FROM knowledge_documents WHERE id = ?",
+            "SELECT d.id, d.title, d.summary, d.content, d.source, d.created_by, "
+            "d.created_at, d.updated_at, d.content_hash, "
+            "f.filename AS original_filename, f.media_type AS original_media_type, "
+            "f.size_bytes AS original_size_bytes, f.sha256 AS original_sha256 "
+            "FROM knowledge_documents d LEFT JOIN knowledge_document_files f "
+            "ON f.document_id = d.id WHERE d.id = ?",
             (int(document_id),),
         )
+
+    def import_files(
+        self,
+        files: Sequence[ExtractedKnowledgeFile],
+        *,
+        created_by: int | None,
+    ) -> list[dict[str, Any]]:
+        self._require_enabled()
+        items = list(files)
+        if not items:
+            raise ValueError("at least one knowledge file is required")
+        if len(items) > MAX_KNOWLEDGE_FILES_PER_IMPORT:
+            raise ValueError(
+                f"at most {MAX_KNOWLEDGE_FILES_PER_IMPORT} knowledge files are allowed"
+            )
+        if sum(item.size_bytes for item in items) > MAX_KNOWLEDGE_IMPORT_BYTES:
+            raise ValueError("knowledge files exceed 100 MiB total")
+        timestamp = now_ts()
+        identities: list[tuple[int, bool]] = []
+        with self.db.transaction(immediate=True) as conn:
+            for item in items:
+                title = item.title.strip()
+                content = item.content.strip()
+                if not title or not content:
+                    raise ValueError("knowledge file title and content are required")
+                if MAX_CONTENT_CHARS > 0 and len(content) > MAX_CONTENT_CHARS:
+                    raise ValueError(
+                        f"content exceeds {MAX_CONTENT_CHARS} characters"
+                    )
+                if (
+                    item.size_bytes < 1
+                    or item.size_bytes > MAX_KNOWLEDGE_FILE_BYTES
+                    or len(item.data) != item.size_bytes
+                    or hashlib.sha256(item.data).hexdigest() != item.sha256
+                ):
+                    raise ValueError("knowledge file integrity is invalid")
+                source = item.filename
+                content_hash = self._content_hash(
+                    title,
+                    content,
+                    source,
+                    item.sha256,
+                )
+                cursor = conn.execute(
+                    "INSERT INTO knowledge_documents("
+                    "title, summary, content, source, created_by, created_at, "
+                    "updated_at, content_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(content_hash) WHERE content_hash != '' DO NOTHING",
+                    (
+                        title,
+                        summarize_content(content),
+                        content,
+                        source,
+                        created_by,
+                        timestamp,
+                        timestamp,
+                        content_hash,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT id FROM knowledge_documents WHERE content_hash = ?",
+                    (content_hash,),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError("knowledge file insert did not produce a row")
+                document_id = int(row["id"])
+                created = cursor.rowcount > 0
+                if created:
+                    conn.execute(
+                        "INSERT INTO knowledge_document_files("
+                        "document_id, filename, media_type, size_bytes, sha256, "
+                        "content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            document_id,
+                            item.filename,
+                            item.media_type,
+                            item.size_bytes,
+                            item.sha256,
+                            item.data,
+                            timestamp,
+                        ),
+                    )
+                identities.append((document_id, created))
+            if any(created for _document_id, created in identities):
+                self._prepare_generation_in_transaction(conn, force=False)
+        results: list[dict[str, Any]] = []
+        for document_id, created in identities:
+            document = self.db.query_one(
+                "SELECT d.id, d.title, d.summary, d.source, d.created_by, "
+                "d.created_at, d.updated_at, d.content_hash, "
+                "f.filename AS original_filename, "
+                "f.media_type AS original_media_type, "
+                "f.size_bytes AS original_size_bytes, "
+                "f.sha256 AS original_sha256 "
+                "FROM knowledge_documents d LEFT JOIN knowledge_document_files f "
+                "ON f.document_id = d.id WHERE d.id = ?",
+                (document_id,),
+            )
+            if document is None:
+                raise RuntimeError("knowledge file disappeared after import")
+            results.append({"document": document, "created": created})
+        return results
+
+    def download_document(self, document_id: int) -> dict[str, Any] | None:
+        row = self.db.query_one(
+            "SELECT d.title, d.summary, d.content AS document_content, d.source, "
+            "f.filename, f.media_type, f.size_bytes, f.sha256, "
+            "f.content AS file_content FROM knowledge_documents d "
+            "LEFT JOIN knowledge_document_files f ON f.document_id = d.id "
+            "WHERE d.id = ?",
+            (int(document_id),),
+        )
+        if row is None:
+            return None
+        if row.get("file_content") is not None:
+            content = bytes(row["file_content"])
+            return {
+                "filename": str(row["filename"]),
+                "media_type": str(row["media_type"]),
+                "size_bytes": int(row["size_bytes"]),
+                "sha256": str(row["sha256"]),
+                "content": content,
+                "original": True,
+            }
+        title = str(row["title"]).strip() or "Knowledge document"
+        sections = [f"# {title}"]
+        source = str(row["source"] or "").strip()
+        summary = str(row["summary"] or "").strip()
+        if source:
+            sections.append(f"Source: {source}")
+        if summary:
+            sections.append(summary)
+        sections.append(str(row["document_content"]))
+        content = "\n\n".join(sections).encode("utf-8")
+        return {
+            "filename": f"{title}.md",
+            "media_type": "text/markdown; charset=utf-8",
+            "size_bytes": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "content": content,
+            "original": False,
+        }
 
     def delete_document(self, document_id: int) -> bool:
         self._require_enabled()
@@ -689,8 +852,12 @@ class KnowledgeBase:
 
     def list_documents(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         return self.db.query(
-            "SELECT id, title, summary, source, created_by, created_at, updated_at, "
-            "content_hash FROM knowledge_documents ORDER BY updated_at DESC, id DESC "
+            "SELECT d.id, d.title, d.summary, d.source, d.created_by, d.created_at, "
+            "d.updated_at, d.content_hash, f.filename AS original_filename, "
+            "f.media_type AS original_media_type, "
+            "f.size_bytes AS original_size_bytes, f.sha256 AS original_sha256 "
+            "FROM knowledge_documents d LEFT JOIN knowledge_document_files f "
+            "ON f.document_id = d.id ORDER BY d.updated_at DESC, d.id DESC "
             "LIMIT ? OFFSET ?",
             (max(1, min(int(limit), 200)), max(0, int(offset))),
         )

@@ -432,6 +432,10 @@ export interface KnowledgeDocument {
   created_by: number | null;
   created_at: number;
   updated_at: number;
+  original_filename?: string | null;
+  original_media_type?: string | null;
+  original_size_bytes?: number | null;
+  original_sha256?: string | null;
 }
 
 export interface FullDocument extends KnowledgeDocument {

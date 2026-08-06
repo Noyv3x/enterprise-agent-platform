@@ -138,6 +138,8 @@ Python 必须从可信 context 推导 memory owner、schedule owner、browser id
 
 knowledge `search` 只返回 active 向量索引的稳定结果，每项包含可交给 `read` 的正整数 `document_id`、`chunk_id`、来源偏移、excerpt 和 score。未配置 Embeddings API key、尚无 active generation 或 provider 失败时返回可区分的错误代码，不以空列表伪装成“无命中”，也不改走本地关键词检索。
 
+知识库产品 API 以 `multipart/form-data` 向 `/api/knowledge/documents/import` 提交一至十个重复 `files` 字段；成功只返回按输入顺序排列的文档元数据和去重状态，不在批量响应中重复正文，任一文件失败时整批失败。`GET /api/knowledge/documents/{id}/download` 对有原件的条目返回原始字节，对手工条目返回 UTF-8 Markdown；两者都要求知识读取权限并只使用附件下载语义。Agent `knowledge` 工具仍只有 `search|read`，不获得文件上传或原件二进制读取能力。
+
 memory 额外支持原子 `reconcile`，其 `operations` 至多二十项且只含 `store|replace|forget`。skill 额外支持精确 `patch`：参数包含 id、可选 support `file_path`、`old_string`、`new_string` 与 `expected_replacements`。复盘 Gateway context 在 memory 的 `search|read|list` 与变更请求中都必须携带 `parent_run_id`、`delegation_depth`、`trigger`、`unattended`、`review_mode` 和 `review_job_id`，并结合已有 run/scope/lifecycle/owner/source message 构成完整主体。Python 在执行任何复盘记忆查询或写入前必须反查 running job、当前 lifecycle、激活账号与权限；过期或不完整主体返回 403，不读取记忆。复盘 Skill 不能 delete、enable/disable、完整 update 或 remove/write support，支持文件修改同样走精确 patch。
 
 Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。

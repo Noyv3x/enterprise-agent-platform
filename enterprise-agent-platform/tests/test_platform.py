@@ -5719,6 +5719,44 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_knowledge_file_import_and_download_preserve_authorization_and_bytes(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                configure_test_knowledge(service)
+                payload = b"# Guide\n\nShared policy"
+                imported = service.import_knowledge_documents(
+                    admin,
+                    [UploadedFile("guide.md", "text/markdown", payload)],
+                )
+                self.assertEqual(len(imported["documents"]), 1)
+                item = imported["documents"][0]
+                self.assertTrue(item["created"])
+                document_id = int(item["document"]["id"])
+                self.assertEqual(item["document"]["original_filename"], "guide.md")
+                download = service.user_knowledge_download(admin, document_id)
+                self.assertEqual(download["content"], payload)
+                self.assertTrue(download["original"])
+
+                duplicate = service.import_knowledge_documents(
+                    admin,
+                    [UploadedFile("guide.md", "text/markdown", payload)],
+                )
+                self.assertFalse(duplicate["documents"][0]["created"])
+                for call in (
+                    lambda: service.import_knowledge_documents(
+                        {"id": 0},
+                        [UploadedFile("bad.txt", "text/plain", b"bad")],
+                    ),
+                    lambda: service.user_knowledge_download({"id": 0}, document_id),
+                ):
+                    with self.assertRaises(ServiceError) as ctx:
+                        call()
+                    self.assertEqual(ctx.exception.status, 403)
+            finally:
+                service.close()
+
     def test_knowledge_status_reports_native_index_state(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -6140,6 +6178,74 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_knowledge_file_http_import_and_download_use_multipart_and_attachment_headers(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            configure_test_knowledge(service)
+            token, _admin = service.authenticate("admin", "admin")
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            cookie = f"{config.session_cookie_name}={token}"
+            boundary = "----knowledge-import-test"
+            original = b"# Imported\n\nShared policy"
+            multipart = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="files"; filename="guide.md"\r\n'
+                "Content-Type: text/markdown\r\n\r\n"
+            ).encode() + original + f"\r\n--{boundary}--\r\n".encode()
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/knowledge/documents/import",
+                    body=multipart,
+                    headers={
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Content-Length": str(len(multipart)),
+                        "Cookie": cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                imported = json.loads(response.read().decode())
+                self.assertEqual(response.status, 201)
+                document_id = int(imported["documents"][0]["document"]["id"])
+
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET",
+                    f"/api/knowledge/documents/{document_id}/download",
+                    headers={"Cookie": cookie},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), original)
+                self.assertEqual(response.getheader("Content-Type"), "text/markdown")
+                self.assertTrue(response.getheader("Content-Disposition").startswith("attachment;"))
+                self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/knowledge/documents/import",
+                    body=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 415)
+                response.read()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                service.close()
+
     def test_branding_http_is_publicly_readable_and_admin_mutations_are_revisioned(self):
         logo_base64 = (
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"

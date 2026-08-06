@@ -118,6 +118,8 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 
 知识配置只包含 `knowledge_embedding_base_url`、`knowledge_embedding_model`、可选 `knowledge_embedding_dimensions`、`knowledge_embedding_batch_size` 和 secret `KNOWLEDGE_EMBEDDING_API_KEY`。base URL 必须是不含凭据的 HTTPS URL（测试只允许精确回环 HTTP），model 和数值字段有服务端长度/范围上限。API 只回传 `credential_configured` 和有界 mask，不回填 key。保存新配置前先执行最小 embedding 探测，成功后原子保存并调度新 generation 重建。缺少 API key 时知识功能 disabled，不启动本地模型也不改走 FTS/LIKE。
 
+知识文件导入复用平台上传边界：单文件最多 50 MiB、单请求最多十个且总计最多 100 MiB，HTTP 客户端不设总墙钟超时，服务端在连续 120 秒未收到字节时终止。提取后的每份规范正文仍受知识正文字符上限约束；ZIP 文档另有不可配置的安全条目数和累计展开大小硬上限，不能通过管理员设置放宽。
+
 托管 Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、知识 Embeddings API key 和 Telegram secret 由 Platform secret store 管理。
 
 私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。

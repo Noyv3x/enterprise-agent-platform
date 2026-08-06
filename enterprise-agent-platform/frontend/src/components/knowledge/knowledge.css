@@ -247,6 +247,17 @@
   resize: vertical;
 }
 
+.knowledge-import {
+  display: grid;
+  gap: 14px;
+}
+
+.knowledge-import__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .knowledge-list__loading {
   min-height: 180px;
   display: grid;

@@ -128,6 +128,7 @@ export const workspaceMessages = defineMessages({
   },
 
   "knowledge.viewDocument": { "zh-CN": "查看正文", en: "View document", "zh-TW": "檢視正文" },
+  "knowledge.download": { "zh-CN": "下载", en: "Download", "zh-TW": "下載" },
   "knowledge.documentRegion": { "zh-CN": "文档正文", en: "Document content", "zh-TW": "文件正文" },
   "knowledge.untitledDocument": { "zh-CN": "文档", en: "DOCUMENT", "zh-TW": "文件" },
   "knowledge.closeDocument": { "zh-CN": "关闭文档", en: "Close document", "zh-TW": "關閉文件" },
@@ -140,9 +141,9 @@ export const workspaceMessages = defineMessages({
   },
   "knowledge.empty": { "zh-CN": "知识库为空", en: "Knowledge base is empty", "zh-TW": "知識庫是空的" },
   "knowledge.emptyDetail": {
-    "zh-CN": "在左侧表单中录入第一条知识。",
-    en: "Add the first entry using the form on the left.",
-    "zh-TW": "請使用左側表單新增第一筆知識。",
+    "zh-CN": "上传文档或手工录入第一条知识。",
+    en: "Upload a document or add the first entry manually.",
+    "zh-TW": "上傳文件或手動新增第一筆知識。",
   },
   "knowledge.createTitle": { "zh-CN": "新增条目", en: "Add entry", "zh-TW": "新增項目" },
   "knowledge.createDescription": {
@@ -193,6 +194,30 @@ export const workspaceMessages = defineMessages({
   "knowledge.content": { "zh-CN": "正文", en: "Content", "zh-TW": "正文" },
   "knowledge.contentPlaceholder": { "zh-CN": "正文内容…", en: "Document content…", "zh-TW": "正文內容…" },
   "knowledge.save": { "zh-CN": "保存条目", en: "Save entry", "zh-TW": "儲存項目" },
+  "knowledge.importTab": { "zh-CN": "上传文档", en: "Upload documents", "zh-TW": "上傳文件" },
+  "knowledge.manualTab": { "zh-CN": "手工录入", en: "Manual entry", "zh-TW": "手動輸入" },
+  "knowledge.importDrop": {
+    "zh-CN": "点击或拖入文档，可一次选择最多 10 个",
+    en: "Click or drop documents here, up to 10 at once",
+    "zh-TW": "點擊或拖入文件，一次最多選擇 10 個",
+  },
+  "knowledge.importFormats": {
+    "zh-CN": "支持 TXT、Markdown、CSV、JSON、HTML、PDF、DOCX、XLSX、PPTX 和 ODT；扫描 PDF 需先完成 OCR。",
+    en: "Supports TXT, Markdown, CSV, JSON, HTML, PDF, DOCX, XLSX, PPTX, and ODT. Scanned PDFs require OCR first.",
+    "zh-TW": "支援 TXT、Markdown、CSV、JSON、HTML、PDF、DOCX、XLSX、PPTX 及 ODT；掃描 PDF 需先完成 OCR。",
+  },
+  "knowledge.importSelection": {
+    "zh-CN": "已选择 {count} 个文件，共 {size} MiB",
+    en: "{count} files selected, {size} MiB total",
+    "zh-TW": "已選擇 {count} 個文件，共 {size} MiB",
+  },
+  "knowledge.importStart": { "zh-CN": "上传并导入", en: "Upload and import", "zh-TW": "上傳並匯入" },
+  "knowledge.importCancel": { "zh-CN": "取消上传", en: "Cancel upload", "zh-TW": "取消上傳" },
+  "knowledge.importFileTooLarge": {
+    "zh-CN": "{name} 超过 50 MiB，无法上传。",
+    en: "{name} exceeds 50 MiB and cannot be uploaded.",
+    "zh-TW": "{name} 超過 50 MiB，無法上傳。",
+  },
   "knowledge.library": { "zh-CN": "条目库", en: "Entry library", "zh-TW": "項目庫" },
   "knowledge.documentCount": {
     "zh-CN": "{count} 篇文档",

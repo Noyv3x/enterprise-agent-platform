@@ -12,7 +12,7 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 - `agent_scopes`、`agent_runtime_scopes`、`agent_runtime_scope_sessions`；
 - `durable_jobs`、`agent_run_inputs`；
 - `agent_memories` 及其 FTS；
-- `knowledge_documents`、`knowledge_chunks`、`knowledge_index_generations`、`knowledge_document_index` 与 `knowledge_chunk_embeddings`；
+- `knowledge_documents`、`knowledge_document_files`、`knowledge_chunks`、`knowledge_index_generations`、`knowledge_document_index` 与 `knowledge_chunk_embeddings`；
 - `agent_schedules`、`agent_schedule_runs`；
 - `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
@@ -89,7 +89,11 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。
 
-`knowledge_documents` 是知识原文的唯一权威来源。Platform 使用稳定 content hash 和版本化分块器生成带文档 ID、字符偏移、标题路径与 chunk hash 的派生块，再通过管理员配置的 OpenAI-compatible Embeddings API 批量生成向量。向量维度从首个合法响应锁定或与显式配置精确比对；数量、顺序、数值、维度或响应大小不合法时整批失败。
+`knowledge_documents` 中的规范文本是检索、阅读和重建索引的权威来源；文件导入另以一对一的 `knowledge_document_files` 行保存不可变原件、规范文件名、媒体类型、字节数和 SHA-256，供用户下载与审计。两者与索引状态位于同一 SQLite 事务/备份边界，派生块不重新解析原件。Platform 使用稳定 content hash 和版本化分块器生成带文档 ID、字符偏移、标题路径与 chunk hash 的派生块，再通过管理员配置的 OpenAI-compatible Embeddings API 批量生成向量。向量维度从首个合法响应锁定或与显式配置精确比对；数量、顺序、数值、维度或响应大小不合法时整批失败。
+
+文件导入接受一次最多十个文件，每个不超过 50 MiB、请求总量不超过 100 MiB。当前格式闭集为 TXT、Markdown、CSV、JSON、HTML、PDF、DOCX、XLSX、PPTX 与 ODT；扩展名、声明媒体类型和容器签名必须相容。纯文本按明确编码解码，HTML 删除脚本/样式后保留可见结构，JSON 规范化，Office/OpenDocument 在有界 ZIP 条目数与解压字节预算内读取，PDF 只提取已有文本层。加密文件、损坏容器、扫描件/无文本 PDF、旧二进制 Office 格式、超大压缩包或提取后空正文全部明确拒绝，不运行宏、外链、公式、嵌入对象或 OCR。整批先完成验证与提取，再在一个事务中写入；任一文件失败时整批不产生知识条目。
+
+文件下载优先逐字节返回保存的原件，并使用原媒体类型、同源鉴权和安全 `Content-Disposition`；手工创建的条目导出为 UTF-8 Markdown。下载不触发重新提取、索引或 provider 调用。列表与正文 API 只返回文件元数据，不把原件 BLOB 塞入 JSON。
 
 索引以 generation 构建：文档与待摄取 job 同事务落库，job 只引用 `document_id + expected_hash + generation_id`，不复制原文。worker 重新读取权威文档，在完整写入所有块与向量时再原子标记该文档 ready；只有覆盖全部当前文档的 ready generation 可原子切为 active。配置或模型变化时在 shadow generation 重建，不让半成品混入查询。
 
@@ -109,10 +113,10 @@ bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示�
 
 ## 备份与迁移
 
-备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。知识原文、分块、索引状态与 active generation 位于同一 SQLite 恢复点；向量可由原文重建，但恢复后不得把未完整 generation 标记为 active。
+备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。知识规范文本、导入原件、分块、索引状态与 active generation 位于同一 SQLite 恢复点；向量可由规范文本重建，但恢复后不得把未完整 generation 标记为 active。
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。本次发布只支持从直接前一 baseline 到当前 baseline 的精确迁移：保留 `knowledge_documents` 的原行与 ID，删除知识 FTS 虚拟表/触发器、全部退役知识派生任务及其已复制的正文 payload，创建当前知识索引结构并将文档置为待重建。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、job 结算、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列、缺失结构或退役表都拒绝。
+数据库 schema version 单调递增。本次发布只支持从直接前一 baseline 到当前 baseline 的精确迁移：保留现有知识文档、索引 generation、chunk、embedding 和 ID，新增一对一原件表；既有手工条目不伪造文件元数据，下载时按当前规范动态导出 Markdown。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

@@ -4,6 +4,7 @@
 
 import { Button, Card } from "antd";
 import { useI18n } from "../../i18n";
+import { endpoints } from "../../lib/endpoints";
 import type { KnowledgeDocument, KnowledgeHit } from "../../types";
 import { formatTimestamp } from "../../utils/format";
 import { Icon } from "../common/Icon";
@@ -42,6 +43,13 @@ export function DocumentCard({ doc, selected, onView }: DocumentCardProps) {
           onClick={(event) => onView(doc.id, event.currentTarget as HTMLButtonElement)}
         >
           {t("knowledge.viewDocument")}
+        </Button>
+        <Button
+          size="small"
+          icon={<Icon name="download" size={14} />}
+          href={endpoints.knowledgeDocumentDownload.path(doc.id)}
+        >
+          {t("knowledge.download")}
         </Button>
       </div>
     </Card>

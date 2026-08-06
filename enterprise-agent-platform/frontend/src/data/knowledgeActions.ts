@@ -2,11 +2,12 @@
    knowledge slice's SET_* actions. Callers wrap asynchronous operations in
    runBusy. */
 
-import { api } from "../lib/api";
+import { api, apiUpload, type ApiUploadProgress } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type {
   CreateDocumentRequest,
   DocumentResponse,
+  KnowledgeImportResponse,
   KnowledgeSearchResponse,
 } from "../types";
 import { loadDocuments, type AppStore } from "./loaders";
@@ -28,6 +29,18 @@ export async function createDocument(payload: CreateDocumentRequest): Promise<vo
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export async function importKnowledgeDocuments(
+  files: readonly File[],
+  options: {
+    signal?: AbortSignal;
+    onProgress?: (progress: ApiUploadProgress) => void;
+  } = {},
+): Promise<KnowledgeImportResponse> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file, file.name);
+  return apiUpload<KnowledgeImportResponse>(endpoints.importKnowledgeDocuments.path(), form, options);
 }
 
 /** GET /api/knowledge/search?q=… and commit results separately from the full library. */

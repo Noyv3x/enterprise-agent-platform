@@ -339,6 +339,15 @@ export interface DocumentResponse {
   document: FullDocument;
 }
 
+export interface KnowledgeImportItem {
+  document: KnowledgeDocument;
+  created: boolean;
+}
+
+export interface KnowledgeImportResponse {
+  documents: KnowledgeImportItem[];
+}
+
 /* ------------------------------------------------------------------ users */
 
 export interface UsersResponse {

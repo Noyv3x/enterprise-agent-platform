@@ -35,7 +35,7 @@
 
 - 频道、私人对话、附件、输入合并、流式回复和上下文用量查看。
 - 账号、权限组、频道、私人消息和 token 用量管理。
-- 平台内建的共享语义知识库；向量由管理员配置的 OpenAI-compatible Embeddings API 生成，未配置时该能力明确禁用。
+- 平台内建的共享语义知识库；支持结构化录入以及 TXT、Markdown、CSV、JSON、HTML、PDF、DOCX、XLSX、PPTX、ODT 文件批量导入和原件下载，向量由管理员配置的 OpenAI-compatible Embeddings API 生成，未配置时该能力明确禁用。
 - 自动维护的 Agent 记忆、用户资料记忆、跨会话搜索，以及最终回复后的低优先级学习复盘。
 - 每 Agent 技能包，包括只读预置技能、用户技能和只维护 Agent 自建技能的自动改进闭环。
 - 私人 Agent 的一次性、间隔和 cron 计划任务。

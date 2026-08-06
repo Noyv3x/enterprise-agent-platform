@@ -52,6 +52,7 @@ import type {
   KnowledgeSearchResponse,
   KnowledgeConfigResponse,
   KnowledgeConfigUpdateRequest,
+  KnowledgeImportResponse,
   KnowledgeStatusResponse,
   LoginRequest,
   LoginResponse,
@@ -396,6 +397,10 @@ export const endpoints = {
     "POST",
     () => "/api/knowledge/documents",
   ),
+  importKnowledgeDocuments: ep<FormData, KnowledgeImportResponse>(
+    "POST",
+    () => "/api/knowledge/documents/import",
+  ),
   knowledgeSearch: ep<void, KnowledgeSearchResponse, [string]>(
     "GET",
     (query) => `/api/knowledge/search?q=${encodeURIComponent(query)}`,
@@ -403,6 +408,10 @@ export const endpoints = {
   knowledgeDocument: ep<void, DocumentResponse, [Id]>(
     "GET",
     (id) => `/api/knowledge/documents/${id}`,
+  ),
+  knowledgeDocumentDownload: ep<void, Blob, [Id]>(
+    "GET",
+    (id) => `/api/knowledge/documents/${id}/download`,
   ),
 
   /* users + permission groups */
