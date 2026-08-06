@@ -13,7 +13,7 @@
 
 `affected` 先运行文档与生成契约检查，再根据已跟踪与未跟踪变更选择 scripts、Manager、Python Platform、Agent Runtime、前端和容器定义。共享契约、发布/容器边界、无法分类路径或选择器自身变化必须自动升级为 `full`；快速通过只是迭代反馈，不能作为发布证据。`full` 在普通 Git 工作树中以 `HEAD → WORKTREE` 运行文档方向同步检查，因此未提交的代码、文档、暂存和未跟踪文件都进入验收。不得用 `HEAD → HEAD` 的空变更检查代替这一边界。
 
-完整命令先校验文档与生成契约，再并行运行相互独立的发布脚本、Manager、Python、Agent Runtime、前端和与 CI 相同的共享容器定义门禁；Python 在本地和 CI 都复用同一确定性四分片选择器。本地 `full` 不能用一次 Compose 渲染冒充完整 `container-smoke.sh`，缺少 Docker Compose 时必须失败而不是把未执行的门禁报告为通过。同一个 Node 工作区的 lockfile 未变且已有与其摘要匹配的 `node_modules` 时，本地迭代不重复执行 `npm ci`；CI 和缓存缺失时仍从 lockfile 干净安装。Runtime 在一轮门禁中只编译一次，不得以 `check → test 内建造 → build` 连续重复编译。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。仓库不提供第二个顶层测试入口。
+完整命令先校验文档与生成契约，再并行运行相互独立的发布脚本、Manager、Python、Agent Runtime、前端和与 CI 相同的共享容器定义门禁；Python 在本地和 CI 都复用同一确定性四分片选择器。本地 `full` 不能用一次 Compose 渲染冒充完整 `container-smoke.sh`，缺少 Docker Compose 时必须失败而不是把未执行的门禁报告为通过。同一个 Node 工作区的 lockfile 未变且已有与其摘要匹配的 `node_modules` 时，本地迭代不重复执行 `npm ci`；CI 和缓存缺失时仍从 lockfile 干净安装。Node 工作区的 Quality job 还执行 high 级别依赖审计；新披露的传递依赖漏洞只通过最小 lockfile 更新修复，不能借机升级无关组件。Runtime 在一轮门禁中只编译一次，不得以 `check → test 内建造 → build` 连续重复编译。前端构建会同步受版本控制的静态资源；提交前必须再次确认这些生成变化已纳入变更。仓库不提供第二个顶层测试入口。
 
 温热工作区的目标是 `affected` 在 3 分钟内给出反馈、`full` 在 10 分钟内完成；Quality CI 继续以独立 job 全量并行。顶层脚本必须输出选中组件和每组耗时；普通变更连续超出目标时，先定位回归或拆分过宽测试域，不把增大全局超时当作默认解法。
 
