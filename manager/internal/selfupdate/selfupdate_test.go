@@ -64,7 +64,7 @@ type fakeRunner struct {
 type runnerFunc func(context.Context, string, ...string) error
 
 func TestStartupIdentityTracksRunningInodeAfterPathReplacement(t *testing.T) {
-	if os.Getenv("UBITECH_SELFUPDATE_INODE_HELPER") == "1" {
+	if os.Getenv("AGENT_PLATFORM_SELFUPDATE_INODE_HELPER") == "1" {
 		executable, err := os.Executable()
 		if err != nil {
 			t.Fatal(err)
@@ -109,7 +109,7 @@ func TestStartupIdentityTracksRunningInodeAfterPathReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	command := exec.Command(copyPath, "-test.run=^TestStartupIdentityTracksRunningInodeAfterPathReplacement$")
-	command.Env = append(os.Environ(), "UBITECH_SELFUPDATE_INODE_HELPER=1")
+	command.Env = append(os.Environ(), "AGENT_PLATFORM_SELFUPDATE_INODE_HELPER=1")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("running-inode helper failed: %v\n%s", err, output)
 	}

@@ -548,7 +548,7 @@ func writeReleaseWithSchema(t *testing.T, root, id string, generatedAt time.Time
 	if err := os.WriteFile(filepath.Join(path, "compose.yaml"), compose, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("UBITECH_UID=1000\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(path, "compose.env"), []byte("AGENT_PLATFORM_UID=1000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path

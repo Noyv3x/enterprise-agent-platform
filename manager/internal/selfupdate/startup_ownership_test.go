@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	startupPrepareProbeEnvironment        = "UBITECH_STARTUP_PREPARE_PROBE"
+	startupPrepareProbeEnvironment        = "AGENT_PLATFORM_STARTUP_PREPARE_PROBE"
 	startupPrepareProbeVersionEnvironment = "AGENT_PLATFORM_STARTUP_PREPARE_PROBE_VERSION"
 )
 

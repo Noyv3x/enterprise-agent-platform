@@ -59,7 +59,7 @@ var managedImageNameSet = func() map[string]struct{} {
 }()
 
 // IsManagedImageName identifies every logical image in the current release
-// schema. Cleanup uses the same closed set as manifest validation.
+// schema. Artifact cleanup uses the same closed set as manifest validation.
 func IsManagedImageName(name string) bool {
 	_, ok := managedImageNameSet[name]
 	return ok

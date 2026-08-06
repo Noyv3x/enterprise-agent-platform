@@ -708,13 +708,13 @@ func TestRecoverCurrentAllowsHealthyCommittedRecoveryDirectSuccessorAndBarrierRe
 func TestActivationCommittedRejectsTamperedDirectRecoverySuccessor(t *testing.T) {
 	tests := map[string]func(*testing.T, *activationTakeoverFixture, *State){
 		"Previous path": func(_ *testing.T, fixture *activationTakeoverFixture, state *State) {
-			state.Previous.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "ubitech-manager")
+			state.Previous.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "wrong-manager")
 		},
 		"Previous hash": func(_ *testing.T, _ *activationTakeoverFixture, state *State) {
 			state.Previous.SHA256 = strings.Repeat("e", 64)
 		},
 		"Current path": func(_ *testing.T, fixture *activationTakeoverFixture, state *State) {
-			state.Current.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "ubitech-manager")
+			state.Current.Path = filepath.Join(fixture.manager.Root, "versions", "recovery-wrong", "wrong-manager")
 		},
 		"Current hash": func(_ *testing.T, _ *activationTakeoverFixture, state *State) {
 			state.Current.SHA256 = strings.Repeat("e", 64)

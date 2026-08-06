@@ -304,8 +304,8 @@ manager_url="${manifest_artifact[0]}"
 expected="${manifest_artifact[1]}"
 
 # Serialize the entire fresh-install ownership decision. The lock is acquired
-# only after the manifest has passed its closed-world validation, so a Bridge or
-# malformed release still creates no target installation path. The inode is
+# only after the manifest has passed its closed-world validation, so an
+# incompatible or malformed release still creates no installation path. The inode is
 # retained deliberately; unlinking a flock file creates a split-lock race.
 ensure_owner_directory "$runtime_root"
 runtime_mode="$(stat -c '%a' "$runtime_root" 2>/dev/null || true)"

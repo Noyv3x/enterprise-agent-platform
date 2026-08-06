@@ -30,7 +30,7 @@ func TestIsManagedTempNameIsExact(t *testing.T) {
 func TestCleanupManagedTempsRemovesCrashLeftResidue(t *testing.T) {
 	directoryPath := t.TempDir()
 	command := exec.Command(os.Args[0], "-test.run=^TestCleanupManagedTempsCrashWriterHelper$")
-	command.Env = append(os.Environ(), "UBITECH_ATOMIC_CRASH_HELPER=1", "UBITECH_ATOMIC_CRASH_DIR="+directoryPath)
+	command.Env = append(os.Environ(), "AGENT_PLATFORM_ATOMIC_CRASH_HELPER=1", "AGENT_PLATFORM_ATOMIC_CRASH_DIR="+directoryPath)
 	if err := command.Run(); err == nil {
 		t.Fatal("crash writer unexpectedly exited successfully")
 	} else {
@@ -67,10 +67,10 @@ func TestCleanupManagedTempsRemovesCrashLeftResidue(t *testing.T) {
 }
 
 func TestCleanupManagedTempsCrashWriterHelper(t *testing.T) {
-	if os.Getenv("UBITECH_ATOMIC_CRASH_HELPER") != "1" {
+	if os.Getenv("AGENT_PLATFORM_ATOMIC_CRASH_HELPER") != "1" {
 		return
 	}
-	directory := os.Getenv("UBITECH_ATOMIC_CRASH_DIR")
+	directory := os.Getenv("AGENT_PLATFORM_ATOMIC_CRASH_DIR")
 	file, err := os.CreateTemp(directory, ".tmp-*")
 	if err != nil {
 		os.Exit(87)

@@ -52,6 +52,8 @@ curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/d
 5. 启动 Manager，并由 Manager 执行首次 `install` operation；
 6. 核心服务健康后才开放业务入口。
 
+不兼容或畸形的清单必须在创建安装路径前失败；竞争安装也必须在进入任何目标清理逻辑前失败，不能留下半安装状态。
+
 安装器写入 stable 的 Manager 已经与 manifest Manager 完全相同时，这是初始 Current，不创建同摘要 Candidate、Activation 或 watchdog。只有现役 Current 与候选摘要不同时才进入 Manager 自更新协议。
 
 Manager 激活前失败只删除本次安装进程创建且身份仍匹配的对象，使同一命令可安全重试。Manager 激活后，容器 operation 由持久 journal 接管；不得重跑安装器或手工删除数据根。
