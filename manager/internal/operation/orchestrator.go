@@ -38,32 +38,35 @@ type SelfUpdater interface {
 }
 
 type Orchestrator struct {
-	Store                *journal.Store
-	Engine               driver.Engine
-	Gate                 Gate
-	Snapshots            Snapshotter
-	SelfUpdate           SelfUpdater
-	TechnicalProfile     identity.ActiveProfile
-	DataRoot             string
-	ReleasesDir          string
-	ManifestURL          string
-	Channel              string
-	ReleaseClient        release.Client
-	Log                  *logstore.Store
-	Now                  func() time.Time
-	Sleep                func(context.Context, time.Duration) error
-	PollInterval         time.Duration
-	OnCommit             func(release.Manifest)
-	OnFinalized          func(release.Manifest)
-	PublicProbe          func(context.Context) error
-	LocalActiveProcesses func() int
-	FixedStackMu         sync.Locker
-	MaintenanceMu        sync.Locker
-	ReclaimCapacity      func(context.Context, string, release.Manifest) error
-	mu                   sync.Mutex
-	finalizeMu           sync.Mutex
-	rollbackMu           sync.Mutex
-	running              map[string]context.CancelFunc
+	Store                 *journal.Store
+	Engine                driver.Engine
+	Gate                  Gate
+	Snapshots             Snapshotter
+	SelfUpdate            SelfUpdater
+	TechnicalProfile      identity.ActiveProfile
+	DataRoot              string
+	ReleasesDir           string
+	ManifestURL           string
+	Channel               string
+	ReleaseClient         release.Client
+	Log                   *logstore.Store
+	Now                   func() time.Time
+	Sleep                 func(context.Context, time.Duration) error
+	PollInterval          time.Duration
+	OnCommit              func(release.Manifest)
+	OnFinalized           func(release.Manifest)
+	PublicProbe           func(context.Context) error
+	LocalActiveProcesses  func() int
+	FixedStackMu          sync.Locker
+	MaintenanceMu         sync.Locker
+	ReclaimCapacity       func(context.Context, string, release.Manifest) error
+	mu                    sync.Mutex
+	finalizeMu            sync.Mutex
+	rollbackMu            sync.Mutex
+	conditionalMu         sync.Mutex
+	conditionalKey        string
+	conditionalValidators release.Validators
+	running               map[string]context.CancelFunc
 }
 
 const reservationReleaseTimeout = 10 * time.Second
@@ -100,14 +103,53 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 	if err != nil {
 		return release.Manifest{}, err
 	}
+	return manifest, o.acceptManifest(ctx, manifest, data)
+}
+
+// CheckIfChanged uses bounded HTTP validators only for the current catalog
+// identity. A 304 is a pure read result and therefore skips release writes and
+// Manager-state mutation.
+func (o *Orchestrator) CheckIfChanged(ctx context.Context, url string) (release.Manifest, bool, error) {
+	if url == "" {
+		url = o.ManifestURL
+	}
+	key := url + "\x00" + o.Channel
+	o.conditionalMu.Lock()
+	defer o.conditionalMu.Unlock()
+	if o.conditionalKey != key {
+		o.conditionalKey = key
+		o.conditionalValidators = release.Validators{}
+	}
+	response, err := o.ReleaseClient.FetchForProfileConditional(
+		ctx,
+		url,
+		o.Channel,
+		o.releaseProfile(),
+		o.conditionalValidators,
+	)
+	if err != nil {
+		return release.Manifest{}, false, err
+	}
+	if !response.Modified {
+		o.conditionalValidators = response.Validators
+		return release.Manifest{}, false, nil
+	}
+	if err := o.acceptManifest(ctx, response.Manifest, response.Data); err != nil {
+		return release.Manifest{}, false, err
+	}
+	o.conditionalValidators = response.Validators
+	return response.Manifest, true, nil
+}
+
+func (o *Orchestrator) acceptManifest(ctx context.Context, manifest release.Manifest, data []byte) error {
 	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
 	if err != nil {
-		return release.Manifest{}, err
+		return err
 	}
 	defer unlockMaintenance()
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
-		return release.Manifest{}, err
+		return err
 	}
 	_, err = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
 		if state.Current != nil && state.Current.ID == manifest.ID() {
@@ -118,7 +160,7 @@ func (o *Orchestrator) Check(ctx context.Context, url string) (release.Manifest,
 		state.LastError = ""
 		return nil
 	})
-	return manifest, err
+	return err
 }
 func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, bool, error) {
 	unlockMaintenance, err := o.lockMaintenanceAdmission(context.Background())

@@ -245,6 +245,21 @@ func (m Manifest) Digest() (string, error) {
 
 type Client struct{ HTTP *http.Client }
 
+// Validators retain bounded HTTP cache validators for a single immutable
+// release-catalog location. They are deliberately supplied by the caller so a
+// Client remains stateless and can still be copied safely into orchestrators.
+type Validators struct {
+	ETag         string
+	LastModified string
+}
+
+type ManifestResponse struct {
+	Manifest   Manifest
+	Data       []byte
+	Validators Validators
+	Modified   bool
+}
+
 // AvailabilityError identifies a valid release location that cannot be read
 // yet. Callers may safely retry these failures, unlike schema, digest, size, or
 // transport-policy validation failures.
@@ -274,6 +289,23 @@ func (c Client) FetchForProfile(ctx context.Context, url, channel string, active
 		return Manifest{}, nil, err
 	}
 	return manifest, data, nil
+}
+
+// FetchForProfileConditional validates a fresh manifest or reports an HTTP
+// 304 without decoding or materializing the previously accepted bytes.
+func (c Client) FetchForProfileConditional(ctx context.Context, url, channel string, active identity.ActiveProfile, validators Validators) (ManifestResponse, error) {
+	data, next, notModified, err := c.fetchConditional(ctx, url, maxManifestBytes, validators)
+	if err != nil {
+		return ManifestResponse{}, err
+	}
+	if notModified {
+		return ManifestResponse{Validators: next, Modified: false}, nil
+	}
+	manifest, err := DecodeManifestForProfile(data, channel, runtime.GOOS, runtime.GOARCH, active)
+	if err != nil {
+		return ManifestResponse{}, err
+	}
+	return ManifestResponse{Manifest: manifest, Data: data, Validators: next, Modified: true}, nil
 }
 
 // DecodeManifest applies the same closed-world parser and cross-field
@@ -404,12 +436,30 @@ func (c Client) FetchArtifact(ctx context.Context, artifact Artifact, maxBytes i
 	return data, nil
 }
 func (c Client) fetch(ctx context.Context, rawURL string, limit int64) ([]byte, error) {
+	data, _, notModified, err := c.fetchConditional(ctx, rawURL, limit, Validators{})
+	if err != nil {
+		return nil, err
+	}
+	if notModified {
+		return nil, errors.New("release server returned not modified without validators")
+	}
+	return data, nil
+}
+
+func (c Client) fetchConditional(ctx context.Context, rawURL string, limit int64, validators Validators) ([]byte, Validators, bool, error) {
 	if err := validateReleaseURL(rawURL); err != nil {
-		return nil, fmt.Errorf("release URL policy: %w", err)
+		return nil, Validators{}, false, fmt.Errorf("release URL policy: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, Validators{}, false, err
+	}
+	validators = sanitizeValidators(validators)
+	if validators.ETag != "" {
+		request.Header.Set("If-None-Match", validators.ETag)
+	}
+	if validators.LastModified != "" {
+		request.Header.Set("If-Modified-Since", validators.LastModified)
 	}
 	client := c.HTTP
 	if client == nil {
@@ -429,25 +479,78 @@ func (c Client) fetch(ctx context.Context, rawURL string, limit int64) ([]byte, 
 	response, err := clientCopy.Do(request)
 	if err != nil {
 		if errors.Is(err, errReleaseURLPolicy) {
-			return nil, err
+			return nil, Validators{}, false, err
 		}
-		return nil, &AvailabilityError{Err: fmt.Errorf("fetch release artifact: %w", err)}
+		return nil, Validators{}, false, &AvailabilityError{Err: fmt.Errorf("fetch release artifact: %w", err)}
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusNotModified {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		if validators.ETag == "" && validators.LastModified == "" {
+			return nil, Validators{}, false, errors.New("release server returned not modified without request validators")
+		}
+		return nil, responseValidators(response.Header, validators), true, nil
+	}
 	if response.StatusCode != http.StatusOK {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		failure := fmt.Errorf("fetch release artifact: HTTP %d", response.StatusCode)
 		if response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooEarly || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
-			return nil, &AvailabilityError{Err: failure}
+			return nil, Validators{}, false, &AvailabilityError{Err: failure}
 		}
-		return nil, failure
+		return nil, Validators{}, false, failure
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		return nil, &AvailabilityError{Err: fmt.Errorf("read release artifact: %w", err)}
+		return nil, Validators{}, false, &AvailabilityError{Err: fmt.Errorf("read release artifact: %w", err)}
 	}
 	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("release artifact exceeds %d bytes", limit)
+		return nil, Validators{}, false, fmt.Errorf("release artifact exceeds %d bytes", limit)
 	}
-	return data, nil
+	return data, responseValidators(response.Header, Validators{}), false, nil
+}
+
+func sanitizeValidators(validators Validators) Validators {
+	if !validETag(validators.ETag) {
+		validators.ETag = ""
+	}
+	if len(validators.LastModified) > 128 {
+		validators.LastModified = ""
+	} else if validators.LastModified != "" {
+		if _, err := http.ParseTime(validators.LastModified); err != nil {
+			validators.LastModified = ""
+		}
+	}
+	return validators
+}
+
+func responseValidators(header http.Header, previous Validators) Validators {
+	next := previous
+	if value := header.Get("ETag"); validETag(value) {
+		next.ETag = value
+	}
+	if value := header.Get("Last-Modified"); len(value) <= 128 {
+		if _, err := http.ParseTime(value); err == nil {
+			next.LastModified = value
+		}
+	}
+	return next
+}
+
+func validETag(value string) bool {
+	if len(value) > 512 {
+		return false
+	}
+	if strings.HasPrefix(value, "W/") {
+		value = strings.TrimPrefix(value, "W/")
+	}
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return false
+	}
+	for _, character := range []byte(value[1 : len(value)-1]) {
+		if character == 0x21 || character >= 0x23 && character <= 0x7e || character >= 0x80 {
+			continue
+		}
+		return false
+	}
+	return true
 }

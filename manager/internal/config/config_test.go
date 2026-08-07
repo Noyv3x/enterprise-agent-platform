@@ -58,7 +58,8 @@ func TestDefaultsUseCanonicalTargetIdentity(t *testing.T) {
 	if cfg.ConfigPath != filepath.Join(configHome, "agent-platform", "manager.toml") ||
 		cfg.DataRoot != wantRoot || cfg.StateDir != filepath.Join(wantRoot, "manager") ||
 		cfg.SocketPath != filepath.Join(runtimeHome, "agent-platform-manager", "manager.sock") ||
-		cfg.ComposeProject != "agent-platform" || cfg.SandboxNetwork != "agent-platform_core" {
+		cfg.ComposeProject != "agent-platform" || cfg.SandboxNetwork != "agent-platform_core" ||
+		cfg.UpdateInterval != time.Minute {
 		t.Fatalf("target identity defaults = %#v", cfg)
 	}
 }

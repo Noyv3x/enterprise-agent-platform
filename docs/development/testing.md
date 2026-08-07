@@ -142,7 +142,7 @@ npm run build
 
 发布冒烟会故意把 Agent Sandbox 挂载根映射为与 CI runner 不同的 UID/GID。测试退出路径必须先尝试停止并移除相关容器，再以 runner 的受控提权只清理 `RUNNER_TEMP` 下由 `mktemp` 创建且带固定产品前缀的单一临时树；不能用普通 runner 身份递归删除已重映射的目录，也不能对未经前缀约束的路径执行提权删除。受控临时树清理失败仍应让发布失败，避免把残留数据掩盖为成功。
 
-原子 release 组装只能下载经过匿名拉取、双架构容量和本地镜像身份验证后生成的单一 `verified-managed-images` 目录，以及独立的 `manager-*` 二进制 family；不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Compose 冒烟和最终 manifest 必须消费同一份已验证目录，不能各自维护镜像默认值。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
+四个镜像构建完成后必须先把原始 `image-*` identity 收敛为闭世界的单一 `managed-images` 目录。双架构匿名拉取/容量验证、Compose 冒烟与最终 manifest 只能消费这同一目录，不能各自维护镜像默认值；原子 publish 必须直接依赖目录生成、两个架构验证与 Compose 三类成功结果，不能在验证完成前运行。发布组装不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
 
 镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖同名中间 artifact。最终 `publish` job 必须使用完整 source commit 作为跨 run 全局锁，并在同一发布步骤中直接复验成功 Quality run、构建 source、workflow run/attempt、release ID、tag commit 和精确资产名称/SHA-256/size；不再生成第二套 promotion 或 provenance 文件。相同 generation 的重放只接受逐字节一致资产；错误 tag、未知/重名资产、无关 Quality run、镜像不可匿名拉取或 digest 漂移都必须在推进 latest 前失败。
 

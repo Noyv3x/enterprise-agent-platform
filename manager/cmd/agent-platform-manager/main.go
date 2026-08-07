@@ -1340,7 +1340,7 @@ func maintenanceStateEligible(state model.ManagerState, allowedOperationID strin
 
 func autoUpdateDue(last, now time.Time, interval time.Duration) bool {
 	if interval <= 0 {
-		interval = 5 * time.Minute
+		interval = time.Minute
 	}
 	return !now.Before(last.Add(interval))
 }
@@ -1354,9 +1354,9 @@ func (a *application) autoUpdate(ctx context.Context) {
 		return
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	manifest, err := a.operations.Check(checkCtx, cfg.ReleaseURL)
+	manifest, modified, err := a.operations.CheckIfChanged(checkCtx, cfg.ReleaseURL)
 	cancel()
-	if err != nil || manifest.ID() == state.Current.ID {
+	if err != nil || !modified || manifest.ID() == state.Current.ID {
 		return
 	}
 	fresh := a.state.State()

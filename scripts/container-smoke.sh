@@ -624,7 +624,7 @@ def job(source: str, name: str) -> str:
     return match.group(0)
 
 required_jobs = {
-    "prepare", "upstream-contracts", "images", "public-images",
+    "prepare", "upstream-contracts", "images", "image-catalog", "public-images",
     "manager-binaries", "manager-systemd-integration", "compose-smoke", "publish",
 }
 jobs_source = workflow.split("\njobs:\n", 1)[1]
@@ -682,27 +682,39 @@ for fragment in (
 public_images = job(workflow, "public-images")
 if "packages: read" not in public_images or "docker/login-action" in public_images:
     raise SystemExit("public-image verification is not anonymous")
+image_catalog = job(workflow, "image-catalog")
 managed = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
     "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
     "firecrawl-redis", "firecrawl-rabbitmq",
 }
 for component in managed:
-    if component not in public_images or f"[{component}]=" not in public_images:
-        raise SystemExit(f"public-image capacity gate omits {component}")
+    if f"[{component}]=" not in image_catalog:
+        raise SystemExit(f"managed-image catalog omits {component}")
 for fragment in (
-    "for architecture in amd64 arm64; do",
-    'docker pull --platform "linux/${architecture}" "$image"',
+    "architecture:",
+    "ARCHITECTURE: ${{ matrix.architecture }}",
+    'docker pull --platform "linux/${ARCHITECTURE}" "$image"',
     ".managed_image_capacity_estimates[$component].compressed_bytes",
     ".managed_image_capacity_estimates[$component].unpacked_bytes",
-    "name: verified-managed-images",
+    "name: managed-images",
 ):
     if fragment not in public_images:
         raise SystemExit(f"public-image gate is incomplete: {fragment}")
 
+for fragment in (
+    "pattern: image-*",
+    "name: managed-images",
+    "path: managed-images.json",
+    ".managed_image_capacity_estimates | keys",
+):
+    if fragment not in image_catalog:
+        raise SystemExit(f"managed-image catalog is incomplete: {fragment}")
+
 compose = job(workflow, "compose-smoke")
 for fragment in (
     "timeout-minutes: 45",
+    "name: managed-images",
     "--wait --wait-timeout 600 firecrawl-api",
     "firecrawl_scrape cold",
     "firecrawl_scrape warm",
@@ -712,6 +724,8 @@ for fragment in (
 ):
     if fragment not in compose:
         raise SystemExit(f"Compose acceptance gate is incomplete: {fragment}")
+if "      - public-images\n" in compose or "      - images\n" in compose:
+    raise SystemExit("Compose acceptance is still serialized behind image verification")
 
 publish = job(workflow, "publish")
 for dependency in required_jobs - {"publish"}:
@@ -721,7 +735,7 @@ for fragment in (
     "group: container-channel-main",
     "cancel-in-progress: false",
     "pattern: manager-*",
-    "name: verified-managed-images",
+    "name: managed-images",
     'git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main',
     'git merge-base --is-ancestor "$current" "$SOURCE_COMMIT"',
     "verify_tag",
@@ -734,7 +748,7 @@ if "pattern: '*'" in publish or 'pattern: "*"' in publish:
     raise SystemExit("publish downloads an unscoped artifact family")
 if "--contract" in publish or "--predecessor-manifest" in publish:
     raise SystemExit("current manifest assembly accepts unrelated inputs")
-for producer in ("images", "manager-binaries"):
+for producer in ("images", "image-catalog", "manager-binaries"):
     if "overwrite: true" not in job(workflow, producer):
         raise SystemExit(f"{producer} artifacts cannot be replaced by a full-run retry")
 PY

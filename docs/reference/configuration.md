@@ -32,7 +32,7 @@ trusted_ingress_cidrs = ["127.0.0.0/8", "::1/128"]
 release_manifest_url = "https://example.invalid/agent-platform/main.json"
 release_channel = "main"
 update_enabled = true
-update_interval = "5m"
+update_interval = "1m"
 sandbox_idle = "30m"
 log_max_size = "20MiB"
 log_max_files = 5
@@ -41,7 +41,7 @@ log_max_files = 5
 - `data_root` 是 Manager、Platform 数据和快照的唯一宿主根；展开后必须为绝对、非符号链接、部署用户可写路径。Platform 数据目录固定为规范化后的 `$data_root/data`，Manager 的 schema migration、快照、Sandbox registry、容器环境和 Compose bind mount 全部使用该路径。不存在独立 `data_dir` 配置。
 - `listen` 是主产品入口；生产反向代理连接此地址。Platform 容器端口由 Manager 动态选择，不单独配置公网监听。可选 LAN listener 默认关闭；`lan_listen` 必须使用与主入口不冲突的独立端口，并只能绑定明确的私网或回环 IP，拒绝通配和公网 IP。启用时只接受 `direct_access_cidrs` 的真实远端地址，并推荐由局域网 TLS 反向代理访问。只有 `trusted_ingress_cidrs` 可以提供 forwarded headers，其它请求头会被 Manager 丢弃并重建。bind 地址不是 canonical public URL。
 - `release_manifest_url` 指向受信 main 通道清单；Manager 强制 HTTPS（仅测试允许回环 HTTP），并校验 schema、架构、commit、artifact SHA-256 和镜像 digest。运行身份永远使用 digest，不使用 tag。
-- `update_enabled` 与 `update_interval` 控制检测；手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
+- `update_enabled` 与 `update_interval` 控制检测；默认一分钟，成功响应提供验证器时使用条件请求，`304` 不产生 Candidate 或磁盘写入。手工 `check/update` 不绕过 manifest、任务空闲或快照门禁。
 - `sandbox_idle` 默认值由机器契约生成；配置覆盖必须在受支持范围内，并同时作用于任务与后台进程判断。
 - 日志限制应用于 Manager 文件日志和容器日志 driver；secret 与宿主执行原始凭据仍必须先脱敏。Manager 状态、operation 和 API 投影都必须使用明确的小型读取预算；提高客户端上限不能代替服务端限制诊断大小。
 

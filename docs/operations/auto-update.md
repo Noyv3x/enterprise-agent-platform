@@ -13,7 +13,7 @@
 每个可发布的 main commit 必须先通过文档同步、Python、Runtime、前端、Manager 和容器门禁。Container workflow 随后：
 
 1. 构建受支持架构的 Manager 与受管镜像；
-2. 验证镜像可匿名按 digest 拉取、容量上限和真实 Compose 冒烟；
+2. 从同一精确镜像目录并行执行 AMD64、ARM64 匿名按 digest 拉取与容量验证和真实 AMD64 Compose 冒烟，发布只等待这些互不依赖的门禁汇合；
 3. 组装唯一 `release.json`、Compose、安装器、Manager 工件及 sidecar；
 4. 计算闭世界资产清单和 Actions provenance；
 5. 创建不可变 `container-<40-hex-commit>` release；
@@ -27,7 +27,9 @@ manifest 必须最后公开，部署机不能看到半套资产。品牌配置�
 
 ## 检测与预拉取
 
-Manager 定时读取 latest manifest，也可由签名 webhook 唤醒。检查阶段只做纯读验证；没有更新时不创建 operation。候选必须满足：
+Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响应的 `ETag` 与 `Last-Modified`，后续请求使用条件头；上游返回 `304 Not Modified` 时不重复解码、落盘或创建 operation。校验器只在相同 manifest URL、通道和技术 profile 下复用，配置变化、无验证器响应或临时网络失败不会把未知内容当作未变化。
+
+当前基线不依赖中心推送服务或逐部署 webhook secret；这样公开供应的安装实例不需要把地址和凭据登记到上游。检查阶段只做纯读验证；没有更新时不创建 operation。候选必须满足：
 
 - schema、protocol、技术 profile 与镜像键集合精确匹配当前契约；
 - source commit 是 40 位小写十六进制，并且不是 current 的降级；

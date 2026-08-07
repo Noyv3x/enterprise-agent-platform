@@ -593,6 +593,11 @@ func testReleaseServer(t *testing.T) (*httptest.Server, string) {
 			_, _ = w.Write(fixture.Compose)
 			return
 		}
+		if r.Header.Get("If-None-Match") == `"schema-v2"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"schema-v2"`)
 		_ = json.NewEncoder(w).Encode(fixture.Manifest)
 	}))
 	fixture = releasetest.NewTarget(
@@ -649,6 +654,33 @@ func TestCheckConsumesCurrentSchemaOnTargetProfile(t *testing.T) {
 	if manifest.SchemaVersion != release.ManifestSchemaVersion || state.Candidate == nil ||
 		state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 10 {
 		t.Fatalf("operation did not retain current schema: manifest=%#v state=%#v", manifest, state)
+	}
+}
+
+func TestConditionalCheckSkipsStateMutationForNotModifiedManifest(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	root := t.TempDir()
+	store, err := journal.Open(filepath.Join(root, "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator := &Orchestrator{
+		Store: store, TechnicalProfile: identity.CompileTimeActiveProfile(),
+		ReleasesDir: filepath.Join(root, "releases"), ManifestURL: url,
+		Channel: contract.ReleaseChannel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	manifest, modified, err := orchestrator.CheckIfChanged(context.Background(), url)
+	if err != nil || !modified || manifest.ID() == "" {
+		t.Fatalf("initial conditional check = %#v, modified=%v, err=%v", manifest, modified, err)
+	}
+	generation := store.State().Generation
+	manifest, modified, err = orchestrator.CheckIfChanged(context.Background(), url)
+	if err != nil || modified || manifest.ID() != "" {
+		t.Fatalf("not-modified conditional check = %#v, modified=%v, err=%v", manifest, modified, err)
+	}
+	if store.State().Generation != generation {
+		t.Fatalf("304 mutated Manager state: before=%d after=%d", generation, store.State().Generation)
 	}
 }
 

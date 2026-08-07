@@ -71,7 +71,7 @@ Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。其官方 URL
 
 `main` 的每次 push 都会触发完整 Quality、不可变容器构建和通道提升，因此只推送已完成、已通过本地全量门禁的垂直交付单元。调试提交、只有文档或只有实现的中间检查点可保留在本地分支，交付前收敛为一个可回滚单元；不得为获取 CI 反馈而连续向自动发布分支推送试错提交。
 
-不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器、校验文件和全部镜像 digest。最终 publish job 在 `container-channel-main` 全局锁内复验成功 Quality、Git 祖先关系、资产封印、Actions provenance、tag identity 与匿名镜像可达性后，原子推进 latest。其它 workflow 不得修改 release visibility 或 latest；发布链没有迁移 stage、固定部署前任或人工回执分支。
+不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器、校验文件和全部镜像 digest。四个自有镜像构建完成后只生成一份精确镜像目录；AMD64、ARM64 的匿名拉取及容量验证与真实 AMD64 Compose 冒烟从该目录并行执行，最终发布等待全部门禁汇合，不把网络验证和 Compose 启动串成单一关键路径。最终 publish job 在 `container-channel-main` 全局锁内复验成功 Quality、Git 祖先关系、资产封印、Actions provenance、tag identity 与匿名镜像可达性后，原子推进 latest。其它 workflow 不得修改 release visibility 或 latest；发布链没有迁移 stage、固定部署前任或人工回执分支。
 
 最终 publish job 直接以排序后的闭世界目录绑定每个 release asset 的精确名称、SHA-256 和字节数，并经 GitHub API 重证本次 workflow run/attempt、实际 source commit、成功 Quality run/attempt、release ID、asset ID/digest/size 与 lightweight tag。重复发布同一 source commit 时必须逐项比较本地、重新下载字节和 API identity，禁止 `--clobber`、重名、未知资产或上传后漂移。main 通道提升前后都以匿名 registry 请求复验 manifest 中全部受管镜像 digest，并复读 release ID、tag、target commit、draft/latest 和资产 identity；任一公开前漂移都不得公开，公开后镜像后验失败必须明确报告为已可见事故。安装器只使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。该边界不需要第二个 promotion workflow、自定义 provenance 文件或部署机回执。
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
 
 func validManifest(base string) Manifest {
@@ -148,6 +149,62 @@ func TestFetchValidatesChecksumAndAvailability(t *testing.T) {
 	}
 	if _, _, err := client.Fetch(context.Background(), server.URL+"/missing", contract.ReleaseChannel); err == nil || !IsTemporarilyUnavailable(err) {
 		t.Fatalf("temporary availability was not classified: %v", err)
+	}
+}
+
+func TestConditionalManifestFetchReusesBoundedValidators(t *testing.T) {
+	modified := time.Unix(1_700_000_000, 0).UTC().Format(http.TimeFormat)
+	requests := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests == 1 {
+			if r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "" {
+				t.Errorf("initial request carried validators: %#v", r.Header)
+			}
+			w.Header().Set("ETag", `W/"generation-a"`)
+			w.Header().Set("Last-Modified", modified)
+			_ = json.NewEncoder(w).Encode(validManifest(server.URL))
+			return
+		}
+		if r.Header.Get("If-None-Match") != `W/"generation-a"` || r.Header.Get("If-Modified-Since") != modified {
+			t.Errorf("conditional request validators = %#v", r.Header)
+		}
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+
+	client := Client{HTTP: server.Client()}
+	first, err := client.FetchForProfileConditional(
+		context.Background(), server.URL, contract.ReleaseChannel,
+		identity.CompileTimeActiveProfile(), Validators{},
+	)
+	if err != nil || !first.Modified || first.Manifest.ID() == "" || len(first.Data) == 0 {
+		t.Fatalf("initial conditional fetch = %#v, %v", first, err)
+	}
+	second, err := client.FetchForProfileConditional(
+		context.Background(), server.URL, contract.ReleaseChannel,
+		identity.CompileTimeActiveProfile(), first.Validators,
+	)
+	if err != nil || second.Modified || second.Manifest.ID() != "" || second.Data != nil {
+		t.Fatalf("not-modified fetch = %#v, %v", second, err)
+	}
+	if second.Validators != first.Validators || requests != 2 {
+		t.Fatalf("conditional validators were not retained: first=%#v second=%#v requests=%d", first.Validators, second.Validators, requests)
+	}
+}
+
+func TestConditionalManifestFetchRejectsUnsolicitedNotModified(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer server.Close()
+	_, err := (Client{HTTP: server.Client()}).FetchForProfileConditional(
+		context.Background(), server.URL, contract.ReleaseChannel,
+		identity.CompileTimeActiveProfile(), Validators{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "without request validators") {
+		t.Fatalf("unsolicited 304 error = %v", err)
 	}
 }
 

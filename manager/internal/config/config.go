@@ -91,7 +91,7 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		PlatformGateURL:     "http://127.0.0.1:18080",
 		ReleaseChannel:      contract.ReleaseChannel,
 		UpdateEnabled:       true,
-		UpdateInterval:      5 * time.Minute,
+		UpdateInterval:      time.Minute,
 		ComposeProject:      profile.ComposeProject,
 		DockerBinary:        "docker",
 		SandboxNetwork:      profile.CoreNetwork,

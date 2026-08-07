@@ -203,6 +203,9 @@ func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
 	if !autoUpdateDue(last, last.Add(31*time.Second), 30*time.Second) {
 		t.Fatal("a shorter patched interval was not effective")
 	}
+	if autoUpdateDue(last, last.Add(59*time.Second), 0) || !autoUpdateDue(last, last.Add(time.Minute), 0) {
+		t.Fatal("the fallback update interval is not one minute")
+	}
 }
 
 func TestReconcileMaintenanceProtectsEveryReachableResource(t *testing.T) {
