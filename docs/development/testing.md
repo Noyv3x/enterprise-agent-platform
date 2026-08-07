@@ -144,7 +144,7 @@ npm run build
 
 四个镜像构建完成后必须先把原始 `image-*` identity 收敛为闭世界的单一 `managed-images` 目录。双架构匿名拉取/容量验证、Compose 冒烟与最终 manifest 只能消费这同一目录，不能各自维护镜像默认值；原子 publish 必须直接依赖目录生成、两个架构验证与 Compose 三类成功结果，不能在验证完成前运行。发布组装不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
 
-镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖同名中间 artifact。最终 `publish` job 必须使用完整 source commit 作为跨 run 全局锁，并在同一发布步骤中直接复验成功 Quality run、构建 source、workflow run/attempt、release ID、tag commit 和精确资产名称/SHA-256/size；不再生成第二套 promotion 或 provenance 文件。相同 generation 的重放只接受逐字节一致资产；错误 tag、未知/重名资产、无关 Quality run、镜像不可匿名拉取或 digest 漂移都必须在推进 latest 前失败。
+镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖同名中间 artifact。最终 `publish` job 必须使用完整 source commit 作为跨 run 全局锁，并在同一发布步骤中直接复验成功 Quality run、构建 source、workflow run/attempt、release ID、tag commit 和精确资产名称/SHA-256/size；不再生成第二套 promotion 或 provenance 文件。GitHub 在创建 lightweight tag 后可能短暂读不到同一 ref，发布器必须只对这次写后读取做有界重试并最终重证 tag 的精确 commit，不能跳过验证或无限等待。相同 generation 的重放只接受逐字节一致资产；错误 tag、未知/重名资产、无关 Quality run、镜像不可匿名拉取或 digest 漂移都必须在推进 latest 前失败。
 
 main 通道测试必须覆盖至少三个线性后代：较旧 workflow 后完成不能降级 latest，连续 push 最终自动推进到最新通过 Quality 的 main head，分叉 candidate 在构建前或发布前拒绝。发布链没有阶段选择器、固定迁移前任、部署 challenge 或人工 promotion 分支。
 

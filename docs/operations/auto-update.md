@@ -25,6 +25,8 @@ manifest 必须最后公开，部署机不能看到半套资产。品牌配置�
 
 发布中的 draft 通过认证的 release identity 和数字 ID 读取、上传及复验；公开的按 tag REST 查询只用于已经可见的 release，不能作为发现 draft 的前提。这样发布任务在上传前、上传后和最终公开后始终校验同一个 release 对象。
 
+创建候选 lightweight tag 后，GitHub 控制面可能短暂返回 ref 不存在。发布器只对该次写后读取执行秒级、有界退避；可见后仍须验证 tag 精确指向候选 commit，超过预算、读到其它对象或其它 commit 都失败关闭，不能跳过验证或无限等待。
+
 ## 检测与预拉取
 
 Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响应的 `ETag` 与 `Last-Modified`，后续请求使用条件头；上游返回 `304 Not Modified` 时不重复解码、落盘或创建 operation。校验器只在相同 manifest URL、通道和技术 profile 下复用，配置变化、无验证器响应或临时网络失败不会把未知内容当作未变化。

@@ -29,11 +29,13 @@ if [[ "${2:-}" == --method ]]; then
     exit 1
   fi
   [[ "$state" == absent ]]
-  printf '%s' exact > "$TAG_STATE"
+  printf '%s' lag-0 > "$TAG_STATE"
   exit 0
 fi
 case "$state" in
   absent|race) exit 1 ;;
+  lag-0) printf '%s' lag-1 > "$TAG_STATE"; exit 1 ;;
+  lag-1) printf '%s' exact > "$TAG_STATE"; printf '{"object":{"type":"commit","sha":"%s"}}\\n' "$EXPECTED_CANDIDATE" ;;
   exact) printf '{"object":{"type":"commit","sha":"%s"}}\\n' "$EXPECTED_CANDIDATE" ;;
   wrong) printf '{"object":{"type":"commit","sha":"%040d"}}\\n' 9 ;;
   annotated) printf '{"object":{"type":"tag","sha":"%s"}}\\n' "$EXPECTED_CANDIDATE" ;;
@@ -43,6 +45,8 @@ esac
             encoding="utf-8",
         )
         (self.bin / "gh").chmod(0o755)
+        (self.bin / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (self.bin / "sleep").chmod(0o755)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -64,7 +68,9 @@ esac
         )
 
     def test_missing_tag_is_created_without_replacing_an_existing_ref(self) -> None:
-        self.assertEqual(self.run_case("absent").returncode, 0)
+        result = self.run_case("absent")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "state").read_text(encoding="utf-8"), "exact")
         self.assertEqual(self.run_case("exact").returncode, 0)
 
     def test_wrong_annotated_or_racing_tag_fails_before_visibility(self) -> None:
