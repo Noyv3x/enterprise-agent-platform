@@ -12,7 +12,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       bash build-essential ca-certificates curl file git jq less openssh-client \
-      procps python3 python3-pip python3-venv ripgrep sudo tini unzip util-linux \
+      procps python3 python3-docx python3-lxml python3-openpyxl python3-pil \
+      python3-pip python3-pypdf python3-reportlab python3-venv python3-xlsxwriter \
+      ripgrep sudo tini unzip util-linux \
+    && python3 -m pip install --break-system-packages --no-cache-dir --no-deps \
+      python-pptx==0.6.21 \
     && rm -rf /var/lib/apt/lists/* \
     && groupmod --new-name agent node \
     && usermod --login agent --home /home/agent --move-home node \

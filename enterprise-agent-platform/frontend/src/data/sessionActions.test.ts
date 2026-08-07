@@ -104,6 +104,27 @@ describe("compact session bootstrap", () => {
     });
   });
 
+  it("hydrates the server-selected private Agent as the default conversation", async () => {
+    const privateBootstrap = {
+      ...bootstrap,
+      user: {
+        id: 7,
+        username: "alice",
+        permissions: ["chat", "private_agent"],
+      } as User,
+      active_scope: { scope_type: "private" as const, scope_id: 7 },
+      messages: [{ id: 12, author_type: "agent", content: "private reply" }] as Message[],
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => response(200, privateBootstrap)));
+    const store = createStore(rootReducer, initialAppState);
+
+    await expect(boot(store)).resolves.toBe("authenticated");
+
+    expect(store.getState().activeView).toBe("private");
+    expect(store.getState().privateMessages).toEqual(privateBootstrap.messages);
+    expect(store.getState().messages).toEqual([]);
+  });
+
   it("treats an unauthenticated bootstrap as an anonymous session", async () => {
     const fetchMock = vi.fn(async (_path: string) =>
       response(401, { error: "authentication required" }));

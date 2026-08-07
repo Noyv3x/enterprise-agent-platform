@@ -10,7 +10,7 @@ import type { Action, AppState, ChatSliceState, Message } from "../../types";
 
 export const chatInitial: ChatSliceState = {
   channels: [],
-  activeView: "channel",
+  activeView: "private",
   activeChannelId: null,
   messages: [],
   privateMessages: [],

@@ -284,6 +284,17 @@ class BackendPerformanceServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     bootstrap["active_scope"],
+                    {"scope_type": "private", "scope_id": str(actor["id"])},
+                )
+
+                viewer = service.create_user(
+                    username="bootstrap-viewer",
+                    password="bootstrap-viewer-pass",
+                    permission_group="viewer",
+                    actor=actor,
+                )
+                self.assertEqual(
+                    service.session_bootstrap(viewer)["active_scope"],
                     {"scope_type": "channel", "scope_id": "1"},
                 )
             finally:
@@ -387,7 +398,7 @@ class BackendPerformanceHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["user"]["username"], "admin")
                 self.assertEqual(
                     payload["bootstrap"]["active_scope"]["scope_type"],
-                    "channel",
+                    "private",
                 )
                 self.assertIn("message_revision", payload["bootstrap"])
                 cookie = response.getheader("Set-Cookie")

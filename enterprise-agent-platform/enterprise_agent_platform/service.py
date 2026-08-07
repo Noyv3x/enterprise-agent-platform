@@ -84,7 +84,12 @@ from .knowledge import (
     KnowledgeUnavailableError,
     MAX_CONTENT_CHARS,
 )
-from .knowledge_files import KnowledgeFileError, extract_knowledge_file
+from .knowledge_files import (
+    KnowledgeFileError,
+    MAX_XLSX_PREVIEW_BYTES,
+    extract_knowledge_file,
+    extract_xlsx_preview,
+)
 from .loopback_http import (
     open_loopback_url,
     open_private_service_url,
@@ -429,6 +434,9 @@ SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
     "image/webp",
     "image/bmp",
 }
+XLSX_ATTACHMENT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 MEDIA_TAG_RE = re.compile(
     r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
     re.IGNORECASE,
@@ -3082,15 +3090,15 @@ class EnterpriseService:
             else []
         )
         active_scope: dict[str, str] | None = None
-        if channels:
-            active_scope = {
-                "scope_type": "channel",
-                "scope_id": str(channels[0]["id"]),
-            }
-        elif PERMISSION_PRIVATE_AGENT in permissions:
+        if PERMISSION_PRIVATE_AGENT in permissions:
             active_scope = {
                 "scope_type": "private",
                 "scope_id": str(actor["id"]),
+            }
+        elif channels:
+            active_scope = {
+                "scope_type": "channel",
+                "scope_id": str(channels[0]["id"]),
             }
 
         messages: list[dict[str, Any]] = []
@@ -16169,6 +16177,38 @@ class EnterpriseService:
             raise ServiceError(404, "attachment file is missing")
         return self._attachment_from_row(row), path
 
+    def get_attachment_xlsx_preview(
+        self,
+        actor: dict[str, Any],
+        attachment_id: int,
+    ) -> dict[str, Any]:
+        attachment, path = self.get_attachment_file(actor, attachment_id)
+        if (
+            Path(str(attachment.get("filename") or "")).suffix.casefold() != ".xlsx"
+            or str(attachment.get("mime_type") or "").casefold()
+            != XLSX_ATTACHMENT_MIME_TYPE
+        ):
+            raise ServiceError(415, "attachment is not an XLSX workbook")
+        try:
+            if path.stat().st_size > MAX_XLSX_PREVIEW_BYTES:
+                raise KnowledgeFileError("XLSX preview input is too large")
+            with path.open("rb") as handle:
+                data = handle.read(MAX_XLSX_PREVIEW_BYTES + 1)
+            if len(data) > MAX_XLSX_PREVIEW_BYTES:
+                raise KnowledgeFileError("XLSX preview input is too large")
+            preview = extract_xlsx_preview(data)
+        except (OSError, KnowledgeFileError) as exc:
+            raise ServiceError(
+                422,
+                "XLSX preview is unavailable; the original file can still be downloaded",
+                code="xlsx_preview_unavailable",
+            ) from exc
+        return {
+            "attachment_id": int(attachment["id"]),
+            "filename": str(attachment.get("filename") or "workbook.xlsx"),
+            **preview,
+        }
+
     def _authorize_attachment(self, actor: dict[str, Any], row: dict[str, Any]) -> None:
         scope_type = str(row["scope_type"])
         scope_id = str(row["scope_id"])
@@ -16203,6 +16243,13 @@ class EnterpriseService:
             "url": f"/api/attachments/{int(row['id'])}",
             "download_url": f"/api/attachments/{int(row['id'])}?download=1",
         }
+        if (
+            Path(str(row.get("filename") or "")).suffix.casefold() == ".xlsx"
+            and mime_type.casefold() == XLSX_ATTACHMENT_MIME_TYPE
+        ):
+            item["preview_url"] = (
+                f"/api/attachments/{int(row['id'])}/xlsx-preview"
+            )
         if include_local_path:
             item["local_path"] = str(local_path)
             parts = storage_path.parts
@@ -16715,6 +16762,8 @@ class EnterpriseService:
         return (
             f"持久工作区是 {logical}{mapping}。默认在 {logical} 中工作并把交付文件保留在这里；"
             "保持目录有序，确认不再需要后清理自己产生的临时文件和中间产物。"
+            f"需要把生成的文件发送给用户时，在最终回复中单独写 MEDIA: {logical}/相对路径；"
+            "不要只报告文件路径，也不要把应交付的表格或文档降级成 Markdown。"
             "不要为了整理而删除用户上传、用户已有或用途不明的文件，也不要修改平台管理的 "
             f"{logical}/{self.config.workspace_internal_directory}/attachments。"
             f"宿主调用获批后，{logical} 会自动映射到同一工作区，"

@@ -1141,6 +1141,29 @@ class SkillStoreTests(unittest.TestCase):
                 instructions = document.read_text(encoding="utf-8")
                 self.assertNotIn(".ubitech/", instructions)
 
+    def test_repository_bundled_document_skills_send_real_workspace_files(self):
+        bundled_root = Path(skills_module.__file__).parent / "bundled_skills"
+        expected = {
+            "spreadsheets": ".xlsx",
+            "documents": ".docx",
+            "presentations": ".pptx",
+            "pdf-documents": ".pdf",
+        }
+        store = SkillStore(
+            Path(self.temporary.name) / "document-skill-data",
+            bundled_skills_dir=bundled_root,
+        )
+
+        for skill_id, extension in expected.items():
+            with self.subTest(skill_id=skill_id):
+                skill = store.load("private:user-1", skill_id)
+                instructions = skill["instructions"]
+                self.assertEqual(skill["source"], "bundled")
+                self.assertIn("/workspace/deliverables/", instructions)
+                self.assertIn("MEDIA:", instructions)
+                self.assertIn(extension, instructions)
+                self.assertIn("verify", instructions.casefold())
+
     def test_user_skill_shadows_bundled_skill_without_upgrade_overwrite(self):
         bundled_root = Path(self.temporary.name) / "bundled"
         package = self.create_bundled_skill(

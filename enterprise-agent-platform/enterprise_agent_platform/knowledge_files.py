@@ -4,6 +4,7 @@ import io
 import hashlib
 import hmac
 import json
+import posixpath
 import re
 import stat
 import zipfile
@@ -22,6 +23,17 @@ MAX_ARCHIVE_ENTRIES = 10_000
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
 MAX_XML_PART_BYTES = 32 * 1024 * 1024
 MAX_PDF_PAGES = 5_000
+MAX_XLSX_PREVIEW_BYTES = 50 * 1024 * 1024
+MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES = 2_048
+MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+MAX_XLSX_PREVIEW_XML_BYTES = 16 * 1024 * 1024
+MAX_XLSX_PREVIEW_SHEETS = 5
+MAX_XLSX_PREVIEW_ROWS = 100
+MAX_XLSX_PREVIEW_COLUMNS = 30
+MAX_XLSX_PREVIEW_CELLS = 2_000
+MAX_XLSX_PREVIEW_CELL_CHARS = 500
+MAX_XLSX_PREVIEW_SHARED_STRINGS = 100_000
+MAX_XLSX_PREVIEW_WORKBOOK_SHEETS = 1_000
 
 
 _CANONICAL_MEDIA_TYPES = {
@@ -204,6 +216,26 @@ def extract_knowledge_file(
     )
 
 
+def extract_xlsx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML workbook."""
+
+    if not data or len(data) > MAX_XLSX_PREVIEW_BYTES or not data.startswith(b"PK"):
+        raise KnowledgeFileError("XLSX preview input is invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = _validate_archive(
+                archive,
+                maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
+                maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
+            )
+            _validate_archive_identity(archive, names, ".xlsx")
+            return _extract_xlsx_preview(archive, names)
+    except KnowledgeFileError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise KnowledgeFileError("XLSX preview is malformed or unsupported") from exc
+
+
 def _decode_text(data: bytes) -> str:
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         encoding = "utf-16"
@@ -254,9 +286,18 @@ def _extract_archive_document(suffix: str, data: bytes) -> str:
         raise KnowledgeFileError("document container is malformed or unsupported") from exc
 
 
-def _validate_archive(archive: zipfile.ZipFile) -> set[str]:
+def _validate_archive(
+    archive: zipfile.ZipFile,
+    *,
+    maximum_entries: int | None = None,
+    maximum_uncompressed_bytes: int | None = None,
+) -> set[str]:
+    if maximum_entries is None:
+        maximum_entries = MAX_ARCHIVE_ENTRIES
+    if maximum_uncompressed_bytes is None:
+        maximum_uncompressed_bytes = MAX_ARCHIVE_UNCOMPRESSED_BYTES
     entries = archive.infolist()
-    if len(entries) > MAX_ARCHIVE_ENTRIES:
+    if len(entries) > maximum_entries:
         raise KnowledgeFileError("document archive contains too many entries")
     total = 0
     names: set[str] = set()
@@ -275,7 +316,7 @@ def _validate_archive(archive: zipfile.ZipFile) -> set[str]:
         if entry.flag_bits & 0x1:
             raise KnowledgeFileError("encrypted document archives are not supported")
         total += int(entry.file_size)
-        if total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        if total > maximum_uncompressed_bytes:
             raise KnowledgeFileError("document archive expands beyond the safety limit")
         names.add(name)
     return names
@@ -323,9 +364,14 @@ def _read_entry(archive: zipfile.ZipFile, name: str, *, maximum: int) -> bytes:
     return value
 
 
-def _root(archive: zipfile.ZipFile, name: str) -> ElementTree.Element:
+def _root(
+    archive: zipfile.ZipFile,
+    name: str,
+    *,
+    maximum: int = MAX_XML_PART_BYTES,
+) -> ElementTree.Element:
     return ElementTree.fromstring(
-        _read_entry(archive, name, maximum=MAX_XML_PART_BYTES)
+        _read_entry(archive, name, maximum=maximum)
     )
 
 
@@ -441,6 +487,201 @@ def _extract_xlsx(archive: zipfile.ZipFile, names: set[str]) -> str:
         if rows:
             output.append(f"## Sheet {index}\n" + "\n".join(rows))
     return "\n\n".join(output)
+
+
+def _xlsx_sheet_parts(
+    archive: zipfile.ZipFile,
+    names: set[str],
+) -> list[tuple[str, str]]:
+    required = {"xl/workbook.xml", "xl/_rels/workbook.xml.rels"}
+    if not required.issubset(names):
+        raise KnowledgeFileError("XLSX workbook metadata is missing")
+    relationships: dict[str, str] = {}
+    for relationship in _root(
+        archive,
+        "xl/_rels/workbook.xml.rels",
+        maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+    ).iter():
+        if _local_name(relationship.tag) != "Relationship":
+            continue
+        relationship_id = str(relationship.attrib.get("Id") or "")
+        relationship_type = str(relationship.attrib.get("Type") or "")
+        target = str(relationship.attrib.get("Target") or "")
+        if (
+            not relationship_id
+            or not relationship_type.endswith("/worksheet")
+            or str(relationship.attrib.get("TargetMode") or "").casefold() == "external"
+        ):
+            continue
+        target_path = PurePosixPath(target.lstrip("/"))
+        if target_path.is_absolute() or ".." in target_path.parts or "\\" in target:
+            raise KnowledgeFileError("XLSX worksheet relationship is unsafe")
+        normalized = posixpath.normpath(
+            target.lstrip("/") if target.startswith("/xl/") else f"xl/{target}"
+        )
+        if not normalized.startswith("xl/") or normalized not in names:
+            raise KnowledgeFileError("XLSX worksheet relationship is invalid")
+        relationships[relationship_id] = normalized
+
+    sheets: list[tuple[str, str]] = []
+    for element in _root(
+        archive,
+        "xl/workbook.xml",
+        maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+    ).iter():
+        if _local_name(element.tag) != "sheet":
+            continue
+        relationship_id = next(
+            (
+                str(value)
+                for key, value in element.attrib.items()
+                if _local_name(key) == "id"
+            ),
+            "",
+        )
+        part = relationships.get(relationship_id)
+        if part is None:
+            raise KnowledgeFileError("XLSX worksheet relationship is missing")
+        name = str(element.attrib.get("name") or f"Sheet {len(sheets) + 1}")
+        name = _preview_text(name)
+        sheets.append((name or f"Sheet {len(sheets) + 1}", part))
+        if len(sheets) > MAX_XLSX_PREVIEW_WORKBOOK_SHEETS:
+            raise KnowledgeFileError("XLSX workbook contains too many worksheets")
+    if not sheets:
+        raise KnowledgeFileError("XLSX document contains no worksheets")
+    return sheets
+
+
+def _xlsx_column_index(reference: str) -> int | None:
+    match = re.fullmatch(r"([A-Za-z]{1,4})[1-9][0-9]*", reference)
+    if match is None:
+        return None
+    value = 0
+    for character in match.group(1).upper():
+        value = value * 26 + ord(character) - ord("A") + 1
+    return value - 1
+
+
+def _preview_text(value: object) -> str:
+    return str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")[
+        :MAX_XLSX_PREVIEW_CELL_CHARS
+    ]
+
+
+def _xlsx_preview_cell(
+    cell: ElementTree.Element,
+    shared: list[tuple[str, bool]],
+) -> tuple[str, bool]:
+    formula = next(
+        (
+            str(child.text or "")
+            for child in cell
+            if _local_name(child.tag) == "f"
+        ),
+        "",
+    )
+    raw_value = next(
+        (
+            str(child.text or "")
+            for child in cell
+            if _local_name(child.tag) == "v"
+        ),
+        "",
+    )
+    kind = str(cell.attrib.get("t") or "")
+    source_truncated = False
+    if formula:
+        value = f"={formula}"
+    elif kind == "inlineStr":
+        value = _element_text(cell)
+    elif kind == "s" and raw_value:
+        try:
+            value, source_truncated = shared[int(raw_value)]
+        except (IndexError, ValueError) as exc:
+            raise KnowledgeFileError("XLSX shared string index is invalid") from exc
+    elif kind == "b":
+        value = "TRUE" if raw_value == "1" else "FALSE"
+    else:
+        value = raw_value
+    clean = _preview_text(value)
+    return clean, source_truncated or len(str(value or "")) > len(clean)
+
+
+def _extract_xlsx_preview(
+    archive: zipfile.ZipFile,
+    names: set[str],
+) -> dict[str, object]:
+    shared: list[tuple[str, bool]] = []
+    if "xl/sharedStrings.xml" in names:
+        for item in _root(
+            archive,
+            "xl/sharedStrings.xml",
+            maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+        ).iter():
+            if _local_name(item.tag) == "si":
+                raw = _element_text(item)
+                clean = _preview_text(raw)
+                shared.append((clean, len(raw) > len(clean)))
+                if len(shared) > MAX_XLSX_PREVIEW_SHARED_STRINGS:
+                    raise KnowledgeFileError(
+                        "XLSX workbook contains too many shared strings"
+                    )
+
+    sheet_parts = _xlsx_sheet_parts(archive, names)
+    preview_sheets: list[dict[str, object]] = []
+    total_cells = 0
+    overall_truncated = len(sheet_parts) > MAX_XLSX_PREVIEW_SHEETS
+    for sheet_name, part in sheet_parts[:MAX_XLSX_PREVIEW_SHEETS]:
+        rows: list[list[str]] = []
+        sheet_truncated = False
+        maximum_columns = 0
+        for row in _root(
+            archive,
+            part,
+            maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+        ).iter():
+            if _local_name(row.tag) != "row":
+                continue
+            if len(rows) >= MAX_XLSX_PREVIEW_ROWS or total_cells >= MAX_XLSX_PREVIEW_CELLS:
+                sheet_truncated = True
+                break
+            values: list[str] = []
+            sequential_column = 0
+            for cell in row:
+                if _local_name(cell.tag) != "c":
+                    continue
+                reference = str(cell.attrib.get("r") or "")
+                column = _xlsx_column_index(reference)
+                if column is None:
+                    column = sequential_column
+                sequential_column = column + 1
+                if column >= MAX_XLSX_PREVIEW_COLUMNS or total_cells >= MAX_XLSX_PREVIEW_CELLS:
+                    sheet_truncated = True
+                    continue
+                while len(values) <= column:
+                    values.append("")
+                value, value_truncated = _xlsx_preview_cell(cell, shared)
+                values[column] = value
+                sheet_truncated = sheet_truncated or value_truncated
+                total_cells += 1
+            while values and not values[-1]:
+                values.pop()
+            maximum_columns = max(maximum_columns, len(values))
+            rows.append(values)
+        overall_truncated = overall_truncated or sheet_truncated
+        preview_sheets.append(
+            {
+                "name": sheet_name,
+                "rows": rows,
+                "columns": maximum_columns,
+                "truncated": sheet_truncated,
+            }
+        )
+    return {
+        "sheet_count": len(sheet_parts),
+        "sheets": preview_sheets,
+        "truncated": overall_truncated,
+    }
 
 
 def _extract_odt(archive: zipfile.ZipFile, names: set[str]) -> str:

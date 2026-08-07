@@ -111,6 +111,8 @@ Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、�
 
 Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
 
+Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：XLSX、DOCX、PPTX 和 PDF 生成不依赖任务期间临时联网安装。依赖属于不可变 Sandbox generation，并由镜像构建、导入和真实文件生成测试共同验收；不能把这些库装入用户持久 HOME 后再把偶然缓存当作平台能力。
+
 Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回确认前必须等待匹配进程退出及其控制器完成输出、进程登记与 Sandbox 活动计数落盘。更新、reset、测试目录回收和 Sandbox 停止都不能在该屏障返回后再次收到旧 wait/watch goroutine 的迟到写入。
 
 ## 验收
@@ -122,6 +124,7 @@ Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回�
 - 登录、首页、消息、SSE 与附件可用；
 - 本人频道消息撤回会推进会话 reset revision，并在同一 current generation 的多客户端消息同步中收敛；
 - Sandbox 可按需创建、停止并保留工作区；
+- Sandbox 可离线生成可打开的 XLSX、DOCX、PPTX 和 PDF，并由 Agent 作为消息附件回传；
 - terminal、搜索、浏览器和网页提取分别报告真实状态；
 - Firecrawl 在保留 PostgreSQL 数据重建后仍可完成真实抓取；
 - SQLite 完整性、current generation 与 Manager journal 一致。

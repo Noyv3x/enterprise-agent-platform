@@ -95,6 +95,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 文件下载优先逐字节返回保存的原件，并使用原媒体类型、同源鉴权和安全 `Content-Disposition`；手工创建的条目导出为 UTF-8 Markdown。下载不触发重新提取、索引或 provider 调用。列表与正文 API 只返回文件元数据，不把原件 BLOB 塞入 JSON。
 
+聊天附件原件和附件元数据仍属于消息 scope。XLSX 预览是从已授权附件原件即时生成的有界派生 JSON，不单独持久化，也不进入知识索引、模型上下文或备份清单。解析只读取有限数量的工作表、行、列、单元格和字符串；响应明确标记工作表或内容截断。预览失败不修改附件，不改变下载语义。
+
 索引以 generation 构建：文档与待摄取 job 同事务落库，job 只引用 `document_id + expected_hash + generation_id`，不复制原文。worker 重新读取权威文档，在完整写入所有块与向量时再原子标记该文档 ready；只有覆盖全部当前文档的 ready generation 可原子切为 active。配置或模型变化时在 shadow generation 重建，不让半成品混入查询。
 
 检索只走 active generation 的查询向量与 cosine 相似度，然后按文档限额去重并在字符预算内返回邻接证据；结果始终包含可读的数字 `document_id`、稳定 `chunk_id`、来源偏移和 score。不存在 FTS、`LIKE`、第二检索后端或静默回退。缺少 API key 时知识库标记为 disabled；创建、重建和显式检索返回可诊断错误，文档列表/原文仍可用于配置与恢复。顶层 Run 的被动建议在未配置或 provider 短暂失败时 fail-open 并记录 degraded，不得返回伪装成“无命中”的空结果。
@@ -104,6 +106,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 用户技能存放在 `agent-skills/<scope-hash>/`，scope key 不直接出现在路径中。每个包以 `SKILL.md` 为可移植主体，`.skill.json` 只保存平台生命周期状态；支持文件只能位于 `references`、`templates`、`scripts` 和 `assets`。
 
 仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
+
+文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA:` 回传、保留最终产物并清理自己创建的中间文件；表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
 
 bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用 `.agent-platform/`。Skill 不提供双路径回退，也不根据管理员品牌选择路径。
 

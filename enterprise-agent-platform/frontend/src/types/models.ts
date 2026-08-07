@@ -118,8 +118,24 @@ export interface Attachment {
   is_image?: boolean;
   url?: string;
   download_url?: string;
+  preview_url?: string;
   /** true for optimistic blob: previews minted client-side via createObjectURL. */
   local_preview?: boolean;
+}
+
+export interface XlsxPreviewSheet {
+  name: string;
+  rows: string[][];
+  columns: number;
+  truncated: boolean;
+}
+
+export interface XlsxAttachmentPreview {
+  attachment_id: Id;
+  filename: string;
+  sheet_count: number;
+  sheets: XlsxPreviewSheet[];
+  truncated: boolean;
 }
 
 /** A single line in an Agent activity or work log. */

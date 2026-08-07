@@ -16,11 +16,11 @@ import {
   loadChannels,
   loadKnowledgeAdmin,
   loadKnowledgeStatus,
-  loadInitial,
   loadMessageAudit,
   loadPrivateConversations,
   loadPrivateMessages,
   loadRuntime,
+  loadSessionBootstrap,
   loadSecrets,
   loadSettings,
   loadTelegramConfig,
@@ -104,8 +104,7 @@ export async function impersonateAccount(store: AppStore, userId: Id): Promise<v
     // and atomically clear the outgoing account before hydrating the new one.
     resetSession(store, { preservePendingOperations: true });
     store.dispatch({ type: "SET_USER", payload: result.user });
-    await loadInitial(store);
-    store.dispatch({ type: "SET_ACTIVE_VIEW", payload: store.getState().activeView });
+    await loadSessionBootstrap(store);
     toast(t("admin.toast.impersonated", { name: result.user.display_name || result.user.username }), { type: "ok", title: t("admin.toast.complete") });
   });
 }

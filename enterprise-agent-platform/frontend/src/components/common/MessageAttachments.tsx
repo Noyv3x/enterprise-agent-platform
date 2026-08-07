@@ -8,6 +8,7 @@ import { useI18n } from "../../i18n";
 import { formatFileSize } from "../../utils/format";
 import type { Attachment } from "../../types";
 import { Icon } from "./Icon";
+import { XlsxAttachmentCard } from "./XlsxAttachmentCard";
 
 export function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
   const { t } = useI18n();
@@ -30,6 +31,14 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
               <img src={safeUrl(attachment.url, { allowData: true })} alt={name} loading="lazy" />
               <span className="msg-attachment__caption">{`${name} · ${size}`}</span>
             </a>
+          );
+        }
+        if (attachment.preview_url) {
+          return (
+            <XlsxAttachmentCard
+              key={String(attachment.id)}
+              attachment={attachment}
+            />
           );
         }
         return (

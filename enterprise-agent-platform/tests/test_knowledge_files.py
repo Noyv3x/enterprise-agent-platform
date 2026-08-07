@@ -18,6 +18,7 @@ from enterprise_agent_platform.knowledge_files import (
     ExtractedKnowledgeFile,
     KnowledgeFileError,
     extract_knowledge_file,
+    extract_xlsx_preview,
 )
 
 
@@ -133,6 +134,57 @@ class KnowledgeFileExtractionTests(unittest.TestCase):
         for filename, data, expected in cases:
             with self.subTest(filename=filename):
                 self.assertIn(expected, extract(filename, "application/octet-stream", data).content)
+
+    def test_xlsx_preview_preserves_sheet_names_columns_and_formula_text(self):
+        xlsx = archive({
+            "[Content_Types].xml": content_types(
+                "vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+            ),
+            "xl/workbook.xml": (
+                b"<workbook xmlns='x' xmlns:r='r'><sheets>"
+                b"<sheet name='Summary' r:id='rId1'/></sheets></workbook>"
+            ),
+            "xl/_rels/workbook.xml.rels": (
+                b"<Relationships><Relationship Id='rId1' "
+                b"Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
+                b"Target='worksheets/sheet1.xml'/></Relationships>"
+            ),
+            "xl/sharedStrings.xml": (
+                b"<sst xmlns='x'><si><t>Name</t></si><si><t>Alice</t></si></sst>"
+            ),
+            "xl/worksheets/sheet1.xml": (
+                b"<worksheet xmlns='x'><sheetData>"
+                b"<row r='1'><c r='A1' t='s'><v>0</v></c><c r='C1'><f>SUM(A2:A3)</f><v>2</v></c></row>"
+                b"<row r='2'><c r='A2' t='s'><v>1</v></c><c r='B2' t='b'><v>1</v></c></row>"
+                b"</sheetData></worksheet>"
+            ),
+        })
+
+        preview = extract_xlsx_preview(xlsx)
+
+        self.assertEqual(preview["sheet_count"], 1)
+        self.assertFalse(preview["truncated"])
+        sheet = preview["sheets"][0]
+        self.assertEqual(sheet["name"], "Summary")
+        self.assertEqual(sheet["rows"][0], ["Name", "", "=SUM(A2:A3)"])
+        self.assertEqual(sheet["rows"][1], ["Alice", "TRUE"])
+
+    def test_xlsx_preview_rejects_external_or_unsafe_worksheet_relationships(self):
+        xlsx = archive({
+            "[Content_Types].xml": content_types(
+                "vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"
+            ),
+            "xl/workbook.xml": (
+                b"<workbook xmlns='x' xmlns:r='r'><sheet name='Bad' r:id='rId1'/></workbook>"
+            ),
+            "xl/_rels/workbook.xml.rels": (
+                b"<Relationships><Relationship Id='rId1' "
+                b"Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
+                b"Target='../escape.xml'/></Relationships>"
+            ),
+        })
+        with self.assertRaisesRegex(KnowledgeFileError, "unsafe"):
+            extract_xlsx_preview(xlsx)
 
     def test_pdf_uses_existing_text_layer_and_rejects_scans(self):
         page = mock.Mock()

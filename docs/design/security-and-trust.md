@@ -108,6 +108,8 @@ Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验
 
 Multipart 正文必须增量读取并先写入 Platform 数据根内 owner-only 的请求 staging 目录；解析过程只保留边界探测所需的小型缓冲区，不得把完整请求或附件复制到内存。服务端完成数量、大小、配额、文件类型和摘要校验后再把 staging 文件流式提交到附件目录；请求成功、失败、取消或超时后都必须清理 staging。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载访问，路径固定为 `/workspace/.agent-platform/attachments`。Platform 不得把自己的数据路径写进普通 Run metadata；唯一例外是由可信配置派生、只进入当前 scope 系统提示的宿主工作区映射。Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
+XLSX 消息预览复用附件读取权限，不提供匿名或跨 scope 入口。服务端在解析前同时校验规范扩展名、媒体类型、ZIP/Office 容器身份、加密标志、条目路径、条目数、单项大小和累计展开大小；解析仅提取有界工作表、行列、单元格和字符串，公式作为惰性文本展示，不计算、不跟随外部关系、不加载宏或嵌入对象。响应只含纯文本单元格和截断元数据，并设置私有、禁止嗅探的 JSON 头。解析失败返回有界通用错误，原件下载继续可用。
+
 邮件附件保存不能使用“父目录 `lstat` 后再按完整路径 `open`”的检查/使用分离流程。Platform 必须固定可信 scope 的 workspace 根 fd，逐段相对父 fd 使用 `O_DIRECTORY | O_NOFOLLOW` 打开目录；缺失目录以 `mkdirat` 创建后重新打开并校验类型与部署用户 owner。最终文件相对固定父 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，随后用 fd 校验普通文件类型与 owner、收紧为 `0600` 并持久化。任何符号链接、特殊文件、owner 异常或并发路径替换都必须 fail closed，且失败清理只能针对同一固定父目录中由本次调用创建的 inode。
 
 Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理不可信路径。目录枚举只能从该 fd 读取名称，不能根据 `os.File` 的逻辑显示名重新解析宿主路径；每个名称随后以 `O_NOFOLLOW` 和非阻塞模式相对父目录 fd 打开，并以 fd 元数据决定是否读取或递归。符号链接不得跟随，FIFO、设备、socket 与其它特殊文件不得读取；附件覆盖层必须先于普通 workspace 映射并保持只读。该路径必须在 Manager 声明的最低 Go 版本与当前受支持版本上保持相同行为。

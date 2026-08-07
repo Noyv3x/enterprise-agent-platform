@@ -109,11 +109,6 @@ function applyMessageHistory(
 
 /* --------------------------------------------------------------- loaders */
 
-export async function loadInitial(store: AppStore): Promise<void> {
-  await Promise.all([loadChannels(store), loadMentionTargets(store)]);
-  await loadChannelMessages(store);
-}
-
 /** Apply the authenticated shell snapshot returned by the compact bootstrap API. */
 export function hydrateSessionBootstrap(
   store: AppStore,

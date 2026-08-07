@@ -47,6 +47,8 @@ Runtime 不创建、修复或推断宿主 workspace。每条 scope/runtime ident
 
 用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件使用 `/workspace/.agent-platform/attachments/...`；Manager 在当前 scope 的只读附件挂载中解析。Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
 
+Agent 生成的用户交付文件必须先写入当前 `/workspace`，再在最终回复中使用平台文件回传标记 `MEDIA: /workspace/<relative-path>`。Platform 是把该标记转换为消息附件的唯一边界，并继续执行路径、scope、数量、单文件和总字节校验；Runtime 不能把任意宿主路径或纯文本文件名伪装成附件。内置表格、文字文档、演示稿和 PDF Skill 应在相应产出请求中主动使用，默认交付 XLSX、DOCX、PPTX 或 PDF，而不是仅返回 Markdown 表格、代码片段或“文件已生成”的文字说明。Skill 必须要求生成后进行内容与结构校验、清理自身临时产物，并保留最终文件。
+
 模型可为单次 terminal、process 或文件调用显式选择 `target=host`。Sandbox 命令不等待人工审批；terminal、process 与文件工具的宿主目标都必须逐次取得用户批准，并且只提供本次批准或拒绝，不能创建 session/permanent 规则。批准后管理器以部署用户在宿主机执行，并允许该用户已有的免密 `sudo`。每次调用仍必须在执行前发出可见审计事件，包含未经隐藏的实际命令参数或 canonical 文件路径、目标、cwd 和超时；凭据只做安全脱敏。宿主执行不能复用为后续调用的隐式授权，也不能把 host 变为 Run 默认值。
 
 Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化、参数上限、凭据脱敏和输出上限。Sandbox 是工作环境隔离，不是恶意租户安全边界；host target 等同授予本次调用部署用户权限。Docker socket、管理器状态根和宿主凭据目录始终由管理器拒绝，即使请求 `target=host`。

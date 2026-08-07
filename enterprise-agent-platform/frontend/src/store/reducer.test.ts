@@ -19,6 +19,10 @@ const message: Message = {
 };
 
 describe("rootReducer session boundaries", () => {
+  it("starts the authenticated shell on the private Agent view", () => {
+    expect(initialAppState.activeView).toBe("private");
+  });
+
   it("clears the complete state tree on RESET_SESSION", () => {
     let state = rootReducer(initialAppState, { type: "SET_USER", payload: user });
     state = rootReducer(state, {

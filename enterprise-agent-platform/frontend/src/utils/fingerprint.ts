@@ -31,6 +31,7 @@ export function messageFingerprint(message: Message): unknown {
       is_image: !!item.is_image,
       url: item.url,
       download_url: item.download_url,
+      preview_url: item.preview_url,
       local_preview: !!item.local_preview,
     })),
     created_at: message.created_at,

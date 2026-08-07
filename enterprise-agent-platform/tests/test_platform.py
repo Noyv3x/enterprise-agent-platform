@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import http.client
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import threading
 import time
 import unittest
 import urllib.parse
+import zipfile
 import zlib
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +50,39 @@ from enterprise_agent_platform.service import (
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
 from enterprise_agent_platform.technical_profile import TARGET_TECHNICAL_PROFILE
+
+
+def make_xlsx_attachment() -> bytes:
+    output = io.BytesIO()
+    entries = {
+        "[Content_Types].xml": (
+            b"<Types><Override PartName='/xl/workbook.xml' "
+            b"ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'/>"
+            b"</Types>"
+        ),
+        "xl/workbook.xml": (
+            b"<workbook xmlns='x' xmlns:r='r'><sheets>"
+            b"<sheet name='Report' r:id='rId1'/></sheets></workbook>"
+        ),
+        "xl/_rels/workbook.xml.rels": (
+            b"<Relationships><Relationship Id='rId1' "
+            b"Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet' "
+            b"Target='worksheets/sheet1.xml'/></Relationships>"
+        ),
+        "xl/sharedStrings.xml": (
+            b"<sst xmlns='x'><si><t>Metric</t></si><si><t>Revenue</t></si></sst>"
+        ),
+        "xl/worksheets/sheet1.xml": (
+            b"<worksheet xmlns='x'><sheetData>"
+            b"<row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>2026</v></c></row>"
+            b"<row r='2'><c r='A2' t='s'><v>1</v></c><c r='B2'><v>42</v></c></row>"
+            b"</sheetData></worksheet>"
+        ),
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in entries.items():
+            archive.writestr(name, value)
+    return output.getvalue()
 
 
 class RecordingAgent:
@@ -3644,6 +3679,7 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertEqual(agent_message["content"], "created file")
                 self.assertEqual(agent_message["attachments"][0]["filename"], "result.csv")
+                self.assertIn("MEDIA: /workspace/", agent.calls[-1]["system_prompt"])
                 attachment, stored_path = service.get_attachment_file(user, agent_message["attachments"][0]["id"])
                 self.assertEqual(attachment["mime_type"], "text/csv")
                 source = service.db.query_one(
@@ -6255,6 +6291,61 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_xlsx_attachment_preview_is_authorized_bounded_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            token, admin = service.authenticate("admin", "admin")
+            result = service.send_private_message(
+                admin,
+                "preview this workbook",
+                [
+                    UploadedFile(
+                        "report.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        make_xlsx_attachment(),
+                    )
+                ],
+            )
+            attachment = result["user_message"]["attachments"][0]
+            self.assertEqual(
+                attachment["preview_url"],
+                f"/api/attachments/{attachment['id']}/xlsx-preview",
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET",
+                    attachment["preview_url"],
+                    headers={"Cookie": f"{config.session_cookie_name}={token}"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Cache-Control"), "no-store")
+                self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+                self.assertEqual(payload["filename"], "report.xlsx")
+                self.assertEqual(payload["sheets"][0]["name"], "Report")
+                self.assertEqual(
+                    payload["sheets"][0]["rows"],
+                    [["Metric", "2026"], ["Revenue", "42"]],
+                )
+                connection.close()
+
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request("GET", attachment["preview_url"])
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 401)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                service.close()
+
     def test_channel_message_withdraw_http_route_enforces_current_user_ownership(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
