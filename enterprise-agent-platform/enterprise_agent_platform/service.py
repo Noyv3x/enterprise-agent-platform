@@ -147,8 +147,10 @@ from .secure_fs import (
     UnsafePrivatePathError,
     copy_private_file_exclusive,
     ensure_private_directory,
+    open_private_child_directory_fd,
     open_private_directory_fd,
     open_private_file_fd_at,
+    read_private_file_at,
     verify_private_directory_path_fd,
     verify_private_file_fd_at,
     write_private_file_below_exclusive,
@@ -6252,7 +6254,9 @@ class EnterpriseService:
         self._reconcile_completed_input_group(task, result)
         self._ensure_agent_task_can_run(task)
         clean_content, generated_attachments = self._extract_generated_attachments(
-            result.content, owner_id=int(scope_id)
+            result.content,
+            owner_id=int(scope_id),
+            workspace_path=Path(agent_scope.workspace_path),
         )
         token_usage = self._token_usage_from_agent_result(result, generation)
         context_usage = extract_context_usage(result.raw)
@@ -16342,10 +16346,9 @@ class EnterpriseService:
             self.config.agent_runtime_data_dir / "cache",
             self._agent_media_tmp_dir(),
         ):
-            try:
-                subtrees.append(path.resolve())
-            except OSError:
-                continue
+            subtrees.append(
+                Path(os.path.abspath(os.path.expanduser(str(path))))
+            )
         return subtrees
 
     def _media_allowed_roots(
@@ -16366,7 +16369,7 @@ class EnterpriseService:
         arbitrary readable temp files via ``MEDIA:`` tags. Platform secrets
         elsewhere under the data directory (``platform.db``, runtime state,
         the bootstrap admin password) are never readable — see
-        ``_resolve_media_path``.
+        ``_media_file_reference``.
         """
         candidates = list(self._media_safe_data_subtrees(owner_id, workspace_path))
         media_roots_environment_variable = "AGENT_PLATFORM_MEDIA_ROOTS"
@@ -16376,46 +16379,100 @@ class EnterpriseService:
                 candidates.append(Path(raw).expanduser())
         roots: list[Path] = []
         for candidate in candidates:
-            try:
-                roots.append(candidate.resolve())
-            except OSError:
-                continue
+            root = Path(
+                os.path.abspath(os.path.expanduser(str(candidate)))
+            )
+            if root != Path(root.anchor) and root not in roots:
+                roots.append(root)
         return roots
 
-    def _resolve_media_path(
+    def _media_file_reference(
         self,
         raw_path: str,
         owner_id: int | None,
         workspace_path: Path | None = None,
-    ) -> Path | None:
-        """Resolve a model-supplied MEDIA: path, confining it to allowed roots.
+    ) -> tuple[Path, Path] | None:
+        """Map one MEDIA path to an allowed root and a safe relative path.
 
-        Symlinks are resolved before the containment check so a symlink inside
-        an allowed root cannot point at a sensitive file outside it. Returns the
-        resolved path only when it is a regular file under an allowed media root
-        AND not a platform secret under the data dir; otherwise returns None.
+        This function is lexical only. The caller must traverse the returned
+        reference from a pinned root fd and must never reopen the joined path.
         """
+        supplied = Path(os.path.expanduser(raw_path))
+        logical_workspace = Path(CONTAINER_PATHS["workspace"])
         try:
-            candidate = Path(os.path.expanduser(raw_path)).resolve()
-        except OSError:
+            relative = supplied.relative_to(logical_workspace)
+        except ValueError:
+            relative = None
+        if relative is not None:
+            if workspace_path is not None:
+                root = workspace_path
+            elif owner_id is not None:
+                root = self.config.workspace_dir / f"user-{int(owner_id)}"
+            else:
+                return None
+            root = Path(os.path.abspath(os.path.expanduser(str(root))))
+        else:
+            if not supplied.is_absolute():
+                return None
+            candidate = Path(os.path.abspath(str(supplied)))
+            roots = [
+                root
+                for root in self._media_allowed_roots(
+                    owner_id,
+                    workspace_path,
+                )
+                if candidate != root and candidate.is_relative_to(root)
+            ]
+            if not roots:
+                return None
+            root = max(roots, key=lambda item: len(item.parts))
+            relative = candidate.relative_to(root)
+        if (
+            relative is None
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
             return None
-        if not candidate.is_file():
-            return None
-        roots = self._media_allowed_roots(owner_id, workspace_path)
-        if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
-            return None
+        candidate = root / relative
         # Even within an allowed root (e.g. the temp dir overlapping a data dir
         # that an operator relocated under /tmp), never serve platform secrets:
         # reject anything under the data dir except the explicitly safe subtrees.
-        try:
-            data_root = self.config.data_dir.resolve()
-        except OSError:
-            return candidate
+        data_root = Path(
+            os.path.abspath(os.path.expanduser(str(self.config.data_dir)))
+        )
         if candidate == data_root or candidate.is_relative_to(data_root):
             safe = self._media_safe_data_subtrees(owner_id, workspace_path)
             if not any(candidate == s or candidate.is_relative_to(s) for s in safe):
                 return None
-        return candidate
+        return root, relative
+
+    @staticmethod
+    def _read_media_file_reference(
+        root: Path,
+        relative: Path,
+    ) -> tuple[Path, bytes]:
+        """Read one generated file through pinned, no-follow descriptors."""
+
+        directory_fd = open_private_directory_fd(root, mode=None)
+        try:
+            for part in relative.parts[:-1]:
+                child_fd = open_private_child_directory_fd(
+                    directory_fd,
+                    part,
+                    mode=None,
+                )
+                os.close(directory_fd)
+                directory_fd = child_fd
+            data, _ = read_private_file_at(
+                directory_fd,
+                relative.name,
+                maximum_bytes=MAX_ATTACHMENT_BYTES,
+                mode=None,
+                link_count=1,
+            )
+            return root / relative, data
+        finally:
+            os.close(directory_fd)
 
     def _extract_generated_attachments(
         self,
@@ -16427,49 +16484,45 @@ class EnterpriseService:
         candidates: list[UploadedFile] = []
         missing: list[str] = []
         refused: list[str] = []
-        seen_paths: set[Path] = set()
+        seen_paths: set[tuple[Path, Path]] = set()
         candidate_total = 0
         aggregate_limit_exceeded = False
         for match in MEDIA_TAG_RE.finditer(content):
             raw_path = clean_media_path(match.group("path"))
             if not raw_path:
                 continue
-            path = self._resolve_media_path(raw_path, owner_id, workspace_path)
-            if path is None:
-                # Distinguish "file is gone" from "file is outside the sandbox"
-                # for diagnostics, without reading anything out of scope.
-                try:
-                    exists = Path(os.path.expanduser(raw_path)).exists()
-                except OSError:
-                    exists = False
-                (refused if exists else missing).append(raw_path)
+            reference = self._media_file_reference(
+                raw_path,
+                owner_id,
+                workspace_path,
+            )
+            if reference is None:
+                refused.append(raw_path)
                 continue
-            if path in seen_paths:
+            if reference in seen_paths:
                 continue
-            seen_paths.add(path)
+            seen_paths.add(reference)
             if len(candidates) >= MAX_ATTACHMENTS_PER_MESSAGE:
                 refused.append(raw_path)
                 continue
             try:
-                size = path.stat().st_size
-                if size > MAX_ATTACHMENT_BYTES:
-                    refused.append(raw_path)
-                    continue
-                if MAX_ATTACHMENTS_TOTAL_BYTES > 0 and candidate_total + size > MAX_ATTACHMENTS_TOTAL_BYTES:
+                path, data = self._read_media_file_reference(*reference)
+                if (
+                    MAX_ATTACHMENTS_TOTAL_BYTES > 0
+                    and candidate_total + len(data)
+                    > MAX_ATTACHMENTS_TOTAL_BYTES
+                ):
                     refused.append(raw_path)
                     aggregate_limit_exceeded = True
-                    continue
-                with path.open("rb") as handle:
-                    data = handle.read(MAX_ATTACHMENT_BYTES + 1)
-                if len(data) > MAX_ATTACHMENT_BYTES:
-                    refused.append(raw_path)
                     continue
                 candidates.append(
                     UploadedFile(path.name, normalize_attachment_mime(path.name, ""), data)
                 )
                 candidate_total += len(data)
-            except OSError:
+            except FileNotFoundError:
                 missing.append(raw_path)
+            except (OSError, RuntimeError):
+                refused.append(raw_path)
 
         if aggregate_limit_exceeded:
             candidates = []

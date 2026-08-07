@@ -108,7 +108,7 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 - `delegation.*`、`context.compacted`、`session.repaired`；
 - `run.idle_timeout`、`run.turn_limit`、`run.cleanup_timeout`。
 
-终态为 `run.completed`、`run.failed`、`run.cancelled` 或 `run.needs_review`。完成数据包含 output/content、session、model、usage、context usage 和输入消费信息。
+终态为 `run.completed`、`run.failed`、`run.cancelled` 或 `run.needs_review`。完成数据包含 output/content、session、model、usage、context usage 和输入消费信息。若 Runtime 在一个含规范 `MEDIA: /workspace/<relative-path>` 的 assistant 回复后自动插入内部文件复验，只有相关变更已被成功复验清除时，`run.completed` 的 output/content 才把该交付标记去重保留下来，即使被持久化的最终 assistant 文本只报告复验结果；复验失败或仍有未确认变更时不恢复标记。Platform 仍是解析并授权附件的唯一边界。
 
 ## 审批与执行审计
 

@@ -107,7 +107,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
 
-文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA:` 回传、保留最终产物并清理自己创建的中间文件；表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
+文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA: /workspace/<relative-path>` 回传、保留最终产物并清理自己创建的中间文件；Platform 只按当前 Agent scope 的权威工作区解释该逻辑路径，Runtime 的成功内部复验不得丢失已经产生的交付标记，失败复验则不得恢复标记。表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
 
 bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用 `.agent-platform/`。Skill 不提供双路径回退，也不根据管理员品牌选择路径。
 

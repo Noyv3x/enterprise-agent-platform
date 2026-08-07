@@ -1100,13 +1100,23 @@ test("RunCoordinator requests one bounded verification after a file change", asy
     path: "changed.txt",
     content: "updated\n",
   }, workspace);
+  await writeFile(`${workspace}/summary.csv`, "status,ok\n", "utf8");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
       fauxToolCall("write_file", { path: "changed.txt", content: "updated\n" }),
       { stopReason: "toolUse" },
     ),
-    fauxAssistantMessage("The requested file was updated."),
+    fauxAssistantMessage(
+      "The requested file was updated.\n"
+      + "MEDIA: /workspace/changed.txt\n"
+      + "MEDIA: `/workspace/changed.txt`\n"
+      + "MEDIA: /workspace/summary.csv\n"
+      + "MEDIA: /workspace/../secret.txt\n"
+      + "MEDIA: /workspace/no-extension\n"
+      + "MEDIA: /workspace/changed.txt — still unverified\n"
+      + "MEDIA: /workspace/control\u0001.txt",
+    ),
     (context) => {
       assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
       return fauxAssistantMessage(
@@ -1114,7 +1124,9 @@ test("RunCoordinator requests one bounded verification after a file change", asy
         { stopReason: "toolUse" },
       );
     },
-    fauxAssistantMessage("Verified the updated file."),
+    fauxAssistantMessage(
+      "Verified the updated file.\nMEDIA: \"/workspace/summary.csv\"",
+    ),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
@@ -1129,7 +1141,11 @@ test("RunCoordinator requests one bounded verification after a file change", asy
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.equal(completed.result?.content, "Verified the updated file.");
+    assert.equal(
+      completed.result?.content,
+      "Verified the updated file.\nMEDIA: \"/workspace/summary.csv\""
+      + "\n\nMEDIA: /workspace/changed.txt",
+    );
     assert.equal(await readFile(`${workspace}/changed.txt`, "utf8"), "updated\n");
     assert.equal(faux.state.callCount, 4);
     assert.equal(
@@ -1248,6 +1264,124 @@ test("a failed terminal check does not satisfy file verification", async () => {
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "Verified after the failed check.");
     assert.equal(faux.state.callCount, 5);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a failed automatic verification does not restore a MEDIA marker", async () => {
+  const home = await temporaryDirectory("agent-failed-media-validation-");
+  const workspace = await temporaryDirectory("agent-failed-media-validation-workspace-");
+  await grantAlways(home, "scope", "write_file", {
+    path: "report.xlsx",
+    content: "not a valid workbook\n",
+  }, workspace);
+  await grantAlways(home, "scope", "terminal", {
+    command: "false # npm test",
+  }, workspace);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("write_file", {
+        path: "report.xlsx",
+        content: "not a valid workbook\n",
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      "The workbook is ready.\nMEDIA: /workspace/report.xlsx",
+    ),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("terminal", { command: "false # npm test" }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage(
+      "Workbook validation failed, so the file is not being delivered.",
+    ),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "failed-media-validation",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "create and validate report.xlsx",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      completed.result?.content,
+      "Workbook validation failed, so the file is not being delivered.",
+    );
+    assert.doesNotMatch(completed.result?.content || "", /MEDIA:/);
+    assert.equal(await readFile(`${workspace}/report.xlsx`, "utf8"), "not a valid workbook\n");
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a successful terminal document verification restores a MEDIA marker", async () => {
+  const home = await temporaryDirectory("agent-terminal-media-validation-");
+  const workspace = await temporaryDirectory("agent-terminal-media-validation-workspace-");
+  const createCommand = "python3 -c \"from pathlib import Path; "
+    + "Path('report.xlsx').write_bytes(b'xlsx')\"";
+  const validateCommand = "python3 -c \"from pathlib import Path; "
+    + "assert Path('report.xlsx').read_bytes() == b'xlsx'\" "
+    + "# openpyxl.load_workbook('/workspace/report.xlsx')";
+  await grantAlways(home, "scope", "terminal", { command: createCommand }, workspace);
+  await grantAlways(home, "scope", "terminal", { command: validateCommand }, workspace);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", { command: createCommand }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage(
+      "The workbook is ready.\nMEDIA: /workspace/report.xlsx",
+    ),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /contains no focused post-change check/);
+      return fauxAssistantMessage(
+        fauxToolCall("terminal", { command: validateCommand }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("The workbook reopened successfully."),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "terminal-media-validation",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "create and validate report.xlsx",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(
+      completed.result?.content,
+      "The workbook reopened successfully.\n\nMEDIA: /workspace/report.xlsx",
+    );
+    assert.equal(await readFile(`${workspace}/report.xlsx`, "utf8"), "xlsx");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

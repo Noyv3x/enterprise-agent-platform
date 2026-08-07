@@ -1094,6 +1094,9 @@ export class RunCoordinator {
         history.length,
         ephemeralMessages,
         record.request.workspace,
+        executionReview.validationSucceeded
+          ? executionReview.preservedMediaMarkers
+          : [],
       );
       const inputSummary = this.inputSummary(record.id);
       result.input_message_ids = inputSummary.input_message_ids;
@@ -1233,12 +1236,15 @@ export class RunCoordinator {
     }
     if (event.type === "message_end") {
       if (ephemeralMessages.has(event.message)) return;
-      if (
-        event.message.role === "assistant"
-        && executionReviewReason(executionReview, event.message) !== undefined
-      ) {
-        ephemeralMessages.add(event.message);
-        return;
+      if (event.message.role === "assistant") {
+        const reviewReason = executionReviewReason(executionReview, event.message);
+        if (reviewReason !== undefined) {
+          if (reviewReason === "validation") {
+            preserveWorkspaceMediaMarkers(executionReview, event.message);
+          }
+          ephemeralMessages.add(event.message);
+          return;
+        }
       }
       const entryId = await this.sessions.appendMessage(
         sessionIdentity(record.request),
@@ -2161,6 +2167,10 @@ function appendLearningReviewPolicy(systemPrompt: string): string {
 }
 
 const MAX_PROMISE_ONLY_CONTINUATIONS = 2;
+const MAX_PRESERVED_MEDIA_MARKERS = 32;
+const MAX_PRESERVED_MEDIA_MARKER_LENGTH = 4096;
+const PRESERVED_MEDIA_SUFFIX_RE = /\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)$/i;
+const UNSAFE_MEDIA_PATH_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 const PROMISE_ONLY_CONTINUATION = "Do not stop at a promise or progress statement. If the request requires action and "
   + "a suitable tool is available, perform the next concrete step now. If action is genuinely unnecessary or "
   + "impossible, give a self-contained final answer explaining that instead. Respect every permission, approval, and "
@@ -2173,16 +2183,20 @@ const FILE_VALIDATION_CONTINUATION = "Code or files changed, but the active run 
 interface ExecutionReviewState {
   promiseOnlyContinuations: number;
   validationContinuationIssued: boolean;
+  validationSucceeded: boolean;
   changedFiles: Set<string>;
   unknownFileChange: boolean;
+  preservedMediaMarkers: string[];
 }
 
 function createExecutionReviewState(): ExecutionReviewState {
   return {
     promiseOnlyContinuations: 0,
     validationContinuationIssued: false,
+    validationSucceeded: false,
     changedFiles: new Set<string>(),
     unknownFileChange: false,
+    preservedMediaMarkers: [],
   };
 }
 
@@ -2194,7 +2208,9 @@ function executionReviewFollowUp(
   updateExecutionEvidence(state, message, toolResults);
   const reason = executionReviewReason(state, message);
   if (reason === "validation") {
+    preserveWorkspaceMediaMarkers(state, message);
     state.validationContinuationIssued = true;
+    state.validationSucceeded = false;
     return runtimeReviewMessage(FILE_VALIDATION_CONTINUATION);
   }
   if (reason === "promise") {
@@ -2202,6 +2218,64 @@ function executionReviewFollowUp(
     return runtimeReviewMessage(PROMISE_ONLY_CONTINUATION);
   }
   return undefined;
+}
+
+function workspaceMediaMarkers(content: string): string[] {
+  const markers: string[] = [];
+  for (const line of content.split(/\r?\n/)) {
+    if (markers.length >= MAX_PRESERVED_MEDIA_MARKERS) break;
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.length > MAX_PRESERVED_MEDIA_MARKER_LENGTH) continue;
+    const match = /^MEDIA:\s*(.+)$/i.exec(trimmed);
+    if (!match) continue;
+    let path = String(match[1] || "").trim();
+    const wrapper = path[0];
+    if (wrapper === "`" || wrapper === "\"" || wrapper === "'") {
+      if (path.length < 2 || path[path.length - 1] !== wrapper) continue;
+      path = path.slice(1, -1).trim();
+    } else if (path.includes("`") || path.includes("\"") || path.includes("'")) {
+      continue;
+    }
+    const relative = path.slice(`${CONTAINER_PATHS.workspace}/`.length);
+    const segments = relative.split("/");
+    if (
+      !path.startsWith(`${CONTAINER_PATHS.workspace}/`)
+      || relative.length === 0
+      || segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+      || path.includes("\\")
+      || UNSAFE_MEDIA_PATH_TEXT_RE.test(path)
+      || path.length > MAX_PRESERVED_MEDIA_MARKER_LENGTH
+      || !PRESERVED_MEDIA_SUFFIX_RE.test(path)
+    ) continue;
+    const marker = `MEDIA: ${path}`;
+    if (!markers.includes(marker)) markers.push(marker);
+  }
+  return markers;
+}
+
+function preserveWorkspaceMediaMarkers(
+  state: ExecutionReviewState,
+  message: AssistantMessage,
+): void {
+  for (const marker of workspaceMediaMarkers(assistantText(message))) {
+    if (
+      state.preservedMediaMarkers.length >= MAX_PRESERVED_MEDIA_MARKERS
+      || state.preservedMediaMarkers.includes(marker)
+    ) continue;
+    state.preservedMediaMarkers.push(marker);
+  }
+}
+
+function appendPreservedMediaMarkers(
+  content: string,
+  preservedMarkers: readonly string[],
+): string {
+  if (preservedMarkers.length === 0) return content;
+  const present = new Set(workspaceMediaMarkers(content));
+  const missing = preservedMarkers.filter((marker) => !present.has(marker));
+  if (missing.length === 0) return content;
+  const base = content.trimEnd();
+  return `${base}${base ? "\n\n" : ""}${missing.join("\n")}`;
 }
 
 function executionReviewReason(
@@ -2238,11 +2312,55 @@ function updateExecutionEvidence(
   const results = new Map(toolResults.map((result) => [result.toolCallId, result]));
   for (const toolCall of assistantToolCalls(message)) {
     const result = results.get(toolCall.id);
-    if (!result || result.isError) continue;
+    if (!result) continue;
+    const validationAttempt = (
+      state.validationContinuationIssued
+      && isFocusedValidationToolCall(state, toolCall)
+    );
+    const successful = successfulToolResult(toolCall, result);
+    if (validationAttempt) state.validationSucceeded = successful;
+    if (result.isError) continue;
     const changedByThisCall = recordFileChange(state, toolCall);
-    if (!successfulToolResult(toolCall, result)) continue;
+    if (state.validationContinuationIssued && changedByThisCall) {
+      state.validationSucceeded = validationAttempt && successful;
+    }
+    if (!successful) continue;
     applyFileValidation(state, toolCall, changedByThisCall);
   }
+}
+
+function preservedMediaValidationPaths(state: ExecutionReviewState): string[] {
+  const workspacePrefix = `${CONTAINER_PATHS.workspace}/`;
+  return state.preservedMediaMarkers.flatMap((marker) => {
+    const path = marker.slice("MEDIA: ".length);
+    const normalized = normalizedValidationPath(path);
+    return path.startsWith(workspacePrefix)
+      ? [normalized, normalizedValidationPath(path.slice(workspacePrefix.length))]
+      : [normalized];
+  });
+}
+
+function isFocusedValidationToolCall(
+  state: ExecutionReviewState,
+  toolCall: ToolCall,
+): boolean {
+  const arguments_ = recordValue(toolCall.arguments);
+  if (toolCall.name === "read_file" || toolCall.name === "search_files") {
+    const path = normalizedValidationPath(arguments_.path);
+    return Boolean(path) && (
+      state.changedFiles.has(path)
+      || preservedMediaValidationPaths(state).includes(path)
+    );
+  }
+  if (toolCall.name !== "terminal") return false;
+  const command = String(arguments_.command || "");
+  if (isComprehensiveValidationCommand(command)) return true;
+  if (
+    /\b(?:openpyxl|load_workbook|PdfReader|python-pptx|python-docx|pdfinfo|qpdf|libreoffice|soffice|unzip\s+-t)\b/i.test(command)
+  ) return true;
+  return preservedMediaValidationPaths(state).some(
+    (path) => path.length > 0 && command.includes(path),
+  );
 }
 
 function assistantToolCalls(message: AssistantMessage): ToolCall[] {
@@ -2298,13 +2416,7 @@ function applyFileValidation(
   }
   if (toolCall.name !== "terminal") return;
   const command = String(recordValue(toolCall.arguments).command || "");
-  const comprehensive = [
-    /\b(?:pytest|unittest|compileall|go\s+test|cargo\s+(?:test|check|clippy)|make\s+(?:test|check))\b/i,
-    /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:run|exec)\s+)?(?:test|check|build|lint|typecheck)\b/i,
-    /\b(?:tsc|mypy|pyright|ruff\s+check|eslint)\b/i,
-    /\bgit\s+(?:diff|status|show)\b/i,
-  ].some((pattern) => pattern.test(command));
-  if (comprehensive) {
+  if (isComprehensiveValidationCommand(command)) {
     state.changedFiles.clear();
     state.unknownFileChange = false;
     return;
@@ -2315,6 +2427,15 @@ function applyFileValidation(
     if (command.includes(path)) state.changedFiles.delete(path);
   }
   if (changedByThisCall) state.unknownFileChange = false;
+}
+
+function isComprehensiveValidationCommand(command: string): boolean {
+  return [
+    /\b(?:pytest|unittest|compileall|go\s+test|cargo\s+(?:test|check|clippy)|make\s+(?:test|check))\b/i,
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:run|exec)\s+)?(?:test|check|build|lint|typecheck)\b/i,
+    /\b(?:tsc|mypy|pyright|ruff\s+check|eslint)\b/i,
+    /\bgit\s+(?:diff|status|show)\b/i,
+  ].some((pattern) => pattern.test(command));
 }
 
 function normalizedValidationPath(value: unknown): string {
@@ -2898,6 +3019,7 @@ function resultFromMessages(
   runMessageStart = 0,
   ephemeralMessages?: WeakSet<AgentMessage>,
   workspace?: string,
+  preservedMediaMarkers: readonly string[] = [],
 ): RunResult {
   const assistant = [...messages].reverse().find(
     (message): message is AssistantMessage => (
@@ -2928,7 +3050,10 @@ function resultFromMessages(
   }
   const contextUsage = contextUsageForCompletedTurn(messages, contextWindow);
   return {
-    content: assistantText(assistant),
+    content: appendPreservedMediaMarkers(
+      assistantText(assistant),
+      preservedMediaMarkers,
+    ),
     messages: durableRunResultMessages(
       messages.filter((message) => !ephemeralMessages?.has(message)),
       workspace,

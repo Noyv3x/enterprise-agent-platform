@@ -109,7 +109,7 @@ Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、�
 
 每个私人 Agent 和频道主 Agent拥有独立 Sandbox；委派子 Agent共享父 Sandbox。首次工具调用时按需创建，无任务且无后台进程达到空闲期限后停止但不删除持久目录。
 
-Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
+Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。Platform 容器不挂载 Sandbox 的 `/workspace`，而是把 Agent 回复中的逻辑交付路径映射到当前 scope 的 Platform 可见工作区，并通过固定目录/文件描述符安全读取后保存附件；后台 Sandbox 进程并发替换路径时交付失败关闭。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
 
 Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：XLSX、DOCX、PPTX 和 PDF 生成不依赖任务期间临时联网安装。依赖属于不可变 Sandbox generation，并由镜像构建、导入和真实文件生成测试共同验收；不能把这些库装入用户持久 HOME 后再把偶然缓存当作平台能力。
 

@@ -48,6 +48,8 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 `target=sandbox` 是默认值，在主 Agent 独立容器内执行。路径以 `/workspace` 为默认 cwd，只允许映射到该 Agent 的 workspace、HOME 和 env；后台进程登记在 Sandbox，决定其空闲生命周期。
 
+Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的逻辑交付声明。Platform 必须从当前服务端 scope 取得权威 `workspace_path`，仅把精确 `/workspace` 后代映射到该根，再从根目录 fd 逐段使用 `O_DIRECTORY | O_NOFOLLOW` 固定父目录，并以 `O_NOFOLLOW` 打开普通、单链接文件；大小复核和读取都使用同一个文件 fd，路径或叶节点在检查期间被替换时失败关闭。模型文本、owner id 推测、其它 scope 路径、`..` 穿越、符号链接和中央容器中偶然存在的 `/workspace` 都不能获得读取权限。Runtime 在内部复验间保存标记只保留完整一行、具受支持后缀且不含穿越或控制字符的规范路径文本，不授予文件权限，也不能把临时回复的尾随说明带入终态输出。
+
 `target=host` 必须由模型在当前 terminal、文件或进程调用中显式选择，并逐次弹出用户审批；只允许 `once` 或 `deny`，不形成 session/always 授权。未批准、超时或通知失败时不得先调用 Manager。批准后管理器在执行前持久化并向聊天发送审计事件；terminal 展示完整实际命令参数、canonical cwd、前后台方式和有效超时，文件与进程工具展示 canonical 目标及完整操作参数。执行后记录结果与副作用。日志可脱敏 secret，但不能隐去影响语义的普通参数。浏览器、Skill、计划等独立业务审批不因命令策略变化而自动取消。邮件发送、回复、移动、标记和保存附件同样逐次审批，审批记录隐藏正文与凭据；邮件唤醒的 unattended Run 无条件拒绝这些动作。
 
 工具审计序列化不得复用于模型历史。模型可见的 tool call 必须保留活动 schema 的原始结构，脱敏占位符仍须符合字段约束；只有工具名精确匹配且仅含既知字段的历史展示 envelope 可以在内存中收敛。工具名不匹配、调用者身份字段或其它未知字段一律失败关闭，不能以兼容为由删除后继续执行。

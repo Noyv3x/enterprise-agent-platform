@@ -23,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from enterprise_agent_platform import secure_fs
 from enterprise_agent_platform.agent_runtime_client import (
     AgentResult,
     AgentRuntimeHTTPError,
@@ -312,7 +313,7 @@ class RotatingSessionAgent(RecordingAgent):
 
 
 class MediaReturningAgent(RecordingAgent):
-    def __init__(self, media_path: Path):
+    def __init__(self, media_path: Path | str):
         self.media_path = media_path
         self.calls = []
 
@@ -3695,6 +3696,48 @@ class PlatformServiceTests(unittest.TestCase):
                 else:
                     os.environ["AGENT_PLATFORM_MEDIA_ROOTS"] = previous_roots
 
+    def test_agent_logical_workspace_media_is_saved_as_xlsx_attachment(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = MediaReturningAgent(
+                "/workspace/deliverables/report.xlsx"
+            )
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=agent,
+            )
+            try:
+                _, user = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(user["id"])
+                media_path = (
+                    Path(scope.workspace_path)
+                    / "deliverables"
+                    / "report.xlsx"
+                )
+                media_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = make_xlsx_attachment()
+                media_path.write_bytes(payload)
+
+                service.send_private_message(user, "make a workbook")
+                service.wait_for_agent_idle("private", str(user["id"]))
+                agent_message = service.list_messages(
+                    user,
+                    "private",
+                    str(user["id"]),
+                )[-1]
+
+                self.assertEqual(agent_message["content"], "created file")
+                self.assertEqual(len(agent_message["attachments"]), 1)
+                attachment = agent_message["attachments"][0]
+                self.assertEqual(attachment["filename"], "report.xlsx")
+                self.assertIn("preview_url", attachment)
+                _, stored_path = service.get_attachment_file(
+                    user,
+                    attachment["id"],
+                )
+                self.assertEqual(stored_path.read_bytes(), payload)
+            finally:
+                service.close()
+
     def test_agent_media_tags_outside_allowed_roots_are_refused(self):
         # A path that exists but lives outside the temp dir and the workspace
         # tree (here: next to the test file in the repo) must never be read and
@@ -3753,6 +3796,157 @@ class PlatformServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(attachments, [])
                 self.assertIn("outside the allowed media directories", content)
+            finally:
+                service.close()
+
+    def test_channel_logical_workspace_media_is_scope_confined(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+            )
+            try:
+                first_scope = service.agent_scopes.ensure_channel_scope(1)
+                second_scope = service.agent_scopes.ensure_channel_scope(2)
+                own = Path(first_scope.workspace_path) / "report.xlsx"
+                foreign = Path(second_scope.workspace_path) / "foreign.xlsx"
+                own.write_bytes(make_xlsx_attachment())
+                foreign.write_bytes(make_xlsx_attachment())
+
+                content, attachments = service._extract_generated_attachments(
+                    "result\nMEDIA: /workspace/report.xlsx",
+                    workspace_path=Path(first_scope.workspace_path),
+                )
+                self.assertEqual(content, "result")
+                self.assertEqual(
+                    [attachment.filename for attachment in attachments],
+                    ["report.xlsx"],
+                )
+
+                _, traversal_attachments = (
+                    service._extract_generated_attachments(
+                        "MEDIA: /workspace/../channel-2/foreign.xlsx",
+                        workspace_path=Path(first_scope.workspace_path),
+                    )
+                )
+                self.assertEqual(traversal_attachments, [])
+                symlink = Path(first_scope.workspace_path) / "foreign.xlsx"
+                symlink.symlink_to(foreign)
+                _, symlink_attachments = (
+                    service._extract_generated_attachments(
+                        "MEDIA: /workspace/foreign.xlsx",
+                        workspace_path=Path(first_scope.workspace_path),
+                    )
+                )
+                self.assertEqual(symlink_attachments, [])
+            finally:
+                service.close()
+
+    def test_agent_media_parent_replacement_cannot_escape_workspace(self):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            tempfile.TemporaryDirectory() as outside_td,
+        ):
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+            )
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                workspace = Path(scope.workspace_path)
+                deliverables = workspace / "deliverables"
+                deliverables.mkdir()
+                (deliverables / "report.xlsx").write_bytes(
+                    make_xlsx_attachment()
+                )
+                outside = Path(outside_td)
+                (outside / "report.xlsx").write_bytes(b"SECRET")
+                original = workspace / "deliverables-original"
+                replaced = False
+
+                def replace_parent(directory_fd, name, *, mode=0o700):
+                    nonlocal replaced
+                    if name == "deliverables" and not replaced:
+                        replaced = True
+                        deliverables.rename(original)
+                        deliverables.symlink_to(
+                            outside,
+                            target_is_directory=True,
+                        )
+                    return secure_fs.open_private_child_directory_fd(
+                        directory_fd,
+                        name,
+                        mode=mode,
+                    )
+
+                with mock.patch(
+                    "enterprise_agent_platform.service."
+                    "open_private_child_directory_fd",
+                    side_effect=replace_parent,
+                ):
+                    _, attachments = service._extract_generated_attachments(
+                        "MEDIA: /workspace/deliverables/report.xlsx",
+                        owner_id=1,
+                        workspace_path=workspace,
+                    )
+                self.assertTrue(replaced)
+                self.assertEqual(attachments, [])
+            finally:
+                service.close()
+
+    def test_agent_media_leaf_replacement_and_symlink_loop_fail_closed(self):
+        with (
+            tempfile.TemporaryDirectory() as td,
+            tempfile.TemporaryDirectory() as outside_td,
+        ):
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+            )
+            try:
+                scope = service.agent_scopes.ensure_private_scope(1)
+                workspace = Path(scope.workspace_path)
+                report = workspace / "report.xlsx"
+                report.write_bytes(make_xlsx_attachment())
+                outside = Path(outside_td) / "secret.xlsx"
+                outside.write_bytes(b"SECRET")
+                original = workspace / "report-original.xlsx"
+                real_open = os.open
+                replaced = False
+
+                def replace_leaf(path, flags, *args, **kwargs):
+                    nonlocal replaced
+                    if (
+                        path == "report.xlsx"
+                        and kwargs.get("dir_fd") is not None
+                        and not replaced
+                    ):
+                        replaced = True
+                        report.rename(original)
+                        report.symlink_to(outside)
+                    return real_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(
+                    secure_fs.os,
+                    "open",
+                    side_effect=replace_leaf,
+                ):
+                    _, attachments = service._extract_generated_attachments(
+                        "MEDIA: /workspace/report.xlsx",
+                        owner_id=1,
+                        workspace_path=workspace,
+                    )
+                self.assertTrue(replaced)
+                self.assertEqual(attachments, [])
+
+                loop = workspace / "loop.xlsx"
+                loop.symlink_to(loop.name)
+                _, loop_attachments = service._extract_generated_attachments(
+                    "MEDIA: /workspace/loop.xlsx",
+                    owner_id=1,
+                    workspace_path=workspace,
+                )
+                self.assertEqual(loop_attachments, [])
             finally:
                 service.close()
 
