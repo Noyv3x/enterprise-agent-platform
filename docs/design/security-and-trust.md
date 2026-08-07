@@ -16,6 +16,8 @@
 
 权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。Platform、Runtime 与 Manager 的内部接口分别使用独立 bearer 或 owner-only Unix socket；浏览器 session 不能替代内部身份。
 
+频道消息撤回是登录用户的受限写操作。Platform 必须在同一频道消息锁内重新读取当前活动账号和权限，并同时验证频道可读、仍有聊天权限、消息仍可见、消息类型为用户以及 `user_id` 与当前账号精确相等；管理员身份不绕过本人所有权，代删继续使用独立的管理审计接口。客户端提供的消息作者、scope 或可见按钮都不能替代这些检查。
+
 ## 容器与网络边界
 
 只有宿主管理器访问 Docker socket。Platform、Runtime、Sandbox、Camoufox、SearXNG 和 Firecrawl 都不得挂载或代理 Docker socket。固定服务与 Sandbox 位于管理器预创建并持有的持久私有 bridge 网络；Compose generation 只引用该 external network，不创建或删除它，因此固定栈切换不能中断仍在运行的 Sandbox。管理器只接管带产品 managed label 且 driver 符合契约的网络；同名但来源或配置不明的网络必须拒绝而不是覆盖。只有 Platform backend 被管理器发布到宿主回环，sidecar 不发布公网端口。

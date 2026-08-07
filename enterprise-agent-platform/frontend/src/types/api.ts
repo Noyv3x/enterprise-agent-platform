@@ -169,6 +169,11 @@ export interface PostMessageResponse {
   input_group_id?: string;
 }
 
+export interface WithdrawChannelMessageResponse {
+  withdrawn: true;
+  message_id: Id;
+}
+
 export interface AgentApprovalSubmitRequest {
   choice: AgentApprovalChoice;
 }

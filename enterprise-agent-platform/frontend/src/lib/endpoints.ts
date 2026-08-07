@@ -92,6 +92,7 @@ import type {
   UpdateCurrentUserResponse,
   UpdateUserRequest,
   UsersResponse,
+  WithdrawChannelMessageResponse,
 } from "../types";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -173,6 +174,10 @@ export const endpoints = {
   postChannelMessage: ep<PostMessageRequest | FormData, PostMessageResponse, [Id]>(
     "POST",
     (id) => `/api/channels/${id}/messages`,
+  ),
+  withdrawChannelMessage: ep<string, WithdrawChannelMessageResponse, [Id, Id]>(
+    "DELETE",
+    (channelId, messageId) => `/api/channels/${channelId}/messages/${messageId}`,
   ),
   channelTyping: ep<TypingRequest, unknown, [Id]>(
     "POST",

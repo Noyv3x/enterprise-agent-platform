@@ -3827,6 +3827,83 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_channel_user_can_withdraw_only_their_own_persisted_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                member = service.create_user(
+                    username="alice",
+                    password="alice-pass",
+                    display_name="Alice",
+                    permission_group="member",
+                    actor=admin,
+                )
+                own = service.send_channel_message(member, 1, "@agent keep working")["user_message"]
+                other = service.send_channel_message(admin, 1, "admin message")["user_message"]
+                permission_guard = service.send_channel_message(
+                    member, 1, "keep after permission downgrade"
+                )["user_message"]
+                service.wait_for_agent_idle("channel", "1", timeout=3)
+                before = service.conversation_revision("channel", "1")
+
+                with self.assertRaises(ServiceError) as member_error:
+                    service.withdraw_channel_message(member, 1, other["id"])
+                self.assertEqual(member_error.exception.status, 403)
+                with self.assertRaises(ServiceError) as admin_error:
+                    service.withdraw_channel_message(admin, 1, own["id"])
+                self.assertEqual(admin_error.exception.status, 403)
+
+                withdrawn = service.withdraw_channel_message(member, 1, own["id"])
+                self.assertEqual(
+                    withdrawn,
+                    {"withdrawn": True, "message_id": own["id"]},
+                )
+                hidden = service.db.query_one(
+                    "SELECT hidden_at, hidden_by_user_id FROM messages WHERE id = ?",
+                    (own["id"],),
+                )
+                self.assertIsNotNone(hidden["hidden_at"])
+                self.assertEqual(hidden["hidden_by_user_id"], member["id"])
+                after = service.conversation_revision("channel", "1")
+                self.assertGreater(after["reset_revision"], before["reset_revision"])
+                self.assertNotIn(
+                    own["id"],
+                    [message["id"] for message in service.list_messages(member, "channel", "1")],
+                )
+                self.assertTrue(
+                    any(
+                        message["author_type"] == "agent"
+                        for message in service.list_messages(member, "channel", "1")
+                    )
+                )
+                job = service.jobs.get_by_key("agent", f"message:{own['id']}")
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "succeeded")
+
+                with self.assertRaises(ServiceError) as repeated:
+                    service.withdraw_channel_message(member, 1, own["id"])
+                self.assertEqual(repeated.exception.status, 404)
+
+                service.update_user(
+                    admin,
+                    member["id"],
+                    {"permission_group": "viewer"},
+                )
+                with self.assertRaises(ServiceError) as revoked:
+                    service.withdraw_channel_message(
+                        member, 1, permission_guard["id"]
+                    )
+                self.assertEqual(revoked.exception.status, 403)
+                self.assertIsNone(
+                    service.db.scalar(
+                        "SELECT hidden_at FROM messages WHERE id = ?",
+                        (permission_guard["id"],),
+                    )
+                )
+            finally:
+                service.close()
+
     def test_admin_can_audit_all_private_agent_conversations(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -6178,6 +6255,64 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_channel_message_withdraw_http_route_enforces_current_user_ownership(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            _, admin = service.authenticate("admin", "admin")
+            member = service.create_user(
+                username="withdraw-http-member",
+                password="withdraw-http-pass",
+                permission_group="member",
+                actor=admin,
+            )
+            token, member = service.authenticate(
+                "withdraw-http-member", "withdraw-http-pass"
+            )
+            own = service.send_channel_message(member, 1, "withdraw through HTTP")[
+                "user_message"
+            ]
+            other = service.send_channel_message(admin, 1, "not yours")["user_message"]
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            headers = {
+                "Content-Type": "application/json",
+                "Cookie": f"{config.session_cookie_name}={token}",
+                "Origin": origin,
+            }
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                connection.request(
+                    "DELETE",
+                    f"/api/channels/1/messages/{other['id']}",
+                    body="{}",
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+
+                connection.request(
+                    "DELETE",
+                    f"/api/channels/1/messages/{own['id']}",
+                    body="{}",
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    payload,
+                    {"withdrawn": True, "message_id": own["id"]},
+                )
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                service.close()
+
     def test_knowledge_file_http_import_and_download_use_multipart_and_attachment_headers(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

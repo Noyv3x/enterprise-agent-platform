@@ -5823,6 +5823,39 @@ class EnterpriseService:
             "agent_status": enqueue_result["agent_status"],
         }
 
+    def withdraw_channel_message(
+        self,
+        actor: dict[str, Any],
+        channel_id: int,
+        message_id: int,
+    ) -> dict[str, Any]:
+        """Hide one persisted channel message owned by the current user."""
+
+        with self._conversation_lock:
+            actor = self._fresh_active_actor(actor)
+            require_permission(actor, PERMISSION_CHAT)
+            self._normalize_conversation(actor, "channel", str(channel_id))
+            row = self.db.query_one(
+                """
+                SELECT id, author_type, user_id
+                FROM messages
+                WHERE id = ? AND scope_type = 'channel' AND scope_id = ?
+                  AND hidden_at IS NULL
+                """,
+                (int(message_id), str(channel_id)),
+            )
+            if not row:
+                raise ServiceError(404, "channel message not found")
+            if (
+                str(row["author_type"]) != "user"
+                or row["user_id"] is None
+                or int(row["user_id"]) != int(actor["id"])
+            ):
+                raise ServiceError(403, "only the message author can withdraw it")
+            if self._hide_message_ids([int(message_id)], actor_id=int(actor["id"])) != 1:
+                raise ServiceError(409, "channel message is no longer available")
+        return {"withdrawn": True, "message_id": int(message_id)}
+
     def _send_channel_agent_reply(self, task: dict[str, Any]) -> dict[str, Any]:
         scope_id = str(task["scope_id"])
         channel = task["channel"]

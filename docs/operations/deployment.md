@@ -120,6 +120,7 @@ Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回�
 - Manager active/enabled，且没有 active/finalize operation；
 - Platform、Runtime 与公共 `/healthz` 正常；
 - 登录、首页、消息、SSE 与附件可用；
+- 本人频道消息撤回会推进会话 reset revision，并在同一 current generation 的多客户端消息同步中收敛；
 - Sandbox 可按需创建、停止并保留工作区；
 - terminal、搜索、浏览器和网页提取分别报告真实状态；
 - Firecrawl 在保留 PostgreSQL 数据重建后仍可完成真实抓取；

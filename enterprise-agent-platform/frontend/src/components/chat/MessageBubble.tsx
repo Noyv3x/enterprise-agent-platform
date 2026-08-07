@@ -19,8 +19,21 @@ import { MessageBody } from "./MessageBody";
 import { MessageMeta } from "./MessageMeta";
 import { CopyButton } from "./CopyButton";
 import { ScheduledTaskMarker } from "./ScheduledTaskMarker";
+import { WithdrawMessageButton } from "./WithdrawMessageButton";
 
-function MessageBubbleImpl({ message }: { message: Message }) {
+interface MessageBubbleProps {
+  message: Message;
+  canWithdraw?: boolean;
+  withdrawing?: boolean;
+  onWithdraw?: (messageId: Message["id"]) => Promise<void> | void;
+}
+
+function MessageBubbleImpl({
+  message,
+  canWithdraw = false,
+  withdrawing = false,
+  onWithdraw,
+}: MessageBubbleProps) {
   const { t } = useI18n();
   const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
@@ -31,6 +44,17 @@ function MessageBubbleImpl({ message }: { message: Message }) {
   const showWorkCard = !!agentWork && hasAgentProcessSteps(agentWork);
   const scheduledTask = message.metadata?.scheduled_task;
   const upload = message.metadata?.upload;
+  const messageActions = message.content || (canWithdraw && onWithdraw) ? (
+    <span className="msg__actions">
+      {canWithdraw && onWithdraw ? (
+        <WithdrawMessageButton
+          loading={withdrawing}
+          onConfirm={() => onWithdraw(message.id)}
+        />
+      ) : null}
+      {message.content ? <CopyButton value={message.content} kind="message" /> : null}
+    </span>
+  ) : null;
 
   if (scheduledTask && message.author_type === "system") {
     return <ScheduledTaskMarker marker={scheduledTask} message={message} />;
@@ -53,7 +77,7 @@ function MessageBubbleImpl({ message }: { message: Message }) {
           isUser={isUser}
           pending={pending}
           streaming={streaming}
-          action={message.content ? <CopyButton value={message.content} kind="message" /> : null}
+          action={messageActions}
         />
         {showWorkCard && agentWork ? <AgentWorkCard work={agentWork} active={false} /> : null}
         {message.content ? <MessageBody content={message.content} /> : null}
@@ -79,5 +103,9 @@ function MessageBubbleImpl({ message }: { message: Message }) {
 
 export const MessageBubble = memo(
   MessageBubbleImpl,
-  (prev, next) => messageFingerprintKey(prev.message) === messageFingerprintKey(next.message),
+  (prev, next) =>
+    messageFingerprintKey(prev.message) === messageFingerprintKey(next.message) &&
+    prev.canWithdraw === next.canWithdraw &&
+    prev.withdrawing === next.withdrawing &&
+    prev.onWithdraw === next.onWithdraw,
 );

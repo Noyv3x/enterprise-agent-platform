@@ -20,7 +20,7 @@ import {
   type ApiOptions,
   type ApiUploadProgress,
 } from "../lib/api";
-import { endpoints } from "../lib/endpoints";
+import { EMPTY_BODY, endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
 import { t } from "../i18n";
 import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
@@ -67,6 +67,7 @@ import type {
   PostMessageResponse,
   PrivateMessagesResponse,
   TypingUser,
+  WithdrawChannelMessageResponse,
 } from "../types";
 
 /* Cross-source re-entrancy mutex: SSE update handlers and the safety poll both
@@ -675,6 +676,45 @@ export async function sendMessage(
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
     toast(text, { type: "error", title: t("chat.sendFailed") });
+    return false;
+  }
+}
+
+/** Withdraw one server-persisted message owned by the current channel user. */
+export async function withdrawChannelMessage(
+  store: AppStore,
+  channelId: string,
+  messageId: Id,
+): Promise<boolean> {
+  try {
+    await api<WithdrawChannelMessageResponse>(
+      endpoints.withdrawChannelMessage.path(channelId, messageId),
+      { method: "DELETE", body: EMPTY_BODY },
+    );
+    const state = store.getState();
+    if (
+      state.activeView === "channel" &&
+      String(state.activeChannelId) === String(channelId)
+    ) {
+      store.dispatch({
+        type: "SET_MESSAGES",
+        payload: state.messages.filter(
+          (message) => String(message.id) !== String(messageId),
+        ),
+      });
+      cacheVisibleChat(store);
+      await refreshActiveChat(store);
+    }
+    toast(t("chat.withdraw.success"), {
+      type: "ok",
+      title: t("chat.withdraw.successTitle"),
+    });
+    return true;
+  } catch (error) {
+    if (isApiRequestCancelled(error)) return false;
+    const text = error instanceof Error ? error.message || String(error) : String(error);
+    store.dispatch({ type: "SET_ERROR", payload: text });
+    toast(text, { type: "error", title: t("chat.withdraw.failed") });
     return false;
   }
 }

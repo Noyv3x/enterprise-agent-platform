@@ -3,7 +3,7 @@ import { resetApiSession } from "../lib/api";
 import { createStore } from "../lib/store";
 import { initialAppState, rootReducer } from "../store/reducer";
 import type { Message, PostMessageResponse, User } from "../types";
-import { refreshActiveChat, sendMessage } from "./chatActions";
+import { refreshActiveChat, sendMessage, withdrawChannelMessage } from "./chatActions";
 
 class FakeUploadRequest {
   static instances: FakeUploadRequest[] = [];
@@ -81,10 +81,96 @@ function privateStore() {
   return store;
 }
 
+function channelStore(messages: Message[]) {
+  const user = {
+    id: 7,
+    username: "alice",
+    display_name: "Alice",
+    active: true,
+    permissions: ["read_workspace", "chat"],
+  } as User;
+  return createStore(rootReducer, {
+    ...initialAppState,
+    user,
+    activeView: "channel" as const,
+    activeChannelId: 3,
+    messages,
+  });
+}
+
 afterEach(() => {
   resetApiSession();
   vi.unstubAllGlobals();
   FakeUploadRequest.instances = [];
+});
+
+describe("channel message withdrawal", () => {
+  it("removes the confirmed message and refreshes the reset boundary", async () => {
+    const message: Message = {
+      id: 44,
+      scope_type: "channel",
+      scope_id: "3",
+      author_type: "user",
+      user_id: 7,
+      username: "Alice",
+      content: "withdraw me",
+    };
+    const fetchMock = vi.fn(async (_path: string, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        return response(200, { withdrawn: true, message_id: 44 });
+      }
+      return response(200, {
+        messages: [],
+        mode: "full",
+        message_revision: 2,
+        reset_revision: 2,
+        next_after_id: 0,
+        next_before_id: null,
+        has_more_before: false,
+        agent_status: { state: "idle" },
+        typing: [],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const store = channelStore([message]);
+
+    await expect(withdrawChannelMessage(store, "3", 44)).resolves.toBe(true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "/api/channels/3/messages/44",
+      expect.objectContaining({ method: "DELETE", body: "{}" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/api/channels/3/messages",
+      expect.anything(),
+    );
+    expect(store.getState().messages).toEqual([]);
+    expect(store.getState().messageSyncCursors["channel:3"]?.resetRevision).toBe(2);
+  });
+
+  it("keeps the message when the server rejects ownership", async () => {
+    const message: Message = {
+      id: 45,
+      scope_type: "channel",
+      scope_id: "3",
+      author_type: "user",
+      user_id: 7,
+      username: "Alice",
+      content: "keep me",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response(403, { error: "only the message author can withdraw it" })),
+    );
+    const store = channelStore([message]);
+
+    await expect(withdrawChannelMessage(store, "3", 45)).resolves.toBe(false);
+
+    expect(store.getState().messages).toEqual([message]);
+    expect(store.getState().error).toContain("only the message author");
+  });
 });
 
 describe("private rapid-message sends", () => {

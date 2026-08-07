@@ -74,8 +74,14 @@
   min-height: 28px;
 }
 
-.msg__meta > .chat-copy {
+.msg__meta > .msg__actions {
   margin-left: auto;
+}
+
+.msg__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .chat-copy {
@@ -110,6 +116,12 @@
 
 .chat-copy.is-copied { color: var(--ok); }
 .chat-copy.is-failed { color: var(--danger); }
+
+.chat-withdraw.chat-withdraw {
+  min-height: 28px;
+  padding: 3px 7px;
+  font-size: 11px;
+}
 
 .scheduled-message-marker {
   width: 100%;

@@ -55,6 +55,53 @@ describe("MessageList Agent work records", () => {
     expect(view.container.querySelector(".agent-work")).toBeNull();
   });
 
+  it("offers withdrawal only for the current user's persisted channel messages", () => {
+    renderMessageList(
+      { state: "idle" },
+      [
+        {
+          id: 1,
+          scope_type: "channel",
+          scope_id: "1",
+          author_type: "user",
+          user_id: 1,
+          username: "Administrator",
+          content: "mine",
+        },
+        {
+          id: 2,
+          scope_type: "channel",
+          scope_id: "1",
+          author_type: "user",
+          user_id: 2,
+          username: "Alice",
+          content: "theirs",
+        },
+        {
+          id: 3,
+          scope_type: "channel",
+          scope_id: "1",
+          author_type: "agent",
+          user_id: null,
+          username: "Agent",
+          content: "answer",
+        },
+        {
+          id: "tmp-4",
+          scope_type: "channel",
+          scope_id: "1",
+          author_type: "user",
+          user_id: 1,
+          username: "Administrator",
+          content: "sending",
+          metadata: { local_pending: true },
+        },
+      ],
+    );
+
+    expect(screen.getAllByRole("button", { name: "Withdraw" })).toHaveLength(1);
+  });
+
   it("keeps approval separate from work records when no tool was called", () => {
     const view = renderMessageList({
       state: "approval",

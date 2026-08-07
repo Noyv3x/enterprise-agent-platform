@@ -105,6 +105,30 @@ describe("MessageBody", () => {
     expect(writeText).toHaveBeenCalledWith("**formatted** message");
   });
 
+  it("confirms a message withdrawal before invoking the mutation", async () => {
+    const user = userEvent.setup();
+    const onWithdraw = vi.fn().mockResolvedValue(undefined);
+    const message: Message = {
+      id: 17,
+      scope_type: "channel",
+      scope_id: "1",
+      author_type: "user",
+      user_id: 7,
+      username: "Alice",
+      content: "remove this",
+      created_at: 1_700_000_000,
+    };
+
+    renderLocalized(
+      <MessageBubble message={message} canWithdraw onWithdraw={onWithdraw} />,
+    );
+    await user.click(screen.getByRole("button", { name: "Withdraw" }));
+    const confirmations = screen.getAllByRole("button", { name: "Withdraw" });
+    await user.click(confirmations[confirmations.length - 1]);
+
+    expect(onWithdraw).toHaveBeenCalledWith(17);
+  });
+
   it("does not attach a work-record card when the Agent used no tools", () => {
     const message: Message = {
       id: "message-without-tools",

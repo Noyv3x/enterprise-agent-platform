@@ -6,10 +6,11 @@
    subscribes to the messages / agent-status / typing slices only, so a composer
    keystroke never re-renders it. */
 
-import { useRef, type ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { Button } from "antd";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
 import { loadOlderMessages } from "../../data/loaders";
+import { withdrawChannelMessage } from "../../data/chatActions";
 import { useI18n, type Translator } from "../../i18n";
 import { agentStatusFor, hasPermission, isAgentActive, scopeTypeFor } from "../../store/selectors";
 import { useStore, useStoreHandle } from "../../store/useStore";
@@ -112,6 +113,7 @@ export function MessageList({
   const { t } = useI18n();
   const store = useStoreHandle();
   const ref = useRef<HTMLDivElement>(null);
+  const [withdrawingMessageId, setWithdrawingMessageId] = useState<string | null>(null);
   const scopeType = scopeTypeFor(mode);
   const scopeKey = `${scopeType}:${scopeId}`;
 
@@ -121,6 +123,20 @@ export function MessageList({
   const typingUsers = useStore((state) => (mode === "channel" ? state.typingUsers : EMPTY_TYPING));
   const canApprove = useStore((state) =>
     mode === "private" ? hasPermission(state, "private_agent") : hasPermission(state, "chat"),
+  );
+  const canChat = useStore((state) => hasPermission(state, "chat"));
+  const currentUserId = useStore((state) => state.user?.id);
+  const handleWithdraw = useCallback(
+    async (messageId: Message["id"]) => {
+      const key = String(messageId);
+      setWithdrawingMessageId(key);
+      try {
+        await withdrawChannelMessage(store, scopeId, messageId);
+      } finally {
+        setWithdrawingMessageId((current) => (current === key ? null : current));
+      }
+    },
+    [scopeId, store],
   );
   const currentStreams = status ? currentTurnStreams(status) : [];
   const streamCount = currentStreams.length;
@@ -179,9 +195,25 @@ export function MessageList({
         </div>,
       );
     }
-    items.push(...messages.map((message) => (
-      <MessageBubble key={String(message.id)} message={message} />
-    )));
+    items.push(...messages.map((message) => {
+      const canWithdraw =
+        mode === "channel" &&
+        canChat &&
+        message.author_type === "user" &&
+        message.user_id != null &&
+        currentUserId != null &&
+        String(message.user_id) === String(currentUserId) &&
+        !message.metadata?.local_pending;
+      return (
+        <MessageBubble
+          key={String(message.id)}
+          message={message}
+          canWithdraw={canWithdraw}
+          withdrawing={withdrawingMessageId === String(message.id)}
+          onWithdraw={canWithdraw ? handleWithdraw : undefined}
+        />
+      );
+    }));
     if (isAgentActive(status) && status) {
       items.push(
         hasAgentProcessSteps(status) ? (

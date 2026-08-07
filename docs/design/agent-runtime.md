@@ -27,6 +27,8 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 私人交互 Run 可以接收追加输入。输入按 message id 持久化并返回 accepted、injected 或 unconsumed；只有模型循环确认注入后，Platform 才能把该输入视为已消费。
 
+产品界面对用户本人频道消息的撤回不属于 Runtime 取消协议。消息已经形成 durable job 或进入 Run 后，撤回只隐藏 Platform 产品消息，不改写 session journal、不撤销输入，也不终止 Run；需要停止工作时仍必须使用明确的取消或 scope cleanup 语义。
+
 ## 模型目录与授权
 
 Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API 类型和固定 endpoint。请求不能覆盖 base URL 或 API 类型。Python 可调用供应商 OAuth 模型发现，但其结果只能与 Runtime 目录求交或作为可用性提示，不能扩展可执行集合。

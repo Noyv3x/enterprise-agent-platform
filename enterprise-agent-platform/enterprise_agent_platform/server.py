@@ -855,6 +855,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             content, attachments = self._body_message()
             self._json(service.send_channel_message(actor, int(m.group(1)), content, attachments), status=201)
             return
+        m = re.fullmatch(r"/api/channels/(\d+)/messages/(\d+)", path)
+        if m and method == "DELETE":
+            self._json(
+                service.withdraw_channel_message(
+                    actor,
+                    int(m.group(1)),
+                    int(m.group(2)),
+                )
+            )
+            return
         m = re.fullmatch(r"/api/channels/(\d+)/typing", path)
         if m and method == "POST":
             body = self._body_json()

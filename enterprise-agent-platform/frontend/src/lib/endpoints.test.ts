@@ -12,6 +12,15 @@ describe("Telegram link challenge endpoint", () => {
   });
 });
 
+describe("channel message withdrawal endpoint", () => {
+  it("uses the author-scoped channel message resource", () => {
+    expect(endpoints.withdrawChannelMessage).toMatchObject({ method: "DELETE" });
+    expect(endpoints.withdrawChannelMessage.path(4, 91)).toBe(
+      "/api/channels/4/messages/91",
+    );
+  });
+});
+
 describe("Agent runtime configuration endpoint", () => {
   it("uses the neutral runtime resource for reads and writes", () => {
     expect(endpoints.agentRuntimeConfig).toMatchObject({ method: "GET" });

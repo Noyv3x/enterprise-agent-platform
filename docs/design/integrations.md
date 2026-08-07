@@ -12,6 +12,7 @@
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生。当前容器路径、环境变量、进程身份和 Camoufox sidecar 只使用 `agent-platform` / `AGENT_PLATFORM_*` / `.agent-platform-runtime.json` target 接口，单个适配器不得引入第二套技术身份。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
+- 频道消息撤回只改变 Platform 产品消息可见性；已经提交给 Agent 或外部集成的输入不作追溯撤销，不能把界面撤回解释为 Runtime、Telegram、邮箱或其它集成的取消协议。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
 - 当前 release manifest 只接受当前 schema 的十镜像闭集，不包含迁移 helper 或第二套技术身份；历史镜像、目录或环境变量不能使已退役集成重新进入运行边界。
