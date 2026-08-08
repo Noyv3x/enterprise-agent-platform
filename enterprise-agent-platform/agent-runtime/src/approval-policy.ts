@@ -609,6 +609,10 @@ export function actionApprovalObject(toolName: string, args: JsonObject): Approv
     ? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "action"))
     : nested;
   const identity = { action, arguments: executionArguments };
+  if (toolName === "sylver_platform") {
+    const rawValidationError = sylverPlatformRawApprovalValidationError(identity);
+    if (rawValidationError) throw new Error(rawValidationError);
+  }
   const displayArguments = displayActionArguments(toolName, action, executionArguments);
   const validationError = approvalDisplayValidationError(displayArguments);
   if (validationError) throw new Error(validationError);
@@ -616,6 +620,27 @@ export function actionApprovalObject(toolName: string, args: JsonObject): Approv
     key: approvalKey(toolName, identity),
     displayArguments,
   };
+}
+
+function sylverPlatformRawApprovalValidationError(identity: JsonObject): string | undefined {
+  if (containsForbiddenApprovalControls(identity)) {
+    return "Sylver Platform arguments contain forbidden control characters";
+  }
+  if (Buffer.byteLength(canonicalJson(identity), "utf8") > APPROVAL_ARGUMENT_MAX_BYTES) {
+    return `Sylver Platform arguments exceed the complete display limit of ${APPROVAL_ARGUMENT_MAX_BYTES} UTF-8 bytes`;
+  }
+  return undefined;
+}
+
+function containsForbiddenApprovalControls(value: unknown): boolean {
+  if (typeof value === "string") return hasForbiddenTerminalControls(value);
+  if (Array.isArray(value)) return value.some(containsForbiddenApprovalControls);
+  if (value && typeof value === "object") {
+    return Object.entries(value as JsonObject).some(
+      ([key, item]) => hasForbiddenTerminalControls(key) || containsForbiddenApprovalControls(item),
+    );
+  }
+  return false;
 }
 
 /** Build the bounded, display-only argument object stored in Runtime events. */
@@ -654,7 +679,7 @@ export function redactToolArgumentsForJournal(
     }
     return result;
   }
-  if (["process", "memory", "skill", "browser", "schedule", "mail"].includes(toolName)) {
+  if (["process", "memory", "skill", "browser", "schedule", "mail", "sylver_platform"].includes(toolName)) {
     try {
       return actionApprovalObject(toolName, args).displayArguments;
     } catch (error) {
@@ -839,23 +864,19 @@ function displayActionArguments(
 }
 
 function redactActionArguments(toolName: string, action: string, args: JsonObject): JsonObject {
-  const omittedBodyKeys = toolName === "browser" && action === "type"
-    ? ["text"]
-    : toolName === "memory"
-      ? ["content"]
-      : toolName === "skill"
-        ? ["instructions", "content"]
-        : toolName === "schedule"
-          ? ["prompt"]
-          : toolName === "mail"
-            ? ["text_body", "html_body"]
-            : [];
+  const omittedBodyKeys = omittedActionBodyKeys(toolName, action);
   const display: JsonObject = {};
   for (const [key, value] of Object.entries(args)) {
     if (omittedBodyKeys.includes(key)) {
       const body = stringValue(value);
       const label = toolName === "browser" && key === "text" ? "input" : key;
       display[key] = `[${label} omitted: ${Buffer.byteLength(body, "utf8")} UTF-8 bytes]`;
+    } else if (toolName === "sylver_platform" && typeof value === "string") {
+      // External platform writes are meaningful only when the user can see
+      // the exact short body being approved.  Keep it complete (after control
+      // removal and credential redaction); the aggregate 16 KiB check below
+      // fails closed instead of silently truncating a long mutation.
+      display[key] = redactCommand(value);
     } else {
       display[key] = redactJson(value);
     }
@@ -864,6 +885,15 @@ function redactActionArguments(toolName: string, action: string, args: JsonObjec
     display.input = redactCommandForApproval(stringValue(args.input));
   }
   return display;
+}
+
+function omittedActionBodyKeys(toolName: string, action: string): string[] {
+  if (toolName === "browser" && action === "type") return ["text"];
+  if (toolName === "memory") return ["content"];
+  if (toolName === "skill") return ["instructions", "content"];
+  if (toolName === "schedule") return ["prompt"];
+  if (toolName === "mail") return ["text_body", "html_body"];
+  return [];
 }
 
 function approvalDisplayValidationError(displayArguments: JsonObject): string | undefined {

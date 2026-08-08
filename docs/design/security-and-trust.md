@@ -122,6 +122,8 @@ Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理�
 
 OAuth refresh token、邮箱应用密码、session secret、内部 token 和其它 secret 保存在 Platform SQLite 的专用凭据表或 `settings` 表，并只返回“已配置”状态；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。
 
+Sylver Lining 工作平台的 Personal API Token 使用每用户专用凭据行，并只接受可安全放入 Bearer header 的非空可见 ASCII。出站 origin 固定为代码锁定的官方 HTTPS 地址，产品请求、用户、模型和数据库内容均不能覆盖；候选 Token 必须先完成 `/api/auth/me` 验证再保存，验证失败不得覆盖既有连接。连接、重连和断开按本地用户从入口起串行，消除慢验证覆盖较新决定的竞态。模型、Runtime、Sandbox、工具参数、审批展示、事件和错误均不得取得 Token。远端 JSON 在离开连接器前递归清除敏感字段值和当前 Token 的任何精确回显；身份响应出现 Token 回显时必须拒绝整次验证，不能存储脱敏后的伪身份。连接器拒绝由模型指定 HTTP path/header，拒绝携凭据重定向，并对未知或未分类业务动作失败关闭。外部写动作先按原始完整审批参数计算 UTF-8 上限并拒绝不可见控制字符，只有通过后才生成完整、脱敏的短正文展示；不能让脱敏或控制字符移除把超限正文压缩后绕过限制。写请求发出后的不确定结果必须显式要求读取远端状态，不能诱导盲目重放。审批决定、跳过审查、员工管理、原始 REST 和破坏性删除不因持有远端 Token 获得工具入口。
+
 知识 Embeddings API key 同样属于 Platform secret：管理接口只接受写入或保留既有值，读取只返回是否已配置和有界掩码，不能回传原文。配置提交前必须对目标 provider 做最小探测；请求禁止携带凭据重定向，并限制 URL、响应体、超时、向量数量、顺序、数值和维度。缺少 key 时知识创建、重建和显式检索以 `knowledge_embedding_unconfigured` 失败关闭，不启动本地模型、不回退关键词检索；聊天启动时的被动知识召回则失败开放，只记录 disabled/degraded，不能因此阻断普通回复。
 
 OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。

@@ -12,6 +12,23 @@ describe("Telegram link challenge endpoint", () => {
   });
 });
 
+describe("Sylver Lining platform connection endpoint", () => {
+  it("uses one private connection resource for read, update, and disconnect", () => {
+    expect(endpoints.privateSylverPlatformConnection).toMatchObject({ method: "GET" });
+    expect(endpoints.updatePrivateSylverPlatformConnection).toMatchObject({ method: "PUT" });
+    expect(endpoints.deletePrivateSylverPlatformConnection).toMatchObject({ method: "DELETE" });
+    expect(endpoints.privateSylverPlatformConnection.path()).toBe(
+      "/api/private-agent/integrations/sylver-platform",
+    );
+    expect(endpoints.updatePrivateSylverPlatformConnection.path()).toBe(
+      "/api/private-agent/integrations/sylver-platform",
+    );
+    expect(endpoints.deletePrivateSylverPlatformConnection.path()).toBe(
+      "/api/private-agent/integrations/sylver-platform",
+    );
+  });
+});
+
 describe("channel message withdrawal endpoint", () => {
   it("uses the author-scoped channel message resource", () => {
     expect(endpoints.withdrawChannelMessage).toMatchObject({ method: "DELETE" });

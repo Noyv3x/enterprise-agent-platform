@@ -1141,6 +1141,31 @@ class SkillStoreTests(unittest.TestCase):
                 instructions = document.read_text(encoding="utf-8")
                 self.assertNotIn(".ubitech/", instructions)
 
+    def test_sylver_skill_notice_matches_the_canonical_upstream_lock(self):
+        repository_root = Path(skills_module.__file__).resolve().parents[2]
+        contract = json.loads(
+            (repository_root / "docs/contracts/upstream-sources.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        source = contract["sources"]["sylver_platform_skill"]
+        notice = (
+            Path(skills_module.__file__).parent
+            / "bundled_skills/sylver-platform/references/NOTICE.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(source["revision"], notice)
+        self.assertIn(source["skill_sha256"], notice)
+        self.assertIn(source["adapter_sha256"], notice)
+
+        instructions = (
+            Path(skills_module.__file__).parent
+            / "bundled_skills/sylver-platform/SKILL.md"
+        ).read_text(encoding="utf-8")
+        for bypass in ("`terminal`", "`web`", "`browser`", "raw HTTP"):
+            self.assertIn(bypass, instructions)
+        self.assertRegex(instructions, r"never\s+approve, reject")
+
     def test_repository_bundled_document_skills_send_real_workspace_files(self):
         bundled_root = Path(skills_module.__file__).parent / "bundled_skills"
         expected = {

@@ -21,6 +21,7 @@ import { Icon } from "../common/Icon";
 import { PageHeader } from "../common/PageHeader";
 import { BrowserNotificationSettings } from "./BrowserNotificationSettings";
 import { MailAccountSettings } from "./MailAccountSettings";
+import { SylverPlatformSettings } from "./SylverPlatformSettings";
 import "./settings.css";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -144,6 +145,7 @@ export function SettingsView() {
         </Card>
         <BrowserNotificationSettings userId={user.id} />
         <MailAccountSettings />
+        {user.permissions?.includes("private_agent") ? <SylverPlatformSettings /> : null}
         <Card
           className="settings-card"
           classNames={{ body: "settings-card__body" }}

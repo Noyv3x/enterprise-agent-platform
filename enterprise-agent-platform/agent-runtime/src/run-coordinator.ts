@@ -70,6 +70,7 @@ import type {
   RuntimeConfig,
 } from "./types.js";
 import { hasLearningReviewMetadata, isLearningReviewRun } from "./types.js";
+import { isSylverPlatformMutation } from "./sylver-platform-contract.js";
 import { frameUntrustedText, untrustedImageNotice } from "./untrusted-content.js";
 import {
   abortError,
@@ -1136,6 +1137,15 @@ export class RunCoordinator {
             && isMailMutation(recordValue(toolContext.args).action)
           ) {
             const reason = "Unattended email runs cannot mutate mail or save attachments";
+            this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
+            return { block: true, reason };
+          }
+          if (
+            unattended
+            && toolContext.toolCall.name === "sylver_platform"
+            && isSylverPlatformMutation(recordValue(toolContext.args).action)
+          ) {
+            const reason = "Unattended runs cannot modify the Sylver Lining platform";
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
@@ -2316,7 +2326,7 @@ function appendLearningReviewPolicy(systemPrompt: string): string {
     + "one-off task narrative, a recovered transient failure, missing environment setup, or a claim that a tool is "
     + "permanently broken into durable procedure. Prefer reconciling duplicates and contradictions over accumulating "
     + "similar memories. Make no change when there is no genuine durable fact or reusable procedure. Do not attempt external actions, files, "
-    + "terminal commands, processes, web, browser, mail, schedules, knowledge, session search, or delegation. When the "
+    + "terminal commands, processes, web, browser, mail, the Sylver Lining platform, schedules, knowledge, session search, or delegation. When the "
     + "review is complete, return only REVIEW_COMPLETE so the private transport has a terminal marker; this marker is "
     + "discarded and is never shown to the user.";
   return `${systemPrompt}\n\n<learning_review_policy>\n${policy}\n</learning_review_policy>`;
@@ -3041,6 +3051,7 @@ const UNMARKED_UNTRUSTED_TOOL_RESULT_SOURCES: Readonly<Record<string, string>> =
   session_search: "session_search",
   search_files: "workspace_search",
   schedule: "schedule",
+  sylver_platform: "sylver_platform",
   // Unmarked skill output cannot be promoted into the controlled
   // procedural-guidance boundary used by newly generated skill.load results.
   skill: "skill.unmarked",

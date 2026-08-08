@@ -1,6 +1,6 @@
 # 外部集成
 
-本文定义平台与模型 OAuth、Knowledge Embeddings API、SearXNG、Firecrawl、Camoufox、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
+本文定义平台与模型 OAuth、Knowledge Embeddings API、SearXNG、Firecrawl、Camoufox、Sylver Lining 工作平台、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
 
 ## 发布与通用原则
 
@@ -70,6 +70,16 @@ Platform 对 Embeddings 请求使用有界 connect/read/body 预算，禁止带 
 Skill 采用 Hermes 风格的“索引后按需读取”机制：正常 Run 只收到有界元数据索引，必须显式 `load`/`read` 才能取得正文或附件。后台学习复盘可以创建新的私有 Skill，也可以在同一次复盘中先读取、再精确替换自己此前创建的 Skill；它不得自动改写用户创建、用户置顶、已归档、已停用或仓库预置的 Skill，也不得删除或停用任何 Skill。`.skill-usage.json` 是 owner-only 的可信来源，记录 `user/agent` 来源、状态、置顶、使用与修补计数；缺失或旧记录一律按用户所有处理并失败关闭。所有自动写入在最终文件系统提交前重新核验私人 scope、lifecycle、活动账户、运行中的复盘 job 和持久变更预算，并重复执行提示词注入、凭据与大小检查。
 
 仓库预置 spreadsheet、document、presentation 和 PDF 文件产出 Skill。它们面向“制作表格/报告/演示稿/PDF”等明确交付意图主动触发，使用 Sandbox 预装的受控文档生成库，在 `/workspace` 产出可下载文件并通过 `MEDIA: /workspace/<relative-path>` 交还 Platform。Runtime 自动追加文件复验时，只在成功复验已经清除相关变更后把此前的规范交付标记保留到终态结果；Platform 再按当前 scope 映射、校验并保存附件。预置说明不得要求临时联网安装任意包、调用外部文档转换服务或把 Markdown 当作默认成品；用户明确要求其它格式或只要聊天内小表格时才采用相应结果。
+
+## Sylver Lining 工作平台
+
+该连接器是当前提供方 REST API 的原生适配器，不是 MCP 客户端，也不运行上游 `ubi.py`、`worker.py`、Claude/Codex CLI 或任意远程脚本。提供方 origin 固定为 `https://devops.sylver-lining.org`，产品 API、界面、模型和本地设置均不能覆盖；每个有私人 Agent 权限的用户最多提交一个自己的 Personal API Token。Platform 在保存前以候选凭据请求固定 origin 的 `GET /api/auth/me`，完整验证身份响应后才原子保存连接、凭据和验证快照；测试通过注入确定性 transport 隔离真实网络。读取接口只返回远端身份及 `credential_configured`，永不回传 Token。
+
+Runtime 只获得固定、闭世界的 `sylver_platform` 业务动作，不接受 URL、HTTP method、path、header、Token、owner 或 scope。首版读取身份、项目、项目上下文、任务与活动、Wiki 文档、审批详情与评论和通知；写动作只包括创建任务、开始任务、添加任务活动、提交 Wiki 提案和添加普通审批评论。任务列表默认只读当前远端身份获分配的任务，审批列表默认读取 inbox，通知列表默认只读未读通知；模型只有显式覆盖参数才请求其它集合。创建任务必须带至少一个真实 tag、明确起止日期，并以正整数 `milestone_id` 选择里程碑或以显式 `null` 表示用户确认跳过；不能省略该决定。普通任务描述使用首行摘要和后续 `- ` 要点。Platform 在任何写请求前读取项目 workflow：存在且仅存在 `proposed` category 时省略 `status_id` 以保留远端提案闸，并允许传入真实 `proposal_approver_id`；不存在 `proposed` 时必须解析唯一 `backlog` status 并显式发送，此时提供 `proposal_approver_id` 必须在建任务前拒绝，workflow 缺失或歧义同样失败关闭。`start_task` 必须显式提供要写入活动流的简短 note；`propose_wiki` 必须显式提供 `content_format` 和 `order`，不能让未展示的客户端默认值进入写请求。所有写动作逐次审批，unattended Run 只读；原始完整审批参数在任何脱敏前超过 16 KiB 或含不可见控制字符时失败关闭，通过后展示完整的脱敏短正文，展示投影也不得超限。审批决定/拒绝、跳过审查、强制完成、员工管理、任意 REST、直接 Wiki 删除、待处理 Wiki 提案列表和 Apifox 同步不进入首版工具表。远端响应和错误始终是不可信工具结果。
+
+Platform 是唯一 HTTP 调用方：凭据只在当前请求闭包中注入，拒绝携带凭据的重定向，限制连接/读取时间、响应类型和正文大小，并只访问代码锁定的官方 origin。解析成功响应后必须递归清除敏感字段值和当前 Token 的任何精确回显；`/api/auth/me` 出现当前 Token 回显时整次身份验证失败，不能把污染身份写入数据库。连接、重连与断开从同一用户请求入口起串行，较早的慢验证不能在较新的断开或重连之后复活旧凭据。写调用在发送前标记副作用；请求发送后的超时、连接中断、成功响应解析失败或 `5xx` 必须明确报告结果不确定，并要求先读取权威远端状态，不得自动重放。外部平台自己的审批门继续是最终业务边界，本地工具审批不能代替远端权限检查。
+
+上游私有 Skill 只作为开发期规则与接口参考。当前上游没有随仓库提供 OpenAPI，因此仓库同时锁定已审阅 commit、`SKILL.md` 与 `scripts/ubi.py` 摘要；前者提供业务规则，后者是当前固定 REST 路径与复合动作的参考，二者都不作为运行时代码执行。开发机 GitHub 凭据位于 Git 元数据目录的 owner-only 本地文件，本地 checkout 也只缓存于 Git 元数据目录，发布物、镜像和部署机均不包含它。同步工具使用进程内临时认证 header 获取精确仓库/分支并报告两个输入的锁定版本与上游差异；确认规则、接口、文档、连接器与测试已同步后，开发者才显式更新两个摘要及锁定 revision。上游内容不能在 Runtime 动态挂载或直接执行；两个参考输入冲突或出现未审阅接口变化时停止更新而不是猜测。本地 bundled Skill 是受控业务子集，不承诺复制上游 CLI 的 Git/PR、worker、管理接口或专用 UI 提案正文流程。
 
 ## Telegram
 

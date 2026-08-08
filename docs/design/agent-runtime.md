@@ -37,7 +37,7 @@ Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API �
 
 ## 工具与执行目标
 
-Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、mail、schedule、session、session_search 和 delegate_task。
+Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、mail、sylver_platform、schedule、session、session_search 和 delegate_task。
 
 模型可见的 assistant tool call 参数必须始终保持对应活动工具 schema 的规范形状；审计展示对象与模型历史使用不同的序列化边界，不能把 `tool` 名称或其它展示字段写回下一轮上下文。读取旧 session 时只允许在内存模型副本中收敛精确匹配的历史展示 envelope，未知字段、身份字段或不匹配工具名继续由严格 schema 拒绝，原 JSONL 不改写。敏感值替换仍须满足字段的枚举、正则和路径约束；允许任意 JSON 的浏览器提取 schema 必须同时限制深度、条目、节点和字符串大小。
 
@@ -56,6 +56,8 @@ Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化�
 Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和规范化逻辑路径；Manager 是宿主映射的最终可信边界。Manager 必须把 `/workspace`、`/home/agent`、`/opt/agent-env` 或绝对宿主路径解析为不可变的根与相对路径，从根目录 fd 逐段以不跟随符号链接的方式打开。文件 read/write/patch/search 与 terminal cwd 都不能在检查后重新按字符串解析；patch 在同一个已固定父目录中完成读取与原子替换，terminal 子进程从已固定目录 fd 切换 cwd。审批后路径被替换为符号链接、非目录或受保护路径时，本次调用失败且批准不可复用。
 
 来自网页、浏览器、知识、记忆、session 和技能附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
+
+`sylver_platform` 只出现在规范私人 scope。它使用固定 action union 回调 Platform，不允许模型提供网络位置、认证或所有权字段；读取动作无需审批，创建任务、开始任务、记录活动、Wiki 提案和普通审批评论只允许交互式 Run 并逐次审批。审批对象绑定完整参数；Runtime 在任何脱敏前按原始完整参数计算 UTF-8 大小并拒绝不可见控制字符，通过后才生成完整、脱敏的短正文展示。原始参数或展示投影任一超过审批上限都在调用前失败关闭，不能截断、仅显示长度或借脱敏收缩绕过。Runtime 在发送任何写动作前标记副作用，且不暴露审批决定、跳过审查、强制完成、员工管理、通用 HTTP 或破坏性删除动作。
 
 terminal 的前台进程在其有界工具 deadline 内以显式执行生命周期保持 Run 活动，不能只依赖与空闲 watchdog 竞争的定时心跳；后台进程立即返回并由对应 Sandbox 登记。Manager 是生产进程清单的唯一权威：同一主 scope 与其 `/delegate/` 子 scope 组成一个进程 family，共享同时运行上限，root cleanup 必须停止整个 family；单进程读写和终止仍要求精确 scope，不允许越权访问子 Agent 句柄。cleanup 或显式终止报告已确认前，不仅要观察到进程终态，还必须等待对应控制器完成输出快照、持久状态、Sandbox 活动计数和终态裁剪；返回后不得再由该进程的 wait/watch goroutine 写入 scope 数据。进程输出、历史记录和同时运行数量有界；终态记录按时间和数量双重裁剪，但不得裁剪 `running` 或 `orphaned`。预览优先返回活动进程，其不透明 revision 在状态或输出变化时必须变化，Manager 重启后旧 revision 必须失效。Run 空闲、模型轮次和 terminal 默认超时的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
 

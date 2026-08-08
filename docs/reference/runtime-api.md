@@ -159,7 +159,7 @@ Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`f
 
 Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
-Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill 和 mail；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+Python 必须从可信 context 推导 memory owner、schedule owner、browser identity、Sylver Lining 连接 owner 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill、mail 和 `sylver_platform`；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
 
 knowledge `search` 只返回 active 向量索引的稳定结果，每项包含可交给 `read` 的正整数 `document_id`、`chunk_id`、来源偏移、excerpt 和 score。未配置 Embeddings API key、尚无 active generation 或 provider 失败时返回可区分的错误代码，不以空列表伪装成“无命中”，也不改走本地关键词检索。
 
@@ -170,6 +170,8 @@ memory 额外支持原子 `reconcile`，其 `operations` 至多二十项且只�
 Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
 
 `mail` Gateway 只接受由 Run context 派生的私人账户所有权。读取动作为 `accounts/folders/search/read`，副作用动作为 `send/reply/move/mark/save_attachment`；unattended trigger 只能使用读取动作。SMTP mutation 携带 `run_id + tool_call_id` 幂等身份，结果不确定时返回 `needs_review` 语义而不是自动重发。
+
+`sylver_platform` Gateway 只接受 canonical private scope，并从当前 lifecycle、活动账号和私人 Agent 权限推导连接 owner。Runtime schema 与 Python dispatcher 使用同一个闭世界 action 集：读取 `whoami|projects|project|project_context|tasks|task|task_activity|wiki_list|wiki_read|approvals|approval|approval_comments|notifications`；写入 `create_task|start_task|add_task_activity|propose_wiki|comment_approval`。`tasks.assigned_to_me` 和 `notifications.unread_only` 缺省均为 `true`，显式 `false` 才读取相应全集；`approvals.box` 缺省为 `inbox`。`create_task` 必须包含非空唯一 `tag_ids`、起止日期，以及必填的 `milestone_id`；后者为正整数时选择真实里程碑，为 `null` 时表示用户明确确认跳过，description 若存在则必须是首行摘要和后续 `- ` 要点。其 Python 复合动作根据项目 workflow 是否存在唯一 `proposed` category 决定省略 status 走提案闸，否则只允许唯一 `backlog` status；`proposal_approver_id` 只允许用于前一条提案路径。`start_task.note`、`propose_wiki.content_format` 和 `propose_wiki.order` 都是显式必填参数，避免审批内容与实际写请求出现隐藏默认值。模型参数不得包含 base URL、Token、HTTP method/path/header、owner 或 scope。全部写动作要求本次审批和 `tool_call_id`，unattended context 直接拒绝；原始完整参数在脱敏前超过 16 KiB 或含不可见控制字符时在调用前失败关闭，脱敏展示也不得超限。审批决定、跳过审查、强制完成、员工管理、通用 REST 和删除动作没有协议表示。
 
 浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API申请当前 scope/tab 的短期租约并发送限幅输入；Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
 

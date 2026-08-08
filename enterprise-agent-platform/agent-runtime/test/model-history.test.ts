@@ -60,6 +60,20 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
         text_body: secret,
       },
     }],
+    ["sylver_platform", {
+      tool: "sylver_platform",
+      action: "propose_wiki",
+      arguments: {
+        project_slug: "platform",
+        title: "Security notes",
+        slug: "security-notes",
+        content: secret,
+        source_document_id: "platform/security-notes",
+        content_format: "markdown",
+        order: 0,
+        change_summary: secret,
+      },
+    }],
     ["delegate_task", { prompt: secret, system_prompt: `${secret}-system` }],
   ];
 
@@ -97,6 +111,18 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
       arguments: { tab_id: "tab" },
     },
     "audit display keeps its explicit tool envelope",
+  );
+  assert.deepEqual(
+    redactToolArgumentsForJournal("sylver_platform", {
+      action: "comment_approval",
+      arguments: { approval_id: 7, body: "private comment" },
+    }),
+    {
+      tool: "sylver_platform",
+      action: "comment_approval",
+      arguments: { approval_id: 7, body: "private comment" },
+    },
+    "Sylver Lining approval display keeps the complete short mutation body",
   );
 });
 

@@ -30,6 +30,7 @@ test("unmarked imported session tool results are framed without changing current
     ["session_search", "session_search"],
     ["search_files", "workspace_search"],
     ["schedule", "schedule"],
+    ["sylver_platform", "sylver_platform"],
     ["skill", "skill.unmarked"],
   ] as const;
   const imported = toolSources.map(([toolName], index) => ({
@@ -2023,6 +2024,48 @@ test("unattended scheduled runs reject sensitive tools immediately without reque
     assert.equal(failed.data.unattended_authorization_required, true);
     assert.match(String(failed.data.reason), /persistent always authorization/);
     await assert.rejects(readFile(`${workspace}/should-not-exist.txt`, "utf8"), { code: "ENOENT" });
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("unattended runs reject sylver_platform mutations before approval or gateway dispatch", async () => {
+  const home = await temporaryDirectory("agent-sylver-unattended-");
+  const workspace = await temporaryDirectory("agent-sylver-unattended-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("sylver_platform", {
+        action: "start_task",
+        arguments: { task_id: 17, note: "Starting task" },
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("The external task was not changed."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  coordinator.gateway.invoke = async () => assert.fail("unattended mutation must not reach the platform gateway");
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      session_id: "scheduled-sylver",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "start the external task",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: { trigger: "scheduled", unattended: true },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    const failed = events.find((event) => event.type === "tool.failed");
+    assert.ok(failed);
+    assert.equal(failed.data.unattended_authorization_required, true);
+    assert.match(String(failed.data.reason), /cannot modify the Sylver Lining platform/);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

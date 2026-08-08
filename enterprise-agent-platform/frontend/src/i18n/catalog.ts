@@ -7,6 +7,7 @@ import { scheduledTaskMessages } from "./messages/scheduledTasks";
 import { memoryMessages } from "./messages/memory";
 import { skillMessages } from "./messages/skills";
 import { mailMessages } from "./messages/mail";
+import { sylverPlatformMessages } from "./messages/sylverPlatform";
 
 export const messages = {
   ...coreMessages,
@@ -18,6 +19,7 @@ export const messages = {
   ...memoryMessages,
   ...skillMessages,
   ...mailMessages,
+  ...sylverPlatformMessages,
 } as const;
 
 export type MessageKey = keyof typeof messages;

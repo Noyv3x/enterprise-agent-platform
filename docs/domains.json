@@ -76,10 +76,13 @@
       "code": [
         ".gitignore",
         ".github/**",
+        "scripts/sync_sylver_platform_skill.py",
         "scripts/python_test_shard.py",
         "scripts/test.sh"
       ],
-      "tests": []
+      "tests": [
+        "scripts/tests/test_sync_sylver_platform_skill.py"
+      ]
     },
     {
       "id": "deployment",
@@ -128,6 +131,7 @@
       "tests": [
         "enterprise-agent-platform/tests/test_agent_scopes.py",
         "enterprise-agent-platform/tests/test_memory_session_search.py",
+        "enterprise-agent-platform/tests/test_sylver_platform_migration.py",
         "enterprise-agent-platform/tests/test_learning_review.py",
         "enterprise-agent-platform/tests/test_knowledge_files.py",
         "enterprise-agent-platform/tests/test_knowledge_db.py",
@@ -184,7 +188,9 @@
         "enterprise-agent-platform/enterprise_agent_platform/telegram_gateway.py",
         "enterprise-agent-platform/enterprise_agent_platform/schedules.py",
         "enterprise-agent-platform/enterprise_agent_platform/skills.py",
+        "enterprise-agent-platform/enterprise_agent_platform/sylver_platform_*.py",
         "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
+        "scripts/sync_sylver_platform_skill.py",
         "enterprise-agent-platform/camofox-runtime/**",
         "containers/compose.yaml",
         "containers/compose.dev.yaml",
@@ -202,7 +208,9 @@
         "enterprise-agent-platform/tests/test_searxng_search.py",
         "enterprise-agent-platform/tests/test_telegram_gateway_lifecycle.py",
         "enterprise-agent-platform/tests/test_browser_preview.py",
-        "enterprise-agent-platform/tests/test_container_data_layout.py"
+        "enterprise-agent-platform/tests/test_container_data_layout.py",
+        "enterprise-agent-platform/tests/test_sylver_platform*.py",
+        "scripts/tests/test_sync_sylver_platform_skill.py"
       ]
     },
     {

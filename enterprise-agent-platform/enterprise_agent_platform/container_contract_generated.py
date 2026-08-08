@@ -3,7 +3,7 @@ from __future__ import annotations
 
 CONTAINER_PLATFORM_SCHEMA_VERSION = 2
 RELEASE_CHANNEL = 'main'
-DATABASE_SCHEMA_VERSION = 2026080602
+DATABASE_SCHEMA_VERSION = 2026080801
 CONTAINER_PATHS = {'data_root': '/var/lib/agent-platform', 'workspace': '/workspace', 'agent_home': '/home/agent', 'agent_env': '/opt/agent-env'}
 EXECUTION_TARGETS = ('sandbox', 'host')
 PERSISTENT_DATA_OWNERS = {'searxng': [], 'firecrawl-redis': [{'uid': 999, 'gid': 0}, {'uid': 999, 'gid': 1000}], 'firecrawl-rabbitmq': [{'uid': 999, 'gid': 0}, {'uid': 999, 'gid': 999}], 'firecrawl-postgres': [{'uid': 999, 'gid': 0}, {'uid': 999, 'gid': 999}]}

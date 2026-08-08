@@ -6620,6 +6620,140 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_sylver_platform_connection_routes_are_closed_world_and_secret_free(self):
+        class FakeSylverPlatformClient:
+            def __init__(self):
+                self.verify_calls: list[tuple[str, str]] = []
+
+            def verify_identity(self, base_url: str, token: str):
+                self.verify_calls.append((base_url, token))
+                return {
+                    "remote_user_id": 13,
+                    "username": "remote-operator",
+                    "full_name": "Remote Operator",
+                    "title": "Engineer",
+                    "email": "operator@example.test",
+                    "role": "member",
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            client = FakeSylverPlatformClient()
+            service = EnterpriseService(
+                config,
+                agent_client=RecordingAgent(),
+                sylver_platform_client=client,
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            route = "/api/private-agent/integrations/sylver-platform"
+            token = "route-personal-token-not-for-output"
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                response = connection.getresponse()
+                response.read()
+                cookie = response.getheader("Set-Cookie")
+                self.assertEqual(response.status, 200)
+                self.assertTrue(cookie)
+
+                connection.request("GET", route, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertIsNone(payload["connection"])
+
+                connection.request(
+                    "PUT",
+                    route,
+                    body=json.dumps({"token": token}),
+                    headers={"Content-Type": "application/json", "Cookie": cookie},
+                )
+                response = connection.getresponse()
+                denied = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 403)
+                self.assertIn("Origin", denied["error"])
+
+                invalid_bodies = (
+                    json.dumps({"token": token, "base_url": "https://evil.example"}),
+                    f'{{"token":"{token}","token":"replacement"}}',
+                )
+                for body in invalid_bodies:
+                    with self.subTest(body=body):
+                        connection.request(
+                            "PUT",
+                            route,
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Cookie": cookie,
+                                "Origin": origin,
+                            },
+                        )
+                        response = connection.getresponse()
+                        response.read()
+                        self.assertEqual(response.status, 400)
+                self.assertEqual(client.verify_calls, [])
+
+                connection.request(
+                    "PUT",
+                    route,
+                    body=json.dumps({"token": token}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                payload = json.loads(raw)
+                self.assertEqual(response.status, 200)
+                self.assertNotIn(token, raw)
+                self.assertNotIn("token", payload["connection"])
+                self.assertTrue(payload["connection"]["credential_configured"])
+                self.assertEqual(
+                    client.verify_calls,
+                    [("https://devops.sylver-lining.org", token)],
+                )
+
+                connection.request("GET", route, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                payload = json.loads(raw)
+                self.assertEqual(response.status, 200)
+                self.assertNotIn(token, raw)
+                self.assertNotIn("token", payload["connection"])
+                self.assertEqual(payload["connection"]["username"], "remote-operator")
+
+                connection.request(
+                    "DELETE",
+                    route,
+                    headers={"Cookie": cookie, "Origin": origin},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload, {"ok": True})
+
+                connection.request("GET", route, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertIsNone(payload["connection"])
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_session_compact_endpoint_uses_the_authenticated_conversation(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))

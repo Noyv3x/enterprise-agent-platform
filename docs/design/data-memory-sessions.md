@@ -14,9 +14,11 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 - `agent_memories` 及其 FTS；
 - `knowledge_documents`、`knowledge_document_files`、`knowledge_chunks`、`knowledge_index_generations`、`knowledge_document_index` 与 `knowledge_chunk_embeddings`；
 - `agent_schedules`、`agent_schedule_runs`；
-- `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
+- `mail_accounts`、`mail_account_credentials`、`sylver_platform_connections`、`sylver_platform_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
 数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
+
+Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base URL、已验证的远端身份投影和验证时间，独立凭据行只保存 Token。相同 origin 与远端用户身份不能同时绑定多个本地用户。删除本地用户或断开连接时凭据级联删除；Token 不进入 Runtime session、消息、workspace、Skill、备份清单或任何派生索引。
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
@@ -123,6 +125,6 @@ bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示�
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。本次发布只支持从直接前一 baseline 到当前 baseline 的精确迁移：保留现有知识文档、索引 generation、chunk、embedding 和 ID，新增一对一原件表；既有手工条目不伪造文件元数据，下载时按当前规范动态导出 Markdown。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
+数据库 schema version 单调递增。本次发布只支持从直接前一 baseline `2026080602` 到当前 baseline `2026080801` 的精确迁移：完整保留既有业务数据与结构，并原子新增初始为空的 `sylver_platform_connections` 和 `sylver_platform_credentials`。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

@@ -158,6 +158,20 @@ from .secure_fs import (
     write_private_file_exclusive,
 )
 from .skills import MAX_SKILL_LIST_RESULTS, SkillStore, SkillStoreError
+from .sylver_platform_client import (
+    SYLVER_PLATFORM_BASE_URL,
+    MUTATION_ACTIONS as SYLVER_PLATFORM_MUTATION_ACTIONS,
+    SUPPORTED_ACTIONS as SYLVER_PLATFORM_ACTIONS,
+    SylverPlatformClient,
+    SylverPlatformError,
+    SylverPlatformValidationError,
+    normalize_base_url as normalize_sylver_platform_base_url,
+    validate_personal_token as validate_sylver_platform_token,
+)
+from .sylver_platform_connections import (
+    SylverPlatformConnectionError,
+    SylverPlatformConnectionStore,
+)
 
 
 class ServiceError(Exception):
@@ -566,6 +580,7 @@ class EnterpriseService:
         agent_client: AgentClient | None = None,
         oauth_http_client=None,
         manager_client: ManagerClient | None = None,
+        sylver_platform_client: SylverPlatformClient | None = None,
     ):
         self.config = config
         self.manager_client = manager_client or (
@@ -625,6 +640,8 @@ class EnterpriseService:
         self.agent_inputs = AgentRunInputStore(self.db)
         self.schedules = AgentScheduleStore(self.db)
         self.mail_accounts = MailAccountStore(self.db)
+        self.sylver_platform_connections = SylverPlatformConnectionStore(self.db)
+        self.sylver_platform_client = sylver_platform_client or SylverPlatformClient()
         self.mail_transport = MailTransport()
         # Agent runs and Telegram sends can have external side effects. An
         # interrupted running record is quarantined rather than blindly
@@ -776,6 +793,12 @@ class EnterpriseService:
         # one user both observing the last slot and reading mail for work that
         # cannot be admitted, without holding the update admission over I/O.
         self._mail_poll_locks = tuple(threading.Lock() for _ in range(64))
+        # Connection verification performs remote I/O.  Serialize the entire
+        # connect/reconnect/disconnect decision per owner so an older slow PUT
+        # cannot commit after a newer request has disconnected or reconnected.
+        self._sylver_platform_connection_locks = tuple(
+            threading.RLock() for _ in range(64)
+        )
         self._mail_thread: threading.Thread | None = None
         self._closed = False
         self._resources_closed = False
@@ -1122,6 +1145,11 @@ class EnterpriseService:
         return self._agent_browser_operation_locks[
             int.from_bytes(digest[:4], "big")
             % len(self._agent_browser_operation_locks)
+        ]
+
+    def _sylver_platform_connection_lock(self, owner_user_id: int) -> threading.RLock:
+        return self._sylver_platform_connection_locks[
+            int(owner_user_id) % len(self._sylver_platform_connection_locks)
         ]
 
     def _cleanup_agent_scope(
@@ -6703,6 +6731,106 @@ class EnterpriseService:
             "error": str(row.get("error") or ""),
         }
 
+    def _sylver_platform_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_user(int(actor.get("id") or 0))
+        if current is None or not current.get("active"):
+            raise ServiceError(401, "platform connection owner is unavailable")
+        require_permission(current, PERMISSION_PRIVATE_AGENT)
+        return current
+
+    @staticmethod
+    def _public_sylver_platform_connection(
+        connection: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if connection is None:
+            return None
+        return {
+            "base_url": str(connection.get("base_url") or ""),
+            "remote_user_id": int(connection.get("remote_user_id") or 0),
+            "username": str(connection.get("username") or ""),
+            "full_name": str(connection.get("full_name") or ""),
+            "title": str(connection.get("title") or ""),
+            "email": str(connection.get("email") or ""),
+            "role": str(connection.get("role") or ""),
+            "credential_configured": bool(connection.get("credential_configured")),
+            "verified_at": int(connection.get("verified_at") or 0),
+            "updated_at": int(connection.get("updated_at") or 0),
+        }
+
+    def get_private_sylver_platform_connection(
+        self, actor: dict[str, Any]
+    ) -> dict[str, Any]:
+        owner = self._sylver_platform_actor(actor)
+        connection = self.sylver_platform_connections.get(int(owner["id"]))
+        return {
+            "connection": self._public_sylver_platform_connection(connection)
+        }
+
+    def put_private_sylver_platform_connection(
+        self,
+        actor: dict[str, Any],
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        owner = self._sylver_platform_actor(actor)
+        if not isinstance(body, dict) or set(body) != {"token"}:
+            raise ServiceError(
+                400,
+                "platform connection body must contain only token",
+            )
+        with self._sylver_platform_connection_lock(int(owner["id"])):
+            try:
+                base_url = normalize_sylver_platform_base_url(
+                    SYLVER_PLATFORM_BASE_URL
+                )
+                token = validate_sylver_platform_token(body.get("token"))
+                identity = self.sylver_platform_client.verify_identity(base_url, token)
+            except SylverPlatformValidationError as exc:
+                raise ServiceError(400, str(exc)) from exc
+            except SylverPlatformError as exc:
+                raise ServiceError(
+                    502,
+                    "remote platform identity verification failed",
+                    code="sylver_platform_verification_failed",
+                ) from exc
+            try:
+                with self._agent_update_admission():
+                    current = self._sylver_platform_actor(owner)
+                    connection = self.sylver_platform_connections.upsert(
+                        int(current["id"]),
+                        {
+                            "base_url": base_url,
+                            "token": token,
+                            **identity,
+                        },
+                    )
+            except SylverPlatformConnectionError as exc:
+                if "another user" in str(exc):
+                    raise ServiceError(
+                        409,
+                        "remote platform identity is already connected to another user",
+                        code="sylver_platform_identity_conflict",
+                    ) from exc
+                raise ServiceError(
+                    400,
+                    "platform connection could not be stored",
+                    code="sylver_platform_connection_invalid",
+                ) from exc
+            finally:
+                token = ""
+        return {
+            "connection": self._public_sylver_platform_connection(connection)
+        }
+
+    def delete_private_sylver_platform_connection(
+        self, actor: dict[str, Any]
+    ) -> dict[str, Any]:
+        owner = self._sylver_platform_actor(actor)
+        with self._sylver_platform_connection_lock(int(owner["id"])):
+            with self._agent_update_admission():
+                current = self._sylver_platform_actor(owner)
+                self.sylver_platform_connections.delete(int(current["id"]))
+        return {"ok": True}
+
     def _mail_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
         current = self.get_user(int(actor.get("id") or 0))
         if current is None or not current.get("active"):
@@ -9454,6 +9582,8 @@ class EnterpriseService:
             result = self._agent_skill_tool(action, arguments, context)
         elif tool == "mail":
             result = self._agent_mail_tool(action, arguments, context)
+        elif tool == "sylver_platform":
+            result = self._agent_sylver_platform_tool(action, arguments, context)
         else:
             raise ServiceError(404, "Agent tool not found")
         content_result = result
@@ -9468,6 +9598,114 @@ class EnterpriseService:
             "content": json.dumps(content_result, ensure_ascii=False, indent=2),
             "data": result,
             "is_error": False,
+        }
+
+    def _sylver_platform_tool_identity(
+        self,
+        arguments: dict[str, Any],
+        context: dict[str, Any],
+        *,
+        action: str,
+    ) -> tuple[dict[str, Any], AgentExecutionScope]:
+        forbidden = {
+            "base_url", "url", "token", "authorization", "headers", "header",
+            "http_method", "method", "path", "endpoint", "credential",
+            "owner", "owner_id", "owner_user_id", "user_id", "scope",
+            "scope_id", "scope_key", "lifecycle_id",
+        }
+        if forbidden.intersection(arguments):
+            raise ServiceError(
+                400,
+                "platform connection, ownership, and credentials come from the Agent run context",
+            )
+        scope_key = str(context.get("scope_key") or "").strip()
+        if not re.fullmatch(r"private:[1-9][0-9]*", scope_key):
+            raise ServiceError(
+                403,
+                "sylver_platform is available only to a top-level private Agent",
+            )
+        scope = self.agent_scopes.get_scope(scope_key)
+        if scope is None or scope.scope_type != "private":
+            raise ServiceError(404, "private Agent scope not found")
+        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
+        if not lifecycle_id or lifecycle_id != scope.lifecycle_id:
+            raise ServiceError(409, "Agent platform connection lifecycle is stale")
+        try:
+            owner_user_id = int(context.get("owner_user_id"))
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(
+                403,
+                "platform connection access requires its private Agent owner",
+            ) from exc
+        if str(owner_user_id) != str(scope.scope_id):
+            raise ServiceError(
+                403,
+                "platform connection owner does not match private Agent scope",
+            )
+        actor = self.get_user(owner_user_id)
+        if actor is None or not actor.get("active"):
+            raise ServiceError(403, "platform connection owner is unavailable")
+        require_permission(actor, PERMISSION_PRIVATE_AGENT)
+        if action in SYLVER_PLATFORM_MUTATION_ACTIONS:
+            if context.get("unattended") is True:
+                raise ServiceError(403, "unattended platform runs are read-only")
+            tool_call_id = str(context.get("tool_call_id") or "").strip()
+            if (
+                not tool_call_id
+                or len(tool_call_id) > 512
+                or any(character in tool_call_id for character in "\r\n\x00")
+            ):
+                raise ServiceError(
+                    400,
+                    "platform mutations require a valid tool_call_id",
+                )
+        return actor, scope
+
+    def _agent_sylver_platform_tool(
+        self,
+        action: str,
+        arguments: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        if action not in SYLVER_PLATFORM_ACTIONS:
+            raise ServiceError(400, "sylver_platform action is not supported")
+        actor, _scope = self._sylver_platform_tool_identity(
+            arguments,
+            context,
+            action=action,
+        )
+        found = self.sylver_platform_connections.get_with_credential(int(actor["id"]))
+        if found is None:
+            raise ServiceError(
+                409,
+                "connect a Sylver Lining platform in personal settings before using this tool",
+            )
+        connection, token = found
+        try:
+            result = self.sylver_platform_client.execute(
+                connection["base_url"],
+                token,
+                action,
+                arguments,
+            )
+        except SylverPlatformValidationError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        except SylverPlatformError as exc:
+            raise ServiceError(
+                502,
+                str(exc),
+                code=(
+                    "sylver_platform_outcome_unknown"
+                    if exc.outcome_unknown
+                    else "sylver_platform_request_failed"
+                ),
+            ) from exc
+        finally:
+            token = ""
+        return {
+            "action": action,
+            "trust": "untrusted_remote_platform_data",
+            "result": result,
         }
 
     def _mail_tool_identity(

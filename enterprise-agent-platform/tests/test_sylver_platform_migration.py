@@ -11,8 +11,8 @@ from enterprise_agent_platform import db as db_module
 from enterprise_agent_platform.db import Database, migrate_database
 
 
-SOURCE_SCHEMA_VERSION = 2026080601
-TARGET_SCHEMA_VERSION = 2026080602
+SOURCE_SCHEMA_VERSION = 2026080602
+TARGET_SCHEMA_VERSION = 2026080801
 
 
 def create_source_database(path: Path) -> None:
@@ -53,18 +53,25 @@ def create_source_database(path: Path) -> None:
                 ") VALUES (3, ?, 3, ?, 1.0, 1)",
                 ("c" * 64, struct.pack("<3f", 1.0, 0.0, 0.0)),
             )
+            connection.execute(
+                "INSERT INTO users(id, username, display_name, password_hash, "
+                "role, permission_group, created_at) "
+                "VALUES (7, 'existing-user', 'Existing User', 'hash', "
+                "'member', 'member', 1)"
+            )
     finally:
         database.close()
     with sqlite3.connect(path) as connection:
-        connection.execute("DROP TABLE knowledge_document_files")
+        connection.execute("DROP TABLE sylver_platform_credentials")
+        connection.execute("DROP TABLE sylver_platform_connections")
         connection.execute(
             "UPDATE schema_migrations SET version = ?",
             (SOURCE_SCHEMA_VERSION,),
         )
 
 
-class KnowledgeFileMigrationTests(unittest.TestCase):
-    def test_direct_migration_preserves_native_knowledge_and_adds_file_table(self):
+class SylverPlatformMigrationTests(unittest.TestCase):
+    def test_direct_migration_preserves_existing_data_and_adds_connection_tables(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "platform.db"
             create_source_database(path)
@@ -82,6 +89,13 @@ class KnowledgeFileMigrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     database.scalar("SELECT count(*) FROM knowledge_document_files"), 0
+                )
+                self.assertEqual(database.scalar("SELECT count(*) FROM users"), 1)
+                self.assertEqual(
+                    database.scalar("SELECT count(*) FROM sylver_platform_connections"), 0
+                )
+                self.assertEqual(
+                    database.scalar("SELECT count(*) FROM sylver_platform_credentials"), 0
                 )
             finally:
                 database.close()
@@ -117,19 +131,24 @@ class KnowledgeFileMigrationTests(unittest.TestCase):
                     connection.execute("SELECT version FROM schema_migrations").fetchone()[0],
                     SOURCE_SCHEMA_VERSION,
                 )
-                self.assertIsNone(
-                    connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' "
-                        "AND name = 'knowledge_document_files'"
-                    ).fetchone()
-                )
+                for table_name in (
+                    "sylver_platform_connections",
+                    "sylver_platform_credentials",
+                ):
+                    self.assertIsNone(
+                        connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' "
+                            "AND name = ?",
+                            (table_name,),
+                        ).fetchone()
+                    )
 
     def test_migration_rejects_any_other_marker(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "platform.db"
             create_source_database(path)
             with sqlite3.connect(path) as connection:
-                connection.execute("UPDATE schema_migrations SET version = 2026080501")
+                connection.execute("UPDATE schema_migrations SET version = 2026080601")
             with self.assertRaisesRegex(
                 sqlite3.DatabaseError,
                 "does not match the current baseline marker",
@@ -158,12 +177,80 @@ class KnowledgeFileMigrationTests(unittest.TestCase):
                     connection.execute("SELECT version FROM schema_migrations").fetchone()[0],
                     SOURCE_SCHEMA_VERSION,
                 )
-                self.assertIsNone(
-                    connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' "
-                        "AND name = 'knowledge_document_files'"
-                    ).fetchone()
-                )
+                for table_name in (
+                    "sylver_platform_connections",
+                    "sylver_platform_credentials",
+                ):
+                    self.assertIsNone(
+                        connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type = 'table' "
+                            "AND name = ?",
+                            (table_name,),
+                        ).fetchone()
+                    )
+
+    def test_current_baseline_rejects_missing_connection_primary_keys(self):
+        for table_name in (
+            "sylver_platform_connections",
+            "sylver_platform_credentials",
+        ):
+            with self.subTest(table_name=table_name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "platform.db"
+                database = Database(path)
+                database.close()
+                with sqlite3.connect(path) as connection:
+                    connection.execute("PRAGMA foreign_keys = OFF")
+                    if table_name == "sylver_platform_credentials":
+                        connection.execute("DROP TABLE sylver_platform_credentials")
+                        connection.execute(
+                            """
+                            CREATE TABLE sylver_platform_credentials (
+                                owner_user_id INTEGER NOT NULL
+                                    REFERENCES sylver_platform_connections(owner_user_id)
+                                    ON DELETE CASCADE,
+                                token TEXT NOT NULL CHECK (length(token) > 0),
+                                updated_at INTEGER NOT NULL
+                            )
+                            """
+                        )
+                    else:
+                        connection.execute("DROP TABLE sylver_platform_credentials")
+                        connection.execute("DROP TABLE sylver_platform_connections")
+                        connection.execute(
+                            """
+                            CREATE TABLE sylver_platform_connections (
+                                owner_user_id INTEGER NOT NULL
+                                    REFERENCES users(id) ON DELETE CASCADE,
+                                base_url TEXT NOT NULL CHECK (length(base_url) > 0),
+                                remote_user_id INTEGER NOT NULL CHECK (remote_user_id > 0),
+                                username TEXT NOT NULL CHECK (length(username) > 0),
+                                full_name TEXT NOT NULL DEFAULT '',
+                                title TEXT NOT NULL DEFAULT '',
+                                email TEXT NOT NULL DEFAULT '',
+                                role TEXT NOT NULL DEFAULT '',
+                                verified_at INTEGER NOT NULL,
+                                created_at INTEGER NOT NULL,
+                                updated_at INTEGER NOT NULL,
+                                UNIQUE(base_url, remote_user_id)
+                            )
+                            """
+                        )
+                        connection.execute(
+                            """
+                            CREATE TABLE sylver_platform_credentials (
+                                owner_user_id INTEGER PRIMARY KEY
+                                    REFERENCES sylver_platform_connections(owner_user_id)
+                                    ON DELETE CASCADE,
+                                token TEXT NOT NULL CHECK (length(token) > 0),
+                                updated_at INTEGER NOT NULL
+                            )
+                            """
+                        )
+                with self.assertRaisesRegex(
+                    sqlite3.DatabaseError,
+                    "non-current primary key",
+                ):
+                    Database(path)
 
 
 if __name__ == "__main__":

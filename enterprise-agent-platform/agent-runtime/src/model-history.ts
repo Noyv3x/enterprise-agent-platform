@@ -8,6 +8,7 @@ const LEGACY_ACTION_ENVELOPE_TOOLS = new Set([
   "browser",
   "schedule",
   "mail",
+  "sylver_platform",
 ]);
 
 const UNKNOWN_SCHEMA_MAX_DEPTH = 6;
@@ -137,6 +138,19 @@ function omittedActionFields(toolName: string, action: string): ReadonlyArray<re
   if (toolName === "schedule" && ["create", "update"].includes(action)) return [["prompt", "prompt"]];
   if (toolName === "mail" && ["send", "reply"].includes(action)) {
     return [["text_body", "text_body"], ["html_body", "html_body"]];
+  }
+  if (toolName === "sylver_platform") {
+    if (action === "create_task") return [["description", "description"]];
+    if (action === "start_task") return [["note", "note"]];
+    if (action === "add_task_activity") return [["detail", "detail"]];
+    if (action === "propose_wiki") {
+      return [
+        ["content", "content"],
+        ["change_summary", "change_summary"],
+        ["discussion_ref", "discussion_ref"],
+      ];
+    }
+    if (action === "comment_approval") return [["body", "body"]];
   }
   return [];
 }

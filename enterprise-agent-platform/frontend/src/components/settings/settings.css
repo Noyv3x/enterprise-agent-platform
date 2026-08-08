@@ -158,6 +158,44 @@
   margin-block-start: 18px;
 }
 
+.sylver-platform-settings__description {
+  margin-block-end: 16px;
+}
+
+.sylver-platform-identity {
+  min-width: 0;
+  margin-block: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.sylver-platform-identity__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-block-end: 12px;
+}
+
+.sylver-platform-identity__header .eap-tag {
+  margin-inline-end: 0;
+}
+
+.sylver-platform-identity__url {
+  overflow-wrap: anywhere;
+}
+
+.sylver-platform-settings__form {
+  margin-block-start: 16px;
+}
+
+.sylver-platform-settings__error,
+.sylver-platform-settings__security {
+  margin-block-start: 16px;
+}
+
 @media (max-width: 800px) {
   .account-identity__body {
     grid-template-columns: auto minmax(0, 1fr);

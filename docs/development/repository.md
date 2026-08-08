@@ -37,6 +37,8 @@ Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。其官方 URL
 
 集成行为应改在 Python adapter、Runtime 或平台生成配置。知识库是平台自有实现，不从研究用第三方 checkout 复制源码或引入其运行依赖。确实必须修改其它上游时，先取得目标 fork、branch 和发布方式的明确授权。
 
+Sylver Lining 私有 Skill 同样不进入产品 Git tree。开发机的只读 GitHub 凭据和 checkout 只允许位于 `.git/agent-platform-secrets/` 与 `.git/upstreams/`，凭据文件必须 owner-only，且不得写入 remote URL、shell argv、日志、补丁或发布工件。`scripts/sync_sylver_platform_skill.py` 只允许精确的 `https://github.com/Sylver-Lining/ubitech-platform-skill.git`，以禁用 Git HTTP 重定向和凭据助手的临时认证 header fetch，并报告 `SKILL.md` 与 `scripts/ubi.py` 的差异；只有人工审阅并同步文档、固定工具协议和测试后，才允许显式更新 revision 与两个文件摘要。同步流程不复制或执行上游脚本。
+
 ## 源码边界
 
 - Python 需要 3.11+，四空格缩进，函数/模块使用 `snake_case`，类型提示用于说明接口。

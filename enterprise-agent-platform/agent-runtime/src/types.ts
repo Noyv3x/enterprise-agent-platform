@@ -231,7 +231,7 @@ export interface ResolvedModel {
 }
 
 export interface GatewayToolRequest {
-  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule" | "skill" | "mail";
+  tool: "memory" | "session" | "knowledge" | "web" | "browser" | "schedule" | "skill" | "mail" | "sylver_platform";
   action: string;
   arguments: JsonObject;
   context: {

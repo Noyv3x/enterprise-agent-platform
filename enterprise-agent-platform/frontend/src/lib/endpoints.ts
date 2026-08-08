@@ -85,6 +85,8 @@ import type {
   SecurityConfigResponse,
   SecurityConfigUpdateRequest,
   SetSecretRequest,
+  SylverPlatformConnectionResponse,
+  SylverPlatformConnectionUpdateRequest,
   TelegramConfigResponse,
   TelegramConfigUpdateRequest,
   TokenUsageResponse,
@@ -250,6 +252,23 @@ export const endpoints = {
   checkPrivateMailAccount: ep<void, MailAccountCheckResponse, [Id]>(
     "POST",
     (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}/check`,
+  ),
+
+  /* private Agent Sylver Lining platform connection */
+  privateSylverPlatformConnection: ep<void, SylverPlatformConnectionResponse>(
+    "GET",
+    () => "/api/private-agent/integrations/sylver-platform",
+  ),
+  updatePrivateSylverPlatformConnection: ep<
+    SylverPlatformConnectionUpdateRequest,
+    SylverPlatformConnectionResponse
+  >(
+    "PUT",
+    () => "/api/private-agent/integrations/sylver-platform",
+  ),
+  deletePrivateSylverPlatformConnection: ep<void, { ok: true }>(
+    "DELETE",
+    () => "/api/private-agent/integrations/sylver-platform",
   ),
 
   /* private Agent schedules */

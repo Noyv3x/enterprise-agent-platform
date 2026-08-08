@@ -356,6 +356,21 @@ export interface MailAccount {
   updated_at: number;
 }
 
+/* ---------------------------------------------- private platform connector */
+
+export interface SylverPlatformConnection {
+  base_url: string;
+  remote_user_id: Id;
+  username: string;
+  full_name: string;
+  title: string;
+  email: string;
+  role: string;
+  credential_configured: boolean;
+  verified_at: number | string;
+  updated_at: number | string;
+}
+
 /* ---------------------------------------------------- scheduled Agent work */
 
 export type AgentScheduleRule =

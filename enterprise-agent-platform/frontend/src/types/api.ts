@@ -31,6 +31,7 @@ import type {
   RuntimeMap,
   Secret,
   SecurityConfigState,
+  SylverPlatformConnection,
   TelegramConfigState,
   TokenUsageReport,
   TypingUser,
@@ -244,6 +245,14 @@ export interface MailAccountCheckResponse extends MailAccountResponse {
   baseline: boolean;
   new_messages: number;
   stale: boolean;
+}
+
+export interface SylverPlatformConnectionResponse {
+  connection: SylverPlatformConnection | null;
+}
+
+export interface SylverPlatformConnectionUpdateRequest {
+  token: string;
 }
 
 export interface AgentSchedulesResponse {

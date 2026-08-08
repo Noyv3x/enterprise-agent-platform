@@ -124,6 +124,8 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 
 私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。
 
+Sylver Lining 工作平台连接属于每用户产品设置，不是 Manager 或容器环境配置。提供方 origin 固定为 `https://devops.sylver-lining.org`；普通用户通过 `/api/private-agent/integrations/sylver-platform` 只提交候选 Personal API Token，Platform 先请求 `/api/auth/me` 验证远端身份，再把 Token 写入独立凭据行。读取只返回固定 origin、身份投影和 `credential_configured`。该 origin 和凭据都不提供环境变量或管理员覆盖入口，凭据也不进入 Sandbox、Runtime metadata 或开发期上游 Git 凭据。
+
 ### Telegram 与自动更新
 
 Telegram enabled、bot token、username、webhook secret 与 polling 属于 Platform。自动更新 enabled/interval/channel、current/target/previous generation 和 operation 属于 Manager；Platform 只显示状态并提交受限 operation，不能保存 Git remote、branch、worktree 或部署命令。Manager 轮询、管理界面和宿主 CLI 是更新入口。
@@ -143,7 +145,7 @@ Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.j
 
 ## Secret
 
-Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Knowledge Embeddings 和 Telegram secret。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
+Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Knowledge Embeddings、Telegram 和每用户 Sylver Lining Personal API Token。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
 
 `secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限；界面不得宣称“加密存储”。secret 值不能进入文档、日志、Run metadata、release manifest、operation journal 或 Git。
 

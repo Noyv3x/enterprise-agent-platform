@@ -1072,6 +1072,20 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/private-agent/telegram" and method == "DELETE":
             self._json(service.unlink_telegram_private_config(actor))
             return
+        if path == "/api/private-agent/integrations/sylver-platform" and method == "GET":
+            self._json(service.get_private_sylver_platform_connection(actor))
+            return
+        if path == "/api/private-agent/integrations/sylver-platform" and method == "PUT":
+            self._json(
+                service.put_private_sylver_platform_connection(
+                    actor,
+                    self._body_json_closed_world(frozenset({"token"})),
+                )
+            )
+            return
+        if path == "/api/private-agent/integrations/sylver-platform" and method == "DELETE":
+            self._json(service.delete_private_sylver_platform_connection(actor))
+            return
         if path == "/api/private-agent/mail/accounts" and method == "GET":
             self._json(service.list_private_mail_accounts(actor))
             return
@@ -1344,7 +1358,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(401, "invalid Agent runtime token")
         if method != "POST":
             raise ServiceError(405, "method not allowed")
-        if re.fullmatch(r"/internal/agent/tools/(?:web|browser|schedule|skill|mail)", path):
+        if re.fullmatch(
+            r"/internal/agent/tools/(?:web|browser|schedule|skill|mail|sylver_platform)",
+            path,
+        ):
             body = self._body_json()
             body["tool"] = path.rsplit("/", 1)[-1]
             self._json(service.invoke_agent_runtime_tool(body))

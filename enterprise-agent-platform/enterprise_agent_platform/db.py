@@ -27,8 +27,8 @@ from .technical_profile import (
 )
 
 
-_SOURCE_DATABASE_BASELINE_VERSION = 2026080601
-_DATABASE_BASELINE_VERSION = 2026080602
+_SOURCE_DATABASE_BASELINE_VERSION = 2026080602
+_DATABASE_BASELINE_VERSION = 2026080801
 _DATABASE_BASELINE_NAME = TARGET_DATABASE_BASELINE
 if _DATABASE_BASELINE_VERSION != DATABASE_SCHEMA_VERSION:
     raise RuntimeError("Database baseline does not match the container contract")
@@ -150,6 +150,32 @@ CREATE TABLE knowledge_document_files (
         CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
     content BLOB NOT NULL CHECK(length(content) = size_bytes),
     created_at INTEGER NOT NULL
+);
+"""
+
+
+_SYLVER_PLATFORM_SCHEMA_SQL = """
+CREATE TABLE sylver_platform_connections (
+    owner_user_id INTEGER PRIMARY KEY
+        REFERENCES users(id) ON DELETE CASCADE,
+    base_url TEXT NOT NULL CHECK(length(base_url) > 0),
+    remote_user_id INTEGER NOT NULL CHECK(remote_user_id > 0),
+    username TEXT NOT NULL CHECK(length(username) > 0),
+    full_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    verified_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(base_url, remote_user_id)
+);
+
+CREATE TABLE sylver_platform_credentials (
+    owner_user_id INTEGER PRIMARY KEY
+        REFERENCES sylver_platform_connections(owner_user_id) ON DELETE CASCADE,
+    token TEXT NOT NULL CHECK(length(token) > 0),
+    updated_at INTEGER NOT NULL
 );
 """
 
@@ -740,6 +766,8 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_external_identities_user ON external_identities(user_id);
 
+                __SYLVER_PLATFORM_SCHEMA__
+
                 CREATE TABLE IF NOT EXISTS telegram_link_challenges (
                     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                     code_hash TEXT NOT NULL UNIQUE,
@@ -982,6 +1010,8 @@ class Database:
                         raise RuntimeError("knowledge schema placeholder is invalid")
                     if schema.count("__KNOWLEDGE_FILE_SCHEMA__") != 1:
                         raise RuntimeError("knowledge file schema placeholder is invalid")
+                    if schema.count("__SYLVER_PLATFORM_SCHEMA__") != 1:
+                        raise RuntimeError("Sylver Platform schema placeholder is invalid")
                     self._conn.executescript(
                         schema.replace(
                             "__CURRENT_DATABASE_BASELINE__",
@@ -993,6 +1023,8 @@ class Database:
                             "__KNOWLEDGE_SCHEMA__", _KNOWLEDGE_SCHEMA_SQL
                         ).replace(
                             "__KNOWLEDGE_FILE_SCHEMA__", _KNOWLEDGE_FILE_SCHEMA_SQL
+                        ).replace(
+                            "__SYLVER_PLATFORM_SCHEMA__", _SYLVER_PLATFORM_SCHEMA_SQL
                         )
                     )
                 except BaseException:
@@ -1015,11 +1047,11 @@ class Database:
         return int(rows[0]["version"]), str(rows[0]["name"])
 
     def _migrate_source_database_baseline(self) -> None:
-        """Atomically add immutable knowledge source-file storage."""
+        """Atomically add per-user Sylver Platform connections and credentials."""
 
         try:
             self._conn.execute("BEGIN IMMEDIATE")
-            _execute_transactional_schema(self._conn, _KNOWLEDGE_FILE_SCHEMA_SQL)
+            _execute_transactional_schema(self._conn, _SYLVER_PLATFORM_SCHEMA_SQL)
             self._conn.execute(
                 "UPDATE schema_migrations SET version = ?, applied_at = ? "
                 "WHERE version = ? AND name = ?",
@@ -1037,7 +1069,7 @@ class Database:
             violations = self._conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise sqlite3.IntegrityError(
-                    f"knowledge file migration produced {len(violations)} "
+                    f"Sylver Platform migration produced {len(violations)} "
                     "foreign-key violations"
                 )
             self._assert_current_database_baseline()
@@ -1183,6 +1215,15 @@ class Database:
         required_columns["mail_account_credentials"] = {
             "account_id", "password", "updated_at",
         }
+        if not source_database_baseline:
+            required_columns["sylver_platform_connections"] = {
+                "owner_user_id", "base_url", "remote_user_id", "username",
+                "full_name", "title", "email", "role", "verified_at",
+                "created_at", "updated_at",
+            }
+            required_columns["sylver_platform_credentials"] = {
+                "owner_user_id", "token", "updated_at",
+            }
         required_columns.update({
             "knowledge_index_generations": {
                 "id", "config_hash", "embedding_base_url",
@@ -1206,11 +1247,10 @@ class Database:
                 "norm", "created_at",
             },
         })
-        if not source_database_baseline:
-            required_columns["knowledge_document_files"] = {
-                "document_id", "filename", "media_type", "size_bytes",
-                "sha256", "content", "created_at",
-            }
+        required_columns["knowledge_document_files"] = {
+            "document_id", "filename", "media_type", "size_bytes",
+            "sha256", "content", "created_at",
+        }
         fts_prefixes = [
             "agent_memory_fts",
             "message_fts",
@@ -1269,6 +1309,19 @@ class Database:
         self._assert_table_sql(
             "mail_accounts", "check(poll_interval_secondsbetween60and3600)"
         )
+        if not source_database_baseline:
+            self._assert_table_sql(
+                "sylver_platform_connections", "check(length(base_url)>0)"
+            )
+            self._assert_table_sql(
+                "sylver_platform_connections", "check(remote_user_id>0)"
+            )
+            self._assert_table_sql(
+                "sylver_platform_connections", "check(length(username)>0)"
+            )
+            self._assert_table_sql(
+                "sylver_platform_credentials", "check(length(token)>0)"
+            )
         self._assert_table_sql(
             "agent_run_inputs",
             "check(statein('running','reserved','submitting','accepted','injected','unconsumed','succeeded','failed','needs_review'))",
@@ -1304,10 +1357,9 @@ class Database:
         self._assert_table_sql(
             "knowledge_chunks", "check(char_end>char_start)"
         )
-        if not source_database_baseline:
-            self._assert_table_sql(
-                "knowledge_document_files", "check(length(content)=size_bytes)"
-            )
+        self._assert_table_sql(
+            "knowledge_document_files", "check(length(content)=size_bytes)"
+        )
         memory_sources = ("manual", "automatic")
         placeholders = ", ".join("?" for _ in memory_sources)
         invalid_sources = int(self._conn.execute(
@@ -1397,6 +1449,16 @@ class Database:
             self._assert_named_index(index_name, table_name, columns)
         self._assert_unique_columns("durable_jobs", ("kind", "dedupe_key"))
         self._assert_unique_columns("mail_accounts", ("owner_user_id", "email_address"))
+        if not source_database_baseline:
+            self._assert_primary_key_columns(
+                "sylver_platform_connections", ("owner_user_id",)
+            )
+            self._assert_primary_key_columns(
+                "sylver_platform_credentials", ("owner_user_id",)
+            )
+            self._assert_unique_columns(
+                "sylver_platform_connections", ("base_url", "remote_user_id")
+            )
         self._assert_unique_columns("agent_run_inputs", ("job_id",))
         self._assert_unique_columns(
             "agent_schedule_runs",
@@ -1428,6 +1490,20 @@ class Database:
             "mail_account_credentials",
             {("account_id", "mail_accounts", "id", "CASCADE")},
         )
+        if not source_database_baseline:
+            self._assert_foreign_keys(
+                "sylver_platform_connections",
+                {("owner_user_id", "users", "id", "CASCADE")},
+            )
+            self._assert_foreign_keys(
+                "sylver_platform_credentials",
+                {
+                    (
+                        "owner_user_id", "sylver_platform_connections",
+                        "owner_user_id", "CASCADE",
+                    )
+                },
+            )
         self._assert_foreign_keys("agent_run_inputs", set())
         self._assert_foreign_keys(
             "agent_schedules",
@@ -1473,11 +1549,10 @@ class Database:
                 ("chunk_id", "knowledge_chunks", "chunk_id", "CASCADE"),
             },
         )
-        if not source_database_baseline:
-            self._assert_foreign_keys(
-                "knowledge_document_files",
-                {("document_id", "knowledge_documents", "id", "CASCADE")},
-            )
+        self._assert_foreign_keys(
+            "knowledge_document_files",
+            {("document_id", "knowledge_documents", "id", "CASCADE")},
+        )
 
         required_triggers = {
             "conversation_revision_ai",
@@ -1555,6 +1630,29 @@ class Database:
         if required_fragment not in normalized:
             raise sqlite3.DatabaseError(
                 f"database table {table_name} is outside the current baseline"
+            )
+
+    def _assert_primary_key_columns(
+        self,
+        table_name: str,
+        columns: tuple[str, ...],
+    ) -> None:
+        actual = tuple(
+            str(row["name"])
+            for row in sorted(
+                (
+                    row
+                    for row in self._conn.execute(
+                        f'PRAGMA table_info("{table_name}")'
+                    ).fetchall()
+                    if int(row["pk"] or 0) > 0
+                ),
+                key=lambda row: int(row["pk"]),
+            )
+        )
+        if actual != columns:
+            raise sqlite3.DatabaseError(
+                f"database table {table_name} has a non-current primary key"
             )
 
     def _assert_named_index(

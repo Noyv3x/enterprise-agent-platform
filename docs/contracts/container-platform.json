@@ -2,7 +2,7 @@
   "schema_version": 2,
   "policy": "container-platform",
   "release_channel": "main",
-  "database_schema_version": 2026080602,
+  "database_schema_version": 2026080801,
   "container_paths": {
     "data_root": "/var/lib/agent-platform",
     "workspace": "/workspace",
