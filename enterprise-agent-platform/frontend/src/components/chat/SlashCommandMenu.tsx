@@ -1,3 +1,5 @@
+import { Button } from "antd";
+
 import { useI18n } from "../../i18n";
 
 export function SlashCommandMenu({
@@ -21,9 +23,10 @@ export function SlashCommandMenu({
       hidden={!visible}
     >
       {visible ? (
-        <button
+        <Button
           className="mention-option slash-command-option is-active"
-          type="button"
+          type="text"
+          htmlType="button"
           role="option"
           id={optionId}
           aria-selected="true"
@@ -38,7 +41,7 @@ export function SlashCommandMenu({
             <span className="mention-option__label">/compact</span>
             <span className="mention-option__meta">{t("chat.commands.compactDescription")}</span>
           </span>
-        </button>
+        </Button>
       ) : null}
     </div>
   );

@@ -9,6 +9,7 @@ import { scheduledTaskMessages } from "./messages/scheduledTasks";
 import { memoryMessages } from "./messages/memory";
 import { skillMessages } from "./messages/skills";
 import { mailMessages } from "./messages/mail";
+import { sylverPlatformMessages } from "./messages/sylverPlatform";
 import {
   LOCALE_STORAGE_KEY,
   applyDocumentLocale,
@@ -118,6 +119,7 @@ describe("translation catalogs", () => {
       memoryMessages,
       skillMessages,
       mailMessages,
+      sylverPlatformMessages,
     ]) {
       for (const key of Object.keys(domain)) {
         if (seen.has(key)) duplicates.push(key);
