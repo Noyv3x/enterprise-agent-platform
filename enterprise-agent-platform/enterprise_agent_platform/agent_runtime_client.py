@@ -107,6 +107,14 @@ class AgentClient(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def compact_session(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        ...
+
     def terminal_previews(
         self,
         scope_key: str,
@@ -534,6 +542,49 @@ class AgentRuntimeClient:
             body,
             timeout=min(self.request_timeout_seconds, 10.0),
         )
+        return result
+
+    def compact_session(
+        self,
+        scope_key: str,
+        lifecycle_id: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        body = {
+            "scope_key": self._required_id("scope_key", scope_key),
+            "lifecycle_id": self._required_id("lifecycle_id", lifecycle_id),
+            "session_id": self._required_id("session_id", session_id),
+        }
+        result, _ = self._json_request(
+            "POST",
+            "/v1/sessions/compact",
+            body,
+            timeout=self.request_timeout_seconds,
+            max_response_bytes=64 * 1024,
+        )
+        if set(result) != {
+            "compacted",
+            "omitted_messages",
+            "retained_messages",
+        }:
+            raise AgentRuntimeProtocolError(
+                "Agent runtime session compaction returned unexpected fields"
+            )
+        compacted = result.get("compacted")
+        omitted = result.get("omitted_messages")
+        retained = result.get("retained_messages")
+        if (
+            not isinstance(compacted, bool)
+            or not isinstance(omitted, int)
+            or isinstance(omitted, bool)
+            or omitted < 0
+            or not isinstance(retained, int)
+            or isinstance(retained, bool)
+            or retained < 0
+        ):
+            raise AgentRuntimeProtocolError(
+                "Agent runtime session compaction returned invalid counts"
+            )
         return result
 
     def health(self) -> dict[str, Any]:

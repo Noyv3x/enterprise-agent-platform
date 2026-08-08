@@ -899,6 +899,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._stream_agent_reply_events(actor)
             return
 
+        if path == "/api/agent-session/compact" and method == "POST":
+            if query:
+                raise ServiceError(400, "session compaction does not accept query parameters")
+            body = self._body_json_closed_world(
+                frozenset({"scope_type", "scope_id"})
+            )
+            if (
+                type(body["scope_type"]) is not str
+                or type(body["scope_id"]) is not str
+                or not body["scope_type"].strip()
+                or not body["scope_id"].strip()
+            ):
+                raise ServiceError(400, "scope_type and scope_id must be non-empty strings")
+            self._json(
+                service.compact_agent_session(
+                    actor,
+                    body["scope_type"],
+                    body["scope_id"],
+                )
+            )
+            return
+
         if path == "/api/private-agent/messages" and method == "GET":
             limit = int_arg(query, "limit", 100)
             sync = service.message_sync(

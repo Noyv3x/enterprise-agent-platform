@@ -170,6 +170,31 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     return;
   }
 
+  if (request.method === "POST" && url.pathname === "/v1/sessions/compact") {
+    if ([...url.searchParams.keys()].length > 0) {
+      throw httpError(400, "Session compaction does not accept query parameters");
+    }
+    const body = await readJson<{
+      scope_key?: string;
+      lifecycle_id?: string;
+      session_id?: string;
+    }>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);
+    const allowed = new Set(["scope_key", "lifecycle_id", "session_id"]);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw httpError(400, "Invalid session compaction request");
+    }
+    if (Object.keys(body).some((key) => !allowed.has(key))) {
+      throw httpError(400, "Session compaction accepts only scope_key, lifecycle_id, and session_id");
+    }
+    const result = await coordinator.compactSession(
+      body.scope_key ?? "",
+      body.lifecycle_id ?? "",
+      body.session_id ?? "",
+    );
+    json(response, 200, result);
+    return;
+  }
+
   if (request.method === "GET" && url.pathname === "/v1/scopes/processes") {
     const allowedQuery = new Set(["scope_key", "lifecycle_id", "since_revision"]);
     if ([...url.searchParams.keys()].some((key) => !allowedQuery.has(key))) {

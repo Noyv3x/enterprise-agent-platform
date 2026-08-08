@@ -16,12 +16,14 @@ export interface TrackedSessionMessage {
   entry_id: string;
   message: AgentMessage;
   model_content_security_version?: number;
+  synthetic_kind?: "context_compaction_notice";
 }
 
 export interface CompactedSessionMessage {
   entry_id?: string;
   message: AgentMessage;
   model_content_security_version?: number;
+  synthetic_kind?: "context_compaction_notice";
 }
 
 interface SessionApprovalEntry {
@@ -85,6 +87,9 @@ export class SessionStore {
               ...(entry.model_content_security_version !== undefined
                 ? { model_content_security_version: entry.model_content_security_version }
                 : {}),
+              ...(entry.synthetic_kind !== undefined
+                ? { synthetic_kind: entry.synthetic_kind }
+                : {}),
             }));
         }
         await mkdir(dirname(file), { recursive: true, mode: 0o700 });
@@ -106,6 +111,21 @@ export class SessionStore {
         return tracked;
       });
     });
+  }
+
+  async loadTracked(identity: SessionIdentity): Promise<TrackedSessionMessage[]> {
+    return (await this.readEntries(identity))
+      .filter((entry) => entry.type === "message")
+      .map((entry) => ({
+        entry_id: entry.id,
+        message: entry.payload as AgentMessage,
+        ...(entry.model_content_security_version !== undefined
+          ? { model_content_security_version: entry.model_content_security_version }
+          : {}),
+        ...(entry.synthetic_kind !== undefined
+          ? { synthetic_kind: entry.synthetic_kind }
+          : {}),
+      }));
   }
 
   async withSessionLock<T>(identity: SessionIdentity, task: () => Promise<T>): Promise<T> {
@@ -264,9 +284,11 @@ export class SessionStore {
             "message",
             durableSessionMessage(message.message),
             message.model_content_security_version,
+            message.synthetic_kind,
           );
         }
         const currentEntry = currentById.get(message.entry_id)!;
+        const syntheticKind = message.synthetic_kind ?? currentEntry.synthetic_kind;
         return {
           id: currentEntry.id,
           type: "message",
@@ -274,6 +296,9 @@ export class SessionStore {
           ...identity,
           ...(message.model_content_security_version !== undefined
             ? { model_content_security_version: message.model_content_security_version }
+            : {}),
+          ...(syntheticKind !== undefined
+            ? { synthetic_kind: syntheticKind }
             : {}),
           payload: durableSessionMessage(message.message),
         };
@@ -431,6 +456,7 @@ export class SessionStore {
     type: SessionEntry["type"],
     payload: JsonValue | AgentMessage,
     modelContentSecurityVersion?: number,
+    syntheticKind?: SessionEntry["synthetic_kind"],
   ): SessionEntry {
     return {
       id: id("entry"),
@@ -439,6 +465,9 @@ export class SessionStore {
       ...identity,
       ...(modelContentSecurityVersion !== undefined
         ? { model_content_security_version: modelContentSecurityVersion }
+        : {}),
+      ...(syntheticKind !== undefined
+        ? { synthetic_kind: syntheticKind }
         : {}),
       payload,
     };

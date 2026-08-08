@@ -48,6 +48,7 @@ from enterprise_agent_platform.service import (
     UploadedFile,
     _ResizableConcurrencyGate,
     agent_tool_detail,
+    normalize_attachment_mime,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
 from enterprise_agent_platform.technical_profile import TARGET_TECHNICAL_PROFILE
@@ -89,6 +90,7 @@ def make_xlsx_attachment() -> bytes:
 class RecordingAgent:
     def __init__(self):
         self.calls = []
+        self.compact_calls = []
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
@@ -141,6 +143,20 @@ class RecordingAgent:
 
     def cleanup_scope(self, _scope_key, *, lifecycle_id=None, delete_sessions=False):
         return {"ok": True}
+
+    def compact_session(self, scope_key, lifecycle_id, session_id):
+        self.compact_calls.append(
+            {
+                "scope_key": scope_key,
+                "lifecycle_id": lifecycle_id,
+                "session_id": session_id,
+            }
+        )
+        return {
+            "compacted": True,
+            "omitted_messages": 9,
+            "retained_messages": 7,
+        }
 
     def terminal_previews(self, _scope_key, _lifecycle_id, *, since_revision=None):
         return {"processes": [], "revision": "empty:0"}
@@ -716,6 +732,40 @@ def make_config(tmp: Path) -> PlatformConfig:
     return config
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_office_attachment_mime_normalization_does_not_depend_on_host_database(self):
+        with mock.patch(
+            "enterprise_agent_platform.service.mimetypes.guess_type",
+            return_value=(None, None),
+        ):
+            cases = {
+                "report.docx": (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                ),
+                "report.xlsx": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+                "report.pptx": (
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                ),
+            }
+            for filename, expected in cases.items():
+                with self.subTest(filename=filename):
+                    self.assertEqual(
+                        normalize_attachment_mime(filename, ""),
+                        expected,
+                    )
+                    self.assertEqual(
+                        normalize_attachment_mime(
+                            filename,
+                            "application/octet-stream",
+                        ),
+                        expected,
+                    )
+            self.assertEqual(
+                normalize_attachment_mime("report.xlsx", "application/x-custom"),
+                "application/x-custom",
+            )
+
     def test_target_profile_writes_only_neutral_machine_setting_keys(self):
         with tempfile.TemporaryDirectory() as td:
             config = replace(
@@ -2713,6 +2763,83 @@ class PlatformServiceTests(unittest.TestCase):
             self.assertNotIn("container", agent.calls[-1]["metadata"])
             service.close()
 
+    def test_manual_compact_uses_trusted_session_identity_without_persisting_a_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                private_scope = service.agent_scopes.ensure_private_scope(admin["id"])
+                before_messages = service.list_messages(
+                    admin,
+                    "private",
+                    str(admin["id"]),
+                )
+                result = service.compact_agent_session(
+                    admin,
+                    "private",
+                    str(admin["id"]),
+                )
+                self.assertEqual(
+                    result,
+                    {
+                        "compacted": True,
+                        "omitted_messages": 9,
+                        "retained_messages": 7,
+                    },
+                )
+                self.assertEqual(
+                    agent.compact_calls,
+                    [
+                        {
+                            "scope_key": private_scope.scope_key,
+                            "lifecycle_id": private_scope.lifecycle_id,
+                            "session_id": private_scope.session_id,
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    service.list_messages(admin, "private", str(admin["id"])),
+                    before_messages,
+                )
+                self.assertEqual(
+                    service.jobs.counts(
+                        kind="agent",
+                        scope_type="private",
+                        scope_id=str(admin["id"]),
+                    )["queued"],
+                    0,
+                )
+                for reserved in ("/compact", "/COMPACT now"):
+                    with self.subTest(reserved=reserved), self.assertRaisesRegex(
+                        ServiceError,
+                        "session compact command endpoint",
+                    ):
+                        service.send_private_message(admin, reserved)
+            finally:
+                service.close()
+
+    def test_manual_compact_rejects_while_the_conversation_is_running(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.send_private_message(admin, "keep working")
+                self.assertTrue(agent.started.wait(timeout=2))
+                with self.assertRaises(ServiceError) as raised:
+                    service.compact_agent_session(
+                        admin,
+                        "private",
+                        str(admin["id"]),
+                    )
+                self.assertEqual(raised.exception.status, 409)
+                self.assertIn("still processing", str(raised.exception))
+            finally:
+                agent.release.set()
+                service.wait_for_agent_idle("private", "1", timeout=5)
+                service.close()
+
     def test_private_agent_joins_rapid_messages_into_one_active_run(self):
         with tempfile.TemporaryDirectory() as td:
             agent = SteeringBlockingAgent()
@@ -3717,8 +3844,12 @@ class PlatformServiceTests(unittest.TestCase):
                 payload = make_xlsx_attachment()
                 media_path.write_bytes(payload)
 
-                service.send_private_message(user, "make a workbook")
-                service.wait_for_agent_idle("private", str(user["id"]))
+                with mock.patch(
+                    "enterprise_agent_platform.service.mimetypes.guess_type",
+                    return_value=(None, None),
+                ):
+                    service.send_private_message(user, "make a workbook")
+                    service.wait_for_agent_idle("private", str(user["id"]))
                 agent_message = service.list_messages(
                     user,
                     "private",
@@ -3729,6 +3860,10 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(len(agent_message["attachments"]), 1)
                 attachment = agent_message["attachments"][0]
                 self.assertEqual(attachment["filename"], "report.xlsx")
+                self.assertEqual(
+                    attachment["mime_type"],
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                 self.assertIn("preview_url", attachment)
                 _, stored_path = service.get_attachment_file(
                     user,
@@ -6485,6 +6620,80 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_session_compact_endpoint_uses_the_authenticated_conversation(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            agent = RecordingAgent()
+            service = EnterpriseService(config, agent_client=agent)
+            token, admin = service.authenticate("admin", "admin")
+            scope = service.agent_scopes.ensure_private_scope(admin["id"])
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            headers = {
+                "Content-Type": "application/json",
+                "Cookie": f"{config.session_cookie_name}={token}",
+                "Origin": origin,
+            }
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "POST",
+                    "/api/agent-session/compact",
+                    body=json.dumps(
+                        {"scope_type": "private", "scope_id": str(admin["id"])}
+                    ),
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["omitted_messages"], 9)
+                self.assertEqual(agent.compact_calls[-1]["scope_key"], scope.scope_key)
+
+                connection.request(
+                    "POST",
+                    "/api/agent-session/compact",
+                    body=json.dumps(
+                        {
+                            "scope_type": "private",
+                            "scope_id": str(admin["id"]),
+                            "scope_key": "private:attacker",
+                        }
+                    ),
+                    headers=headers,
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 400)
+
+                for target, body in (
+                    (
+                        "/api/agent-session/compact?force=true",
+                        json.dumps(
+                            {"scope_type": "private", "scope_id": str(admin["id"])}
+                        ),
+                    ),
+                    (
+                        "/api/agent-session/compact",
+                        json.dumps({"scope_type": "private", "scope_id": None}),
+                    ),
+                    (
+                        "/api/agent-session/compact",
+                        '{"scope_type":"private","scope_type":"channel","scope_id":"1"}',
+                    ),
+                ):
+                    connection.request("POST", target, body=body, headers=headers)
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 400)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_xlsx_attachment_preview_is_authorized_bounded_json(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
@@ -6501,7 +6710,25 @@ class PlatformHTTPTests(unittest.TestCase):
                     )
                 ],
             )
-            attachment = result["user_message"]["attachments"][0]
+            attachment_id = result["user_message"]["attachments"][0]["id"]
+            service.db.execute(
+                "UPDATE attachments SET mime_type = ? WHERE id = ?",
+                ("application/octet-stream", attachment_id),
+            )
+            message = next(
+                item
+                for item in service.list_messages(
+                    admin,
+                    "private",
+                    str(admin["id"]),
+                )
+                if item["id"] == result["user_message"]["id"]
+            )
+            attachment = message["attachments"][0]
+            self.assertEqual(
+                attachment["mime_type"],
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
             self.assertEqual(
                 attachment["preview_url"],
                 f"/api/attachments/{attachment['id']}/xlsx-preview",

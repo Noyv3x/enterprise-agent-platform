@@ -4,7 +4,7 @@ import { useI18n } from "../../i18n";
 import { Button, Tooltip } from "antd";
 import { Icon } from "../common/Icon";
 
-export function SendButton({ disabled }: { disabled: boolean }) {
+export function SendButton({ disabled, loading = false }: { disabled: boolean; loading?: boolean }) {
   const { t } = useI18n();
   return (
     <Tooltip title={t("chat.composer.sendTitle")}>
@@ -15,6 +15,7 @@ export function SendButton({ disabled }: { disabled: boolean }) {
         htmlType="submit"
         aria-label={t("chat.composer.send")}
         disabled={disabled}
+        loading={loading}
         icon={<Icon name="send" size={18} />}
       />
     </Tooltip>

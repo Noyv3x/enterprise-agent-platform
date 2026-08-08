@@ -65,6 +65,7 @@ class _ManagerStub:
                 "id": "release-current",
                 "source_commit": "a" * 40,
                 "images": {"platform": "registry/platform@sha256:abc"},
+                "activated_at": "2026-07-24T12:00:00Z",
             },
             "previous": {"id": "release-previous"},
             "target": {"id": "release-target", "source_commit": "b" * 40},
@@ -154,7 +155,21 @@ class ManagerUpdateControlTests(unittest.TestCase):
                 self.assertEqual(payload["status"]["current_generation"], "release-current")
                 self.assertEqual(payload["status"]["previous_generation"], "release-previous")
                 self.assertEqual(payload["status"]["target_generation"], "release-target")
+                self.assertEqual(
+                    payload["status"]["last_successful_update_at"],
+                    "2026-07-24T12:00:00Z",
+                )
                 self.assertTrue(payload["status"]["update_available"])
+
+                manager.status_payload["current"] = {
+                    "id": "release-current",
+                    "activated_at": "not-a-timestamp",
+                }
+                self.assertIsNone(
+                    service.auto_update_config(actor)["status"][
+                        "last_successful_update_at"
+                    ]
+                )
 
                 updated = service.update_auto_update_config(
                     actor,

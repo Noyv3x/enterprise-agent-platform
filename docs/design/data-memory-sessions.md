@@ -36,6 +36,8 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 产品消息用于界面、审计、Telegram 投递、跨会话搜索和回复关联。Runtime 会话用于模型上下文、工具调用配对和压缩恢复。两者用 source message、Run、scope、lifecycle 和 session 元数据关联，但任何一方都不能通过模糊文本推断另一方身份。
 
+界面的 `/compact` 是当前 Runtime session 的本地控制操作，不写入产品消息库，也不作为用户消息追加到 Runtime journal。它只把可安全省略的活动 journal 条目归档并原子改写当前上下文；Runtime 生成的上下文提示由 entry 顶层结构化标记区分，正文相同但没有该标记的真实用户消息仍必须归档。archive、产品消息、附件、记忆、知识和 workspace 均不删除，因此压缩前历史仍可通过 `session` 或 `session_search` 找回。
+
 持久 Runtime 会话中的 assistant tool call 是下一轮模型会直接看到的协议样例，因此其参数必须始终保持当前工具 schema 的规范形状。敏感正文只可在 schema 允许的位置替换为有界且符合字段约束的占位符；受正则、枚举或路径规则约束的标识符不能使用破坏约束的通用展示占位符。允许任意 JSON 的字段还必须限制投影深度、条目数、节点数和单字符串字节数。审计专用的 `tool` 名称、展示 envelope、拒绝原因或其它 schema 外字段不得写回模型历史。工具活动 journal 可以使用独立的展示对象，不能与模型历史共用同一个序列化函数。读取既有会话时，Runtime 在不改写 JSONL 的前提下把历史展示 envelope 归一为规范参数后再交给模型；未知字段和身份字段仍失败关闭，不能借归一化扩大工具权限。
 
 管理审计中的单条删除、按时间删除和清空对话，以及用户对本人频道消息的撤回，都是产品消息的逻辑隐藏：它们不轮换 lifecycle/session，不清理 Runtime 上下文、memory、附件或 workspace，也不取消已经排队或运行的回复。用户撤回只允许精确匹配当前频道、`author_type=user` 且 `user_id` 等于当前登录账号的可见持久消息；乐观发送中的临时行没有服务端撤回语义。用户后续继续对话时，Runtime 仍可使用原会话历史。真正重置 Agent 上下文必须走显式的 lifecycle/session rotation 与 scope cleanup，不能从消息行是否可见来推断。

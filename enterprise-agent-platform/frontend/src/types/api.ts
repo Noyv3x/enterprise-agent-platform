@@ -184,6 +184,17 @@ export interface AgentApprovalSubmitResponse {
   agent_status?: AgentStatus | null;
 }
 
+export interface AgentSessionCompactRequest {
+  scope_type: "private" | "channel";
+  scope_id: string;
+}
+
+export interface AgentSessionCompactResponse {
+  compacted: boolean;
+  omitted_messages: number;
+  retained_messages: number;
+}
+
 export interface TypingRequest {
   typing: boolean;
 }

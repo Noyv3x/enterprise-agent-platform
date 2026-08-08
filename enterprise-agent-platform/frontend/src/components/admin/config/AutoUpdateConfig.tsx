@@ -149,6 +149,7 @@ export function AutoUpdateConfig() {
           <Descriptions.Item label={t("admin.updates.operationId")} span={3}>
             <Typography.Text code copyable={!!status.operation_id}>{status.operation_id || "-"}</Typography.Text>
           </Descriptions.Item>
+          <Descriptions.Item label={t("admin.updates.currentActivatedAt")}>{formatTimestamp(status.last_successful_update_at) || "-"}</Descriptions.Item>
           <Descriptions.Item label={t("admin.updates.lastCheck")}>{formatTimestamp(status.last_check_at) || "-"}</Descriptions.Item>
           <Descriptions.Item label={t("admin.updates.activeTasks")}>{status.active_tasks ?? "-"}</Descriptions.Item>
           <Descriptions.Item label={t("admin.updates.queuedTasks")}>{status.queued_tasks ?? "-"}</Descriptions.Item>

@@ -63,6 +63,8 @@ terminal 的前台进程在其有界工具 deadline 内以显式执行生命周�
 
 每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。上下文超过策略阈值时，Runtime 计算压缩计划；被省略的已持久消息先 fsync 到去重 archive，再原子替换活动 journal。没有稳定 entry id 的消息不得被压缩。
 
+`/compact` 是 Platform 调用的会话控制操作，不是模型输入。Runtime 只接受严格的 scope、lifecycle 与 session 身份；当前身份存在 queued/running Run 时拒绝，在会话锁内复用自动压缩的边界计算、archive 去重与 journal 原子替换。活动消息不足以安全省略时返回成功但 `compacted=false`，不创建伪消息；内部压缩提示必须用 journal entry 的 Runtime-owned 结构化标记识别，不能从用户可伪造的正文推断。连续调用不得把上一轮内部压缩提示当作用户历史再次归档，也不得增长 journal 或 archive。被省略的历史仍可由 `session` 搜索。命令执行期间的新 Run 必须由同一身份门闩隔离，不能与 journal 替换竞态。
+
 中断留下的孤立 tool call 会在恢复时修复并发出 `session.repaired`。`session` 工具搜索当前 session 的活动 journal 和 archive；跨产品会话的 `session_search` 由 Python 提供。二者返回的历史都必须标记为不可信数据，而不是指令。
 
 ## 记忆与技能注入

@@ -8,17 +8,27 @@ import { AttachButton } from "./AttachButton";
 import { ComposerTextarea, type ComposerTextareaProps } from "./ComposerTextarea";
 import { MentionMenu } from "./MentionMenu";
 import { SendButton } from "./SendButton";
+import { SlashCommandMenu } from "./SlashCommandMenu";
 
 export function ComposerField({
   disabled,
+  busy,
   fileInputRef,
   onFileChange,
   textarea,
+  slashCommand,
 }: {
   disabled: boolean;
+  busy: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
   textarea: ComposerTextareaProps;
+  slashCommand: {
+    visible: boolean;
+    onChoose: () => void;
+    menuId: string;
+    optionId: string;
+  };
 }) {
   return (
     <div className="composer__field">
@@ -26,6 +36,7 @@ export function ComposerField({
         ref={fileInputRef}
         className="composer__file-input"
         type="file"
+        disabled={disabled}
         multiple
         tabIndex={-1}
         onChange={onFileChange}
@@ -33,7 +44,8 @@ export function ComposerField({
       <AttachButton disabled={disabled} onClick={() => fileInputRef.current?.click()} />
       <ComposerTextarea {...textarea} />
       <MentionMenu mention={textarea.mention} />
-      <SendButton disabled={disabled} />
+      <SlashCommandMenu {...slashCommand} />
+      <SendButton disabled={disabled} loading={busy} />
     </div>
   );
 }

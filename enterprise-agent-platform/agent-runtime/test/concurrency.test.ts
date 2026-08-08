@@ -269,6 +269,67 @@ test("scope cleanup fences matching runs until destructive cleanup finishes", as
   }
 });
 
+test("manual compaction fences only the exact session while its journal is rewritten", async () => {
+  const home = await temporaryDirectory("agent-compaction-fence-");
+  const workspace = await temporaryDirectory("agent-compaction-fence-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage("other session complete")]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { maxConcurrency: 2 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  let releaseRewrite!: () => void;
+  const rewriteGate = new Promise<void>((resolve) => { releaseRewrite = resolve; });
+  let enteredRewrite!: () => void;
+  const rewriteEntered = new Promise<void>((resolve) => { enteredRewrite = resolve; });
+  const target = request(workspace, "compaction target");
+  try {
+    await coordinator.sessions.initializeTracked(
+      {
+        scope_key: target.scope_key,
+        lifecycle_id: target.lifecycle_id,
+        session_id: target.session_id,
+      },
+      Array.from({ length: 10 }, (_, index) => ({
+        role: "user" as const,
+        content: `history-${index}`,
+        timestamp: index,
+      })),
+    );
+    const originalRewrite = coordinator.sessions.rewriteCompacted.bind(coordinator.sessions);
+    coordinator.sessions.rewriteCompacted = async (...args: Parameters<typeof originalRewrite>) => {
+      enteredRewrite();
+      await rewriteGate;
+      return await originalRewrite(...args);
+    };
+
+    const compacting = coordinator.compactSession(
+      target.scope_key,
+      target.lifecycle_id,
+      target.session_id,
+    );
+    await rewriteEntered;
+    assert.throws(
+      () => coordinator.createRun(target),
+      /session compaction is in progress/i,
+    );
+
+    const otherSession = coordinator.createRun({
+      ...target,
+      session_id: "other-session",
+      input: "other session",
+    });
+    assert.equal((await withDeadline(coordinator.wait(otherSession.id))).status, "completed");
+    releaseRewrite();
+    assert.equal((await withDeadline(compacting)).compacted, true);
+  } finally {
+    releaseRewrite();
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 function request(workspace: string, input: string): RunRequest {
   return {
     scope_key: `scope:${input}`,

@@ -1220,6 +1220,13 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
   box-shadow: var(--shadow-2);
 }
 .mention-menu[hidden] { display: none; }
+.mention-option.slash-command-option {
+  grid-template-columns: 30px minmax(0, 1fr);
+}
+.slash-command-option__mark {
+  font-family: var(--font-mono);
+  font-weight: 750;
+}
 .mention-option {
   width: 100%;
   min-height: 44px;

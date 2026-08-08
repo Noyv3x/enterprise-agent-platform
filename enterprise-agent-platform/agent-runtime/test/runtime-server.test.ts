@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { access, readFile, rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -141,6 +141,154 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     await runtime.close();
     await rm(home, { recursive: true, force: true });
     await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("runtime compacts an idle session without creating a Run or a missing journal", async () => {
+  const home = await temporaryDirectory("agent-server-compact-");
+  const config = testConfig(home, { bearerToken: "secret" });
+  const coordinator = new RunCoordinator({ config });
+  const runtime = createRuntimeServer(config, coordinator);
+  const identity = {
+    scope_key: "private:7",
+    lifecycle_id: "life-7",
+    session_id: "session-7",
+  };
+  try {
+    const address = await runtime.listen();
+    const endpoint = `http://${address.host}:${address.port}/v1/sessions/compact`;
+    const headers = { authorization: "Bearer secret", "content-type": "application/json" };
+
+    assert.equal((await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(identity),
+    })).status, 401);
+    assert.equal((await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...identity, extra: true }),
+    })).status, 400);
+    assert.equal((await fetch(`${endpoint}?force=true`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(identity),
+    })).status, 400);
+
+    const missingIdentity = { ...identity, session_id: "missing" };
+    const missing = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(missingIdentity),
+    });
+    assert.equal(missing.status, 200);
+    assert.deepEqual(await missing.json(), {
+      compacted: false,
+      omitted_messages: 0,
+      retained_messages: 0,
+    });
+    await assert.rejects(access(coordinator.sessions.path(missingIdentity)), { code: "ENOENT" });
+
+    const original = Array.from({ length: 10 }, (_, index) => ({
+      role: "user" as const,
+      content: `message-${index}`,
+      timestamp: index,
+    }));
+    await coordinator.sessions.initializeTracked(identity, original);
+    const compacted = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(identity),
+    });
+    assert.equal(compacted.status, 200);
+    assert.deepEqual(await compacted.json(), {
+      compacted: true,
+      omitted_messages: 4,
+      retained_messages: 7,
+    });
+    const current = await coordinator.sessions.load(identity);
+    assert.equal(current.length, 7);
+    const noticeText = String(current[0]?.role === "user" ? current[0].content : "");
+    assert.match(noticeText, /compacted out/);
+    assert.deepEqual(current.slice(1), original.slice(4));
+    assert.match(
+      await readFile(coordinator.sessions.path(identity), "utf8"),
+      /"synthetic_kind":"context_compaction_notice"/,
+    );
+    const searchable = await coordinator.sessions.loadSearchable(identity);
+    assert.ok(searchable.some((message) => message.role === "user" && message.content === "message-0"));
+
+    const journalAfterFirst = await readFile(coordinator.sessions.path(identity), "utf8");
+    const archiveAfterFirst = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    const repeated = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(identity),
+    });
+    assert.equal(repeated.status, 200);
+    assert.deepEqual(await repeated.json(), {
+      compacted: false,
+      omitted_messages: 0,
+      retained_messages: 7,
+    });
+    assert.equal(await readFile(coordinator.sessions.path(identity), "utf8"), journalAfterFirst);
+    assert.equal(await readFile(coordinator.sessions.archivePath(identity), "utf8"), archiveAfterFirst);
+
+    for (let index = 0; index < 8; index += 1) {
+      await coordinator.sessions.appendMessage(identity, {
+        role: "user",
+        content: `new-message-${index}`,
+        timestamp: 100 + index,
+      });
+    }
+    const compactedAgain = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(identity),
+    });
+    assert.equal(compactedAgain.status, 200);
+    assert.deepEqual(await compactedAgain.json(), {
+      compacted: true,
+      omitted_messages: 8,
+      retained_messages: 7,
+    });
+    const repeatedCurrentRaw = await readFile(coordinator.sessions.path(identity), "utf8");
+    const repeatedArchiveRaw = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    assert.equal((repeatedCurrentRaw.match(/compacted out of the active model context/g) ?? []).length, 1);
+    assert.doesNotMatch(repeatedArchiveRaw, /compacted out of the active model context/);
+    assert.match(repeatedArchiveRaw, /message-4/);
+    assert.match(repeatedArchiveRaw, /new-message-1/);
+
+    // A user can type the same visible text as the Runtime notice. Only the
+    // journal-owned marker may classify an entry as synthetic, so this real
+    // message must still be archived and searchable.
+    const spoofIdentity = { ...identity, session_id: "spoofed-notice" };
+    await coordinator.sessions.initializeTracked(
+      spoofIdentity,
+      Array.from({ length: 10 }, (_, index) => ({
+        role: "user" as const,
+        content: index === 0 ? noticeText : `spoof-message-${index}`,
+        timestamp: 200 + index,
+      })),
+    );
+    const spoofed = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(spoofIdentity),
+    });
+    assert.equal(spoofed.status, 200);
+    assert.deepEqual(await spoofed.json(), {
+      compacted: true,
+      omitted_messages: 4,
+      retained_messages: 7,
+    });
+    const spoofSearchable = await coordinator.sessions.loadSearchable(spoofIdentity);
+    assert.equal(spoofSearchable.filter(
+      (message) => message.role === "user" && message.content === noticeText,
+    ).length, 2);
+  } finally {
+    await runtime.close();
+    await rm(home, { recursive: true, force: true });
   }
 });
 

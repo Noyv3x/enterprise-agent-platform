@@ -20,6 +20,8 @@ import type {
   ManagerOperationRequest,
   AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
+  AgentSessionCompactRequest,
+  AgentSessionCompactResponse,
   AgentMemoriesExportResponse,
   AgentMemoriesResponse,
   AgentMemoryMutationRequest,
@@ -191,6 +193,10 @@ export const endpoints = {
 
   /* authenticated cross-scope Agent reply notifications */
   agentReplyEvents: ep<void, never>("GET", () => "/api/agent/reply-events"),
+  compactAgentSession: ep<AgentSessionCompactRequest, AgentSessionCompactResponse>(
+    "POST",
+    () => "/api/agent-session/compact",
+  ),
 
   /* private agent */
   privateMessages: ep<void, PrivateMessagesResponse>(

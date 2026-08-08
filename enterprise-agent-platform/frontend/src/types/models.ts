@@ -785,6 +785,7 @@ export interface AutoUpdateStatus {
   update_available?: boolean;
   current_revision?: string;
   remote_revision?: string;
+  last_successful_update_at?: string | null;
   last_check_at?: number | string;
   last_error?: string;
   active_tasks?: number;

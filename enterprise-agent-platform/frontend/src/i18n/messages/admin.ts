@@ -304,6 +304,7 @@ const baseAdminMessages = defineMessages({
   "admin.updates.operationId": m("操作编号", "Operation ID", "操作編號"),
   "admin.updates.services": m("服务健康", "Service health", "服務健康"),
   "admin.updates.imageDigests": m("镜像 digest", "Image digests", "映像 digest"),
+  "admin.updates.currentActivatedAt": m("上次更新成功时间", "Last successful update", "上次更新成功時間"),
   "admin.updates.lastCheck": m("最近检查", "Last checked", "最近檢查"),
   "admin.updates.activeTasks": m("运行中任务", "Active tasks", "執行中任務"),
   "admin.updates.queuedTasks": m("排队任务", "Queued tasks", "排隊任務"),

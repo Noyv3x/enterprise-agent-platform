@@ -20,6 +20,7 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 | `POST /v1/runs/{run_id}/input` | 向活动 Run 提交追加输入 |
 | `POST /v1/runs/{run_id}/approval` | 处理当前审批 |
 | `POST /v1/runs/{run_id}/cancel` | 取消 Run |
+| `POST /v1/sessions/compact` | 立即压缩一个空闲 session |
 | `POST /v1/scopes/cleanup` | 取消 scope Run、进程并可删除 session |
 | `GET /v1/scopes/processes` | 读取一个 scope/lifecycle 的终端预览 |
 | `GET /v1/scopes/process-summary` | 读取进程摘要 |
@@ -80,6 +81,30 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 - `unconsumed`：Run 已结束或无法消费，平台需要重新排队。
 
 平台不能把 HTTP 接收成功等同于模型已经消费。
+
+## 立即压缩 Session
+
+`POST /v1/sessions/compact` 只接受以下严格 JSON：
+
+```json
+{
+  "scope_key": "private:42",
+  "lifecycle_id": "lifecycle-id",
+  "session_id": "session-id"
+}
+```
+
+Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有 queued/running Run，再串行执行 archive 与 journal 原子替换。存在活动 Run 返回 409；未知字段、空身份或非法身份返回 400。会话不存在或没有足够历史可省略不是错误，返回 HTTP 200：
+
+```json
+{
+  "compacted": false,
+  "omitted_messages": 0,
+  "retained_messages": 4
+}
+```
+
+实际压缩时 `compacted=true`；`omitted_messages` 只统计归档的真实会话消息，`retained_messages` 统计改写后的活动 journal 条目并包含一条 Runtime 内部提示。内部提示由 Runtime-owned entry 标记识别，不能按正文识别。对已经压缩且没有新增可省略历史的 session 重复调用是幂等 no-op，不归档内部压缩提示、不增长 journal 或 archive。该 endpoint 不创建 Run、不调用模型、不写入命令消息，也不删除 archive。
 
 ## SSE journal
 

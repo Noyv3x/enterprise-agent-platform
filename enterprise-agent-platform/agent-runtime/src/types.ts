@@ -195,6 +195,8 @@ export interface SessionEntry {
   session_id: string;
   /** Runtime-owned marker; absent on unmarked/imported model content. */
   model_content_security_version?: number;
+  /** Runtime-owned entry classification; never derived from message content. */
+  synthetic_kind?: "context_compaction_notice";
   payload: JsonValue | AgentMessage;
 }
 

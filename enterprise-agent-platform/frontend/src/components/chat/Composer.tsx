@@ -13,7 +13,7 @@
    in data/chatActions.sendMessage; on failure we restore the draft + files and
    re-focus. */
 
-import { useCallback, useRef, type ChangeEvent } from "react";
+import { useCallback, useLayoutEffect, useRef, useState, type ChangeEvent } from "react";
 import { useI18n } from "../../i18n";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES } from "../../lib/constants";
 import { relinquishBrowserControlFor } from "../../lib/browserControl";
@@ -21,7 +21,8 @@ import { useAutoGrow } from "../../hooks/useAutoGrow";
 import { useMention } from "../../hooks/useMention";
 import { useToast } from "../../hooks/useToast";
 import { useTypingNotifier } from "../../hooks/useTypingNotifier";
-import { sendMessage } from "../../data/chatActions";
+import { compactAgentSession, sendMessage } from "../../data/chatActions";
+import { isApiError } from "../../lib/api";
 import { preserveFailedSend, restoreNextFailedSend } from "../../data/failedSendRecovery";
 import { scopeTypeFor } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
@@ -70,16 +71,37 @@ export function Composer({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingCaretRef = useRef<number | null>(null);
   const isComposingRef = useRef(false);
+  const activeDraftKeyRef = useRef(draftKey);
+  const commandRequestsRef = useRef(new Map<string, symbol>());
+  const [commandScopesInFlight, setCommandScopesInFlight] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [dismissedSlashCommand, setDismissedSlashCommand] = useState<{
+    draftKey: string;
+    query: string;
+  } | null>(null);
+  const [isComposing, setIsComposing] = useState(false);
+  const commandInFlight = commandScopesInFlight.has(draftKey);
+
+  useLayoutEffect(() => {
+    activeDraftKeyRef.current = draftKey;
+  }, [draftKey]);
 
   const notify = useTypingNotifier(mode, scopeId);
   useAutoGrow(textareaRef, draft);
 
   const menuId = `mention-menu-${scopeTypeFor(mode)}-${scopeId}`;
+  const slashMenuId = `slash-menu-${scopeTypeFor(mode)}-${scopeId}`;
+  const slashOptionId = `${slashMenuId}-compact`;
 
   const setDraft = useCallback(
     (value: string) => dispatch({ type: "SET_DRAFT", payload: { key: draftKey, value } }),
     [dispatch, draftKey],
   );
+  const updateDraft = useCallback((value: string) => {
+    setDismissedSlashCommand(null);
+    setDraft(value);
+  }, [setDraft]);
   const setPendingCaret = useCallback((position: number) => {
     pendingCaretRef.current = position;
   }, []);
@@ -145,9 +167,79 @@ export function Composer({
 
   const submit = useCallback(async () => {
     if (isComposingRef.current) return; // never submit mid-IME
+    if (commandRequestsRef.current.has(draftKey)) return;
     const content = (store.getState().drafts[draftKey] || textareaRef.current?.value || "").trim();
     const files = store.getState().draftFiles[draftKey] || EMPTY_FILES;
     if ((!content && !files.length) || disabled) return;
+    const compactInvocation = /^\/compact(?:\s|$)/iu.test(content);
+    if (compactInvocation) {
+      if (content.toLocaleLowerCase() !== "/compact") {
+        toast(t("chat.commands.compactNoArguments"), {
+          type: "error",
+          title: t("chat.commands.compactFailedTitle"),
+        });
+        return;
+      }
+      if (files.length) {
+        toast(t("chat.commands.compactNoAttachments"), {
+          type: "error",
+          title: t("chat.commands.compactFailedTitle"),
+        });
+        return;
+      }
+      const requestToken = Symbol(draftKey);
+      commandRequestsRef.current.set(draftKey, requestToken);
+      setCommandScopesInFlight((current) => {
+        const next = new Set(current);
+        next.add(draftKey);
+        return next;
+      });
+      try {
+        const result = await compactAgentSession(mode, scopeId);
+        const currentDraft = store.getState().drafts[draftKey] || "";
+        if (currentDraft.trim().toLocaleLowerCase() === "/compact") {
+          setDraft("");
+          notify(false);
+        }
+        if (activeDraftKeyRef.current === draftKey) {
+          if (result.compacted) {
+            toast(
+              t("chat.commands.compactDone", {
+                omitted: result.omitted_messages,
+                retained: result.retained_messages,
+              }),
+              { type: "ok", title: t("chat.commands.compactDoneTitle") },
+            );
+          } else {
+            toast(t("chat.commands.compactNoop"), {
+              type: "ok",
+              title: t("chat.commands.compactNoopTitle"),
+            });
+          }
+        }
+      } catch (error) {
+        if (activeDraftKeyRef.current === draftKey) {
+          toast(
+            isApiError(error, 409)
+              ? t("chat.commands.compactBusy")
+              : t("chat.commands.compactFailed"),
+            { type: "error", title: t("chat.commands.compactFailedTitle") },
+          );
+        }
+      } finally {
+        if (commandRequestsRef.current.get(draftKey) === requestToken) {
+          commandRequestsRef.current.delete(draftKey);
+          setCommandScopesInFlight((current) => {
+            if (!current.has(draftKey)) return current;
+            const next = new Set(current);
+            next.delete(draftKey);
+            return next;
+          });
+          if (activeDraftKeyRef.current === draftKey) onBumpFocus();
+        }
+      }
+      return;
+    }
     const browserHandoff = relinquishBrowserControlFor({ scope_type: mode, scope_id: scopeId });
     // Clear, focus + snap to bottom, and tell the server we stopped typing. These
     // sync dispatches batch with the optimistic insert inside sendMessage.
@@ -168,26 +260,61 @@ export function Composer({
     }
   }, [disabled, draftKey, mode, scopeId, store, dispatch, setDraft, notify, toast, t, onBumpFocus, onBumpForceBottom]);
 
+  const slashQuery = draft.trimStart();
+  const slashCommandEligible = Boolean(
+    slashQuery
+    && !slashQuery.includes("\n")
+    && "/compact".startsWith(slashQuery.toLocaleLowerCase()),
+  );
+  const slashCommandVisible = Boolean(
+    slashCommandEligible
+    && !commandInFlight
+    && !isComposing
+    && !(
+      dismissedSlashCommand?.draftKey === draftKey
+      && dismissedSlashCommand.query === slashQuery
+    ),
+  );
+  const chooseSlashCommand = useCallback(() => {
+    setDismissedSlashCommand(null);
+    setDraft("/compact");
+    setPendingCaret("/compact".length);
+    onBumpFocus();
+  }, [onBumpFocus, setDraft, setPendingCaret]);
+  const dismissSlashCommand = useCallback(() => {
+    setDismissedSlashCommand({ draftKey, query: slashQuery });
+  }, [draftKey, slashQuery]);
+  const composerDisabled = disabled || commandInFlight;
+
   const textareaProps: ComposerTextareaProps = {
     textareaRef,
     pendingCaretRef,
     isComposingRef,
     value: draft,
-    disabled,
+    disabled: composerDisabled,
     placeholder,
     mode,
     menuId,
     focusToken,
     mention,
-    onDraftChange: setDraft,
+    slashCommand: {
+      active: slashCommandVisible,
+      choose: chooseSlashCommand,
+      dismiss: dismissSlashCommand,
+      menuId: slashMenuId,
+      optionId: slashOptionId,
+    },
+    onDraftChange: updateDraft,
     onSubmit: submit,
     onAddFiles: addDraftFiles,
+    onCompositionChange: setIsComposing,
     notify,
   };
 
   return (
     <form
       className="composer"
+      aria-busy={commandInFlight}
       onSubmit={(event) => {
         event.preventDefault();
         void submit();
@@ -205,10 +332,17 @@ export function Composer({
           />
         ) : null}
         <ComposerField
-          disabled={disabled}
+          disabled={composerDisabled}
+          busy={commandInFlight}
           fileInputRef={fileInputRef}
           onFileChange={onFileChange}
           textarea={textareaProps}
+          slashCommand={{
+            visible: slashCommandVisible,
+            onChoose: chooseSlashCommand,
+            menuId: slashMenuId,
+            optionId: slashOptionId,
+          }}
         />
         {selectedFiles.length ? <ComposerFiles files={selectedFiles} onRemove={removeFile} /> : null}
         <ComposerHint />

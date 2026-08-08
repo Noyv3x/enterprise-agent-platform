@@ -190,6 +190,61 @@ export const chatMessages = defineMessages({
   "chat.composer.inputLabel": { "zh-CN": "消息输入框", en: "Message input", "zh-TW": "訊息輸入框" },
   "chat.composer.send": { "zh-CN": "发送", en: "Send", "zh-TW": "傳送" },
   "chat.sendFailed": { "zh-CN": "发送失败", en: "Send failed", "zh-TW": "傳送失敗" },
+  "chat.commands.label": {
+    "zh-CN": "Agent 命令",
+    en: "Agent commands",
+    "zh-TW": "Agent 命令",
+  },
+  "chat.commands.compactDescription": {
+    "zh-CN": "立即压缩当前会话上下文",
+    en: "Compact the current session context now",
+    "zh-TW": "立即壓縮目前工作階段上下文",
+  },
+  "chat.commands.compactDoneTitle": {
+    "zh-CN": "会话已压缩",
+    en: "Session compacted",
+    "zh-TW": "工作階段已壓縮",
+  },
+  "chat.commands.compactDone": {
+    "zh-CN": "已归档 {omitted} 条历史，当前保留 {retained} 条。",
+    en: "Archived: {omitted}; retained in active context: {retained}.",
+    "zh-TW": "已封存 {omitted} 則歷史，目前保留 {retained} 則。",
+  },
+  "chat.commands.compactNoopTitle": {
+    "zh-CN": "无需压缩",
+    en: "Nothing to compact",
+    "zh-TW": "無需壓縮",
+  },
+  "chat.commands.compactNoop": {
+    "zh-CN": "当前会话内容较少，未作更改。",
+    en: "This session is already small, so nothing changed.",
+    "zh-TW": "目前工作階段內容較少，未作變更。",
+  },
+  "chat.commands.compactBusy": {
+    "zh-CN": "Agent 正在处理此对话，请等待当前任务完成后再压缩。",
+    en: "The Agent is working in this conversation. Wait for it to finish before compacting.",
+    "zh-TW": "Agent 正在處理此對話，請等待目前任務完成後再壓縮。",
+  },
+  "chat.commands.compactFailedTitle": {
+    "zh-CN": "压缩失败",
+    en: "Compaction failed",
+    "zh-TW": "壓縮失敗",
+  },
+  "chat.commands.compactFailed": {
+    "zh-CN": "暂时无法压缩当前会话，请稍后重试。",
+    en: "The session could not be compacted. Try again shortly.",
+    "zh-TW": "暫時無法壓縮目前工作階段，請稍後重試。",
+  },
+  "chat.commands.compactNoAttachments": {
+    "zh-CN": "/compact 不能携带附件，请先移除附件。",
+    en: "/compact cannot include attachments. Remove them first.",
+    "zh-TW": "/compact 不能攜帶附件，請先移除附件。",
+  },
+  "chat.commands.compactNoArguments": {
+    "zh-CN": "/compact 暂不支持参数。",
+    en: "/compact does not support arguments yet.",
+    "zh-TW": "/compact 暫不支援參數。",
+  },
   "chat.failedSend.title": {
     "zh-CN": { other: "有 {count} 条发送失败的消息待恢复" },
     en: { one: "{count} failed message is waiting", other: "{count} failed messages are waiting" },

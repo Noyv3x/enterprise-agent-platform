@@ -199,6 +199,16 @@ class _FakeRuntime:
                 if self.path == "/v1/scopes/cleanup":
                     self._json(200, {"ok": True, "scope_key": body.get("scope_key"), "killed": 2})
                     return
+                if self.path == "/v1/sessions/compact":
+                    self._json(
+                        200,
+                        {
+                            "compacted": True,
+                            "omitted_messages": 12,
+                            "retained_messages": 7,
+                        },
+                    )
+                    return
                 self._json(404, {"error": "not found"})
 
             def _json(self, status: int, payload: dict[str, Any]) -> None:
@@ -837,6 +847,28 @@ class AgentRuntimeClientTests(unittest.TestCase):
                 "scope_key": "private:7",
                 "lifecycle_id": "life-2",
                 "delete_sessions": False,
+            },
+        )
+        compacted = self.client.compact_session(
+            "private:7",
+            "life-1",
+            "session-1",
+        )
+        self.assertEqual(
+            compacted,
+            {
+                "compacted": True,
+                "omitted_messages": 12,
+                "retained_messages": 7,
+            },
+        )
+        compact_request = self.runtime.request("POST", "/v1/sessions/compact")
+        self.assertEqual(
+            compact_request["body"],
+            {
+                "scope_key": "private:7",
+                "lifecycle_id": "life-1",
+                "session_id": "session-1",
             },
         )
         self.client.cleanup_scope(

@@ -31,6 +31,8 @@ manifest 必须最后公开，部署机不能看到半套资产。品牌配置�
 
 Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响应的 `ETag` 与 `Last-Modified`，后续请求使用条件头；上游返回 `304 Not Modified` 时不重复解码、落盘或创建 operation。校验器只在相同 manifest URL、通道和技术 profile 下复用，配置变化、无验证器响应或临时网络失败不会把未知内容当作未变化。
 
+管理面板的“上次更新成功时间”读取 Manager 当前 generation 持久化的 `activated_at`，Platform 只做只读投影，不另建更新历史或以浏览器时间猜测。回滚后该值仍是被恢复 generation 原本成功启用的时间。
+
 当前基线不依赖中心推送服务或逐部署 webhook secret；这样公开供应的安装实例不需要把地址和凭据登记到上游。检查阶段只做纯读验证；没有更新时不创建 operation。候选必须满足：
 
 - schema、protocol、技术 profile 与镜像键集合精确匹配当前契约；

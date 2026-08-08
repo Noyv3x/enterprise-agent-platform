@@ -8,6 +8,7 @@ import { createStore } from "../../../lib/store";
 import { initialAppState, rootReducer } from "../../../store/reducer";
 import { StoreContext } from "../../../store/StoreProvider";
 import type { AutoUpdateConfigState } from "../../../types";
+import { formatTimestamp } from "../../../utils/format";
 import { AutoUpdateConfig } from "./AutoUpdateConfig";
 
 function renderConfig(value: AutoUpdateConfigState) {
@@ -47,6 +48,7 @@ describe("AutoUpdateConfig manager state", () => {
         target_generation: "generation-target-456",
         previous_generation: "generation-previous-789",
         operation_id: "operation-1",
+        last_successful_update_at: "2026-07-24T12:00:00Z",
       },
     });
 
@@ -54,6 +56,8 @@ describe("AutoUpdateConfig manager state", () => {
     expect(screen.getByText(/The update is queued/)).toBeInTheDocument();
     expect(screen.getByText("generation-current")).toBeInTheDocument();
     expect(screen.getByText("operation-1")).toBeInTheDocument();
+    expect(screen.getByText("Last successful update")).toBeInTheDocument();
+    expect(screen.getByText(formatTimestamp("2026-07-24T12:00:00Z"))).toBeInTheDocument();
     expect(screen.queryByText("Git remote")).not.toBeInTheDocument();
   });
 

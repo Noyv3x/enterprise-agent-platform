@@ -59,6 +59,7 @@ import type {
   AgentApprovalChoice,
   AgentApprovalSubmitResponse,
   AgentStatus,
+  AgentSessionCompactResponse,
   AppState,
   ChannelMessagesResponse,
   ChatMode,
@@ -69,6 +70,19 @@ import type {
   TypingUser,
   WithdrawChannelMessageResponse,
 } from "../types";
+
+export async function compactAgentSession(
+  mode: ChatMode,
+  scopeId: string,
+): Promise<AgentSessionCompactResponse> {
+  return await api<AgentSessionCompactResponse>(
+    endpoints.compactAgentSession.path(),
+    {
+      method: "POST",
+      body: JSON.stringify({ scope_type: mode, scope_id: String(scopeId) }),
+    },
+  );
+}
 
 /* Cross-source re-entrancy mutex: SSE update handlers and the safety poll both
    call refreshActiveChat and must not

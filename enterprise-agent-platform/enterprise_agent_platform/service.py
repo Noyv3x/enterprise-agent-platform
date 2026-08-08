@@ -140,6 +140,7 @@ from .schedules import (
     next_occurrence,
     normalize_schedule,
     normalize_timezone,
+    parse_rfc3339,
     rfc3339_utc,
     validate_schedule_prompt,
 )
@@ -439,6 +440,17 @@ SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
 XLSX_ATTACHMENT_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
+MANUAL_COMPACT_COMMAND = "/compact"
+MANUAL_COMPACT_INVOCATION_RE = re.compile(
+    rf"^{re.escape(MANUAL_COMPACT_COMMAND)}(?:\s|$)",
+    re.IGNORECASE,
+)
+_CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": XLSX_ATTACHMENT_MIME_TYPE,
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+_GENERIC_ATTACHMENT_MIME_TYPES = {"", "application/octet-stream"}
 MEDIA_TAG_RE = re.compile(
     r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
     re.IGNORECASE,
@@ -4937,6 +4949,15 @@ class EnterpriseService:
         current = current if isinstance(current, dict) else {}
         target = target if isinstance(target, dict) else {}
         previous = previous if isinstance(previous, dict) else {}
+        raw_activated_at = current.get("activated_at")
+        last_successful_update_at: str | None = None
+        if isinstance(raw_activated_at, str):
+            try:
+                parse_rfc3339(raw_activated_at, field="current.activated_at")
+            except ValueError:
+                pass
+            else:
+                last_successful_update_at = raw_activated_at
         public_state = str(
             manager_status.get("public_state") or manager_status.get("state") or "idle"
         )
@@ -4997,6 +5018,7 @@ class EnterpriseService:
                 "images": current.get("images") or {},
                 "services": services,
                 "operation_id": str(manager_status.get("operation_id") or ""),
+                "last_successful_update_at": last_successful_update_at,
                 "last_check_at": manager_status.get("checked_at"),
                 "last_error": str(manager_status.get("error") or ""),
                 "active_tasks": len(self._agent_active_tasks),
@@ -5778,6 +5800,8 @@ class EnterpriseService:
         uploads = self._normalize_uploaded_files(attachments)
         if not content and not uploads:
             raise ServiceError(400, "message content is required")
+        if MANUAL_COMPACT_INVOCATION_RE.match(content):
+            raise ServiceError(400, "use the session compact command endpoint")
         if uploads:
             self._enforce_upload_rate_limit(actor.get("id"))
         scope_id = str(channel_id)
@@ -6011,6 +6035,8 @@ class EnterpriseService:
         uploads = self._normalize_uploaded_files(attachments)
         if not content and not uploads:
             raise ServiceError(400, "message content is required")
+        if MANUAL_COMPACT_INVOCATION_RE.match(content):
+            raise ServiceError(400, "use the session compact command endpoint")
         if telegram_update_id is not None:
             try:
                 telegram_update_id = int(telegram_update_id)
@@ -13828,6 +13854,94 @@ class EnterpriseService:
         )
         return result
 
+    def compact_agent_session(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any]:
+        scope_type, scope_id = self._normalize_conversation(
+            actor,
+            scope_type,
+            scope_id,
+        )
+        if scope_type == "channel":
+            require_permission(actor, PERMISSION_CHAT)
+        conversation_key = self._conversation_key(scope_type, scope_id)
+        scope_key = (
+            self.agent_scopes.private_scope_key(int(scope_id))
+            if scope_type == "private"
+            else self.agent_scopes.channel_scope_key(scope_id)
+        )
+
+        with self._agent_ingress_lock(conversation_key):
+            self._begin_agent_update_admission()
+            start_lock = self._agent_run_start_lock(scope_key)
+            try:
+                # Match the lifecycle-reset lock order. Existing workers can
+                # finish their short Runtime registration boundary first; once
+                # this lock is held, same-conversation ingress remains blocked.
+                with self._conversation_lock:
+                    start_lock.acquire()
+                try:
+                    with self._conversation_lock:
+                        if self._closed:
+                            raise ServiceError(503, "service is shutting down")
+                        actor = self._fresh_active_actor(actor)
+                        normalized = self._normalize_conversation(
+                            actor,
+                            scope_type,
+                            scope_id,
+                        )
+                        if normalized != (scope_type, scope_id):
+                            raise ServiceError(409, "conversation identity changed")
+                        if scope_type == "channel":
+                            require_permission(actor, PERMISSION_CHAT)
+                        busy = bool(
+                            self._agent_active_tasks.get(conversation_key)
+                            or self._agent_queues.get(conversation_key)
+                            or (
+                                self._agent_workers.get(conversation_key)
+                                and self._agent_workers[conversation_key].is_alive()
+                            )
+                        )
+                    job_counts = self.jobs.counts(
+                        kind="agent",
+                        scope_type=scope_type,
+                        scope_id=scope_id,
+                    )
+                    if busy or job_counts["queued"] or job_counts["running"]:
+                        raise ServiceError(
+                            409,
+                            "Agent is still processing this conversation",
+                        )
+                    agent_scope = self.agent_scopes.get_scope(scope_key)
+                    if agent_scope is None:
+                        return {
+                            "compacted": False,
+                            "omitted_messages": 0,
+                            "retained_messages": 0,
+                        }
+                    try:
+                        return self.agent_client.compact_session(
+                            agent_scope.scope_key,
+                            agent_scope.lifecycle_id,
+                            agent_scope.session_id,
+                        )
+                    except AgentRuntimeHTTPError as exc:
+                        if exc.status_code == 409:
+                            raise ServiceError(
+                                409,
+                                "Agent is still processing this conversation",
+                            ) from exc
+                        raise ServiceError(502, "Agent session compaction failed") from exc
+                    except (AgentRuntimeError, ValueError, TypeError) as exc:
+                        raise ServiceError(502, "Agent session compaction failed") from exc
+                finally:
+                    start_lock.release()
+            finally:
+                self._end_agent_update_admission()
+
     def respond_agent_approval(
         self,
         actor: dict[str, Any],
@@ -16229,7 +16343,11 @@ class EnterpriseService:
         raise ServiceError(400, "unsupported attachment scope")
 
     def _attachment_from_row(self, row: dict[str, Any], *, include_local_path: bool = False) -> dict[str, Any]:
-        mime_type = str(row.get("mime_type") or "application/octet-stream")
+        filename = str(row.get("filename") or "attachment")
+        mime_type = normalize_attachment_mime(
+            filename,
+            str(row.get("mime_type") or ""),
+        )
         storage_path = Path(str(row["storage_path"]))
         local_path = self._attachment_root() / storage_path
         item = {
@@ -16238,7 +16356,7 @@ class EnterpriseService:
             "scope_type": row["scope_type"],
             "scope_id": row["scope_id"],
             "source": row["source"],
-            "filename": row["filename"],
+            "filename": filename,
             "mime_type": mime_type,
             "size_bytes": int(row["size_bytes"] or 0),
             "sha256": row["sha256"],
@@ -17410,8 +17528,18 @@ def sanitize_attachment_filename(value: str) -> str:
 
 def normalize_attachment_mime(filename: str, value: str) -> str:
     clean = str(value or "").split(";", 1)[0].strip().lower()
-    if not clean or "/" not in clean or re.search(r"[\r\n\x00]", clean):
-        clean = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if (
+        clean in _GENERIC_ATTACHMENT_MIME_TYPES
+        or "/" not in clean
+        or re.search(r"[\r\n\x00]", clean)
+    ):
+        clean = (
+            _CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES.get(
+                Path(str(filename or "")).suffix.casefold()
+            )
+            or mimetypes.guess_type(filename)[0]
+            or "application/octet-stream"
+        )
     return clean[:120]
 
 
