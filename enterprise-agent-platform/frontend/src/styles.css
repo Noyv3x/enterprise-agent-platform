@@ -1128,11 +1128,13 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
   border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
   background: var(--surface);
-  padding: 7px 7px 7px 15px;
+  padding: 7px;
   transition: border-color var(--t), box-shadow var(--t);
 }
 .composer__field:focus-within { border-color: var(--accent); box-shadow: var(--ring); }
 .composer__field textarea {
+  min-width: 0;
+  flex: 1 1 0;
   border: 0;
   background: transparent;
   height: 35px;
@@ -1148,12 +1150,10 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
 .composer__field textarea:focus-visible { box-shadow: none; }
 .composer__file-input { display: none; }
 .composer__attach {
-  width: 34px;
-  height: 34px;
   flex: 0 0 auto;
   color: var(--muted);
 }
-.composer__send { width: 36px; height: 36px; border-radius: var(--r-pill); padding: 0; }
+.composer__send { border-radius: var(--r-pill); padding: 0; }
 .composer__hint { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-top: 9px; font-size: 11.5px; color: var(--faint); padding-left: 2px; }
 .failed-send {
   display: grid;
@@ -2052,16 +2052,8 @@ code, kbd, pre, .mono { font-family: var(--font-mono); }
   }
   .composer__field {
     gap: 5px;
-    padding: 6px 6px 6px 10px;
+    padding: 6px;
     border-radius: var(--r-md);
-  }
-  .composer__attach {
-    width: 32px;
-    height: 32px;
-  }
-  .composer__send {
-    width: 34px;
-    height: 34px;
   }
   .composer-file {
     max-width: 100%;

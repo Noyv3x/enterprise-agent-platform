@@ -393,6 +393,13 @@
 @media (pointer: coarse) {
   .chat-copy,
   .scroll-latest { min-height: 44px; }
+
+  .composer__attach.composer__attach,
+  .composer__send.composer__send {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
 }
 
 @media (max-width: 520px) {
