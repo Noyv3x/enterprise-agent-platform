@@ -76,6 +76,8 @@ operation 终态与 Manager state 的半提交窗口必须幂等收敛：
 - operation 已 finalized 但 pending state 尚未清除时重放同一幂等结算，再清引用；
 - 不可恢复错误保持 Manager control 与维护页在线，不形成 systemd 崩溃循环。
 
+模型目录与自动推荐的变化不构成数据库迁移。更新必须逐字保留所有非空的明确模型选择和空字符串表示的自动状态；Runtime 历史缓存中由旧实现写入的 provider 默认值只在重新装载目录时归一化，不能据此改写生产设置、账号或会话。部署机不需要为目录更新执行人工数据操作。
+
 ## Manager 自更新
 
 Manager 使用不可变版本目录、Candidate/Activation、独立 user-systemd watchdog 和原子 Current/Previous 更新自身。watchdog 不属于 Manager 主 unit 的 cgroup；它验证候选进程 inode与认证 identity，成功后提交，失败则恢复 previous stable 并清除可自动激活的 Candidate。

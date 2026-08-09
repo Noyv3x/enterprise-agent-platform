@@ -51,7 +51,7 @@ class PlatformConfig:
     telegram_polling: bool = True
     agent_runtime_url: str = "http://agent-runtime:8766"
     agent_runtime_token: str = ""
-    agent_runtime_model: str = "gpt-5.5"
+    agent_runtime_model: str = ""
     agent_runtime_provider: str = "openai-codex"
     agent_runtime_idle_timeout_seconds: float = float(
         RUN_IDLE_TIMEOUT_DEFAULT_SECONDS
@@ -223,9 +223,8 @@ class PlatformConfig:
                 "AGENT_PLATFORM_AGENT_RUNTIME_TOKEN", ""
             ).strip(),
             agent_runtime_model=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_MODEL", "gpt-5.5"
-            ).strip()
-            or "gpt-5.5",
+                "AGENT_PLATFORM_AGENT_RUNTIME_MODEL", ""
+            ).strip(),
             agent_runtime_provider=os.getenv(
                 "AGENT_PLATFORM_AGENT_RUNTIME_PROVIDER", "openai-codex"
             ).strip().lower() or "openai-codex",

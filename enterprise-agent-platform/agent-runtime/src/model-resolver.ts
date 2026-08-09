@@ -34,7 +34,7 @@ export interface ProductModelCatalog {
 const PRODUCT_PROVIDERS: Readonly<Record<ProductProviderId, ProductProviderDefinition>> = {
   "openai-codex": {
     runtimeProvider: "openai-codex",
-    defaultModel: "gpt-5.5",
+    defaultModel: "",
     api: "openai-codex-responses",
     baseUrl: "https://chatgpt.com/backend-api",
   },
@@ -102,7 +102,7 @@ function productModelCatalog(
   }));
   const defaultModel = models.some((model) => model.id === definition.defaultModel)
     ? definition.defaultModel
-    : (models[0]?.id ?? "");
+    : "";
   return {
     provider,
     runtime_provider: definition.runtimeProvider,

@@ -33,7 +33,7 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API 类型和固定 endpoint。请求不能覆盖 base URL 或 API 类型。Python 可调用供应商 OAuth 模型发现，但其结果只能与 Runtime 目录求交或作为可用性提示，不能扩展可执行集合。
 
-模型清单会随锁定依赖升级而改变，设计文档不得复制静态 ID 列表。Python 在调用时向内部授权端点请求当前访问凭据；OAuth token 不写入 Run metadata、session 或事件日志。
+模型清单会随锁定依赖升级而改变，设计文档不得复制静态 ID 列表。Runtime 的 `default_model` 只表示 provider 自身具有稳定默认值时的能力目录回退；对由账号目录决定推荐顺序的 Codex OAuth 必须为空，不能在 Runtime 中固定某个产品版本。Python 在调用时向内部授权端点请求当前访问凭据；OAuth token 不写入 Run metadata、session 或事件日志。
 
 ## 工具与执行目标
 

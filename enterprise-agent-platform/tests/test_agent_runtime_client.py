@@ -71,7 +71,7 @@ class _FakeRuntime:
                                 "openai-codex": {
                                     "provider": "openai-codex",
                                     "runtime_provider": "openai-codex",
-                                    "default_model": "gpt-5.5",
+                                    "default_model": "",
                                     "models": [
                                         {
                                             "id": "gpt-5.5",
@@ -899,6 +899,10 @@ class AgentRuntimeClientTests(unittest.TestCase):
             "gpt-5.5",
         )
         self.assertEqual(
+            catalog["providers"]["openai-codex"]["default_model"],
+            "",
+        )
+        self.assertEqual(
             catalog["providers"]["xai-oauth"]["default_model"],
             "grok-4.3",
         )
@@ -932,6 +936,10 @@ class AgentRuntimeClientTests(unittest.TestCase):
             ),
             (
                 lambda payload: payload["providers"]["openai-codex"].__setitem__("default_model", 123),
+                "invalid default model",
+            ),
+            (
+                lambda payload: payload["providers"]["openai-codex"].pop("default_model"),
                 "invalid default model",
             ),
             (lambda payload: payload.__setitem__("source", 123), "invalid source"),

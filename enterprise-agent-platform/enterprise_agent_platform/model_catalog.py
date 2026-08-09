@@ -98,8 +98,8 @@ class ModelCatalogManager:
         trusted_ids = [str(item.get("id") or "") for item in details if isinstance(item, dict)]
         trusted_ids = [model_id for model_id in trusted_ids if _valid_model_id(model_id)]
         default_model = str(trusted.get("default_model") or "") if isinstance(trusted, dict) else ""
-        if default_model not in trusted_ids:
-            default_model = trusted_ids[0] if trusted_ids else ""
+        if default_model and default_model not in trusted_ids:
+            default_model = ""
         if not trusted_ids:
             return {
                 "provider": provider,
@@ -142,7 +142,7 @@ class ModelCatalogManager:
                 if isinstance(item, dict) and item.get("id") in selected_set
             }
             selected_details = [detail_by_id[model_id] for model_id in selected if model_id in detail_by_id]
-            selected_default = default_model if default_model in selected_set else (selected[0] if selected else "")
+            selected_default = selected[0] if selected else ""
             unsupported_count = len([model_id for model_id in discovered if model_id not in trusted_set])
             compatibility_error = ""
             if discovered and not selected:
@@ -521,8 +521,10 @@ def _normalize_runtime_providers(value: Any) -> dict[str, dict[str, Any]]:
             seen.add(model_id)
             models.append({**item, "id": model_id})
         default_model = str(raw.get("default_model") or "").strip()
-        if default_model not in seen:
-            default_model = models[0]["id"] if models else ""
+        if provider == "openai-codex":
+            default_model = ""
+        elif default_model and default_model not in seen:
+            default_model = ""
         normalized[provider] = {
             **raw,
             "provider": provider,

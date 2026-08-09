@@ -695,10 +695,9 @@ class AgentRuntimeClient:
                 if isinstance(raw_default_model, str)
                 else ""
             )
-            if (
-                raw_default_model is not None
-                and not isinstance(raw_default_model, str)
-            ) or (default_model and default_model not in seen):
+            if not isinstance(raw_default_model, str) or (
+                default_model and default_model not in seen
+            ):
                 raise AgentRuntimeProtocolError(
                     f"Agent runtime model catalog for {provider} has an invalid default model"
                 )
@@ -706,7 +705,7 @@ class AgentRuntimeClient:
                 "provider": provider,
                 "runtime_provider": expected_runtime_provider,
                 "models": models,
-                "default_model": default_model or (models[0]["id"] if models else ""),
+                "default_model": default_model,
             }
         raw_source = result.get("source", "agent-runtime")
         source = raw_source.strip() if isinstance(raw_source, str) else ""

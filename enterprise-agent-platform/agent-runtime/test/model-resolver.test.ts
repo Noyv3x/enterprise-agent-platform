@@ -38,7 +38,7 @@ test("public model catalogs are generated from the same trusted Runtime models",
     catalogs["xai-oauth"].models.map((model) => model.id),
     PRODUCT_MODELS.xai,
   );
-  assert.equal(catalogs["openai-codex"].default_model, "gpt-5.5");
+  assert.equal(catalogs["openai-codex"].default_model, "");
   assert.equal(catalogs["xai-oauth"].default_model, "grok-4.3");
   assert.ok(catalogs["openai-codex"].models.every((model) => model.context_window > 0));
   assert.ok(catalogs["xai-oauth"].models.every((model) => model.max_tokens > 0));

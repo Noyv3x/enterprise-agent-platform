@@ -29,9 +29,9 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 
 ## 模型目录
 
-`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。
+`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。`default_model` 是字符串且允许为空；为空表示推荐值必须由账号级供应商目录决定，调用方不得擅自替换为 Runtime 列表第一项。
 
-目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 可以将目录与当前 OAuth 账号可见模型合并，但不能创造目录外模型。
+目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 可以将目录与当前 OAuth 账号可见模型合并，但不能创造目录外模型。Codex OAuth 合并成功时以供应商 priority 顺序中的第一个交集模型作为推荐默认；已有显式选择只要仍可执行就不随推荐值变化而改写。
 
 ## 创建 Run
 

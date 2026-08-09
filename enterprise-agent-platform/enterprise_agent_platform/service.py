@@ -950,9 +950,7 @@ class EnterpriseService:
             "default_provider": str(
                 runtime.get("provider") or self.config.agent_runtime_provider
             ),
-            "default_model": str(
-                runtime.get("model") or self.config.agent_runtime_model
-            ),
+            "default_model": self._configured_agent_runtime_model(),
             "require_loopback": False,
             "managed_execution": True,
         }
@@ -8270,6 +8268,10 @@ class EnterpriseService:
         require_admin(actor)
         with self._agent_runtime_config_lock:
             config = self.runtimes.agent_runtime_config()
+            # An empty stored value is the intentional "automatic" state. Do
+            # not let the Runtime manager's generic non-empty fallback turn it
+            # back into a historical configuration default in this API.
+            config["model"] = self._configured_agent_runtime_model()
             config["model_catalog"] = self._oauth_model_catalogs()
             config["oauth"] = self.oauth_provider_status(actor)
             cached = self.runtimes.cached_status()
@@ -8300,6 +8302,7 @@ class EnterpriseService:
                 )
             updates: dict[str, str] = {}
             provider = None
+            current_provider = self._active_oauth_provider()
             if "provider" in body:
                 provider = normalize_oauth_provider(str(body.get("provider") or ""))
                 if provider not in SUPPORTED_OAUTH_PROVIDERS:
@@ -8310,8 +8313,12 @@ class EnterpriseService:
                 updates[AGENT_SETTING_MODEL] = self._resolve_oauth_model_selection(
                     active_provider, str(body.get("model") or "")
                 )
-            elif provider:
-                updates[AGENT_SETTING_MODEL] = self._default_oauth_model(provider)
+            elif provider and provider != current_provider:
+                # A saved model belongs to the provider under which it was
+                # selected.  Switching providers without an explicit model
+                # returns to account-scoped automatic selection instead of
+                # persisting today's recommendation as a new preference.
+                updates[AGENT_SETTING_MODEL] = ""
             if "idle_timeout_seconds" in body:
                 try:
                     idle_timeout = float(body.get("idle_timeout_seconds"))
@@ -8532,10 +8539,9 @@ class EnterpriseService:
             force_refresh=force_refresh,
         )
         info = oauth_provider_info(provider)
-        runtime = self.runtimes.agent_runtime_config()
         selected_model = (
-            str(runtime.get("model") or "").strip()
-            if normalize_oauth_provider(str(runtime.get("provider") or "")) == provider
+            self._configured_agent_runtime_model()
+            if self._active_oauth_provider() == provider
             else ""
         )
         return {
@@ -13796,11 +13802,13 @@ class EnterpriseService:
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         provider = self._active_oauth_provider()
-        runtime_model = normalize_model_name(
-            str(self.runtimes.agent_runtime_config().get("model") or self.config.agent_runtime_model)
-        )
+        runtime_model = self._configured_agent_runtime_model()
         model = normalize_model_name(str(actor.get("model_name") or "")) or runtime_model
-        model = self._validated_generation_model(model, fallback_model=runtime_model)
+        model = (
+            self._validated_generation_model(model, fallback_model=runtime_model)
+            if model
+            else self._default_oauth_model(provider)
+        )
         thinking_depth = normalize_thinking_depth(str(actor.get("thinking_depth") or DEFAULT_THINKING_DEPTH))
         return {
             "provider": provider,
@@ -13864,6 +13872,13 @@ class EnterpriseService:
         )
         return active_provider if active_provider in SUPPORTED_OAUTH_PROVIDERS else "openai-codex"
 
+    def _configured_agent_runtime_model(self) -> str:
+        """Return the persisted model while preserving an explicit empty value."""
+
+        stored = self.get_setting(AGENT_SETTING_MODEL)
+        source = self.config.agent_runtime_model if stored is None else stored
+        return normalize_model_name(str(source or ""))
+
     def _extract_oauth_credentials(self, payload: dict[str, Any]) -> dict[str, dict[str, str]]:
         by_provider: dict[str, dict[str, str]] = {provider: {} for provider in SUPPORTED_OAUTH_PROVIDERS}
         self._collect_flat_oauth_credentials(by_provider, payload)
@@ -13910,8 +13925,30 @@ class EnterpriseService:
                 by_provider[provider][key] = clean
 
     def _select_oauth_provider(self, provider: str) -> None:
-        self.set_setting(AGENT_SETTING_PROVIDER, provider)
-        self.set_setting(AGENT_SETTING_MODEL, self._default_oauth_model(provider))
+        with self._agent_runtime_config_lock:
+            previous_provider = self._active_oauth_provider()
+            updates = {AGENT_SETTING_PROVIDER: provider}
+            if provider != previous_provider:
+                # OAuth completion selects the provider, not a concrete model.
+                # A model saved for another provider cannot be carried across;
+                # re-verifying the same provider preserves both an explicit
+                # selection and an intentionally empty automatic setting.
+                updates[AGENT_SETTING_MODEL] = ""
+            timestamp = now_ts()
+            with self.db.transaction() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                for key, value in updates.items():
+                    connection.execute(
+                        """
+                        INSERT INTO settings(key, value, secret, updated_at)
+                        VALUES (?, ?, 0, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            value=excluded.value,
+                            secret=0,
+                            updated_at=excluded.updated_at
+                        """,
+                        (key, value, timestamp),
+                    )
 
     def _oauth_model_catalogs(self) -> dict[str, dict[str, Any]]:
         return self.model_catalogs.catalogs()
@@ -13955,15 +13992,15 @@ class EnterpriseService:
         raise ServiceError(503, f"Agent model catalog for {label} is unavailable{detail}")
 
     def _resolve_oauth_model_selection(self, provider: str, model: str) -> str:
+        clean = normalize_model_name(model)
+        if clean in {"", "agent"}:
+            return ""
         catalog = self._oauth_model_catalog(provider)
         models = catalog["models"]
         if not models:
             label = oauth_provider_info(provider)["label"]
             detail = f": {catalog['error']}" if catalog.get("error") else ""
             raise ServiceError(503, f"Agent model catalog for {label} is unavailable{detail}")
-        clean = str(model or "").strip()
-        if clean in {"", "agent"}:
-            clean = catalog["default_model"] or models[0]
         if clean not in models:
             label = oauth_provider_info(provider)["label"]
             raise ServiceError(400, f"Agent model must be selected from the catalog for {label}")
@@ -13996,7 +14033,12 @@ class EnterpriseService:
             return clean
         if fallback in models:
             return fallback
-        return catalog["default_model"] or models[0]
+        default_model = normalize_model_name(str(catalog.get("default_model") or ""))
+        if default_model in models:
+            return default_model
+        label = oauth_provider_info(provider)["label"]
+        detail = f": {catalog['error']}" if catalog.get("error") else ""
+        raise ServiceError(503, f"Agent model catalog for {label} has no recommended model{detail}")
 
     def _store_oauth_flow_result(self, provider: str, flow: dict[str, Any]) -> None:
         tokens = flow.pop("tokens", None)

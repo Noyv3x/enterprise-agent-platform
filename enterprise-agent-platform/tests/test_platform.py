@@ -4915,21 +4915,74 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_generation_falls_back_when_system_model_is_stale(self):
+    def test_generation_falls_back_to_catalog_recommendation_when_system_model_is_stale(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")
                 service.set_setting(AGENT_SETTING_MODEL, "gpt-5.3-codex")
-
-                result = service.send_private_message(admin, "draft a plan")
+                recommended = {
+                    "models": ["gpt-5.6-sol", "gpt-5.5"],
+                    "default_model": "gpt-5.6-sol",
+                    "error": "",
+                }
+                with mock.patch.object(
+                    service,
+                    "_oauth_model_catalog",
+                    return_value=recommended,
+                ):
+                    result = service.send_private_message(admin, "draft a plan")
                 self.assertIsNone(result["agent_message"])
                 service.wait_for_agent_idle("private", str(admin["id"]))
                 agent_message = service.list_messages(admin, "private", str(admin["id"]))[-1]
 
-                self.assertEqual(agent.calls[-1]["model"], "gpt-5.5")
-                self.assertEqual(agent_message["metadata"]["generation"]["model"], "gpt-5.5")
+                self.assertEqual(agent.calls[-1]["model"], "gpt-5.6-sol")
+                self.assertEqual(agent_message["metadata"]["generation"]["model"], "gpt-5.6-sol")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.3-codex")
+            finally:
+                service.close()
+
+    def test_automatic_model_resolution_is_ephemeral_and_requires_recommendation(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), agent_runtime_model="")
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+                recommended = {
+                    "models": ["gpt-5.6-sol", "gpt-5.5"],
+                    "default_model": "gpt-5.6-sol",
+                    "error": "",
+                }
+                with mock.patch.object(
+                    service,
+                    "_oauth_model_catalog",
+                    return_value=recommended,
+                ):
+                    generation = service.account_generation_config(admin)
+                    self.assertEqual(generation["model"], "gpt-5.6-sol")
+                    self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+
+                    service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
+                    generation = service.account_generation_config(admin)
+                    self.assertEqual(generation["model"], "gpt-5.5")
+                    self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
+
+                service.set_setting(AGENT_SETTING_MODEL, "")
+                unavailable = {
+                    "models": ["gpt-5.6-sol", "gpt-5.5"],
+                    "default_model": "",
+                    "error": "OAuth model discovery is unavailable",
+                }
+                with mock.patch.object(
+                    service,
+                    "_oauth_model_catalog",
+                    return_value=unavailable,
+                ), self.assertRaises(ServiceError) as error:
+                    service.account_generation_config(admin)
+                self.assertEqual(error.exception.status, 503)
+                self.assertIn("unavailable", error.exception.message)
             finally:
                 service.close()
 
@@ -5287,6 +5340,58 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_runtime_model_auto_setting_and_provider_switch_are_not_materialized(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
+
+                service.update_agent_runtime_config(
+                    admin,
+                    {"provider": "openai-codex"},
+                )
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
+
+                cleared = service.update_agent_runtime_config(
+                    admin,
+                    {"model": ""},
+                )["config"]
+                self.assertEqual(cleared["model"], "")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+
+                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
+                switched = service.update_agent_runtime_config(
+                    admin,
+                    {"provider": "xai-oauth"},
+                )["config"]
+                self.assertEqual(switched["provider"], "xai-oauth")
+                self.assertEqual(switched["model"], "")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+            finally:
+                service.close()
+
+    def test_oauth_reverification_preserves_same_provider_model_and_switch_clears_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                service.set_setting(AGENT_SETTING_PROVIDER, "openai-codex")
+                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
+
+                service._select_oauth_provider("openai-codex")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
+
+                service.set_setting(AGENT_SETTING_MODEL, "")
+                service._select_oauth_provider("openai-codex")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+
+                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
+                service._select_oauth_provider("xai-oauth")
+                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+            finally:
+                service.close()
+
     def test_agent_run_gate_resizes_up_and_down_without_interrupting_active_runs(self):
         gate = _ResizableConcurrencyGate(1)
         release_up = threading.Event()
@@ -5413,6 +5518,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
                 self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
                 self.assertEqual(service._active_oauth_provider(), "openai-codex")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
                 self.assertTrue(
                     next(
                         item

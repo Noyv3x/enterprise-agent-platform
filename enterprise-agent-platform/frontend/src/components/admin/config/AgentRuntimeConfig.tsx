@@ -42,6 +42,7 @@ function agentModelCatalog(
 interface ResolvedModel {
   models: string[];
   value: string;
+  recommendedModel: string;
   disabled: boolean;
   hint: string;
 }
@@ -61,17 +62,23 @@ function resolveModel(
     return {
       models: [],
       value: "",
+      recommendedModel: "",
       disabled: true,
       hint: catalog.error
         ? t("admin.model.catalogError", { error: catalog.error })
         : t("admin.agentRuntime.modelUnavailableHint"),
     };
   }
-  const value = models.includes(current) ? current : models.includes(fallback) ? fallback : models[0];
   const hint = catalog.error
     ? t("admin.model.catalogError", { error: catalog.error })
     : t("admin.model.count", { count: models.length });
-  return { models, value, disabled: false, hint };
+  const recommendedModel = models.includes(fallback) ? fallback : models[0];
+  const value = current === ""
+    ? ""
+    : models.includes(current)
+      ? current
+      : recommendedModel;
+  return { models, value, recommendedModel, disabled: false, hint };
 }
 
 interface AgentRuntimeFormState {
@@ -174,7 +181,13 @@ export function AgentRuntimeConfig() {
                 aria-describedby={modelHintId}
                 options={resolved.disabled
                   ? [{ value: "", label: t("admin.agentRuntime.modelUnavailable") }]
-                  : resolved.models.map((model) => ({ value: model, label: model }))}
+                  : [
+                      {
+                        value: "",
+                        label: t("admin.model.autoOption", { model: resolved.recommendedModel }),
+                      },
+                      ...resolved.models.map((model) => ({ value: model, label: model })),
+                    ]}
                 onChange={(value) =>
                   setForm((previous) => ({ ...previous, modelPreferred: value }))
                 }

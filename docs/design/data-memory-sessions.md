@@ -46,6 +46,12 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 当前这些管理接口不执行物理消息清除。未来若增加不可恢复的 purge，必须把消息、附件、活动任务和 Agent scope 作为一个版本化操作共同设计，不能复用“隐藏”语义。
 
+## 模型选择状态
+
+`settings.agent_runtime_model` 和账号模型字段的空字符串是持久化的“自动选择”状态，不是缺失值。非空值表示用户或管理员明确选择的模型，OAuth 重新验证、目录刷新和普通更新都不得覆盖；切换 provider 且没有同时明确指定新模型时清空旧 provider 的选择，避免把不相容的模型标识带入新 provider。
+
+自动状态下，每次 Run 从当前可信 Runtime 能力目录与账号实时可用目录的安全交集解析推荐模型。该推荐是瞬时派生值，不写回账号、设置、消息、session 或 memory；没有安全推荐时明确拒绝启动 Run，不能猜测列表首项。这样目录演进可以自动生效，同时数据库中的明确选择保持稳定。
+
 ## 持久任务与追加输入
 
 Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO worker 消费，全局并发门只限制实际进入 Runtime 的任务。

@@ -460,6 +460,30 @@ class ConfigFromEnvTests(unittest.TestCase):
             else:
                 os.environ[key] = previous
 
+    def test_agent_runtime_model_has_no_versioned_bootstrap_default(self):
+        with mock.patch.dict(
+            os.environ,
+            {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
+            clear=True,
+        ):
+            self.assertEqual(
+                PlatformConfig.from_env(Path("/tmp")).agent_runtime_model,
+                "",
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "AGENT_PLATFORM_AGENT_RUNTIME_MODEL": " explicit-model ",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                PlatformConfig.from_env(Path("/tmp")).agent_runtime_model,
+                "explicit-model",
+            )
+
     def test_agent_idle_timeout_rejects_values_above_contract_maximum(self):
         key = RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE
         previous = os.environ.get(key)

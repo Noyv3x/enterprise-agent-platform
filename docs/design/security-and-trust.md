@@ -126,7 +126,7 @@ Sylver Lining 工作平台的 Personal API Token 使用每用户专用凭据行�
 
 知识 Embeddings API key 同样属于 Platform secret：管理接口只接受写入或保留既有值，读取只返回是否已配置和有界掩码，不能回传原文。配置提交前必须对目标 provider 做最小探测；请求禁止携带凭据重定向，并限制 URL、响应体、超时、向量数量、顺序、数值和维度。缺少 key 时知识创建、重建和显式检索以 `knowledge_embedding_unconfigured` 失败关闭，不启动本地模型、不回退关键词检索；聊天启动时的被动知识召回则失败开放，只记录 disabled/degraded，不能因此阻断普通回复。
 
-OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。
+OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。Codex 账号目录只能与 Runtime 从锁定 Pi 元数据得到的 provider、API、endpoint 和模型能力目录求交；供应商返回的未知模型不能因为 priority 更高而直接获得执行权限。推荐默认来自交集后的账号顺序，不能通过硬编码旧模型或直接采用未校验 ID 绕过这条边界。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。
 
 ## 品牌输入与公开读取
 

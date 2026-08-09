@@ -32,6 +32,12 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
   const errorText = oauthProviderErrorText(provider);
   const label = providerLabel(t, provider.id, provider.label);
   const logoChar = (label || "?").trim().charAt(0);
+  const recommendedModel = provider.configured
+    ? String(provider.default_model || "").trim()
+    : "";
+  const modelCount = provider.configured && Array.isArray(provider.models)
+    ? provider.models.length
+    : null;
 
   return (
     <div className={cx("oauth-card", provider.active && "is-active")}>
@@ -42,9 +48,16 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
           </div>
           <div>
             <div className="oauth-card__label">{label}</div>
-            {provider.default_model ? (
-              <div className="oauth-card__model">{provider.default_model}</div>
-            ) : null}
+            <div className="oauth-card__model">
+              {recommendedModel
+                ? t("admin.oauth.recommendedModel", { model: recommendedModel })
+                : t("admin.oauth.recommendedModelUnavailable")}
+            </div>
+            <div className="oauth-card__model">
+              {modelCount === null
+                ? t("admin.oauth.availableModelsUnavailable")
+                : t("admin.oauth.availableModels", { count: modelCount })}
+            </div>
           </div>
         </div>
         <Badge

@@ -24,7 +24,7 @@ describe("AgentRuntimeConfig", () => {
 
   afterEach(cleanup);
 
-  it("submits only the neutral runtime settings", async () => {
+  it("keeps an explicitly selected model when saving another setting", async () => {
     const store = createStore(rootReducer, initialAppState);
     store.dispatch({
       type: "SET_AGENT_RUNTIME_CONFIG",
@@ -68,6 +68,48 @@ describe("AgentRuntimeConfig", () => {
         max_concurrency: "8",
         compaction_threshold: "0.8",
       },
+    );
+  });
+
+  it("keeps automatic model selection empty when saving another setting", async () => {
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({
+      type: "SET_AGENT_RUNTIME_CONFIG",
+      payload: {
+        config: {
+          provider: "openai-codex",
+          model: "",
+          idle_timeout_seconds: 1800,
+          max_concurrency: 4,
+          compaction_threshold: 0.8,
+          model_catalog: {
+            "openai-codex": {
+              models: ["gpt-recommended-test", "gpt-specific-test"],
+              default_model: "gpt-recommended-test",
+            },
+          },
+        },
+      },
+    });
+
+    render(
+      <StoreContext.Provider value={store}>
+        <I18nProvider>
+          <AgentRuntimeConfig />
+        </I18nProvider>
+      </StoreContext.Provider>,
+    );
+
+    expect(screen.getByText("Automatic (recommended: gpt-recommended-test)")).toBeInTheDocument();
+
+    const concurrency = screen.getByRole("spinbutton", { name: "Maximum concurrent tasks" });
+    await userEvent.clear(concurrency);
+    await userEvent.type(concurrency, "8");
+    await userEvent.click(screen.getByRole("button", { name: "Save runtime settings" }));
+
+    expect(actions.saveAgentRuntimeConfig).toHaveBeenCalledWith(
+      store,
+      expect.objectContaining({ model: "", max_concurrency: "8" }),
     );
   });
 });
