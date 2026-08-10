@@ -6,7 +6,7 @@
    subscribes to the messages / agent-status / typing slices only, so a composer
    keystroke never re-renders it. */
 
-import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "antd";
 import { useStickyScroll } from "../../hooks/useStickyScroll";
 import { loadOlderMessages } from "../../data/loaders";
@@ -20,11 +20,36 @@ import { Icon } from "../common/Icon";
 import { AgentActivity } from "./AgentActivity";
 import { AgentApprovalPrompt } from "./AgentApprovalPrompt";
 import { AgentTyping } from "./AgentTyping";
-import { AgentWorkCard, hasAgentProcessSteps } from "./AgentWorkCard";
+import { AgentWorkCard, hasAgentBrowserStep, hasAgentProcessSteps } from "./AgentWorkCard";
 import { MessageBubble } from "./MessageBubble";
 import { TypingUsers } from "./TypingUsers";
 
 const EMPTY_TYPING: TypingUser[] = [];
+const BROWSER_WORK_PREVIEW_RETENTION_MS = 5 * 60 * 1000;
+
+function messageTimestampMs(message: Message): number {
+  const value = Number(message.created_at || message.metadata?.agent_work?.updated_at || 0);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return value > 10_000_000_000 ? value : value * 1000;
+}
+
+function latestCompletedBrowserMessage(
+  messages: Message[],
+  scopeType: ScopeType,
+  scopeId: string,
+): Message | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.scope_type && message.scope_type !== scopeType) continue;
+    if (message?.scope_id != null && String(message.scope_id) !== scopeId) continue;
+    if (
+      message?.author_type === "agent"
+      && message.metadata?.agent_work
+      && hasAgentBrowserStep(message.metadata.agent_work)
+    ) return message;
+  }
+  return null;
+}
 
 /** Steering starts a new model turn. If a status briefly contains buffers from
  * both turns, render only the newest turn so an obsolete draft never appears
@@ -119,13 +144,51 @@ export function MessageList({
 
   const messages = useStore((state) => (mode === "private" ? state.privateMessages : state.messages));
   const history = useStore((state) => state.messageHistory[scopeKey]);
-  const status = useStore((state) => agentStatusFor(state, mode));
+  const status = useStore((state) => agentStatusFor(state, mode, scopeId));
   const typingUsers = useStore((state) => (mode === "channel" ? state.typingUsers : EMPTY_TYPING));
   const canApprove = useStore((state) =>
     mode === "private" ? hasPermission(state, "private_agent") : hasPermission(state, "chat"),
   );
   const canChat = useStore((state) => hasPermission(state, "chat"));
   const currentUserId = useStore((state) => state.user?.id);
+  const activeBrowserPreview = Boolean(
+    status
+    && isAgentActive(status)
+    && hasAgentBrowserStep(status),
+  );
+  const completedBrowserMessage = useMemo(
+    () => latestCompletedBrowserMessage(messages, scopeType, scopeId),
+    [messages, scopeId, scopeType],
+  );
+  const completedBrowserPreviewExpiresAt = completedBrowserMessage
+    ? messageTimestampMs(completedBrowserMessage) + BROWSER_WORK_PREVIEW_RETENTION_MS
+    : 0;
+  const completedBrowserMessageId = completedBrowserMessage
+    ? String(completedBrowserMessage.id)
+    : "";
+  const [, setBrowserPreviewExpiryTick] = useState(0);
+
+  useEffect(() => {
+    if (activeBrowserPreview || !completedBrowserPreviewExpiresAt) return;
+    const remaining = completedBrowserPreviewExpiresAt - Date.now();
+    if (remaining <= 0) return;
+    const timer = window.setTimeout(
+      () => setBrowserPreviewExpiryTick((current) => current + 1),
+      remaining,
+    );
+    return () => window.clearTimeout(timer);
+  }, [
+    activeBrowserPreview,
+    completedBrowserMessageId,
+    completedBrowserPreviewExpiresAt,
+    scopeKey,
+  ]);
+
+  const retainedBrowserMessageId = (
+    !activeBrowserPreview
+    && completedBrowserPreviewExpiresAt > Date.now()
+    && completedBrowserMessage
+  ) ? completedBrowserMessageId : "";
   const handleWithdraw = useCallback(
     async (messageId: Message["id"]) => {
       const key = String(messageId);
@@ -208,6 +271,7 @@ export function MessageList({
         <MessageBubble
           key={String(message.id)}
           message={message}
+          browserPreviewAttached={String(message.id) === retainedBrowserMessageId}
           canWithdraw={canWithdraw}
           withdrawing={withdrawingMessageId === String(message.id)}
           onWithdraw={canWithdraw ? handleWithdraw : undefined}
