@@ -82,24 +82,30 @@ class ModelCatalogManagerTests(unittest.TestCase):
         )
         return manager, saved
 
-    def test_unconfigured_provider_uses_runtime_catalog_without_oauth(self):
+    def test_unconfigured_provider_does_not_expose_runtime_catalog(self):
         http = FakeHTTP()
-        manager, _ = self.manager(http=http)
+        runtime_calls = []
+        manager, _ = self.manager(
+            http=http,
+            runtime_loader=lambda: runtime_calls.append(True) or runtime_payload(),
+        )
 
         result = manager.catalog("openai-codex")
 
-        self.assertEqual(result["models"], ["gpt-5.5", "gpt-5.6-sol"])
+        self.assertEqual(result["models"], [])
         self.assertEqual(result["default_model"], "")
-        self.assertEqual(result["source"], "agent-runtime")
+        self.assertEqual(result["source"], "oauth-unconfigured")
+        self.assertIn("not configured", result["error"])
         self.assertEqual(http.calls, [])
+        self.assertEqual(runtime_calls, [])
 
-    def test_runtime_codex_nonempty_default_is_ignored_but_xai_default_is_preserved(self):
+    def test_runtime_nonempty_defaults_are_ignored_for_all_oauth_providers(self):
         payload = runtime_payload()
         payload["providers"]["openai-codex"]["default_model"] = "gpt-5.5"
         manager, _ = self.manager(runtime_loader=lambda: payload)
 
         self.assertEqual(manager.catalog("openai-codex")["default_model"], "")
-        self.assertEqual(manager.catalog("xai-oauth")["default_model"], "grok-4.3")
+        self.assertEqual(manager.catalog("xai-oauth")["default_model"], "")
 
     def test_legacy_persisted_codex_default_is_ignored(self):
         payload = runtime_payload()
@@ -126,11 +132,19 @@ class ModelCatalogManagerTests(unittest.TestCase):
         )
 
         self.assertEqual(manager.catalog("openai-codex")["default_model"], "")
-        self.assertEqual(manager.catalog("xai-oauth")["default_model"], "grok-4.3")
+        self.assertEqual(manager.catalog("xai-oauth")["default_model"], "")
 
     def test_empty_runtime_default_survives_persisted_cache_roundtrip(self):
-        seed, saved = self.manager(now=1_000)
-        self.assertEqual(seed.catalog("openai-codex")["default_model"], "")
+        http = FakeHTTP()
+        http.responses[
+            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        ] = OAuthHTTPResponse(200, {"models": [{"slug": "gpt-5.6-sol"}]})
+        seed, saved = self.manager(
+            configured={"openai-codex"},
+            http=http,
+            now=1_000,
+        )
+        self.assertEqual(seed.catalog("openai-codex")["default_model"], "gpt-5.6-sol")
         persisted = saved[-1]
         self.assertEqual(
             json.loads(persisted)["runtime"]["providers"]["openai-codex"]["default_model"],
@@ -142,10 +156,11 @@ class ModelCatalogManagerTests(unittest.TestCase):
 
         restored, _ = self.manager(
             cache=persisted,
+            configured={"openai-codex"},
             runtime_loader=unavailable_runtime,
             now=1_001,
         )
-        self.assertEqual(restored.catalog("openai-codex")["default_model"], "")
+        self.assertEqual(restored.catalog("openai-codex")["default_model"], "gpt-5.6-sol")
 
     def test_codex_uses_account_visible_intersection_in_provider_priority_order(self):
         http = FakeHTTP()
@@ -158,7 +173,7 @@ class ModelCatalogManagerTests(unittest.TestCase):
                     {"slug": "future-model", "priority": 0},
                     {"slug": "gpt-5.6-sol", "priority": 1},
                     {"slug": "hidden-model", "priority": 2, "visibility": "hidden"},
-                    {"slug": "gpt-5.5", "priority": 3},
+                    {"slug": "gpt-5.5", "priority": 1},
                 ]
             },
         )
@@ -225,7 +240,7 @@ class ModelCatalogManagerTests(unittest.TestCase):
         self.assertEqual(result["source"], "oauth-cache")
         self.assertEqual(cached_http.calls, [])
 
-    def test_grok_live_listing_is_an_annotation_not_an_exclusive_allowlist(self):
+    def test_grok_uses_account_visible_intersection_as_exclusive_allowlist(self):
         http = FakeHTTP()
         http.responses["https://api.x.ai/v1/models"] = OAuthHTTPResponse(
             200,
@@ -235,9 +250,32 @@ class ModelCatalogManagerTests(unittest.TestCase):
 
         result = manager.catalog("xai-oauth")
 
-        self.assertEqual(result["models"], ["grok-4.3", "grok-4.5"])
+        self.assertEqual(result["models"], ["grok-4.5"])
+        self.assertEqual(result["default_model"], "grok-4.5")
         self.assertEqual(result["oauth_verified_models"], ["grok-4.5"])
-        self.assertEqual(result["source"], "agent-runtime+oauth")
+        self.assertEqual(result["source"], "oauth-live")
+
+    def test_grok_aliases_participate_in_provider_ordered_intersection(self):
+        http = FakeHTTP()
+        http.responses["https://api.x.ai/v1/models"] = OAuthHTTPResponse(
+            200,
+            {
+                "data": [
+                    {
+                        "id": "provider-latest",
+                        "aliases": ["grok-4.5", "another-provider-alias"],
+                    },
+                    {"id": "grok-4.3", "aliases": []},
+                ]
+            },
+        )
+        manager, _ = self.manager(configured={"xai-oauth"}, http=http)
+
+        result = manager.catalog("xai-oauth")
+
+        self.assertEqual(result["models"], ["grok-4.5", "grok-4.3"])
+        self.assertEqual(result["default_model"], "grok-4.5")
+        self.assertIn("hidden until Runtime metadata", result["error"])
 
     def test_failed_refresh_uses_persisted_last_known_good_snapshots(self):
         seed_http = FakeHTTP()
@@ -272,9 +310,9 @@ class ModelCatalogManagerTests(unittest.TestCase):
 
     def test_invalid_persisted_cache_is_ignored(self):
         manager, _ = self.manager(cache=json.dumps({"version": 999}))
-        self.assertEqual(manager.catalog("openai-codex")["models"], ["gpt-5.5", "gpt-5.6-sol"])
+        self.assertEqual(manager.catalog("openai-codex")["models"], [])
 
-    def test_failed_refreshes_are_briefly_throttled_without_hiding_runtime_fallback(self):
+    def test_failed_refreshes_are_throttled_without_runtime_fallback(self):
         http = FakeHTTP()
         http.responses[
             "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
@@ -294,9 +332,10 @@ class ModelCatalogManagerTests(unittest.TestCase):
         first = manager.catalog("openai-codex")
         second = manager.catalog("openai-codex")
 
-        self.assertEqual(first["models"], ["gpt-5.5", "gpt-5.6-sol"])
+        self.assertEqual(first["models"], [])
         self.assertEqual(second["models"], first["models"])
         self.assertTrue(first["stale"])
+        self.assertEqual(first["source"], "oauth-unavailable")
         self.assertEqual(len(runtime_calls), 1)
         self.assertEqual(len(http.calls), 1)
 
@@ -311,7 +350,15 @@ class ModelCatalogManagerTests(unittest.TestCase):
                 raise OSError("runtime unavailable")
             return runtime_payload()
 
-        manager, _ = self.manager(runtime_loader=load_runtime)
+        http = FakeHTTP()
+        http.responses[
+            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        ] = OAuthHTTPResponse(200, {"models": [{"slug": "gpt-5.6-sol"}]})
+        manager, _ = self.manager(
+            configured={"openai-codex"},
+            http=http,
+            runtime_loader=load_runtime,
+        )
         self.assertFalse(manager.catalog("openai-codex")["stale"])
 
         failing = True
@@ -319,7 +366,7 @@ class ModelCatalogManagerTests(unittest.TestCase):
         first = manager.catalog("openai-codex")
         second = manager.catalog("openai-codex")
 
-        self.assertEqual(first["models"], ["gpt-5.5", "gpt-5.6-sol"])
+        self.assertEqual(first["models"], ["gpt-5.6-sol"])
         self.assertTrue(first["stale"])
         self.assertIn("runtime unavailable", first["error"])
         self.assertEqual(second, first)
@@ -337,12 +384,16 @@ class ModelCatalogManagerTests(unittest.TestCase):
                 raise OSError("runtime unavailable")
             return runtime_payload()
 
+        http = FakeHTTP()
+        http.responses[
+            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        ] = OAuthHTTPResponse(200, {"models": [{"slug": "gpt-5.6-sol"}]})
         manager = ModelCatalogManager(
             runtime_loader=load_runtime,
             credential_loader=lambda provider: (f"{provider}-token", 1),
-            oauth_configured=lambda _provider: False,
+            oauth_configured=lambda provider: provider == "openai-codex",
             credential_revision=lambda _provider: 1,
-            http_client=FakeHTTP(),
+            http_client=http,
             cache_loader=lambda: "",
             cache_saver=lambda _value: None,
             clock=lambda: now,
@@ -373,7 +424,15 @@ class ModelCatalogManagerTests(unittest.TestCase):
             release.wait(2)
             return runtime_payload()
 
-        manager, _ = self.manager(runtime_loader=load_runtime)
+        http = FakeHTTP()
+        http.responses[
+            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
+        ] = OAuthHTTPResponse(200, {"models": [{"slug": "gpt-5.6-sol"}]})
+        manager, _ = self.manager(
+            configured={"openai-codex"},
+            http=http,
+            runtime_loader=load_runtime,
+        )
         results: list[dict] = []
         errors: list[BaseException] = []
 

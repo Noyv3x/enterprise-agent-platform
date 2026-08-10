@@ -112,4 +112,46 @@ describe("AgentRuntimeConfig", () => {
       expect.objectContaining({ model: "", max_concurrency: "8" }),
     );
   });
+
+  it("does not display stale runtime candidates when OAuth is unconfigured", () => {
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({
+      type: "SET_AGENT_RUNTIME_CONFIG",
+      payload: {
+        config: {
+          provider: "openai-codex",
+          model: "",
+          model_catalog: {
+            "openai-codex": {
+              models: ["stale-runtime-candidate"],
+              default_model: "stale-runtime-candidate",
+            },
+          },
+        },
+      },
+    });
+    store.dispatch({
+      type: "SET_OAUTH_PROVIDERS",
+      payload: {
+        active_provider: "openai-codex",
+        providers: [{
+          id: "openai-codex",
+          configured: false,
+          models: ["stale-runtime-candidate"],
+          default_model: "stale-runtime-candidate",
+        }],
+      },
+    });
+
+    render(
+      <StoreContext.Provider value={store}>
+        <I18nProvider>
+          <AgentRuntimeConfig />
+        </I18nProvider>
+      </StoreContext.Provider>,
+    );
+
+    expect(screen.getByText("Model catalog unavailable")).toBeInTheDocument();
+    expect(screen.queryByText(/stale-runtime-candidate/)).not.toBeInTheDocument();
+  });
 });

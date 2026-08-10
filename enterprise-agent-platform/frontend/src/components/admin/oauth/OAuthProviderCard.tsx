@@ -32,12 +32,12 @@ export function OAuthProviderCard({ provider }: { provider: OAuthProvider }) {
   const errorText = oauthProviderErrorText(provider);
   const label = providerLabel(t, provider.id, provider.label);
   const logoChar = (label || "?").trim().charAt(0);
-  const recommendedModel = provider.configured
-    ? String(provider.default_model || "").trim()
+  const models = provider.configured && Array.isArray(provider.models) ? provider.models : null;
+  const recommendedCandidate = String(provider.default_model || "").trim();
+  const recommendedModel = models
+    ? (models.includes(recommendedCandidate) ? recommendedCandidate : models[0] || "")
     : "";
-  const modelCount = provider.configured && Array.isArray(provider.models)
-    ? provider.models.length
-    : null;
+  const modelCount = models?.length ?? null;
 
   return (
     <div className={cx("oauth-card", provider.active && "is-active")}>

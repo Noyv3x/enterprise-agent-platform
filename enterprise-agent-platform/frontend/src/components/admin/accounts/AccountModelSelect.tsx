@@ -32,16 +32,25 @@ function agentModelCatalog(
   oauthProviders: OAuthProvidersState | null,
 ): AgentModelCatalog {
   const normalized = AGENT_PROVIDERS.includes(providerId) ? providerId : "openai-codex";
-  const fromConfig = runtimeConfig?.config?.model_catalog?.[normalized];
-  if (fromConfig && typeof fromConfig === "object") return fromConfig;
   const fromOAuth = (oauthProviders?.providers || []).find((item) => item.id === normalized);
-  if (fromOAuth) {
+  if (oauthProviders) {
+    if (!fromOAuth?.configured) {
+      return {
+        models: [],
+        default_model: "",
+        error: fromOAuth?.model_catalog_error || "",
+      };
+    }
+    const models = Array.isArray(fromOAuth.models) ? fromOAuth.models : [];
+    const recommended = String(fromOAuth.default_model || "").trim();
     return {
-      models: fromOAuth.models || [],
-      default_model: fromOAuth.default_model || "",
+      models,
+      default_model: models.includes(recommended) ? recommended : models[0] || "",
       error: fromOAuth.model_catalog_error || "",
     };
   }
+  const fromConfig = runtimeConfig?.config?.model_catalog?.[normalized];
+  if (fromConfig && typeof fromConfig === "object") return fromConfig;
   return { models: [], default_model: "", error: "unavailable" };
 }
 
@@ -62,7 +71,12 @@ export function AccountModelSelect({ id, value, onChange, coercedRef }: AccountM
     const providerId = activeAgentProviderId(oauthProviders, runtimeConfig);
     const catalog = agentModelCatalog(providerId, runtimeConfig, oauthProviders);
     const list = Array.isArray(catalog.models) ? catalog.models : [];
-    const fallback = catalog.default_model || runtimeConfig?.config?.model || t("admin.model.systemDefault");
+    const deploymentModel = String(runtimeConfig?.config?.model || "").trim();
+    const recommendedCandidate = String(catalog.default_model || "").trim();
+    const recommendedModel = list.includes(recommendedCandidate)
+      ? recommendedCandidate
+      : list[0] || "";
+    const fallback = deploymentModel || recommendedModel || t("admin.model.systemDefault");
     const clean = String(value || "").trim();
     const coerced = clean && list.includes(clean) ? clean : "";
     let helpText: string;

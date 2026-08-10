@@ -26,16 +26,25 @@ function agentModelCatalog(
   oauthProviders: OAuthProvidersState | null,
 ): AgentModelCatalog {
   const normalized = AGENT_PROVIDERS.includes(providerId) ? providerId : "openai-codex";
-  const fromConfig = runtimeConfig?.config?.model_catalog?.[normalized];
-  if (fromConfig && typeof fromConfig === "object") return fromConfig;
   const fromOAuth = (oauthProviders?.providers || []).find((item) => item.id === normalized);
-  if (fromOAuth) {
+  if (oauthProviders) {
+    if (!fromOAuth?.configured) {
+      return {
+        models: [],
+        default_model: "",
+        error: fromOAuth?.model_catalog_error || "",
+      };
+    }
+    const models = Array.isArray(fromOAuth.models) ? fromOAuth.models : [];
+    const recommended = String(fromOAuth.default_model || "").trim();
     return {
-      models: fromOAuth.models || [],
-      default_model: fromOAuth.default_model || "",
+      models,
+      default_model: models.includes(recommended) ? recommended : models[0] || "",
       error: fromOAuth.model_catalog_error || "",
     };
   }
+  const fromConfig = runtimeConfig?.config?.model_catalog?.[normalized];
+  if (fromConfig && typeof fromConfig === "object") return fromConfig;
   return { models: [], default_model: "", error: "" };
 }
 

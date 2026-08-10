@@ -8,6 +8,7 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
   const seen: string[] = [];
   let memoryBody: Record<string, unknown> = {};
   let scheduleBody: Record<string, unknown> = {};
+  let credentialBody: Record<string, unknown> = {};
   const server = createServer(async (request, response) => {
     seen.push(`${request.method} ${request.url} ${request.headers.authorization || ""}`);
     const chunks: Buffer[] = [];
@@ -16,6 +17,8 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
       memoryBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     } else if (request.url === "/internal/agent/tools/schedule") {
       scheduleBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    } else if (request.url === "/api/agent/tools/credentials/resolve") {
+      credentialBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
     }
     response.setHeader("content-type", "application/json");
     if (request.url === "/api/agent/tools/memory/search") response.end(JSON.stringify({ memories: [{ id: 1, content: "remembered" }] }));
@@ -35,7 +38,7 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
       workspace: "/tmp",
       system_prompt: "system",
       input: "input",
-      model: { provider: "openai-codex", id: "gpt-5" },
+      model: { provider: "openai-codex", id: "requested-model" },
       metadata: { actor: { id: 42 } },
       gateway: { base_url: "http://127.0.0.1:1", token: "rotated-token" },
     };
@@ -67,6 +70,11 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
       owner_user_id: 42,
     });
     assert.equal(await gateway.token(request, "openai-codex"), "fresh-token");
+    assert.deepEqual(credentialBody, {
+      provider: "openai-codex",
+      model: "requested-model",
+      scope_key: "scope",
+    });
     assert.ok(seen.every((entry) => entry.endsWith("Bearer rotated-token")));
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));

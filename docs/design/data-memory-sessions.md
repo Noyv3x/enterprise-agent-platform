@@ -50,7 +50,9 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 `settings.agent_runtime_model` 和账号模型字段的空字符串是持久化的“自动选择”状态，不是缺失值。非空值表示用户或管理员明确选择的模型，OAuth 重新验证、目录刷新和普通更新都不得覆盖；切换 provider 且没有同时明确指定新模型时清空旧 provider 的选择，避免把不相容的模型标识带入新 provider。
 
-自动状态下，每次 Run 从当前可信 Runtime 能力目录与账号实时可用目录的安全交集解析推荐模型。该推荐是瞬时派生值，不写回账号、设置、消息、session 或 memory；没有安全推荐时明确拒绝启动 Run，不能猜测列表首项。这样目录演进可以自动生效，同时数据库中的明确选择保持稳定。
+自动状态下，每次 Run 从当前可信 Runtime 能力目录与账号实时可用目录的安全交集解析推荐模型。该推荐是瞬时派生值，不写回账号、设置、消息、session 或 memory；没有安全推荐时明确拒绝启动 Run，不能猜测列表首项。这样目录演进可以自动生效，同时数据库中的明确选择保持稳定。目录临时不可用时，明确选择只可继续作为未改写的 Run 意图，不能重新进入可选列表；Runtime 取得 Token 前仍必须通过当前交集复验，因此不能实际绕过账号目录。
+
+Runtime 为本次实际调用的模型按 `provider + model + scope_key` 临时请求 OAuth 凭据；Platform 必须先以当前账号目录复验该模型，返回值不形成新的持久模型选择。Token 与这次复验结果都不得进入消息、session、memory 或 workspace；辅助模型必须以自己的模型 ID 独立复验，不能复用主模型的可用性判断。
 
 ## 持久任务与追加输入
 

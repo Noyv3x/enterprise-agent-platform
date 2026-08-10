@@ -8530,27 +8530,58 @@ class EnterpriseService:
     def resolve_agent_credentials(self, body: dict[str, Any]) -> dict[str, Any]:
         """Resolve a current OAuth access token for the loopback Agent runtime."""
 
-        provider = normalize_oauth_provider(str(body.get("provider") or self._active_oauth_provider()))
+        unknown = sorted(
+            set(body) - {"provider", "model", "scope_key", "force_refresh"}
+        )
+        if unknown:
+            raise ServiceError(
+                400,
+                "OAuth credential resolution received unsupported fields: "
+                + ", ".join(unknown),
+            )
+        raw_provider = str(body.get("provider") or "").strip()
+        if not raw_provider:
+            raise ServiceError(400, "OAuth credential resolution requires a provider")
+        provider = normalize_oauth_provider(raw_provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+        model = normalize_model_name(str(body.get("model") or ""))
+        if not model or model == "agent":
+            raise ServiceError(400, "OAuth credential resolution requires a model")
+        scope_key = str(body.get("scope_key") or "").strip()
+        if not scope_key:
+            raise ServiceError(400, "OAuth credential resolution requires a scope_key")
         force_refresh = parse_bool(body.get("force_refresh"))
         access_token, expires_at = self._resolve_oauth_access_token(
             provider,
             force_refresh=force_refresh,
         )
+        catalog = self._oauth_model_catalog(provider)
+        models = catalog["models"]
+        if not models:
+            label = oauth_provider_info(provider)["label"]
+            detail = f": {catalog['error']}" if catalog.get("error") else ""
+            raise ServiceError(
+                503,
+                f"Agent model catalog for {label} is unavailable{detail}",
+            )
+        if model not in models:
+            label = oauth_provider_info(provider)["label"]
+            raise ServiceError(
+                409,
+                f"Model {model} is not available to the connected {label} account",
+            )
         info = oauth_provider_info(provider)
-        selected_model = (
-            self._configured_agent_runtime_model()
-            if self._active_oauth_provider() == provider
-            else ""
-        )
         return {
             "provider": provider,
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_at": expires_at or None,
             "base_url": info["base_url"],
-            "model": selected_model,
+            # Echo the model whose current account availability was verified;
+            # this may be an auxiliary image model rather than the deployment
+            # default selected for ordinary turns.
+            "model": model,
         }
 
     def _resolve_oauth_access_token(
@@ -14028,7 +14059,21 @@ class EnterpriseService:
         catalog = self._oauth_model_catalog(provider)
         models = catalog["models"]
         if not models:
-            return clean or fallback
+            # Preserve an administrator/user's explicit persisted selection as
+            # Run intent while discovery is temporarily unavailable. This is
+            # not an authorization fallback: Runtime must request credentials
+            # for the exact model, and resolve_agent_credentials fails closed
+            # unless that model is in the current OAuth/Runtime intersection.
+            if clean:
+                return clean
+            if fallback:
+                return fallback
+            label = oauth_provider_info(provider)["label"]
+            detail = f": {catalog['error']}" if catalog.get("error") else ""
+            raise ServiceError(
+                503,
+                f"Agent model catalog for {label} is unavailable{detail}",
+            )
         if clean in models:
             return clean
         if fallback in models:

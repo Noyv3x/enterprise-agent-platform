@@ -9,10 +9,8 @@ type ProductProviderId = "openai-codex" | "xai-oauth";
 
 interface ProductProviderDefinition {
   runtimeProvider: ProductProvider;
-  defaultModel: string;
   api: Api;
   baseUrl: string;
-  excludedModelIds?: ReadonlySet<string>;
 }
 
 export interface ProductModelCatalogEntry {
@@ -34,24 +32,14 @@ export interface ProductModelCatalog {
 const PRODUCT_PROVIDERS: Readonly<Record<ProductProviderId, ProductProviderDefinition>> = {
   "openai-codex": {
     runtimeProvider: "openai-codex",
-    defaultModel: "",
     api: "openai-codex-responses",
     baseUrl: "https://chatgpt.com/backend-api",
   },
   "xai-oauth": {
     runtimeProvider: "xai",
-    defaultModel: "grok-4.3",
     api: "openai-completions",
     baseUrl: "https://api.x.ai/v1",
-    // xAI retired these model families on 2026-05-15. Pi still catalogs them,
-    // but the product catalog must not offer models the provider no longer serves.
-    excludedModelIds: new Set(["grok-3", "grok-3-fast", "grok-code-fast-1"]),
   },
-};
-
-const AUXILIARY_VISION_MODEL_PREFERENCES: Readonly<Record<ProductProvider, readonly string[]>> = {
-  "openai-codex": ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"],
-  xai: ["grok-4.3", "grok-4.20-0309-non-reasoning", "grok-4.20-0309-reasoning"],
 };
 
 const PRODUCT_PROVIDER_RUNTIME: Readonly<Record<ProductProviderId, ProductProvider>> = {
@@ -68,8 +56,7 @@ function definitionForRuntimeProvider(provider: ProductProvider): ProductProvide
 function isTrustedProductModel(model: Model<Api>, definition: ProductProviderDefinition): boolean {
   return model.provider === definition.runtimeProvider
     && model.api === definition.api
-    && model.baseUrl.replace(/\/$/, "") === definition.baseUrl
-    && !definition.excludedModelIds?.has(model.id);
+    && model.baseUrl.replace(/\/$/, "") === definition.baseUrl;
 }
 
 function trustedModels(provider: ProductProvider): Model<Api>[] {
@@ -93,20 +80,17 @@ function productModelCatalog(
   definition: ProductProviderDefinition,
 ): ProductModelCatalog {
   const models = trustedModels(definition.runtimeProvider).map((model) => ({
-      id: model.id,
-      name: model.name,
-      reasoning: model.reasoning,
-      input: [...model.input],
-      context_window: model.contextWindow,
-      max_tokens: model.maxTokens,
+    id: model.id,
+    name: model.name,
+    reasoning: model.reasoning,
+    input: [...model.input],
+    context_window: model.contextWindow,
+    max_tokens: model.maxTokens,
   }));
-  const defaultModel = models.some((model) => model.id === definition.defaultModel)
-    ? definition.defaultModel
-    : "";
   return {
     provider,
     runtime_provider: definition.runtimeProvider,
-    default_model: defaultModel,
+    default_model: "",
     models,
   };
 }
@@ -159,13 +143,8 @@ export function resolveModel(request: RunRequest, gateway: PlatformGateway, sign
   }
   return {
     model,
-    async getApiKey(requestedProvider: string): Promise<string | undefined> {
-      const candidates = [requestedProvider, request.model.provider, provider];
-      for (const candidate of new Set(candidates)) {
-        const token = await gateway.token(request, candidate, signal);
-        if (token) return token;
-      }
-      return undefined;
+    async getApiKey(_requestedProvider: string): Promise<string | undefined> {
+      return await gateway.token(request, request.model.provider, signal);
     },
   };
 }
@@ -179,32 +158,33 @@ export function modelSupportsImages(model: Model<Api>): boolean {
   return model.input.includes("image");
 }
 
+export interface AuthorizedAuxiliaryModel {
+  model: Model<Api>;
+  apiKey: string;
+}
+
 /**
- * Resolve an allowed image-capable companion on the same product/OAuth
- * provider. The primary model's metadata remains authoritative and unchanged.
+ * Resolve the first image-capable Pi model on the same product/OAuth provider
+ * that the current account authorizes. Each candidate is checked with its own
+ * model ID; authorization for the primary model is never reused.
  */
-export function resolveAuxiliaryVisionModel(
+export async function resolveAuxiliaryVisionModel(
   request: RunRequest,
   gateway: PlatformGateway,
   signal?: AbortSignal,
-): ResolvedModel | undefined {
+): Promise<AuthorizedAuxiliaryModel | undefined> {
   const provider = validateProductModelRequest(request.model);
   const primary = resolveModel(request, gateway, signal);
   if (modelSupportsImages(primary.model)) return undefined;
-  for (const id of AUXILIARY_VISION_MODEL_PREFERENCES[provider]) {
-    if (!PRODUCT_MODELS[provider].includes(id)) continue;
-    const candidate = resolveModel({
-      ...request,
-      model: { ...request.model, id },
-    }, gateway, signal);
-    if (modelSupportsImages(candidate.model)) return candidate;
-  }
   for (const candidate of trustedModels(provider)) {
     if (candidate.id === request.model.id || !modelSupportsImages(candidate)) continue;
-    return resolveModel({
+    const candidateRequest: RunRequest = {
       ...request,
       model: { ...request.model, id: candidate.id },
-    }, gateway, signal);
+    };
+    const resolved = resolveModel(candidateRequest, gateway, signal);
+    const apiKey = await resolved.getApiKey(candidateRequest.model.provider);
+    if (apiKey) return { model: resolved.model, apiKey };
   }
   return undefined;
 }

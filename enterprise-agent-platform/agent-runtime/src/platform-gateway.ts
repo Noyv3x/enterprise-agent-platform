@@ -97,7 +97,7 @@ export class PlatformGateway {
         "content-type": "application/json",
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
-      body: JSON.stringify({ provider, scope_key: request.scope_key }),
+      body: JSON.stringify({ provider, model: request.model.id, scope_key: request.scope_key }),
     };
     if (signal) init.signal = signal;
     const response = await fetch(`${baseUrl}/api/agent/tools/credentials/resolve`, init);

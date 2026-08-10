@@ -20,6 +20,7 @@ from enterprise_agent_platform.oauth_flows import (
     OAUTH_HTTP_USER_AGENT,
     XAI_OAUTH_DISCOVERY_URL,
 )
+from enterprise_agent_platform.model_catalog import CODEX_MODELS_URL
 from enterprise_agent_platform.runtimes import AGENT_SETTING_PROVIDER
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
 
@@ -50,6 +51,24 @@ class _ScriptedOAuthHTTPClient:
 
     def get_json(self, url, *, timeout=20.0):
         self.calls.append(("get_json", url))
+        return self._next(url)
+
+    def get_bearer_json(
+        self,
+        url,
+        access_token,
+        *,
+        additional_headers=None,
+        timeout=20.0,
+    ):
+        self.calls.append(
+            (
+                "get_bearer_json",
+                url,
+                access_token,
+                dict(additional_headers or {}),
+            )
+        )
         return self._next(url)
 
     def post_json(self, url, body, *, timeout=20.0):
@@ -325,7 +344,11 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
                         "refresh_token": "rotated-refresh",
                         "expires_in": 7200,
                     },
-                )
+                ),
+                CODEX_MODELS_URL: OAuthHTTPResponse(
+                    200,
+                    {"models": [{"slug": "gpt-5.6-sol", "priority": 0}]},
+                ),
             }
         )
         with tempfile.TemporaryDirectory() as td:
@@ -346,7 +369,15 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
                 def resolve():
                     try:
                         barrier.wait(timeout=3)
-                        results.append(service.resolve_agent_credentials({"provider": "openai-codex"}))
+                        results.append(
+                            service.resolve_agent_credentials(
+                                {
+                                    "provider": "openai-codex",
+                                    "model": "gpt-5.6-sol",
+                                    "scope_key": "private:1",
+                                }
+                            )
+                        )
                     except BaseException as exc:
                         errors.append(exc)
 
@@ -360,10 +391,78 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
                 self.assertEqual(errors, [])
                 self.assertEqual(len(results), 4)
                 self.assertEqual({result["access_token"] for result in results}, {"rotated-access"})
+                self.assertEqual({result["model"] for result in results}, {"gpt-5.6-sol"})
                 refresh_calls = [call for call in client.calls if call[0] == "post_form"]
                 self.assertEqual(len(refresh_calls), 1)
                 self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "rotated-access")
                 self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "rotated-refresh")
+            finally:
+                service.close()
+
+    def test_runtime_credential_resolution_requires_exact_model_and_scope_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                for body, message in (
+                    (
+                        {"model": "gpt-5.6-sol", "scope_key": "private:1"},
+                        "requires a provider",
+                    ),
+                    ({"provider": "openai-codex"}, "requires a model"),
+                    (
+                        {"provider": "openai-codex", "model": "gpt-5.6-sol"},
+                        "requires a scope_key",
+                    ),
+                    (
+                        {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.6-sol",
+                            "scope_key": "private:1",
+                            "unexpected": True,
+                        },
+                        "unsupported fields",
+                    ),
+                ):
+                    with self.subTest(body=body):
+                        with self.assertRaises(ServiceError) as raised:
+                            service.resolve_agent_credentials(body)
+                        self.assertEqual(raised.exception.status, 400)
+                        self.assertIn(message, raised.exception.message)
+            finally:
+                service.close()
+
+    def test_runtime_credential_resolution_rejects_model_outside_live_account_catalog(self):
+        client = _ScriptedOAuthHTTPClient(
+            {
+                CODEX_MODELS_URL: OAuthHTTPResponse(
+                    200,
+                    {"models": [{"slug": "gpt-5.6-sol", "priority": 0}]},
+                ),
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=client,
+            )
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "current-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "current-refresh")
+                service.set_setting("CODEX_OAUTH_EXPIRES_AT", str(int(time.time()) + 7200))
+
+                with self.assertRaises(ServiceError) as raised:
+                    service.resolve_agent_credentials(
+                        {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.5",
+                            "scope_key": "private:1",
+                        }
+                    )
+
+                self.assertEqual(raised.exception.status, 409)
+                self.assertIn("not available", raised.exception.message)
             finally:
                 service.close()
 
@@ -372,7 +471,13 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 with self.assertRaises(ServiceError) as raised:
-                    service.resolve_agent_credentials({"provider": "xai-oauth"})
+                    service.resolve_agent_credentials(
+                        {
+                            "provider": "xai-oauth",
+                            "model": "grok-4.5",
+                            "scope_key": "private:1",
+                        }
+                    )
                 self.assertEqual(raised.exception.status, 409)
                 self.assertIn("not connected", raised.exception.message)
             finally:

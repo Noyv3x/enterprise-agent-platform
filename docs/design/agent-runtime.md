@@ -31,9 +31,11 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 ## 模型目录与授权
 
-Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API 类型和固定 endpoint。请求不能覆盖 base URL 或 API 类型。Python 可调用供应商 OAuth 模型发现，但其结果只能与 Runtime 目录求交或作为可用性提示，不能扩展可执行集合。
+Runtime 从锁定的 Pi 元数据计算受支持模型，校验 provider、API 类型和固定 endpoint。请求不能覆盖 base URL 或 API 类型。Python 使用当前 OAuth 凭据获取账号可用目录，并只向产品暴露供应商目录与 Runtime 能力目录的交集；供应商结果不能扩展可执行集合，Runtime 结果也不能扩展账号权限。
 
-模型清单会随锁定依赖升级而改变，设计文档不得复制静态 ID 列表。Runtime 的 `default_model` 只表示 provider 自身具有稳定默认值时的能力目录回退；对由账号目录决定推荐顺序的 Codex OAuth 必须为空，不能在 Runtime 中固定某个产品版本。Python 在调用时向内部授权端点请求当前访问凭据；OAuth token 不写入 Run metadata、session 或事件日志。
+模型清单会随锁定依赖和供应商账号目录改变，设计文档不得复制静态 ID、退役名单、默认版本或辅助模型优先级。所有 OAuth provider 的 Runtime `default_model` 固定为空，推荐顺序完全由账号目录决定。账号尚未完成 OAuth、当前凭据从未成功取得目录，或安全交集为空时，产品目录为空且自动选择明确失败；同一凭据最近一次成功目录可以带 stale 标志继续使用，不能回退为完整 Runtime 清单。数据库中的明确选择可以作为尚未改写的 Run 意图保留，但不能因此取得 Token 或绕过执行前的当前交集复验。
+
+Python 在调用时向内部授权端点请求当前访问凭据，并同时复验请求中的具体模型仍属于该账号目录。视觉辅助模型只按同一 provider 的 Pi 输入能力动态枚举，再通过这项账号目录复验选择；不能按模型名称或版本写优先级，也不能因主模型已获授权而给另一个隐藏模型复用 Token。OAuth token 不写入 Run metadata、session 或事件日志。
 
 ## 工具与执行目标
 

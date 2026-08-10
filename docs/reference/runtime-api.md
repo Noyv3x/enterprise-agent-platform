@@ -29,9 +29,9 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 
 ## 模型目录
 
-`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。`default_model` 是字符串且允许为空；为空表示推荐值必须由账号级供应商目录决定，调用方不得擅自替换为 Runtime 列表第一项。
+`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。OAuth provider 的 `default_model` 始终为空；推荐值必须由账号级供应商目录决定，调用方不得擅自替换为 Runtime 列表第一项。
 
-目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 可以将目录与当前 OAuth 账号可见模型合并，但不能创造目录外模型。Codex OAuth 合并成功时以供应商 priority 顺序中的第一个交集模型作为推荐默认；已有显式选择只要仍可执行就不随推荐值变化而改写。
+目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 必须将目录与当前 OAuth 账号可见模型求交，不能创造任一目录外模型；两个 provider 都以供应商返回顺序中的第一个安全交集模型作为推荐默认。已有显式选择只有仍在安全交集中才可执行，且不随推荐值变化而改写。
 
 ## 创建 Run
 
@@ -160,6 +160,8 @@ Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`f
 Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
 Python 必须从可信 context 推导 memory owner、schedule owner、browser identity、Sylver Lining 连接 owner 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill、mail 和 `sylver_platform`；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+
+模型访问凭据请求只接受必填的 `provider`、`model`、`scope_key` 和可选的内部 `force_refresh`；`provider` 必须是规范 OAuth product id，`model` 必须是本次实际调用的非空模型 ID，`scope_key` 必须是当前 Run scope。Platform 在返回 Token 前确认 provider 是当前支持的 OAuth 类型，并确认 model 仍在同一凭据最近成功发现的账号目录与 Runtime 目录交集中。目录未配置、从未成功获取、已被新凭据替代或模型不在交集时失败关闭；Runtime 为视觉辅助模型请求 Token 时同样使用该模型自己的 ID，不能沿用主模型的授权判断。
 
 knowledge `search` 只返回 active 向量索引的稳定结果，每项包含可交给 `read` 的正整数 `document_id`、`chunk_id`、来源偏移、excerpt 和 score。未配置 Embeddings API key、尚无 active generation 或 provider 失败时返回可区分的错误代码，不以空列表伪装成“无命中”，也不改走本地关键词检索。
 

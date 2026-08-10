@@ -58,10 +58,12 @@ describe("OAuthProviderCard", () => {
     renderProvider({
       id: "xai-oauth",
       configured: true,
+      default_model: "stale-runtime-candidate",
       models: [],
     });
 
     expect(screen.getByText("Recommended model: Unavailable")).toBeInTheDocument();
     expect(screen.getByText("0 available models")).toBeInTheDocument();
+    expect(screen.queryByText(/stale-runtime-candidate/)).not.toBeInTheDocument();
   });
 });

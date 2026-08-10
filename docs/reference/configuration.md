@@ -112,7 +112,7 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 - `agent_runtime_max_concurrency`
 - `agent_runtime_compaction_threshold`
 
-模型 provider 只接受受支持 OAuth 类型，model ID 必须来自 Runtime 实时目录。`agent_runtime_model=""` 表示部署默认使用自动推荐，账号 `model_name=""` 表示继承该部署策略；新实例和未显式选择模型的账号不持久化某个具体产品版本作为默认值。Platform 在需要执行时从 Runtime 能力目录与当前 OAuth 账号可见目录的交集解析推荐候选，解析失败时明确拒绝执行，不能猜测目录第一项。已有显式选择只要仍在交集中就保持不变；OAuth 重验和只修改其它 Runtime 字段不能填充或覆盖模型设置，切换 provider 且没有同时提供模型时把部署模型恢复为空。更新这些设置使用单一事务并作用于后续 Run；固定 Runtime 容器的生命周期只属于 Manager，Platform 不因模型设置变化重启它。
+模型 provider 只接受受支持 OAuth 类型，model ID 必须来自当前 OAuth 账号目录与 Runtime 实时能力目录的交集。`agent_runtime_model=""` 表示部署默认使用自动推荐，账号 `model_name=""` 表示继承该部署策略；新实例和未显式选择模型的账号不持久化某个具体产品版本作为默认值。Platform 在需要执行时以 OAuth 供应商顺序解析安全交集的推荐候选；账号未完成 OAuth、当前凭据从未成功获取目录或交集为空时，目录与自动选择明确不可用，不能使用完整 Runtime 清单或固定版本回退。已有显式选择不被目录故障改写，但它只有仍在当前交集中才能取得执行 Token；OAuth 重验和只修改其它 Runtime 字段不能填充或覆盖模型设置，切换 provider 且没有同时提供模型时把部署模型恢复为空。更新这些设置使用单一事务并作用于后续 Run；固定 Runtime 容器的生命周期只属于 Manager，Platform 不因模型设置变化重启它。
 
 ### 知识与集成
 

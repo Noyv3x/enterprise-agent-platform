@@ -1570,7 +1570,7 @@ export class RunCoordinator {
 
     try {
       if (record.controller.signal.aborted || signal?.aborted) throw abortError();
-      const companion = resolveAuxiliaryVisionModel(
+      const companion = await resolveAuxiliaryVisionModel(
         record.request,
         this.gateway,
         auxiliaryController.signal,
@@ -1609,7 +1609,6 @@ export class RunCoordinator {
         ],
         timestamp: Date.now(),
       };
-      const apiKey = await companion.getApiKey(companion.model.provider);
       if (auxiliaryController.signal.aborted) throw abortError();
       const responseStream = await this.visionStreamFn(
         companion.model,
@@ -1619,7 +1618,7 @@ export class RunCoordinator {
           tools: [],
         },
         {
-          ...(apiKey ? { apiKey } : {}),
+          apiKey: companion.apiKey,
           signal: auxiliaryController.signal,
         },
       );

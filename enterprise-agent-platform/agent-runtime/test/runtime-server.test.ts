@@ -3,6 +3,7 @@ import { access, readFile, rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { productModelCatalogs } from "../src/model-resolver.js";
 import { RunCoordinator } from "../src/run-coordinator.js";
 import { createRuntimeServer } from "../src/server.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
@@ -54,8 +55,9 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     assert.equal(modelBody.version, 1);
     assert.equal(modelBody.source, "pi-runtime");
     assert.equal(modelBody.providers["openai-codex"]?.provider, "openai-codex");
-    assert.ok(modelBody.providers["openai-codex"]?.models.some((model) => model.id === "gpt-5.5"));
+    assert.deepEqual(modelBody.providers["openai-codex"], productModelCatalogs()["openai-codex"]);
     assert.equal(modelBody.providers["xai-oauth"]?.provider, "xai-oauth");
+    assert.deepEqual(modelBody.providers["xai-oauth"], productModelCatalogs()["xai-oauth"]);
     const modelsWithQuery = await fetch(`${base}/v1/models?provider=openai-codex`, {
       headers: { authorization: "Bearer secret" },
     });

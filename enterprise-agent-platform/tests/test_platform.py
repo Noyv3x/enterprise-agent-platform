@@ -669,6 +669,35 @@ class FakeOAuthHTTPClient:
             },
         )
 
+    def get_bearer_json(
+        self,
+        url,
+        access_token,
+        *,
+        additional_headers=None,
+        timeout=20.0,
+    ):
+        self.calls.append(
+            (
+                "get_bearer_json",
+                url,
+                {"access_token": access_token, **dict(additional_headers or {})},
+            )
+        )
+        if "chatgpt.com/backend-api/codex/models" in url:
+            return OAuthHTTPResponse(
+                200,
+                {
+                    "models": [
+                        {"slug": "gpt-5.4", "priority": 0},
+                        {"slug": "gpt-5.6-sol", "priority": 1},
+                    ]
+                },
+            )
+        if "api.x.ai/v1/models" in url:
+            return OAuthHTTPResponse(200, {"data": [{"id": "grok-4.5"}]})
+        return OAuthHTTPResponse(404, {}, "not found")
+
     def post_json(self, url, body, *, timeout=20.0):
         self.calls.append(("post_json", url, dict(body)))
         if url.endswith("/usercode"):
@@ -701,6 +730,22 @@ class FakeOAuthHTTPClient:
                 },
             )
         return OAuthHTTPResponse(404, {}, "not found")
+
+
+def configure_test_codex(service: EnterpriseService, admin: dict) -> None:
+    """Connect the deterministic account catalog used by model-policy tests."""
+
+    service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+    service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+    service.set_setting("CODEX_OAUTH_EXPIRES_AT", str(int(time.time()) + 3600))
+
+
+def configure_test_grok(service: EnterpriseService, admin: dict) -> None:
+    """Connect the deterministic Grok account catalog used by config tests."""
+
+    service.set_secret(admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
+    service.set_secret(admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
+    service.set_setting("GROK_OAUTH_EXPIRES_AT", str(int(time.time()) + 3600))
 
 
 
@@ -4737,9 +4782,14 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_admin_can_manage_account_permissions_and_model_policy(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
+                configure_test_codex(service, admin)
                 user = service.create_user(
                     username="alice",
                     password="alice-pass",
@@ -4888,9 +4938,14 @@ class PlatformServiceTests(unittest.TestCase):
     def test_account_model_and_thinking_depth_are_used_for_agent_calls(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
-            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=agent,
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
+                configure_test_codex(service, admin)
                 service.create_user(
                     username="bob",
                     password="bob-pass",
@@ -4988,9 +5043,14 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_admin_can_update_own_model_without_invalidating_session(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 token, admin = service.authenticate("admin", "admin")
+                configure_test_codex(service, admin)
                 updated = service.update_user(
                     admin,
                     admin["id"],
@@ -5253,14 +5313,19 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_agent_runtime_config_updates_and_validates_runtime_controls(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
+                configure_test_grok(service, admin)
                 updated = service.update_agent_runtime_config(
                     admin,
                     {
                         "provider": "xai-oauth",
-                        "model": "grok-4.3",
+                        "model": "grok-4.5",
                         "idle_timeout_seconds": 321,
                         "max_concurrency": 4,
                         "compaction_threshold": 0.75,
@@ -5268,7 +5333,7 @@ class PlatformServiceTests(unittest.TestCase):
                 )["config"]
 
                 self.assertEqual(updated["provider"], "xai-oauth")
-                self.assertEqual(updated["model"], "grok-4.3")
+                self.assertEqual(updated["model"], "grok-4.5")
                 self.assertEqual(updated["idle_timeout_seconds"], 321)
                 self.assertEqual(updated["max_concurrency"], 4)
                 self.assertEqual(updated["compaction_threshold"], 0.75)
@@ -5277,7 +5342,7 @@ class PlatformServiceTests(unittest.TestCase):
                 with self.assertRaises(ServiceError) as alias_error:
                     service.update_agent_runtime_config(admin, {"provider": "grok-oauth"})
                 self.assertEqual(alias_error.exception.status, 400)
-                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.3")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.5")
                 self.assertEqual(
                     service.get_setting(AGENT_SETTING_IDLE_TIMEOUT), "321.0"
                 )
@@ -5467,21 +5532,27 @@ class PlatformServiceTests(unittest.TestCase):
 
     def test_agent_runtime_model_selection_uses_platform_catalog(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
                 config = service.agent_runtime_config(admin)["config"]
+                self.assertEqual(config["model_catalog"]["openai-codex"]["models"], [])
+
+                with self.assertRaises(ServiceError) as ctx:
+                    service.update_agent_runtime_config(admin, {"model": "not-in-catalog"})
+                self.assertEqual(ctx.exception.status, 503)
+
+                service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
+                service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
+                service.set_setting("CODEX_OAUTH_EXPIRES_AT", str(int(time.time()) + 3600))
+                config = service.agent_runtime_config(admin)["config"]
                 self.assertEqual(
                     config["model_catalog"]["openai-codex"]["models"],
-                    [
-                        "gpt-5.3-codex-spark",
-                        "gpt-5.4",
-                        "gpt-5.4-mini",
-                        "gpt-5.5",
-                        "gpt-5.6-luna",
-                        "gpt-5.6-sol",
-                        "gpt-5.6-terra",
-                    ],
+                    ["gpt-5.4", "gpt-5.6-sol"],
                 )
 
                 with self.assertRaises(ServiceError) as ctx:
@@ -8028,6 +8099,7 @@ class PlatformHTTPTests(unittest.TestCase):
             service = EnterpriseService(
                 make_config(Path(td)),
                 agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
             )
             server, thread = serve_in_thread(make_config(Path(td)), service)
             host, port = server.server_address
@@ -8046,6 +8118,7 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(res.status, 200)
                 self.assertEqual(body["user"]["username"], "admin")
                 admin = body["user"]
+                configure_test_codex(service, admin)
 
                 conn.request("GET", "/api/channels", headers={"Cookie": cookie})
                 res = conn.getresponse()

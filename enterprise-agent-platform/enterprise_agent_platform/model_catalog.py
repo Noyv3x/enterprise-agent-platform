@@ -21,11 +21,11 @@ _MODEL_ID_RE = re.compile(r"^[^\r\n\x00]{1,160}$")
 
 
 class ModelCatalogManager:
-    """Merge Runtime capabilities with provider OAuth visibility.
+    """Intersect Runtime capabilities with provider OAuth visibility.
 
     The Agent Runtime is the sole authority for executable model metadata.
-    Provider discovery may narrow or annotate that trusted set, but can never
-    introduce a model that the Runtime cannot resolve safely.
+    Provider discovery is the sole authority for account availability. Neither
+    side may expand the other: only their ordered intersection is selectable.
     """
 
     def __init__(
@@ -90,6 +90,18 @@ class ModelCatalogManager:
                 "oauth_verified_models": [],
                 "error": "unsupported provider",
             }
+        if not self._oauth_configured(provider):
+            return self._result(
+                provider,
+                [],
+                [],
+                "",
+                source="oauth-unconfigured",
+                stale=False,
+                fetched_at=None,
+                verified=[],
+                error="OAuth is not configured",
+            )
         runtime, runtime_stale, runtime_error, runtime_at = self._runtime_catalogs()
         trusted = runtime.get(provider, {})
         details = trusted.get("models") if isinstance(trusted, dict) else []
@@ -97,9 +109,6 @@ class ModelCatalogManager:
             details = []
         trusted_ids = [str(item.get("id") or "") for item in details if isinstance(item, dict)]
         trusted_ids = [model_id for model_id in trusted_ids if _valid_model_id(model_id)]
-        default_model = str(trusted.get("default_model") or "") if isinstance(trusted, dict) else ""
-        if default_model and default_model not in trusted_ids:
-            default_model = ""
         if not trusted_ids:
             return {
                 "provider": provider,
@@ -113,69 +122,45 @@ class ModelCatalogManager:
                 "error": runtime_error or "Agent Runtime returned no supported models",
             }
 
-        if not self._oauth_configured(provider):
-            return self._result(
-                provider,
-                trusted_ids,
-                details,
-                default_model,
-                source="agent-runtime",
-                stale=runtime_stale,
-                fetched_at=runtime_at,
-                verified=[],
-                error=runtime_error,
-            )
-
         discovered, oauth_at, oauth_stale, oauth_error, oauth_source = self._oauth_models(provider)
         trusted_set = set(trusted_ids)
         verified = [model_id for model_id in discovered if model_id in trusted_set]
 
-        if provider == "openai-codex" and discovered:
-            # Codex exposes an account-scoped catalog. Only models both
-            # visible to this OAuth account and executable by the Runtime
-            # may be selected.
-            selected = verified
-            selected_set = set(selected)
-            detail_by_id = {
-                str(item.get("id")): item
-                for item in details
-                if isinstance(item, dict) and item.get("id") in selected_set
-            }
-            selected_details = [detail_by_id[model_id] for model_id in selected if model_id in detail_by_id]
-            selected_default = selected[0] if selected else ""
-            unsupported_count = len([model_id for model_id in discovered if model_id not in trusted_set])
-            compatibility_error = ""
-            if discovered and not selected:
-                compatibility_error = "OAuth models are not yet supported by this Agent Runtime"
-            elif unsupported_count:
-                compatibility_error = (
-                    f"{unsupported_count} OAuth model(s) are hidden until Runtime metadata is available"
-                )
-            return self._result(
-                provider,
-                selected,
-                selected_details,
-                selected_default,
-                source=oauth_source,
-                stale=runtime_stale or oauth_stale,
-                fetched_at=oauth_at or runtime_at,
-                verified=verified,
-                error=oauth_error or runtime_error or compatibility_error,
+        # Provider discovery is account-scoped for every supported OAuth
+        # provider. Preserve its ordering while Runtime metadata remains the
+        # non-expandable execution boundary.
+        selected = verified
+        selected_set = set(selected)
+        detail_by_id = {
+            str(item.get("id")): item
+            for item in details
+            if isinstance(item, dict) and item.get("id") in selected_set
+        }
+        selected_details = [
+            detail_by_id[model_id]
+            for model_id in selected
+            if model_id in detail_by_id
+        ]
+        unsupported_count = len([
+            model_id for model_id in discovered if model_id not in trusted_set
+        ])
+        compatibility_error = ""
+        if discovered and not selected:
+            compatibility_error = "OAuth models are not yet supported by this Agent Runtime"
+        elif unsupported_count:
+            compatibility_error = (
+                f"{unsupported_count} OAuth model(s) are hidden until Runtime metadata is available"
             )
-
-        # xAI's /v1/models response is not exhaustive for OAuth accounts.
-        # Keep the complete trusted Runtime catalog and expose the live
-        # intersection only as an availability signal, never an allowlist.
         return self._result(
             provider,
-            trusted_ids,
-            details,
-            default_model,
-            source=("agent-runtime+oauth" if discovered else "agent-runtime-fallback"),
-            stale=runtime_stale or oauth_stale or bool(oauth_error),
-            fetched_at=oauth_at or runtime_at,
-            verified=verified,
-            error=oauth_error or runtime_error,
+            selected,
+            selected_details,
+            selected[0] if selected else "",
+            source=oauth_source,
+            stale=runtime_stale or oauth_stale,
+            fetched_at=oauth_at,
+            verified=selected,
+            error=oauth_error or runtime_error or compatibility_error,
         )
 
     def invalidate_oauth(self, provider: str | None = None) -> None:
@@ -298,7 +283,7 @@ class ModelCatalogManager:
                         recent_failure[2],
                         "oauth-cache"
                         if cached_models and cached_revision == revision
-                        else "agent-runtime-fallback",
+                        else "oauth-unavailable",
                     )
                 if (
                     cached_models
@@ -386,7 +371,7 @@ class ModelCatalogManager:
                     if cached_models and cached_revision == active_revision:
                         result = (cached_models, cached_at or None, True, error, "oauth-cache")
                     else:
-                        result = ([], None, True, error, "agent-runtime-fallback")
+                        result = ([], None, True, error, "oauth-unavailable")
                 condition.notify_all()
 
             if retry:
@@ -520,16 +505,13 @@ def _normalize_runtime_providers(value: Any) -> dict[str, dict[str, Any]]:
                 continue
             seen.add(model_id)
             models.append({**item, "id": model_id})
-        default_model = str(raw.get("default_model") or "").strip()
-        if provider == "openai-codex":
-            default_model = ""
-        elif default_model and default_model not in seen:
-            default_model = ""
         normalized[provider] = {
             **raw,
             "provider": provider,
             "models": models,
-            "default_model": default_model,
+            # OAuth account discovery owns recommendation order for every
+            # provider. Runtime metadata never supplies a product default.
+            "default_model": "",
         }
     return normalized
 
@@ -538,8 +520,8 @@ def _parse_codex_models(payload: Any) -> list[str]:
     entries = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
         return []
-    sortable: list[tuple[int, str]] = []
-    for item in entries:
+    sortable: list[tuple[int, int, str]] = []
+    for index, item in enumerate(entries):
         if not isinstance(item, dict):
             continue
         visibility = str(item.get("visibility") or "").strip().lower()
@@ -550,9 +532,9 @@ def _parse_codex_models(payload: Any) -> list[str]:
             continue
         priority = item.get("priority")
         rank = int(priority) if isinstance(priority, (int, float)) else 10_000
-        sortable.append((rank, model_id))
+        sortable.append((rank, index, model_id))
     sortable.sort(key=lambda item: (item[0], item[1]))
-    return _clean_model_ids([model_id for _, model_id in sortable])
+    return _clean_model_ids([model_id for _, _, model_id in sortable])
 
 
 def _parse_xai_models(payload: Any) -> list[str]:
@@ -561,10 +543,16 @@ def _parse_xai_models(payload: Any) -> list[str]:
         entries = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(entries, list):
         return []
-    return _clean_model_ids([
-        item.get("id") if isinstance(item, dict) else item
-        for item in entries
-    ])
+    models: list[Any] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            models.append(item)
+            continue
+        models.append(item.get("id"))
+        aliases = item.get("aliases")
+        if isinstance(aliases, list):
+            models.extend(aliases)
+    return _clean_model_ids(models)
 
 
 def _clean_model_ids(value: Any) -> list[str]:

@@ -3,6 +3,7 @@ import { mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promise
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { productModelCatalogs } from "../src/model-resolver.js";
 import {
   adaptImageContentForModel,
   appendSkillPolicy,
@@ -2608,9 +2609,11 @@ test("retained mail records omit message bodies while live Agent context remains
   assert.match(JSON.stringify([assistant, result]), new RegExp(body));
 });
 
-test("Spark receives browser vision text fallback while work records omit the live screenshot", async () => {
-  const home = await temporaryDirectory("agent-spark-browser-vision-");
-  const workspace = await temporaryDirectory("agent-spark-browser-workspace-");
+test("text-only Codex receives browser vision text fallback while work records omit the live screenshot", async () => {
+  const home = await temporaryDirectory("agent-text-browser-vision-");
+  const workspace = await temporaryDirectory("agent-text-browser-workspace-");
+  const textOnlyModelId = codexModelId(false);
+  const imageModelId = codexModelId(true);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -2636,6 +2639,9 @@ test("Spark receives browser vision text fallback while work records omit the li
     return visionFaux.provider.streamSimple(model, context, options);
   };
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn, visionStreamFn });
+  coordinator.gateway.token = async (candidateRequest) => candidateRequest.model.id === imageModelId
+    ? "authorized-vision-token"
+    : undefined;
   const encoded = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64");
   coordinator.gateway.invoke = async () => ({
     data: {
@@ -2651,18 +2657,18 @@ test("Spark receives browser vision text fallback while work records omit the li
     const run = coordinator.createRun({
       scope_key: "scope",
       lifecycle_id: "life",
-      session_id: "spark-browser",
+      session_id: "text-browser",
       workspace,
       system_prompt: "You are an Agent.",
       input: "Inspect the page",
-      model: { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
-      metadata: { idempotency_key: "spark-vision-once" },
+      model: { provider: "openai-codex", id: textOnlyModelId },
+      metadata: { idempotency_key: "text-vision-once" },
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
     assert.equal(contexts.length, 2);
     assert.equal(visionCalls.length, 1);
-    assert.equal(visionCalls[0]?.model, "gpt-5.4-mini");
+    assert.equal(visionCalls[0]?.model, imageModelId);
     assert.match(JSON.stringify(visionCalls[0]?.messages), new RegExp(encoded), "the companion must receive the live image");
     assert.match(
       JSON.stringify(visionCalls[0]?.messages),
@@ -2698,9 +2704,11 @@ test("Spark receives browser vision text fallback while work records omit the li
   }
 });
 
-test("Spark browser vision timeout degrades to snapshot text without failing the run", async () => {
-  const home = await temporaryDirectory("agent-spark-browser-timeout-");
-  const workspace = await temporaryDirectory("agent-spark-browser-timeout-workspace-");
+test("text-only Codex browser vision timeout degrades to snapshot text without failing the run", async () => {
+  const home = await temporaryDirectory("agent-text-browser-timeout-");
+  const workspace = await temporaryDirectory("agent-text-browser-timeout-workspace-");
+  const textOnlyModelId = codexModelId(false);
+  const imageModelId = codexModelId(true);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -2723,6 +2731,9 @@ test("Spark browser vision timeout degrades to snapshot text without failing the
     visionStreamFn,
     visionTimeoutMs: 10,
   });
+  coordinator.gateway.token = async (candidateRequest) => candidateRequest.model.id === imageModelId
+    ? "authorized-vision-token"
+    : undefined;
   const encoded = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64");
   coordinator.gateway.invoke = async () => ({
     data: {
@@ -2736,11 +2747,11 @@ test("Spark browser vision timeout degrades to snapshot text without failing the
     const run = coordinator.createRun({
       scope_key: "scope",
       lifecycle_id: "life",
-      session_id: "spark-browser-timeout",
+      session_id: "text-browser-timeout",
       workspace,
       system_prompt: "You are an Agent.",
       input: "Inspect the page",
-      model: { provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+      model: { provider: "openai-codex", id: textOnlyModelId },
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
@@ -2755,6 +2766,14 @@ test("Spark browser vision timeout degrades to snapshot text without failing the
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+function codexModelId(imageCapable: boolean): string {
+  const model = productModelCatalogs()["openai-codex"].models.find(
+    (candidate) => candidate.input.includes("image") === imageCapable,
+  );
+  assert.ok(model, `locked Pi catalog must include a ${imageCapable ? "multimodal" : "text-only"} Codex model`);
+  return model.id;
+}
 
 async function waitUntil<T>(read: () => T | undefined, timeoutMs = 2_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;

@@ -39,32 +39,31 @@ test("public model catalogs are generated from the same trusted Runtime models",
     PRODUCT_MODELS.xai,
   );
   assert.equal(catalogs["openai-codex"].default_model, "");
-  assert.equal(catalogs["xai-oauth"].default_model, "grok-4.3");
+  assert.equal(catalogs["xai-oauth"].default_model, "");
   assert.ok(catalogs["openai-codex"].models.every((model) => model.context_window > 0));
   assert.ok(catalogs["xai-oauth"].models.every((model) => model.max_tokens > 0));
-  for (const retired of ["grok-3", "grok-3-fast", "grok-code-fast-1"]) {
-    assert.equal(catalogs["xai-oauth"].models.some((model) => model.id === retired), false);
-    assert.throws(
-      () => validateProductModelRequest({ provider: "xai-oauth", id: retired }),
-      /not allowed/,
-    );
-  }
 });
 
 test("only canonical product provider ids resolve", () => {
   const gateway = new PlatformGateway();
-  assert.equal(resolveModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway).model.provider, "openai-codex");
-  assert.equal(resolveModel(request({ provider: "xai-oauth", id: "grok-4.3" }), gateway).model.provider, "xai");
+  assert.equal(
+    resolveModel(request({ provider: "openai-codex", id: catalogModelId("openai-codex") }), gateway).model.provider,
+    "openai-codex",
+  );
+  assert.equal(
+    resolveModel(request({ provider: "xai-oauth", id: catalogModelId("xai-oauth") }), gateway).model.provider,
+    "xai",
+  );
   for (const provider of ["codex", "grok", "openai", "xai", "faux", "openrouter"]) {
     assert.throws(
-      () => validateProductModelRequest({ provider, id: "gpt-5.5" }),
+      () => validateProductModelRequest({ provider, id: "catalog-model" }),
       /model\.provider must be/,
     );
   }
 });
 
 test("caller-controlled model API and base URL are rejected before token resolution", () => {
-  const allowed = { provider: "openai-codex", id: "gpt-5.5" };
+  const allowed = { provider: "openai-codex", id: catalogModelId("openai-codex") };
   assert.throws(
     () => validateProductModelRequest({ ...allowed, base_url: "https://attacker.invalid/v1" } as unknown as ModelRequest),
     /base_url is controlled/,
@@ -82,52 +81,139 @@ test("caller-controlled model API and base URL are rejected before token resolut
     /not allowed/,
   );
   assert.throws(
-    () => validateProductModelRequest({ provider: "grok", id: "gpt-5.5" }),
-    /model\.provider must be/,
-  );
-  assert.throws(
-    () => validateProductModelRequest({ provider: "grok", id: "grok-4.20-multi-agent-0309" }),
+    () => validateProductModelRequest({ provider: "grok", id: "catalog-model" }),
     /model\.provider must be/,
   );
 });
 
 test("OAuth token lookup keeps the canonical product provider on the fixed endpoint", async () => {
+  const xaiModelId = catalogModelId("xai-oauth");
+  const seen: Array<{ model: string; provider: string }> = [];
   const gateway = {
-    token: async () => "short-lived-oauth-token",
+    token: async (candidateRequest: RunRequest, provider: string) => {
+      seen.push({ model: candidateRequest.model.id, provider });
+      return "short-lived-oauth-token";
+    },
   } as unknown as PlatformGateway;
-  const run = request({ provider: "xai-oauth", id: "grok-4.3" });
+  const run = request({ provider: "xai-oauth", id: xaiModelId });
   const resolved = resolveModel(run, gateway);
   assert.equal(await resolved.getApiKey(resolved.model.provider), "short-lived-oauth-token");
+  assert.deepEqual(seen, [{ model: xaiModelId, provider: "xai-oauth" }]);
   assert.equal(resolved.model.baseUrl, "https://api.x.ai/v1");
 });
 
 test("image support follows locked model metadata without overriding Codex OAuth models", () => {
   const gateway = new PlatformGateway();
-  const spark = resolveModel(request({ provider: "openai-codex", id: "gpt-5.3-codex-spark" }), gateway);
-  const multimodalCodex = resolveModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway);
+  const textOnly = resolveModel(request({
+    provider: "openai-codex",
+    id: catalogModelId("openai-codex", (model) => !model.input.includes("image")),
+  }), gateway);
+  const multimodalCodex = resolveModel(request({
+    provider: "openai-codex",
+    id: catalogModelId("openai-codex", (model) => model.input.includes("image")),
+  }), gateway);
 
-  assert.equal(modelSupportsImages(spark.model), false);
+  assert.equal(modelSupportsImages(textOnly.model), false);
   assert.equal(modelSupportsImages(multimodalCodex.model), true);
-  assert.equal(spark.model.api, "openai-codex-responses");
-  assert.equal(spark.model.baseUrl, "https://chatgpt.com/backend-api");
+  assert.equal(textOnly.model.api, "openai-codex-responses");
+  assert.equal(textOnly.model.baseUrl, "https://chatgpt.com/backend-api");
 });
 
-test("text-only Codex selects an allowed image companion on the same OAuth endpoint", () => {
-  const gateway = new PlatformGateway();
-  const sparkRequest = request({ provider: "openai-codex", id: "gpt-5.3-codex-spark" });
-  const companion = resolveAuxiliaryVisionModel(sparkRequest, gateway);
+test("text-only Codex selects the first account-authorized image companion from Pi metadata", async () => {
+  const catalogs = productModelCatalogs();
+  const imageModels = catalogs["openai-codex"].models.filter((model) => model.input.includes("image"));
+  assert.ok(imageModels.length > 1, "the locked Pi fixture must expose multiple image-capable Codex models");
+  const authorized = imageModels.at(-1);
+  assert.ok(authorized);
+  const attempts: string[] = [];
+  const gateway = {
+    token: async (candidateRequest: RunRequest) => {
+      attempts.push(candidateRequest.model.id);
+      return candidateRequest.model.id === authorized.id ? "authorized-model-token" : undefined;
+    },
+  } as unknown as PlatformGateway;
+  const textOnlyRequest = request({
+    provider: "openai-codex",
+    id: catalogModelId("openai-codex", (model) => !model.input.includes("image")),
+  });
+  const companion = await resolveAuxiliaryVisionModel(textOnlyRequest, gateway);
 
   assert.ok(companion);
-  assert.equal(companion.model.id, "gpt-5.4-mini");
+  assert.equal(companion.model.id, authorized.id);
+  assert.equal(companion.apiKey, "authorized-model-token");
+  assert.deepEqual(attempts, imageModels.map((model) => model.id));
   assert.equal(companion.model.provider, "openai-codex");
   assert.equal(companion.model.api, "openai-codex-responses");
   assert.equal(companion.model.baseUrl, "https://chatgpt.com/backend-api");
   assert.equal(modelSupportsImages(companion.model), true);
   assert.equal(
-    resolveAuxiliaryVisionModel(request({ provider: "openai-codex", id: "gpt-5.5" }), gateway),
+    await resolveAuxiliaryVisionModel(request({ provider: "openai-codex", id: imageModels[0]!.id }), gateway),
     undefined,
   );
 });
+
+test("text-only Codex has no auxiliary companion when the account authorizes no image model", async () => {
+  const attempted: string[] = [];
+  const gateway = {
+    token: async (candidateRequest: RunRequest) => {
+      attempted.push(candidateRequest.model.id);
+      return undefined;
+    },
+  } as unknown as PlatformGateway;
+  const textOnlyRequest = request({
+    provider: "openai-codex",
+    id: catalogModelId("openai-codex", (model) => !model.input.includes("image")),
+  });
+
+  assert.equal(await resolveAuxiliaryVisionModel(textOnlyRequest, gateway), undefined);
+  assert.deepEqual(
+    attempted,
+    productModelCatalogs()["openai-codex"].models
+      .filter((model) => model.input.includes("image"))
+      .map((model) => model.id),
+  );
+});
+
+test("xAI auxiliary authorization binds the product provider, candidate model, and original scope", async () => {
+  const textOnlyModelId = catalogModelId("xai-oauth", (model) => !model.input.includes("image"));
+  const imageModelId = catalogModelId("xai-oauth", (model) => model.input.includes("image"));
+  const seen: Array<{ provider: string; requestProvider: string; model: string; scopeKey: string }> = [];
+  const gateway = {
+    token: async (candidateRequest: RunRequest, provider: string) => {
+      seen.push({
+        provider,
+        requestProvider: candidateRequest.model.provider,
+        model: candidateRequest.model.id,
+        scopeKey: candidateRequest.scope_key,
+      });
+      return candidateRequest.model.id === imageModelId ? "xai-image-token" : undefined;
+    },
+  } as unknown as PlatformGateway;
+  const candidateRequest = request({ provider: "xai-oauth", id: textOnlyModelId });
+  candidateRequest.scope_key = "private:42";
+
+  const companion = await resolveAuxiliaryVisionModel(candidateRequest, gateway);
+
+  assert.ok(companion);
+  assert.equal(companion.model.id, imageModelId);
+  assert.equal(companion.apiKey, "xai-image-token");
+  assert.deepEqual(seen, [{
+    provider: "xai-oauth",
+    requestProvider: "xai-oauth",
+    model: imageModelId,
+    scopeKey: "private:42",
+  }]);
+  assert.notEqual(seen[0]?.model, textOnlyModelId, "the primary model authorization must not be reused");
+});
+
+function catalogModelId(
+  provider: "openai-codex" | "xai-oauth",
+  predicate: (model: ReturnType<typeof productModelCatalogs>[typeof provider]["models"][number]) => boolean = () => true,
+): string {
+  const model = productModelCatalogs()[provider].models.find(predicate);
+  assert.ok(model, `locked Pi catalog must include a matching ${provider} model`);
+  return model.id;
+}
 
 function request(model: ModelRequest): RunRequest {
   return {
