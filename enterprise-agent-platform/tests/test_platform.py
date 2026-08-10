@@ -4663,6 +4663,8 @@ class PlatformServiceTests(unittest.TestCase):
             entered = threading.Event()
             release = threading.Event()
             append_errors = []
+            delete_done = threading.Event()
+            delete_errors = []
             try:
                 _, admin = service.authenticate("admin", "admin")
                 original_store = service._store_attachments
@@ -4687,6 +4689,14 @@ class PlatformServiceTests(unittest.TestCase):
                     except BaseException as exc:
                         append_errors.append(exc)
 
+                def hide_message():
+                    try:
+                        service.delete_private_message(admin, admin["id"], message_id)
+                    except BaseException as exc:
+                        delete_errors.append(exc)
+                    finally:
+                        delete_done.set()
+
                 with mock.patch.object(service, "_store_attachments", side_effect=blocked_store):
                     append_thread = threading.Thread(target=append_message)
                     append_thread.start()
@@ -4694,18 +4704,17 @@ class PlatformServiceTests(unittest.TestCase):
                     message_id = int(
                         service.db.scalar("SELECT id FROM messages WHERE content = 'attachment race'")
                     )
-                    delete_thread = threading.Thread(
-                        target=service.delete_private_message,
-                        args=(admin, admin["id"], message_id),
-                    )
+                    delete_thread = threading.Thread(target=hide_message)
                     delete_thread.start()
-                    time.sleep(0.05)
+                    self.assertTrue(delete_done.wait(timeout=3))
+                    delete_thread.join(timeout=1)
                     self.assertFalse(delete_thread.is_alive())
                     release.set()
                     append_thread.join(timeout=3)
                     delete_thread.join(timeout=3)
 
                 self.assertEqual(append_errors, [])
+                self.assertEqual(delete_errors, [])
                 self.assertFalse(append_thread.is_alive())
                 self.assertFalse(delete_thread.is_alive())
                 self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 1)
