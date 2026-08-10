@@ -27,17 +27,40 @@
         background: white;
         font: 18px monospace;
       }
+      #drag-track {
+        position: fixed;
+        inset: 190px auto auto 24px;
+        width: 520px;
+        height: 56px;
+        border: 2px solid #7890be;
+        border-radius: 28px;
+        background: #dfe7f6;
+        touch-action: none;
+      }
+      #drag-handle {
+        position: absolute;
+        inset: 4px auto auto 4px;
+        width: 48px;
+        height: 48px;
+        border-radius: 50%;
+        background: #294d91;
+      }
     </style>
   </head>
   <body>
     <input id="human-control-input" aria-label="Human control input" autocomplete="off">
     <output id="human-control-state" role="status"></output>
+    <div id="drag-track" aria-label="Human control drag track">
+      <div id="drag-handle"></div>
+    </div>
     <script>
       const input = document.getElementById("human-control-input");
       const output = document.getElementById("human-control-state");
-      const state = { focus: 0, text: "empty", key: "none", scroll: 0 };
+      const track = document.getElementById("drag-track");
+      const handle = document.getElementById("drag-handle");
+      const state = { focus: 0, text: "empty", key: "none", scroll: 0, drag: 0, dragCount: 0, pointerDown: 0 };
       const render = () => {
-        output.textContent = `human-control-state focus=${state.focus};text=${state.text};key=${state.key};scroll=${state.scroll}`;
+        output.textContent = `human-control-state focus=${state.focus};text=${state.text};key=${state.key};scroll=${state.scroll};drag=${state.drag};drag_count=${state.dragCount};pointer_down=${state.pointerDown}`;
       };
       input.addEventListener("focus", () => { state.focus = 1; render(); });
       input.addEventListener("input", () => { state.text = input.value || "empty"; render(); });
@@ -52,6 +75,43 @@
         state.scroll = window.scrollY > 0 ? 1 : 0;
         render();
       }, { passive: true });
+      let dragging = false;
+      const moveHandle = (clientX) => {
+        const bounds = track.getBoundingClientRect();
+        const left = Math.max(4, Math.min(bounds.width - 52, clientX - bounds.left - 24));
+        handle.style.left = `${left}px`;
+        return left;
+      };
+      handle.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        dragging = true;
+        state.pointerDown = 1;
+        handle.setPointerCapture(event.pointerId);
+        moveHandle(event.clientX);
+        render();
+      });
+      handle.addEventListener("pointermove", (event) => {
+        if (!dragging) return;
+        moveHandle(event.clientX);
+      });
+      const finishDrag = (event) => {
+        if (!dragging) return;
+        const left = moveHandle(event.clientX);
+        dragging = false;
+        state.pointerDown = 0;
+        if (left >= 430) {
+          state.drag = 1;
+          state.dragCount += 1;
+        }
+        render();
+      };
+      handle.addEventListener("pointerup", finishDrag);
+      handle.addEventListener("pointercancel", (event) => {
+        if (!dragging) return;
+        dragging = false;
+        state.pointerDown = 0;
+        render();
+      });
       render();
     </script>
   </body>

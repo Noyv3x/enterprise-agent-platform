@@ -6,6 +6,7 @@ import type { AgentPreviewScope } from "../../types";
 import { Icon } from "../common/Icon";
 import { Spinner } from "../common/Spinner";
 import { BrowserPreviewView } from "./BrowserPreviewView";
+import { ChatPreviewContext } from "./ChatPreviewContext";
 import { TerminalPreviewView } from "./TerminalPreviewView";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 import "./preview.css";
@@ -42,14 +43,24 @@ export function ChatPreviewSidebar({
   const { t } = useI18n();
   const { state } = usePreviewAvailability(scope);
   const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
+  const [browserIntentPending, setBrowserIntentPending] = useState(false);
+  const [browserControlRequestId, setBrowserControlRequestId] = useState(0);
+  const [browserIntentScopeKey, setBrowserIntentScopeKey] = useState("");
   const memoryButton = useRef<HTMLButtonElement>(null);
   const skillsButton = useRef<HTMLButtonElement>(null);
   const tasksButton = useRef<HTMLButtonElement>(null);
   const browserButton = useRef<HTMLButtonElement>(null);
   const terminalButton = useRef<HTMLButtonElement>(null);
   const previousOpen = useRef<SidePanelKind | null>(null);
+  const browserControlSequence = useRef(0);
   const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
   const browserActive = !!scope && state.browserActive;
+  const browserIntentCurrent = Boolean(scopeKey) && browserIntentScopeKey === scopeKey;
+  const browserIntentVisible = browserIntentCurrent && browserIntentPending;
+  const browserVisible = browserActive || browserIntentVisible;
+  const currentBrowserControlRequestId = browserIntentCurrent
+    ? browserControlRequestId
+    : 0;
   const terminalCount = scope ? state.runningTerminalCount : 0;
   const terminalActive = terminalCount > 0;
   const memoryActive = scope?.scope_type === "private";
@@ -60,21 +71,33 @@ export function ChatPreviewSidebar({
     (openPreview === "memory" && memoryActive)
     || (openPreview === "skills" && skillsActive)
     || (openPreview === "tasks" && tasksActive)
-    || (openPreview === "browser" && browserActive)
+    || (openPreview === "browser" && browserVisible)
     || (openPreview === "terminal" && terminalActive)
   ) ? openPreview : null;
 
   useEffect(() => {
     setOpenPreview(null);
+    setBrowserIntentPending(false);
+    setBrowserControlRequestId(0);
+    setBrowserIntentScopeKey("");
+    browserControlSequence.current = 0;
   }, [scopeKey]);
 
   useEffect(() => {
-    if (openPreview === "browser" && !browserActive) setOpenPreview(null);
+    if (openPreview === "browser" && !browserVisible) {
+      setOpenPreview(null);
+      setBrowserControlRequestId(0);
+      setBrowserIntentScopeKey("");
+    }
     if (openPreview === "terminal" && !terminalActive) setOpenPreview(null);
     if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
     if (openPreview === "memory" && !memoryActive) setOpenPreview(null);
     if (openPreview === "skills" && !skillsActive) setOpenPreview(null);
-  }, [browserActive, memoryActive, openPreview, skillsActive, tasksActive, terminalActive]);
+  }, [browserVisible, memoryActive, openPreview, skillsActive, tasksActive, terminalActive]);
+
+  useEffect(() => {
+    if (browserActive && browserIntentVisible) setBrowserIntentPending(false);
+  }, [browserActive, browserIntentVisible]);
 
   useEffect(() => {
     const wasOpen = previousOpen.current;
@@ -95,7 +118,27 @@ export function ChatPreviewSidebar({
     });
   }, [openPreview]);
 
-  const closePreview = useCallback(() => setOpenPreview(null), []);
+  const closePreview = useCallback(() => {
+    setOpenPreview(null);
+    setBrowserIntentPending(false);
+    setBrowserControlRequestId(0);
+    setBrowserIntentScopeKey("");
+  }, []);
+
+  const openBrowserAssist = useCallback(() => {
+    const requestId = ++browserControlSequence.current;
+    setBrowserIntentPending(true);
+    setBrowserIntentScopeKey(scopeKey);
+    setOpenPreview("browser");
+    setBrowserControlRequestId(requestId);
+  }, [scopeKey]);
+
+  const togglePreview = useCallback((kind: SidePanelKind) => {
+    setOpenPreview((current) => current === kind ? null : kind);
+    setBrowserIntentPending(false);
+    setBrowserControlRequestId(0);
+    setBrowserIntentScopeKey("");
+  }, []);
 
   useEffect(() => {
     if (!openPreview) return;
@@ -183,12 +226,25 @@ export function ChatPreviewSidebar({
         </Suspense>
       );
     }
-    return visiblePreview === "browser" ? <BrowserPreviewView scope={scope} /> : <TerminalPreviewView scope={scope} />;
-  }, [canManageSkills, scope, t, visiblePreview]);
+    return visiblePreview === "browser" ? (
+      <BrowserPreviewView
+        scope={scope}
+        controlRequestId={currentBrowserControlRequestId || undefined}
+      />
+    ) : <TerminalPreviewView scope={scope} />;
+  }, [canManageSkills, currentBrowserControlRequestId, scope, t, visiblePreview]);
+
+  const previewContext = useMemo(() => ({
+    scope,
+    browserDrawerOpen: visiblePreview === "browser",
+    openBrowserAssist,
+  }), [openBrowserAssist, scope, visiblePreview]);
 
   return (
     <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
-      <div className="chat">{children}</div>
+      <ChatPreviewContext.Provider value={previewContext}>
+        <div className="chat">{children}</div>
+      </ChatPreviewContext.Provider>
       {hasPreviews ? (
         <nav className="chat-preview__rail" aria-label={t("preview.sidebarLabel")}>
           {memoryActive ? (
@@ -202,7 +258,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "memory"}
                 icon={<Icon name="library" size={19} />}
-                onClick={() => setOpenPreview((current) => current === "memory" ? null : "memory")}
+                onClick={() => togglePreview("memory")}
               />
             </Tooltip>
           ) : null}
@@ -217,7 +273,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "skills"}
                 icon={<Icon name="sparkles" size={19} />}
-                onClick={() => setOpenPreview((current) => current === "skills" ? null : "skills")}
+                onClick={() => togglePreview("skills")}
               />
             </Tooltip>
           ) : null}
@@ -232,7 +288,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "tasks"}
                 icon={<Icon name="calendar" size={19} />}
-                onClick={() => setOpenPreview((current) => current === "tasks" ? null : "tasks")}
+                onClick={() => togglePreview("tasks")}
               />
             </Tooltip>
           ) : null}
@@ -251,7 +307,7 @@ export function ChatPreviewSidebar({
                     <Icon name="browser" size={19} />
                   </Badge>
                 )}
-                onClick={() => setOpenPreview((current) => current === "browser" ? null : "browser")}
+                onClick={() => togglePreview("browser")}
               />
             </Tooltip>
           ) : null}
@@ -275,7 +331,7 @@ export function ChatPreviewSidebar({
                     <Icon name="terminal" size={19} />
                   </Badge>
                 )}
-                onClick={() => setOpenPreview((current) => current === "terminal" ? null : "terminal")}
+                onClick={() => togglePreview("terminal")}
               />
             </Tooltip>
           ) : null}

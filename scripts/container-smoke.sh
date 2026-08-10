@@ -578,6 +578,20 @@ release_workflow=.github/workflows/container-release.yml
   || fail "a second release-promotion implementation remains"
 
 for expected in \
+  'send(1, "drag", points=drag_points)' \
+  '"duplicate") is True' \
+  '"drag_count=1"' \
+  '"pointer_down=0"' \
+  'X-Preview-Refresh-Ms'; do
+  grep -Fq "$expected" scripts/browser-control-compose-smoke.py \
+    || fail "browser control Compose smoke is missing: $expected"
+done
+grep -Fq 'handle.addEventListener("pointerdown"' scripts/fixtures/browser-control.html \
+  || fail "browser control fixture no longer exercises a real pointer drag"
+grep -Fq "app.post('/tabs/:tabId/pointer'" enterprise-agent-platform/camofox-runtime/patch-runtime.cjs \
+  || fail "Camoufox patch is missing the atomic pointer endpoint"
+
+for expected in \
   'python3 scripts/browser-control-compose-smoke.py' \
   'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
   'group: container-channel-main' \

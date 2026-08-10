@@ -175,7 +175,7 @@ Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会
 
 `sylver_platform` Gateway 只接受 canonical private scope，并从当前 lifecycle、活动账号和私人 Agent 权限推导连接 owner。Runtime schema 与 Python dispatcher 使用同一个闭世界 action 集：读取 `whoami|projects|project|project_context|tasks|task|task_activity|wiki_list|wiki_read|approvals|approval|approval_comments|notifications`；写入 `create_task|start_task|add_task_activity|propose_wiki|comment_approval`。`tasks.assigned_to_me` 和 `notifications.unread_only` 缺省均为 `true`，显式 `false` 才读取相应全集；`approvals.box` 缺省为 `inbox`。`create_task` 必须包含非空唯一 `tag_ids`、起止日期，以及必填的 `milestone_id`；后者为正整数时选择真实里程碑，为 `null` 时表示用户明确确认跳过，description 若存在则必须是首行摘要和后续 `- ` 要点。其 Python 复合动作根据项目 workflow 是否存在唯一 `proposed` category 决定省略 status 走提案闸，否则只允许唯一 `backlog` status；`proposal_approver_id` 只允许用于前一条提案路径。`start_task.note`、`propose_wiki.content_format` 和 `propose_wiki.order` 都是显式必填参数，避免审批内容与实际写请求出现隐藏默认值。模型参数不得包含 base URL、Token、HTTP method/path/header、owner 或 scope。全部写动作要求本次审批和 `tool_call_id`，unattended context 直接拒绝；原始完整参数在脱敏前超过 16 KiB 或含不可见控制字符时在调用前失败关闭，脱敏展示也不得超限。审批决定、跳过审查、强制完成、员工管理、通用 REST 和删除动作没有协议表示。
 
-浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API申请当前 scope/tab 的短期租约并发送限幅输入；Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
+浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API 申请当前 scope/tab 的短期租约并发送限幅输入；连续拖拽只接受有界、单调计时的 `down → move[] → up` 完整轨迹，Camoufox 在异常路径保证最终抬键。Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
 
 ## 协议演进
 

@@ -198,6 +198,12 @@ export function hasAgentProcessSteps(work: Work | null | undefined): boolean {
   return compactAgentProcessSteps(work).length > 0;
 }
 
+export function hasAgentBrowserStep(work: Work | null | undefined): boolean {
+  return compactAgentProcessSteps(work).some((step) =>
+    String(step?.tool || step?.label || "").trim().toLowerCase() === "browser",
+  );
+}
+
 function agentWorkTitle(work: Work | null | undefined, translate: Translator): string {
   if (work?.state === "error") return translate("chat.work.failed");
   return translate("chat.work.view");

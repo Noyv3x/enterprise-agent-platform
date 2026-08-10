@@ -144,7 +144,9 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 浏览器接管与局域网
 
-浏览器人工接管使用当前 scope/tab 的短期租约。服务端从登录身份重新派生 scope 与 Camoufox user identity，客户端不能提供 user id、selector、脚本或任意内部 URL；只接受限幅后的鼠标、滚动、文本和按键动作。同一 root scope 的租约取得/释放、人工输入与 Agent 变更型动作共享串行操作门，互斥范围覆盖真实 Camoufox 调用，不能留下“Agent 已检查无租约、人工随后取得租约、两者同时修改页面”的窗口。租约期间 Agent 的变更型浏览器工具返回可重试冲突。发送会触发 Agent 的新消息时，前端先等待本地接管队列收敛，Platform 再在同一操作门内、入队前只撤销发送者本人持有的对应 root scope 租约；不能撤销其他用户租约，也不能让不触发 Agent 的普通频道消息取得该能力。结束、失焦、页面隐藏、过期、tab 变化、409 冲突或 tab 关闭后客户端立即降为只读并尽力释放，服务端到期与 scope cleanup 负责最终回收。共享 X display 不能直接暴露为 noVNC/VNC，因为那会跨 scope 泄露页面。
+浏览器人工接管使用当前 scope/tab 的短期租约。服务端从登录身份重新派生 scope 与 Camoufox user identity，客户端不能提供 user id、selector、脚本或任意内部 URL；只接受限幅后的鼠标轨迹、滚动、文本和按键动作。拖拽轨迹必须具有有界点数、总时长、单调相对时间与 CSS 坐标，作为一个 sequence 原子验证并执行；重复 sequence 不得重放，异常执行必须最终 `mouse.up`。同一 root scope 的租约取得/释放、人工输入与 Agent 变更型动作共享串行操作门，互斥范围覆盖真实 Camoufox 调用，不能留下“Agent 已检查无租约、人工随后取得租约、两者同时修改页面”的窗口。租约期间 Agent 的变更型浏览器工具返回可重试冲突。
+
+发送会触发 Agent 的新消息时，前端先等待本地接管队列收敛，Platform 再在同一操作门内、入队前只撤销发送者本人持有的对应 root scope 租约；不能撤销其他用户租约，也不能让不触发 Agent 的普通频道消息取得该能力。结束、失焦、页面隐藏、过期、tab 变化、409 冲突或 tab 关闭后客户端立即降为只读并尽力取消/释放，服务端到期与 scope cleanup 负责最终回收。接管画面继续通过逐请求鉴权、维护闸和大小限制的同源二进制 GET 获取，不增加绕过 Manager 的长连接入口。共享 X display 不能直接暴露为 noVNC/VNC，因为那会跨 scope 泄露页面。
 
 局域网入口默认关闭，只能绑定明确的私网或回环 IP，拒绝通配和公网 IP。启用时 Manager 以真实 `RemoteAddr` 和显式 CIDR 判断准入，丢弃非可信来源携带的 `Forwarded`/`X-Forwarded-*` 并自行重建；不能用客户端头判断来源。推荐局域网 DNS/TLS 反代到 Manager 回环入口，以维持 Secure Cookie、Web Notification 和统一 Origin/CSRF 语义。若管理员明确启用明文局域网入口，界面必须显示风险且浏览器不声称支持需要 secure context 的通知能力。
 

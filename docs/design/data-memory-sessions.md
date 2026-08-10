@@ -22,6 +22,8 @@ Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base UR
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
+浏览器预览帧缓存、人工接管租约与输入 sequence 都是 Platform/Camoufox 进程内的短期协调状态，不写入 SQLite、Runtime session、workspace、消息或备份。Platform 重启使租约失效；完整拖拽在单次 Camoufox tab lock 内以 `finally` 抬键，因此不需要通过持久数据恢复半个指针手势。
+
 ## Agent scope
 
 规范私人 scope 为 `private:<user-id>`，频道主 Agent scope 为 `channel:<channel-id>:main-agent`。`agent_scopes.lifecycle_id` 属于稳定 logical scope 元数据；`agent_runtime_scopes.lifecycle_id` 与 session 属于当前 conversation runtime，可以独立轮换，二者没有相等关系。scope 保存稳定的相对 workspace 标识和不可由模型覆盖的主 Agent sandbox identity；workspace marker 绑定 logical scope 的 key/type/id、sandbox/workspace identity 与当前 Runtime lifecycle，而不是 logical scope lifecycle。历史 Runtime lifecycle/session 由 alias 表保留。委派 scope 继承父 sandbox identity，不建立新的工作目录。当前架构只有 Sandbox 执行路径，因此数据库和 workspace marker 不保存可选择的执行后端字段。

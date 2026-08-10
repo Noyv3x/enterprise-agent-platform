@@ -346,12 +346,17 @@ SESSION_SEARCH_MESSAGE_MAX_CHARACTERS = 4_000
 SESSION_SEARCH_RESPONSE_MAX_CHARACTERS = 48_000
 SESSION_SEARCH_CONTENT_BUDGET = 16_000
 SESSION_SEARCH_MIN_MESSAGE_CHARACTERS = 128
-# Browser preview is deliberately a low-frame-rate polling surface.  A short
-# per-tab cache prevents several open dashboards from taking duplicate
-# screenshots, while the hard entry cap keeps abandoned delegate scopes from
-# becoming an unbounded in-memory registry.
+# Browser preview remains low-rate until the authenticated lease owner is
+# actively assisting a tab.  Control mode uses a shorter cache and lower JPEG
+# quality so pointer feedback improves without turning idle dashboards into a
+# high-bandwidth stream.  The hard entry cap keeps abandoned delegate scopes
+# from becoming an unbounded in-memory registry.
 BROWSER_PREVIEW_REFRESH_MS = 2000
 BROWSER_PREVIEW_MIN_CAPTURE_SECONDS = 1.5
+BROWSER_CONTROL_PREVIEW_REFRESH_MS = 250
+BROWSER_CONTROL_PREVIEW_MIN_CAPTURE_SECONDS = 0.2
+BROWSER_PREVIEW_JPEG_QUALITY = 65
+BROWSER_CONTROL_PREVIEW_JPEG_QUALITY = 55
 MAX_BROWSER_PREVIEW_CACHE_ENTRIES = 128
 MAX_BROWSER_PREVIEW_CACHE_BYTES = 32 * 1024 * 1024
 MAX_BROWSER_PREVIEW_FAMILY_SCOPES = 64
@@ -359,6 +364,9 @@ MAX_BROWSER_PREVIEW_DIMENSION = 16_384
 MAX_BROWSER_PREVIEW_PIXELS = 50_000_000
 BROWSER_CONTROL_LEASE_SECONDS = 90.0
 MAX_BROWSER_CONTROL_TEXT = 4096
+MIN_BROWSER_CONTROL_DRAG_POINTS = 2
+MAX_BROWSER_CONTROL_DRAG_POINTS = 64
+MAX_BROWSER_CONTROL_DRAG_DURATION_MS = 10_000
 TERMINAL_PREVIEW_REVISION_RE = re.compile(
     r"preview_[A-Za-z0-9._-]{1,96}:\d{1,20}"
 )
@@ -10756,6 +10764,152 @@ class EnterpriseService:
                 root_scope_key=root_scope_key,
             )
 
+    @staticmethod
+    def _validated_browser_control_input(
+        body: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Validate and normalize one input before its sequence is consumed."""
+
+        action = str(body.get("action") or "").strip().lower()
+        common_fields = {
+            "command",
+            "scope_type",
+            "scope_id",
+            "tab_id",
+            "lease_id",
+            "sequence",
+            "action",
+        }
+        action_fields = {
+            "click": {"x", "y"},
+            "double_click": {"x", "y"},
+            "drag": {"points"},
+            "text": {"text"},
+            "key": {"key"},
+            "wheel": {"delta_x", "delta_y"},
+            "back": set(),
+            "forward": set(),
+            "refresh": set(),
+        }
+        expected_fields = action_fields.get(action)
+        if expected_fields is None:
+            raise ServiceError(400, "unsupported browser input action")
+        if set(body) - common_fields - expected_fields:
+            raise ServiceError(400, "browser input contains unsupported fields")
+
+        if action in {"click", "double_click"}:
+            if isinstance(body.get("x"), bool) or isinstance(body.get("y"), bool):
+                raise ServiceError(400, "browser click coordinates are invalid")
+            try:
+                x = float(body.get("x"))
+                y = float(body.get("y"))
+            except (TypeError, ValueError) as exc:
+                raise ServiceError(400, "browser click coordinates are invalid") from exc
+            if (
+                not math.isfinite(x)
+                or not math.isfinite(y)
+                or x < 0
+                or y < 0
+                or x > MAX_BROWSER_PREVIEW_DIMENSION
+                or y > MAX_BROWSER_PREVIEW_DIMENSION
+            ):
+                raise ServiceError(400, "browser click coordinates are out of range")
+            return action, {
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "doubleClick": action == "double_click",
+            }
+
+        if action == "drag":
+            raw_points = body.get("points")
+            if not isinstance(raw_points, list) or not (
+                MIN_BROWSER_CONTROL_DRAG_POINTS
+                <= len(raw_points)
+                <= MAX_BROWSER_CONTROL_DRAG_POINTS
+            ):
+                raise ServiceError(400, "browser drag point count is invalid")
+            points: list[dict[str, Any]] = []
+            previous_at_ms = -1
+            for index, raw_point in enumerate(raw_points):
+                if not isinstance(raw_point, dict) or set(raw_point) != {
+                    "x",
+                    "y",
+                    "at_ms",
+                }:
+                    raise ServiceError(400, "browser drag point is invalid")
+                try:
+                    if isinstance(raw_point.get("x"), bool) or isinstance(
+                        raw_point.get("y"), bool
+                    ):
+                        raise TypeError("boolean coordinate")
+                    x = float(raw_point.get("x"))
+                    y = float(raw_point.get("y"))
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(400, "browser drag coordinates are invalid") from exc
+                at_ms = raw_point.get("at_ms")
+                if isinstance(at_ms, bool) or not isinstance(at_ms, int):
+                    raise ServiceError(400, "browser drag timing is invalid")
+                if (
+                    not math.isfinite(x)
+                    or not math.isfinite(y)
+                    or x < 0
+                    or y < 0
+                    or x > MAX_BROWSER_PREVIEW_DIMENSION
+                    or y > MAX_BROWSER_PREVIEW_DIMENSION
+                ):
+                    raise ServiceError(400, "browser drag coordinates are out of range")
+                if (
+                    (index == 0 and at_ms != 0)
+                    or (index > 0 and at_ms <= previous_at_ms)
+                    or at_ms > MAX_BROWSER_CONTROL_DRAG_DURATION_MS
+                ):
+                    raise ServiceError(400, "browser drag timing is invalid")
+                points.append(
+                    {"x": round(x, 2), "y": round(y, 2), "at_ms": at_ms}
+                )
+                previous_at_ms = at_ms
+            return action, {"points": points}
+
+        if action == "text":
+            text = body.get("text")
+            if (
+                not isinstance(text, str)
+                or not text
+                or len(text) > MAX_BROWSER_CONTROL_TEXT
+                or "\x00" in text
+            ):
+                raise ServiceError(400, "browser input text is invalid")
+            return action, {"text": text}
+
+        if action == "key":
+            key = str(body.get("key") or "").strip()
+            allowed_keys = {
+                "Enter", "Tab", "Escape", "Backspace", "Delete", "Space",
+                "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                "Home", "End", "PageUp", "PageDown",
+            }
+            if key not in allowed_keys:
+                raise ServiceError(400, "browser key is not allowed")
+            return action, {"key": key}
+
+        if action == "wheel":
+            raw_delta_x = body.get("delta_x", 0)
+            raw_delta_y = body.get("delta_y", 0)
+            if (
+                isinstance(raw_delta_x, bool)
+                or isinstance(raw_delta_y, bool)
+                or not isinstance(raw_delta_x, int)
+                or not isinstance(raw_delta_y, int)
+            ):
+                raise ServiceError(400, "browser wheel delta is invalid")
+            delta_x = max(-4000, min(4000, raw_delta_x))
+            delta_y = max(-4000, min(4000, raw_delta_y))
+            if delta_x == 0 and delta_y == 0:
+                raise ServiceError(400, "browser wheel delta is required")
+            return action, {"delta_x": delta_x, "delta_y": delta_y}
+
+        return action, {}
+
     def _browser_preview_control_serialized(
         self,
         actor: dict[str, Any],
@@ -10768,6 +10922,15 @@ class EnterpriseService:
         command = str(body.get("command") or "").strip().lower()
         scope_type = str(body.get("scope_type") or "").strip().lower()
         scope_id = str(body.get("scope_id") or "").strip()
+        if command in {"acquire", "release"}:
+            allowed_fields = {"command", "scope_type", "scope_id", "tab_id"}
+            if command == "release":
+                allowed_fields.add("lease_id")
+            if set(body) - allowed_fields:
+                raise ServiceError(
+                    400,
+                    "browser control command contains unsupported fields",
+                )
         tab_id = str(body.get("tab_id") or "").strip()
         if (
             not tab_id
@@ -10775,6 +10938,19 @@ class EnterpriseService:
             or any(character in tab_id for character in "\r\n\x00")
         ):
             raise ServiceError(400, "valid browser tab_id is required")
+        sequence = 0
+        action = ""
+        action_payload: dict[str, Any] = {}
+        if command == "input":
+            raw_sequence = body.get("sequence")
+            if isinstance(raw_sequence, bool) or not isinstance(
+                raw_sequence, int
+            ):
+                raise ServiceError(400, "browser input sequence is invalid")
+            sequence = raw_sequence
+            if sequence <= 0:
+                raise ServiceError(400, "browser input sequence is invalid")
+            action, action_payload = self._validated_browser_control_input(body)
         actor_id = int(actor["id"])
         lease_key = (root_scope_key, tab_id)
         now = time.monotonic()
@@ -10796,7 +10972,14 @@ class EnterpriseService:
                         409,
                         "browser assistance lease is missing or expired",
                     )
+                selected_scope_key = str(
+                    current.get("selected_scope_key") or ""
+                )
                 self._browser_control_leases.pop(lease_key, None)
+                if selected_scope_key:
+                    self._agent_browser_drop_preview_cache_unlocked(
+                        selected_scope_key
+                    )
             return {"active": False, "released": True, "tab_id": tab_id}
 
         (
@@ -10828,6 +11011,9 @@ class EnterpriseService:
                     "last_sequence": 0,
                     "expires_at": now + BROWSER_CONTROL_LEASE_SECONDS,
                 }
+                self._agent_browser_drop_preview_cache_unlocked(
+                    selected_scope_key
+                )
                 return {
                     "active": True,
                     "lease_id": token,
@@ -10843,12 +11029,6 @@ class EnterpriseService:
             ):
                 raise ServiceError(409, "browser assistance lease is missing or expired")
 
-            try:
-                sequence = int(body.get("sequence"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "browser input sequence is invalid") from exc
-            if sequence <= 0:
-                raise ServiceError(400, "browser input sequence is invalid")
             if sequence <= int(current.get("last_sequence") or 0):
                 return {
                     "ok": True,
@@ -10867,75 +11047,60 @@ class EnterpriseService:
             current["last_sequence"] = sequence
             current["expires_at"] = now + BROWSER_CONTROL_LEASE_SECONDS
 
-        action = str(body.get("action") or "").strip().lower()
         encoded_tab_id = urllib.parse.quote(tab_id, safe="")
         endpoint = f"{base_url}/tabs/{encoded_tab_id}"
         result: dict[str, Any]
         if action in {"click", "double_click"}:
-            try:
-                x = float(body.get("x"))
-                y = float(body.get("y"))
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "browser click coordinates are invalid") from exc
-            if (
-                not math.isfinite(x)
-                or not math.isfinite(y)
-                or x < 0
-                or y < 0
-                or x > MAX_BROWSER_PREVIEW_DIMENSION
-                or y > MAX_BROWSER_PREVIEW_DIMENSION
-            ):
-                raise ServiceError(400, "browser click coordinates are out of range")
             result = self._runtime_json_request(
                 endpoint + "/click",
                 {
                     "userId": user_id,
-                    "x": round(x, 2),
-                    "y": round(y, 2),
-                    "doubleClick": action == "double_click",
+                    **action_payload,
+                },
+                headers=headers,
+                timeout=30,
+            )
+        elif action == "drag":
+            result = self._runtime_json_request(
+                endpoint + "/pointer",
+                {
+                    "userId": user_id,
+                    "action": action,
+                    **action_payload,
                 },
                 headers=headers,
                 timeout=30,
             )
         elif action == "text":
-            text = str(body.get("text") or "")
-            if not text or len(text) > MAX_BROWSER_CONTROL_TEXT or "\x00" in text:
-                raise ServiceError(400, "browser input text is invalid")
             result = self._runtime_json_request(
                 endpoint + "/type",
-                {"userId": user_id, "text": text, "mode": "keyboard", "delay": 15},
+                {
+                    "userId": user_id,
+                    "text": action_payload["text"],
+                    "mode": "keyboard",
+                    "delay": 15,
+                },
                 headers=headers,
                 timeout=30,
             )
         elif action == "key":
-            key = str(body.get("key") or "").strip()
-            allowed_keys = {
-                "Enter", "Tab", "Escape", "Backspace", "Delete", "Space",
-                "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
-                "Home", "End", "PageUp", "PageDown",
-            }
-            if key not in allowed_keys:
-                raise ServiceError(400, "browser key is not allowed")
             result = self._runtime_json_request(
                 endpoint + "/press",
-                {"userId": user_id, "key": key},
+                {"userId": user_id, "key": action_payload["key"]},
                 headers=headers,
                 timeout=30,
             )
         elif action == "wheel":
-            try:
-                delta_x = int(body.get("delta_x") or 0)
-                delta_y = int(body.get("delta_y") or 0)
-            except (TypeError, ValueError) as exc:
-                raise ServiceError(400, "browser wheel delta is invalid") from exc
-            delta_x = max(-4000, min(4000, delta_x))
-            delta_y = max(-4000, min(4000, delta_y))
-            if delta_x == 0 and delta_y == 0:
-                raise ServiceError(400, "browser wheel delta is required")
             result = {"ok": True}
             for direction, amount in (
-                (("down" if delta_y > 0 else "up"), abs(delta_y)),
-                (("right" if delta_x > 0 else "left"), abs(delta_x)),
+                (
+                    ("down" if action_payload["delta_y"] > 0 else "up"),
+                    abs(action_payload["delta_y"]),
+                ),
+                (
+                    ("right" if action_payload["delta_x"] > 0 else "left"),
+                    abs(action_payload["delta_x"]),
+                ),
             ):
                 if amount:
                     result = self._runtime_json_request(
@@ -11206,6 +11371,21 @@ class EnterpriseService:
 
         selected_scope_key, user_id, tabs, selected_tab = selected
         selected_tab_id = str(selected_tab["tabId"])
+        with self._agent_browser_tabs_lock:
+            self._expire_browser_control_leases_unlocked()
+            active_lease = self._browser_control_leases.get(
+                (root_scope_key, selected_tab_id)
+            )
+            control_active = bool(
+                active_lease is not None
+                and int(active_lease.get("owner_user_id") or 0)
+                == int(actor["id"])
+            )
+        refresh_interval_ms = (
+            BROWSER_CONTROL_PREVIEW_REFRESH_MS
+            if control_active
+            else BROWSER_PREVIEW_REFRESH_MS
+        )
         if metadata_only:
             session = (
                 "main"
@@ -11229,7 +11409,7 @@ class EnterpriseService:
                 "tab_id": selected_tab_id,
                 "tab_count": len(tabs),
                 "session": session,
-                "refresh_interval_ms": BROWSER_PREVIEW_REFRESH_MS,
+                "refresh_interval_ms": refresh_interval_ms,
                 "etag": f'"metadata-{digest[:32]}"',
             }
         return self._capture_browser_preview_frame(
@@ -11241,6 +11421,7 @@ class EnterpriseService:
             user_id=user_id,
             base_url=base_url,
             headers=headers,
+            control_active=control_active,
         )
 
     def _capture_browser_preview_frame(
@@ -11254,16 +11435,34 @@ class EnterpriseService:
         user_id: str,
         base_url: str,
         headers: dict[str, str],
+        control_active: bool = False,
     ) -> dict[str, Any]:
         cache_key = (selected_scope_key, selected_tab_id)
+        refresh_interval_ms = (
+            BROWSER_CONTROL_PREVIEW_REFRESH_MS
+            if control_active
+            else BROWSER_PREVIEW_REFRESH_MS
+        )
+        minimum_capture_seconds = (
+            BROWSER_CONTROL_PREVIEW_MIN_CAPTURE_SECONDS
+            if control_active
+            else BROWSER_PREVIEW_MIN_CAPTURE_SECONDS
+        )
+        jpeg_quality = (
+            BROWSER_CONTROL_PREVIEW_JPEG_QUALITY
+            if control_active
+            else BROWSER_PREVIEW_JPEG_QUALITY
+        )
 
         def cache_idle(reason: str) -> dict[str, Any]:
             # A failing local browser can otherwise make every dashboard waiter
             # repeat the same slow screenshot attempt after acquiring this tab's
             # capture stripe. Cache the bounded idle result for the same short
-            # interval as a successful frame so concurrent observers collapse to
-            # one failure without hiding recovery for more than 1.5 seconds.
+            # mode-specific interval as a successful frame so concurrent
+            # observers collapse to one failure without delaying control-mode
+            # recovery behind the normal 1.5-second cache.
             frame = self._browser_preview_idle(reason)
+            frame["refresh_interval_ms"] = refresh_interval_ms
             with self._agent_browser_tabs_lock:
                 self._browser_preview_cache_put_unlocked(
                     cache_key,
@@ -11284,10 +11483,12 @@ class EnterpriseService:
                 cached = self._browser_preview_cache.get(cache_key)
                 if cached is not None and (
                     monotonic_now - float(cached.get("captured_monotonic") or 0.0)
-                    < BROWSER_PREVIEW_MIN_CAPTURE_SECONDS
+                    < minimum_capture_seconds
                 ):
                     self._browser_preview_cache.move_to_end(cache_key)
-                    return dict(cached["frame"])
+                    frame = dict(cached["frame"])
+                    frame["refresh_interval_ms"] = refresh_interval_ms
+                    return frame
 
             encoded_tab_id = urllib.parse.quote(selected_tab_id, safe="")
             query = urllib.parse.urlencode(
@@ -11295,7 +11496,7 @@ class EnterpriseService:
                     "userId": user_id,
                     "fullPage": "false",
                     "format": "jpeg",
-                    "quality": "65",
+                    "quality": str(jpeg_quality),
                 }
             )
             try:
@@ -11405,7 +11606,7 @@ class EnterpriseService:
                 "title": title,
                 "width": width,
                 "height": height,
-                "refresh_interval_ms": BROWSER_PREVIEW_REFRESH_MS,
+                "refresh_interval_ms": refresh_interval_ms,
             }
             with self._agent_browser_tabs_lock:
                 self._browser_preview_cache_put_unlocked(

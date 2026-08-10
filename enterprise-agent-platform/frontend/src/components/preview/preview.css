@@ -324,6 +324,7 @@
 
 .browser-preview__screen.is-controlling {
   cursor: crosshair;
+  touch-action: none;
   outline: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
   outline-offset: -2px;
 }
@@ -377,6 +378,30 @@
   inset: 0;
   z-index: 1;
   cursor: default;
+}
+
+.browser-preview__pointer-feedback {
+  position: absolute;
+  z-index: 3;
+  left: var(--pointer-left);
+  top: var(--pointer-top);
+  width: 16px;
+  height: 16px;
+  border: 2px solid white;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 78%, transparent);
+  box-shadow: 0 0 0 3px rgb(10 15 25 / 42%), 0 4px 12px rgb(0 0 0 / 36%);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.browser-preview__pointer-feedback.is-dragging {
+  width: 20px;
+  height: 20px;
+  background: color-mix(in srgb, var(--accent) 88%, white 12%);
+  box-shadow:
+    0 0 0 5px color-mix(in srgb, var(--accent) 28%, transparent),
+    0 4px 14px rgb(0 0 0 / 42%);
 }
 
 .browser-preview__meta {

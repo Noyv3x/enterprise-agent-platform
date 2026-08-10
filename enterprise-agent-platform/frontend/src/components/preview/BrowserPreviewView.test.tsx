@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { ApiError } from "../../lib/api";
@@ -37,12 +38,55 @@ vi.mock("../../data/previewActions", () => ({
   sendBrowserControlInput: mocks.send,
 }));
 
-function renderPreview() {
+function renderPreview(controlRequestId?: number) {
   return render(
     <I18nProvider>
-      <BrowserPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
+      <BrowserPreviewView
+        scope={{ scope_type: "private", scope_id: "7" }}
+        controlRequestId={controlRequestId}
+      />
     </I18nProvider>,
   );
+}
+
+function pointerEvent(type: string, values: Record<string, unknown>): Event {
+  const event = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: Number(values.clientX || 0),
+    clientY: Number(values.clientY || 0),
+  });
+  for (const [key, value] of Object.entries(values)) {
+    Object.defineProperty(event, key, { configurable: true, value });
+  }
+  return event;
+}
+
+async function preparePointerSurface(): Promise<HTMLElement> {
+  const surface = await screen.findByRole("application");
+  const image = screen.getByRole("img", { name: "Latest Agent browser frame" });
+  Object.defineProperties(image, {
+    naturalWidth: { configurable: true, value: 1_000 },
+    naturalHeight: { configurable: true, value: 500 },
+  });
+  image.getBoundingClientRect = () => ({
+    bottom: 250,
+    height: 250,
+    left: 0,
+    right: 500,
+    top: 0,
+    width: 500,
+    x: 0,
+    y: 0,
+    toJSON: () => ({}),
+  });
+  surface.getBoundingClientRect = image.getBoundingClientRect;
+  Object.assign(surface, {
+    hasPointerCapture: vi.fn(() => true),
+    releasePointerCapture: vi.fn(),
+    setPointerCapture: vi.fn(),
+  });
+  return surface;
 }
 
 describe("BrowserPreviewView", () => {
@@ -92,6 +136,90 @@ describe("BrowserPreviewView", () => {
 
     expect(screen.getByText("Browser is not running")).toBeVisible();
     expect(screen.queryByText("Loading browser view")).not.toBeInTheDocument();
+  });
+
+  it("keeps an explicit work-record handoff loading until a tab appears", () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "idle";
+    renderPreview(1);
+
+    expect(screen.getByText("Loading browser view")).toBeVisible();
+    expect(screen.queryByText("Browser is not running")).not.toBeInTheDocument();
+    expect(mocks.acquire).not.toHaveBeenCalled();
+  });
+
+  it("expires a quick-control handoff without acquiring a browser that appears later", async () => {
+    vi.useFakeTimers();
+    mocks.state.connection = "connected";
+    mocks.state.activity = "idle";
+    const view = renderPreview(1);
+
+    act(() => vi.advanceTimersByTime(15_000));
+    expect(screen.getByText("Browser is not running")).toBeVisible();
+
+    Object.assign(mocks.state, {
+      activity: "live",
+      frameUrl: "blob:late-frame",
+      tabId: "tab-1",
+    });
+    view.rerender(
+      <I18nProvider>
+        <BrowserPreviewView
+          scope={{ scope_type: "private", scope_id: "7" }}
+          controlRequestId={1}
+        />
+      </I18nProvider>,
+    );
+    await act(async () => { await Promise.resolve(); });
+
+    expect(mocks.acquire).not.toHaveBeenCalled();
+    expect(screen.getByText("Read only")).toBeVisible();
+  });
+
+  it("consumes each positive quick-control request once and ignores the normal rail", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+
+    const normal = renderPreview();
+    await Promise.resolve();
+    expect(mocks.acquire).not.toHaveBeenCalled();
+    normal.unmount();
+
+    const assisted = renderPreview(1);
+    await waitFor(() => expect(mocks.acquire).toHaveBeenCalledTimes(1));
+    assisted.rerender(
+      <I18nProvider>
+        <BrowserPreviewView
+          scope={{ scope_type: "private", scope_id: "7" }}
+          controlRequestId={1}
+        />
+      </I18nProvider>,
+    );
+    await Promise.resolve();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps quick control single-shot through the StrictMode effect probe", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+
+    render(
+      <StrictMode>
+        <I18nProvider>
+          <BrowserPreviewView
+            scope={{ scope_type: "private", scope_id: "7" }}
+            controlRequestId={1}
+          />
+        </I18nProvider>
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(mocks.acquire).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("Human assistance")).toBeVisible();
   });
 
   it("keeps the retry state distinct from a stopped browser after an initial error", () => {
@@ -157,6 +285,142 @@ describe("BrowserPreviewView", () => {
     await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(2));
     expect(mocks.send.mock.calls[1][1]).toBe("tab-1");
     expect(mocks.send.mock.calls[1][3]).toBe(2);
+  });
+
+  it("captures a pointer trajectory and submits it as one bounded drag", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    const user = userEvent.setup();
+    renderPreview();
+
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    const surface = await preparePointerSurface();
+
+    fireEvent(surface, pointerEvent("pointerdown", {
+      button: 0,
+      clientX: 50,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 7,
+      pointerType: "mouse",
+    }));
+    fireEvent(surface, pointerEvent("pointermove", {
+      clientX: 150,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 7,
+      pointerType: "mouse",
+    }));
+    fireEvent(surface, pointerEvent("pointerup", {
+      button: 0,
+      clientX: 250,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 7,
+      pointerType: "mouse",
+    }));
+
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1));
+    const input = mocks.send.mock.calls[0][4] as {
+      action: string;
+      points: Array<{ x: number; y: number; at_ms: number }>;
+    };
+    expect(input.action).toBe("drag");
+    expect(input.points.length).toBeGreaterThanOrEqual(2);
+    expect(input.points[0]).toEqual({ x: 100, y: 100, at_ms: 0 });
+    expect(input.points[input.points.length - 1]?.x).toBe(500);
+    expect(input.points[input.points.length - 1]?.at_ms).toBeGreaterThan(0);
+    expect(mocks.send).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-1",
+      1,
+      input,
+    );
+  });
+
+  it("clamps a captured drag to the frame when the pointer is released outside", async () => {
+    mocks.state.connection = "connected";
+    mocks.state.activity = "live";
+    mocks.state.frameUrl = "blob:live-frame";
+    mocks.state.tabId = "tab-1";
+    const user = userEvent.setup();
+    renderPreview();
+
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    const surface = await preparePointerSurface();
+
+    fireEvent(surface, pointerEvent("pointerdown", {
+      button: 0,
+      clientX: 50,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 9,
+      pointerType: "mouse",
+    }));
+    fireEvent(surface, pointerEvent("pointerup", {
+      button: 0,
+      clientX: 750,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 9,
+      pointerType: "mouse",
+    }));
+
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledTimes(1));
+    const input = mocks.send.mock.calls[0][4] as {
+      action: string;
+      points: Array<{ x: number; y: number; at_ms: number }>;
+    };
+    expect(input.action).toBe("drag");
+    expect(input.points).toHaveLength(2);
+    expect(input.points[0]).toEqual({ x: 100, y: 100, at_ms: 0 });
+    expect(input.points[1]?.x).toBe(1_000);
+    expect(input.points[1]?.at_ms).toBeGreaterThan(0);
+  });
+
+  it("clears an interrupted local drag and releases control when pointer capture is lost", async () => {
+    Object.assign(mocks.state, {
+      connection: "connected",
+      activity: "live",
+      frameUrl: "blob:live-frame",
+      tabId: "tab-1",
+    });
+    const user = userEvent.setup();
+    renderPreview();
+
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    const surface = await preparePointerSurface();
+    fireEvent(surface, pointerEvent("pointerdown", {
+      button: 0,
+      clientX: 50,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 11,
+      pointerType: "mouse",
+    }));
+    fireEvent(surface, pointerEvent("pointermove", {
+      clientX: 150,
+      clientY: 50,
+      isPrimary: true,
+      pointerId: 11,
+      pointerType: "mouse",
+    }));
+    fireEvent(surface, pointerEvent("lostpointercapture", {
+      isPrimary: true,
+      pointerId: 11,
+      pointerType: "mouse",
+    }));
+
+    await screen.findByText("Read only");
+    expect(mocks.send).not.toHaveBeenCalled();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(
+      { scope_type: "private", scope_id: "7" },
+      "tab-1",
+      "lease-1",
+    ));
   });
 
   it("drops to read only and releases the original tab when polling selects another tab", async () => {

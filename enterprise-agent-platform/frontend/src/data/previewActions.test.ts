@@ -30,6 +30,17 @@ describe("browser preview transport", () => {
     );
   });
 
+  it("reads the server refresh interval on an unchanged control frame", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, {
+      status: 304,
+      headers: { "X-Preview-Refresh-Ms": "250" },
+    })));
+
+    await expect(
+      fetchBrowserPreview(scope, '"frame-1"', new AbortController().signal),
+    ).resolves.toEqual({ kind: "unchanged", refreshIntervalMs: 250 });
+  });
+
   it("accepts bounded PNG frames and decodes safe metadata headers", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([137, 80, 78, 71]), {
       status: 200,

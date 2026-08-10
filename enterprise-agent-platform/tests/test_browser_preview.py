@@ -126,6 +126,215 @@ class BrowserPreviewServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_human_drag_is_bounded_atomic_and_not_replayed(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                calls: list[tuple[str, dict[str, object]]] = []
+
+                def request(url, body, **_kwargs):
+                    calls.append((url, dict(body or {})))
+                    return {"ok": True, "points": len((body or {}).get("points") or [])}
+
+                with (
+                    mock.patch.object(
+                        service,
+                        "_resolve_browser_control_tab",
+                        return_value=resolved,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_runtime_json_request",
+                        side_effect=request,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_agent_browser_validate_tab_url",
+                        return_value="https://example.test/",
+                    ),
+                ):
+                    acquired = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    drag = {
+                        "command": "input",
+                        "scope_type": "private",
+                        "scope_id": str(actor["id"]),
+                        "tab_id": "tab-1",
+                        "lease_id": acquired["lease_id"],
+                        "sequence": 1,
+                        "action": "drag",
+                        "points": [
+                            {"x": 20, "y": 30, "at_ms": 0},
+                            {"x": 120.125, "y": 30, "at_ms": 80},
+                            {"x": 240, "y": 31, "at_ms": 160},
+                        ],
+                    }
+                    first = service.browser_preview_control(actor, drag)
+                    duplicate = service.browser_preview_control(actor, drag)
+
+                self.assertTrue(first["ok"])
+                self.assertTrue(duplicate["duplicate"])
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(calls[0][0].endswith("/tabs/tab-1/pointer"))
+                self.assertEqual(calls[0][1]["action"], "drag")
+                self.assertEqual(
+                    calls[0][1]["points"],
+                    [
+                        {"x": 20.0, "y": 30.0, "at_ms": 0},
+                        {"x": 120.12, "y": 30.0, "at_ms": 80},
+                        {"x": 240.0, "y": 31.0, "at_ms": 160},
+                    ],
+                )
+                self.assertNotIn("gestureId", calls[0][1])
+            finally:
+                service.close()
+
+    def test_invalid_drag_does_not_consume_its_sequence(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(actor["id"])
+                resolved = (
+                    scope.scope_key,
+                    scope.scope_key,
+                    "agent-browser-user",
+                    "http://127.0.0.1:9090",
+                    {"Authorization": "Bearer test"},
+                )
+                calls: list[str] = []
+
+                def request(url, _body, **_kwargs):
+                    calls.append(url)
+                    return {"ok": True}
+
+                with (
+                    mock.patch.object(
+                        service,
+                        "_resolve_browser_control_tab",
+                        return_value=resolved,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_runtime_json_request",
+                        side_effect=request,
+                    ),
+                    mock.patch.object(
+                        service,
+                        "_agent_browser_validate_tab_url",
+                        return_value="https://example.test/",
+                    ),
+                ):
+                    acquired = service.browser_preview_control(
+                        actor,
+                        {
+                            "command": "acquire",
+                            "scope_type": "private",
+                            "scope_id": str(actor["id"]),
+                            "tab_id": "tab-1",
+                        },
+                    )
+                    common = {
+                        "command": "input",
+                        "scope_type": "private",
+                        "scope_id": str(actor["id"]),
+                        "tab_id": "tab-1",
+                        "lease_id": acquired["lease_id"],
+                        "sequence": 1,
+                    }
+                    invalid_inputs = (
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [{"x": 1, "y": 2, "at_ms": 0}],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": index, "y": 2, "at_ms": index}
+                                for index in range(65)
+                            ],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": 1, "y": 2, "at_ms": 1},
+                                {"x": 3, "y": 4, "at_ms": 2},
+                            ],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": 1, "y": 2, "at_ms": 0},
+                                {"x": 3, "y": 4, "at_ms": 0},
+                            ],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": 1, "y": 2, "at_ms": 0},
+                                {"x": 16_385, "y": 4, "at_ms": 2},
+                            ],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": 1, "y": 2, "at_ms": 0},
+                                {"x": 3, "y": 4, "at_ms": 10_001},
+                            ],
+                        },
+                        {
+                            **common,
+                            "action": "drag",
+                            "points": [
+                                {"x": 1, "y": 2, "at_ms": 0},
+                                {"x": 3, "y": 4, "at_ms": 4},
+                            ],
+                            "gestureId": "client-controlled",
+                        },
+                    )
+                    for invalid in invalid_inputs:
+                        with self.assertRaises(ServiceError) as raised:
+                            service.browser_preview_control(actor, invalid)
+                        self.assertEqual(raised.exception.status, 400)
+
+                    accepted = service.browser_preview_control(
+                        actor,
+                        {
+                            **common,
+                            "action": "click",
+                            "x": 10,
+                            "y": 20,
+                        },
+                    )
+
+                self.assertTrue(accepted["ok"])
+                self.assertEqual(len(calls), 1)
+                self.assertTrue(calls[0].endswith("/tabs/tab-1/click"))
+            finally:
+                service.close()
+
     def test_private_agent_message_releases_senders_lease_before_enqueue(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
@@ -850,6 +1059,49 @@ class BrowserPreviewServiceTests(unittest.TestCase):
                     binary.call_args.kwargs["allowed_content_types"],
                     {"image/jpeg", "image/png"},
                 )
+            finally:
+                service.close()
+
+    def test_control_preview_uses_faster_bounded_cache_and_lower_jpeg_quality(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = self._service(Path(td))
+            try:
+                service._runtime_json_request = lambda *_args, **_kwargs: {
+                    "url": "https://example.test/page",
+                    "title": "Page",
+                }
+                binary = mock.Mock(return_value=(jpeg_fixture(), "image/jpeg"))
+                service._runtime_binary_request = binary
+                service._validate_browser_page_url = lambda _value: None
+                arguments = {
+                    "root_scope_key": "private:1",
+                    "selected_scope_key": "private:1",
+                    "selected_tab_id": "tab-1",
+                    "selected_tab": {"title": "Page"},
+                    "tab_count": 1,
+                    "user_id": "agent-test",
+                    "base_url": "http://127.0.0.1:9377",
+                    "headers": {"Authorization": "Bearer test"},
+                    "control_active": True,
+                }
+
+                first = service._capture_browser_preview_frame(**arguments)
+                with service._agent_browser_tabs_lock:
+                    service._browser_preview_cache[("private:1", "tab-1")][
+                        "captured_monotonic"
+                    ] -= 0.25
+                second = service._capture_browser_preview_frame(**arguments)
+
+                self.assertTrue(first["active"])
+                self.assertTrue(second["active"])
+                self.assertEqual(first["refresh_interval_ms"], 250)
+                self.assertEqual(binary.call_count, 2)
+                for call in binary.call_args_list:
+                    query = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(call.args[0]).query
+                    )
+                    self.assertEqual(query["format"], ["jpeg"])
+                    self.assertEqual(query["quality"], ["55"])
             finally:
                 service.close()
 

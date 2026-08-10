@@ -241,7 +241,7 @@ def run(args: argparse.Namespace) -> None:
         else:
             raise SmokeError("Agent mutation was not blocked by the human lease")
 
-        def send(sequence: int, action: str, **details: Any) -> None:
+        def send(sequence: int, action: str, **details: Any) -> dict[str, Any]:
             response = client.control(
                 {
                     "command": "input",
@@ -254,11 +254,30 @@ def run(args: argparse.Namespace) -> None:
             )
             _expect(response.get("ok") is True, f"human {action} input did not succeed")
             _expect(response.get("sequence") == sequence, f"human {action} sequence was not preserved")
+            return response
 
-        send(1, "click", x=96, y=64)
-        send(2, "text", text=CONTROL_TEXT)
-        send(3, "key", key="Enter")
-        send(4, "wheel", delta_x=0, delta_y=900)
+        drag_points = [
+            {"x": 52, "y": 218, "at_ms": 0},
+            {"x": 180, "y": 218, "at_ms": 50},
+            {"x": 330, "y": 218, "at_ms": 100},
+            {"x": 480, "y": 218, "at_ms": 150},
+        ]
+        send(1, "drag", points=drag_points)
+        replay = client.control(
+            {
+                "command": "input",
+                **scope,
+                "lease_id": lease_id,
+                "sequence": 1,
+                "action": "drag",
+                "points": drag_points,
+            }
+        )
+        _expect(replay.get("duplicate") is True, "duplicate drag sequence was replayed")
+        send(2, "click", x=96, y=64)
+        send(3, "text", text=CONTROL_TEXT)
+        send(4, "key", key="Enter")
+        send(5, "wheel", delta_x=0, delta_y=900)
 
         snapshot = client.gateway("snapshot", {"tab_id": tab_id})
         snapshot_text = str(snapshot.get("snapshot") or "")
@@ -267,6 +286,9 @@ def run(args: argparse.Namespace) -> None:
             f"text={CONTROL_TEXT}",
             "key=Enter",
             "scroll=1",
+            "drag=1",
+            "drag_count=1",
+            "pointer_down=0",
         ):
             _expect(marker in snapshot_text, f"browser snapshot did not observe {marker}")
 
@@ -282,6 +304,10 @@ def run(args: argparse.Namespace) -> None:
         )
         _expect(int(headers.get("X-Preview-Width") or 0) > 0, "browser preview width is missing")
         _expect(int(headers.get("X-Preview-Height") or 0) > 0, "browser preview height is missing")
+        _expect(
+            int(headers.get("X-Preview-Refresh-Ms") or 0) == 250,
+            "browser control preview did not advertise its bounded faster interval",
+        )
 
         released = client.control(
             {"command": "release", **scope, "lease_id": lease_id}

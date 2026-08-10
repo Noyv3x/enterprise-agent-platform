@@ -18,6 +18,8 @@
 
 所有权威数据都使用明确的宿主 bind mount。不得用匿名 Docker volume 保存产品数据。固定 Compose 栈使用 Manager 预先创建的 external network，generation 切换不能删除该网络或中断仍在运行的 Sandbox。
 
+人工浏览器拖拽仍沿 Platform 到 Camoufox 的私有 HTTP 服务边界执行；部署不新增 WebSocket、VNC、X display 或宿主端口。Camoufox 镜像内的锁定补丁负责 CSS 像素截图与原子 `mouse.down/move/up`，发布验收必须经过真实 Platform 鉴权链路验证该补丁，而不能直连 sidecar 代替。
+
 ## 技术身份与安装位置
 
 默认安装位置固定为：

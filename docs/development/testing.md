@@ -56,7 +56,7 @@ operation journal 裁剪测试必须证明七天时间窗口与最新 `128` 条�
 
 真实启动 SearXNG 后还必须检查容器 Mounts，证明 `/etc/searxng` 来自受管 config 根的只读 bind，且镜像声明没有额外生成匿名 volume；只检查 Compose 文本不足以覆盖镜像自身的 `VOLUME` 行为。
 
-Camoufox 发布验收使用同一 Compose 中的真实 Platform/Camoufox 镜像与一个只接入临时 core network 的静态页面，不访问公网。测试必须经 Platform 登录和内部 browser Gateway 建立私人 scope/tab，再经浏览器同源控制 API 完成 `acquire → 坐标 click → text → key → wheel → frame/snapshot → release`；租约期间 Agent 变更型动作必须返回冲突，释放后必须重新可用。测试不得把管理员密码、session 或内部 bearer 放进命令参数和输出。
+Camoufox 发布验收使用同一 Compose 中的真实 Platform/Camoufox 镜像与一个只接入临时 core network 的静态页面，不访问公网。测试必须经 Platform 登录和内部 browser Gateway 建立私人 scope/tab，再经浏览器同源控制 API 完成 `acquire → 真实滑块拖拽 → text → key → wheel → 交互帧/snapshot → release`，并验证成功轨迹已经抬键、重复 sequence 不重放、租约期间 Agent 变更型动作返回冲突以及释放后重新可用；独立补丁契约测试还必须确认异常路径由 `finally` 执行 `mouse.up`。测试不得把管理员密码、session 或内部 bearer 放进命令参数和输出。
 
 ## Python 平台
 

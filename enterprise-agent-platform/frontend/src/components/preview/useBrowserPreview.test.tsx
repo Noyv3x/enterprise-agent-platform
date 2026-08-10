@@ -55,6 +55,35 @@ describe("useBrowserPreview", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:frame-1");
   });
 
+  it("uses the control refresh interval and backs off unchanged frames", async () => {
+    fetchPreviewMock
+      .mockResolvedValueOnce({
+        kind: "frame",
+        blob: new Blob(["jpeg"], { type: "image/jpeg" }),
+        etag: '"one"',
+        refreshIntervalMs: 250,
+        tabId: "tab-1",
+        title: "Page",
+        url: "https://example.test/",
+        capturedAt: "1784060400000",
+      })
+      .mockResolvedValue({ kind: "unchanged", refreshIntervalMs: 250 });
+
+    renderHook(() => useBrowserPreview(scope, true));
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(fetchPreviewMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(249); });
+    expect(fetchPreviewMock).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchPreviewMock).toHaveBeenCalledTimes(2);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(499); });
+    expect(fetchPreviewMock).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchPreviewMock).toHaveBeenCalledTimes(3);
+  });
+
   it("does not poll while the page is hidden", async () => {
     fetchPreviewMock.mockResolvedValue({ kind: "unchanged" });
     renderHook(() => useBrowserPreview(scope));

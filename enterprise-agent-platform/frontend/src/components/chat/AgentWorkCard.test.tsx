@@ -9,7 +9,7 @@ import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AgentStatus } from "../../types";
-import { AgentWorkCard } from "./AgentWorkCard";
+import { AgentWorkCard, hasAgentBrowserStep } from "./AgentWorkCard";
 
 describe("AgentWorkCard", () => {
   beforeEach(() => {
@@ -17,6 +17,18 @@ describe("AgentWorkCard", () => {
   });
 
   afterEach(cleanup);
+
+  it("recognizes a substantive browser tool step without mistaking tool noise for one", () => {
+    expect(hasAgentBrowserStep({
+      activity: [
+        { stage: "tool", tool: "tool", detail: "tool" },
+        { stage: "tool.started", tool: "browser", tool_call_id: "browser-1", tool_status: "running" },
+      ],
+    })).toBe(true);
+    expect(hasAgentBrowserStep({
+      activity: [{ stage: "tool", tool: "web", tool_call_id: "web-1", tool_status: "running" }],
+    })).toBe(false);
+  });
 
   it("renders structured tool states and a complete terminal command preview", () => {
     const store = createStore(rootReducer, initialAppState);

@@ -50,6 +50,22 @@ export const previewMessages = defineMessages({
   "browserPreview.typeSend": { "zh-CN": "输入", en: "Type", "zh-TW": "輸入" },
   "browserPreview.controlSurface": { "zh-CN": "可操作的 Agent 浏览器画面", en: "Interactive Agent browser view", "zh-TW": "可操作的 Agent 瀏覽器畫面" },
   "browserPreview.frameAlt": { "zh-CN": "Agent 浏览器的最新画面", en: "Latest Agent browser frame", "zh-TW": "Agent 瀏覽器的最新畫面" },
+  "browserPreview.workTitle": { "zh-CN": "浏览器预览", en: "Browser preview", "zh-TW": "瀏覽器預覽" },
+  "browserPreview.workFrameAlt": {
+    "zh-CN": "Agent 工作中的浏览器画面",
+    en: "Agent browser view during this run",
+    "zh-TW": "Agent 工作中的瀏覽器畫面",
+  },
+  "browserPreview.workLoading": {
+    "zh-CN": "正在准备浏览器画面",
+    en: "Preparing browser view",
+    "zh-TW": "正在準備瀏覽器畫面",
+  },
+  "browserPreview.workTakeControl": {
+    "zh-CN": "打开并接管浏览器",
+    en: "Open and take control of the browser",
+    "zh-TW": "開啟並接管瀏覽器",
+  },
   "browserPreview.loadingFrame": {
     "zh-CN": "正在加载浏览器画面",
     en: "Loading browser view",

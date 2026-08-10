@@ -203,7 +203,7 @@ const screenshotEncodingAfter = `    const { tabState } = found;
     const quality = Number.isFinite(requestedQuality)
       ? Math.max(30, Math.min(90, requestedQuality))
       : 65;
-    const options = { type: format, fullPage };
+    const options = { type: format, fullPage, scale: 'css' };
     if (format === 'jpeg') options.quality = quality;
     const buffer = await tabState.page.screenshot(options);
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
@@ -236,6 +236,137 @@ const coordinateClickBranchAfter = `      if (hasCoordinate) {
         let locator = refToLocator(tabState.page, ref, tabState.refs);
         if (!locator) {
           // Use tight timeout (4s max) to leave budget for click + post-click buildRefs`;
+const pointerRouteBefore = `// Type
+/**
+ * @openapi
+ * /tabs/{tabId}/type:`;
+const pointerRouteAfter = `// Platform-owned atomic human pointer gestures.
+// A complete drag is validated before entering the tab lock, then executes as
+// one down/move/up unit. Platform's lease-bound monotonic sequence is the sole
+// replay fence, so this internal route has no second gesture identity.
+app.post('/tabs/:tabId/pointer', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'pointer body must be an object' });
+    }
+    const allowedFields = new Set(['userId', 'action', 'points']);
+    if (Object.keys(body).some((key) => !allowedFields.has(key))) {
+      return res.status(400).json({ error: 'unsupported pointer field' });
+    }
+    const { userId, action, points } = body;
+    if (typeof userId !== 'string' || !userId) {
+      return res.status(400).json({ error: 'userId required' });
+    }
+    if (action !== 'drag') {
+      return res.status(400).json({ error: 'pointer action is invalid' });
+    }
+
+    if (!Array.isArray(points) || points.length < 2 || points.length > 64) {
+      return res.status(400).json({ error: 'drag point count is invalid' });
+    }
+    let previousAtMs = -1;
+    const normalizedPoints = [];
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      if (!point || typeof point !== 'object' || Array.isArray(point)
+          || Object.keys(point).length !== 3
+          || !Object.hasOwn(point, 'x')
+          || !Object.hasOwn(point, 'y')
+          || !Object.hasOwn(point, 'at_ms')) {
+        return res.status(400).json({ error: 'drag point is invalid' });
+      }
+      if (typeof point.x !== 'number' || typeof point.y !== 'number') {
+        return res.status(400).json({ error: 'drag coordinates are invalid' });
+      }
+      const x = point.x;
+      const y = point.y;
+      const atMs = point.at_ms;
+      if (!Number.isFinite(x) || !Number.isFinite(y)
+          || x < 0 || y < 0 || x > 16384 || y > 16384) {
+        return res.status(400).json({ error: 'drag coordinates are out of range' });
+      }
+      if (!Number.isSafeInteger(atMs)
+          || (index === 0 && atMs !== 0)
+          || (index > 0 && atMs <= previousAtMs)
+          || atMs > 10000) {
+        return res.status(400).json({ error: 'drag timing is invalid' });
+      }
+      normalizedPoints.push({ x, y, atMs });
+      previousAtMs = atMs;
+    }
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, tabId);
+    session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls += 1;
+    tabState.consecutiveTimeouts = 0;
+    tabState.consecutiveFailures = 0;
+
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      if (tabState.agentPlatformPointerDown) {
+        try {
+          await tabState.page.mouse.up({ button: 'left' });
+        } finally {
+          tabState.agentPlatformPointerDown = false;
+        }
+      }
+      const first = normalizedPoints[0];
+      await tabState.page.mouse.move(first.x, first.y);
+      let dragError = null;
+      try {
+        tabState.agentPlatformPointerDown = true;
+        await tabState.page.mouse.down({ button: 'left' });
+        let previousAtMs = first.atMs;
+        for (const point of normalizedPoints.slice(1)) {
+          const delayMs = point.atMs - previousAtMs;
+          if (delayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+          await tabState.page.mouse.move(point.x, point.y);
+          previousAtMs = point.atMs;
+        }
+      } catch (error) {
+        dragError = error;
+        throw error;
+      } finally {
+        if (tabState.agentPlatformPointerDown) {
+          try {
+            await tabState.page.mouse.up({ button: 'left' });
+          } catch (upError) {
+            if (!dragError) throw upError;
+            log('warn', 'pointer cleanup failed after drag error', {
+              reqId: req.reqId,
+              tabId,
+              error: upError.message,
+            });
+          } finally {
+            tabState.agentPlatformPointerDown = false;
+          }
+        }
+      }
+      return {
+        ok: true,
+        points: normalizedPoints.length,
+        durationMs: normalizedPoints[normalizedPoints.length - 1].atMs,
+      };
+    }));
+
+    pluginEvents.emit('tab:pointer', { userId, tabId, action });
+    res.json(result);
+  } catch (err) {
+    log('error', 'pointer action failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Type
+/**
+ * @openapi
+ * /tabs/{tabId}/type:`;
 const displayAfter = `    let displayStartupError = null;
     try {
       if (os.platform() === 'linux') {
@@ -344,6 +475,13 @@ applyExactPatch("low-bandwidth-screenshot-encoding", screenshotEncodingBefore, s
 applyExactPatch("coordinate-click-request", coordinateClickRequestBefore, coordinateClickRequestAfter);
 applyExactPatch("coordinate-click-validation", coordinateClickValidationBefore, coordinateClickValidationAfter);
 applyExactPatch("coordinate-click-branch", coordinateClickBranchBefore, coordinateClickBranchAfter);
+const pointerRouteMarker = "app.post('/tabs/:tabId/pointer'";
+const pointerRouteMatches = patched.split(pointerRouteMarker).length - 1;
+if (pointerRouteMatches === 0) {
+  applyExactPatch("atomic-human-pointer-route", pointerRouteBefore, pointerRouteAfter);
+} else if (pointerRouteMatches !== 1) {
+  throw new Error(`expected at most one atomic-human-pointer-route, found ${pointerRouteMatches}`);
+}
 
 const source = fs.readFileSync(target, "utf8");
 if (patched === source) process.exit(0);

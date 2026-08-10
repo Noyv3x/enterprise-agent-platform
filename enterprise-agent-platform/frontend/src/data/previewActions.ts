@@ -30,6 +30,7 @@ export interface BrowserPreviewFrame {
   kind: "frame";
   blob: Blob;
   etag: string;
+  refreshIntervalMs?: number;
   tabId: string;
   title: string;
   url: string;
@@ -39,11 +40,13 @@ export interface BrowserPreviewFrame {
 export interface BrowserPreviewIdle {
   kind: "idle";
   etag: string;
+  refreshIntervalMs?: number;
   status: string;
 }
 
 export interface PreviewUnchanged {
   kind: "unchanged";
+  refreshIntervalMs?: number;
 }
 
 export type BrowserPreviewResult = BrowserPreviewFrame | BrowserPreviewIdle | PreviewUnchanged;
@@ -61,6 +64,10 @@ export interface BrowserControlResponse {
 
 export type BrowserControlInput =
   | { action: "click" | "double_click"; x: number; y: number }
+  | {
+      action: "drag";
+      points: Array<{ x: number; y: number; at_ms: number }>;
+    }
   | { action: "text"; text: string }
   | { action: "key"; key: string }
   | { action: "wheel"; delta_x: number; delta_y: number }
@@ -145,6 +152,14 @@ function decodedHeader(response: Response, ...names: string[]): string {
   }
 }
 
+function browserRefreshInterval(response: Response, fallback?: unknown): number | undefined {
+  const raw = header(response, "x-preview-refresh-ms") || fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 100 && value <= 10_000
+    ? value
+    : undefined;
+}
+
 async function previewError(response: Response): Promise<Error> {
   if (response.status === 401) _invokeSessionExpired();
   let message = "";
@@ -226,7 +241,13 @@ export async function fetchBrowserPreview(
       signal,
     },
   );
-  if (response.status === 304) return { kind: "unchanged" };
+  if (response.status === 304) {
+    const refreshIntervalMs = browserRefreshInterval(response);
+    return {
+      kind: "unchanged",
+      ...(refreshIntervalMs ? { refreshIntervalMs } : {}),
+    };
+  }
   if (!response.ok) throw await previewError(response);
 
   const responseEtag = response.headers.get("etag") || "";
@@ -235,13 +256,30 @@ export async function fetchBrowserPreview(
     let status = "idle";
     if (response.status !== 204) {
       try {
-        const body = (await response.json()) as { status?: string; state?: string };
+        const body = (await response.json()) as {
+          refresh_interval_ms?: number;
+          status?: string;
+          state?: string;
+        };
         status = body.status || body.state || status;
+        const refreshIntervalMs = browserRefreshInterval(response, body.refresh_interval_ms);
+        return {
+          kind: "idle",
+          etag: responseEtag,
+          ...(refreshIntervalMs ? { refreshIntervalMs } : {}),
+          status,
+        };
       } catch {
         // Treat a malformed empty-state response as idle; no executable data is consumed.
       }
     }
-    return { kind: "idle", etag: responseEtag, status };
+    const refreshIntervalMs = browserRefreshInterval(response);
+    return {
+      kind: "idle",
+      etag: responseEtag,
+      ...(refreshIntervalMs ? { refreshIntervalMs } : {}),
+      status,
+    };
   }
   if (!["image/jpeg", "image/png", "image/webp"].includes(contentType)) {
     throw new Error(t("preview.loadFailed"));
@@ -250,10 +288,12 @@ export async function fetchBrowserPreview(
   const blob = await response.blob();
   if (blob.size > MAX_BROWSER_FRAME_BYTES) throw new Error(t("preview.frameTooLarge"));
 
+  const refreshIntervalMs = browserRefreshInterval(response);
   return {
     kind: "frame",
     blob,
     etag: responseEtag,
+    ...(refreshIntervalMs ? { refreshIntervalMs } : {}),
     tabId: decodedHeader(response, "x-preview-tab-id"),
     title: decodedHeader(response, "x-preview-title", "x-preview-tab-title"),
     url: decodedHeader(response, "x-preview-url", "x-preview-tab-url"),

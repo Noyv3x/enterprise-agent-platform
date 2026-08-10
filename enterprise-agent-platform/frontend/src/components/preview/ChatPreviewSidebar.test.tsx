@@ -3,9 +3,11 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import type { AgentPreviewScope } from "../../types";
+import { useChatPreviewContext } from "./ChatPreviewContext";
 import { ChatPreviewSidebar } from "./ChatPreviewSidebar";
 
 const mocks = vi.hoisted(() => ({
@@ -14,6 +16,7 @@ const mocks = vi.hoisted(() => ({
     runningTerminalCount: 0,
   },
   browserRender: vi.fn(),
+  browserProps: vi.fn(),
   terminalRender: vi.fn(),
   schedulesRender: vi.fn(),
   memoryRender: vi.fn(),
@@ -33,8 +36,9 @@ vi.mock("./usePreviewAvailability", () => ({
 }));
 
 vi.mock("./BrowserPreviewView", () => ({
-  BrowserPreviewView: () => {
+  BrowserPreviewView: (props: { controlRequestId?: number }) => {
     mocks.browserRender();
+    mocks.browserProps(props);
     return <div data-testid="browser-preview-fixture" />;
   },
 }));
@@ -79,6 +83,7 @@ const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" }
 function renderSidebar(
   scope: AgentPreviewScope | null = privateScope,
   canManageSkills = true,
+  children: ReactNode = <div>Chat content</div>,
 ) {
   return render(
     <I18nProvider>
@@ -86,9 +91,18 @@ function renderSidebar(
         scope={scope}
         canManageSkills={canManageSkills}
       >
-        <div>Chat content</div>
+        {children}
       </ChatPreviewSidebar>
     </I18nProvider>,
+  );
+}
+
+function BrowserAssistFixture() {
+  const preview = useChatPreviewContext();
+  return (
+    <button type="button" onClick={preview?.openBrowserAssist}>
+      Open browser from work
+    </button>
   );
 }
 
@@ -98,6 +112,7 @@ describe("ChatPreviewSidebar", () => {
     mocks.availability.browserActive = false;
     mocks.availability.runningTerminalCount = 0;
     mocks.browserRender.mockClear();
+    mocks.browserProps.mockClear();
     mocks.terminalRender.mockClear();
     mocks.schedulesRender.mockClear();
     mocks.memoryRender.mockClear();
@@ -212,6 +227,45 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.getByRole("complementary", { name: "Live browser preview" })).toBeVisible();
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
     expect(mocks.browserRender).toHaveBeenCalled();
+    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: undefined }));
+  });
+
+  it("opens from a work-record intent before availability and issues one monotonic control request", async () => {
+    const user = userEvent.setup();
+    renderSidebar(privateScope, true, <BrowserAssistFixture />);
+
+    expect(screen.queryByRole("button", { name: "Open browser preview" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+
+    expect(screen.getByRole("complementary", { name: "Live browser preview" })).toBeVisible();
+    expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
+    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
+
+    await user.click(screen.getByRole("button", { name: "Close preview" }));
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 2 }));
+  });
+
+  it("clears a pending work-record browser intent when the chat scope changes", async () => {
+    const user = userEvent.setup();
+    const view = renderSidebar(privateScope, true, <BrowserAssistFixture />);
+    await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    expect(screen.getByRole("complementary")).toBeVisible();
+    const browserRenderCount = mocks.browserRender.mock.calls.length;
+
+    view.rerender(
+      <I18nProvider>
+        <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+          <BrowserAssistFixture />
+        </ChatPreviewSidebar>
+      </I18nProvider>,
+    );
+
+    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    expect(mocks.browserRender).toHaveBeenCalledTimes(browserRenderCount);
+    await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
   });
 
   it("closes with Escape and restores focus to the preview trigger", async () => {

@@ -1,5 +1,13 @@
 import { Button, Input, Space, Spin, Tag } from "antd";
-import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import {
   acquireBrowserControl,
   releaseBrowserControl,
@@ -34,6 +42,52 @@ function previewTime(value: string | number | null, locale: string): string {
 }
 
 const DEFAULT_BROWSER_LEASE_MS = 90_000;
+const DRAG_MOVEMENT_THRESHOLD_PX = 6;
+const MAX_DRAG_POINTS = 64;
+const MAX_LOCAL_DRAG_POINTS = 256;
+const MAX_DRAG_DURATION_MS = 10_000;
+
+interface BrowserDragPoint {
+  x: number;
+  y: number;
+  at_ms: number;
+}
+
+interface ActivePointerGesture {
+  pointerId: number;
+  surface: HTMLDivElement;
+  startedAt: number;
+  startClientX: number;
+  startClientY: number;
+  moved: boolean;
+  points: BrowserDragPoint[];
+}
+
+interface LocalPointerFeedback {
+  left: number;
+  top: number;
+  dragging: boolean;
+}
+
+function compressDragPoints(points: BrowserDragPoint[]): BrowserDragPoint[] {
+  if (points.length <= MAX_DRAG_POINTS) return points;
+  const compressed = [points[0]!];
+  const finalIndex = points.length - 1;
+  for (let index = 1; index < MAX_DRAG_POINTS - 1; index += 1) {
+    compressed.push(points[Math.round((index * finalIndex) / (MAX_DRAG_POINTS - 1))]!);
+  }
+  compressed.push(points[finalIndex]!);
+  return compressed;
+}
+
+function boundLocalDragPoints(points: BrowserDragPoint[]): BrowserDragPoint[] {
+  if (points.length <= MAX_LOCAL_DRAG_POINTS) return points;
+  return [
+    points[0]!,
+    ...points.slice(1, -1).filter((_point, index) => index % 2 === 0),
+    points[points.length - 1]!,
+  ];
+}
 
 interface ActiveBrowserLease {
   id: string;
@@ -43,13 +97,24 @@ interface ActiveBrowserLease {
   scope: AgentPreviewScope;
 }
 
-export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
+export function BrowserPreviewView({
+  scope,
+  controlRequestId,
+}: {
+  scope: AgentPreviewScope;
+  controlRequestId?: string | number | null;
+}) {
   const { t, locale } = useI18n();
-  const { state, refresh } = useBrowserPreview(scope);
   const [lease, setLease] = useState<ActiveBrowserLease | null>(null);
+  const leaseActiveForScope = Boolean(
+    lease
+    && `${lease.scope.scope_type}:${String(lease.scope.scope_id)}` === `${scope.scope_type}:${String(scope.scope_id)}`,
+  );
+  const { state, refresh } = useBrowserPreview(scope, leaseActiveForScope);
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState("");
   const [textInput, setTextInput] = useState("");
+  const [pointerFeedback, setPointerFeedback] = useState<LocalPointerFeedback | null>(null);
   const sequenceRef = useRef(0);
   const leaseGenerationRef = useRef(0);
   const leaseRef = useRef<ActiveBrowserLease | null>(null);
@@ -61,8 +126,17 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
   const currentTabRef = useRef(state.tabId);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pointerGestureRef = useRef<ActivePointerGesture | null>(null);
+  const suppressClickRef = useRef(false);
+  const consumedControlRequestRef = useRef<string | number | null>(null);
+  const consumedControlScopeRef = useRef("");
+  const [quickControlTimedOut, setQuickControlTimedOut] = useState(false);
   const lastUpdate = previewTime(state.capturedAt || state.checkedAt, intlLocale(locale));
   const scopeKey = `${scope.scope_type}:${String(scope.scope_id)}`;
+  if (consumedControlScopeRef.current !== scopeKey) {
+    consumedControlScopeRef.current = scopeKey;
+    consumedControlRequestRef.current = null;
+  }
   currentTabRef.current = state.tabId;
   const controlling = Boolean(
     lease
@@ -81,6 +155,21 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
       const pending = controlQueueRef.current;
       await pending.catch(() => undefined);
       if (pending === controlQueueRef.current) return;
+    }
+  }, []);
+
+  const clearPointerGesture = useCallback(() => {
+    const gesture = pointerGestureRef.current;
+    pointerGestureRef.current = null;
+    setPointerFeedback(null);
+    if (gesture) {
+      try {
+        if (gesture.surface.hasPointerCapture?.(gesture.pointerId)) {
+          gesture.surface.releasePointerCapture(gesture.pointerId);
+        }
+      } catch {
+        // The browser may have already released capture during blur/cancel.
+      }
     }
   }, []);
 
@@ -105,9 +194,10 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
+    clearPointerGesture();
     if (message) setControlError(message);
     queueBestEffortRelease(expected);
-  }, [queueBestEffortRelease]);
+  }, [clearPointerGesture, queueBestEffortRelease]);
 
   const refreshLeaseExpiry = useCallback((
     active: ActiveBrowserLease,
@@ -123,11 +213,11 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
     setLease(next);
   }, []);
 
-  const sendInput = useCallback((input: BrowserControlInput) => {
+  const sendInput = useCallback((input: BrowserControlInput): Promise<void> => {
     const active = leaseRef.current;
-    if (!active || currentTabRef.current !== active.tabId) return;
+    if (!active || currentTabRef.current !== active.tabId) return Promise.resolve();
     const sequence = ++sequenceRef.current;
-    void enqueueControl(async () => {
+    return enqueueControl(async () => {
       const current = leaseRef.current;
       if (!current || current.generation !== active.generation) return;
       if (Date.now() >= current.expiresAt) {
@@ -183,6 +273,7 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
         clearTimeout(clickTimerRef.current);
         clickTimerRef.current = null;
       }
+      clearPointerGesture();
       const latest = leaseRef.current;
       if (latest) {
         leaseRef.current = null;
@@ -190,7 +281,7 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
         queueBestEffortRelease(latest);
       }
     };
-  }, [queueBestEffortRelease, scopeKey]);
+  }, [clearPointerGesture, queueBestEffortRelease, scopeKey]);
 
   useEffect(() => {
     const active = leaseRef.current;
@@ -246,7 +337,7 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
     return () => window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, onMessageSubmit);
   }, [relinquishLease, scopeKey, waitForControlIdle]);
 
-  const beginControl = async () => {
+  const beginControl = useCallback(async () => {
     const requestedTab = state.tabId;
     if (!requestedTab || controlBusy || acquireInFlightRef.current) return;
     const previousLease = leaseRef.current;
@@ -300,9 +391,64 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
         setControlBusy(false);
       }
     }
-  };
+  }, [
+    controlBusy,
+    enqueueControl,
+    queueBestEffortRelease,
+    relinquishLease,
+    scope.scope_id,
+    scope.scope_type,
+    state.tabId,
+    t,
+  ]);
 
-  const frameCoordinates = (clientX: number, clientY: number): { x: number; y: number } | null => {
+  const hasQuickControlRequest = (
+    (typeof controlRequestId === "number" && controlRequestId > 0)
+    || (typeof controlRequestId === "string" && controlRequestId.length > 0)
+  );
+
+  useEffect(() => {
+    setQuickControlTimedOut(false);
+    if (!hasQuickControlRequest || state.tabId) return;
+    const requested = controlRequestId;
+    const timer = window.setTimeout(() => {
+      // A work-record handoff is single-shot even when the browser never
+      // becomes ready. Consume it with the timeout so a stale tab discovery
+      // cannot unexpectedly seize control later.
+      consumedControlRequestRef.current = requested ?? null;
+      setQuickControlTimedOut(true);
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [controlRequestId, hasQuickControlRequest, state.tabId]);
+
+  useEffect(() => {
+    if (
+      controlRequestId === undefined
+      || controlRequestId === null
+      || controlRequestId === ""
+      || (typeof controlRequestId === "number" && controlRequestId <= 0)
+      || !state.tabId
+      || Object.is(consumedControlRequestRef.current, controlRequestId)
+    ) {
+      return;
+    }
+    // Defer one task so React StrictMode can finish its development-only
+    // setup/cleanup probe. Consume before asynchronous acquisition; a failed
+    // request remains visible and must never become an automatic retry.
+    const requested = controlRequestId;
+    const timer = window.setTimeout(() => {
+      if (Object.is(consumedControlRequestRef.current, requested)) return;
+      consumedControlRequestRef.current = requested;
+      void beginControl();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [beginControl, controlRequestId, state.tabId]);
+
+  const frameCoordinates = (
+    clientX: number,
+    clientY: number,
+    clampToFrame = false,
+  ): { x: number; y: number } | null => {
     const image = imageRef.current;
     if (!image || !image.naturalWidth || !image.naturalHeight) return null;
     const rect = image.getBoundingClientRect();
@@ -311,12 +457,133 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
     const shownHeight = image.naturalHeight * scale;
     const left = rect.left + (rect.width - shownWidth) / 2;
     const top = rect.top + (rect.height - shownHeight) / 2;
-    if (clientX < left || clientX > left + shownWidth || clientY < top || clientY > top + shownHeight) return null;
-    return { x: (clientX - left) / scale, y: (clientY - top) / scale };
+    if (
+      !clampToFrame
+      && (clientX < left || clientX > left + shownWidth || clientY < top || clientY > top + shownHeight)
+    ) return null;
+    const boundedX = Math.max(left, Math.min(left + shownWidth, clientX));
+    const boundedY = Math.max(top, Math.min(top + shownHeight, clientY));
+    return { x: (boundedX - left) / scale, y: (boundedY - top) / scale };
+  };
+
+  const pointerFeedbackAt = (surface: HTMLDivElement, clientX: number, clientY: number) => {
+    const rect = surface.getBoundingClientRect();
+    return {
+      left: Math.max(0, Math.min(rect.width, clientX - rect.left)),
+      top: Math.max(0, Math.min(rect.height, clientY - rect.top)),
+    };
+  };
+
+  const appendPointerPoint = (
+    gesture: ActivePointerGesture,
+    clientX: number,
+    clientY: number,
+    final = false,
+  ): boolean => {
+    const point = frameCoordinates(clientX, clientY, true);
+    if (!point) return false;
+    const previous = gesture.points[gesture.points.length - 1]!;
+    const maxAt = final ? MAX_DRAG_DURATION_MS : MAX_DRAG_DURATION_MS - 1;
+    if (previous.at_ms >= maxAt) return false;
+    const elapsed = Math.max(0, Math.floor(performance.now() - gesture.startedAt));
+    const atMs = Math.max(previous.at_ms + 1, Math.min(maxAt, elapsed));
+    gesture.points = boundLocalDragPoints([
+      ...gesture.points,
+      { x: point.x, y: point.y, at_ms: atMs },
+    ]);
+    return true;
+  };
+
+  const onFramePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (
+      !controlling
+      || !event.isPrimary
+      || (event.pointerType === "mouse" && event.button !== 0)
+      || pointerGestureRef.current
+    ) return;
+    const point = frameCoordinates(event.clientX, event.clientY);
+    if (!point) return;
+    const surface = event.currentTarget;
+    try {
+      surface.setPointerCapture(event.pointerId);
+    } catch {
+      return;
+    }
+    pointerGestureRef.current = {
+      pointerId: event.pointerId,
+      surface,
+      startedAt: performance.now(),
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      moved: false,
+      points: [{ x: point.x, y: point.y, at_ms: 0 }],
+    };
+    suppressClickRef.current = false;
+    setPointerFeedback({
+      ...pointerFeedbackAt(surface, event.clientX, event.clientY),
+      dragging: false,
+    });
+    surface.focus({ preventScroll: true });
+  };
+
+  const onFramePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = pointerGestureRef.current;
+    if (!controlling || !gesture || gesture.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const distance = Math.hypot(
+      event.clientX - gesture.startClientX,
+      event.clientY - gesture.startClientY,
+    );
+    if (distance >= DRAG_MOVEMENT_THRESHOLD_PX) gesture.moved = true;
+    if (gesture.moved) appendPointerPoint(gesture, event.clientX, event.clientY);
+    setPointerFeedback({
+      ...pointerFeedbackAt(gesture.surface, event.clientX, event.clientY),
+      dragging: gesture.moved,
+    });
+  };
+
+  const onFramePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const distance = Math.hypot(
+      event.clientX - gesture.startClientX,
+      event.clientY - gesture.startClientY,
+    );
+    if (distance >= DRAG_MOVEMENT_THRESHOLD_PX) gesture.moved = true;
+    if (gesture.moved) appendPointerPoint(gesture, event.clientX, event.clientY, true);
+    const points = gesture.moved ? compressDragPoints(gesture.points) : [];
+    const feedback = pointerFeedbackAt(gesture.surface, event.clientX, event.clientY);
+    suppressClickRef.current = gesture.moved;
+    if (gesture.moved) {
+      window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+    }
+    clearPointerGesture();
+    if (points.length >= 2) {
+      event.preventDefault();
+      setPointerFeedback({ ...feedback, dragging: false });
+      void sendInput({ action: "drag", points }).finally(() => setPointerFeedback(null));
+    }
+  };
+
+  const onFramePointerCancel = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = pointerGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    const moved = gesture.moved;
+    suppressClickRef.current = moved;
+    if (moved) {
+      window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+    }
+    clearPointerGesture();
+    controlLifecycleRef.current += 1;
+    relinquishLease();
   };
 
   const onFrameClick = (event: ReactMouseEvent<HTMLDivElement>) => {
     if (!controlling) return;
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
     const point = frameCoordinates(event.clientX, event.clientY);
     if (!point) return;
     if (clickTimerRef.current) clearTimeout(clickTimerRef.current);
@@ -330,6 +597,11 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
       void sendInput({ action: "click", ...point });
     }, 220);
   };
+
+  const waitingForQuickControl = hasQuickControlRequest
+    && !quickControlTimedOut
+    && !state.tabId
+    && !Object.is(consumedControlRequestRef.current, controlRequestId);
 
   return (
     <section className="browser-preview" aria-label={t("browserPreview.title")}>
@@ -404,6 +676,11 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
           role={controlling ? "application" : undefined}
           aria-label={controlling ? t("browserPreview.controlSurface") : undefined}
           onClick={onFrameClick}
+          onPointerDown={onFramePointerDown}
+          onPointerMove={onFramePointerMove}
+          onPointerUp={onFramePointerUp}
+          onPointerCancel={onFramePointerCancel}
+          onLostPointerCapture={onFramePointerCancel}
           onWheel={(event) => {
             if (!controlling) return;
             event.preventDefault();
@@ -424,7 +701,7 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
               alt={t("browserPreview.frameAlt")}
               draggable={false}
             />
-          ) : state.activity === "idle" ? (
+          ) : state.activity === "idle" && !waitingForQuickControl ? (
             <EmptyState
               icon="browser"
               title={t("browserPreview.noBrowser")}
@@ -442,6 +719,18 @@ export function BrowserPreviewView({ scope }: { scope: AgentPreviewScope }) {
               <p>{t("browserPreview.loadingFrameDetail")}</p>
             </div>
           )}
+          {pointerFeedback ? (
+            <span
+              className={pointerFeedback.dragging
+                ? "browser-preview__pointer-feedback is-dragging"
+                : "browser-preview__pointer-feedback"}
+              style={{
+                "--pointer-left": `${pointerFeedback.left}px`,
+                "--pointer-top": `${pointerFeedback.top}px`,
+              } as CSSProperties}
+              aria-hidden="true"
+            />
+          ) : null}
           {!controlling ? <div className="browser-preview__readonly-shield" aria-hidden="true" /> : null}
         </div>
       </div>
