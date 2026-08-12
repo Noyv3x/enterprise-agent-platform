@@ -873,5 +873,6 @@ export interface TopbarInfo {
   title: string;
   icon?: IconName;
   hash?: boolean;
+  publicChannel?: boolean;
   sub: string;
 }

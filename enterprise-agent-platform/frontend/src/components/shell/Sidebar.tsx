@@ -34,15 +34,19 @@ export function Sidebar({ showBrand = true }: { showBrand?: boolean }) {
       {showBrand ? <div className="sidebar__head"><Brand /></div> : null}
       <div className="sidebar__scroll">
         <div>
-          <div className="section-label">
-            <span>{t("nav.channels")}</span>
-            <Badge
-              className="nav__badge"
-              classNames={{ indicator: "nav__badge-indicator" }}
-              count={channelCount}
-              showZero
-              size="small"
-            />
+          <div className="public-channel-heading">
+            <div className="public-channel-heading__title">
+              <Icon name="users" size={17} />
+              <span>{t("nav.channels")}</span>
+              <Badge
+                className="nav__badge public-channel-heading__badge"
+                classNames={{ indicator: "nav__badge-indicator" }}
+                count={channelCount}
+                showZero
+                size="small"
+              />
+            </div>
+            <div className="public-channel-heading__hint">{t("nav.channels.visibility")}</div>
           </div>
           <ChannelList />
           {canManageChannels ? <ChannelCreateForm /> : null}

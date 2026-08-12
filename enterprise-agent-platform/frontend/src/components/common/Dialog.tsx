@@ -14,6 +14,7 @@ export interface DialogProps {
   className?: string;
   closeOnBackdrop?: boolean;
   showCloseButton?: boolean;
+  afterOpenChange?: (open: boolean) => void;
   /** Focus this element after the panel opens. */
   initialFocusRef?: React.RefObject<HTMLElement | null>;
 }
@@ -30,6 +31,7 @@ export function Dialog({
   className,
   closeOnBackdrop = true,
   showCloseButton = true,
+  afterOpenChange,
   initialFocusRef,
 }: DialogProps) {
   const { t } = useI18n();
@@ -57,6 +59,7 @@ export function Dialog({
       keyboard={false}
       destroyOnHidden
       centered
+      afterOpenChange={afterOpenChange}
       modalRender={(node) => id ? <div id={id}>{node}</div> : node}
     >
       {description ? <p className="eap-dialog__description">{description}</p> : null}

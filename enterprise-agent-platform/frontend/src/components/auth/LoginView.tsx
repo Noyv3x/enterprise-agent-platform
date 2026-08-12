@@ -2,8 +2,9 @@
    supplies form controls, validation semantics, loading, and inline feedback. */
 
 import { Alert, Button, Form, Input } from "antd";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { login, runBusy } from "../../data/sessionActions";
+import { isApiError } from "../../lib/api";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
 import { Brand } from "../common/Brand";
@@ -16,6 +17,27 @@ export function LoginView() {
   const { t } = useI18n();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [retryAt, setRetryAt] = useState(0);
+  const [retrySeconds, setRetrySeconds] = useState(0);
+
+  useEffect(() => {
+    if (!retryAt) return;
+    const update = () => {
+      const remaining = Math.max(0, Math.ceil((retryAt - Date.now()) / 1_000));
+      setRetrySeconds(remaining);
+      if (remaining === 0) {
+        setRetryAt(0);
+        store.dispatch({ type: "SET_ERROR", payload: "" });
+      }
+    };
+    update();
+    const timer = window.setInterval(update, 1_000);
+    return () => window.clearInterval(timer);
+  }, [retryAt, store]);
+
+  const displayedError = retrySeconds > 0
+    ? t("auth.rateLimited", { count: retrySeconds })
+    : error;
 
   return (
     <main className="auth auth--login">
@@ -32,7 +54,20 @@ export function LoginView() {
             layout="vertical"
             requiredMark={false}
             onFinish={() => {
-              void runBusy(store, "auth:login", () => login(store, username, password));
+              if (retrySeconds > 0) return;
+              void runBusy(store, "auth:login", async () => {
+                try {
+                  await login(store, username, password);
+                } catch (loginError) {
+                  if (isApiError(loginError, 429) && loginError.code === "login_rate_limited") {
+                    const seconds = loginError.retryAfterSeconds ?? 60;
+                    setRetryAt(Date.now() + seconds * 1_000);
+                    setRetrySeconds(seconds);
+                    throw new Error(t("auth.rateLimited", { count: seconds }));
+                  }
+                  throw loginError;
+                }
+              });
             }}
           >
             <Form.Item className="auth__field" label={t("auth.username")} htmlFor="login-username" required>
@@ -42,8 +77,8 @@ export function LoginView() {
                 autoComplete="username"
                 required
                 placeholder={t("auth.username")}
-                aria-invalid={!!error || undefined}
-                aria-describedby={error ? "login-error" : undefined}
+                aria-invalid={!!displayedError || undefined}
+                aria-describedby={displayedError ? "login-error" : undefined}
                 value={username}
                 onChange={(event) => setUsername(event.target.value)}
                 classNames={{ root: "auth-input__root", input: "auth-input__control" }}
@@ -56,8 +91,8 @@ export function LoginView() {
                 autoComplete="current-password"
                 required
                 placeholder={t("auth.password")}
-                aria-invalid={!!error || undefined}
-                aria-describedby={error ? "login-error" : undefined}
+                aria-invalid={!!displayedError || undefined}
+                aria-describedby={displayedError ? "login-error" : undefined}
                 value={password}
                 onChange={(event) => setPassword(event.target.value)}
                 classNames={{ root: "auth-input__root", input: "auth-input__control" }}
@@ -70,12 +105,16 @@ export function LoginView() {
               htmlType="submit"
               block
               loading={busy}
-              disabled={busy}
+              disabled={busy || retrySeconds > 0}
             >
-              {busy ? t("auth.loggingIn") : t("auth.login")}
+              {busy
+                ? t("auth.loggingIn")
+                : retrySeconds > 0
+                  ? t("auth.retryIn", { count: retrySeconds })
+                  : t("auth.login")}
             </Button>
-            {error ? (
-              <Alert className="auth__error" id="login-error" type="error" showIcon title={error} />
+            {displayedError ? (
+              <Alert className="auth__error" id="login-error" type="error" showIcon title={displayedError} />
             ) : null}
           </Form>
         </section>

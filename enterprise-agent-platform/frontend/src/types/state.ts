@@ -88,6 +88,8 @@ export interface AppState {
 
   /* ui slice */
   sidebarOpen: boolean;
+  personalAiGuideOpen: boolean;
+  personalAiGuideShownThisSession: boolean;
   resourceStates: Record<string, ResourceState>;
 }
 
@@ -181,7 +183,10 @@ export type AdminSliceState = Pick<
   | "oauthCallbackUrls"
 >;
 
-export type UiSliceState = Pick<AppState, "sidebarOpen" | "resourceStates">;
+export type UiSliceState = Pick<
+  AppState,
+  "sidebarOpen" | "personalAiGuideOpen" | "personalAiGuideShownThisSession" | "resourceStates"
+>;
 
 /* ===================================================================== */
 /* Action discriminated union — the contract every reducer is filled against. */
@@ -450,6 +455,10 @@ interface SetSidebarOpenAction {
 interface ToggleSidebarAction {
   type: "TOGGLE_SIDEBAR";
 }
+interface SetPersonalAiGuideOpenAction {
+  type: "SET_PERSONAL_AI_GUIDE_OPEN";
+  payload: { open: boolean; markShown?: boolean };
+}
 interface SetResourceStateAction {
   type: "SET_RESOURCE_STATE";
   payload: { key: string; state: ResourceState };
@@ -521,6 +530,7 @@ export type Action =
   /* ui */
   | SetSidebarOpenAction
   | ToggleSidebarAction
+  | SetPersonalAiGuideOpenAction
   | SetResourceStateAction;
 
 /** Discriminated-union helper: the action for a given `type`. */

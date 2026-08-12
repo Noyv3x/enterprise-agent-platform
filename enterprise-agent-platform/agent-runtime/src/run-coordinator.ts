@@ -21,6 +21,7 @@ import { ApprovalBroker } from "./approval-broker.js";
 import { redactCommandForApproval, redactToolArgumentsForJournal } from "./approval-policy.js";
 import { CONTAINER_PATHS, EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import { EventJournal } from "./event-journal.js";
+import { MODEL_STREAM_MAX_RETRIES, withModelStreamRetry } from "./model-stream-retry.js";
 import { redactToolArgumentsForModelHistory } from "./model-history.js";
 import {
   createExecutionManager,
@@ -1219,7 +1220,22 @@ export class RunCoordinator {
           signal,
         ),
       };
-      if (this.streamFn) agentOptions.streamFn = this.streamFn;
+      agentOptions.streamFn = withModelStreamRetry(this.streamFn ?? streamSimple, {
+        onRetry: (attempt, delayMs) => this.touchRunActivity(
+          record.id,
+          `retrying transient model failure (${attempt}/${MODEL_STREAM_MAX_RETRIES}) after ${delayMs} ms`,
+        ),
+        ...(this.config.runIdleTimeoutMs > 0 ? {
+          activityHeartbeatMs: Math.max(
+            1,
+            Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3)),
+          ),
+          onRetryActivity: () => this.touchRunActivity(
+            record.id,
+            "waiting to retry transient model failure",
+          ),
+        } : {}),
+      });
       if (record.controller.signal.aborted) throw abortError();
       agent = new Agent(agentOptions);
       this.agents.set(record.id, agent);

@@ -27,6 +27,18 @@ describe("Sylver Lining platform connection endpoint", () => {
       "/api/private-agent/integrations/sylver-platform",
     );
   });
+
+  it("uses an account-scoped administrator resource and a separate verification action", () => {
+    const path = "/api/admin/users/user%2F7/integrations/sylver-platform";
+    expect(endpoints.adminSylverPlatformConnection).toMatchObject({ method: "GET" });
+    expect(endpoints.verifyAdminSylverPlatformConnection).toMatchObject({ method: "POST" });
+    expect(endpoints.updateAdminSylverPlatformConnection).toMatchObject({ method: "PUT" });
+    expect(endpoints.deleteAdminSylverPlatformConnection).toMatchObject({ method: "DELETE" });
+    expect(endpoints.adminSylverPlatformConnection.path("user/7")).toBe(path);
+    expect(endpoints.verifyAdminSylverPlatformConnection.path("user/7")).toBe(`${path}/verify`);
+    expect(endpoints.updateAdminSylverPlatformConnection.path("user/7")).toBe(path);
+    expect(endpoints.deleteAdminSylverPlatformConnection.path("user/7")).toBe(path);
+  });
 });
 
 describe("channel message withdrawal endpoint", () => {

@@ -23,6 +23,7 @@ import { Drawer } from "../../common/Drawer";
 import { Icon } from "../../common/Icon";
 import { AccountModelSelect } from "./AccountModelSelect";
 import { PermissionGroupSelect, permissionGroupLabel } from "./PermissionGroupSelect";
+import { SylverPlatformAccountDrawer } from "./SylverPlatformAccountDrawer";
 import { ThinkingDepthSelect } from "./ThinkingDepthSelect";
 
 interface AccountEditorProps {
@@ -212,6 +213,7 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
   const impersonating = useStore((state) => state.pendingOperations.includes(`admin:accounts:impersonate:${user.id}`));
   const currentUserId = useStore((state) => state.user?.id);
   const [editOpen, setEditOpen] = useState(false);
+  const [sylverOpen, setSylverOpen] = useState(false);
   const { confirm, dialog } = useConfirm();
   const selfDisabled = user.id === currentUserId;
   const canImpersonate = !selfDisabled && !!user.active;
@@ -227,30 +229,44 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
     );
     if (ok) await impersonateAccount(store, user.id);
   };
-  const menuItems: MenuProps["items"] = [{
-    key: "impersonate",
-    label: t("admin.accounts.impersonate"),
-    disabled: impersonateDisabled,
-  }];
+  const menuItems: MenuProps["items"] = [
+    {
+      key: "sylver",
+      label: t("admin.accounts.sylver.manage"),
+    },
+    { type: "divider" },
+    {
+      key: "impersonate",
+      label: t("admin.accounts.impersonate"),
+      disabled: impersonateDisabled,
+    },
+  ];
   return (
     <>
       <Space className="eap-admin-account-actions" size={4}>
         <Button type="text" size="small" icon={<Icon name="settings" size={15} />} onClick={() => setEditOpen(true)}>
           {t("admin.accounts.edit")}
         </Button>
-        {canImpersonate ? (
-          <Dropdown
-            menu={{ items: menuItems, onClick: ({ key }) => key === "impersonate" && void handleImpersonate() }}
-            placement="bottomRight"
-            trigger={["click"]}
-          >
-            <Button type="text" size="small" loading={impersonating}>
-              {t("admin.accounts.more")}
-            </Button>
-          </Dropdown>
-        ) : null}
+        <Dropdown
+          menu={{
+            items: menuItems,
+            onClick: ({ key }) => {
+              if (key === "sylver") setSylverOpen(true);
+              if (key === "impersonate") void handleImpersonate();
+            },
+          }}
+          placement="bottomRight"
+          trigger={["click"]}
+        >
+          <Button type="text" size="small" loading={impersonating}>
+            {t("admin.accounts.more")}
+          </Button>
+        </Dropdown>
       </Space>
       {editOpen ? <AccountEditor user={user} groups={groups} open onClose={() => setEditOpen(false)} /> : null}
+      {sylverOpen ? (
+        <SylverPlatformAccountDrawer user={user} open onClose={() => setSylverOpen(false)} />
+      ) : null}
       {dialog}
     </>
   );

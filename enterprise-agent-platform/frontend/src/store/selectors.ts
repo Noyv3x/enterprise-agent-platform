@@ -120,6 +120,7 @@ export function topbarInfo(state: AppState, translate: Translator = defaultTrans
   return {
     title: ch?.name || translate("nav.channel"),
     hash: true,
+    publicChannel: !!ch,
     sub: ch
       ? active || translate("nav.topbar.channelMessages", { count: state.messages.length })
       : translate("nav.topbar.selectChannel"),

@@ -62,11 +62,33 @@ describe("LoginView", () => {
     await user.type(screen.getByLabelText("Password"), "secret-pass");
     await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Invalid credentials");
+    expect(await screen.findByRole("alert")).toHaveTextContent("The username or password is incorrect.");
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
       method: "POST",
       body: JSON.stringify({ username: "avery", password: "secret-pass" }),
     });
+  });
+
+  it("honors login Retry-After and blocks repeat submissions during the countdown", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ error: "too many attempts", code: "login_rate_limited" }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "2" } },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+    renderLogin();
+
+    await user.type(screen.getByLabelText("Username"), "avery");
+    await user.type(screen.getByLabelText("Password"), "wrong-pass");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Too many sign-in attempts. Try again in 2 seconds.",
+    );
+    const blocked = screen.getByRole("button", { name: /Retry in 2s/ });
+    expect(blocked).toBeDisabled();
+    await user.click(blocked);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

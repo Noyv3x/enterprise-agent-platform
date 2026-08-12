@@ -4,9 +4,9 @@ export const memoryMessages = defineMessages({
   "memory.open": { "zh-CN": "打开记忆管理", en: "Open memory manager", "zh-TW": "開啟記憶管理" },
   "memory.title": { "zh-CN": "记忆管理", en: "Memory", "zh-TW": "記憶管理" },
   "memory.description": {
-    "zh-CN": "查看和管理私人 Agent 会在以后对话中使用的信息。",
-    en: "Review and manage information your Private Agent can use in future conversations.",
-    "zh-TW": "檢視和管理私人 Agent 會在之後對話中使用的資訊。",
+    "zh-CN": "查看和管理个人 AI 会在以后对话中使用的信息。",
+    en: "Review and manage information your Personal AI can use in future conversations.",
+    "zh-TW": "檢視和管理個人 AI 會在之後對話中使用的資訊。",
   },
   "memory.target.agent": { "zh-CN": "Agent 记忆", en: "Agent memory", "zh-TW": "Agent 記憶" },
   "memory.target.user": { "zh-CN": "我的资料", en: "About me", "zh-TW": "我的資料" },
@@ -62,14 +62,14 @@ export const memoryMessages = defineMessages({
   },
   "memory.empty": { "zh-CN": "这里还没有记忆", en: "No memories here yet", "zh-TW": "這裡還沒有記憶" },
   "memory.emptyDetail.agent": {
-    "zh-CN": "你可以直接添加，私人 Agent 也会自动保存有长期价值的稳定事实。",
-    en: "Add one directly, or let your Private Agent automatically retain stable facts with lasting value.",
-    "zh-TW": "你可以直接新增，私人 Agent 也會自動儲存有長期價值的穩定事實。",
+    "zh-CN": "你可以直接添加，个人 AI 也会自动保存有长期价值的稳定事实。",
+    en: "Add one directly, or let your Personal AI automatically retain stable facts with lasting value.",
+    "zh-TW": "你可以直接新增，個人 AI 也會自動儲存有長期價值的穩定事實。",
   },
   "memory.emptyDetail.user": {
-    "zh-CN": "添加希望私人 Agent 长期记住的偏好或个人资料。",
-    en: "Add preferences or profile details you want your Private Agent to remember.",
-    "zh-TW": "新增希望私人 Agent 長期記住的偏好或個人資料。",
+    "zh-CN": "添加希望个人 AI 长期记住的偏好或个人资料。",
+    en: "Add preferences or profile details you want your Personal AI to remember.",
+    "zh-TW": "新增希望個人 AI 長期記住的偏好或個人資料。",
   },
   "memory.noResults": { "zh-CN": "没有匹配的记忆", en: "No matching memories", "zh-TW": "沒有符合的記憶" },
   "memory.noResultsDetail": {
@@ -117,9 +117,9 @@ export const memoryMessages = defineMessages({
   },
   "memory.deleteConfirmTitle": { "zh-CN": "删除这条记忆？", en: "Delete this memory?", "zh-TW": "刪除這則記憶？" },
   "memory.deleteConfirm": {
-    "zh-CN": "删除后，私人 Agent 将不再从记忆中读取这条信息。此操作无法撤销。",
-    en: "Your Private Agent will no longer read this information from memory. This cannot be undone.",
-    "zh-TW": "刪除後，私人 Agent 將不再從記憶中讀取這則資訊。此操作無法復原。",
+    "zh-CN": "删除后，个人 AI 将不再从记忆中读取这条信息。此操作无法撤销。",
+    en: "Your Personal AI will no longer read this information from memory. This cannot be undone.",
+    "zh-TW": "刪除後，個人 AI 將不再從記憶中讀取這則資訊。此操作無法復原。",
   },
   "memory.clearConfirmTitle": {
     "zh-CN": "清空“{target}”？",

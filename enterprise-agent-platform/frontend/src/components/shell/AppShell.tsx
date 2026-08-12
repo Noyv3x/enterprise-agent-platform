@@ -8,7 +8,7 @@
 */
 
 import { Drawer } from "antd";
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { usePolling } from "../../hooks/usePolling";
 import { useRealtime } from "../../hooks/useRealtime";
@@ -21,6 +21,8 @@ import { Topbar } from "./Topbar";
 import { ensureCurrentUserTimezone } from "../../data/accountActions";
 import { Brand } from "../common/Brand";
 import { Icon } from "../common/Icon";
+import { PersonalAiComposerFocusContext } from "./PersonalAiGuideContext";
+import { PersonalAiGuideDialog } from "./PersonalAiGuideDialog";
 
 export function AppShell() {
   const store = useStoreHandle();
@@ -29,6 +31,11 @@ export function AppShell() {
   const userId = useStore((state) => state.user?.id);
   const userTimezone = useStore((state) => state.user?.timezone);
   const isMobile = useMediaQuery("(max-width: 800px)");
+  const [personalAiComposerFocusToken, setPersonalAiComposerFocusToken] = useState(0);
+  const requestPersonalAiComposerFocus = useCallback(
+    () => setPersonalAiComposerFocusToken((token) => token + 1),
+    [],
+  );
 
   // A connected stream uses cheap revision events for normal delivery. Keep a
   // low-frequency watchdog as well: if the one GET triggered by an SSE event
@@ -52,7 +59,7 @@ export function AppShell() {
   const closeSidebar = () => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
 
   return (
-    <>
+    <PersonalAiComposerFocusContext.Provider value={personalAiComposerFocusToken}>
       <a className="skip-link" href="#main-content">{t("shell.skipToContent")}</a>
       <div className="shell">
         {isMobile ? (
@@ -87,6 +94,7 @@ export function AppShell() {
           <ContentRouter />
         </main>
       </div>
-    </>
+      <PersonalAiGuideDialog onDraftFilled={requestPersonalAiComposerFocus} />
+    </PersonalAiComposerFocusContext.Provider>
   );
 }

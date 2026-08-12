@@ -77,23 +77,23 @@ Skill 采用 Hermes 风格的“索引后按需读取”机制：正常 Run 只�
 
 ## Sylver Lining 工作平台
 
-该连接器是当前提供方 REST API 的原生适配器，不是 MCP 客户端，也不运行上游 `ubi.py`、`worker.py`、Claude/Codex CLI 或任意远程脚本。提供方 origin 固定为 `https://devops.sylver-lining.org`，产品 API、界面、模型和本地设置均不能覆盖；每个有私人 Agent 权限的用户最多提交一个自己的 Personal API Token。Platform 在保存前以候选凭据请求固定 origin 的 `GET /api/auth/me`，完整验证身份响应后才原子保存连接、凭据和验证快照；测试通过注入确定性 transport 隔离真实网络。读取接口只返回远端身份及 `credential_configured`，永不回传 Token。
+该连接器是当前提供方 REST API 的原生适配器，不是 MCP 客户端，也不运行上游 `ubi.py`、`worker.py`、Claude/Codex CLI 或任意远程脚本。提供方 origin 固定为 `https://devops.sylver-lining.org`，产品 API、界面、模型和本地设置均不能覆盖；每个本地用户最多关联一个 Personal API Token。用户可管理自己的连接，管理员可通过独立的目标账号资源查看、预验证、确认替换或断开任意现存账号，但不能读取既有凭据。管理员预验证只返回清洗后的远端身份；确认请求带预期远端用户 ID，Platform 再次请求固定 origin 的 `GET /api/auth/me` 并核对身份后才原子保存连接、凭据和验证快照。用户自助入口同样在保存前完整验证身份；测试通过注入确定性 transport 隔离真实网络。所有读取接口只返回远端身份及 `credential_configured`，永不回传 Token。
 
 Runtime 只获得固定、闭世界的 `sylver_platform` 业务动作，不接受 URL、HTTP method、path、header、Token、owner 或 scope。首版读取身份、项目、项目上下文、任务与活动、Wiki 文档、审批详情与评论和通知；写动作只包括创建任务、开始任务、添加任务活动、提交 Wiki 提案和添加普通审批评论。任务列表默认只读当前远端身份获分配的任务，审批列表默认读取 inbox，通知列表默认只读未读通知；模型只有显式覆盖参数才请求其它集合。创建任务必须带至少一个真实 tag、明确起止日期，并以正整数 `milestone_id` 选择里程碑或以显式 `null` 表示用户确认跳过；不能省略该决定。普通任务描述使用首行摘要和后续 `- ` 要点。Platform 在任何写请求前读取项目 workflow：存在且仅存在 `proposed` category 时省略 `status_id` 以保留远端提案闸，并允许传入真实 `proposal_approver_id`；不存在 `proposed` 时必须解析唯一 `backlog` status 并显式发送，此时提供 `proposal_approver_id` 必须在建任务前拒绝，workflow 缺失或歧义同样失败关闭。`start_task` 必须显式提供要写入活动流的简短 note；`propose_wiki` 必须显式提供 `content_format` 和 `order`，不能让未展示的客户端默认值进入写请求。所有写动作逐次审批，unattended Run 只读；原始完整审批参数在任何脱敏前超过 16 KiB 或含不可见控制字符时失败关闭，通过后展示完整的脱敏短正文，展示投影也不得超限。审批决定/拒绝、跳过审查、强制完成、员工管理、任意 REST、直接 Wiki 删除、待处理 Wiki 提案列表和 Apifox 同步不进入首版工具表。远端响应和错误始终是不可信工具结果。
 
-Platform 是唯一 HTTP 调用方：凭据只在当前请求闭包中注入，拒绝携带凭据的重定向，限制连接/读取时间、响应类型和正文大小，并只访问代码锁定的官方 origin。解析成功响应后必须递归清除敏感字段值和当前 Token 的任何精确回显；`/api/auth/me` 出现当前 Token 回显时整次身份验证失败，不能把污染身份写入数据库。连接、重连与断开从同一用户请求入口起串行，较早的慢验证不能在较新的断开或重连之后复活旧凭据。写调用在发送前标记副作用；请求发送后的超时、连接中断、成功响应解析失败或 `5xx` 必须明确报告结果不确定，并要求先读取权威远端状态，不得自动重放。外部平台自己的审批门继续是最终业务边界，本地工具审批不能代替远端权限检查。
+Platform 是唯一 HTTP 调用方：凭据只在当前请求闭包中注入，拒绝携带凭据的重定向，限制连接/读取时间、响应类型和正文大小，并只访问代码锁定的官方 origin。解析成功响应后必须递归清除敏感字段值和当前 Token 的任何精确回显；`/api/auth/me` 出现当前 Token 回显时整次身份验证失败，不能把污染身份写入数据库。用户与管理员入口的连接、重连、断开以及 Agent 工具真实调用按同一本地 owner 串行，较早的慢验证不能在较新的断开或重连之后复活旧凭据，管理操作返回后也不能留有使用旧 Token 的在途工具请求。写调用在发送前标记副作用；请求发送后的超时、连接中断、成功响应解析失败或 `5xx` 必须明确报告结果不确定，并要求先读取权威远端状态，不得自动重放。外部平台自己的审批门继续是最终业务边界，本地工具审批不能代替远端权限检查。
 
 上游私有 Skill 只作为开发期规则与接口参考。当前上游没有随仓库提供 OpenAPI，因此仓库同时锁定已审阅 commit、`SKILL.md` 与 `scripts/ubi.py` 摘要；前者提供业务规则，后者是当前固定 REST 路径与复合动作的参考，二者都不作为运行时代码执行。开发机 GitHub 凭据位于 Git 元数据目录的 owner-only 本地文件，本地 checkout 也只缓存于 Git 元数据目录，发布物、镜像和部署机均不包含它。同步工具使用进程内临时认证 header 获取精确仓库/分支并报告两个输入的锁定版本与上游差异；确认规则、接口、文档、连接器与测试已同步后，开发者才显式更新两个摘要及锁定 revision。上游内容不能在 Runtime 动态挂载或直接执行；两个参考输入冲突或出现未审阅接口变化时停止更新而不是猜测。本地 bundled Skill 是受控业务子集，不承诺复制上游 CLI 的 Git/PR、worker、管理接口或专用 UI 提案正文流程。
 
 ## Telegram
 
-Telegram Gateway 只处理私聊，忽略群组、超级群组和频道。用户在私人 Agent 界面生成短时绑定码，通过 `/link CODE` 或 `/start CODE` 绑定身份。
+Telegram Gateway 只处理私聊，忽略群组、超级群组和频道。用户在个人 AI 界面生成短时绑定码，通过 `/link CODE` 或 `/start CODE` 绑定身份。
 
 update id 是入站去重边界；未确认 update 可在重启后重新领取。出站回复使用持久 delivery job；已开始发送但结果未知的任务进入 `needs_review`，不能盲目重复。停用或轮换 bot 时先吊销旧 sender generation，再停止 transport。
 
 ## 邮箱
 
-私人 Agent 可以配置标准 IMAP/SMTP 邮箱账户与应用专用密码。Platform 使用系统 CA 验证 IMAPS、SMTPS 或 STARTTLS，不增加邮件容器，也不把密码交给 Runtime、Sandbox、日志或工具结果。界面只管理账户、测试连接、立即检查和收信唤醒开关，不实现第二个完整邮件客户端。
+个人 AI 可以配置标准 IMAP/SMTP 邮箱账户与应用专用密码。Platform 使用系统 CA 验证 IMAPS、SMTPS 或 STARTTLS，不增加邮件容器，也不把密码交给 Runtime、Sandbox、日志或工具结果。界面只管理账户、测试连接、立即检查和收信唤醒开关，不实现第二个完整邮件客户端。
 
 `mail` 工具支持列账户、文件夹、搜索、读取、发送、回复、移动、标记与把附件安全保存到当前工作区。所有权由可信私人 scope 派生；频道、委派或其他用户不能访问账户。交互式搜索也必须先用 `UIDNEXT` 限定最近的有界 UID 窗口，不能让 `SEARCH ALL` 为大邮箱生成无界响应；读取完整正文前先读取 `RFC822.SIZE` 并拒绝超限或缺失大小的响应。邮件正文、头部和附件名始终作为不可信工具结果。发送使用持久幂等投递记录：明确成功才完成，明确失败可由新请求重试，结果未知进入 `needs_review`，不得盲目重发；“删除”只移动到 Trash，不执行不可恢复 expunge。
 

@@ -3,9 +3,9 @@ import { defineMessages } from "../types";
 export const mailMessages = defineMessages({
   "mail.title": { "zh-CN": "邮件账户", en: "Mail accounts", "zh-TW": "郵件帳戶" },
   "mail.description": {
-    "zh-CN": "添加标准 IMAP/SMTP 邮箱后，私人 Agent 可以收发和管理邮件。请使用应用专用密码。",
-    en: "Add a standard IMAP/SMTP account so your Private Agent can read, send, and manage mail. Use an app password.",
-    "zh-TW": "新增標準 IMAP/SMTP 郵箱後，私人 Agent 可以收發和管理郵件。請使用應用程式專用密碼。",
+    "zh-CN": "添加标准 IMAP/SMTP 邮箱后，个人 AI 可以收发和管理邮件。请使用应用专用密码。",
+    en: "Add a standard IMAP/SMTP account so your Personal AI can read, send, and manage mail. Use an app password.",
+    "zh-TW": "新增標準 IMAP/SMTP 郵箱後，個人 AI 可以收發和管理郵件。請使用應用程式專用密碼。",
   },
   "mail.add": { "zh-CN": "添加账户", en: "Add account", "zh-TW": "新增帳戶" },
   "mail.addTitle": { "zh-CN": "添加邮件账户", en: "Add mail account", "zh-TW": "新增郵件帳戶" },

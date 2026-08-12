@@ -7,9 +7,9 @@ export const sylverPlatformMessages = defineMessages({
     "zh-TW": "Sylver Lining 工作平台",
   },
   "sylverPlatform.description": {
-    "zh-CN": "连接你的工作平台账号，让私人 Agent 使用受控工具读取项目资料并提交工作进度。",
-    en: "Connect your work-platform account so your Private Agent can read project context and submit progress through controlled tools.",
-    "zh-TW": "連接你的工作平台帳戶，讓私人 Agent 使用受控工具讀取專案資料並提交工作進度。",
+    "zh-CN": "连接你的工作平台账号，让个人 AI 使用受控工具读取项目资料并提交工作进度。",
+    en: "Connect your work-platform account so your Personal AI can read project context and submit progress through controlled tools.",
+    "zh-TW": "連接你的工作平台帳戶，讓個人 AI 使用受控工具讀取專案資料並提交工作進度。",
   },
   "sylverPlatform.baseUrl": {
     "zh-CN": "平台网址",

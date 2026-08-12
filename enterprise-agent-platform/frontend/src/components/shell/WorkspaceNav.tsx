@@ -39,6 +39,13 @@ export function WorkspaceNav() {
       </span>
     ),
   }));
+  if (perms.has("private_agent")) {
+    items.push({
+      key: "personal-ai-guide",
+      icon: <Icon name="sparkles" />,
+      label: <span className="shell-menu__label">{t("personalAi.guide.sidebar")}</span>,
+    });
+  }
 
   return (
     <nav className="nav" aria-label={t("shell.navigation")}>
@@ -52,7 +59,17 @@ export function WorkspaceNav() {
           itemIcon: "shell-menu__icon",
           itemContent: "shell-menu__content",
         }}
-        onClick={({ key }) => void navigateToView(store, key as ActiveView)}
+        onClick={({ key }) => {
+          if (key === "personal-ai-guide") {
+            void navigateToView(store, "private");
+            store.dispatch({
+              type: "SET_PERSONAL_AI_GUIDE_OPEN",
+              payload: { open: true, markShown: true },
+            });
+            return;
+          }
+          void navigateToView(store, key as ActiveView);
+        }}
       />
     </nav>
   );

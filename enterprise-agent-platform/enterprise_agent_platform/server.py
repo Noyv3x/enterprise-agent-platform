@@ -617,7 +617,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             payload = {"error": exc.message}
             if exc.code:
                 payload["code"] = exc.code
-            self._json(payload, status=exc.status)
+            headers = None
+            if exc.retry_after_seconds:
+                headers = {"Retry-After": str(exc.retry_after_seconds)}
+            self._json(payload, status=exc.status, headers=headers)
         except Exception as exc:
             traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
             self._json({"error": "internal server error"}, status=500)
@@ -673,7 +676,10 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _handle_api(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         service = self.server.service
         if path == "/api/auth/login" and method == "POST":
-            body = self._body_json()
+            body = self._body_json_closed_world(
+                frozenset({"username", "password"}),
+                maximum_bytes=4 * 1024,
+            )
             token, user = service.authenticate(
                 str(body.get("username", "")),
                 str(body.get("password", "")),
@@ -792,6 +798,54 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             token, user = service.impersonate_user(actor, int(m.group(1)))
             self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
+            return
+        m = re.fullmatch(
+            r"/api/admin/users/(\d+)/integrations/sylver-platform/verify",
+            path,
+        )
+        if m and method == "POST":
+            self._json(
+                service.verify_admin_sylver_platform_connection(
+                    actor,
+                    int(m.group(1)),
+                    self._body_json_closed_world(
+                        frozenset({"token"}),
+                        maximum_bytes=8 * 1024,
+                    ),
+                )
+            )
+            return
+        m = re.fullmatch(
+            r"/api/admin/users/(\d+)/integrations/sylver-platform",
+            path,
+        )
+        if m and method == "GET":
+            self._json(
+                service.get_admin_sylver_platform_connection(
+                    actor,
+                    int(m.group(1)),
+                )
+            )
+            return
+        if m and method == "PUT":
+            self._json(
+                service.put_admin_sylver_platform_connection(
+                    actor,
+                    int(m.group(1)),
+                    self._body_json_closed_world(
+                        frozenset({"token", "expected_remote_user_id"}),
+                        maximum_bytes=8 * 1024,
+                    ),
+                )
+            )
+            return
+        if m and method == "DELETE":
+            self._json(
+                service.delete_admin_sylver_platform_connection(
+                    actor,
+                    int(m.group(1)),
+                )
+            )
             return
         m = re.fullmatch(r"/api/users/(\d+)", path)
         if m and method == "PUT":
@@ -1079,7 +1133,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(
                 service.put_private_sylver_platform_connection(
                     actor,
-                    self._body_json_closed_world(frozenset({"token"})),
+                    self._body_json_closed_world(
+                        frozenset({"token"}),
+                        maximum_bytes=8 * 1024,
+                    ),
                 )
             )
             return

@@ -25,6 +25,8 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 创建请求的 `idempotency_key` 在 `scope_key` 内唯一。终态结果原子保存；重复创建返回既有 Run。重启时发现已经开始但没有终态的幂等 Run，必须返回 `needs_review`，不能自动重做。
 
+Agent 主循环中的模型供应商过载、限流、可重试服务端错误和瞬时网络故障，在单次模型请求边界进行有界指数退避与抖动重试。只有失败 attempt 尚未向 Agent loop 提交任何非空正文、思考或工具调用时才可丢弃并重发相同请求；一旦已有可见增量，或错误属于上下文/输出大小、额度、账单、认证、内容策略等非瞬时类别，就不得自动重试。这个机制可以重试工具完成后的下一次模型请求，但不能重新开始整个 Run、重放 session 中已完成的模型轮次或再次执行工具。退避等待可被 Run 取消并持续刷新活动；预算耗尽后仍按现有 `failed` / `needs_review` 与副作用事实终结。这个主循环策略不扩展到 browser 结果的视觉辅助分析；该辅助请求仍使用自身有界 timeout 与文本 fallback，不得因重试阻塞工具结果回到主循环。
+
 私人交互 Run 可以接收追加输入。输入按 message id 持久化并返回 accepted、injected 或 unconsumed；只有模型循环确认注入后，Platform 才能把该输入视为已消费。
 
 产品界面对用户本人频道消息的撤回不属于 Runtime 取消协议。消息已经形成 durable job 或进入 Run 后，撤回只隐藏 Platform 产品消息，不改写 session journal、不撤销输入，也不终止 Run；需要停止工作时仍必须使用明确的取消或 scope cleanup 语义。

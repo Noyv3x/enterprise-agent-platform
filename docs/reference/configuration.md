@@ -86,7 +86,7 @@ Platform 命令行只有当前容器入口使用的 `serve --host --port --data`
 
 若无管理员密码，Platform 生成随机密码并写入数据根的 owner-only bootstrap 文件。显式首次 bootstrap 值不覆盖已有账号。已有数据库使用其中持久化的 session secret；新库使用 Manager 文件并把值持久化。Agent tool token 与 Runtime token 属于当前容器 generation 的内部能力，Platform 启动时把 Manager 文件中的值原子同步到自己的 secret store。该同步不导出 OAuth、Telegram 或其它产品 secret。
 
-Platform 的 SQLite 机器自有 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。其它前缀、旧键或混合键直接拒绝；Platform 不提供双读回退，也不会在启动或管理员更新时补写旧键。
+Platform 的 SQLite 机器身份 secret 键只能是 `AGENT_PLATFORM_SESSION_SECRET`、`AGENT_PLATFORM_TELEGRAM_BOT_TOKEN` 和 `AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET`。登录防爆破状态另使用保留的内部前缀 `AGENT_PLATFORM_LOGIN_FAILURE_V1:`；这些行不是配置项，不进入管理员 Secret 列表或环境变量入口，并随窗口过期清除。除此之外的机器前缀、旧键或混合键直接拒绝；Platform 不提供双读回退，也不会在启动或管理员更新时补写旧键。
 
 ## Platform 动态设置
 
@@ -124,7 +124,7 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。公网 listen
 
 私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。
 
-Sylver Lining 工作平台连接属于每用户产品设置，不是 Manager 或容器环境配置。提供方 origin 固定为 `https://devops.sylver-lining.org`；普通用户通过 `/api/private-agent/integrations/sylver-platform` 只提交候选 Personal API Token，Platform 先请求 `/api/auth/me` 验证远端身份，再把 Token 写入独立凭据行。读取只返回固定 origin、身份投影和 `credential_configured`。该 origin 和凭据都不提供环境变量或管理员覆盖入口，凭据也不进入 Sandbox、Runtime metadata 或开发期上游 Git 凭据。
+Sylver Lining 工作平台连接属于每用户产品设置，不是 Manager 或容器环境配置。提供方 origin 固定为 `https://devops.sylver-lining.org`；普通用户通过 `/api/private-agent/integrations/sylver-platform` 提交自己的候选 Personal API Token，管理员通过 `/api/admin/users/{user_id}/integrations/sylver-platform` 代表目标账号读取、确认替换或断开，并通过其 `/verify` 子资源预览候选远端身份。Platform 在每次保存前请求 `/api/auth/me` 验证并核对远端身份，再把 Token 写入独立凭据行。读取只返回固定 origin、身份投影和 `credential_configured`。origin 不提供环境变量或产品覆盖，凭据不进入 Sandbox、Runtime metadata 或开发期上游 Git 凭据；管理员入口也不能回读任何凭据表示。
 
 ### Telegram 与自动更新
 

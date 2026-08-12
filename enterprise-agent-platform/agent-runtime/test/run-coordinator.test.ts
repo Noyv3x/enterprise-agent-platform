@@ -2767,6 +2767,56 @@ test("text-only Codex browser vision timeout degrades to snapshot text without f
   }
 });
 
+test("an invisible overload after a mutation retries only the next model turn", async () => {
+  const home = await temporaryDirectory("agent-model-retry-mutation-");
+  const workspace = await temporaryDirectory("agent-model-retry-mutation-workspace-");
+  const arguments_ = { command: "printf mutation" };
+  await grantAlways(home, "scope", "terminal", arguments_, workspace);
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("terminal", arguments_),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage: "Codex error: Our servers are currently overloaded. Please try again later.",
+    }),
+    fauxAssistantMessage("The terminal command completed."),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "model-retry-mutation",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "write the file",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+
+    assert.equal(completed.status, "completed", completed.error);
+    assert.equal(completed.result?.content, "The terminal command completed.");
+    assert.equal(faux.state.callCount, 3);
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().filter(
+        (event) => event.type === "tool.started" && event.data.tool_name === "terminal",
+      ).length,
+      1,
+      "retrying the empty provider attempt must not replay the completed mutation",
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 function codexModelId(imageCapable: boolean): string {
   const model = productModelCatalogs()["openai-codex"].models.find(
     (candidate) => candidate.input.includes("image") === imageCapable,

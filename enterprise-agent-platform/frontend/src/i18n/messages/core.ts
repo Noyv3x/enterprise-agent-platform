@@ -3,9 +3,9 @@ import { defineMessages } from "../types";
 export const coreMessages = defineMessages({
   "app.title": { "zh-CN": "Agent Platform", en: "Agent Platform", "zh-TW": "Agent Platform" },
   "app.description": {
-    "zh-CN": "{product} - 频道协作、私人 Agent、知识库与运行时管理。",
-    en: "{product} - channels, private agents, knowledge, and runtime management.",
-    "zh-TW": "{product} - 頻道協作、私人 Agent、知識庫與執行環境管理。",
+    "zh-CN": "{product} - 公共频道、个人 AI、知识库与运行时管理。",
+    en: "{product} - public channels, Personal AI, knowledge, and runtime management.",
+    "zh-TW": "{product} - 公共頻道、個人 AI、知識庫與執行環境管理。",
   },
   "language.label": { "zh-CN": "语言", en: "Language", "zh-TW": "語言" },
   "common.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
@@ -14,7 +14,7 @@ export const coreMessages = defineMessages({
   "common.loading": { "zh-CN": "正在加载", en: "Loading", "zh-TW": "正在載入" },
   "shell.skipToContent": { "zh-CN": "跳到主要内容", en: "Skip to main content", "zh-TW": "跳到主要內容" },
   "shell.navigation": { "zh-CN": "主导航", en: "Main navigation", "zh-TW": "主導覽" },
-  "shell.channelsNavigation": { "zh-CN": "频道导航", en: "Channel navigation", "zh-TW": "頻道導覽" },
+  "shell.channelsNavigation": { "zh-CN": "公共频道导航", en: "Public channel navigation", "zh-TW": "公共頻道導覽" },
   "shell.tools": { "zh-CN": "工具", en: "Tools", "zh-TW": "工具" },
   "shell.userMenu.open": { "zh-CN": "打开用户菜单", en: "Open user menu", "zh-TW": "開啟使用者選單" },
   "shell.userMenu.settings": { "zh-CN": "个人设置", en: "Personal settings", "zh-TW": "個人設定" },
@@ -27,6 +27,21 @@ export const coreMessages = defineMessages({
   "auth.loggingIn": { "zh-CN": "正在登录…", en: "Signing in…", "zh-TW": "正在登入…" },
   "auth.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },
   "auth.password": { "zh-CN": "密码", en: "Password", "zh-TW": "密碼" },
+  "auth.invalidCredentials": {
+    "zh-CN": "用户名或密码错误。",
+    en: "The username or password is incorrect.",
+    "zh-TW": "使用者名稱或密碼錯誤。",
+  },
+  "auth.rateLimited": {
+    "zh-CN": "登录尝试过多，请在 {count} 秒后重试。",
+    en: "Too many sign-in attempts. Try again in {count} seconds.",
+    "zh-TW": "登入嘗試過多，請在 {count} 秒後重試。",
+  },
+  "auth.retryIn": {
+    "zh-CN": "{count} 秒后可重试",
+    en: "Retry in {count}s",
+    "zh-TW": "{count} 秒後可重試",
+  },
   "boot.connecting": { "zh-CN": "正在启动", en: "Starting", "zh-TW": "正在啟動" },
   "boot.failed": { "zh-CN": "暂时无法连接", en: "Unable to connect", "zh-TW": "暫時無法連線" },
   "boot.failedDetail": {

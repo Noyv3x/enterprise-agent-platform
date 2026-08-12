@@ -52,7 +52,7 @@ Platform 从逐段 no-follow 打开的数据根 fd 打开数据库。既有数�
 
 ## Workspace、附件与 Skill
 
-私人 Agent 的默认 workspace 为 `data/workspaces/user-<id>/`，频道主 Agent 使用 `data/workspaces/channels/channel-<id>/`。数据库只保存相对 workspace identity。Sandbox 内统一映射为 `/workspace`；可信系统提示可同时说明该 scope 的精确宿主映射，但宿主绝对路径不得进入公共 API、普通 Runtime metadata 或数据库。
+个人 AI 的默认 workspace 为 `data/workspaces/user-<id>/`，频道主 Agent 使用 `data/workspaces/channels/channel-<id>/`。数据库只保存相对 workspace identity。Sandbox 内统一映射为 `/workspace`；可信系统提示可同时说明该 scope 的精确宿主映射，但宿主绝对路径不得进入公共 API、普通 Runtime metadata 或数据库。
 
 `agent-envs/<scope-hash>/home` 和 `env` 保存用户级工具、环境和配置。`agent-skills/<scope-hash>/` 保存 Skill 包与原子的 `.skill-usage.json`。委派子 Agent使用父主 Agent 的目录。
 

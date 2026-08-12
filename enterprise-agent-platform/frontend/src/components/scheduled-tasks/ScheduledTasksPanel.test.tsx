@@ -290,6 +290,6 @@ describe("ScheduledTasksPanel", () => {
     mocks.loadAgentSchedules.mockResolvedValue({ schedules: [] });
     renderPanel();
     expect(await screen.findByText("No scheduled tasks yet")).toBeVisible();
-    expect(screen.getByText("Ask your Private Agent in the conversation to create one.")).toBeVisible();
+    expect(screen.getByText("Ask your Personal AI in the conversation to create one.")).toBeVisible();
   });
 });

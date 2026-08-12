@@ -10,7 +10,7 @@
    It renders <MessageList> + <Composer>. It does NOT mount useRealtime/usePolling —
    those are shell-owned (AppShell) so the stream/poll are not duplicated. */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { activeChannel, hasPermission, scopeIdFor, scopeTypeFor } from "../../store/selectors";
@@ -19,6 +19,7 @@ import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";
+import { PersonalAiComposerFocusContext } from "../shell/PersonalAiGuideContext";
 import "./chat.css";
 
 export function ChatView({ mode }: { mode: ChatMode }) {
@@ -29,6 +30,8 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   );
   const channelName = useStore((state) => activeChannel(state)?.name);
   const mobile = useMediaQuery("(max-width: 800px)");
+  const personalAiGuideFocusToken = useContext(PersonalAiComposerFocusContext);
+  const lastPersonalAiGuideFocusToken = useRef(personalAiGuideFocusToken);
 
   const noChannel = mode === "channel" && !scopeId;
   const disabled = noChannel || !canChat;
@@ -47,6 +50,15 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   useEffect(() => {
     if (!mobile) bumpFocus();
   }, [mode, scopeId, mobile, bumpFocus]);
+
+  // The shell token is a one-shot request. Remember the value present at mount
+  // so returning to Personal AI later never replays an old request and raises a
+  // mobile software keyboard unexpectedly.
+  useEffect(() => {
+    const changed = personalAiGuideFocusToken !== lastPersonalAiGuideFocusToken.current;
+    lastPersonalAiGuideFocusToken.current = personalAiGuideFocusToken;
+    if (mode === "private" && changed) bumpFocus();
+  }, [bumpFocus, mode, personalAiGuideFocusToken]);
 
   const placeholder = noChannel
     ? t("chat.composer.noChannel")

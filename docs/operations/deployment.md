@@ -97,7 +97,7 @@ Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_a
 
 Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与知识 Embeddings provider 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。未配置 Embeddings API key 是明确的知识 disabled 状态，不是容器 readiness 失败。
 
-任何时刻最多一个可写 Platform 打开 SQLite。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
+任何时刻最多一个可写 Platform 打开 SQLite。账号级集成凭据和有界登录失败窗口都属于 SQLite 中的 Platform 状态，必须随同一个候选快照、提交和回滚边界切换；更新不能清空防爆破计数，也不能让旧、新 generation 同时修改连接凭据。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
 
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
@@ -109,7 +109,7 @@ Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、�
 
 ## Agent Sandbox
 
-每个私人 Agent 和频道主 Agent拥有独立 Sandbox；委派子 Agent共享父 Sandbox。首次工具调用时按需创建，无任务且无后台进程达到空闲期限后停止但不删除持久目录。
+每个个人 AI 和频道主 Agent拥有独立 Sandbox；委派子 Agent共享父 Sandbox。首次工具调用时按需创建，无任务且无后台进程达到空闲期限后停止但不删除持久目录。
 
 Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。Platform 容器不挂载 Sandbox 的 `/workspace`，而是把 Agent 回复中的逻辑交付路径映射到当前 scope 的 Platform 可见工作区，并通过固定目录/文件描述符安全读取后保存附件；后台 Sandbox 进程并发替换路径时交付失败关闭。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
 

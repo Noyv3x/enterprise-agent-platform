@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -147,8 +150,172 @@ class LoginLimiterTests(unittest.TestCase):
                         len(service._login_failures_by_user),
                         service_module.MAX_LOGIN_FAILURE_KEYS,
                     )
+                    self.assertLessEqual(
+                        len(service._login_failures_by_client),
+                        service_module.MAX_LOGIN_FAILURE_KEYS,
+                    )
             finally:
                 service.close()
+
+    def test_same_client_cannot_spray_passwords_across_many_usernames(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                with mock.patch.object(service_module, "MAX_LOGIN_FAILURES_PER_CLIENT", 4):
+                    for index in range(4):
+                        with self.assertRaises(ServiceError) as attempt:
+                            service.authenticate(
+                                f"spray-target-{index}",
+                                "wrong-password",
+                                client_id="198.51.100.40",
+                            )
+                        self.assertEqual(
+                            attempt.exception.status,
+                            429 if index == 3 else 401,
+                        )
+
+                    with self.assertRaises(ServiceError) as limited:
+                        service.authenticate(
+                            "admin",
+                            "admin",
+                            client_id="198.51.100.40",
+                        )
+                    self.assertEqual(limited.exception.status, 429)
+                    self.assertEqual(limited.exception.code, "login_rate_limited")
+                    self.assertGreater(limited.exception.retry_after_seconds, 0)
+
+                token, user = service.authenticate(
+                    "admin",
+                    "admin",
+                    client_id="198.51.100.41",
+                )
+                self.assertTrue(token)
+                self.assertEqual(user["username"], "admin")
+            finally:
+                service.close()
+
+    def test_concurrent_attempts_cannot_cross_the_password_check_admission_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                workers = 12
+                barrier = threading.Barrier(workers)
+
+                def attempt() -> int:
+                    barrier.wait()
+                    try:
+                        service.authenticate(
+                            "admin",
+                            "wrong-password",
+                            client_id="198.51.100.70",
+                        )
+                    except ServiceError as exc:
+                        return exc.status
+                    self.fail("wrong password unexpectedly authenticated")
+
+                def reject_slowly(_password: str, _encoded: str) -> bool:
+                    time.sleep(0.01)
+                    return False
+
+                with (
+                    mock.patch.object(service_module, "MAX_LOGIN_FAILURES", 4),
+                    mock.patch.object(
+                        service_module,
+                        "verify_password",
+                        side_effect=reject_slowly,
+                    ) as verify,
+                    ThreadPoolExecutor(max_workers=workers) as pool,
+                ):
+                    statuses = list(pool.map(lambda _index: attempt(), range(workers)))
+
+                self.assertEqual(statuses.count(401), 4)
+                self.assertEqual(statuses.count(429), workers - 4)
+                self.assertEqual(
+                    verify.call_count,
+                    4,
+                    "attempts rejected by admission must not spend PBKDF2 work",
+                )
+            finally:
+                service.close()
+
+    def test_failed_multi_bucket_commit_rolls_back_and_invalidates_cache(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                original = service._persist_login_failure_bucket
+                calls = 0
+
+                def fail_second(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise RuntimeError("injected bucket write failure")
+                    return original(*args, **kwargs)
+
+                with mock.patch.object(
+                    service,
+                    "_persist_login_failure_bucket",
+                    side_effect=fail_second,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "injected bucket"):
+                        service.authenticate(
+                            "admin",
+                            "wrong-password",
+                            client_id="198.51.100.71",
+                        )
+
+                persisted = service.db.query(
+                    "SELECT key FROM settings WHERE key LIKE ?",
+                    (f"{service_module.LOGIN_FAILURE_SETTING_PREFIX}%",),
+                )
+                self.assertEqual(persisted, [])
+                self.assertEqual(service._login_failures, {})
+                self.assertEqual(service._login_failures_by_user, {})
+                self.assertEqual(service._login_failures_by_client, {})
+            finally:
+                service.close()
+
+    def test_login_failure_window_survives_restart_without_plaintext_subjects(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td)
+            client_id = "198.51.100.55"
+            service = EnterpriseService(make_config(path), agent_client=RecordingAgent())
+            try:
+                for _ in range(service_module.MAX_LOGIN_FAILURES):
+                    with self.assertRaises(ServiceError) as attempt:
+                        service.authenticate(
+                            "admin",
+                            "wrong-password",
+                            client_id=client_id,
+                        )
+                    self.assertEqual(attempt.exception.status, 401)
+                persisted = service.db.query(
+                    "SELECT key, value FROM settings WHERE key LIKE ?",
+                    (f"{service_module.LOGIN_FAILURE_SETTING_PREFIX}%",),
+                )
+                self.assertGreaterEqual(len(persisted), 3)
+                serialized = repr([dict(row) for row in persisted])
+                self.assertNotIn("admin", serialized)
+                self.assertNotIn(client_id, serialized)
+            finally:
+                service.close()
+
+            restarted = EnterpriseService(make_config(path), agent_client=RecordingAgent())
+            try:
+                with self.assertRaises(ServiceError) as limited:
+                    restarted.authenticate("admin", "admin", client_id=client_id)
+                self.assertEqual(limited.exception.status, 429)
+                self.assertEqual(limited.exception.code, "login_rate_limited")
+
+                token, user = restarted.authenticate(
+                    "admin",
+                    "admin",
+                    client_id="198.51.100.56",
+                )
+                self.assertTrue(token)
+                self.assertEqual(user["username"], "admin")
+            finally:
+                restarted.close()
 
     def test_nonexistent_user_returns_401_like_wrong_password(self):
         # Username enumeration: a nonexistent (but syntactically valid) username

@@ -18,7 +18,9 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 
 数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
-Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base URL、已验证的远端身份投影和验证时间，独立凭据行只保存 Token。相同 origin 与远端用户身份不能同时绑定多个本地用户。删除本地用户或断开连接时凭据级联删除；Token 不进入 Runtime session、消息、workspace、Skill、备份清单或任何派生索引。
+Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base URL、已验证的远端身份投影和验证时间，独立凭据行只保存 Token。相同 origin 与远端用户身份不能同时绑定多个本地用户。用户本人和管理员代目标账号执行的变更共享同一个 owner 串行边界；删除本地用户或任一入口断开连接时凭据级联删除。Token 不进入 Runtime session、消息、workspace、Skill、备份清单或任何派生索引。
+
+短期登录失败窗口属于 Platform 安全状态，使用 session secret 派生的不可逆主体标识保存在 secret 设置行，并随当前 SQLite 一起备份、更新和恢复。它只保留当前窗口内的有界时间戳，不保存明文用户名、客户端地址或密码；成功登录、窗口过期和容量回收按认证策略清理相应桶。
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
@@ -66,7 +68,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
 
-私人 Agent 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。服务重启时：
+个人 AI 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。服务重启时：
 
 - 尚未提交的 reserved/unconsumed 输入可重新排队；
 - 已提交或已注入但终态未知的输入与父 job 进入 `needs_review`；
@@ -87,7 +89,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 交互式私人顶层 Run 在对话中发现稳定且跨会话有价值的信息时直接写入、替换或忘记正式记忆，不弹出审批。Agent 应优先更新同一事实而不是追加冲突副本；临时任务状态和过程信息留在 session 或工作区。计划任务、邮件唤醒、频道 Agent 和委派 Agent 只能召回，不得自动修改记忆。普通自动写入也不是只凭 Runtime metadata 放行：Platform 必须持有该 scope 的 lifecycle start barrier，并在覆盖授权复验、记忆变更和返回快照的同一个 `BEGIN IMMEDIATE` 事务内确认 canonical private scope/current lifecycle、激活账号与私人权限、来源用户消息，以及 `agent_run_inputs.runtime_run_id` 所属父 `agent` durable job 仍为 running。撤权、reset、父任务终结和记忆写入据此线性化，不能在预检与落盘之间穿越。
 
-前台即时维护之外还有 Hermes 风格的回复后复盘。每个私人 Agent 的节奏状态保存在 SQLite `settings`，触发任务保存在 `durable_jobs`；成功私人回合每十次触发记忆审查，成功工具调用累计十次可提前触发流程审查。计数和任务都绑定当前 lifecycle，轮换后从零开始；同一来源消息只能产生一个复盘任务。复盘使用近期产品消息和有界工具活动作为不可信历史，只保存稳定事实、消除冲突或忘记已明确失效的事实，不保存凭据、一次性错误、短期任务状态和未经用户确认的推断。
+前台即时维护之外还有 Hermes 风格的回复后复盘。每个个人 AI 的节奏状态保存在 SQLite `settings`，触发任务保存在 `durable_jobs`；成功私人回合每十次触发记忆审查，成功工具调用累计十次可提前触发流程审查。计数和任务都绑定当前 lifecycle，轮换后从零开始；同一来源消息只能产生一个复盘任务。复盘使用近期产品消息和有界工具活动作为不可信历史，只保存稳定事实、消除冲突或忘记已明确失效的事实，不保存凭据、一次性错误、短期任务状态和未经用户确认的推断。
 
 复盘对 Skill 采用 Hermes 的主动信号与分层策略：用户对风格、格式、流程或工具使用的纠正，非平凡的可复用技巧，以及本轮已使用 Skill 暴露的缺漏都应触发维护；优先精确 patch 已检查且允许自动维护的现有 agent-owned Skill，没有合适目标时才创建可覆盖一类任务的 umbrella Skill。不得把一次性任务叙述、已经恢复的瞬时故障、环境暂缺或“某工具永远不可用”固化为 Skill；没有真实持久信号时允许不写入。
 
@@ -99,7 +101,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 顶层 Run 启动前只在当前 Agent scope 内进行 query recall，并列出该 Agent 保存的当前用户资料记忆。空结果不注入；失败不使 Run 失败。注入内容按记录边界裁剪，并包在明确的不可信数据标签中。
 
-`session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有带当前 `session_id` 元数据或可由当前 reply 关系明确归属到该 session 的消息才进入索引，不为缺少会话来源的行合成兼容 session。只有规范私人 Agent 与频道主 Agent 可以使用，响应有统一字符预算。
+`session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有带当前 `session_id` 元数据或可由当前 reply 关系明确归属到该 session 的消息才进入索引，不为缺少会话来源的行合成兼容 session。只有规范个人 AI 与频道主 Agent 可以使用，响应有统一字符预算。
 
 知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。
 

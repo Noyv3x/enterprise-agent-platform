@@ -246,9 +246,9 @@ export const workspaceMessages = defineMessages({
   },
 
   "mention.agentDescription": {
-    "zh-CN": "呼叫频道 Agent",
-    en: "Mention the channel Agent",
-    "zh-TW": "呼叫頻道 Agent",
+    "zh-CN": "呼叫公共频道 Agent",
+    en: "Mention the public-channel Agent",
+    "zh-TW": "呼叫公共頻道 Agent",
   },
   "oauth.waitingForUser": {
     "zh-CN": "等待网页登录",

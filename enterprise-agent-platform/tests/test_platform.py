@@ -42,6 +42,7 @@ from enterprise_agent_platform.runtimes import (
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
     BOOTSTRAP_ADMIN_PASSWORD_FILE,
+    LOGIN_FAILURE_SETTING_PREFIX,
     MAX_LOGIN_FAILURES,
     EnterpriseService,
     ServiceError,
@@ -6806,6 +6807,126 @@ class PlatformServiceTests(unittest.TestCase):
             )
 
 class PlatformHTTPTests(unittest.TestCase):
+    def test_admin_secret_http_projection_excludes_internal_login_failure_buckets(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            token, _admin = service.authenticate(
+                "admin",
+                "admin",
+                client_id="198.51.100.80",
+            )
+            with self.assertRaises(ServiceError):
+                service.authenticate(
+                    "admin",
+                    "wrong-password",
+                    client_id="198.51.100.81",
+                )
+            internal_rows = service.db.query(
+                "SELECT key FROM settings WHERE key LIKE ?",
+                (f"{LOGIN_FAILURE_SETTING_PREFIX}%",),
+            )
+            self.assertGreaterEqual(len(internal_rows), 3)
+
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET",
+                    "/api/settings/secrets",
+                    headers={
+                        "Cookie": f"{config.session_cookie_name}={token}",
+                    },
+                )
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                payload = json.loads(raw)
+
+                self.assertEqual(response.status, 200)
+                self.assertNotIn(LOGIN_FAILURE_SETTING_PREFIX, raw)
+                self.assertFalse(
+                    any(
+                        str(item.get("key") or "").startswith(
+                            LOGIN_FAILURE_SETTING_PREFIX
+                        )
+                        for item in payload["secrets"]
+                    )
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_login_is_closed_world_and_rate_limit_returns_retry_after(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                for invalid_body in (
+                    json.dumps(
+                        {"username": "admin", "password": "admin", "owner": 1}
+                    ),
+                    '{"username":"admin","username":"other","password":"admin"}',
+                ):
+                    connection.request(
+                        "POST",
+                        "/api/auth/login",
+                        body=invalid_body,
+                        headers={"Content-Type": "application/json", "Origin": origin},
+                    )
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 400)
+
+                oversized = json.dumps(
+                    {"username": "admin", "password": "x" * 5_000}
+                )
+                connection.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=oversized,
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 413)
+
+                for _ in range(MAX_LOGIN_FAILURES):
+                    connection.request(
+                        "POST",
+                        "/api/auth/login",
+                        body=json.dumps(
+                            {"username": "admin", "password": "wrong-password"}
+                        ),
+                        headers={"Content-Type": "application/json", "Origin": origin},
+                    )
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 401)
+
+                connection.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 429)
+                self.assertEqual(payload["code"], "login_rate_limited")
+                self.assertGreater(int(response.getheader("Retry-After") or "0"), 0)
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
     def test_sylver_platform_connection_routes_are_closed_world_and_secret_free(self):
         class FakeSylverPlatformClient:
             def __init__(self):
@@ -6929,6 +7050,237 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(payload, {"ok": True})
 
                 connection.request("GET", route, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertIsNone(payload["connection"])
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_admin_sylver_platform_routes_are_targeted_closed_world_and_secret_free(
+        self,
+    ):
+        class FakeSylverPlatformClient:
+            def __init__(self):
+                self.verify_calls: list[tuple[str, str]] = []
+
+            def verify_identity(self, base_url: str, token: str):
+                self.verify_calls.append((base_url, token))
+                return {
+                    "remote_user_id": 13,
+                    "username": "remote-operator",
+                    "full_name": "Remote Operator",
+                    "title": "Engineer",
+                    "email": "operator@example.test",
+                    "role": "member",
+                }
+
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            client = FakeSylverPlatformClient()
+            service = EnterpriseService(
+                config,
+                agent_client=RecordingAgent(),
+                sylver_platform_client=client,
+            )
+            admin_token, admin = service.authenticate("admin", "admin")
+            ordinary = service.create_user(
+                username="ordinary-admin-route-user",
+                password="ordinary-admin-route-password",
+                display_name="Ordinary User",
+                role="member",
+                actor=admin,
+            )
+            ordinary_token, _ordinary_actor = service.authenticate(
+                "ordinary-admin-route-user",
+                "ordinary-admin-route-password",
+            )
+            target = service.create_user(
+                username="inactive-admin-route-target",
+                password="inactive-admin-route-password",
+                display_name="Inactive Target",
+                role="member",
+                actor=admin,
+            )
+            service.update_user(admin, int(target["id"]), {"active": False})
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            route = (
+                f"/api/admin/users/{target['id']}/integrations/sylver-platform"
+            )
+            verify_route = route + "/verify"
+            token = "admin-route-token-not-for-output"
+            admin_cookie = f"{config.session_cookie_name}={admin_token}"
+            ordinary_cookie = f"{config.session_cookie_name}={ordinary_token}"
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+
+                connection.request(
+                    "POST",
+                    verify_route,
+                    body=json.dumps({"token": token}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": ordinary_cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+
+                connection.request(
+                    "POST",
+                    "/api/admin/users/999999/integrations/sylver-platform/verify",
+                    body=json.dumps({"token": token}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": admin_cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 404)
+                self.assertEqual(client.verify_calls, [])
+
+                for request_method, request_path, body in (
+                    (
+                        "POST",
+                        verify_route,
+                        json.dumps({"token": token, "url": "https://evil.example"}),
+                    ),
+                    ("POST", verify_route, f'{{"token":"{token}","token":"other"}}'),
+                    (
+                        "PUT",
+                        route,
+                        json.dumps(
+                            {
+                                "token": token,
+                                "expected_remote_user_id": 13,
+                                "owner_user_id": int(ordinary["id"]),
+                            }
+                        ),
+                    ),
+                    (
+                        "PUT",
+                        route,
+                        json.dumps(
+                            {
+                                "token": token,
+                                "expected_remote_user_id": "13",
+                            }
+                        ),
+                    ),
+                ):
+                    with self.subTest(path=request_path, body=body):
+                        connection.request(
+                            request_method,
+                            request_path,
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Cookie": admin_cookie,
+                                "Origin": origin,
+                            },
+                        )
+                        response = connection.getresponse()
+                        response.read()
+                        self.assertEqual(response.status, 400)
+                self.assertEqual(client.verify_calls, [])
+
+                connection.request(
+                    "POST",
+                    verify_route,
+                    body=json.dumps({"token": token}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": admin_cookie,
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+                self.assertEqual(client.verify_calls, [])
+
+                connection.request(
+                    "POST",
+                    verify_route,
+                    body=json.dumps({"token": token}),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": admin_cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                preview = json.loads(raw)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(preview["identity"]["remote_user_id"], 13)
+                self.assertNotIn("token", preview["identity"])
+                self.assertNotIn(token, raw)
+
+                connection.request(
+                    "PUT",
+                    route,
+                    body=json.dumps(
+                        {"token": token, "expected_remote_user_id": 13}
+                    ),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cookie": admin_cookie,
+                        "Origin": origin,
+                    },
+                )
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                saved = json.loads(raw)
+                self.assertEqual(response.status, 200)
+                self.assertTrue(saved["connection"]["credential_configured"])
+                self.assertNotIn("token", saved["connection"])
+                self.assertNotIn(token, raw)
+                self.assertEqual(
+                    client.verify_calls,
+                    [
+                        ("https://devops.sylver-lining.org", token),
+                        ("https://devops.sylver-lining.org", token),
+                    ],
+                )
+
+                connection.request("GET", route, headers={"Cookie": admin_cookie})
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8")
+                loaded = json.loads(raw)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(loaded["connection"], saved["connection"])
+                self.assertNotIn(token, raw)
+
+                connection.request(
+                    "DELETE",
+                    route,
+                    headers={"Cookie": admin_cookie},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 403)
+
+                connection.request(
+                    "DELETE",
+                    route,
+                    headers={"Cookie": admin_cookie, "Origin": origin},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload, {"ok": True})
+
+                connection.request("GET", route, headers={"Cookie": admin_cookie})
                 response = connection.getresponse()
                 payload = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(response.status, 200)

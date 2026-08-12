@@ -40,6 +40,8 @@ class FakeXMLHttpRequest {
 
   setRequestHeader() {}
 
+  getResponseHeader() { return null; }
+
   send(body: FormData) {
     this.body = body;
   }
@@ -166,6 +168,19 @@ describe("api request lifecycle", () => {
     vi.stubGlobal("fetch", vi.fn(async () => response(403, { error: "forbidden" })));
     const request = api("/api/protected");
     await expect(request).rejects.toMatchObject({ status: 403, message: "forbidden" });
+  });
+
+  it("preserves a bounded Retry-After value on API errors", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: "slow down", code: "login_rate_limited" }),
+      { status: 429, headers: { "Content-Type": "application/json", "Retry-After": "42" } },
+    )));
+
+    await expect(api("/api/auth/login", { skipAuthHandling: true })).rejects.toMatchObject({
+      status: 429,
+      code: "login_rate_limited",
+      retryAfterSeconds: 42,
+    });
   });
 
   it("preserves the maintenance code and notifies the update gate", async () => {

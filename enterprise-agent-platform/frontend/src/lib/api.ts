@@ -21,12 +21,14 @@ export const DEFAULT_API_TIMEOUT_MS = 60_000;
 export class ApiError extends Error {
   readonly status: number;
   readonly code?: string;
+  readonly retryAfterSeconds?: number;
 
-  constructor(message: string, status: number, code?: string) {
+  constructor(message: string, status: number, code?: string, retryAfterSeconds?: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -123,9 +125,12 @@ function parsedJson(text: string): unknown {
   }
 }
 
-function responseError(status: number, data: unknown): ApiError {
+function responseError(status: number, data: unknown, retryAfterHeader?: string | null): ApiError {
   const err = data as { code?: string; error?: string; detail?: string };
   const code = err.code || (err.error === "platform_updating" ? err.error : undefined);
+  const parsedRetryAfter = /^\d+$/.test(retryAfterHeader || "")
+    ? Math.min(86_400, Math.max(1, Number(retryAfterHeader)))
+    : undefined;
   if (status === 503 && code === "platform_updating") {
     _invokePlatformUpdating();
   }
@@ -133,6 +138,7 @@ function responseError(status: number, data: unknown): ApiError {
     err.error || err.detail || t("api.failed", { status }),
     status,
     code,
+    parsedRetryAfter,
   );
 }
 
@@ -183,7 +189,7 @@ export async function api<T = unknown>(path: string, options: ApiOptions = {}): 
       if (generation !== sessionGeneration) throw new ApiRequestCancelledError();
     }
     if (!res.ok) {
-      throw responseError(res.status, data);
+      throw responseError(res.status, data, res.headers?.get("Retry-After"));
     }
     return data as T;
   } catch (error) {
@@ -265,7 +271,11 @@ export function apiUpload<T = unknown>(
         }
       }
       if (xhr.status < 200 || xhr.status >= 300) {
-        finish(() => reject(responseError(xhr.status, data)));
+        finish(() => reject(responseError(
+          xhr.status,
+          data,
+          xhr.getResponseHeader("Retry-After"),
+        )));
         return;
       }
       finish(() => resolve(data as T));

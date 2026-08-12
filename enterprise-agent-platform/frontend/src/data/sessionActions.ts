@@ -140,10 +140,16 @@ function coerceActiveView(store: AppStore): void {
 }
 
 export async function login(store: AppStore, username: string, password: string): Promise<void> {
-  const result = await api<LoginResponse>(endpoints.login.path(), {
-    method: "POST",
-    body: JSON.stringify({ username, password }),
-  });
+  let result: LoginResponse;
+  try {
+    result = await api<LoginResponse>(endpoints.login.path(), {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    });
+  } catch (error) {
+    if (isApiError(error, 401)) throw new Error(t("auth.invalidCredentials"));
+    throw error;
+  }
   resetSession(store, { preservePendingOperations: true });
   if (!result.user || !result.bootstrap) {
     throw new Error(t("resource.loadFailed"));

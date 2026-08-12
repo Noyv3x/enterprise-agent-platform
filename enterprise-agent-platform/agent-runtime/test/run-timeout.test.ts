@@ -81,6 +81,74 @@ test("streaming model activity can exceed the run idle duration", async () => {
   }
 });
 
+test("model retry backoff heartbeats keep a short-idle run active", async () => {
+  const home = await temporaryDirectory("agent-model-retry-idle-");
+  const workspace = await temporaryDirectory("agent-model-retry-idle-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage: "Codex error: Our servers are currently overloaded. Please try again later.",
+    }),
+    fauxAssistantMessage("recovered after retry backoff"),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { runIdleTimeoutMs: 100 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const started = Date.now();
+    const run = coordinator.createRun(baseRequest(workspace));
+    const completed = await withDeadline(coordinator.wait(run.id), 4_000);
+    assert.equal(completed.status, "completed", completed.error);
+    assert.equal(completed.result?.content, "recovered after retry backoff");
+    assert.equal(faux.state.callCount, 2);
+    assert.ok(Date.now() - started >= 700, "the provider retry should outlive the idle window");
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
+      false,
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a run during model retry backoff settles without cleanup timeout", async () => {
+  const home = await temporaryDirectory("agent-model-retry-cancel-");
+  const workspace = await temporaryDirectory("agent-model-retry-cancel-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage: "Codex error: Our servers are currently overloaded. Please try again later.",
+    }),
+    fauxAssistantMessage("must not be requested"),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { runIdleTimeoutMs: 5_000, cleanupGraceMs: 500 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const run = coordinator.createRun(baseRequest(workspace));
+    await waitUntil(() => faux.state.callCount === 1 ? true : undefined);
+    await delay(25);
+    coordinator.cancel(run.id);
+    const completed = await withDeadline(coordinator.wait(run.id), 2_000);
+    assert.equal(completed.status, "cancelled", completed.error);
+    assert.equal(faux.state.callCount, 1);
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.cleanup_timeout"),
+      false,
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("active foreground terminal work can exceed the run idle duration", async () => {
   const home = await temporaryDirectory("agent-active-terminal-");
   const workspace = await temporaryDirectory("agent-active-terminal-workspace-");

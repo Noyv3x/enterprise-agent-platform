@@ -226,7 +226,7 @@ class TelegramGateway:
             actor = self.service.get_user(int(stored_result.get("user_id") or 0)) or {}
             text = (
                 "绑定成功。之后发送到此私聊的消息会进入 "
-                f"{actor.get('display_name') or actor.get('username') or '该用户'} 的私人 Agent。"
+                f"{actor.get('display_name') or actor.get('username') or '该用户'} 的个人 AI。"
             )
             return self._queue_text_reply(update_id, message, text, stored_result)
 
@@ -252,7 +252,7 @@ class TelegramGateway:
             return self._queue_text_reply(
                 update_id,
                 message,
-                f"绑定成功。之后发送到此私聊的消息会进入 {actor.get('display_name') or actor.get('username')} 的私人 Agent。",
+                f"绑定成功。之后发送到此私聊的消息会进入 {actor.get('display_name') or actor.get('username')} 的个人 AI。",
                 result,
             )
         if command and str(command.group(1)).lower() == "link":
@@ -461,14 +461,14 @@ class TelegramGateway:
     def _help_text(self, sender: dict[str, Any]) -> str:
         return (
             "Telegram 私聊网关已连接。\n"
-            "请在平台的「私人 Agent」页面生成一次性绑定码，然后在这里发送完整的 /link CODE 命令。\n"
-            "绑定成功后，私聊发送的消息会进入你自己的私人 Agent。"
+            "请在平台的「个人 AI」页面生成一次性绑定码，然后在这里发送完整的 /link CODE 命令。\n"
+            "绑定成功后，私聊发送的消息会进入你自己的个人 AI。"
         )
 
     def _unlinked_text(self, sender: dict[str, Any]) -> str:
         return (
             "这个 Telegram 账号还没有绑定到平台用户。\n"
-            "登录平台后打开「私人 Agent」，生成一次性绑定码，再回到这里发送 /link CODE。"
+            "登录平台后打开「个人 AI」，生成一次性绑定码，再回到这里发送 /link CODE。"
         )
 
     def _send_reply(self, message: dict[str, Any], text: str, *, raise_errors: bool = False) -> None:

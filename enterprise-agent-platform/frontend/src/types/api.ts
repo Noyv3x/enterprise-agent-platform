@@ -255,6 +255,25 @@ export interface SylverPlatformConnectionUpdateRequest {
   token: string;
 }
 
+export interface SylverPlatformIdentityPreview {
+  base_url: string;
+  remote_user_id: Id;
+  username: string;
+  full_name: string;
+  title: string;
+  email: string;
+  role: string;
+}
+
+export interface SylverPlatformIdentityPreviewResponse {
+  identity: SylverPlatformIdentityPreview;
+}
+
+export interface AdminSylverPlatformConnectionUpdateRequest {
+  token: string;
+  expected_remote_user_id: Id;
+}
+
 export interface AgentSchedulesResponse {
   schedules: AgentSchedule[];
 }

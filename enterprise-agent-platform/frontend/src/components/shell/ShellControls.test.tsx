@@ -132,8 +132,8 @@ describe("application shell controls", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderShell(<ChannelCreateForm />);
 
-    await user.type(screen.getByLabelText("New channel name"), "  roadmap  ");
-    await user.click(screen.getByRole("button", { name: "Create channel" }));
+    await user.type(screen.getByLabelText("New public channel name"), "  roadmap  ");
+    await user.click(screen.getByRole("button", { name: "Create public channel" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({

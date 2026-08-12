@@ -2,6 +2,7 @@
    selector with a shallow comparator so unrelated store changes don't re-render
    the title. When info.hash the prefix is a # span; otherwise an icon. */
 
+import { Tag } from "antd";
 import { useEffect, useRef } from "react";
 import { useI18n } from "../../i18n";
 import { topbarInfo } from "../../store/selectors";
@@ -10,7 +11,11 @@ import type { TopbarInfo } from "../../types";
 import { Icon } from "../common/Icon";
 
 function infoEqual(a: TopbarInfo, b: TopbarInfo): boolean {
-  return a.title === b.title && a.icon === b.icon && a.hash === b.hash && a.sub === b.sub;
+  return a.title === b.title
+    && a.icon === b.icon
+    && a.hash === b.hash
+    && a.publicChannel === b.publicChannel
+    && a.sub === b.sub;
 }
 
 export function TopbarTitle() {
@@ -35,7 +40,16 @@ export function TopbarTitle() {
         ) : info.icon ? (
           <Icon name={info.icon} size={18} cls="muted" />
         ) : null}
-        <span>{info.title}</span>
+        <span className="topbar__heading-text">{info.title}</span>
+        {info.publicChannel ? (
+          <Tag
+            className="topbar__public-badge"
+            icon={<Icon name="users" size={13} />}
+            variant="filled"
+          >
+            {t("nav.channel.publicBadge")}
+          </Tag>
+        ) : null}
       </h1>
       {info.sub ? <div className="topbar__sub">{info.sub}</div> : null}
     </div>

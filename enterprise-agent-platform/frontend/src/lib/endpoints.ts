@@ -87,6 +87,8 @@ import type {
   SetSecretRequest,
   SylverPlatformConnectionResponse,
   SylverPlatformConnectionUpdateRequest,
+  SylverPlatformIdentityPreviewResponse,
+  AdminSylverPlatformConnectionUpdateRequest,
   TelegramConfigResponse,
   TelegramConfigUpdateRequest,
   TokenUsageResponse,
@@ -269,6 +271,32 @@ export const endpoints = {
   deletePrivateSylverPlatformConnection: ep<void, { ok: true }>(
     "DELETE",
     () => "/api/private-agent/integrations/sylver-platform",
+  ),
+
+  /* administrator-managed Sylver Lining connection for one account */
+  adminSylverPlatformConnection: ep<void, SylverPlatformConnectionResponse, [Id]>(
+    "GET",
+    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
+  ),
+  verifyAdminSylverPlatformConnection: ep<
+    SylverPlatformConnectionUpdateRequest,
+    SylverPlatformIdentityPreviewResponse,
+    [Id]
+  >(
+    "POST",
+    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform/verify`,
+  ),
+  updateAdminSylverPlatformConnection: ep<
+    AdminSylverPlatformConnectionUpdateRequest,
+    SylverPlatformConnectionResponse,
+    [Id]
+  >(
+    "PUT",
+    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
+  ),
+  deleteAdminSylverPlatformConnection: ep<void, { ok: true }, [Id]>(
+    "DELETE",
+    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
   ),
 
   /* private Agent schedules */

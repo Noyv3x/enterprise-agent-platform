@@ -4,6 +4,7 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import hmac
 import http.client
 import imaplib
 import inspect
@@ -175,11 +176,19 @@ from .sylver_platform_connections import (
 
 
 class ServiceError(Exception):
-    def __init__(self, status: int, message: str, *, code: str = ""):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        *,
+        code: str = "",
+        retry_after_seconds: int = 0,
+    ):
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = str(code or "")
+        self.retry_after_seconds = max(0, int(retry_after_seconds))
 
 
 def _close_instance_lock_descriptors(lock_fd: int, directory_fd: int) -> None:
@@ -324,6 +333,9 @@ MAX_LOGIN_FAILURES = 8
 # force (rotating source IPs / X-Forwarded-For) against one username is still
 # bounded even though the per-(user, client) limit alone could be evaded.
 MAX_LOGIN_FAILURES_PER_USER = 50
+MAX_LOGIN_FAILURES_PER_CLIENT = 100
+MAX_LOGIN_PASSWORD_CHARACTERS = 1_024
+LOGIN_FAILURE_SETTING_PREFIX = "AGENT_PLATFORM_LOGIN_FAILURE_V1:"
 # Hard ceiling on the number of distinct keys retained in the in-memory login
 # failure maps. Usernames are attacker-controlled even for invalid logins, so
 # without this bound a flood of distinct usernames could grow the maps without
@@ -566,7 +578,7 @@ PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
     },
     "member": {
         "label": "成员",
-        "description": "使用频道、知识库和私人 Agent。",
+        "description": "使用公共频道、知识库和个人 AI。",
         "permissions": [
             PERMISSION_READ_WORKSPACE,
             PERMISSION_CHAT,
@@ -668,7 +680,11 @@ class EnterpriseService:
             "UPDATE telegram_updates SET status = 'queued', last_error = ? WHERE status = 'processing'",
             ("gateway interrupted by service restart",),
         )
-        self.tokens = TokenSigner(self._resolve_session_secret(), self._effective_session_ttl_seconds())
+        self._session_secret = self._resolve_session_secret()
+        self.tokens = TokenSigner(
+            self._session_secret,
+            self._effective_session_ttl_seconds(),
+        )
         self._synchronize_container_internal_tokens()
         self.knowledge = KnowledgeBase(self.db)
         self._agent_runtime_config_lock = threading.RLock()
@@ -764,6 +780,7 @@ class EnterpriseService:
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
         self._auth_lock = threading.RLock()
+        self._login_lock = threading.RLock()
         self.model_catalogs = ModelCatalogManager(
             runtime_loader=self._load_agent_runtime_model_catalog,
             credential_loader=self._catalog_credential_snapshot,
@@ -773,8 +790,14 @@ class EnterpriseService:
             cache_loader=lambda: self.get_setting(MODEL_CATALOG_CACHE_SETTING),
             cache_saver=lambda value: self.set_setting(MODEL_CATALOG_CACHE_SETTING, value),
         )
-        self._login_failures: dict[tuple[str, str], Deque[float]] = {}
+        self._login_failures: dict[str, Deque[float]] = {}
         self._login_failures_by_user: dict[str, Deque[float]] = {}
+        self._login_failures_by_client: dict[str, Deque[float]] = {}
+        self._login_failure_hmac_key = hmac.new(
+            self._session_secret.encode("utf-8"),
+            b"agent-platform/login-failure/v1",
+            hashlib.sha256,
+        ).digest()
         # Per-user upload timestamps for the sliding-window rate limiter.
         self._upload_rate: dict[int, Deque[float]] = {}
         # Fixed dummy hash so authentication spends a comparable amount of time
@@ -2532,7 +2555,7 @@ class EnterpriseService:
         if "session_ttl_seconds" in body:
             ttl = self._validate_session_ttl(body.get("session_ttl_seconds"))
             self.set_setting(PLATFORM_SETTING_SESSION_TTL, str(ttl))
-            self.tokens = TokenSigner(self._resolve_session_secret(), ttl)
+            self.tokens = TokenSigner(self._session_secret, ttl)
         session_secret = str(body.get("session_secret") or "").strip()
         if session_secret:
             if len(session_secret) < 32:
@@ -2660,10 +2683,37 @@ class EnterpriseService:
         return self.get_user(user_id) or {}
 
     def authenticate(self, username: str, password: str, *, client_id: str = "") -> tuple[str, dict[str, Any]]:
+        # Admission, the expensive password check, and failure accounting form
+        # one linearized boundary. Without this gate a burst can pass the same
+        # pre-check concurrently and spend unbounded PBKDF2 work before any
+        # request records the threshold-crossing failure.
+        with self._login_lock:
+            return self._authenticate_locked(username, password, client_id=client_id)
+
+    def _authenticate_locked(
+        self,
+        username: str,
+        password: str,
+        *,
+        client_id: str = "",
+    ) -> tuple[str, dict[str, Any]]:
+        password_value = str(password or "")
         try:
             clean_username = normalize_name(username)
         except ServiceError as exc:
-            self._record_login_failure(str(username).strip().lower()[:80] or "invalid", client_id)
+            invalid_username = str(username).strip().lower()[:80] or "invalid"
+            self._check_login_client_rate_limit(client_id)
+            verify_password(
+                password_value
+                if len(password_value) <= MAX_LOGIN_PASSWORD_CHARACTERS
+                else "oversized-password",
+                self._dummy_password_hash,
+            )
+            self._record_login_failure(invalid_username, client_id)
+            if self._login_failures_over_client_limit(client_id):
+                raise self._login_rate_limit_error(
+                    self._login_client_failures(client_id)
+                ) from exc
             raise ServiceError(401, "invalid username or password") from exc
         # Per-(user, client) limit blocks a single source brute forcing one
         # account, regardless of whether the supplied password is correct.
@@ -2675,10 +2725,14 @@ class EnterpriseService:
         # Always run a PBKDF2 verification, even when the user does not exist, so
         # wall-clock time does not reveal whether a username is valid (timing
         # oracle). The dummy result is discarded.
-        if user:
-            password_ok = verify_password(password, user["password_hash"])
+        password_has_valid_size = len(password_value) <= MAX_LOGIN_PASSWORD_CHARACTERS
+        if user and password_has_valid_size:
+            password_ok = verify_password(password_value, user["password_hash"])
         else:
-            verify_password(password, self._dummy_password_hash)
+            verify_password(
+                password_value if password_has_valid_size else "oversized-password",
+                self._dummy_password_hash,
+            )
             password_ok = False
         if not password_ok:
             self._record_login_failure(clean_username, client_id)
@@ -2687,7 +2741,13 @@ class EnterpriseService:
             # DoS). Surface the ceiling as a 429 so a distributed brute force
             # against one account still sees backpressure.
             if self._login_failures_over_user_limit(clean_username):
-                raise ServiceError(429, "too many failed login attempts; try again later")
+                raise self._login_rate_limit_error(
+                    self._login_user_failures(clean_username)
+                )
+            if self._login_failures_over_client_limit(client_id):
+                raise self._login_rate_limit_error(
+                    self._login_client_failures(client_id)
+                )
             raise ServiceError(401, "invalid username or password")
         self._clear_login_failures(clean_username, client_id)
         self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), user["id"]))
@@ -2695,70 +2755,131 @@ class EnterpriseService:
         return self.tokens.issue(int(user["id"]), int(user.get("token_version") or 1)), public
 
     def _check_login_rate_limit(self, username: str, client_id: str) -> None:
-        key = self._login_failure_key(username, client_id)
         now = time.time()
-        with self._auth_lock:
-            per_client = self._login_failures.get(key)
-            if per_client:
-                self._trim_login_failures(per_client, now, self._login_failures, key)
-                if len(per_client) >= MAX_LOGIN_FAILURES:
-                    raise ServiceError(429, "too many failed login attempts; try again later")
+        with self._login_lock:
+            failures = self._login_user_client_failures(username, client_id)
+            self._trim_login_failures(failures, now)
+            if len(failures) >= MAX_LOGIN_FAILURES:
+                raise self._login_rate_limit_error(failures, now=now)
+            self._check_login_client_rate_limit_locked(client_id, now)
+
+    def _check_login_client_rate_limit(self, client_id: str) -> None:
+        now = time.time()
+        with self._login_lock:
+            self._check_login_client_rate_limit_locked(client_id, now)
+
+    def _check_login_client_rate_limit_locked(
+        self,
+        client_id: str,
+        now: float,
+    ) -> None:
+        failures = self._login_client_failures(client_id)
+        self._trim_login_failures(failures, now)
+        if len(failures) >= MAX_LOGIN_FAILURES_PER_CLIENT:
+            raise self._login_rate_limit_error(failures, now=now)
 
     def _login_failures_over_user_limit(self, username: str) -> bool:
         """Return True when the per-account wrong-password ceiling is reached."""
-        user_key = self._login_failure_key(username, "")[0]
         now = time.time()
-        with self._auth_lock:
-            per_user = self._login_failures_by_user.get(user_key)
-            if not per_user:
-                return False
-            self._trim_login_failures(per_user, now, self._login_failures_by_user, user_key)
+        with self._login_lock:
+            per_user = self._login_user_failures(username)
+            self._trim_login_failures(per_user, now)
             return len(per_user) >= MAX_LOGIN_FAILURES_PER_USER
 
-    def _record_login_failure(self, username: str, client_id: str) -> None:
-        key = self._login_failure_key(username, client_id)
+    def _login_failures_over_client_limit(self, client_id: str) -> bool:
         now = time.time()
-        with self._auth_lock:
-            client_failures = self._login_failures.setdefault(key, deque())
-            self._trim_login_failures(client_failures, now)
-            client_failures.append(now)
-            user_failures = self._login_failures_by_user.setdefault(key[0], deque())
-            self._trim_login_failures(user_failures, now)
-            user_failures.append(now)
+        with self._login_lock:
+            per_client = self._login_client_failures(client_id)
+            self._trim_login_failures(per_client, now)
+            return len(per_client) >= MAX_LOGIN_FAILURES_PER_CLIENT
+
+    def _record_login_failure(self, username: str, client_id: str) -> None:
+        now = time.time()
+        with self._login_lock:
+            buckets = (
+                (
+                    "user_client",
+                    self._login_subject("user_client", username, client_id),
+                    self._login_failures,
+                    MAX_LOGIN_FAILURES,
+                ),
+                (
+                    "user",
+                    self._login_subject("user", username),
+                    self._login_failures_by_user,
+                    MAX_LOGIN_FAILURES_PER_USER,
+                ),
+                (
+                    "client",
+                    self._login_subject("client", client_id),
+                    self._login_failures_by_client,
+                    MAX_LOGIN_FAILURES_PER_CLIENT,
+                ),
+            )
+            persisted: list[tuple[str, str, Deque[float]]] = []
+            for dimension, subject, store, limit in buckets:
+                failures = self._load_login_failure_bucket(
+                    dimension,
+                    subject,
+                    store,
+                )
+                self._trim_login_failures(failures, now)
+                failures.append(now)
+                while len(failures) > limit:
+                    failures.popleft()
+                persisted.append((dimension, subject, failures))
             # Bound the number of distinct keys so attacker-controlled usernames
             # cannot grow the maps without limit (memory-exhaustion DoS).
-            self._evict_stale_login_failures_locked(now)
+            try:
+                with self.db.transaction(immediate=True) as conn:
+                    for dimension, subject, failures in persisted:
+                        self._persist_login_failure_bucket(
+                            dimension,
+                            subject,
+                            failures,
+                            conn=conn,
+                        )
+                    self._evict_persisted_login_failures(conn, now)
+            except BaseException:
+                for _dimension, subject, _failures in persisted:
+                    self._login_failures.pop(subject, None)
+                    self._login_failures_by_user.pop(subject, None)
+                    self._login_failures_by_client.pop(subject, None)
+                raise
+            self._evict_login_failure_memory_locked(now)
 
     def _clear_login_failures(self, username: str, client_id: str) -> None:
-        key = self._login_failure_key(username, client_id)
-        with self._auth_lock:
-            self._login_failures.pop(key, None)
-            self._login_failures_by_user.pop(key[0], None)
+        with self._login_lock:
+            user_client = self._login_subject("user_client", username, client_id)
+            user = self._login_subject("user", username)
+            with self.db.transaction(immediate=True) as conn:
+                self._delete_login_failure_bucket("user_client", user_client, conn=conn)
+                self._delete_login_failure_bucket("user", user, conn=conn)
+            self._login_failures.pop(user_client, None)
+            self._login_failures_by_user.pop(user, None)
 
     @staticmethod
     def _trim_login_failures(
         failures: Deque[float],
         now: float,
-        parent: dict[Any, Deque[float]] | None = None,
-        key: Any = None,
     ) -> None:
         cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
         while failures and failures[0] < cutoff:
             failures.popleft()
-        # Drop the key from its parent map once it has no recent failures left,
-        # so emptied entries do not accumulate.
-        if parent is not None and not failures:
-            parent.pop(key, None)
 
-    def _evict_stale_login_failures_locked(self, now: float) -> None:
-        """Bound the login-failure maps. Caller must hold ``_auth_lock``.
+    def _evict_login_failure_memory_locked(self, now: float) -> None:
+        """Bound the login-failure maps. Caller must hold ``_login_lock``.
 
         First sweep entries whose newest failure has aged out of the window;
         if a map is still over the key cap, evict the oldest-by-last-timestamp
         entries (bounded LRU).
         """
         cutoff = now - LOGIN_FAILURE_WINDOW_SECONDS
-        for store in (self._login_failures, self._login_failures_by_user):
+        for store in (
+            self._login_failures,
+            self._login_failures_by_user,
+            self._login_failures_by_client,
+        ):
             if len(store) <= MAX_LOGIN_FAILURE_KEYS:
                 continue
             for k in [k for k, dq in store.items() if not dq or dq[-1] < cutoff]:
@@ -2770,10 +2891,155 @@ class EnterpriseService:
                 store.pop(k, None)
 
     @staticmethod
-    def _login_failure_key(username: str, client_id: str) -> tuple[str, str]:
-        clean_user = str(username or "unknown").strip().lower()[:80] or "unknown"
-        clean_client = str(client_id or "local").strip()[:120] or "local"
-        return clean_user, clean_client
+    def _evict_persisted_login_failures(
+        conn: sqlite3.Connection,
+        now: float,
+    ) -> None:
+        cutoff_timestamp = int(now - LOGIN_FAILURE_WINDOW_SECONDS)
+        conn.execute(
+            "DELETE FROM settings WHERE secret = 1 AND key LIKE ? AND updated_at < ?",
+            (f"{LOGIN_FAILURE_SETTING_PREFIX}%", cutoff_timestamp),
+        )
+        rows = conn.execute(
+            """
+            SELECT key FROM settings
+            WHERE secret = 1 AND key LIKE ?
+            ORDER BY updated_at DESC, key DESC
+            LIMIT -1 OFFSET ?
+            """,
+            (f"{LOGIN_FAILURE_SETTING_PREFIX}%", MAX_LOGIN_FAILURE_KEYS),
+        ).fetchall()
+        for row in rows:
+            conn.execute("DELETE FROM settings WHERE key = ?", (row["key"],))
+
+    def _login_user_client_failures(
+        self,
+        username: str,
+        client_id: str,
+    ) -> Deque[float]:
+        subject = self._login_subject("user_client", username, client_id)
+        return self._load_login_failure_bucket(
+            "user_client",
+            subject,
+            self._login_failures,
+        )
+
+    def _login_user_failures(self, username: str) -> Deque[float]:
+        subject = self._login_subject("user", username)
+        return self._load_login_failure_bucket(
+            "user",
+            subject,
+            self._login_failures_by_user,
+        )
+
+    def _login_client_failures(self, client_id: str) -> Deque[float]:
+        subject = self._login_subject("client", client_id)
+        return self._load_login_failure_bucket(
+            "client",
+            subject,
+            self._login_failures_by_client,
+        )
+
+    def _login_subject(self, dimension: str, *parts: str) -> str:
+        normalized = [str(part or "local").strip().casefold()[:120] or "local" for part in parts]
+        payload = "\x00".join((dimension, *normalized)).encode("utf-8")
+        return hmac.new(
+            self._login_failure_hmac_key,
+            payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def _login_failure_setting_key(dimension: str, subject: str) -> str:
+        return f"{LOGIN_FAILURE_SETTING_PREFIX}{dimension}:{subject}"
+
+    def _load_login_failure_bucket(
+        self,
+        dimension: str,
+        subject: str,
+        store: dict[str, Deque[float]],
+    ) -> Deque[float]:
+        existing = store.get(subject)
+        if existing is not None:
+            return existing
+        key = self._login_failure_setting_key(dimension, subject)
+        row = self.db.query_one(
+            "SELECT value FROM settings WHERE key = ? AND secret = 1",
+            (key,),
+        )
+        failures: Deque[float] = deque()
+        if row is not None:
+            try:
+                raw = json.loads(str(row["value"]))
+                if not isinstance(raw, list):
+                    raise ValueError("login failure bucket must be a list")
+                for item in raw:
+                    value = float(item)
+                    if not math.isfinite(value) or value < 0:
+                        raise ValueError("login failure timestamp is invalid")
+                    failures.append(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._delete_login_failure_bucket(dimension, subject)
+                failures.clear()
+        self._trim_login_failures(failures, time.time())
+        store[subject] = failures
+        return failures
+
+    def _persist_login_failure_bucket(
+        self,
+        dimension: str,
+        subject: str,
+        failures: Deque[float],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
+        key = self._login_failure_setting_key(dimension, subject)
+        arguments = (key, json.dumps(list(failures), separators=(",", ":")), now_ts())
+        statement = """
+            INSERT INTO settings(key, value, secret, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                secret=1,
+                updated_at=excluded.updated_at
+            """
+        if conn is None:
+            self.db.execute(statement, arguments)
+        else:
+            conn.execute(statement, arguments)
+
+    def _delete_login_failure_bucket(
+        self,
+        dimension: str,
+        subject: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> None:
+        arguments = (self._login_failure_setting_key(dimension, subject),)
+        if conn is None:
+            self.db.execute("DELETE FROM settings WHERE key = ?", arguments)
+        else:
+            conn.execute("DELETE FROM settings WHERE key = ?", arguments)
+
+    @staticmethod
+    def _login_rate_limit_error(
+        failures: Deque[float],
+        *,
+        now: float | None = None,
+    ) -> ServiceError:
+        current = time.time() if now is None else now
+        retry_after = max(
+            1,
+            math.ceil((failures[0] + LOGIN_FAILURE_WINDOW_SECONDS) - current)
+            if failures
+            else LOGIN_FAILURE_WINDOW_SECONDS,
+        )
+        return ServiceError(
+            429,
+            "too many failed login attempts; try again later",
+            code="login_rate_limited",
+            retry_after_seconds=retry_after,
+        )
 
     def user_from_token(self, token: str | None) -> dict[str, Any] | None:
         if not token:
@@ -6237,7 +6503,7 @@ class EnterpriseService:
         generation = task["generation"]
         scope_id = str(task["scope_id"])
         user_msg = task["user_message"]
-        self._record_agent_activity("private", scope_id, "preparing", "准备私人工作区", f"u{actor['id']}")
+        self._record_agent_activity("private", scope_id, "preparing", "准备个人 AI 工作区", f"u{actor['id']}")
         agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
         task["_agent_scope_key"] = agent_scope.scope_key
         task["_agent_lifecycle_id"] = agent_scope.lifecycle_id
@@ -6327,7 +6593,7 @@ class EnterpriseService:
                 refreshed_scope = self.agent_scopes.get_scope(agent_scope.scope_key)
                 if refreshed_scope is not None:
                     execution = self._agent_execution_metadata(refreshed_scope)
-            self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到私人会话")
+            self._record_agent_activity("private", scope_id, "complete", "回复已生成", "保存到个人 AI 会话")
             metadata = {
                 "session_id": result.session_id,
                 "degraded": result.degraded,
@@ -6744,6 +7010,21 @@ class EnterpriseService:
         require_permission(current, PERMISSION_PRIVATE_AGENT)
         return current
 
+    def _sylver_platform_admin_actor(
+        self, actor: dict[str, Any]
+    ) -> dict[str, Any]:
+        current = self.get_user(int(actor.get("id") or 0))
+        if current is None or not current.get("active"):
+            raise ServiceError(403, "admin role required")
+        require_admin(current)
+        return current
+
+    def _sylver_platform_target_user(self, user_id: int) -> dict[str, Any]:
+        target = self.get_user(int(user_id))
+        if target is None:
+            raise ServiceError(404, "user not found")
+        return target
+
     @staticmethod
     def _public_sylver_platform_connection(
         connection: dict[str, Any] | None,
@@ -6762,6 +7043,71 @@ class EnterpriseService:
             "verified_at": int(connection.get("verified_at") or 0),
             "updated_at": int(connection.get("updated_at") or 0),
         }
+
+    @staticmethod
+    def _public_sylver_platform_identity(
+        base_url: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "base_url": str(base_url),
+            "remote_user_id": int(identity.get("remote_user_id") or 0),
+            "username": str(identity.get("username") or ""),
+            "full_name": str(identity.get("full_name") or ""),
+            "title": str(identity.get("title") or ""),
+            "email": str(identity.get("email") or ""),
+            "role": str(identity.get("role") or ""),
+        }
+
+    def _verify_sylver_platform_candidate(
+        self,
+        token_value: Any,
+    ) -> tuple[str, str, dict[str, Any]]:
+        try:
+            base_url = normalize_sylver_platform_base_url(
+                SYLVER_PLATFORM_BASE_URL
+            )
+            token = validate_sylver_platform_token(token_value)
+            identity = self.sylver_platform_client.verify_identity(base_url, token)
+        except SylverPlatformValidationError as exc:
+            raise ServiceError(400, str(exc)) from exc
+        except SylverPlatformError as exc:
+            raise ServiceError(
+                502,
+                "remote platform identity verification failed",
+                code="sylver_platform_verification_failed",
+            ) from exc
+        return base_url, token, identity
+
+    def _store_sylver_platform_connection(
+        self,
+        owner_user_id: int,
+        *,
+        base_url: str,
+        token: str,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self.sylver_platform_connections.upsert(
+                owner_user_id,
+                {
+                    "base_url": base_url,
+                    "token": token,
+                    **identity,
+                },
+            )
+        except SylverPlatformConnectionError as exc:
+            if "another user" in str(exc):
+                raise ServiceError(
+                    409,
+                    "remote platform identity is already connected to another user",
+                    code="sylver_platform_identity_conflict",
+                ) from exc
+            raise ServiceError(
+                400,
+                "platform connection could not be stored",
+                code="sylver_platform_connection_invalid",
+            ) from exc
 
     def get_private_sylver_platform_connection(
         self, actor: dict[str, Any]
@@ -6784,43 +7130,18 @@ class EnterpriseService:
                 "platform connection body must contain only token",
             )
         with self._sylver_platform_connection_lock(int(owner["id"])):
-            try:
-                base_url = normalize_sylver_platform_base_url(
-                    SYLVER_PLATFORM_BASE_URL
-                )
-                token = validate_sylver_platform_token(body.get("token"))
-                identity = self.sylver_platform_client.verify_identity(base_url, token)
-            except SylverPlatformValidationError as exc:
-                raise ServiceError(400, str(exc)) from exc
-            except SylverPlatformError as exc:
-                raise ServiceError(
-                    502,
-                    "remote platform identity verification failed",
-                    code="sylver_platform_verification_failed",
-                ) from exc
+            base_url, token, identity = self._verify_sylver_platform_candidate(
+                body.get("token")
+            )
             try:
                 with self._agent_update_admission():
                     current = self._sylver_platform_actor(owner)
-                    connection = self.sylver_platform_connections.upsert(
+                    connection = self._store_sylver_platform_connection(
                         int(current["id"]),
-                        {
-                            "base_url": base_url,
-                            "token": token,
-                            **identity,
-                        },
+                        base_url=base_url,
+                        token=token,
+                        identity=identity,
                     )
-            except SylverPlatformConnectionError as exc:
-                if "another user" in str(exc):
-                    raise ServiceError(
-                        409,
-                        "remote platform identity is already connected to another user",
-                        code="sylver_platform_identity_conflict",
-                    ) from exc
-                raise ServiceError(
-                    400,
-                    "platform connection could not be stored",
-                    code="sylver_platform_connection_invalid",
-                ) from exc
             finally:
                 token = ""
         return {
@@ -6835,6 +7156,107 @@ class EnterpriseService:
             with self._agent_update_admission():
                 current = self._sylver_platform_actor(owner)
                 self.sylver_platform_connections.delete(int(current["id"]))
+        return {"ok": True}
+
+    def get_admin_sylver_platform_connection(
+        self,
+        actor: dict[str, Any],
+        user_id: int,
+    ) -> dict[str, Any]:
+        self._sylver_platform_admin_actor(actor)
+        target = self._sylver_platform_target_user(user_id)
+        with self._sylver_platform_connection_lock(int(target["id"])):
+            connection = self.sylver_platform_connections.get(int(target["id"]))
+        return {
+            "connection": self._public_sylver_platform_connection(connection)
+        }
+
+    def verify_admin_sylver_platform_connection(
+        self,
+        actor: dict[str, Any],
+        user_id: int,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._sylver_platform_admin_actor(actor)
+        target = self._sylver_platform_target_user(user_id)
+        if not isinstance(body, dict) or set(body) != {"token"}:
+            raise ServiceError(
+                400,
+                "platform connection verification body must contain only token",
+            )
+        with self._sylver_platform_connection_lock(int(target["id"])):
+            base_url, token, identity = self._verify_sylver_platform_candidate(
+                body.get("token")
+            )
+            try:
+                preview = self._public_sylver_platform_identity(base_url, identity)
+            finally:
+                token = ""
+        return {"identity": preview}
+
+    def put_admin_sylver_platform_connection(
+        self,
+        actor: dict[str, Any],
+        user_id: int,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._sylver_platform_admin_actor(actor)
+        target = self._sylver_platform_target_user(user_id)
+        if not isinstance(body, dict) or set(body) != {
+            "token",
+            "expected_remote_user_id",
+        }:
+            raise ServiceError(
+                400,
+                "platform connection body must contain token and expected_remote_user_id",
+            )
+        expected_remote_user_id = body.get("expected_remote_user_id")
+        if (
+            isinstance(expected_remote_user_id, bool)
+            or not isinstance(expected_remote_user_id, int)
+            or expected_remote_user_id <= 0
+        ):
+            raise ServiceError(400, "expected_remote_user_id is invalid")
+        with self._sylver_platform_connection_lock(int(target["id"])):
+            base_url, token, identity = self._verify_sylver_platform_candidate(
+                body.get("token")
+            )
+            try:
+                if int(identity.get("remote_user_id") or 0) != expected_remote_user_id:
+                    raise ServiceError(
+                        409,
+                        "remote platform identity changed after verification",
+                        code="sylver_platform_identity_changed",
+                    )
+                with self._agent_update_admission():
+                    self._sylver_platform_admin_actor(actor)
+                    current_target = self._sylver_platform_target_user(
+                        int(target["id"])
+                    )
+                    connection = self._store_sylver_platform_connection(
+                        int(current_target["id"]),
+                        base_url=base_url,
+                        token=token,
+                        identity=identity,
+                    )
+            finally:
+                token = ""
+        return {
+            "connection": self._public_sylver_platform_connection(connection)
+        }
+
+    def delete_admin_sylver_platform_connection(
+        self,
+        actor: dict[str, Any],
+        user_id: int,
+    ) -> dict[str, Any]:
+        self._sylver_platform_admin_actor(actor)
+        target = self._sylver_platform_target_user(user_id)
+        with self._sylver_platform_connection_lock(int(target["id"])):
+            with self._agent_update_admission():
+                self._sylver_platform_admin_actor(actor)
+                current_target = self._sylver_platform_target_user(int(target["id"]))
+                self.sylver_platform_connections.delete(int(current_target["id"]))
         return {"ok": True}
 
     def _mail_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -9719,34 +10141,37 @@ class EnterpriseService:
             context,
             action=action,
         )
-        found = self.sylver_platform_connections.get_with_credential(int(actor["id"]))
-        if found is None:
-            raise ServiceError(
-                409,
-                "connect a Sylver Lining platform in personal settings before using this tool",
+        with self._sylver_platform_connection_lock(int(actor["id"])):
+            found = self.sylver_platform_connections.get_with_credential(
+                int(actor["id"])
             )
-        connection, token = found
-        try:
-            result = self.sylver_platform_client.execute(
-                connection["base_url"],
-                token,
-                action,
-                arguments,
-            )
-        except SylverPlatformValidationError as exc:
-            raise ServiceError(400, str(exc)) from exc
-        except SylverPlatformError as exc:
-            raise ServiceError(
-                502,
-                str(exc),
-                code=(
-                    "sylver_platform_outcome_unknown"
-                    if exc.outcome_unknown
-                    else "sylver_platform_request_failed"
-                ),
-            ) from exc
-        finally:
-            token = ""
+            if found is None:
+                raise ServiceError(
+                    409,
+                    "connect a Sylver Lining platform in personal settings before using this tool",
+                )
+            connection, token = found
+            try:
+                result = self.sylver_platform_client.execute(
+                    connection["base_url"],
+                    token,
+                    action,
+                    arguments,
+                )
+            except SylverPlatformValidationError as exc:
+                raise ServiceError(400, str(exc)) from exc
+            except SylverPlatformError as exc:
+                raise ServiceError(
+                    502,
+                    str(exc),
+                    code=(
+                        "sylver_platform_outcome_unknown"
+                        if exc.outcome_unknown
+                        else "sylver_platform_request_failed"
+                    ),
+                ) from exc
+            finally:
+                token = ""
         return {
             "action": action,
             "trust": "untrusted_remote_platform_data",
@@ -14051,13 +14476,18 @@ class EnterpriseService:
 
     def list_secrets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
         require_admin(actor)
-        rows = self.db.query("SELECT key, value, updated_at FROM settings WHERE secret = 1 ORDER BY key")
-        found = {row["key"]: row for row in rows}
-        items = []
         known_keys = set(OAUTH_SECRET_KEYS) | {
             "FIRECRAWL_API_KEY",
             "agent_tool_token",
         }
+        placeholders = ",".join("?" for _ in known_keys)
+        rows = self.db.query(
+            f"SELECT key, value, updated_at FROM settings "
+            f"WHERE secret = 1 AND key IN ({placeholders}) ORDER BY key",
+            tuple(sorted(known_keys)),
+        )
+        found = {row["key"]: row for row in rows}
+        items = []
         for key in sorted(known_keys):
             value = found.get(key, {}).get("value") or os.getenv(key, "")
             items.append({
@@ -17395,7 +17825,7 @@ class EnterpriseService:
         passive = self._passive_knowledge_prompt(suggestions)
         return (
             f"{self._agent_identity_prompt()}\n"
-            "当前工作模式: 私人助手。每个用户拥有独立 Sandbox、工作区、记忆和会话；"
+            "当前工作模式: 个人 AI。每个用户拥有独立 Sandbox、工作区、记忆和会话；"
             "工具默认在 Sandbox 执行，只有显式选择 host 的单次调用才在宿主执行。\n"
             "当前用户资料位于下方不可信数据块。\n"
             f"{user_context}\n"
