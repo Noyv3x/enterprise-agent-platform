@@ -363,7 +363,7 @@ const baseAdminMessages = defineMessages({
   "admin.security.port": m("监听 Port", "Listening port", "監聽 Port"),
   "admin.security.appliedRestartHint": m("当前进程：{value}，修改后需重启/重新部署。", "Current process: {value}. Restart or redeploy after changing.", "目前程序：{value}，修改後需重新啟動或部署。"),
   "admin.security.sessionTtl": m("Session TTL 秒", "Session TTL (seconds)", "Session TTL 秒"),
-  "admin.security.sessionTtlHint": m("影响新签发的登录会话；建议公网保持有限时长。", "Applies to newly issued sign-in sessions; use a finite lifetime for public access.", "影響新簽發的登入工作階段；建議公網使用有限時長。"),
+  "admin.security.sessionTtlHint": m("默认 7 天。Cookie 会按此时长保存，使用中剩余不足一半时自动续期；新值只影响之后签发或续期的会话。", "Default is 7 days. Cookies persist for this lifetime and refresh when less than half remains. The new value applies to sessions issued or renewed afterwards.", "預設 7 天。Cookie 會依此時長保存，使用中剩餘不足一半時自動續期；新值只影響之後簽發或續期的工作階段。"),
   "admin.security.rotateSecret": m("轮换 Session Secret", "Rotate session secret", "輪換 Session Secret"),
   "admin.security.secretPlaceholder": m("至少 32 字符", "At least 32 characters", "至少 32 個字元"),
   "admin.security.rotateSecretHint": m("留空不修改；填入新值后重启会使所有旧会话失效。", "Leave blank to keep unchanged. Restarting after setting a new value invalidates all old sessions.", "留空不修改；填入新值後重新啟動會使所有舊工作階段失效。"),

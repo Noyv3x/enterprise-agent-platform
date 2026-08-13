@@ -6,6 +6,7 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
+from .auth import DEFAULT_SESSION_TTL_SECONDS
 from .design_contract_generated import (
     RUN_IDLE_TIMEOUT_DEFAULT_SECONDS,
     RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS,
@@ -167,7 +168,7 @@ class PlatformConfig:
             token_secret=token_secret,
             token_ttl_seconds=_env_int(
                 "AGENT_PLATFORM_SESSION_TTL_SECONDS",
-                8 * 60 * 60,
+                DEFAULT_SESSION_TTL_SECONDS,
                 minimum=1,
             ),
             agent_tool_token=os.getenv("AGENT_PLATFORM_AGENT_TOOL_TOKEN"),

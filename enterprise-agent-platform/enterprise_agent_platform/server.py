@@ -493,6 +493,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str) -> None:
         self._request_started_monotonic = time.monotonic()
+        self._renewed_session_token: str | None = None
         self._upload_slot_held = False
         self._upload_staging_dirs: list[Path] = []
         parsed = urllib.parse.urlparse(self.path)
@@ -1429,9 +1430,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         raise ServiceError(404, "Agent runtime endpoint not found")
 
     def _require_user(self) -> dict[str, Any]:
-        user = self.server.service.user_from_token(self._read_token())
+        bearer = bearer_token(self.headers.get("Authorization", ""))
+        token = self._read_token()
+        user = self.server.service.user_from_token(token)
         if not user:
             raise ServiceError(401, "authentication required")
+        if not bearer:
+            renewed = self.server.service.refresh_browser_session(token)
+            if renewed:
+                self._renewed_session_token = renewed
         return user
 
     def _read_token(self) -> str | None:
@@ -1537,7 +1544,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _json(self, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        response_headers = dict(headers or {})
+        response_headers = self._with_renewed_session_cookie(headers)
         request_path = urllib.parse.urlparse(self.path).path
         compressible = (
             len(body) >= JSON_GZIP_MIN_BYTES
@@ -1591,7 +1598,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.NOT_MODIFIED)
                 self.send_header("Content-Length", "0")
                 self._send_security_headers()
-                for key, value in response_headers.items():
+                for key, value in self._with_renewed_session_cookie(response_headers).items():
                     self.send_header(key, value)
                 self.end_headers()
                 return
@@ -1599,7 +1606,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self._send_security_headers()
-            for key, value in response_headers.items():
+            for key, value in self._with_renewed_session_cookie(response_headers).items():
                 self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
@@ -1632,7 +1639,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
-            for key, value in metadata_headers.items():
+            for key, value in self._with_renewed_session_cookie(metadata_headers).items():
                 self.send_header(key, value)
             self.end_headers()
             return
@@ -1641,7 +1648,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type)
         self.send_header("Content-Length", str(len(image)))
         self._send_security_headers()
-        for key, value in metadata_headers.items():
+        for key, value in self._with_renewed_session_cookie(metadata_headers).items():
             self.send_header(key, value)
         self.end_headers()
         try:
@@ -1758,7 +1765,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
-            for key, value in response_headers.items():
+            for key, value in self._with_renewed_session_cookie(response_headers).items():
                 self.send_header(key, value)
             self.end_headers()
             return
@@ -1766,7 +1773,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self._send_security_headers()
-        for key, value in response_headers.items():
+        for key, value in self._with_renewed_session_cookie(response_headers).items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
@@ -1798,6 +1805,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}")
             self.send_header("Cache-Control", "private, max-age=3600")
             self._send_security_headers()
+            self._send_renewed_session_cookie()
             self.end_headers()
             self._stream_file_handle(fh)
 
@@ -1833,6 +1841,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "private, no-store")
         self.send_header("ETag", f'"{sha256}"')
         self._send_security_headers()
+        self._send_renewed_session_cookie()
         self.end_headers()
         try:
             self.wfile.write(content)
@@ -1861,6 +1870,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.send_header("X-Accel-Buffering", "no")
             self._send_security_headers()
+            self._send_renewed_session_cookie()
             self.end_headers()
             # This stream is now bounded by the SSE caps (acquire_sse_slot above),
             # so hand the general request slot back rather than pinning it for the
@@ -2015,6 +2025,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.send_header("X-Accel-Buffering", "no")
             self._send_security_headers()
+            self._send_renewed_session_cookie()
             self.end_headers()
             self.server.release_request_slot_once()
             initial = json.dumps({"watermark": cursor}, ensure_ascii=False)
@@ -2172,9 +2183,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             "frame-ancestors 'none'",
         )
 
+    def _with_renewed_session_cookie(self, headers: dict[str, str] | None) -> dict[str, str]:
+        merged = dict(headers or {})
+        token = getattr(self, "_renewed_session_token", None)
+        if token and "Set-Cookie" not in merged:
+            merged["Set-Cookie"] = self._session_cookie(token)
+            self._renewed_session_token = None
+        return merged
+
+    def _send_renewed_session_cookie(self) -> None:
+        token = getattr(self, "_renewed_session_token", None)
+        if not token:
+            return
+        self.send_header("Set-Cookie", self._session_cookie(token))
+        self._renewed_session_token = None
+
     def _session_cookie(self, token: str) -> str:
         cookie_name = self.server.service.config.session_cookie_name
-        attrs = [f"{cookie_name}={token}", "Path=/", "HttpOnly", "SameSite=Lax"]
+        attrs = [
+            f"{cookie_name}={token}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            f"Max-Age={int(self.server.service.tokens.ttl_seconds)}",
+        ]
         if self._secure_cookie_enabled():
             attrs.append("Secure")
         return "; ".join(attrs)

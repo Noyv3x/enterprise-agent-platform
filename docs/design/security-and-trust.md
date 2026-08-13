@@ -12,7 +12,9 @@
 
 密码使用 PBKDF2-SHA256 和随机盐。登录失败按客户端与账号限流，并使用固定 dummy hash 降低用户名时序泄漏。用户停用、改密、权限变化或显式吊销会推进 token version，使旧会话失效。
 
-浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly` 和 `SameSite=Lax`。开启 Manager 可信代理边界时，`Secure` 必须以 Manager 清洗并重建的当前请求 scheme 为准：HTTPS 请求增加 `Secure`，明文 LAN HTTP 请求不增加，不能因全局公网 URL 为 HTTPS 而使 LAN 会话无法登录。未开启可信代理时必须忽略客户端伪造的 `Forwarded`/`X-Forwarded-*`，并以公共 URL scheme 作为本地直连的安全回退。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer。
+浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly`、`SameSite=Lax`，以及与当前会话 TTL 相同的 `Max-Age`，因此关闭浏览器后仍保持登录，直到 token 到期、被吊销或用户退出。开启 Manager 可信代理边界时，`Secure` 必须以 Manager 清洗并重建的当前请求 scheme 为准：HTTPS 请求增加 `Secure`，明文 LAN HTTP 请求不增加，不能因全局公网 URL 为 HTTPS 而使 LAN 会话无法登录。未开启可信代理时必须忽略客户端伪造的 `Forwarded`/`X-Forwarded-*`，并以公共 URL scheme 作为本地直连的安全回退。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer。
+
+出厂会话 TTL 为 7 天（604800 秒），管理员可在 60 秒到 30 天（2592000 秒）之间调整；该值同时约束 token `exp` 与 Cookie `Max-Age`。token 自签发起计算绝对到期时间。当浏览器以 Cookie 出示仍有效的会话，且剩余寿命已不足当前 TTL 的一半时，Platform 用同一 token version 签发新 token，并在本次响应写入 `Set-Cookie`，使日常使用自动续期。Authorization bearer、已过期 token、停用账号或 token version 变化不得续期。
 
 权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。Platform、Runtime 与 Manager 的内部接口分别使用独立 bearer 或 owner-only Unix socket；浏览器 session 不能替代内部身份。
 

@@ -12,6 +12,9 @@ from typing import Any
 
 
 PBKDF2_ITERATIONS = 260_000
+DEFAULT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+MIN_SESSION_TTL_SECONDS = 60
+MAX_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60
 
 
 def _b64url(data: bytes) -> str:
@@ -67,16 +70,21 @@ class TokenPayload:
 
 
 class TokenSigner:
-    def __init__(self, secret: str, ttl_seconds: int = 8 * 60 * 60):
+    def __init__(self, secret: str, ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS):
         if not secret:
             raise ValueError("token secret must not be empty")
         self._secret = secret.encode("utf-8")
-        self._ttl_seconds = ttl_seconds
+        self._ttl_seconds = int(ttl_seconds)
 
-    def issue(self, user_id: int, version: int = 1) -> str:
+    @property
+    def ttl_seconds(self) -> int:
+        return self._ttl_seconds
+
+    def issue(self, user_id: int, version: int = 1, *, now: int | None = None) -> str:
+        current = int(time.time() if now is None else now)
         payload = TokenPayload(
             user_id=user_id,
-            expires_at=int(time.time()) + self._ttl_seconds,
+            expires_at=current + self._ttl_seconds,
             nonce=secrets.token_urlsafe(12),
             version=int(version),
         )
@@ -84,7 +92,7 @@ class TokenSigner:
         sig = _b64url(hmac.new(self._secret, body.encode("ascii"), hashlib.sha256).digest())
         return f"{body}.{sig}"
 
-    def verify(self, token: str) -> TokenPayload | None:
+    def verify(self, token: str, *, now: int | None = None) -> TokenPayload | None:
         try:
             body, sig = token.split(".", 1)
         except ValueError:
@@ -102,6 +110,16 @@ class TokenSigner:
             )
         except Exception:
             return None
-        if payload.expires_at < int(time.time()):
+        if payload.expires_at < int(time.time() if now is None else now):
             return None
         return payload
+
+    def maybe_refresh(self, token: str, *, now: int | None = None) -> str | None:
+        current = int(time.time() if now is None else now)
+        payload = self.verify(token, now=current)
+        if payload is None:
+            return None
+        remaining = payload.expires_at - current
+        if remaining >= (self._ttl_seconds + 1) // 2:
+            return None
+        return self.issue(payload.user_id, payload.version, now=current)

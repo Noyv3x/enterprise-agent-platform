@@ -20,7 +20,7 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 
 Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base URL、已验证的远端身份投影和验证时间，独立凭据行只保存 Token。相同 origin 与远端用户身份不能同时绑定多个本地用户。用户本人和管理员代目标账号执行的变更共享同一个 owner 串行边界；删除本地用户或任一入口断开连接时凭据级联删除。Token 不进入 Runtime session、消息、workspace、Skill、备份清单或任何派生索引。
 
-短期登录失败窗口属于 Platform 安全状态，使用 session secret 派生的不可逆主体标识保存在 secret 设置行，并随当前 SQLite 一起备份、更新和恢复。它只保留当前窗口内的有界时间戳，不保存明文用户名、客户端地址或密码；成功登录、窗口过期和容量回收按认证策略清理相应桶。
+短期登录失败窗口属于 Platform 安全状态，使用 session secret 派生的不可逆主体标识保存在 secret 设置行，并随当前 SQLite 一起备份、更新和恢复。它只保留当前窗口内的有界时间戳，不保存明文用户名、客户端地址或密码；成功登录、窗口过期和容量回收按认证策略清理相应桶。浏览器登录 Cookie 是 HMAC 签名的瞬时认证状态，不写入用户表或 Runtime JSONL；其 TTL、`Max-Age` 与活动续期见[安全与信任边界](security-and-trust.md)。Platform 重启只要沿用已持久化的 session secret，就不会使未到期且未被吊销的登录失效。
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 

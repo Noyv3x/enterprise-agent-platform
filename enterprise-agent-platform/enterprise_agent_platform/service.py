@@ -39,7 +39,14 @@ from typing import Any, Callable, Deque, Iterable
 
 from PIL import Image, UnidentifiedImageError
 
-from .auth import TokenSigner, hash_password, verify_password
+from .auth import (
+    DEFAULT_SESSION_TTL_SECONDS,
+    MAX_SESSION_TTL_SECONDS,
+    MIN_SESSION_TTL_SECONDS,
+    TokenSigner,
+    hash_password,
+    verify_password,
+)
 from .agent_inputs import AgentRunInput, AgentRunInputStore
 from .agent_scopes import (
     AgentExecutionScope,
@@ -2376,8 +2383,16 @@ class EnterpriseService:
                 parsed = int(value)
             except (TypeError, ValueError):
                 parsed = self.config.token_ttl_seconds
-            return max(60, min(parsed, 30 * 24 * 60 * 60))
-        return int(self.config.token_ttl_seconds)
+            return max(
+                MIN_SESSION_TTL_SECONDS,
+                min(parsed, MAX_SESSION_TTL_SECONDS),
+            )
+        return int(self.config.token_ttl_seconds or DEFAULT_SESSION_TTL_SECONDS)
+
+    def refresh_browser_session(self, token: str | None) -> str | None:
+        if not self.user_from_token(token):
+            return None
+        return self.tokens.maybe_refresh(token)
 
     def public_base_url(self) -> str:
         return (self.get_setting(PLATFORM_SETTING_PUBLIC_BASE_URL) or self.config.public_base_url).rstrip("/")
@@ -2779,8 +2794,11 @@ class EnterpriseService:
             ttl = int(value)
         except (TypeError, ValueError) as exc:
             raise ServiceError(400, "session TTL must be an integer") from exc
-        if ttl < 60 or ttl > 30 * 24 * 60 * 60:
-            raise ServiceError(400, "session TTL must be between 60 and 2592000 seconds")
+        if ttl < MIN_SESSION_TTL_SECONDS or ttl > MAX_SESSION_TTL_SECONDS:
+            raise ServiceError(
+                400,
+                f"session TTL must be between {MIN_SESSION_TTL_SECONDS} and {MAX_SESSION_TTL_SECONDS} seconds",
+            )
         return ttl
 
     @staticmethod

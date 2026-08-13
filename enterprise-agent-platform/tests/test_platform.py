@@ -6048,6 +6048,118 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_unset_session_ttl_uses_seven_day_factory_default(self):
+        from enterprise_agent_platform.auth import DEFAULT_SESSION_TTL_SECONDS
+
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(
+                make_config(Path(td)),
+                token_ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
+            )
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                self.assertEqual(
+                    service._effective_session_ttl_seconds(),
+                    DEFAULT_SESSION_TTL_SECONDS,
+                )
+                security = service.platform_security_config(admin)["config"]
+                self.assertEqual(
+                    security["session_ttl_seconds"],
+                    DEFAULT_SESSION_TTL_SECONDS,
+                )
+                self.assertEqual(service.tokens.ttl_seconds, DEFAULT_SESSION_TTL_SECONDS)
+            finally:
+                service.close()
+
+    def test_login_cookie_sets_max_age_and_renews_before_half_life(self):
+        from enterprise_agent_platform.auth import TokenSigner
+
+        with tempfile.TemporaryDirectory() as td:
+            config = replace(make_config(Path(td)), token_ttl_seconds=60)
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            origin = f"http://{host}:{port}"
+            try:
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                conn.request(
+                    "POST",
+                    "/api/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}),
+                    headers={"Content-Type": "application/json", "Origin": origin},
+                )
+                response = conn.getresponse()
+                login_body = json.loads(response.read().decode("utf-8"))
+                cookie = response.getheader("Set-Cookie") or ""
+                self.assertEqual(response.status, 200)
+                self.assertIn("Max-Age=60", cookie)
+                self.assertIn("HttpOnly", cookie)
+                cookie_value = cookie.split(";", 1)[0]
+
+                conn.request(
+                    "GET",
+                    "/api/auth/me",
+                    headers={"Cookie": cookie_value},
+                )
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertIsNone(response.getheader("Set-Cookie"))
+
+                secret = service.get_secret("AGENT_PLATFORM_SESSION_SECRET")
+                aging = TokenSigner(secret, ttl_seconds=60).issue(
+                    int(login_body["user"]["id"]),
+                    int(login_body["user"].get("token_version") or 1),
+                    now=int(time.time()) - 40,
+                )
+                aging_cookie = f"{config.session_cookie_name}={aging}"
+                conn.request(
+                    "GET",
+                    "/api/auth/me",
+                    headers={"Cookie": aging_cookie},
+                )
+                response = conn.getresponse()
+                me = json.loads(response.read().decode("utf-8"))
+                renewed = response.getheader("Set-Cookie") or ""
+                self.assertEqual(response.status, 200)
+                self.assertEqual(me["user"]["username"], "admin")
+                self.assertIn("Max-Age=60", renewed)
+                renewed_token = renewed.split(";", 1)[0].split("=", 1)[1]
+                payload = service.tokens.verify(renewed_token)
+                self.assertIsNotNone(payload)
+                self.assertGreaterEqual(payload.expires_at, int(time.time()) + 50)
+
+                conn.request(
+                    "GET",
+                    "/api/auth/me",
+                    headers={"Authorization": f"Bearer {aging}"},
+                )
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertIsNone(response.getheader("Set-Cookie"))
+            finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_token_signer_refreshes_only_after_half_life(self):
+        from enterprise_agent_platform.auth import TokenSigner
+
+        signer = TokenSigner("unit-test-session-secret", ttl_seconds=100)
+        now = 1_700_000_000
+        token = signer.issue(7, 3, now=now)
+        self.assertIsNone(signer.maybe_refresh(token, now=now + 50))
+        refreshed = signer.maybe_refresh(token, now=now + 51)
+        self.assertIsNotNone(refreshed)
+        payload = signer.verify(refreshed, now=now + 51)
+        self.assertEqual(payload.user_id, 7)
+        self.assertEqual(payload.version, 3)
+        self.assertEqual(payload.expires_at, now + 151)
+        self.assertIsNone(signer.maybe_refresh(token, now=now + 101))
+
     def test_database_handles_concurrent_threads(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -8354,6 +8466,7 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIn("HttpOnly", cookie)
                 self.assertIn("SameSite=Lax", cookie)
                 self.assertIn("Secure", cookie)
+                self.assertIn("Max-Age=3600", cookie)
 
                 conn.request(
                     "POST",

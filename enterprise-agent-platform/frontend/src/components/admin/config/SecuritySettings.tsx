@@ -34,7 +34,7 @@ function seedForm(security: SecurityConfigValues): SecurityFormState {
     trustedProxy: !!security.trusted_proxy,
     host: security.host || "127.0.0.1",
     port: String(security.port || 8765),
-    sessionTtl: String(security.session_ttl_seconds || 8 * 60 * 60),
+    sessionTtl: String(security.session_ttl_seconds || 7 * 24 * 60 * 60),
     sessionSecret: "",
   };
 }
