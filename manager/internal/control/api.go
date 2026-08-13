@@ -511,7 +511,7 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 		if !a.decodeExecutor(response, request, &body) {
 			return
 		}
-		result, err := a.Executor.Process(body)
+		result, err := a.Executor.Process(request.Context(), body)
 		a.executorResult(response, result, err)
 	case "/v1/executor/file":
 		var body executor.Call
@@ -526,12 +526,26 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 			return
 		}
 		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.CancelRun(body)})
-	case "/v1/executor/scopes/cleanup":
-		var body executor.ScopeIdentity
+	case "/v1/executor/tasks/reconcile":
+		var body executor.TaskIdentity
 		if !a.decodeExecutor(response, request, &body) {
 			return
 		}
-		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.CleanupScope(body)})
+		processes, err := a.Executor.ReconcileTasks(body)
+		a.executorResult(response, map[string]any{"processes": processes}, err)
+	case "/v1/executor/tasks/acknowledge":
+		var body executor.TaskProcessIdentity
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.AcknowledgeTask(body)})
+	case "/v1/executor/scopes/cleanup":
+		var body executor.ScopeCleanupIdentity
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.CleanupScope(request.Context(), body)
+		a.executorResult(response, result, err)
 	case "/v1/executor/scopes/processes":
 		var body executor.ScopeIdentity
 		if !a.decodeExecutor(response, request, &body) {

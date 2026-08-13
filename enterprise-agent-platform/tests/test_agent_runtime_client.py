@@ -10,6 +10,7 @@ from typing import Any
 from unittest import mock
 
 from enterprise_agent_platform.agent_runtime_client import (
+    AGENT_RUNTIME_COMPACTION_TIMEOUT_SECONDS,
     AgentRuntimeClient,
     AgentRuntimeConnectionError,
     AgentRuntimeHTTPError,
@@ -659,6 +660,39 @@ class AgentRuntimeClientTests(unittest.TestCase):
                 self.assertEqual(error.raw["event_count"], 2)
                 self.assertEqual(error.raw["events"][-1]["type"], terminal_event)
 
+    def test_needs_review_terminal_content_is_the_authoritative_partial_diagnostic(self):
+        self.runtime.events = [
+            _event(1, "message.delta", {"delta": "obsolete draft"}),
+            _event(
+                2,
+                "run.needs_review",
+                {
+                    "error": "unfinished todo requires review",
+                    "content": "Verified 7 of 10 files; three remain blocked.",
+                    "session_id": "session-reviewed",
+                    "usage": {"input": 12, "output": 8},
+                },
+            ),
+        ]
+
+        with self.assertRaises(AgentRuntimeRunError) as raised:
+            self.client.generate(
+                system_prompt="system",
+                user_message="question",
+                history=[],
+                session_id="session-1",
+                session_key="private:7",
+            )
+
+        error = raised.exception
+        self.assertEqual(error.state, "needs_review")
+        self.assertEqual(
+            error.partial_content,
+            "Verified 7 of 10 files; three remain blocked.",
+        )
+        self.assertEqual(error.session_id, "session-reviewed")
+        self.assertEqual(error.raw["usage"], {"input": 12, "output": 8})
+
     def test_malformed_event_frame_does_not_abort_later_completion(self):
         self.runtime.events = [
             b"event: message.delta\ndata: {not valid json}\n\n",
@@ -853,6 +887,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             "private:7",
             "life-1",
             "session-1",
+            model={"provider": "openai-codex", "id": "gpt-5.5"},
         )
         self.assertEqual(
             compacted,
@@ -869,7 +904,34 @@ class AgentRuntimeClientTests(unittest.TestCase):
                 "scope_key": "private:7",
                 "lifecycle_id": "life-1",
                 "session_id": "session-1",
+                "model": {"provider": "openai-codex", "id": "gpt-5.5"},
             },
+        )
+
+    def test_session_compaction_uses_its_independent_long_request_deadline(self):
+        response = {
+            "compacted": True,
+            "omitted_messages": 12,
+            "retained_messages": 7,
+        }
+        with mock.patch.object(
+            self.client,
+            "_json_request",
+            return_value=(response, {}),
+        ) as request:
+            self.assertEqual(
+                self.client.compact_session(
+                    "private:7",
+                    "life-1",
+                    "session-1",
+                    model={"provider": "openai-codex", "id": "gpt-5.5"},
+                ),
+                response,
+            )
+
+        self.assertEqual(
+            request.call_args.kwargs["timeout"],
+            AGENT_RUNTIME_COMPACTION_TIMEOUT_SECONDS,
         )
         self.client.cleanup_scope(
             "private:7", lifecycle_id="life-1", delete_sessions=True

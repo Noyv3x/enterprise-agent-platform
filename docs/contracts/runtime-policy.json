@@ -22,5 +22,11 @@
     "maximum_milliseconds": 3600000,
     "runtime_environment_variable": "AGENT_RUNTIME_TERMINAL_TIMEOUT_MS",
     "semantics": "Foreground terminal commands have an independent execution timeout. An explicit timeout_ms overrides the default; background commands do not inherit it."
+  },
+  "process_wait_timeout": {
+    "default_milliseconds": 1800000,
+    "minimum_milliseconds": 100,
+    "maximum_milliseconds": 3600000,
+    "semantics": "Waiting observes one already-started background process without terminating it. The call returns immediately on a terminal snapshot, returns a running snapshot with wait_timed_out on deadline, pauses the run idle guard while pending, and remains abortable."
   }
 }

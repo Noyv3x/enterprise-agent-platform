@@ -74,7 +74,13 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
         change_summary: secret,
       },
     }],
-    ["delegate_task", { prompt: secret, system_prompt: `${secret}-system` }],
+    ["delegate_task", { prompt: secret }],
+    ["delegate_task", {
+      tasks: [
+        { prompt: `${secret}-one` },
+        { prompt: `${secret}-two`, role: "orchestrator" },
+      ],
+    }],
   ];
 
   for (const [toolName, args] of cases) {
@@ -124,6 +130,22 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
     },
     "Sylver Lining approval display keeps the complete short mutation body",
   );
+  const delegatedAudit = redactToolArgumentsForJournal("delegate_task", {
+    tasks: [
+      { prompt: `${secret}-one` },
+      { prompt: `${secret}-two`, role: "orchestrator" },
+    ],
+  });
+  assert.doesNotMatch(JSON.stringify(delegatedAudit), new RegExp(secret));
+  assert.deepEqual(delegatedAudit, {
+    tasks: [
+      { prompt: "[delegated prompt omitted from durable and event records]" },
+      {
+        prompt: "[delegated prompt omitted from durable and event records]",
+        role: "orchestrator",
+      },
+    ],
+  });
 });
 
 test("model-history canonicalization retains mismatched and unknown fields for strict rejection", () => {

@@ -178,19 +178,39 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       scope_key?: string;
       lifecycle_id?: string;
       session_id?: string;
+      model?: { provider: string; id: string; reasoning?: boolean };
+      gateway?: { base_url?: string; token?: string };
     }>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);
-    const allowed = new Set(["scope_key", "lifecycle_id", "session_id"]);
+    const allowed = new Set(["scope_key", "lifecycle_id", "session_id", "model", "gateway"]);
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw httpError(400, "Invalid session compaction request");
     }
     if (Object.keys(body).some((key) => !allowed.has(key))) {
-      throw httpError(400, "Session compaction accepts only scope_key, lifecycle_id, and session_id");
+      throw httpError(400, "Session compaction accepts only scope_key, lifecycle_id, session_id, model, and gateway");
     }
-    const result = await coordinator.compactSession(
-      body.scope_key ?? "",
-      body.lifecycle_id ?? "",
-      body.session_id ?? "",
-    );
+    if (!body.model || typeof body.model !== "object" || Array.isArray(body.model)) {
+      throw httpError(400, "Session compaction requires model");
+    }
+    const controller = new AbortController();
+    const abortCompaction = (): void => {
+      if (!response.writableEnded) controller.abort();
+    };
+    request.once("aborted", abortCompaction);
+    response.once("close", abortCompaction);
+    let result;
+    try {
+      result = await coordinator.compactSession(
+        body.scope_key ?? "",
+        body.lifecycle_id ?? "",
+        body.session_id ?? "",
+        body.model,
+        body.gateway,
+        controller.signal,
+      );
+    } finally {
+      request.off("aborted", abortCompaction);
+      response.off("close", abortCompaction);
+    }
     json(response, 200, result);
     return;
   }

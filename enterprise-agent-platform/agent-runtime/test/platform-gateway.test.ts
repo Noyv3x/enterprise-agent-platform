@@ -81,6 +81,75 @@ test("PlatformGateway adapts memory and credential calls to protected platform r
   }
 });
 
+test("PlatformGateway forwards schedule identity only for a valid top-level scheduled occurrence", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ data: { completed: true } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const gateway = new PlatformGateway(`http://127.0.0.1:${address.port}`, "token");
+    const request: RunRequest = {
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace: "/workspace",
+      system_prompt: "system",
+      input: "input",
+      model: { provider: "openai-codex", id: "gpt-5" },
+      metadata: {
+        actor: { id: 42 },
+        source_message_id: 99,
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "45",
+        schedule_recurring: true,
+      },
+    };
+    await gateway.invoke(request, "scheduled-run", "schedule", "complete_current", {});
+    await gateway.invoke({
+      ...request,
+      metadata: { ...request.metadata, trigger: "interactive", unattended: false },
+    }, "ordinary-run", "schedule", "complete_current", {});
+    await gateway.invoke({
+      ...request,
+      metadata: { ...request.metadata, schedule_run_id: "not-an-id" },
+    }, "invalid-run", "schedule", "complete_current", {});
+
+    assert.deepEqual((bodies[0]?.context as Record<string, unknown>), {
+      run_id: "scheduled-run",
+      scope_key: "private:42",
+      lifecycle_id: "life",
+      session_id: "session",
+      workspace: "/workspace",
+      owner_user_id: 42,
+      source_message_id: 99,
+      trigger: "scheduled",
+      unattended: true,
+      schedule_id: "7",
+      schedule_run_id: "45",
+      schedule_recurring: true,
+    });
+    for (const body of bodies.slice(1)) {
+      const context = body.context as Record<string, unknown>;
+      assert.equal(context.schedule_id, undefined);
+      assert.equal(context.schedule_run_id, undefined);
+      assert.equal(context.schedule_recurring, undefined);
+    }
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("PlatformGateway forwards mail through the internal boundary with trusted tool-call identity", async () => {
   let body: Record<string, unknown> = {};
   const server = createServer(async (request, response) => {

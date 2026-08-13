@@ -495,6 +495,163 @@ AGENT_MENTION_RE = re.compile(r"(?<![\w@])@(agent|main-agent|main_agent|main\s+a
 VISIBLE_TOOL_PROGRESS_EVENTS = frozenset(
     {"tool.started", "tool.updated", "tool.completed", "tool.failed"}
 )
+AGENT_WORK_TIMELINE_MAX_ENTRIES = 512
+AGENT_WORK_TIMELINE_DETAIL_MAX_CHARS = 32 * 1024
+AGENT_WORK_TIMELINE_TOTAL_DETAIL_MAX_CHARS = 512 * 1024
+AGENT_WORK_TIMELINE_TRUNCATION_STAGE = "work.truncated"
+
+
+def _is_persistable_agent_work_item(item: dict[str, Any]) -> bool:
+    return (
+        item.get("stage") == "assistant.message"
+        and item.get("source") == "agent"
+    ) or (
+        item.get("stage") == "tool"
+        and item.get("source") == "agent"
+        and str(item.get("tool") or "").strip().lower() not in {"", "tool"}
+    )
+
+
+def _next_agent_work_sequence(status: dict[str, Any]) -> int:
+    raw_next = status.get("_work_timeline_next_sequence")
+    try:
+        sequence = int(raw_next)
+    except (TypeError, ValueError):
+        sequence = max(
+            (
+                int(item.get("sequence") or 0)
+                for item in status.get("activity") or []
+                if isinstance(item, dict)
+            ),
+            default=0,
+        ) + 1
+    sequence = max(1, sequence)
+    status["_work_timeline_next_sequence"] = sequence + 1
+    return sequence
+
+
+def _truncate_agent_work_detail(value: str, maximum: int) -> tuple[str, int]:
+    text = str(value or "")
+    maximum = max(0, int(maximum))
+    if len(text) <= maximum:
+        return text, 0
+    return text[:maximum], len(text) - maximum
+
+
+def _bounded_agent_work_item(
+    activity: list[dict[str, Any]],
+    item: dict[str, Any],
+    *,
+    replacing_index: int | None = None,
+) -> dict[str, Any]:
+    bounded = dict(item)
+    bounded["label"] = str(bounded.get("label") or "")[:256]
+    bounded["line"] = str(bounded.get("line") or "")[:512]
+    if bounded.get("tool") is not None:
+        bounded["tool"] = str(bounded.get("tool") or "")[:128]
+    if bounded.get("tool_call_id") is not None:
+        bounded["tool_call_id"] = str(bounded.get("tool_call_id") or "")[:512]
+    detail = str(bounded.get("detail") or "")
+    if _is_persistable_agent_work_item(bounded):
+        other_detail_chars = sum(
+            len(str(existing.get("detail") or ""))
+            for index, existing in enumerate(activity)
+            if index != replacing_index and _is_persistable_agent_work_item(existing)
+        )
+        detail_limit = min(
+            AGENT_WORK_TIMELINE_DETAIL_MAX_CHARS,
+            max(0, AGENT_WORK_TIMELINE_TOTAL_DETAIL_MAX_CHARS - other_detail_chars),
+        )
+    else:
+        detail_limit = AGENT_WORK_TIMELINE_DETAIL_MAX_CHARS
+    rendered, omitted = _truncate_agent_work_detail(detail, detail_limit)
+    bounded["detail"] = rendered
+    if omitted:
+        bounded["detail_truncated_chars"] = omitted
+    else:
+        bounded.pop("detail_truncated_chars", None)
+    return bounded
+
+
+def _append_agent_work_item(
+    status: dict[str, Any],
+    activity: list[dict[str, Any]],
+    item: dict[str, Any],
+) -> int | None:
+    sequence = _next_agent_work_sequence(status)
+    regular_count = sum(_is_persistable_agent_work_item(existing) for existing in activity)
+    if (
+        _is_persistable_agent_work_item(item)
+        and regular_count >= AGENT_WORK_TIMELINE_MAX_ENTRIES
+    ):
+        omitted_tool_call_id = (
+            str(item.get("tool_call_id") or "").strip()
+            if item.get("stage") == "tool"
+            else ""
+        )
+        if omitted_tool_call_id:
+            status.setdefault("_work_timeline_omitted_tool_call_ids", set()).add(
+                omitted_tool_call_id
+            )
+        marker = next(
+            (
+                existing
+                for existing in activity
+                if existing.get("stage") == AGENT_WORK_TIMELINE_TRUNCATION_STAGE
+            ),
+            None,
+        )
+        if marker is None:
+            marker = {
+                "stage": AGENT_WORK_TIMELINE_TRUNCATION_STAGE,
+                "source": "platform",
+                "label": "Work record truncated",
+                "detail": "",
+                "line": "Work record truncated",
+                "sequence": sequence,
+                "updated_sequence": sequence,
+                "omitted_events": 1,
+                "omitted_tool_events": 1 if omitted_tool_call_id else 0,
+                "at": item.get("at"),
+            }
+            activity.append(marker)
+        else:
+            marker["omitted_events"] = int(marker.get("omitted_events") or 0) + 1
+            if omitted_tool_call_id:
+                marker["omitted_tool_events"] = int(
+                    marker.get("omitted_tool_events") or 0
+                ) + 1
+            marker["updated_sequence"] = sequence
+        return None
+    bounded = _bounded_agent_work_item(activity, item)
+    bounded["sequence"] = sequence
+    bounded["updated_sequence"] = sequence
+    activity.append(bounded)
+    return len(activity) - 1
+
+
+def _update_agent_work_item(
+    status: dict[str, Any],
+    activity: list[dict[str, Any]],
+    index: int,
+    updates: dict[str, Any],
+) -> None:
+    current = dict(activity[index])
+    sequence = current.get("sequence")
+    created_at = current.get("at")
+    previous_truncated_chars = int(current.get("detail_truncated_chars") or 0)
+    replaces_detail = bool(str(updates.get("detail") or ""))
+    merged = {**current, **updates}
+    if not replaces_detail:
+        merged["detail"] = current.get("detail") or ""
+    merged = _bounded_agent_work_item(activity, merged, replacing_index=index)
+    if not replaces_detail and previous_truncated_chars:
+        merged["detail_truncated_chars"] = previous_truncated_chars
+    event_sequence = _next_agent_work_sequence(status)
+    merged["sequence"] = sequence or event_sequence
+    merged["updated_sequence"] = event_sequence
+    merged["at"] = created_at
+    activity[index] = merged
 
 
 def is_substantive_tool_start(payload: dict[str, Any]) -> bool:
@@ -1752,6 +1909,7 @@ class EnterpriseService:
             self._append_agent_error(
                 task,
                 "Agent execution was interrupted during restart; its side effects are uncertain and it was not run twice.",
+                needs_review=True,
             )
 
     def _surface_failed_agent_jobs_without_message(
@@ -2073,7 +2231,7 @@ class EnterpriseService:
             )
             if job_update.rowcount <= 0:
                 return
-            conn.execute(
+            run_update = conn.execute(
                 """
                 UPDATE agent_schedule_runs
                 SET status = 'blocked', error = ?, finished_at = ?, updated_at = ?
@@ -2087,6 +2245,13 @@ class EnterpriseService:
                     int(job_id),
                 ),
             )
+            if run_update.rowcount > 0:
+                self.schedules.pause_current_schedule_for_terminal_run(
+                    conn,
+                    int(run_id),
+                    error=SCHEDULE_PROMPT_SAFETY_ERROR,
+                    timestamp=timestamp,
+                )
 
     def _start_telegram_gateway(self) -> None:
         if self._closed or self._auto_update_reserved:
@@ -8127,6 +8292,10 @@ class EnterpriseService:
                     "unattended": True,
                     "schedule_id": str(schedule_id),
                     "schedule_run_id": str(run_id),
+                    "schedule_recurring": str(
+                        self.schedules.decoded_schedule(locked_schedule).get("type") or ""
+                    )
+                    in {"interval", "cron"},
                     "scheduled_for": scheduled_text,
                 }
                 task = {
@@ -8440,16 +8609,21 @@ class EnterpriseService:
                 "unattended": True,
                 "schedule_id": str(run["schedule_id"]),
                 "schedule_run_id": str(run["id"]),
+                "schedule_recurring": str(
+                    self.schedules.decoded_schedule(run).get("type") or ""
+                )
+                in {"interval", "cron"},
                 "scheduled_for": scheduled_for,
             }
             try:
                 task["content"] = validate_schedule_prompt(task.get("content"))
             except ValueError:
-                self.schedules.update_run_status(
+                self.schedules.update_run_status_and_pause_current_schedule(
                     int(run["id"]),
                     "blocked",
                     error=SCHEDULE_PROMPT_SAFETY_ERROR,
                 )
+                self._schedule_wakeup.set()
                 continue
             job, _ = self.jobs.enqueue(
                 kind="agent",
@@ -8511,12 +8685,21 @@ class EnterpriseService:
                 )
             if status == str(row["run_status"]):
                 continue
-            self.schedules.update_run_status(
-                int(row["run_id"]),
-                status,
-                response_message_id=int(response["id"]) if response else None,
-                error=restored_error,
-            )
+            if status in {"needs_review", "blocked"}:
+                self.schedules.update_run_status_and_pause_current_schedule(
+                    int(row["run_id"]),
+                    status,
+                    response_message_id=int(response["id"]) if response else None,
+                    error=restored_error,
+                )
+                self._schedule_wakeup.set()
+            else:
+                self.schedules.update_run_status(
+                    int(row["run_id"]),
+                    status,
+                    response_message_id=int(response["id"]) if response else None,
+                    error=restored_error,
+                )
 
     def agent_terminal_previews(
         self,
@@ -10036,7 +10219,15 @@ class EnterpriseService:
     def invoke_agent_runtime_tool(self, body: dict[str, Any]) -> dict[str, Any]:
         tool = str(body.get("tool") or "").strip().lower()
         action = str(body.get("action") or "").strip().lower()
-        arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {}
+        raw_arguments = body.get("arguments")
+        if tool == "schedule" and action in {"continue_current", "complete_current"} and (
+            not isinstance(raw_arguments, dict) or raw_arguments
+        ):
+            raise ServiceError(
+                400,
+                f"schedule {action} requires an empty arguments object",
+            )
+        arguments = raw_arguments if isinstance(raw_arguments, dict) else {}
         context = body.get("context") if isinstance(body.get("context"), dict) else {}
         scope_key = str(context.get("scope_key") or "").strip()
         if tool == "web":
@@ -10825,6 +11016,8 @@ class EnterpriseService:
         arguments: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
+        if action in {"continue_current", "complete_current"} and arguments:
+            raise ServiceError(400, f"schedule {action} does not accept arguments")
         forbidden = {
             "owner",
             "owner_id",
@@ -10847,6 +11040,14 @@ class EnterpriseService:
         actor = self.get_user(int(scope.scope_id))
         if actor is None:
             raise ServiceError(403, "schedule owner is unavailable")
+
+        if action in {"continue_current", "complete_current"}:
+            return self._current_agent_schedule_decision(
+                actor,
+                scope,
+                context,
+                action=action,
+            )
 
         def schedule_id() -> int:
             try:
@@ -10891,8 +11092,209 @@ class EnterpriseService:
             return self.run_private_schedule_now(actor, schedule_id())
         raise ServiceError(
             400,
-            "schedule action must be list, get, history, create, update, pause, resume, delete or run_now",
+            "schedule action must be list, get, history, create, update, pause, resume, "
+            "delete, run_now, continue_current or complete_current",
         )
+
+    def _current_agent_schedule_decision(
+        self,
+        actor: dict[str, Any],
+        scope: AgentExecutionScope,
+        context: dict[str, Any],
+        *,
+        action: str,
+    ) -> dict[str, Any]:
+        """Validate one current recurring-occurrence decision atomically.
+
+        The model deliberately cannot select a target.  The two identifiers
+        come from Runtime's signed Gateway context and are checked against the
+        currently running durable job, source message and schedule revision in
+        one SQLite transaction. ``continue_current`` only confirms the already
+        computed next occurrence; ``complete_current`` ends the schedule. This
+        keeps a stale occurrence from deciding for a later revision.
+        """
+
+        actor = self._schedule_actor(actor)
+        owner_user_id = int(actor["id"])
+        if (
+            str(context.get("trigger") or "").strip().lower() != "scheduled"
+            or context.get("unattended") is not True
+            or context.get("schedule_recurring") is not True
+            or context.get("parent_run_id") not in {None, ""}
+            or context.get("delegation_depth") not in {None, 0}
+        ):
+            raise ServiceError(
+                403,
+                f"schedule {action} requires a top-level recurring scheduled Run",
+            )
+        if str(context.get("lifecycle_id") or "").strip() != scope.lifecycle_id:
+            raise ServiceError(409, "scheduled Run lifecycle is stale")
+
+        def trusted_positive_id(field: str) -> int:
+            raw = context.get(field)
+            if isinstance(raw, bool):
+                raise ServiceError(403, "scheduled Run identity is invalid")
+            if isinstance(raw, int):
+                value = raw
+            elif isinstance(raw, str) and re.fullmatch(r"[1-9][0-9]*", raw):
+                value = int(raw)
+            else:
+                raise ServiceError(403, "scheduled Run identity is missing")
+            if value <= 0:
+                raise ServiceError(403, "scheduled Run identity is invalid")
+            return value
+
+        context_owner_user_id = trusted_positive_id("owner_user_id")
+        schedule_id = trusted_positive_id("schedule_id")
+        schedule_run_id = trusted_positive_id("schedule_run_id")
+        source_message_id = trusted_positive_id("source_message_id")
+        if context_owner_user_id != owner_user_id:
+            raise ServiceError(403, "scheduled Run owner does not match its private Agent")
+
+        with self._schedule_dispatch_lock:
+            with self.db.transaction(immediate=True) as conn:
+                row = conn.execute(
+                    """
+                    SELECT schedules.*,
+                           runs.id AS current_run_id,
+                           runs.schedule_revision AS run_schedule_revision,
+                           runs.trigger AS run_trigger,
+                           runs.status AS run_status,
+                           runs.source_message_id AS run_source_message_id,
+                           jobs.kind AS job_kind,
+                           jobs.scope_type AS job_scope_type,
+                           jobs.scope_id AS job_scope_id,
+                           jobs.status AS job_status,
+                           source.scope_type AS source_scope_type,
+                           source.scope_id AS source_scope_id,
+                           source.author_type AS source_author_type,
+                           source.user_id AS source_user_id,
+                           users.active AS owner_active,
+                           users.permission_group AS owner_permission_group,
+                           runtime.lifecycle_id AS runtime_lifecycle_id
+                    FROM agent_schedule_runs AS runs
+                    JOIN agent_schedules AS schedules
+                      ON schedules.id = runs.schedule_id
+                    JOIN durable_jobs AS jobs
+                      ON jobs.id = runs.durable_job_id
+                    JOIN messages AS source
+                      ON source.id = runs.source_message_id
+                    JOIN users ON users.id = schedules.owner_user_id
+                    JOIN agent_runtime_scopes AS runtime
+                      ON runtime.scope_key = ?
+                    WHERE runs.id = ? AND schedules.id = ?
+                    """,
+                    (scope.scope_key, schedule_run_id, schedule_id),
+                ).fetchone()
+                if row is None:
+                    raise ServiceError(409, "scheduled Run occurrence is stale")
+                schedule = dict(row)
+                permission_group = str(schedule.get("owner_permission_group") or "")
+                if (
+                    int(schedule["owner_user_id"]) != owner_user_id
+                    or schedule.get("deleted_at") is not None
+                    or not bool(schedule.get("owner_active"))
+                    or permission_group not in PERMISSION_GROUPS
+                    or PERMISSION_PRIVATE_AGENT
+                    not in PERMISSION_GROUPS[permission_group]["permissions"]
+                ):
+                    raise ServiceError(403, "scheduled Run owner is no longer authorized")
+                if (
+                    str(schedule.get("runtime_lifecycle_id") or "")
+                    != scope.lifecycle_id
+                    or int(schedule.get("last_run_id") or 0) != schedule_run_id
+                ):
+                    raise ServiceError(409, "scheduled Run occurrence is no longer current")
+                if (
+                    int(schedule.get("run_source_message_id") or 0)
+                    != source_message_id
+                    or str(schedule.get("run_status") or "") != "running"
+                    or str(schedule.get("job_kind") or "") != "agent"
+                    or str(schedule.get("job_scope_type") or "") != "private"
+                    or str(schedule.get("job_scope_id") or "")
+                    != str(owner_user_id)
+                    or str(schedule.get("job_status") or "") != "running"
+                    or str(schedule.get("source_scope_type") or "") != "private"
+                    or str(schedule.get("source_scope_id") or "")
+                    != str(owner_user_id)
+                    or str(schedule.get("source_author_type") or "") != "system"
+                    or int(schedule.get("source_user_id") or 0) != owner_user_id
+                ):
+                    raise ServiceError(409, "scheduled Run task identity does not match")
+                run_revision = int(schedule.get("run_schedule_revision") or 1)
+                dispatched_revision = run_revision + (
+                    1 if str(schedule.get("run_trigger") or "") == "scheduled" else 0
+                )
+                current_revision = int(schedule.get("revision") or 1)
+                definition = self.schedules.decoded_schedule(schedule)
+                if str(definition.get("type") or "") not in {"interval", "cron"}:
+                    raise ServiceError(409, "scheduled Run does not belong to a recurring schedule")
+                if action == "continue_current":
+                    if (
+                        current_revision != dispatched_revision
+                        or str(schedule.get("state") or "") != "active"
+                        or not bool(schedule.get("enabled"))
+                        or schedule.get("next_run_at") is None
+                    ):
+                        raise ServiceError(409, "schedule changed after this occurrence started")
+                    return {
+                        "continued": True,
+                        "schedule": self._public_schedule(schedule),
+                    }
+                completed_shape = (
+                    str(schedule.get("state") or "") == "completed"
+                    and not bool(schedule.get("enabled"))
+                    and schedule.get("next_run_at") is None
+                )
+                completed_by_this_run = (
+                    completed_shape
+                    and current_revision == dispatched_revision + 1
+                )
+                already_completed = completed_by_this_run
+                if not already_completed:
+                    if (
+                        current_revision != dispatched_revision
+                        or str(schedule.get("state") or "") != "active"
+                        or not bool(schedule.get("enabled"))
+                    ):
+                        raise ServiceError(409, "schedule changed after this occurrence started")
+                    timestamp = now_ts()
+                    cursor = conn.execute(
+                        """
+                        UPDATE agent_schedules
+                        SET state = 'completed', enabled = 0, next_run_at = NULL,
+                            revision = ?, retry_after = 0, last_error = '', updated_at = ?
+                        WHERE id = ? AND owner_user_id = ? AND deleted_at IS NULL
+                          AND last_run_id = ? AND revision = ?
+                          AND state = 'active' AND enabled = 1
+                        """,
+                        (
+                            dispatched_revision + 1,
+                            timestamp,
+                            schedule_id,
+                            owner_user_id,
+                            schedule_run_id,
+                            dispatched_revision,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ServiceError(409, "schedule changed concurrently")
+                    final_row = conn.execute(
+                        "SELECT * FROM agent_schedules WHERE id = ?",
+                        (schedule_id,),
+                    ).fetchone()
+                    if final_row is None:
+                        raise ServiceError(409, "schedule changed concurrently")
+                    schedule = dict(final_row)
+
+        self._schedule_wakeup.set()
+        return {
+            "completed": True,
+            "already_completed": already_completed,
+            "schedule": self._public_schedule(
+                schedule,
+            ),
+        }
 
     def _agent_web_tool(self, action: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if action == "search":
@@ -14853,6 +15255,7 @@ class EnterpriseService:
                             raise ServiceError(409, "conversation identity changed")
                         if scope_type == "channel":
                             require_permission(actor, PERMISSION_CHAT)
+                        generation = self.account_generation_config(actor)
                         busy = bool(
                             self._agent_active_tasks.get(conversation_key)
                             or self._agent_queues.get(conversation_key)
@@ -14883,6 +15286,8 @@ class EnterpriseService:
                             agent_scope.scope_key,
                             agent_scope.lifecycle_id,
                             agent_scope.session_id,
+                            model=generation["model"],
+                            reasoning_config=generation["reasoning_config"],
                         )
                     except AgentRuntimeHTTPError as exc:
                         if exc.status_code == 409:
@@ -15918,7 +16323,17 @@ class EnterpriseService:
                         error_persisted = True
                     else:
                         try:
-                            self._append_agent_error(task, error, require_current=True)
+                            self._append_agent_error(
+                                task,
+                                error,
+                                require_current=True,
+                                partial_content=(
+                                    exc.partial_content
+                                    if runtime_needs_review
+                                    else ""
+                                ),
+                                needs_review=runtime_needs_review,
+                            )
                         except _AgentTaskCancelled:
                             # A reset/deactivation owns the terminal state; do
                             # not recreate an error message after it completed.
@@ -15994,8 +16409,11 @@ class EnterpriseService:
                                 "detail": error[:180],
                                 "line": agent_work_line("error", "Agent 回复失败", error[:180]),
                                 "at": now_ts(),
+                                "sequence": 1,
+                                "updated_sequence": 1,
                             }
                         ]
+                        idle["_work_timeline_next_sequence"] = 2
                     self._agent_status[key] = idle
                     self._drop_empty_conversation_maps_locked(key)
                     self._agent_workers.pop(key, None)
@@ -16023,12 +16441,21 @@ class EnterpriseService:
         if run_id <= 0:
             return
         try:
-            self.schedules.update_run_status(
-                run_id,
-                status,
-                response_message_id=response_message_id,
-                error=error,
-            )
+            if status in {"needs_review", "blocked"}:
+                self.schedules.update_run_status_and_pause_current_schedule(
+                    run_id,
+                    status,
+                    response_message_id=response_message_id,
+                    error=error,
+                )
+                self._schedule_wakeup.set()
+            else:
+                self.schedules.update_run_status(
+                    run_id,
+                    status,
+                    response_message_id=response_message_id,
+                    error=error,
+                )
         except Exception as exc:
             print(f"Failed to update scheduled run {run_id}: {exc}", file=sys.stderr)
 
@@ -16050,6 +16477,8 @@ class EnterpriseService:
         error: str,
         *,
         require_current: bool = False,
+        partial_content: str = "",
+        needs_review: bool = False,
     ) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
         metadata = {
@@ -16057,6 +16486,8 @@ class EnterpriseService:
             "reply_to": self._reply_target(task),
             **self._input_group_metadata(task),
         }
+        if needs_review:
+            metadata["needs_review"] = True
         if task.get("_job_id"):
             metadata["durable_job_id"] = int(task["_job_id"])
         scheduled_terminal_status = str(task.get("_scheduled_terminal_status") or "")
@@ -16065,14 +16496,25 @@ class EnterpriseService:
             metadata["scheduled_run_error"] = str(
                 task.get("_unattended_authorization_reason") or error
             )[:2000]
-        metadata["agent_work"] = self._agent_work_snapshot(task, state="error")
+        metadata["agent_work"] = self._agent_work_snapshot(
+            task,
+            state="needs_review" if needs_review else "error",
+        )
+        safe_partial = self._agent_review_partial_content(partial_content)
+        content = f"Agent 回复失败: {error}"
+        if safe_partial:
+            content = (
+                "任务尚未完成，以下是停止前的进度：\n\n"
+                f"{safe_partial}\n\n"
+                f"需要复核：{error}"
+            )
         kwargs = {
             "scope_type": str(task["scope_type"]),
             "scope_id": str(task["scope_id"]),
             "author_type": "agent",
             "user_id": None,
             "username": username,
-            "content": f"Agent 回复失败: {error}",
+            "content": content,
             "metadata": metadata,
         }
         if require_current:
@@ -16097,6 +16539,17 @@ class EnterpriseService:
             self._append_message(**kwargs)
         if str(task["scope_type"]) == "private":
             self._telegram_delivery_wakeup.set()
+
+    @staticmethod
+    def _agent_review_partial_content(content: str) -> str:
+        """Bound visible diagnostics without ever interpreting MEDIA output."""
+
+        clean = str(content or "").strip()
+        if not clean:
+            return ""
+        if len(clean) > 24_000:
+            clean = clean[:24_000].rstrip() + "\n…[进度说明已截断]"
+        return clean
 
     def _normalize_conversation(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> tuple[str, str]:
         scope_type = str(scope_type).strip().lower()
@@ -16153,6 +16606,8 @@ class EnterpriseService:
                     "detail": "",
                     "line": agent_work_line(state, label, ""),
                     "at": started_at,
+                    "sequence": 1,
+                    "updated_sequence": 1,
                 }
             ],
             "current_step": label,
@@ -16165,6 +16620,7 @@ class EnterpriseService:
             "input_group_id": str(task.get("_input_group_id") or ""),
             "processing_mode": str(task.get("_processing_mode") or ("queued" if state == "queued" else "started")),
             "active_input_group": None,
+            "_work_timeline_next_sequence": 2,
         }
         self._update_active_input_group_status(status, task)
         return status
@@ -16232,11 +16688,15 @@ class EnterpriseService:
             "input_group_id": "",
             "processing_mode": "",
             "active_input_group": None,
+            "_work_timeline_next_sequence": 1,
         }
 
     @staticmethod
     def _copy_status(status: dict[str, Any]) -> dict[str, Any]:
         copied = dict(status)
+        copied.pop("_work_timeline_next_sequence", None)
+        copied.pop("_work_timeline_tool_seen", None)
+        copied.pop("_work_timeline_omitted_tool_call_ids", None)
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
@@ -16284,9 +16744,10 @@ class EnterpriseService:
                         matched_index = index
                         break
             if matched_index is not None:
-                activity.pop(matched_index)
-            activity.append(item)
-            status["activity"] = activity[-30:]
+                _update_agent_work_item(status, activity, matched_index, item)
+            else:
+                _append_agent_work_item(status, activity, item)
+            status["activity"] = activity
             status["current_step"] = label
             status["updated_at"] = timestamp
             self._agent_status[key] = status
@@ -16300,12 +16761,32 @@ class EnterpriseService:
             return status
         stream["active"] = False
         stream["updated_at"] = timestamp
-        segments = [dict(item) for item in status.get("stream_messages") or []]
-        if not segments or segments[-1].get("id") != stream.get("id"):
-            segments.append(stream)
-        else:
-            segments[-1] = stream
-        status["stream_messages"] = segments[-8:]
+        activity = [dict(item) for item in status.get("activity") or []]
+        summary = " ".join(content.split())
+        timeline_index = _append_agent_work_item(
+            status,
+            activity,
+            {
+                "stage": "assistant.message",
+                "source": "agent",
+                "label": "Agent update",
+                "line": summary[:180],
+                "detail": content,
+                "at": stream.get("created_at") or status.get("started_at") or timestamp,
+                "completed_at": timestamp,
+                "stream_id": stream.get("id"),
+            },
+        )
+        status["activity"] = activity
+        if timeline_index is None:
+            status["stream_message"] = None
+            status["stream_messages"] = []
+            return status
+        # The finalized prose now belongs to the monotonic work timeline. Do
+        # not retain a second copy: MessageList would render it as a full Agent
+        # bubble beside the compact row, and repeated tool boundaries would
+        # otherwise grow this legacy buffer without bound.
+        status["stream_messages"] = []
         status["stream_message"] = None
         return status
 
@@ -16521,7 +17002,13 @@ class EnterpriseService:
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            if is_substantive_tool_start(event):
+                # The completed assistant segment happened before this tool,
+                # even when both events share the same second-granularity
+                # timestamp. Append it first to the monotonic timeline.
+                status = self._finalize_stream_message(status, timestamp)
             activity = [dict(item) for item in status.get("activity") or []]
+            status["_work_timeline_tool_seen"] = True
             if tool_status in {
                 "completed",
                 "complete",
@@ -16554,6 +17041,31 @@ class EnterpriseService:
                             matched_index = index
                             break
                 if matched_index is None:
+                    omitted_tool_ids = status.get("_work_timeline_omitted_tool_call_ids")
+                    if (
+                        tool_call_id
+                        and isinstance(omitted_tool_ids, set)
+                        and tool_call_id in omitted_tool_ids
+                    ):
+                        marker = next(
+                            (
+                                existing
+                                for existing in activity
+                                if existing.get("stage") == AGENT_WORK_TIMELINE_TRUNCATION_STAGE
+                            ),
+                            None,
+                        )
+                        if marker is not None:
+                            marker["updated_sequence"] = _next_agent_work_sequence(status)
+                        status["activity"] = activity
+                        status["current_step"] = (
+                            f"{tool} 执行失败"
+                            if terminal_status == "failed"
+                            else f"完成 {tool}"
+                        )
+                        status["updated_at"] = timestamp
+                        self._agent_status[key] = status
+                        return
                     item = {
                         "stage": "tool",
                         "source": "agent",
@@ -16564,19 +17076,28 @@ class EnterpriseService:
                         "tool_call_id": tool_call_id,
                         "at": timestamp,
                     }
+                    item["tool_status"] = terminal_status
+                    item["completed_at"] = timestamp
+                    _append_agent_work_item(status, activity, item)
                 else:
-                    # A tool occupies one row for its entire lifecycle. Move the
-                    # completed row to the end so approval events that happened
-                    # while it was paused remain in chronological order.
-                    item = activity.pop(matched_index)
-                    item["tool"] = tool
-                    item["label"] = tool
+                    # A tool occupies its original row for the entire
+                    # lifecycle. Completion records when it changed without
+                    # reordering later commentary or tools.
+                    updates = {
+                        "tool": tool,
+                        "label": tool,
+                        "tool_status": terminal_status,
+                        "completed_at": timestamp,
+                    }
                     if detail:
-                        item["detail"] = detail
-                item["tool_status"] = terminal_status
-                item["completed_at"] = timestamp
-                activity.append(item)
-                status["activity"] = activity[-30:]
+                        updates["detail"] = detail
+                    _update_agent_work_item(
+                        status,
+                        activity,
+                        matched_index,
+                        updates,
+                    )
+                status["activity"] = activity
                 status["current_step"] = (
                     f"{tool} 执行失败"
                     if terminal_status == "failed"
@@ -16615,16 +17136,20 @@ class EnterpriseService:
             if detail:
                 item_data["detail"] = detail
             if existing is not None:
-                existing.update(item_data)
+                existing_index = activity.index(existing)
+                _update_agent_work_item(
+                    status,
+                    activity,
+                    existing_index,
+                    item_data,
+                )
             else:
                 item_data.setdefault("detail", "")
-                activity.append(item_data)
-            if is_substantive_tool_start(event):
-                status = self._finalize_stream_message(status, timestamp)
+                _append_agent_work_item(status, activity, item_data)
             if status.get("state") == "approval":
                 status["state"] = "replying"
                 status["approval"] = None
-            status["activity"] = activity[-30:]
+            status["activity"] = activity
             status["current_step"] = line
             status["updated_at"] = timestamp
             self._agent_status[key] = status
@@ -16660,12 +17185,17 @@ class EnterpriseService:
                         existing = item
                         break
             if existing is None:
-                activity.append(item_data)
+                _append_agent_work_item(status, activity, item_data)
             else:
-                existing.update(item_data)
+                _update_agent_work_item(
+                    status,
+                    activity,
+                    activity.index(existing),
+                    item_data,
+                )
             status["state"] = "approval"
             status["approval"] = approval
-            status["activity"] = activity[-30:]
+            status["activity"] = activity
             status["current_step"] = line
             status["updated_at"] = timestamp
             self._agent_status[key] = status
@@ -16717,11 +17247,16 @@ class EnterpriseService:
                 "approval_result": dict(approval_result or {}),
             }
             if existing is None:
-                activity.append(item_data)
+                _append_agent_work_item(status, activity, item_data)
             elif responder or not existing.get("approval_responder"):
                 # Prefer the user-facing HTTP responder over the anonymous SSE
                 # acknowledgement when the two paths race.
-                existing.update(item_data)
+                _update_agent_work_item(
+                    status,
+                    activity,
+                    activity.index(existing),
+                    item_data,
+                )
             current_approval_id = str(current_approval.get("approval_id") or "").strip()
             resolves_current = not current_approval_id or not approval_id or current_approval_id == approval_id
             if resolves_current:
@@ -16732,7 +17267,7 @@ class EnterpriseService:
                 )
                 status["approval"] = None
                 status["current_step"] = "权限审批已处理"
-            status["activity"] = activity[-30:]
+            status["activity"] = activity
             status["updated_at"] = timestamp
             self._agent_status[key] = status
             return self._copy_status(status)
@@ -16759,25 +17294,47 @@ class EnterpriseService:
     def _agent_work_snapshot(self, task: dict[str, Any], state: str) -> dict[str, Any]:
         key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
         with self._conversation_lock:
-            status = self._copy_status(
-                self._agent_status.get(key)
-                or self._idle_agent_status(str(task["scope_type"]), str(task["scope_id"]))
+            raw_status = self._agent_status.get(key) or self._idle_agent_status(
+                str(task["scope_type"]), str(task["scope_id"])
             )
-        tool_activity = []
-        for item in status.get("activity") or []:
-            tool = str(item.get("tool") or "").strip()
-            if (
-                item.get("source") == "agent"
-                and item.get("stage") == "tool"
-                and tool
-                and tool.lower() != "tool"
-            ):
-                tool_activity.append(item)
+            tool_seen = bool(raw_status.get("_work_timeline_tool_seen"))
+            status = self._copy_status(
+                raw_status
+            )
+        # A failed or interrupted run may still have a live diagnostic segment;
+        # finalize it only on the copied snapshot. On a successful run the live
+        # segment is the final answer and must remain message.content only.
+        if state != "complete" and status.get("stream_message"):
+            status = self._finalize_stream_message(status, now_ts())
+
+        activity = [dict(item) for item in status.get("activity") or []]
+        tool_seen = tool_seen or any(
+            item.get("source") == "agent"
+            and item.get("stage") == "tool"
+            and str(item.get("tool") or "").strip().lower() not in {"", "tool"}
+            for item in activity
+        )
+        process_activity: list[dict[str, Any]] = []
+        if tool_seen:
+            for item in activity:
+                stage = str(item.get("stage") or "").strip().lower()
+                tool = str(item.get("tool") or "").strip()
+                if stage == "assistant.message" and item.get("source") == "agent":
+                    process_activity.append(item)
+                elif (
+                    stage == "tool"
+                    and item.get("source") == "agent"
+                    and tool
+                    and tool.lower() != "tool"
+                ):
+                    process_activity.append(item)
+                elif stage == AGENT_WORK_TIMELINE_TRUNCATION_STAGE:
+                    process_activity.append(item)
         return {
             "run_id": self._run_id_for_task(task),
             "state": state,
             "replying_to": self._reply_target(task),
-            "activity": tool_activity,
+            "activity": process_activity,
             "current_step": status.get("current_step") or "",
             "started_at": status.get("started_at"),
             "updated_at": status.get("updated_at"),

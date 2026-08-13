@@ -69,6 +69,7 @@ export type AgentState =
   | "replying"
   | "approval"
   | "error"
+  | "needs_review"
   | "complete"
   | "idle"
   | (string & {});
@@ -154,6 +155,16 @@ export interface ActivityStep {
   emoji?: string;
   at?: number | string;
   completed_at?: number | string;
+  /** Stable position assigned when the work item first appears. */
+  sequence?: number;
+  /** Latest lifecycle event folded into this stable work item. */
+  updated_sequence?: number;
+  /** Original detail characters omitted by a Platform safety bound. */
+  detail_truncated_chars?: number;
+  /** Work events omitted after the timeline entry bound was reached. */
+  omitted_events?: number;
+  /** Omitted events known to be real tool calls. */
+  omitted_tool_events?: number;
 }
 
 export interface AgentApprovalRequest {

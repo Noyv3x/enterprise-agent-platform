@@ -7,7 +7,7 @@
 ## 修改顺序
 
 1. 在对应设计或参考文档中描述期望的最终行为。
-2. 如果精确默认值、边界或枚举跨语言/进程共享，或被声明为稳定设计契约，先修改相应的机器可读契约；当前跨层 Runtime 策略契约为 [`runtime-policy.json`](../contracts/runtime-policy.json)，容器服务集合、容量预算与更新边界由 [`container-platform.json`](../contracts/container-platform.json) 统一定义。
+2. 如果精确默认值、边界或枚举跨语言/进程共享，或被声明为稳定设计契约，先修改相应的机器可读契约；当前跨层 Runtime 策略契约为 [`runtime-policy.json`](../contracts/runtime-policy.json)，其中同时校验 Run 空闲、模型轮次、终端执行和后台进程单次等待的默认值与上下限，并为 Platform、Runtime、前端及需要执行等待边界的 Manager 生成语言原生常量；容器服务集合、容量预算与更新边界由 [`container-platform.json`](../contracts/container-platform.json) 统一定义。
 3. 运行 `python3 scripts/docs_sync.py sync`，生成各语言消费的契约模块。
 4. 修改生产代码，并补充或更新映射域中的验收测试。
 5. 运行 `python3 scripts/docs_sync.py check` 和该代码域的完整测试。

@@ -101,6 +101,12 @@ class DocsSyncTests(unittest.TestCase):
                     "tests": [],
                 },
                 {
+                    "id": "security-and-trust",
+                    "documents": ["docs/design/security.md"],
+                    "code": ["manager/internal/executor/runtime_policy_generated.go"],
+                    "tests": [],
+                },
+                {
                     "id": "integrations",
                     "documents": ["docs/design/integrations.md"],
                     "code": [
@@ -136,7 +142,12 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "id": "container-platform",
                     "source": "docs/contracts/container-platform.json",
-                    "domains": ["deployment", "platform", "agent-runtime", "frontend"],
+                    "domains": [
+                        "deployment",
+                        "platform",
+                        "agent-runtime",
+                        "frontend",
+                    ],
                     "targets": [
                         {
                             "path": "manager/internal/contract/generated.go",
@@ -184,8 +195,18 @@ class DocsSyncTests(unittest.TestCase):
                 {
                     "id": "runtime-policy",
                     "source": "docs/contracts/runtime-policy.json",
-                    "domains": ["platform", "agent-runtime", "frontend"],
+                    "domains": [
+                        "deployment",
+                        "security-and-trust",
+                        "platform",
+                        "agent-runtime",
+                        "frontend",
+                    ],
                     "targets": [
+                        {
+                            "path": "manager/internal/executor/runtime_policy_generated.go",
+                            "format": "go-runtime-policy",
+                        },
                         {
                             "path": "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py",
                             "format": "python-runtime-policy",
@@ -229,6 +250,12 @@ class DocsSyncTests(unittest.TestCase):
                 "maximum_milliseconds": 3600000,
                 "runtime_environment_variable": "RUNTIME_TERMINAL_TIMEOUT_MS",
                 "semantics": "Foreground commands have their own timeout.",
+            },
+            "process_wait_timeout": {
+                "default_milliseconds": 1800000,
+                "minimum_milliseconds": 100,
+                "maximum_milliseconds": 3600000,
+                "semantics": "Wait calls observe a process without stopping it.",
             },
         }
 
@@ -381,6 +408,7 @@ class DocsSyncTests(unittest.TestCase):
             "docs/design/governance.md": "# Governance\n\nThe documentation policy.\n",
             "docs/design/repository.md": "# Repository\n\nThe repository policy.\n",
             "docs/design/deployment.md": "# Deployment\n\nThe deployment policy.\n",
+            "docs/design/security.md": "# Security\n\nThe security policy.\n",
             "docs/design/integrations.md": "# Integrations\n\nThe integration policy.\n",
             "docs/design/runtime.md": "# Runtime\n\nThe current runtime design.\n",
             "docs/design/frontend.md": "# Frontend\n\nThe current frontend design.\n",
@@ -420,6 +448,7 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("already current", second.stdout)
 
         generated_paths = [
+            self.root / "manager/internal/executor/runtime_policy_generated.go",
             self.root
             / "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py",
             self.root
@@ -1375,6 +1404,17 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("terminal_timeout.minimum_milliseconds must be greater than zero", terminal.stderr)
 
         contract = self.contract()
+        contract["process_wait_timeout"]["minimum_milliseconds"] = 0  # type: ignore[index]
+        (self.root / "docs/contracts/runtime-policy.json").write_text(
+            json.dumps(contract, indent=2) + "\n", encoding="utf-8"
+        )
+        process_wait = self.run_command("sync", expect=1)
+        self.assertIn(
+            "process_wait_timeout.minimum_milliseconds must be greater than zero",
+            process_wait.stderr,
+        )
+
+        contract = self.contract()
         unsafe_seconds = ((1 << 53) - 1) // 1000 + 1
         contract["run_idle_timeout"]["maximum_seconds"] = unsafe_seconds  # type: ignore[index]
         (self.root / "docs/contracts/runtime-policy.json").write_text(
@@ -1407,6 +1447,17 @@ class DocsSyncTests(unittest.TestCase):
         )
         node_timer = self.run_command("sync", expect=1)
         self.assertIn("must not exceed the Node.js timer limit", node_timer.stderr)
+
+        contract = self.contract()
+        contract["process_wait_timeout"]["maximum_milliseconds"] = 2_147_483_648  # type: ignore[index]
+        (self.root / "docs/contracts/runtime-policy.json").write_text(
+            json.dumps(contract, indent=2) + "\n", encoding="utf-8"
+        )
+        process_wait_timer = self.run_command("sync", expect=1)
+        self.assertIn(
+            "process_wait_timeout.maximum_milliseconds must not exceed the Node.js timer limit",
+            process_wait_timer.stderr,
+        )
 
     def test_first_manifest_commit_is_a_bootstrap(self) -> None:
         self.initialize_git()

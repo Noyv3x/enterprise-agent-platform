@@ -693,11 +693,23 @@ export function redactToolArgumentsForJournal(
     }
   }
   if (toolName === "delegate_task") {
+    const tasks = Array.isArray(args.tasks) ? args.tasks : undefined;
+    if (tasks) {
+      return {
+        tasks: tasks.map((task) => {
+          const candidate = objectValue(task);
+          return {
+            prompt: "[delegated prompt omitted from durable and event records]",
+            ...(candidate.role === "leaf" || candidate.role === "orchestrator"
+              ? { role: candidate.role }
+              : {}),
+          };
+        }),
+      };
+    }
     return {
       prompt: "[delegated prompt omitted from durable and event records]",
-      ...(Object.hasOwn(args, "system_prompt")
-        ? { system_prompt: "[delegated system prompt omitted from durable and event records]" }
-        : {}),
+      ...(args.role === "leaf" || args.role === "orchestrator" ? { role: args.role } : {}),
     };
   }
   return redactJson(args) as JsonObject;

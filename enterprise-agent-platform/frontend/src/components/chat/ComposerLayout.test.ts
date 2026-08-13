@@ -68,9 +68,7 @@ describe("Composer layout contract", () => {
   });
 
   it("removes decorative work-card sweeps and provides local reduced motion", () => {
-    const sweep = declarations(chatStyles, ".agent-work--active .agent-work__summary::after");
-
-    expect(sweep.get("display")).toBe("none");
+    expect(chatStyles).not.toContain(".agent-work--active .agent-work__summary::after");
     expect(chatStyles).toContain("@media (prefers-reduced-motion: reduce)");
     expect(chatStyles).toContain("transition-duration: 0.001ms !important");
   });

@@ -62,7 +62,7 @@ SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务�
 
 ## Agent Runtime
 
-Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、委派、上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具。
+Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、结构化 todo、受限并行委派、语义上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具。
 
 Runtime 不拥有 Docker socket。terminal、process 和文件工具携带主 Agent sandbox identity 调用管理器的容器内 Unix 控制 socket；管理器确保 Sandbox 存在后执行。显式 `target=host` 的单次调用改由管理器以部署用户执行。具体职责见 [Agent Runtime](agent-runtime.md)，协议见 [Runtime API](../reference/runtime-api.md)。
 
@@ -81,7 +81,7 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器。知识索引属于 Plat
 1. Platform 先确认 Manager 持久更新预约已释放，再完成权限检查并持久化用户消息和 Agent job。若同一发送者正持有该 Agent root scope 的浏览器人工接管租约，Platform 必须在浏览器操作门内先撤销租约再把任务入队；其他用户租约保持不变。候选容器启动期间所有后台 worker 同样保持冻结。
 2. 每个会话 FIFO worker 领取任务，全局并发门控制同时进入 Runtime 的数量。
 3. Platform 创建 Runtime Run，随后消费事件；工具过程和最终内容分别写入状态和消息元数据。
-4. Runtime 将产品工具回调 Platform；terminal、process 与文件工具按主 Agent identity 调用管理器，默认进入对应 Sandbox。
+4. Runtime 将产品工具回调 Platform；terminal、process 与文件工具按主 Agent identity 调用管理器，默认进入对应 Sandbox。短命令在前台等待；后台有终点进程由 `process.wait` 在同一 Run 内等待终态，不创建计划任务轮询。
 5. Sandbox 执行在硬阻断和审计后直接运行；宿主命令必须先获得本次用户审批，管理器再产生带完整安全展示参数的审计事件，并记录 target、部署用户和 sudo 使用情况。
 6. 最终回复和用量先持久化，再将任务账本转为成功。
 

@@ -4,7 +4,12 @@ import { mkdir, open, rename, rm, symlink, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { assertReadableTargetAllowed, assertWritableTargetAllowed, browserGatewayResult, classifyToolCall, createTools, readRegularFileRange } from "../src/tools.js";
+import {
+  PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS,
+  PROCESS_WAIT_TIMEOUT_MAXIMUM_MILLISECONDS,
+  PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS,
+} from "../src/design-contract.generated.js";
+import { assertReadableTargetAllowed, assertWritableTargetAllowed, browserGatewayResult, classifyToolCall, createTools, isScheduleMutation, readRegularFileRange } from "../src/tools.js";
 import { resolveWorkspacePath } from "../src/utils.js";
 import { temporaryDirectory } from "./helpers.js";
 
@@ -66,6 +71,7 @@ test("managed file and process policy auto-allows sandbox and requires one-shot 
     ["write_file", { path: "note.txt", content: "ok" }, { target: "host", path: "/tmp/note.txt", content: "ok" }],
     ["search_files", { path: ".", query: "ok" }, { target: "host", path: "/tmp", query: "ok" }],
     ["process", { action: "list" }, { target: "host", action: "list" }],
+    ["process", { action: "wait", process_id: "process-1" }, { target: "host", action: "wait", process_id: "process-1" }],
     ["process", { action: "kill", process_id: "process-1" }, { target: "host", action: "kill", process_id: "process-1" }],
   ] as const) {
     const sandbox = await classifyToolCall(tool, sandboxArgs, "/workspace", 12_345, true);
@@ -103,10 +109,182 @@ test("tool descriptions route semantic file work away from terminal scripts", ()
   assert.match(terminal.description, /use ls only when the directory listing itself matters/);
   assert.match(terminal.description, /Do not use sed\/awk or Python to edit files/);
   assert.match(terminal.description, /one-off Python scripts/);
+  assert.match(terminal.description, /process\.wait/);
   assert.match(readFile.description, /before editing/);
   assert.match(searchFiles.description, /definitions and usages/);
   assert.match(patchFile.description, /re-read/);
   assert.match(writeFile.description, /do not create files by terminal heredoc/);
+});
+
+test("delegate_task preserves single-call behavior and batches bounded children concurrently in input order", async () => {
+  const started: Array<{ prompt: string; role: string }> = [];
+  const releases = new Map<string, {
+    resolve: (value: string | {
+      child_run_id: string;
+      status: "completed";
+      content: string;
+      side_effects_started: boolean;
+      changed_files: string[];
+      unknown_change: boolean;
+    }) => void;
+    reject: (error: Error) => void;
+  }>();
+  let active = 0;
+  let maximumActive = 0;
+  const tools = createTools({
+    runId: "run-delegate-batch",
+    request: { scope_key: "private:1", metadata: {} } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async (prompt, _signal, role) => {
+      started.push({ prompt, role: role ?? "leaf" });
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      try {
+        return await new Promise<string | {
+          child_run_id: string;
+          status: "completed";
+          content: string;
+          side_effects_started: boolean;
+          changed_files: string[];
+          unknown_change: boolean;
+        }>((resolve, reject) => { releases.set(prompt, { resolve, reject }); });
+      } finally {
+        active -= 1;
+      }
+    },
+    maxDelegationDepth: 2,
+    maxDelegatesPerRun: 2,
+    markSideEffect: () => undefined,
+  });
+  const delegate = tools.find((tool) => tool.name === "delegate_task");
+  assert.ok(delegate);
+  assert.match(delegate.description, /at most 2 tasks/);
+
+  assert.doesNotThrow(() => validateToolArguments(delegate, fauxToolCall("delegate_task", {
+    prompt: "single",
+  })));
+  assert.throws(
+    () => validateToolArguments(delegate, fauxToolCall("delegate_task", {
+      prompt: "single",
+      system_prompt: "Replace the trusted child policy.",
+    })),
+    /additional properties/,
+  );
+  assert.throws(
+    () => validateToolArguments(delegate, fauxToolCall("delegate_task", {
+      tasks: [{ prompt: "one" }, { prompt: "two" }, { prompt: "three" }],
+    })),
+    /must not have more than 2 items/,
+  );
+
+  const pending = delegate.execute("batch", {
+    tasks: [
+      { prompt: "first" },
+      { prompt: "second", role: "orchestrator" },
+    ],
+  }, undefined);
+  assert.deepEqual(started, [
+    { prompt: "first", role: "leaf" },
+    { prompt: "second", role: "orchestrator" },
+  ]);
+  assert.equal(maximumActive, 2);
+  releases.get("second")?.reject(new Error("second failed"));
+  await Promise.resolve();
+  releases.get("first")?.resolve({
+    child_run_id: "run-child-first",
+    status: "completed",
+    content: "first result",
+    side_effects_started: true,
+    changed_files: ["first.txt"],
+    unknown_change: false,
+  });
+  const result = await pending;
+  assert.deepEqual(result.details, {
+    results: [
+      {
+        index: 0,
+        child_run_id: "run-child-first",
+        status: "completed",
+        content: "first result",
+        side_effects_started: true,
+        changed_files: ["first.txt"],
+        unknown_change: false,
+      },
+      { index: 1, status: "failed", error: "second failed" },
+    ],
+  });
+  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /re-check relevant files/);
+
+  const singlePending = delegate.execute("single", { prompt: "single" }, undefined);
+  assert.deepEqual(started.at(-1), { prompt: "single", role: "leaf" });
+  releases.get("single")?.resolve("single result");
+  const single = await singlePending;
+  assert.deepEqual(single, {
+    content: [{ type: "text", text: "single result" }],
+    details: null,
+  });
+});
+
+test("delegate_task is root-visible, leaf-hidden, and depth-bounded for explicit orchestrators", () => {
+  const hasDelegate = (metadata: Record<string, unknown>, maxDelegationDepth = 2) => createTools({
+    runId: "run-delegate-role",
+    request: { scope_key: "private:1", metadata } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    maxDelegationDepth,
+    maxDelegatesPerRun: 4,
+    markSideEffect: () => undefined,
+  }).some((tool) => tool.name === "delegate_task");
+
+  assert.equal(hasDelegate({}), true);
+  assert.equal(hasDelegate({ parent_run_id: "parent", delegation_depth: 1 }), false);
+  assert.equal(hasDelegate({ parent_run_id: "parent", delegation_depth: 1, delegation_role: "leaf" }), false);
+  assert.equal(hasDelegate({
+    parent_run_id: "parent",
+    delegation_depth: 1,
+    delegation_role: "orchestrator",
+  }), true);
+  assert.equal(hasDelegate({
+    parent_run_id: "parent",
+    delegation_depth: 2,
+    delegation_role: "orchestrator",
+  }), false);
+});
+
+test("delegate_task waits for every child to observe parent cancellation before rejecting", async () => {
+  const controller = new AbortController();
+  let started = 0;
+  let aborted = 0;
+  const delegate = createTools({
+    runId: "run-delegate-abort",
+    request: { scope_key: "private:1", metadata: {} } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async (_prompt, signal) => await new Promise<string>((_resolve, reject) => {
+      started += 1;
+      const onAbort = () => {
+        aborted += 1;
+        reject(new Error("child cancelled"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+    }),
+    maxDelegatesPerRun: 2,
+    markSideEffect: () => undefined,
+  }).find((tool) => tool.name === "delegate_task");
+  assert.ok(delegate);
+
+  const pending = delegate.execute("batch-abort", {
+    tasks: [{ prompt: "first" }, { prompt: "second" }],
+  }, controller.signal);
+  assert.equal(started, 2);
+  controller.abort();
+  await assert.rejects(pending, /aborted/i);
+  assert.equal(aborted, 2);
 });
 
 test("terminal forwards background and command-specific timeout behavior", async () => {
@@ -188,6 +366,82 @@ test("process write rechecks hardline input at execution", async () => {
     input: "printf safe\n",
   }, undefined);
   assert.deepEqual(writes, ["printf safe\n"]);
+});
+
+test("process wait uses generated bounds, observes without side effects, and exposes timeout state", async () => {
+  const waits: Array<{ scope: string; id: string; lifecycle: string; timeout: number; signal?: AbortSignal }> = [];
+  let sideEffects = 0;
+  const tools = createTools({
+    runId: "run",
+    request: { scope_key: "private:1", lifecycle_id: "life", workspace: "/tmp" } as never,
+    processes: {
+      async wait(scope: string, id: string, lifecycle: string, timeout: number, signal?: AbortSignal) {
+        waits.push({ scope, id, lifecycle, timeout, ...(signal ? { signal } : {}) });
+        return {
+          id,
+          run_id: "run",
+          scope_key: scope,
+          lifecycle_id: lifecycle,
+          command: "sleep 30",
+          cwd: "/tmp",
+          status: "running",
+          stdout: "working",
+          stderr: "",
+          started_at: new Date().toISOString(),
+          background: true,
+          wait_timed_out: true,
+        };
+      },
+    } as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => { sideEffects += 1; },
+  });
+  const processTool = tools.find((tool) => tool.name === "process");
+  assert.ok(processTool);
+  const schema = JSON.stringify(processTool.parameters);
+  assert.match(schema, new RegExp(`"minimum":${PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS}`));
+  assert.match(schema, new RegExp(`"maximum":${PROCESS_WAIT_TIMEOUT_MAXIMUM_MILLISECONDS}`));
+  assert.match(processTool.description, /Do not create an interval or cron schedule/);
+
+  const controller = new AbortController();
+  const result = await processTool.execute("wait-default", {
+    action: "wait",
+    process_id: "process-1",
+  }, controller.signal);
+  assert.equal(sideEffects, 0);
+  assert.deepEqual(waits, [{
+    scope: "private:1",
+    id: "process-1",
+    lifecycle: "life",
+    timeout: PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS,
+    signal: controller.signal,
+  }]);
+  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /did not stop it/);
+  assert.equal((result.details as Record<string, unknown>).wait_timed_out, true);
+
+  assert.doesNotThrow(() => validateToolArguments(processTool, fauxToolCall("process", {
+    action: "wait",
+    process_id: "process-1",
+    timeout_ms: PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS,
+  })));
+  assert.throws(
+    () => validateToolArguments(processTool, fauxToolCall("process", {
+      action: "wait",
+      process_id: "process-1",
+      timeout_ms: PROCESS_WAIT_TIMEOUT_MAXIMUM_MILLISECONDS + 1,
+    })),
+    /must be <=/,
+  );
+  assert.throws(
+    () => validateToolArguments(processTool, fauxToolCall("process", {
+      action: "wait",
+      process_id: "process-1",
+      timeout_ms: PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS - 1,
+    })),
+    /must be >=/,
+  );
 });
 
 test("browser screenshots become native image content without base64 in details", () => {
@@ -312,7 +566,7 @@ test("schedule schema strictly describes every supported action", () => {
   const schedule = tools.find((tool) => tool.name === "schedule");
   assert.ok(schedule);
   const schema = JSON.stringify(schedule.parameters);
-  for (const action of ["list", "get", "history", "create", "update", "pause", "resume", "delete", "run_now"]) {
+  for (const action of ["list", "get", "history", "continue_current", "complete_current", "create", "update", "pause", "resume", "delete", "run_now"]) {
     assert.match(schema, new RegExp(`"const":"${action}"`));
   }
   assert.match(schema, /"minimum":300/);
@@ -321,6 +575,27 @@ test("schedule schema strictly describes every supported action", () => {
   assert.match(schema, /chat_and_telegram/);
   assert.match(schema, /additionalProperties/);
   assert.equal(collectObjectSchemas(schedule.parameters).every((entry) => entry.additionalProperties === false), true);
+  assert.doesNotThrow(() => validateToolArguments(schedule, fauxToolCall("schedule", {
+    action: "continue_current",
+    arguments: {},
+  })));
+  assert.doesNotThrow(() => validateToolArguments(schedule, fauxToolCall("schedule", {
+    action: "complete_current",
+    arguments: {},
+  })));
+  assert.throws(
+    () => validateToolArguments(schedule, fauxToolCall("schedule", {
+      action: "complete_current",
+      arguments: { schedule_id: 7 },
+    })),
+    /additional properties/,
+  );
+  assert.throws(
+    () => validateToolArguments(schedule, fauxToolCall("schedule", {
+      action: "complete_current",
+    })),
+    /required properties arguments/,
+  );
 });
 
 test("schedule tool forwards strict arguments and marks only mutations as side effects", async () => {
@@ -353,7 +628,15 @@ test("schedule tool forwards strict arguments and marks only mutations as side e
       delivery: "chat",
     },
   }, undefined);
-  assert.equal(sideEffects, 1);
+  await schedule.execute("call-continue", {
+    action: "continue_current",
+    arguments: {},
+  }, undefined);
+  await schedule.execute("call-complete", {
+    action: "complete_current",
+    arguments: {},
+  }, undefined);
+  assert.equal(sideEffects, 2);
   assert.deepEqual(invocations, [
     { tool: "schedule", action: "list", arguments_: {} },
     {
@@ -367,6 +650,8 @@ test("schedule tool forwards strict arguments and marks only mutations as side e
         delivery: "chat",
       },
     },
+    { tool: "schedule", action: "continue_current", arguments_: {} },
+    { tool: "schedule", action: "complete_current", arguments_: {} },
   ]);
 });
 
@@ -1280,13 +1565,17 @@ test("schedule tool is exposed only to canonical private Agent scopes", () => {
   }
 });
 
-test("schedule policy approves reads and requires approval for every mutation", async () => {
+test("schedule policy approves reads and self-completion while user-targeted mutations require approval", async () => {
   for (const action of ["list", "get", "history"]) {
     assert.deepEqual(await classifyToolCall("schedule", { action, arguments: {} }), {});
   }
   for (const action of ["create", "update", "pause", "resume", "delete", "run_now"]) {
     assert.match((await classifyToolCall("schedule", { action, arguments: {} })).approvalReason || "", /scheduled work/);
   }
+  assert.equal(isScheduleMutation("complete_current"), true);
+  assert.equal(isScheduleMutation("continue_current"), false);
+  assert.deepEqual(await classifyToolCall("schedule", { action: "continue_current", arguments: {} }), {});
+  assert.deepEqual(await classifyToolCall("schedule", { action: "complete_current", arguments: {} }), {});
 });
 
 test("read-only browser operations do not mark the run as side-effecting", async () => {

@@ -66,12 +66,22 @@ export function redactToolArgumentsForModelHistory(
     return replaceString(canonical, "query", "query");
   }
   if (toolName === "delegate_task") {
+    if (Array.isArray(canonical.tasks)) {
+      return {
+        ...canonical,
+        tasks: canonical.tasks.map((task) => {
+          if (!isObject(task)) return omittedValue("delegated task");
+          const redactedTask = { ...task };
+          if (typeof task.prompt === "string") {
+            redactedTask.prompt = omittedValue("delegated prompt", task.prompt);
+          }
+          return redactedTask;
+        }),
+      };
+    }
     const redacted = { ...canonical };
     if (typeof canonical.prompt === "string") {
       redacted.prompt = omittedValue("delegated prompt", canonical.prompt);
-    }
-    if (typeof canonical.system_prompt === "string") {
-      redacted.system_prompt = omittedValue("delegated system prompt", canonical.system_prompt);
     }
     return redacted;
   }

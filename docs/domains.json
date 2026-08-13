@@ -328,11 +328,17 @@
       "id": "runtime-policy",
       "source": "docs/contracts/runtime-policy.json",
       "domains": [
+        "deployment",
+        "security-and-trust",
         "platform",
         "agent-runtime",
         "frontend"
       ],
       "targets": [
+        {
+          "path": "manager/internal/executor/runtime_policy_generated.go",
+          "format": "go-runtime-policy"
+        },
         {
           "path": "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py",
           "format": "python-runtime-policy"

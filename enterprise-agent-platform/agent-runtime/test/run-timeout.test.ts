@@ -190,6 +190,56 @@ test("active foreground terminal work can exceed the run idle duration", async (
   }
 });
 
+test("process wait pauses the run idle guard for its full observation lifecycle", async () => {
+  const home = await temporaryDirectory("agent-active-process-wait-");
+  const workspace = await temporaryDirectory("agent-active-process-wait-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "sleep 0.20; printf finished",
+      background: true,
+    }), { stopReason: "toolUse" }),
+    (context) => {
+      const match = /Process started: (process_[a-z0-9]+)/i.exec(JSON.stringify(context.messages));
+      assert.ok(match?.[1]);
+      return fauxAssistantMessage(fauxToolCall("process", {
+        action: "wait",
+        process_id: match[1],
+        timeout_ms: 1_000,
+      }), { stopReason: "toolUse" });
+    },
+    fauxAssistantMessage("background task complete"),
+  ]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home, { runIdleTimeoutMs: 50 }),
+    streamFn: faux.provider.streamSimple,
+  });
+  try {
+    const started = Date.now();
+    const run = coordinator.createRun(baseRequest(workspace));
+    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
+      (event) => event.type === "approval.requested",
+    ), 10_000);
+    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
+    const completed = await withDeadline(coordinator.wait(run.id));
+    assert.equal(completed.status, "completed", completed.error);
+    assert.equal(completed.result?.content, "background task complete");
+    assert.ok(Date.now() - started >= 150, "the process wait should outlive the idle window");
+    assert.equal(
+      coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
+      false,
+    );
+    const waitEvent = coordinator.getJournal(run.id)?.list().find(
+      (event) => event.type === "tool.completed" && event.data.tool_name === "process",
+    );
+    assert.match(JSON.stringify(waitEvent?.data.result), /wait_timed_out/);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("foreground terminal uses the runtime default deadline when timeout_ms is omitted", async () => {
   const home = await temporaryDirectory("agent-default-terminal-timeout-");
   const workspace = await temporaryDirectory("agent-default-terminal-timeout-workspace-");
@@ -310,6 +360,10 @@ test("delegated child activity refreshes the parent inactivity deadline", async 
       timeout_ms: 1_000,
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("child complete"),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "printf parent-verified && npm --version >/dev/null # npm run check",
+      timeout_ms: 1_000,
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("parent complete"),
   ]);
   const coordinator = new RunCoordinator({
@@ -332,6 +386,17 @@ test("delegated child activity refreshes the parent inactivity deadline", async 
       false,
     );
     await coordinator.respondApproval(parent.id, String(approval.data.approval_id), "once");
+    const parentVerificationApproval = await waitUntil(() => {
+      const requests = coordinator.getJournal(parent.id)?.list().filter(
+        (event) => event.type === "approval.requested",
+      ) ?? [];
+      return requests.length >= 2 ? requests.at(-1) : undefined;
+    }, 10_000);
+    await coordinator.respondApproval(
+      parent.id,
+      String(parentVerificationApproval?.data.approval_id),
+      "once",
+    );
     const completed = await withDeadline(coordinator.wait(parent.id), 10_000);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "parent complete");

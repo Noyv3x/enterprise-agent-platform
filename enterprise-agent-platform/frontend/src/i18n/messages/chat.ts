@@ -434,6 +434,11 @@ export const chatMessages = defineMessages({
     en: "Message table, scroll horizontally",
     "zh-TW": "訊息表格，可水平捲動",
   },
+  "chat.markdown.mathLabel": {
+    "zh-CN": "数学公式，可横向滚动",
+    en: "Mathematical formula, scroll horizontally",
+    "zh-TW": "數學公式，可水平捲動",
+  },
   "chat.markdown.imageBlocked": {
     "zh-CN": "已阻止外部图片：{alt}",
     en: "External image blocked: {alt}",
@@ -539,6 +544,26 @@ export const chatMessages = defineMessages({
     "zh-CN": "终端命令",
     en: "Terminal command",
     "zh-TW": "終端命令",
+  },
+  "chat.activity.agentUpdate": {
+    "zh-CN": "Agent 说明",
+    en: "Agent update",
+    "zh-TW": "Agent 說明",
+  },
+  "chat.activity.truncatedTitle": {
+    "zh-CN": "记录已截断",
+    en: "Records truncated",
+    "zh-TW": "記錄已截斷",
+  },
+  "chat.activity.truncatedEvents": {
+    "zh-CN": { other: "因安全上限省略了 {count} 个后续工作事件" },
+    en: { one: "{count} later work event was omitted by the safety limit", other: "{count} later work events were omitted by the safety limit" },
+    "zh-TW": { other: "因安全上限省略了 {count} 個後續工作事件" },
+  },
+  "chat.activity.truncatedCharacters": {
+    "zh-CN": { other: "因安全上限省略了 {count} 个详情字符" },
+    en: { one: "{count} detail character was omitted by the safety limit", other: "{count} detail characters were omitted by the safety limit" },
+    "zh-TW": { other: "因安全上限省略了 {count} 個詳情字元" },
   },
   "chat.activity.toolName.terminal": { "zh-CN": "命令", en: "Command", "zh-TW": "命令" },
   "chat.activity.toolName.process": { "zh-CN": "进程", en: "Process", "zh-TW": "程序" },

@@ -15,11 +15,34 @@ import {
   RunInputConflictError,
   RunValidationError,
   sanitizeToolResultForJournal,
+  serializeCompactionHistory,
 } from "../src/run-coordinator.js";
 import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
+
+test("semantic compaction input reserves the original objective and latest user request", () => {
+  const original = "ORIGINAL_ACCEPTANCE: deliver every verified artifact";
+  const latest = "LATEST_REQUEST: notify me only after the batch is complete";
+  const history: AgentMessage[] = [
+    { role: "user", content: original, timestamp: 1 },
+    ...Array.from({ length: 20 }, (_, index): AgentMessage => ({
+      role: "toolResult",
+      toolCallId: `tool-${index}`,
+      toolName: "terminal",
+      content: [{ type: "text", text: `large-output-${index}-${"x".repeat(16_000)}` }],
+      isError: false,
+      timestamp: 2 + index,
+    })),
+    { role: "user", content: latest, timestamp: 100 },
+  ];
+
+  const serialized = serializeCompactionHistory(history);
+  assert.match(serialized, new RegExp(original));
+  assert.match(serialized, new RegExp(latest));
+  assert.ok(serialized.length <= 160_000, `summary input remains bounded: ${serialized.length}`);
+});
 
 test("unmarked imported session tool results are framed without changing current results", () => {
   const toolSources = [
@@ -450,14 +473,15 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     (context) => {
       rootPrompt = context.systemPrompt || "";
       assert.equal(context.tools?.some((tool) => tool.name === "skill"), true);
+      assert.equal(context.tools?.some((tool) => tool.name === "delegate_task"), true);
       return fauxAssistantMessage(fauxToolCall("delegate_task", {
         prompt: "review this",
-        system_prompt: "Custom child prompt.",
       }), { stopReason: "toolUse" });
     },
     (context) => {
       childPrompt = context.systemPrompt || "";
       assert.equal(context.tools?.some((tool) => tool.name === "skill"), true);
+      assert.equal(context.tools?.some((tool) => tool.name === "delegate_task"), false);
       return fauxAssistantMessage("child done");
     },
     fauxAssistantMessage("parent done"),
@@ -494,7 +518,7 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     assert.match(rootPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(rootPrompt, /unloaded secret instructions/);
     assert.ok(rootPrompt.indexOf("</memory_policy>") < rootPrompt.indexOf("<skill_policy>"));
-    assert.match(childPrompt, /^Custom child prompt\./);
+    assert.match(childPrompt, /^Root prompt\./);
     assert.match(childPrompt, /<execution_discipline>/);
     assert.match(childPrompt, /Both memory targets are isolated to this Agent scope/);
     assert.match(childPrompt, /"id":"code-review"/);
@@ -937,6 +961,7 @@ test("process write cannot inject a hardline command into a background shell", a
     fauxAssistantMessage(fauxToolCall("terminal", {
       command: "bash",
       background: true,
+      background_kind: "service",
     }), { stopReason: "toolUse" }),
     (context) => {
       const match = /Process started: (process_[a-z0-9]+)/i.exec(JSON.stringify(context.messages));
@@ -1052,9 +1077,18 @@ test("execution-review messages remain ephemeral across context compaction", asy
     fauxAssistantMessage("I'm working on it."),
     fauxAssistantMessage("No action was needed after inspection."),
   ]);
+  const summaries = fauxProvider();
+  summaries.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage(
+    "Current objective\n- Inspect the existing state and continue concrete work.",
+  )));
+  const streamFn: StreamFn = (model, context, options) => context.systemPrompt?.startsWith(
+    "Create a concise continuation handoff",
+  )
+    ? summaries.provider.streamSimple(model, context, options)
+    : faux.provider.streamSimple(model, context, options);
   const coordinator = new RunCoordinator({
     config: testConfig(home, { compactionThreshold: 0.0001 }),
-    streamFn: faux.provider.streamSimple,
+    streamFn,
   });
   try {
     const run = coordinator.createRun({
@@ -2255,13 +2289,74 @@ test("unattended scheduled runs cannot mutate schedules even with an always auth
   }
 });
 
+test("a top-level scheduled occurrence can complete only its current schedule without approval", async () => {
+  const home = await temporaryDirectory("agent-scheduled-complete-current-");
+  const workspace = await temporaryDirectory("agent-scheduled-complete-current-workspace-");
+  const faux = fauxProvider();
+  faux.setResponses([
+    (context) => {
+      const prompt = context.systemPrompt || "";
+      assert.match(prompt, /<scheduled_run_policy>/);
+      assert.match(prompt, /\{"action":"complete_current","arguments":\{\}\}/);
+      assert.match(prompt, /Do not create a cron or interval schedule/);
+      assert.match(prompt, /use process\.wait/);
+      return fauxAssistantMessage(
+        fauxToolCall("schedule", { action: "complete_current", arguments: {} }),
+        { stopReason: "toolUse" },
+      );
+    },
+    fauxAssistantMessage("The monitored work is complete and future checks have stopped."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const calls: Array<{ tool: string; action: string; arguments_: Record<string, unknown> }> = [];
+  coordinator.gateway.invoke = async (_request, _runId, tool, action, arguments_) => {
+    calls.push({ tool, action, arguments_ });
+    return { data: { completed: true } };
+  };
+  try {
+    const run = coordinator.createRun({
+      scope_key: "private:1",
+      lifecycle_id: "life",
+      session_id: "scheduled-complete-current",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "check until the transfer finishes, then stop checking",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+      metadata: {
+        actor: { id: 1 },
+        source_message_id: 81,
+        trigger: "scheduled",
+        unattended: true,
+        schedule_id: "7",
+        schedule_run_id: "45",
+        schedule_recurring: true,
+        scheduled_for: "2026-07-16T08:15:00Z",
+      },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.deepEqual(calls, [{ tool: "schedule", action: "complete_current", arguments_: {} }]);
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.some((event) => event.type === "approval.requested"), false);
+    assert.equal(events.some((event) => event.type === "tool.failed"), false);
+    assert.equal(events.filter((event) => event.type === "tool.started").length, 1);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("nested delegated unattended blocks reach the scheduled parent journal", async () => {
   const home = await temporaryDirectory("agent-scheduled-delegate-block-");
   const workspace = await temporaryDirectory("agent-scheduled-delegate-block-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("delegate_task", { prompt: "delegate the sensitive command again" }),
+      fauxToolCall("delegate_task", {
+        prompt: "delegate the sensitive command again",
+        role: "orchestrator",
+      }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage(

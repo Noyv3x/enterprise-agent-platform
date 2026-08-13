@@ -5,6 +5,7 @@ import type {
   ProcessPreviewResult,
   ProcessPreviewSummary,
   ProcessSnapshot,
+  ProcessWaitResult,
 } from "./process-registry.js";
 import type {
   ExecutionContext,
@@ -15,7 +16,11 @@ import type {
 import { abortError, errorMessage, safeEqual } from "./utils.js";
 
 const MAX_MANAGER_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_SCOPE_CLEANUP_COMPLETION_EVIDENCE = 1024;
 const PROCESS_PREVIEW_REVISION = /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/;
+const MANAGED_PROCESS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+const COMPLETION_OWNER_ID = /^[a-f0-9]{64}$/;
+const PROCESS_WAIT_TRANSPORT_GRACE_MILLISECONDS = 30_000;
 
 export interface ExecutionIdentity {
   run_id: string;
@@ -45,6 +50,14 @@ export interface ExecutionCallContext extends ExecutionIdentity {
   receipt: ExecutionAuditReceipt;
 }
 
+export interface TaskExecutionIdentity extends Required<ScopeExecutionIdentity> {
+  completion_owner_id: string;
+}
+
+export interface ReconciledTaskSnapshot extends ProcessSnapshot {
+  target: ExecutionTarget;
+}
+
 export interface ExecutorTerminalResponse {
   result: ProcessSnapshot;
 }
@@ -64,6 +77,21 @@ export interface ScopeExecutionIdentity {
   execution_context: ExecutionContext;
 }
 
+export interface ScopeCleanupIdentity {
+  scope_id: string;
+  lifecycle_id?: string;
+}
+
+export interface CompletionTaskCleanupEvidence extends TaskExecutionIdentity {
+  process_id: string;
+  target: ExecutionTarget;
+}
+
+export interface ScopeCleanupResult {
+  confirmed: true;
+  completion_tasks: CompletionTaskCleanupEvidence[];
+}
+
 export interface ExecutionManager {
   readonly managed: boolean;
   audit(request: ExecutionAuditRequest, signal?: AbortSignal): Promise<ExecutionAuditReceipt>;
@@ -71,6 +99,7 @@ export interface ExecutionManager {
     context: ExecutionCallContext,
     arguments_: JsonObject,
     signal?: AbortSignal,
+    completionOwnerId?: string,
   ): Promise<ExecutorTerminalResponse>;
   process(
     context: ExecutionCallContext,
@@ -84,8 +113,13 @@ export interface ExecutionManager {
     arguments_: JsonObject,
     signal?: AbortSignal,
   ): Promise<ExecutorFileResponse>;
-  cancelRun(identity: Omit<ExecutionIdentity, "tool_call_id">): Promise<boolean>;
-  cleanupScope(identity: ScopeExecutionIdentity): Promise<boolean>;
+  cancelRun(
+    identity: Omit<ExecutionIdentity, "tool_call_id">,
+    preserveProcessIds?: readonly string[],
+  ): Promise<boolean>;
+  reconcileTasks?(identity: TaskExecutionIdentity): Promise<ReconciledTaskSnapshot[]>;
+  acknowledgeTask?(identity: TaskExecutionIdentity, processId: string): Promise<boolean>;
+  cleanupScope(identity: ScopeCleanupIdentity): Promise<ScopeCleanupResult>;
   preview(
     identity: Required<ScopeExecutionIdentity>,
     sinceRevision?: string,
@@ -128,10 +162,18 @@ export class ManagerExecutorClient implements ExecutionManager {
     context: ExecutionCallContext,
     arguments_: JsonObject,
     signal?: AbortSignal,
+    completionOwnerId?: string,
   ): Promise<ExecutorTerminalResponse> {
     const response = objectValue(await this.post(
       "/v1/executor/terminal",
-      executionBody(context, { action: "run", arguments: arguments_ }),
+      executionBody(context, {
+        action: "run",
+        arguments: arguments_,
+        ...(completionOwnerId ? {
+          completion_required: true,
+          completion_owner_id: completionOwnerId,
+        } : {}),
+      }),
       signal,
     ));
     return { result: processSnapshot(response.result) };
@@ -143,11 +185,21 @@ export class ManagerExecutorClient implements ExecutionManager {
     arguments_: JsonObject,
     signal?: AbortSignal,
   ): Promise<ExecutorProcessResponse> {
+    const waitTimeout = action === "wait" && Number.isSafeInteger(arguments_.timeout_ms)
+      && Number(arguments_.timeout_ms) > 0
+      ? Number(arguments_.timeout_ms)
+      : undefined;
     const response = objectValue(await this.post(
       "/v1/executor/process",
       executionBody(context, { action, arguments: arguments_ }),
       signal,
+      waitTimeout === undefined
+        ? undefined
+        : Math.max(this.requestTimeoutMs, waitTimeout + PROCESS_WAIT_TRANSPORT_GRACE_MILLISECONDS),
     ));
+    if (action === "wait") {
+      return { result: processWaitResult(response.result) as unknown as JsonValue };
+    }
     return { result: sanitizeExecutionResult(response.result) };
   }
 
@@ -170,14 +222,78 @@ export class ManagerExecutorClient implements ExecutionManager {
     return result;
   }
 
-  async cancelRun(identity: Omit<ExecutionIdentity, "tool_call_id">): Promise<boolean> {
-    const response = objectValue(await this.post("/v1/executor/runs/cancel", identity));
+  async cancelRun(
+    identity: Omit<ExecutionIdentity, "tool_call_id">,
+    preserveProcessIds: readonly string[] = [],
+  ): Promise<boolean> {
+    const response = objectValue(await this.post("/v1/executor/runs/cancel", {
+      ...identity,
+      ...(preserveProcessIds.length > 0 ? { preserve_process_ids: [...preserveProcessIds] } : {}),
+    }));
     return response.confirmed === true;
   }
 
-  async cleanupScope(identity: ScopeExecutionIdentity): Promise<boolean> {
-    const response = objectValue(await this.post("/v1/executor/scopes/cleanup", identity));
+  async reconcileTasks(identity: TaskExecutionIdentity): Promise<ReconciledTaskSnapshot[]> {
+    const response = objectValue(await this.post("/v1/executor/tasks/reconcile", identity));
+    if (!Array.isArray(response.processes) || response.processes.length > 256) {
+      throw new Error("Manager executor returned an invalid task reconciliation set");
+    }
+    return response.processes.map((value) => {
+      const raw = objectValue(value);
+      return { ...processSnapshot(raw), target: executionTarget(raw.target) };
+    });
+  }
+
+  async acknowledgeTask(identity: TaskExecutionIdentity, processId: string): Promise<boolean> {
+    const response = objectValue(await this.post("/v1/executor/tasks/acknowledge", {
+      ...identity,
+      process_id: processId,
+    }));
     return response.confirmed === true;
+  }
+
+  async cleanupScope(identity: ScopeCleanupIdentity): Promise<ScopeCleanupResult> {
+    const response = objectValue(await this.post("/v1/executor/scopes/cleanup", identity));
+    requireExactKeys(response, ["confirmed", "completion_tasks"], "scope cleanup response");
+    if (response.confirmed !== true || !Array.isArray(response.completion_tasks)) {
+      throw new Error("Manager executor returned an invalid scope cleanup response");
+    }
+    if (response.completion_tasks.length > MAX_SCOPE_CLEANUP_COMPLETION_EVIDENCE) {
+      throw new Error("Manager executor scope cleanup evidence exceeds its safety limit");
+    }
+    const seen = new Set<string>();
+    const completionTasks = response.completion_tasks.map((value): CompletionTaskCleanupEvidence => {
+      const item = objectValue(value);
+      requireExactKeys(item, [
+        "scope_id", "lifecycle_id", "execution_context", "completion_owner_id", "process_id", "target",
+      ], "scope cleanup completion evidence");
+      const execution = objectValue(item.execution_context);
+      requireExactKeys(execution, ["sandbox_id", "workspace_id"], "scope cleanup execution context");
+      if (
+        typeof item.scope_id !== "string" || !item.scope_id
+        || typeof item.lifecycle_id !== "string" || !item.lifecycle_id
+        || typeof execution.sandbox_id !== "string" || !execution.sandbox_id
+        || typeof execution.workspace_id !== "string" || !execution.workspace_id
+        || typeof item.completion_owner_id !== "string" || !COMPLETION_OWNER_ID.test(item.completion_owner_id)
+        || typeof item.process_id !== "string" || !MANAGED_PROCESS_ID.test(item.process_id)
+        || seen.has(item.process_id)
+      ) {
+        throw new Error("Manager executor returned invalid scope cleanup completion evidence");
+      }
+      seen.add(item.process_id);
+      return {
+        scope_id: item.scope_id,
+        lifecycle_id: item.lifecycle_id,
+        execution_context: {
+          sandbox_id: execution.sandbox_id,
+          workspace_id: execution.workspace_id,
+        },
+        completion_owner_id: item.completion_owner_id,
+        process_id: item.process_id,
+        target: executionTarget(item.target),
+      };
+    });
+    return { confirmed: true, completion_tasks: completionTasks };
   }
 
   async preview(
@@ -208,7 +324,12 @@ export class ManagerExecutorClient implements ExecutionManager {
     return { running_terminal_count: boundedCount(response.running_terminal_count, "running_terminal_count") };
   }
 
-  private async post(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+  private async post(
+    path: string,
+    body: unknown,
+    signal?: AbortSignal,
+    requestTimeoutMs = this.requestTimeoutMs,
+  ): Promise<unknown> {
     if (signal?.aborted) throw abortError();
     const encoded = Buffer.from(JSON.stringify(body), "utf8");
     return await new Promise<unknown>((resolvePromise, reject) => {
@@ -265,7 +386,7 @@ export class ManagerExecutorClient implements ExecutionManager {
           }
         });
       });
-      request.setTimeout(this.requestTimeoutMs, () => {
+      request.setTimeout(requestTimeoutMs, () => {
         request.destroy(new Error(`Manager executor POST ${path} timed out`));
       });
       request.once("error", fail);
@@ -355,6 +476,17 @@ function processSnapshot(value: unknown): ProcessSnapshot {
   return result;
 }
 
+function processWaitResult(value: unknown): ProcessWaitResult {
+  const raw = objectValue(value);
+  if (typeof raw.wait_timed_out !== "boolean") {
+    throw new Error("Manager executor process wait result is missing wait_timed_out");
+  }
+  return {
+    ...processSnapshot(raw),
+    wait_timed_out: raw.wait_timed_out,
+  };
+}
+
 function processPreview(value: unknown, index: number): import("./process-registry.js").ProcessPreview {
   const preview = objectValue(value);
   for (const field of ["id", "command", "cwd", "output", "status", "started_at", "updated_at"] as const) {
@@ -417,6 +549,13 @@ function objectValue(value: unknown): JsonObject {
     throw new Error("Manager executor returned an invalid object response");
   }
   return value as JsonObject;
+}
+
+function requireExactKeys(value: JsonObject, allowed: readonly string[], label: string): void {
+  const expected = new Set(allowed);
+  if (Object.keys(value).length !== expected.size || Object.keys(value).some((key) => !expected.has(key))) {
+    throw new Error(`Manager executor returned an invalid ${label}`);
+  }
 }
 
 function stringValue(value: unknown): string {

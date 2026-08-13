@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import test from "node:test";
+import { PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS } from "../src/design-contract.generated.js";
 import { ProcessRegistry } from "../src/process-registry.js";
 import { temporaryDirectory } from "./helpers.js";
 
@@ -13,6 +14,111 @@ test("ProcessRegistry captures command output and isolates ownership", async () 
     assert.equal(result.stdout, "hello");
     assert.throws(() => registry.get("other-scope", result.id), /not found/);
   } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("ProcessRegistry wait returns natural success and non-zero terminal snapshots", async () => {
+  const workspace = await temporaryDirectory("agent-process-wait-terminal-");
+  const registry = new ProcessRegistry();
+  try {
+    const success = await registry.run({
+      runId: "run-success",
+      scopeKey: "private:1",
+      lifecycleId: "life-1",
+      command: "sleep 0.05; printf complete",
+      cwd: workspace,
+      background: true,
+    });
+    const succeeded = await registry.wait("private:1", success.id, "life-1", 1_000);
+    assert.equal(succeeded.wait_timed_out, false);
+    assert.equal(succeeded.status, "completed");
+    assert.equal(succeeded.exit_code, 0);
+    assert.equal(succeeded.stdout, "complete");
+
+    const failure = await registry.run({
+      runId: "run-failure",
+      scopeKey: "private:1",
+      lifecycleId: "life-1",
+      command: "sleep 0.05; printf trouble >&2; exit 7",
+      cwd: workspace,
+      background: true,
+    });
+    const failed = await registry.wait("private:1", failure.id, "life-1", 1_000);
+    assert.equal(failed.wait_timed_out, false);
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.exit_code, 7);
+    assert.equal(failed.stderr, "trouble");
+
+    const repeated = await registry.wait("private:1", failure.id, "life-1", 1_000);
+    assert.deepEqual(repeated, failed);
+  } finally {
+    registry.killScope("private:1", "life-1");
+    await registry.waitForScopeExit("private:1", "life-1");
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("ProcessRegistry wait timeout and abort do not stop the process", async () => {
+  const workspace = await temporaryDirectory("agent-process-wait-observe-");
+  const registry = new ProcessRegistry();
+  try {
+    const started = await registry.run({
+      runId: "run",
+      scopeKey: "private:2",
+      lifecycleId: "life-2",
+      command: "printf ready; sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    const timedOut = await registry.wait(
+      "private:2",
+      started.id,
+      "life-2",
+      PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS,
+    );
+    assert.equal(timedOut.wait_timed_out, true);
+    assert.equal(timedOut.status, "running");
+    assert.equal(registry.get("private:2", started.id, "life-2").status, "running");
+
+    const controller = new AbortController();
+    const waiting = registry.wait("private:2", started.id, "life-2", 1_000, controller.signal);
+    setTimeout(() => controller.abort(), PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS);
+    await assert.rejects(
+      waiting,
+      (error: unknown) => error instanceof Error && error.name === "AbortError",
+    );
+    assert.equal(registry.get("private:2", started.id, "life-2").status, "running");
+  } finally {
+    registry.killScope("private:2", "life-2");
+    await registry.waitForScopeExit("private:2", "life-2");
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("ProcessRegistry wait requires exact scope and lifecycle ownership", async () => {
+  const workspace = await temporaryDirectory("agent-process-wait-ownership-");
+  const registry = new ProcessRegistry();
+  try {
+    const started = await registry.run({
+      runId: "run",
+      scopeKey: "private:3/delegate/child",
+      lifecycleId: "life-3",
+      command: "sleep 30",
+      cwd: workspace,
+      background: true,
+    });
+    await assert.rejects(
+      registry.wait("private:3", started.id, "life-3", 1_000),
+      /Process not found/,
+    );
+    await assert.rejects(
+      registry.wait("private:3/delegate/child", started.id, "other-life", 1_000),
+      /Process not found/,
+    );
+  } finally {
+    registry.killScope("private:3", "life-3");
+    await registry.waitForScopeExit("private:3", "life-3");
     await rm(workspace, { recursive: true, force: true });
   }
 });

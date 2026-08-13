@@ -2,7 +2,13 @@ import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { redactCommandForApproval } from "./approval-policy.js";
+import {
+  BackgroundTaskStore,
+  type BackgroundTaskObligation,
+  type BackgroundTaskSessionState,
+} from "./background-task-store.js";
 import { redactToolArgumentsForModelHistory } from "./model-history.js";
+import { TodoStore, type TodoItem, type TodoSessionState } from "./todo-store.js";
 import type { JsonValue, SessionEntry } from "./types.js";
 import { id, nowIso, scopeOwns, stableHash } from "./utils.js";
 
@@ -36,7 +42,7 @@ interface SessionApprovalEntry {
 }
 
 const MAX_SESSION_JOURNAL_BYTES = 64 * 1024 * 1024;
-const MAX_SESSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
+export const MAX_SESSION_ARCHIVE_BYTES = 256 * 1024 * 1024;
 export const CURRENT_MODEL_CONTENT_SECURITY_VERSION = 1;
 
 export class SessionStore {
@@ -46,9 +52,16 @@ export class SessionStore {
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
   private readonly archiveQueues = new Map<string, Promise<void>>();
+  private readonly todos: TodoStore;
+  private readonly backgroundTasks: BackgroundTaskStore;
 
-  constructor(home: string) {
+  constructor(home: string, private readonly maxSessionArchiveBytes = MAX_SESSION_ARCHIVE_BYTES) {
+    if (!Number.isSafeInteger(maxSessionArchiveBytes) || maxSessionArchiveBytes <= 0) {
+      throw new Error("Session archive byte limit must be a positive safe integer");
+    }
     this.sessionsRoot = join(home, "sessions");
+    this.todos = new TodoStore((identity) => this.todoPath(identity));
+    this.backgroundTasks = new BackgroundTaskStore((identity) => this.backgroundTaskPath(identity));
   }
 
   path(identity: SessionIdentity): string {
@@ -64,6 +77,32 @@ export class SessionStore {
 
   archivePath(identity: SessionIdentity): string {
     return this.path(identity).replace(/\.jsonl$/, ".archive.jsonl");
+  }
+
+  todoPath(identity: SessionIdentity): string {
+    return this.path(identity).replace(/\.jsonl$/, ".state.json");
+  }
+
+  backgroundTaskPath(identity: SessionIdentity): string {
+    return this.path(identity).replace(/\.jsonl$/, ".background-tasks.json");
+  }
+
+  todoState(identity: SessionIdentity): TodoSessionState {
+    return this.todos.session(identity);
+  }
+
+  /** Runtime-owned active task state for prompt injection and completion review. */
+  async loadActiveTodos(identity: SessionIdentity): Promise<TodoItem[]> {
+    return await this.todos.active(identity);
+  }
+
+  backgroundTaskState(identity: SessionIdentity): BackgroundTaskSessionState {
+    return this.backgroundTasks.session(identity);
+  }
+
+  /** Runtime-owned finite background-process obligations for completion review. */
+  async loadActiveBackgroundTasks(identity: SessionIdentity): Promise<BackgroundTaskObligation[]> {
+    return await this.backgroundTasks.active(identity);
   }
 
   async initialize(identity: SessionIdentity, history: AgentMessage[] = []): Promise<AgentMessage[]> {
@@ -166,7 +205,7 @@ export class SessionStore {
     return await this.readSessionEntries(
       this.archivePath(identity),
       "Agent session archive",
-      MAX_SESSION_ARCHIVE_BYTES,
+      this.maxSessionArchiveBytes,
     );
   }
 
@@ -324,16 +363,24 @@ export class SessionStore {
     const file = this.archivePath(identity);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
     await this.withQueue(this.archiveQueues, file, async () => {
-      await this.repairJsonlTail(file, "Agent session archive", MAX_SESSION_ARCHIVE_BYTES);
-      const known = new Set((await this.readArchiveEntries(identity)).map((entry) => entry.id));
-      for (const entry of entries) {
-        if (known.has(entry.id)) continue;
-        const durableEntry = entry.type === "message"
+      await this.repairJsonlTail(file, "Agent session archive", this.maxSessionArchiveBytes);
+      const archived = await this.readArchiveEntries(identity);
+      const known = new Set(archived.map((entry) => entry.id));
+      const pending = entries.flatMap((entry) => {
+        if (known.has(entry.id)) return [];
+        return [entry.type === "message"
           ? { ...entry, payload: durableSessionMessage(entry.payload as AgentMessage) }
-          : entry;
-        await this.appendRaw(file, durableEntry);
-        known.add(entry.id);
+          : entry];
+      });
+      const combined = [...archived, ...pending];
+      const combinedSize = Buffer.byteLength(
+        `${combined.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf8",
+      );
+      if (combinedSize > this.maxSessionArchiveBytes) {
+        throw new Error(`Agent session archive exceeds ${this.maxSessionArchiveBytes} bytes`);
       }
+      if (pending.length > 0) await this.replaceRaw(file, combined);
     });
   }
 
@@ -355,6 +402,8 @@ export class SessionStore {
           rm(file, { force: true }),
           rm(archive, { force: true }),
           rm(manifest, { force: true }),
+          this.todos.deleteSession(identity),
+          this.backgroundTasks.deleteSession(identity),
         ]);
         try {
           await this.syncDirectory(directory);
@@ -383,6 +432,48 @@ export class SessionStore {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
     }
+  }
+
+  /** Clear only finite background-task responsibilities in an exact scope family. */
+  async deleteBackgroundTaskScopeFamily(scopeKey: string, lifecycleId?: string): Promise<void> {
+    for (const file of await this.backgroundTaskScopeFamilyPaths(scopeKey, lifecycleId)) {
+      await this.backgroundTasks.deletePath(file);
+    }
+  }
+
+  private async backgroundTaskScopeFamilyPaths(scopeKey: string, lifecycleId?: string): Promise<string[]> {
+    const directories = await readdir(this.sessionsRoot, { withFileTypes: true }).then(
+      (entries) => entries.filter((entry) => entry.isDirectory()).map((entry) => join(this.sessionsRoot, entry.name)),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+    );
+    const files: string[] = [];
+    for (const directory of directories) {
+      let candidate: string;
+      try {
+        const manifest = JSON.parse(await readFile(join(directory, "scope.json"), "utf8")) as { scope_key?: string };
+        candidate = String(manifest.scope_key || "");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (!scopeOwns(scopeKey, candidate)) continue;
+      const lifecycleDirectories = lifecycleId
+        ? [join(directory, stableHash(lifecycleId))]
+        : await readdir(directory, { withFileTypes: true }).then(
+          (entries) => entries.filter((entry) => entry.isDirectory()).map((entry) => join(directory, entry.name)),
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+        );
+      for (const lifecycleDirectory of lifecycleDirectories) {
+        const responsibilityFiles = await readdir(lifecycleDirectory, { withFileTypes: true }).then(
+          (entries) => entries
+            .filter((entry) => entry.name.endsWith(".background-tasks.json"))
+            .map((entry) => join(lifecycleDirectory, entry.name)),
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+        );
+        files.push(...responsibilityFiles);
+      }
+    }
+    return files;
   }
 
   async hasSessionApproval(identity: SessionIdentity, approvalKey: string): Promise<boolean> {

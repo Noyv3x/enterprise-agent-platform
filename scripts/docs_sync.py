@@ -32,6 +32,7 @@ REQUIRED_RUNTIME_POLICIES = {
     "run_idle_timeout",
     "max_turns_per_run",
     "terminal_timeout",
+    "process_wait_timeout",
 }
 REQUIRED_FORBIDDEN_TOP_LEVEL_FILES = {"claude.md"}
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
@@ -47,8 +48,11 @@ ENTRY_MARKDOWN_PATHS = (
     "enterprise-agent-platform/agent-runtime/README.md",
 )
 REQUIRED_RUNTIME_POLICY_SOURCE = "docs/contracts/runtime-policy.json"
-REQUIRED_RUNTIME_POLICY_DOMAINS = frozenset({"platform", "agent-runtime", "frontend"})
+REQUIRED_RUNTIME_POLICY_DOMAINS = frozenset(
+    {"deployment", "security-and-trust", "platform", "agent-runtime", "frontend"}
+)
 REQUIRED_RUNTIME_POLICY_TARGETS = {
+    "manager/internal/executor/runtime_policy_generated.go": "go-runtime-policy",
     "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py": "python-runtime-policy",
     "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts": "typescript-runtime-policy",
     "enterprise-agent-platform/frontend/src/design-contract.generated.ts": "typescript-runtime-policy",
@@ -511,6 +515,7 @@ def load_manifest(root: Path) -> Manifest:
             if target_format not in {
                 "python-runtime-policy",
                 "typescript-runtime-policy",
+                "go-runtime-policy",
                 "python-container-platform",
                 "typescript-container-platform",
                 "go-container-platform",
@@ -1075,7 +1080,18 @@ def _is_covered_document(manifest: Manifest, path: str) -> bool:
 
 def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
     contract = _expect_object(raw, label)
-    _reject_unknown_keys(contract, {"schema_version", "policy", "run_idle_timeout", "max_turns_per_run", "terminal_timeout"}, label)
+    _reject_unknown_keys(
+        contract,
+        {
+            "schema_version",
+            "policy",
+            "run_idle_timeout",
+            "max_turns_per_run",
+            "terminal_timeout",
+            "process_wait_timeout",
+        },
+        label,
+    )
     if contract.get("schema_version") != 1:
         raise DocsSyncError(f"{label}.schema_version must be 1")
     if contract.get("policy") != "runtime-policy":
@@ -1109,6 +1125,15 @@ def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
         {"default_milliseconds", "minimum_milliseconds", "maximum_milliseconds", "runtime_environment_variable", "semantics"},
         f"{label}.terminal_timeout",
     )
+    process_wait = _expect_object(
+        contract["process_wait_timeout"],
+        f"{label}.process_wait_timeout",
+    )
+    _reject_unknown_keys(
+        process_wait,
+        {"default_milliseconds", "minimum_milliseconds", "maximum_milliseconds", "semantics"},
+        f"{label}.process_wait_timeout",
+    )
 
     numeric_groups = (
         (idle, "default_seconds", "minimum_seconds", "maximum_seconds", "run_idle_timeout"),
@@ -1119,6 +1144,13 @@ def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
             "minimum_milliseconds",
             "maximum_milliseconds",
             "terminal_timeout",
+        ),
+        (
+            process_wait,
+            "default_milliseconds",
+            "minimum_milliseconds",
+            "maximum_milliseconds",
+            "process_wait_timeout",
         ),
     )
     for group, default_key, minimum_key, maximum_key, group_label in numeric_groups:
@@ -1135,6 +1167,10 @@ def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
         raise DocsSyncError(f"{label}.max_turns_per_run.minimum must be greater than zero")
     if terminal["minimum_milliseconds"] <= 0:
         raise DocsSyncError(f"{label}.terminal_timeout.minimum_milliseconds must be greater than zero")
+    if process_wait["minimum_milliseconds"] <= 0:
+        raise DocsSyncError(
+            f"{label}.process_wait_timeout.minimum_milliseconds must be greater than zero"
+        )
     for key in ("minimum", "default", "maximum"):
         if turns[key] > JAVASCRIPT_MAX_SAFE_INTEGER:
             raise DocsSyncError(
@@ -1145,9 +1181,18 @@ def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
             raise DocsSyncError(
                 f"{label}.terminal_timeout.{key} must be a JavaScript safe integer"
             )
+        if process_wait[key] > JAVASCRIPT_MAX_SAFE_INTEGER:
+            raise DocsSyncError(
+                f"{label}.process_wait_timeout.{key} must be a JavaScript safe integer"
+            )
     if terminal["maximum_milliseconds"] > NODE_MAX_TIMER_MILLISECONDS:
         raise DocsSyncError(
             f"{label}.terminal_timeout.maximum_milliseconds must not exceed the Node.js timer limit "
+            f"of {NODE_MAX_TIMER_MILLISECONDS}"
+        )
+    if process_wait["maximum_milliseconds"] > NODE_MAX_TIMER_MILLISECONDS:
+        raise DocsSyncError(
+            f"{label}.process_wait_timeout.maximum_milliseconds must not exceed the Node.js timer limit "
             f"of {NODE_MAX_TIMER_MILLISECONDS}"
         )
     maximum_safe_seconds = JAVASCRIPT_MAX_SAFE_INTEGER // 1_000
@@ -1178,6 +1223,7 @@ def _render_python_runtime_policy(contract: dict[str, Any], source: str) -> str:
     idle = contract["run_idle_timeout"]
     turns = contract["max_turns_per_run"]
     terminal = contract["terminal_timeout"]
+    process_wait = contract["process_wait_timeout"]
     return f'''# Generated from {source} by scripts/docs_sync.py; do not edit.
 from __future__ import annotations
 
@@ -1198,6 +1244,10 @@ TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS = {terminal["default_milliseconds"]}
 TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS = {terminal["minimum_milliseconds"]}
 TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS = {terminal["maximum_milliseconds"]}
 TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE = {terminal["runtime_environment_variable"]!r}
+
+PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS = {process_wait["default_milliseconds"]}
+PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS = {process_wait["minimum_milliseconds"]}
+PROCESS_WAIT_TIMEOUT_MAXIMUM_MILLISECONDS = {process_wait["maximum_milliseconds"]}
 '''
 
 
@@ -1209,6 +1259,7 @@ def _render_typescript_runtime_policy(contract: dict[str, Any], source: str) -> 
     idle = contract["run_idle_timeout"]
     turns = contract["max_turns_per_run"]
     terminal = contract["terminal_timeout"]
+    process_wait = contract["process_wait_timeout"]
     return f'''// Generated from {source} by scripts/docs_sync.py; do not edit.
 export const RUNTIME_POLICY_SCHEMA_VERSION = {contract["schema_version"]} as const;
 
@@ -1227,6 +1278,43 @@ export const TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS = {terminal["default_millisec
 export const TERMINAL_TIMEOUT_MINIMUM_MILLISECONDS = {terminal["minimum_milliseconds"]} as const;
 export const TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS = {terminal["maximum_milliseconds"]} as const;
 export const TERMINAL_TIMEOUT_RUNTIME_ENVIRONMENT_VARIABLE = {_typescript_string(terminal["runtime_environment_variable"])} as const;
+
+export const PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS = {process_wait["default_milliseconds"]} as const;
+export const PROCESS_WAIT_TIMEOUT_MINIMUM_MILLISECONDS = {process_wait["minimum_milliseconds"]} as const;
+export const PROCESS_WAIT_TIMEOUT_MAXIMUM_MILLISECONDS = {process_wait["maximum_milliseconds"]} as const;
+'''
+
+
+def _render_go_runtime_policy(contract: dict[str, Any], source: str) -> str:
+    idle = contract["run_idle_timeout"]
+    turns = contract["max_turns_per_run"]
+    terminal = contract["terminal_timeout"]
+    process_wait = contract["process_wait_timeout"]
+    constants = (
+        ("runtimePolicySchemaVersion", contract["schema_version"]),
+        ("runIdleTimeoutDefaultSeconds", idle["default_seconds"]),
+        ("runIdleTimeoutMinimumSeconds", idle["minimum_seconds"]),
+        ("runIdleTimeoutMaximumSeconds", idle["maximum_seconds"]),
+        ("maxTurnsPerRunDefault", turns["default"]),
+        ("maxTurnsPerRunMinimum", turns["minimum"]),
+        ("maxTurnsPerRunMaximum", turns["maximum"]),
+        ("terminalTimeoutDefaultMilliseconds", terminal["default_milliseconds"]),
+        ("terminalTimeoutMinimumMilliseconds", terminal["minimum_milliseconds"]),
+        ("terminalTimeoutMaximumMilliseconds", terminal["maximum_milliseconds"]),
+        ("processWaitTimeoutDefaultMilliseconds", process_wait["default_milliseconds"]),
+        ("processWaitTimeoutMinimumMilliseconds", process_wait["minimum_milliseconds"]),
+        ("processWaitTimeoutMaximumMilliseconds", process_wait["maximum_milliseconds"]),
+    )
+    name_width = max(len(name) for name, _ in constants)
+    constant_lines = "\n".join(
+        f"\t{name:<{name_width}} = {value}" for name, value in constants
+    )
+    return f'''// Code generated from {source} by scripts/docs_sync.py; DO NOT EDIT.
+package executor
+
+const (
+{constant_lines}
+)
 '''
 
 
@@ -2100,6 +2188,8 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_python_runtime_policy(parsed, contract.source)
         elif target.format == "typescript-runtime-policy":
             content = _render_typescript_runtime_policy(parsed, contract.source)
+        elif target.format == "go-runtime-policy":
+            content = _render_go_runtime_policy(parsed, contract.source)
         elif target.format == "python-container-platform":
             content = _render_python_container_platform(parsed, contract.source)
         elif target.format == "typescript-container-platform":

@@ -515,6 +515,108 @@ class AgentScheduleStore:
         )
         return cursor.rowcount > 0
 
+    def update_run_status_and_pause_current_schedule(
+        self,
+        run_id: int,
+        status: str,
+        *,
+        response_message_id: int | None = None,
+        error: str = "",
+        delivery_warning: str | None = None,
+    ) -> bool:
+        """Terminalize a review/blocked occurrence and disable its current schedule.
+
+        The run status and schedule pause share one immediate transaction. A
+        stale occurrence may still record its own terminal status, but cannot
+        pause a newer schedule revision. Repeating recovery for the same
+        already-terminal occurrence is a no-op rather than another revision.
+        """
+
+        if status not in {"needs_review", "blocked"}:
+            raise ValueError("schedule pause requires needs_review or blocked status")
+        timestamp = now_ts()
+        with self.db.transaction(immediate=True) as conn:
+            existing = conn.execute(
+                "SELECT status FROM agent_schedule_runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+            if existing is None:
+                return False
+            current_status = str(existing["status"])
+            changed = False
+            if current_status in {"queued", "running"}:
+                assignments = ["status = ?", "finished_at = ?", "updated_at = ?"]
+                params: list[Any] = [status, timestamp, timestamp]
+                if response_message_id is not None:
+                    assignments.append("response_message_id = ?")
+                    params.append(int(response_message_id))
+                if error:
+                    assignments.append("error = ?")
+                    params.append(str(error)[:2000])
+                if delivery_warning is not None:
+                    assignments.append("delivery_warning = ?")
+                    params.append(str(delivery_warning)[:1000])
+                params.extend((int(run_id), current_status))
+                cursor = conn.execute(
+                    f"""
+                    UPDATE agent_schedule_runs SET {', '.join(assignments)}
+                    WHERE id = ? AND status = ?
+                    """,
+                    params,
+                )
+                changed = cursor.rowcount == 1
+            elif current_status != status:
+                return False
+            self.pause_current_schedule_for_terminal_run(
+                conn,
+                int(run_id),
+                error=error,
+                timestamp=timestamp,
+            )
+            return changed
+
+    @staticmethod
+    def pause_current_schedule_for_terminal_run(
+        conn: Any,
+        run_id: int,
+        *,
+        error: str,
+        timestamp: int,
+    ) -> bool:
+        """Pause only the still-current revision owned by ``run_id``."""
+
+        row = conn.execute(
+            """
+            SELECT r.schedule_id, r.schedule_revision, r.trigger
+            FROM agent_schedule_runs AS r
+            WHERE r.id = ?
+            """,
+            (int(run_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        dispatched_revision = int(row["schedule_revision"]) + (
+            1 if str(row["trigger"] or "") == "scheduled" else 0
+        )
+        cursor = conn.execute(
+            """
+            UPDATE agent_schedules
+            SET state = 'paused', enabled = 0, next_run_at = NULL,
+                revision = ?, retry_after = 0, last_error = ?, updated_at = ?
+            WHERE id = ? AND deleted_at IS NULL AND last_run_id = ?
+              AND revision = ? AND state = 'active' AND enabled = 1
+            """,
+            (
+                dispatched_revision + 1,
+                str(error)[:2000],
+                int(timestamp),
+                int(row["schedule_id"]),
+                int(run_id),
+                dispatched_revision,
+            ),
+        )
+        return cursor.rowcount == 1
+
     def record_dispatch_error(
         self,
         schedule_id: int,

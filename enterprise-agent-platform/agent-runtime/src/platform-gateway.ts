@@ -29,6 +29,7 @@ export class PlatformGateway {
     if (!baseUrl) throw new Error(`Platform gateway is not configured for ${tool}`);
     const owner = ownerUserId(request);
     const sourceMessageId = sourceMessageIdFor(request);
+    const scheduleIdentity = trustedScheduleIdentity(request);
     const body: GatewayToolRequest = {
       tool,
       action,
@@ -58,6 +59,7 @@ export class PlatformGateway {
           && request.metadata.review_job_id > 0
           ? { review_job_id: request.metadata.review_job_id }
           : {}),
+        ...(scheduleIdentity ?? {}),
       },
     };
     const target = gatewayTarget(baseUrl, body);
@@ -295,4 +297,31 @@ function sourceMessageIdFor(request: RunRequest): number | undefined {
     return explicit;
   }
   return undefined;
+}
+
+function trustedScheduleIdentity(
+  request: RunRequest,
+): { schedule_id: string; schedule_run_id: string; schedule_recurring: boolean } | undefined {
+  const metadata = request.metadata;
+  if (
+    metadata?.trigger !== "scheduled"
+    || metadata.unattended !== true
+    || (metadata.parent_run_id !== undefined && metadata.parent_run_id !== "")
+    || (metadata.delegation_depth !== undefined && metadata.delegation_depth !== 0)
+  ) {
+    return undefined;
+  }
+  const scheduleId = sqliteIdentifierString(metadata.schedule_id);
+  const scheduleRunId = sqliteIdentifierString(metadata.schedule_run_id);
+  if (!scheduleId || !scheduleRunId || typeof metadata.schedule_recurring !== "boolean") return undefined;
+  return {
+    schedule_id: scheduleId,
+    schedule_run_id: scheduleRunId,
+    schedule_recurring: metadata.schedule_recurring,
+  };
+}
+
+function sqliteIdentifierString(value: unknown): string | undefined {
+  if (typeof value !== "string" || !/^[1-9][0-9]{0,18}$/.test(value)) return undefined;
+  return BigInt(value) <= 9_223_372_036_854_775_807n ? value : undefined;
 }

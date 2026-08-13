@@ -100,6 +100,46 @@ func TestReceiptCannotBeReusedForDifferentTarget(t *testing.T) {
 	}
 }
 
+func TestTerminalStartAdmissionPrecedesAuditReceiptConsumption(t *testing.T) {
+	service, _ := newTestService(t)
+	arguments, _ := json.Marshal(terminalArguments{Command: "true"})
+	request := AuditRequest{
+		Identity: identity(), AuditID: "audit-cleanup-fence", Target: "host",
+		Operation: "terminal", Action: "run", Arguments: arguments, Details: map[string]any{},
+	}
+	receipt, err := service.Audit(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := Call{
+		Identity: request.Identity, AuditID: receipt.AuditID, ExecutorID: receipt.ExecutorID,
+		Target: receipt.Target, Action: "run", Arguments: arguments,
+	}
+	release, err := service.Processes.acquireScopeCleanupFence(
+		context.Background(),
+		scopeCleanupFence{scopeID: request.ScopeID, lifecycleID: request.LifecycleID},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Terminal(context.Background(), call); err == nil || !strings.Contains(err.Error(), "cleanup") {
+		release()
+		t.Fatalf("terminal entered an active scope cleanup fence: %v", err)
+	}
+	release()
+
+	// Reusing the same receipt after the fence proves the rejected start did not
+	// consume it before admission. The second call must execute normally.
+	response, err := service.Terminal(context.Background(), call)
+	if err != nil {
+		t.Fatalf("start admission consumed the audit receipt before rejection: %v", err)
+	}
+	result := response["result"].(ProcessSnapshot)
+	if result.Status != "completed" {
+		t.Fatalf("terminal did not complete after the cleanup fence was released: %#v", result)
+	}
+}
+
 func TestApprovedHostFilePathCannotBeRedirectedBeforeExecution(t *testing.T) {
 	service, root := newTestService(t)
 	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/approved/secret.txt", Content: "approved"}); err != nil {
@@ -152,14 +192,14 @@ func TestProcessReceiptCannotCrossFromSandboxToHostProcess(t *testing.T) {
 		t.Fatalf("active background process count = %d, want 1", got)
 	}
 
-	processArguments, _ := json.Marshal(processArguments{ProcessID: processID})
+	processArguments, _ := json.Marshal(processIDArguments{ProcessID: processID})
 	processAudit := AuditRequest{Identity: identity(), AuditID: "audit-sandbox-process", Target: "sandbox", Operation: "process", Action: "read", Arguments: processArguments, Details: map[string]any{"action": "read"}}
 	processReceipt, err := service.Audit(processAudit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	processCall := Call{Identity: processAudit.Identity, AuditID: processReceipt.AuditID, ExecutorID: processReceipt.ExecutorID, Target: "sandbox", Action: "read", Arguments: processArguments}
-	if _, err := service.Process(processCall); err == nil {
+	if _, err := service.Process(context.Background(), processCall); err == nil {
 		t.Fatal("sandbox process receipt accessed a host process")
 	}
 	if _, err := service.Processes.Kill(hostAudit.ScopeID, hostAudit.LifecycleID, "host", processID); err != nil {

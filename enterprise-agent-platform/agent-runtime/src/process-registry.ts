@@ -27,6 +27,11 @@ export interface ProcessSnapshot {
   background: boolean;
 }
 
+/** Per-call wait state. This flag is never stored in the process registry. */
+export interface ProcessWaitResult extends ProcessSnapshot {
+  wait_timed_out: boolean;
+}
+
 export interface ProcessPreview {
   id: string;
   title: string;
@@ -66,6 +71,7 @@ interface ManagedProcess extends ProcessSnapshot {
   previewOutput: string;
   previewOutputTruncated: boolean;
   previewUpdatedAt: string;
+  completion?: Promise<void>;
 }
 
 const PREVIEW_PROCESS_LIMIT = 16;
@@ -207,6 +213,10 @@ export class ProcessRegistry {
         resolve(this.snapshot(managed));
       });
     });
+    managed.completion = completion.then(
+      () => undefined,
+      () => undefined,
+    );
     let timeout: NodeJS.Timeout | undefined;
     let timedOut = false;
     let activityHeartbeat: NodeJS.Timeout | undefined;
@@ -298,6 +308,50 @@ export class ProcessRegistry {
     return this.snapshot(process);
   }
 
+  async wait(
+    scopeKey: string,
+    processId: string,
+    lifecycleId: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<ProcessWaitResult> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("timeoutMs must be a positive integer");
+    }
+    throwIfAborted(signal);
+    const process = this.owned(scopeKey, processId, lifecycleId);
+    const initial = this.snapshot(process);
+    if (!processStatusActive(initial.status)) {
+      return { ...initial, wait_timed_out: false };
+    }
+
+    return await new Promise<ProcessWaitResult>((resolve, reject) => {
+      let settled = false;
+      const finish = (waitTimedOut: boolean): void => {
+        if (settled) return;
+        const snapshot = this.snapshot(process);
+        settled = true;
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        resolve({
+          ...snapshot,
+          wait_timed_out: waitTimedOut && processStatusActive(snapshot.status),
+        });
+      };
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        reject(abortError());
+      };
+      const timeout = setTimeout(() => finish(true), timeoutMs);
+      timeout.unref();
+      signal?.addEventListener("abort", onAbort, { once: true });
+      process.completion?.then(() => finish(false));
+    });
+  }
+
   write(scopeKey: string, processId: string, input: string, lifecycleId?: string): void {
     const process = this.owned(scopeKey, processId, lifecycleId);
     if (process.status !== "running") throw new Error("Process is not running");
@@ -310,8 +364,14 @@ export class ProcessRegistry {
     return this.snapshot(process);
   }
 
-  killRun(runId: string): void {
-    for (const process of this.processes.values()) if (process.run_id === runId && process.status === "running") this.killManaged(process);
+  killRun(runId: string, preserveProcessIds: ReadonlySet<string> = new Set()): void {
+    for (const process of this.processes.values()) {
+      if (
+        process.run_id === runId
+        && process.status === "running"
+        && !(process.background && preserveProcessIds.has(process.id))
+      ) this.killManaged(process);
+    }
   }
 
   killScope(scopeKey: string, lifecycleId?: string): void {
@@ -349,7 +409,11 @@ export class ProcessRegistry {
   private owned(scopeKey: string, processId: string, lifecycleId?: string): ManagedProcess {
     this.pruneCompleted();
     const process = this.processes.get(processId);
-    if (!process || process.scope_key !== scopeKey || (lifecycleId && process.lifecycle_id !== lifecycleId)) {
+    if (
+      !process
+      || process.scope_key !== scopeKey
+      || (lifecycleId !== undefined && process.lifecycle_id !== lifecycleId)
+    ) {
       throw new Error("Process not found");
     }
     if (process.exitConfirmed) this.touchCompleted(process.id);
@@ -451,6 +515,7 @@ export class ProcessRegistry {
       previewOutput: _previewOutput,
       previewOutputTruncated: _previewOutputTruncated,
       previewUpdatedAt: _previewUpdatedAt,
+      completion: _completion,
       ...snapshot
     } = process;
     return {

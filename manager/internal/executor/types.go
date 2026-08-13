@@ -47,6 +47,10 @@ type Call struct {
 	Target     string          `json:"target"`
 	Action     string          `json:"action"`
 	Arguments  json.RawMessage `json:"arguments"`
+	// CompletionOwnerID is a Runtime-derived digest for a finite background
+	// task. It is private executor metadata and never a model argument.
+	CompletionRequired bool   `json:"completion_required,omitempty"`
+	CompletionOwnerID  string `json:"completion_owner_id,omitempty"`
 }
 
 type ProcessSnapshot struct {
@@ -68,15 +72,29 @@ type ProcessSnapshot struct {
 	Background    bool       `json:"background"`
 }
 
+// ProcessWaitResult is a per-call observation, not durable process state.
+// WaitTimedOut therefore must never be persisted into ProcessSnapshot.
+type ProcessWaitResult struct {
+	ProcessSnapshot
+	WaitTimedOut bool `json:"wait_timed_out"`
+}
+
 type terminalArguments struct {
 	Command    string `json:"command"`
 	CWD        string `json:"cwd,omitempty"`
 	TimeoutMS  int    `json:"timeout_ms,omitempty"`
 	Background bool   `json:"background,omitempty"`
 }
-type processArguments struct {
-	ProcessID string `json:"process_id,omitempty"`
-	Input     string `json:"input,omitempty"`
+type processIDArguments struct {
+	ProcessID string `json:"process_id"`
+}
+type processWriteArguments struct {
+	ProcessID string `json:"process_id"`
+	Input     string `json:"input"`
+}
+type processWaitArguments struct {
+	ProcessID string `json:"process_id"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
 }
 type fileReadArguments struct {
 	Path   string `json:"path"`
@@ -107,9 +125,41 @@ type ScopeIdentity struct {
 	ExecutionContext ExecutionContext `json:"execution_context"`
 	SinceRevision    string           `json:"since_revision,omitempty"`
 }
+
+type ScopeCleanupIdentity struct {
+	ScopeID     string `json:"scope_id"`
+	LifecycleID string `json:"lifecycle_id,omitempty"`
+}
+
+type CompletionTaskCleanupEvidence struct {
+	ScopeID           string           `json:"scope_id"`
+	LifecycleID       string           `json:"lifecycle_id"`
+	ExecutionContext  ExecutionContext `json:"execution_context"`
+	CompletionOwnerID string           `json:"completion_owner_id"`
+	ProcessID         string           `json:"process_id"`
+	Target            string           `json:"target"`
+}
+
+type ScopeCleanupResult struct {
+	Confirmed       bool                            `json:"confirmed"`
+	CompletionTasks []CompletionTaskCleanupEvidence `json:"completion_tasks"`
+}
 type RunIdentity struct {
-	RunID            string           `json:"run_id"`
-	ScopeID          string           `json:"scope_id"`
-	LifecycleID      string           `json:"lifecycle_id"`
-	ExecutionContext ExecutionContext `json:"execution_context"`
+	RunID              string           `json:"run_id"`
+	ScopeID            string           `json:"scope_id"`
+	LifecycleID        string           `json:"lifecycle_id"`
+	ExecutionContext   ExecutionContext `json:"execution_context"`
+	PreserveProcessIDs []string         `json:"preserve_process_ids,omitempty"`
+}
+
+type TaskIdentity struct {
+	ScopeID           string           `json:"scope_id"`
+	LifecycleID       string           `json:"lifecycle_id"`
+	ExecutionContext  ExecutionContext `json:"execution_context"`
+	CompletionOwnerID string           `json:"completion_owner_id"`
+}
+
+type TaskProcessIdentity struct {
+	TaskIdentity
+	ProcessID string `json:"process_id"`
 }

@@ -58,6 +58,12 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 Runtime 为本次实际调用的模型按 `provider + model + scope_key` 临时请求 OAuth 凭据；Platform 必须先以当前账号目录复验该模型，返回值不形成新的持久模型选择。Token 与这次复验结果都不得进入消息、session、memory 或 workspace；辅助模型必须以自己的模型 ID 独立复验，不能复用主模型的可用性判断。
 
+每个 Runtime session 还有两个同目录、owner-only、原子替换且彼此 schema 独立的 Runtime 状态 sidecar：一个承载 Agent 自用 todo 清单，另一个承载有明确终点的后台进程责任。两者都绑定精确 scope、lifecycle 和 session，不能由 Platform history seed、用户正文或模型摘要直接创建；读取时必须拒绝符号链接、硬链接、错误 owner、宽松权限、未知字段、损坏 JSON 和身份漂移，scope/session 清理会与 JSONL、archive 一并删除。
+
+todo 工具结果写入 JSONL 供模型和审计查看，但权威状态以 todo sidecar 为准。该状态不是产品业务任务、长期记忆或共享知识，不进入管理员记忆列表；压缩和 Runtime 重启后只把 `pending/in_progress` 项重新注入活动上下文。普通 Run 因活动项进入 `needs_review` 时不得删除或伪造完成这些项；后续同 session Run 从 sidecar 恢复它们，全部完成或明确取消后才可正常终结。
+
+后台进程责任 sidecar 只保存 Manager 返回的 process id、规范 target 与登记/更新时间，不保存命令、输出或模型文本。默认 `background_kind=task` 的成功 terminal 调用必须先登记责任；只有相同 session 以匹配 id 与 target 调用 `process.wait|read|kill` 并观察到权威 `completed|failed|cancelled` 才原子解除。超时、`running`、`orphaned`、Run 终止和 Runtime 重启都保留责任；显式 `background_kind=service` 不登记。活动责任以可信 Runtime 段注入后续 Run，并在有界延续耗尽时强制 `needs_review`。存储或身份校验失败必须失败关闭，不能用空状态继续。
+
 ## 持久任务与追加输入
 
 Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO worker 消费，全局并发门只限制实际进入 Runtime 的任务。
@@ -67,6 +73,8 @@ Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO
 Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构建本次恢复使用的 `durable_job_id` 与完成状态索引；随后对失败、待复核和分组任务只做集合查询。不得为每条历史 job 重复读取并解析整张消息表，使启动成本退化为任务数与消息数的乘积。该索引只是一轮启动内的派生数据，不替代 SQLite 中的消息和 job 权威记录。
 
 当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
+
+计划任务 occurrence 与当前计划身份由 Platform SQLite 权威保存。Platform 从当前定义派生并随 scheduled Run 透传可信 `schedule_id/schedule_run_id/schedule_recurring`。recurring occurrence 只能以无 id 的空参数 `continue_current` 或 `complete_current` 提交机械决策：前者在单一事务中复验 owner、revision、当前 run/job/source identity 后不修改 schedule，后者在同一边界设置 completed、关闭 enabled 并清空 next run；已经过期或重复的 dispatcher 观察无法取得其它计划能力。若本轮以 `needs_review` 或 `blocked` 结束，Platform 在更新 occurrence 终态的同一事务中仅对仍匹配 `last_run_id` 和 revision 的计划设置 paused、关闭 enabled 并清空 next run，重复恢复幂等且不会暂停较新 revision。计划任务不能用于观察当前 Run 启动的本地进程；这类等待属于 Runtime/Manager process 生命周期。
 
 个人 AI 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。服务重启时：
 
@@ -123,7 +131,9 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
 
-文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA: /workspace/<relative-path>` 回传、保留最终产物并清理自己创建的中间文件；Platform 只按当前 Agent scope 的权威工作区解释该逻辑路径，Runtime 的成功内部复验不得丢失已经产生的交付标记，失败复验则不得恢复标记。表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
+文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA: /workspace/<relative-path>` 回传、保留最终产物并清理自己创建的中间文件；Platform 只按当前 Agent scope 的权威工作区解释该逻辑路径，Runtime 的成功内部复验不得丢失已经产生的交付标记，失败复验则不得恢复标记。它们也共享视觉交付基线：先识别受众和使用场景，使用一致且专业的字体层级、间距、对齐和有限配色，保证文字、图表和表格在目标页面或画布内清晰可读，并通过格式专属复验避免溢出、截断、失真与机械默认样式。表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
+
+消息 `metadata.agent_work.activity` 是已完成 Run 的持久工作过程：只在 Run 实际调用工具时存在，可同时包含工具生命周期和工具边界前已经对用户展示的阶段性 Agent 文本。Platform 在当前 Run 内为每个新过程项分配严格递增的 `sequence`；阶段性文本在结束边界追加并从 finalized stream buffer 移除，工具在首次真实调用时追加，之后按 `tool_call_id` 原位更新而不改变 `sequence`。因此阶段性文本在活动界面只由紧凑时间线展示一次，也不会在 `stream_messages` 形成第二份无界副本；该旧字段仅供前端读取升级前的瞬时状态，新状态的流式正文只存在于 `stream_message`。最终快照直接从该时间线投影，不再分别截取文本段和工具列表后按秒级时间重排；当前最终答案仍不复制到其中。正常合法 Run 完整保留；仅异常流超过 512 条过程项、单项 32 KiB 详情或 512 KiB 总详情时，使用带省略事件/字符计数的显式截断项或字段。该字段属于消息 scope，与对应消息一同分页、备份、隐藏或删除，不另建会话或记忆副本。
 
 bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用 `.agent-platform/`。Skill 不提供双路径回退，也不根据管理员品牌选择路径。
 

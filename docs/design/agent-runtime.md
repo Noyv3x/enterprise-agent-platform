@@ -41,17 +41,23 @@ Python 在调用时向内部授权端点请求当前访问凭据，并同时复�
 
 ## 工具与执行目标
 
-Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、memory、skill、knowledge、web、browser、mail、sylver_platform、schedule、session、session_search 和 delegate_task。
+Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、todo、memory、skill、knowledge、web、browser、mail、sylver_platform、schedule、session、session_search 和 delegate_task。
+
+`todo` 是当前 Runtime session 内的结构化执行清单，不是平台业务任务、计划任务或长期记忆。模型可以读取、整体替换或按稳定 id 合并至多 256 项 `pending|in_progress|completed|cancelled` 任务；每项正文有界。权威清单保存在 Runtime-owned session sidecar，工具结果只作为模型可见审计副本，不能从 caller seed、用户正文或未配对的历史工具结果恢复授权状态。压缩只重新注入 `pending` 与 `in_progress` 项。普通 Run 准备结束时仍有活动项，且没有可验证的外部 blocker 时，Runtime 必须要求继续执行或显式更新状态；有界延续预算耗尽后只要仍有活动项，本 Run 就必须进入 `needs_review`，即使尚未记录其它副作用，也不能把未完成任务记为 `completed`。真实 blocker 对应的活动项保持原状态，供下一次同 session Run 恢复；只有全部项均为 `completed` 或 `cancelled` 时才允许正常完成。
+
+Runtime 因未完成 todo、尚未观察到终态的有限后台任务或缺失 recurring occurrence 决策而机械转入 `needs_review` 时，必须保留模型最后一段非空、非 Runtime 临时指令的阶段性说明作为有界诊断结果，并在 `run.needs_review` 终态中同时携带该内容与明确 blocker。这个结果只表示“停止位置与已有进度”，其 Run 状态、持久幂等状态和 Platform durable job 都必须继续是 `needs_review`，不得因存在 `result` 或正文而升级为 `completed`。诊断结果不得恢复或发布 `MEDIA:` 交付标记；需要复核的 Run 没有附件交付权。
 
 模型可见的 assistant tool call 参数必须始终保持对应活动工具 schema 的规范形状；审计展示对象与模型历史使用不同的序列化边界，不能把 `tool` 名称或其它展示字段写回下一轮上下文。读取旧 session 时只允许在内存模型副本中收敛精确匹配的历史展示 envelope，未知字段、身份字段或不匹配工具名继续由严格 schema 拒绝，原 JSONL 不改写。敏感值替换仍须满足字段的枚举、正则和路径约束；允许任意 JSON 的浏览器提取 schema 必须同时限制深度、条目、节点和字符串大小。
 
-terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。
+terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。有限后台 task 的 Manager 私有请求额外携带由 Runtime 对 scope/lifecycle/session 计算的固定摘要和 `completion_required`；这不是模型参数，也不暴露 session 原文或 `background_kind`。
 
 Runtime 不创建、修复或推断宿主 workspace。每条 scope/runtime identity 对应的 workspace、当前 marker 与 alias 必须在接受 Run 前完整存在并匹配；任何未物化、缺失、旧格式或身份漂移都失败关闭，普通更新和恢复也没有放宽入口。
 
 用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件使用 `/workspace/.agent-platform/attachments/...`；Manager 在当前 scope 的只读附件挂载中解析。Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
 
-Agent 生成的用户交付文件必须先写入当前 `/workspace`，再在最终回复中使用平台文件回传标记 `MEDIA: /workspace/<relative-path>`。该路径是 Sandbox 逻辑路径，不是中央 Platform 容器中的同名路径；Platform 只能把精确的 `/workspace` 后代映射到当前可信 scope 的 `workspace_path`，并从已固定的工作区根目录 fd 逐段以不跟随符号链接的方式打开，最终从同一文件 fd 完成身份、数量、单文件和总字节校验与读取，不能在检查后重新解析路径字符串。Platform 是把该标记转换为消息附件的唯一边界，Runtime 不能把任意宿主路径或纯文本文件名伪装成附件。如果 Runtime 在含交付标记的回复后自动追加内部文件复验，只有相关变更已由成功的复验工具清除时，才把被隐藏中间回复中的规范 `/workspace` 标记去重保留到 Run 终态 output；复验失败或仍有未确认变更时不得恢复标记，成功复验则不能让已声明的交付物消失。两种情况都不能跳过 Platform 校验。内置表格、文字文档、演示稿和 PDF Skill 应在相应产出请求中主动使用，默认交付 XLSX、DOCX、PPTX 或 PDF，而不是仅返回 Markdown 表格、代码片段或“文件已生成”的文字说明。Skill 必须要求生成后进行内容与结构校验、清理自身临时产物，并保留最终文件。
+Agent 生成的用户交付文件必须先写入当前 `/workspace`，再在最终回复中使用平台文件回传标记 `MEDIA: /workspace/<relative-path>`。该路径是 Sandbox 逻辑路径，不是中央 Platform 容器中的同名路径；Platform 只能把精确的 `/workspace` 后代映射到当前可信 scope 的 `workspace_path`，并从已固定的工作区根目录 fd 逐段以不跟随符号链接的方式打开，最终从同一文件 fd 完成身份、数量、单文件和总字节校验与读取，不能在检查后重新解析路径字符串。Platform 是把该标记转换为消息附件的唯一边界，Runtime 不能把任意宿主路径或纯文本文件名伪装成附件。如果 Runtime 在含交付标记的回复后自动追加内部文件复验，只有相关变更已由成功的复验工具清除时，才把被隐藏中间回复中的规范 `/workspace` 标记去重保留到 Run 终态 output；复验失败或仍有未确认变更时不得恢复标记，成功复验则不能让已声明的交付物消失。两种情况都不能跳过 Platform 校验。内置表格、文字文档、演示稿和 PDF Skill 应在相应产出请求中主动使用，默认交付 XLSX、DOCX、PPTX 或 PDF，而不是仅返回 Markdown 表格、代码片段或“文件已生成”的文字说明。Skill 必须把视觉质量作为交付条件：根据用途选择专业且克制的主题，建立一致层级、间距、对齐和色彩，避免默认库样式直接外露；同时要求生成后进行内容、结构与格式专属布局校验，清理自身临时产物并保留最终文件。
+
+模型在一次 Run 中发出的、随后因真实工具调用而结束的阶段性说明属于用户已经看见的工作过程。Platform 必须在不改变 Runtime 流协议的前提下，将这些已结束的文本段与工具首次调用写入同一条带严格递增序号的时间线；工具更新按 `tool_call_id` 原位合并，最终消息的 `agent_work.activity` 直接从该时间线生成，不能用秒级时间重新排序或静默截取尾部。当前仍活动的最终回答不属于过程文本，不能在 metadata 中复制。没有真实工具事件时仍不得生成工作记录。异常事件或正文触发 Platform 的有界防滥用限制时必须携带明确的省略计数。
 
 模型可为单次 terminal、process 或文件调用显式选择 `target=host`。Sandbox 命令不等待人工审批；terminal、process 与文件工具的宿主目标都必须逐次取得用户批准，并且只提供本次批准或拒绝，不能创建 session/permanent 规则。批准后管理器以部署用户在宿主机执行，并允许该用户已有的免密 `sudo`。每次调用仍必须在执行前发出可见审计事件，包含未经隐藏的实际命令参数或 canonical 文件路径、目标、cwd 和超时；凭据只做安全脱敏。宿主执行不能复用为后续调用的隐式授权，也不能把 host 变为 Run 默认值。
 
@@ -63,13 +69,29 @@ Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和
 
 `sylver_platform` 只出现在规范私人 scope。它使用固定 action union 回调 Platform，不允许模型提供网络位置、认证或所有权字段；读取动作无需审批，创建任务、开始任务、记录活动、Wiki 提案和普通审批评论只允许交互式 Run 并逐次审批。审批对象绑定完整参数；Runtime 在任何脱敏前按原始完整参数计算 UTF-8 大小并拒绝不可见控制字符，通过后才生成完整、脱敏的短正文展示。原始参数或展示投影任一超过审批上限都在调用前失败关闭，不能截断、仅显示长度或借脱敏收缩绕过。Runtime 在发送任何写动作前标记副作用，且不暴露审批决定、跳过审查、强制完成、员工管理、通用 HTTP 或破坏性删除动作。
 
-terminal 的前台进程在其有界工具 deadline 内以显式执行生命周期保持 Run 活动，不能只依赖与空闲 watchdog 竞争的定时心跳；后台进程立即返回并由对应 Sandbox 登记。Manager 是生产进程清单的唯一权威：同一主 scope 与其 `/delegate/` 子 scope 组成一个进程 family，共享同时运行上限，root cleanup 必须停止整个 family；单进程读写和终止仍要求精确 scope，不允许越权访问子 Agent 句柄。cleanup 或显式终止报告已确认前，不仅要观察到进程终态，还必须等待对应控制器完成输出快照、持久状态、Sandbox 活动计数和终态裁剪；返回后不得再由该进程的 wait/watch goroutine 写入 scope 数据。进程输出、历史记录和同时运行数量有界；终态记录按时间和数量双重裁剪，但不得裁剪 `running` 或 `orphaned`。预览优先返回活动进程，其不透明 revision 在状态或输出变化时必须变化，Manager 重启后旧 revision 必须失效。Run 空闲、模型轮次和 terminal 默认超时的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
+terminal 的前台进程在其有界工具 deadline 内以显式执行生命周期保持 Run 活动，不能只依赖与空闲 watchdog 竞争的定时心跳；有明确终点且能在工具上限内结束的复制、转换、扫描和批处理必须优先以前台方式执行，并给出足够的 `timeout_ms`。`background=true` 时模型还可以声明 Runtime-only 的 `background_kind=task|service`，省略时固定为 `task`；非后台调用不得携带该字段。`task` 表示当前 session 必须确认终点的有界工作：Runtime 从成功的 terminal 结果把 process id、执行 target 和登记时间写入独立、owner-only、原子替换且绑定精确 scope/lifecycle/session 的责任 sidecar；只有同一 session 的 `process.wait|read|kill` 对同一 id 与 target 返回 `completed|failed|cancelled` 才解除。wait timeout、`running`、`orphaned`、Runtime 重启或上一 Run 进入 `needs_review` 都不算完成。后续 Run 必须从 sidecar 恢复并以可信 Runtime 状态注入这些责任。模型试图在仍有活动 task 时结束，Runtime 进行有界延续并要求 `process.wait`，预算耗尽后强制 `needs_review`，即使没有其它副作用也不能报告成功；sidecar 损坏或身份漂移同样失败关闭。`service` 表示用户确实要求独立存续的长期服务，不登记完成责任且不阻止 Run 结束，但模型仍应检查其就绪状态。`background_kind` 本身不发送给 Manager；Runtime 只为 task 派生闭合的 completion-required 元数据，Manager 的执行绑定和审计仍只依据规范 command、target、cwd、background 与 timeout。
+
+为关闭“Manager 已启动 task、Runtime 尚未登记 sidecar”之间的崩溃窗口，Manager 必须在启动命令前先持久化 completion-required intent。每次普通 Run 读取 sidecar 前，Runtime 以精确 scope/lifecycle/execution context 和 session 摘要向 Manager 对账未确认 task，并把缺失项原子登记后才允许模型运行；因此重启恢复不会把同一用户动作当成尚未执行而重复。Manager 不按普通一小时/数量规则裁剪未确认 task 的活动或终态记录。Runtime 得到权威终态时先把本地责任从 `active` 原子改为 `resolved` tombstone，再向 Manager acknowledge；Manager 确认后 Runtime 才删除 tombstone。任一边界崩溃后，下次对账都只会重试 acknowledge 或重新观察既有进程，不会重跑命令或伪造成功。只有 acknowledge 成功后该终态才进入普通有界裁剪。
+
+后台模式用于需要独立句柄的长任务或服务；当前 Run 仍要等待其结果时，必须调用 `process.wait`，不得创建 interval/cron 计划来轮询本 Run 启动的进程。只要当前 session 仍有活动 task 责任，Runtime 的工具策略就必须在任何 Platform 调用或审批前拒绝 `schedule.create`；取得权威终态并解除全部责任后恢复允许。显式 service 不登记责任，因此不触发这项限制。`process.wait` 在精确 scope、lifecycle、target 和 process id 上长轮询至终态或调用超时：自然终态返回最终有界快照，等待超时返回仍在运行且不终止进程，取消会立即中断等待；等待全程暂停 Run 空闲保护，但不放宽模型轮次或进程 deadline。读取、等待和预览不会消费终态，重复等待同一已结束进程立即返回相同权威快照。
+
+todo、有限后台 task 或 recurring occurrence 决策的机械完成守卫结束当前 Run 时，不等同于用户取消执行。若终态是由这些守卫产生的 `needs_review`，Runtime 只把当前 session 责任 sidecar 中仍活动且属于本 Run 的精确 task process id 作为保留集合交给 Manager；Manager 必须清理同 Run 的其它前台进程和未登记后台进程，只允许该闭合保留集合跨 Run 存续。显式用户取消、Run 空闲超时、scope cleanup、无法读取责任 sidecar或其它真正的取消/异常终止一律使用空保留集合并执行完整清理。模型不能提供、扩大或修改保留集合，service 分类也不能借机械守卫获得隐式保留权。
+
+scope cleanup 是对整个 scope family 的显式取消边界，不是允许 task 跨停机继续的普通 Run 守卫。Runtime 必须按 root scope/lifecycle 调用 Manager 的 family cleanup，不能依赖进程内 execution-context 映射发现进程。Manager 接受 cleanup 后必须先安装 family/lifecycle admission fence：拒绝同一边界内尚未进入启动临界区的新 terminal start，并等待已进入临界区的 start 原子地登记到进程清单或退出，之后才允许快照、evidence 上限预检和停止；fence 必须保持到 cleanup 返回，不能阻塞相邻 scope family 或其它 lifecycle。重叠 cleanup 要么共享同一次闭合结果，要么有界拒绝，不能并发穿透；等待时不得持有会阻止 start 完成登记的锁。Manager 确认全部进程已经停止后，把仍未确认的 completion task 身份作为有界闭世界 evidence 返回并保持记录 pinned；不能在 Runtime 本地提交前擅自 acknowledge。Runtime 通过责任存储自身的串行化删除路径清除精确 scope family/lifecycle 下所有有限 task sidecar，永久 scope reset 则删除整个 session family；本地提交成功后才逐项确认 Manager evidence，最后清除内存 context。任一阶段崩溃或失败后，同一 cleanup 可从 Manager 保留的 evidence 幂等重试，避免 pre-start intent 因 Runtime 尚无 sidecar/context 而漏清，也避免 Manager 已裁剪而 Runtime 留下幽灵责任。
+
+后台进程立即返回并由对应 Sandbox 登记。Manager 是生产进程清单的唯一权威：同一主 scope 与其 `/delegate/` 子 scope 组成一个进程 family，共享同时运行上限，root cleanup 必须停止整个 family；单进程读写、等待和终止仍要求精确 scope，不允许越权访问子 Agent 句柄。cleanup 或显式终止报告已确认前，不仅要观察到进程终态，还必须等待对应控制器完成输出快照、持久状态、Sandbox 活动计数和终态裁剪；返回后不得再由该进程的 wait/watch goroutine 写入 scope 数据。进程输出、历史记录和同时运行数量有界；终态记录按时间和数量双重裁剪，但不得裁剪 `running` 或 `orphaned`。预览优先返回活动进程，其不透明 revision 在状态或输出变化时必须变化，Manager 重启后旧 revision 必须失效。Run 空闲、模型轮次、terminal 默认超时和单次 process wait 上限的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
+
+计划任务只用于真正基于时间的提醒、周期报告或与当前 Run 无关的未来检查，不能充当本地进程 watcher。Platform 对计划唤醒的 Run 签发可信 `schedule_id`、`schedule_run_id` 与布尔 `schedule_recurring`；后者只在当前权威定义为 interval/cron 时为 `true`，once 固定为 `false`，模型和调用方不能自行选择。当前顶层 recurring occurrence 结束前必须成功调用且只能以空参数调用 `schedule.continue_current` 或 `schedule.complete_current`：前者只原子复验并确认本轮保留下一次执行，不修改计划；后者原子结束本次所属计划，清除 `enabled/next_run_at`，使并发排队的旧 occurrence 失效。两者都不能选择目标 id 或取得其它计划权限，重复调用和竞态按当前 occurrence 身份幂等或失败关闭。
+
+Runtime 不从最终回复中的“继续”“完成”文字猜测决策。recurring Run 准备结束却没有成功的 current-occurrence 决策时，它有界追加明确 follow-up；预算耗尽仍无决策则进入 `needs_review`，不能完成。once occurrence 不要求这项决策并继续在 dispatch 后自动结束。Platform 将 scheduled occurrence 的 `needs_review` 或授权 `blocked` 与“暂停所属当前 revision、关闭 enabled、清空 next_run_at”放在同一事务；重复恢复和迟到写入不得重开计划。这样一次模型遗漏至多产生一条需要关注的结果，不会继续按间隔刷屏。
 
 ## 会话与压缩
 
-每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。上下文超过策略阈值时，Runtime 计算压缩计划；被省略的已持久消息先 fsync 到去重 archive，再原子替换活动 journal。没有稳定 entry id 的消息不得被压缩。
+每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。上下文超过策略阈值时，Runtime 先按合法 user/assistant/tool 边界保护最近 tail，并用当前已授权模型把待省略历史更新成一个结构化 handoff。首轮自动压缩后，Runtime 可以复用“handoff + tail”的模型投影，但每次新增消息后都必须重新计算该投影的上下文用量；同一 Run 的长工具循环再次越过阈值时必须再次自动压缩，不能因为已有 handoff 永久绕过阈值判断。后续压缩把上一轮 handoff 作为不可信历史迭代更新，只保留一个现役 handoff，旧 handoff 不写入 archive。摘要模型输入在总字符预算内必须为最早目标/验收条件和待省略段中最新用户请求分别预留首尾有界锚点，再把其余预算按时间倒序分给最近工具证据；大量工具输出不能把原始目标完全挤出摘要输入。摘要必须保留最新未完成用户请求、验收条件、已完成动作及证据、决策与约束、文件和关键工具结果、blocker、下一步，以及 Runtime-owned 活动 todo/process 状态；旧摘要采用迭代更新而不是作为普通历史重复堆叠。历史正文和既有摘要都属于不可信数据，不能授予工具、审批或身份。Runtime 使用同一集中敏感文本清洗器同时处理发送给摘要模型的历史和模型返回的摘要，覆盖常见供应商 Token、认证头、JWT、私钥、带密码连接串、敏感配置字段与 URL 参数；原始 journal/archive 仍按会话访问边界保存真实历史，不能把清洗后的摘要反向当作原文替换。摘要输出有独立大小上限；摘要请求失败、被取消、为空或不合法时，本次压缩不改活动 journal，也不丢任何上下文，已经安全提交的上一轮压缩保持有效。
 
-`/compact` 是 Platform 调用的会话控制操作，不是模型输入。Runtime 只接受严格的 scope、lifecycle 与 session 身份；当前身份存在 queued/running Run 时拒绝，在会话锁内复用自动压缩的边界计算、archive 去重与 journal 原子替换。活动消息不足以安全省略时返回成功但 `compacted=false`，不创建伪消息；内部压缩提示必须用 journal entry 的 Runtime-owned 结构化标记识别，不能从用户可伪造的正文推断。连续调用不得把上一轮内部压缩提示当作用户历史再次归档，也不得增长 journal 或 archive。被省略的历史仍可由 `session` 搜索。命令执行期间的新 Run 必须由同一身份门闩隔离，不能与 journal 替换竞态。
+摘要成功后，被省略的已持久消息先 fsync 到去重 archive，再原子替换活动 journal。archive 追加前必须按写入后的 UTF-8 总字节执行上限检查，不能先写过界再让后续读取永久失败；没有稳定 entry id 的消息不得被压缩。Runtime-owned todo sidecar 不依赖模型摘要，活动项以独立可信段重新注入；完成和取消项保留在 sidecar 审计中但不占后续模型上下文。
+
+`/compact` 是 Platform 调用的会话控制操作，不是模型输入。Runtime 只接受严格的 scope、lifecycle、session、模型和内部 Gateway 身份；当前身份存在 queued/running Run 时拒绝，在会话锁内复用自动压缩的同一摘要、边界计算、archive 去重与 journal 原子替换。活动消息不足以安全省略时返回成功但 `compacted=false`，不创建伪消息；内部摘要必须用 journal entry 的 Runtime-owned 结构化标记识别，不能从用户可伪造的正文推断。连续调用不得把上一轮内部摘要当作用户历史再次归档，也不得无新历史时增长 journal 或 archive。被省略的历史仍可由 `session` 搜索。命令执行期间的新 Run 必须由同一身份门闩隔离，不能与摘要调用或 journal 替换竞态。该同步控制请求使用独立的长模型调用 deadline；客户端断开或 deadline 在模型摘要及提交准备阶段会取消本次操作并释放门闩，不改 archive/journal。一旦越过最终提交点，Runtime 忽略迟到断线并完成有界的 archive-first 原子替换后再释放门闩，不能停在活动 journal 已替换但 archive 缺失的状态。
 
 中断留下的孤立 tool call 会在恢复时修复并发出 `session.repaired`。`session` 工具搜索当前 session 的活动 journal 和 archive；跨产品会话的 `session_search` 由 Python 提供。二者返回的历史都必须标记为不可信数据，而不是指令。
 
@@ -91,11 +113,19 @@ Platform 可创建 `metadata.review_mode=memory_skill`、`trigger=learning_revie
 
 ## 委派
 
-委派深度和每 Run 子任务数量受策略限制。子 Agent 使用派生 scope 和独立 session，但继承父主 Agent 的 Sandbox、workspace、HOME 与 env；临时记忆和浏览器身份仍按子 scope 隔离。子 Run 的模型输出、工具活动和等待要向父 Run 传播活动，避免父 Run 被误判无进展。
+委派深度和整棵顶层 Run 委派树的总创建数量受策略限制。`delegate_task` 接受一个任务或有界 `tasks[]`；批量任务在同一父 Run 内受限并发执行，结果按输入顺序合并，父 Run 必须等待全部子 Run 终态。每层不能各自重新取得一份数量预算；Runtime 从可信的内存父子关系定位根 Run，并让所有后代原子共享根预算，模型 metadata 不能补充或重置余额。全局同时活动的子 Run 还受同一策略值派生的 admission cap 约束；达到上限立即拒绝新子 Run 而不排队等待，避免多个顶层 Run 放大并发，也避免持有执行槽的 orchestrator 相互等待形成死锁。父取消仍会取消所有已经创建的后代。委派 scope/session 是临时执行上下文，子 Run 终态后会被整体清理，因此子 Agent 不得启动任何后台进程；Runtime 必须在产生副作用、请求审批或调用 Manager 前稳定拒绝 `background=true`，子 Agent 需要等待的命令必须以前台方式完成。
+
+子 Agent 始终继承 Platform 为父 Run 建立的可信系统提示与安全策略；父模型只能提供作为用户任务数据传入的 `prompt`，不能替换或追加子 Agent 的系统提示。默认子 Agent 是 leaf，不再获得委派工具；只有父 Agent 显式请求且仍处于深度与根树总预算内的 orchestrator 子 Agent 才能继续委派。这样避免无意递归和提示词提权，同时保留复杂任务的分层编排。
+
+子 Agent 使用派生 scope 和独立 session，但继承父主 Agent 的 Sandbox、workspace、HOME 与 env；临时记忆和浏览器身份仍按子 scope 隔离。并行任务默认用于相互独立的读取、分析或不同输出，多个子 Agent 不得并发修改同一文件或共享外部对象。子 Run 的模型输出、工具活动、`process.wait` 和压缩要向父 Run 传播活动，避免父 Run 被误判无进展；父取消会取消所有仍活动子 Run。
+
+子 Agent 的成功结果是待复验的自述。Runtime 在 `delegate_task` 结果中加入由自身生成、不能由模型填写的 child id、是否已开始副作用、已知变更文件和未知变更标记；批量结果逐项保留该证据。只读子 Run 不增加父 Run 的完成条件；任一成功子 Run 开始过副作用，则父 Run 在该委派之后至少执行一次成功、非 `delegate_task` 的聚焦验证工具才可完成。已知文件优先复用 read/search/针对该路径的 terminal 检查，未知或外部变更保守要求综合 terminal 验证。自然语言声称“已检查”不算证据；Runtime 有界提示后仍没有成功验证时强制 `needs_review`，新一批带副作用的委派会使旧验证失效并要求再次复验。
 
 ## 停止与恢复
 
-用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台进程属于 Sandbox 生命周期，不因单个 Run 完成而停止；管理器根据任务和进程登记决定空闲回收。
+用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台服务属于 Sandbox 生命周期，不因单个 Run 完成而停止；当前任务启动但尚未观察终态的有界后台进程不是“完成”，模型必须等待、明确转为独立服务，或进入可恢复的复核状态。管理器根据任务和进程登记决定空闲回收。
+
+普通 Run 只有在没有活动 todo、没有尚未观察完成的有界进程、文件变更已经聚焦验证且不存在未解决的执行承诺时才可完成。Runtime 可以有界追加模型 follow-up 要求继续执行或修正 todo；follow-up 预算耗尽不能把原来的进度陈述升级为成功。真实需要用户输入、授权或外部状态变化时应明确说明 blocker；可能已有副作用而无法确认结果时使用 `needs_review`。
 
 Runtime 没有活动任务的固定墙钟上限。无进展保护、模型轮次上限和 terminal 默认超时的精确跨层值由 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义。审批、请求体、清理和保留等其它边界由[配置参考](../reference/configuration.md)列出，并由 Runtime 配置测试校验。
 

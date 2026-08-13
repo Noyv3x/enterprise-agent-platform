@@ -11,7 +11,7 @@ function scopeTypeFor(mode: ChatMode): "private" | "channel" {
 function flattenActivity(activity: AgentStatus["activity"]): string[] {
   return (activity || []).map(
     (item) =>
-      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_call_id || ""}:${item.tool_status || ""}:${item.approval_id || ""}:${item.approval_choice || ""}:${item.emoji || ""}:${item.at}:${item.completed_at || ""}`,
+      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_call_id || ""}:${item.tool_status || ""}:${item.approval_id || ""}:${item.approval_choice || ""}:${item.emoji || ""}:${item.at}:${item.completed_at || ""}:${item.sequence || ""}:${item.updated_sequence || ""}:${item.detail_truncated_chars || ""}:${item.omitted_events || ""}:${item.omitted_tool_events || ""}`,
   );
 }
 

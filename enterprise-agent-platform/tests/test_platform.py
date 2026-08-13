@@ -145,12 +145,22 @@ class RecordingAgent:
     def cleanup_scope(self, _scope_key, *, lifecycle_id=None, delete_sessions=False):
         return {"ok": True}
 
-    def compact_session(self, scope_key, lifecycle_id, session_id):
+    def compact_session(
+        self,
+        scope_key,
+        lifecycle_id,
+        session_id,
+        *,
+        model=None,
+        reasoning_config=None,
+    ):
         self.compact_calls.append(
             {
                 "scope_key": scope_key,
                 "lifecycle_id": lifecycle_id,
                 "session_id": session_id,
+                "model": model,
+                "reasoning_config": reasoning_config,
             }
         )
         return {
@@ -255,11 +265,39 @@ class NeedsReviewAgent(RecordingAgent):
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
+        content_callback = kwargs.get("content_callback")
+        if content_callback:
+            content_callback(
+                "Validated seven records; three remain blocked.",
+                turn_id="review-turn",
+                turn_index=1,
+            )
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "tool.started",
+                    "tool": "terminal",
+                    "tool_call_id": "review-tool",
+                    "arguments": {"command": "validate-records"},
+                    "execution_started": True,
+                }
+            )
+            progress_callback(
+                {
+                    "event": "tool.completed",
+                    "tool": "terminal",
+                    "tool_call_id": "review-tool",
+                }
+            )
         raise AgentRuntimeRunError(
             "run-uncertain",
             "needs_review",
             "tool side effects may have completed",
-            partial_content="partial output must not be committed",
+            partial_content=(
+                "Validated seven records; three remain blocked.\n"
+                "MEDIA: /workspace/unreviewed.xlsx"
+            ),
             session_id=kwargs["session_id"],
             raw={"terminal_event": "run.needs_review"},
         )
@@ -1385,7 +1423,11 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(len(tools), 1)
                 self.assertEqual(tools[0]["tool"], "terminal")
                 self.assertEqual(tools[0]["tool_status"], "completed")
-                self.assertEqual(status["activity"][-1]["tool_call_id"], "tool-1")
+                approval_step = next(
+                    item for item in status["activity"] if item.get("stage") == "approval"
+                )
+                self.assertLess(tools[0]["sequence"], approval_step["sequence"])
+                self.assertGreater(tools[0]["updated_sequence"], approval_step["sequence"])
                 self.assertNotIn("super-secret", tools[0]["detail"])
                 self.assertEqual(
                     tools[0]["detail"],
@@ -1826,6 +1868,165 @@ class PlatformServiceTests(unittest.TestCase):
                 agent.release.set()
                 service.close()
 
+    def test_agent_work_timeline_preserves_long_run_order_and_updates_tools_in_place(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            task = {
+                "scope_type": "channel",
+                "scope_id": "1",
+                "user_message": {"id": 42, "content": "long run"},
+                "actor": {"id": 1, "username": "admin", "display_name": "Administrator"},
+                "content": "long run",
+            }
+            try:
+                with mock.patch(
+                    "enterprise_agent_platform.service.now_ts",
+                    return_value=1_700_000_000,
+                ):
+                    for index in range(40):
+                        service._record_agent_content_delta(
+                            "channel",
+                            "1",
+                            f"phase {index}",
+                            turn_id=f"turn-{index}",
+                            turn_index=index + 1,
+                        )
+                        service._record_agent_progress(
+                            "channel",
+                            "1",
+                            {
+                                "event": "tool.started",
+                                "tool_name": "search_files",
+                                "tool_call_id": f"tool-{index}",
+                                "arguments": {"query": f"query-{index}"},
+                            },
+                        )
+                    service._record_agent_progress(
+                        "channel",
+                        "1",
+                        {
+                            "event": "tool.completed",
+                            "tool_name": "search_files",
+                            "tool_call_id": "tool-0",
+                        },
+                    )
+                    service._record_agent_content_delta(
+                        "channel",
+                        "1",
+                        "This is the final answer and must not be copied.",
+                        turn_id="final-turn",
+                        turn_index=41,
+                    )
+                    snapshot = service._agent_work_snapshot(task, state="complete")
+
+                activity = snapshot["activity"]
+                self.assertEqual(len(activity), 80)
+                self.assertEqual(
+                    [item["sequence"] for item in activity],
+                    sorted(item["sequence"] for item in activity),
+                )
+                self.assertEqual(len({item["sequence"] for item in activity}), 80)
+                self.assertEqual(activity[0]["stage"], "assistant.message")
+                self.assertEqual(activity[0]["detail"], "phase 0")
+                self.assertEqual(activity[1]["tool_call_id"], "tool-0")
+                self.assertEqual(activity[1]["tool_status"], "completed")
+                self.assertGreater(
+                    activity[1]["updated_sequence"],
+                    activity[-1]["sequence"],
+                )
+                self.assertEqual(activity[2]["detail"], "phase 1")
+                self.assertFalse(
+                    any("final answer" in str(item.get("detail") or "") for item in activity)
+                )
+            finally:
+                service.close()
+
+    def test_agent_work_timeline_reports_entry_and_detail_truncation(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            task = {
+                "scope_type": "channel",
+                "scope_id": "1",
+                "user_message": {"id": 43, "content": "bounded run"},
+                "actor": {"id": 1, "username": "admin", "display_name": "Administrator"},
+                "content": "bounded run",
+            }
+            patches = (
+                mock.patch(
+                    "enterprise_agent_platform.service.AGENT_WORK_TIMELINE_DETAIL_MAX_CHARS",
+                    10,
+                ),
+                mock.patch(
+                    "enterprise_agent_platform.service.AGENT_WORK_TIMELINE_TOTAL_DETAIL_MAX_CHARS",
+                    12,
+                ),
+            )
+            try:
+                for patcher in patches:
+                    patcher.start()
+                with service._conversation_lock:
+                    service._agent_status["channel:1"] = service._status_for_task(
+                        task,
+                        "replying",
+                        queued_count=0,
+                    )
+                commands = ["12345678901234567890", "abcdefghij"] + [
+                    "x" for _ in range(512)
+                ]
+                for index, command in enumerate(commands):
+                    service._record_agent_progress(
+                        "channel",
+                        "1",
+                        {
+                            "event": "tool.started",
+                            "tool_name": "terminal",
+                            "tool_call_id": f"bounded-{index}",
+                            "arguments": {"command": command},
+                        },
+                    )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "terminal",
+                        "tool_call_id": "bounded-513",
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "terminal",
+                        "tool_call_id": "bounded-0",
+                    },
+                )
+                snapshot = service._agent_work_snapshot(task, state="complete")
+
+                self.assertEqual(len(snapshot["activity"]), 513)
+                first, second, *_, marker = snapshot["activity"]
+                self.assertEqual(first["detail"], "1234567890")
+                self.assertEqual(first["detail_truncated_chars"], 10)
+                self.assertEqual(second["detail"], "ab")
+                self.assertEqual(second["detail_truncated_chars"], 8)
+                self.assertEqual(marker["stage"], "work.truncated")
+                self.assertEqual(marker["omitted_events"], 2)
+                self.assertEqual(marker["omitted_tool_events"], 2)
+                self.assertEqual(
+                    len([item for item in snapshot["activity"] if item.get("stage") == "tool"]),
+                    512,
+                )
+                self.assertEqual(sum(len(item.get("detail") or "") for item in snapshot["activity"]), 12)
+                self.assertEqual(
+                    [item["sequence"] for item in snapshot["activity"]],
+                    sorted(item["sequence"] for item in snapshot["activity"]),
+                )
+            finally:
+                for patcher in reversed(patches):
+                    patcher.stop()
+                service.close()
+
     def test_stream_status_keeps_only_latest_runtime_turn_identity(self):
         with tempfile.TemporaryDirectory() as td:
             agent = TurnAwareStreamingAgent()
@@ -1865,14 +2066,31 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(agent.tool_started.wait(timeout=1))
                 status = service.agent_status(user, "channel", "1")
                 self.assertIsNone(status.get("stream_message"))
-                self.assertEqual(status["stream_messages"][-1]["content"], "Now browser_vision call.\n\n")
-                self.assertFalse(status["stream_messages"][-1]["active"])
+                self.assertEqual(status["stream_messages"], [])
+                commentary = [
+                    item
+                    for item in status["activity"]
+                    if item.get("stage") == "assistant.message"
+                ]
+                self.assertEqual(len(commentary), 1)
+                self.assertEqual(commentary[0]["detail"], "Now browser_vision call.\n\n")
                 self.assertEqual(status["activity"][-1]["tool"], "browser_vision")
 
                 agent.release_final.set()
                 service.wait_for_agent_idle("channel", "1")
                 messages = service.list_messages(user, "channel", "1")
                 self.assertEqual(messages[-1]["content"], "好了，这次成功了。")
+                work_activity = messages[-1]["metadata"]["agent_work"]["activity"]
+                self.assertEqual(
+                    [item["stage"] for item in work_activity],
+                    ["assistant.message", "tool"],
+                )
+                self.assertEqual(
+                    work_activity[0]["detail"],
+                    "Now browser_vision call.\n\n",
+                )
+                self.assertNotIn("好了，这次成功了。", work_activity[0]["detail"])
+                self.assertEqual(work_activity[1]["tool"], "browser_vision")
             finally:
                 agent.release_tool.set()
                 agent.release_final.set()
@@ -2841,6 +3059,8 @@ class PlatformServiceTests(unittest.TestCase):
                             "scope_key": private_scope.scope_key,
                             "lifecycle_id": private_scope.lifecycle_id,
                             "session_id": private_scope.session_id,
+                            "model": service.account_generation_config(admin)["model"],
+                            "reasoning_config": service.account_generation_config(admin)["reasoning_config"],
                         }
                     ],
                 )
@@ -5908,9 +6128,24 @@ class PlatformServiceTests(unittest.TestCase):
                 messages = service.audit_private_messages(user, user["id"])["messages"]
                 agent_messages = [message for message in messages if message["author_type"] == "agent"]
                 self.assertEqual(len(agent_messages), 1)
-                self.assertIn("Agent 回复失败", agent_messages[0]["content"])
+                self.assertIn("任务尚未完成", agent_messages[0]["content"])
+                self.assertIn(
+                    "Validated seven records; three remain blocked.",
+                    agent_messages[0]["content"],
+                )
+                self.assertIn("需要复核", agent_messages[0]["content"])
                 self.assertIn("needs_review", agent_messages[0]["metadata"]["error"])
-                self.assertNotIn("partial output must not be committed", agent_messages[0]["content"])
+                self.assertTrue(agent_messages[0]["metadata"]["needs_review"])
+                self.assertEqual(agent_messages[0]["attachments"], [])
+                work = agent_messages[0]["metadata"]["agent_work"]
+                self.assertEqual(work["state"], "needs_review")
+                self.assertTrue(
+                    any(
+                        item.get("stage") == "assistant.message"
+                        and "Validated seven records" in item.get("detail", "")
+                        for item in work["activity"]
+                    )
+                )
                 self.assertEqual(
                     service.jobs.counts(
                         kind="agent", scope_type="private", scope_id=str(user["id"])

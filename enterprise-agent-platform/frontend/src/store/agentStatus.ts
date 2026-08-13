@@ -1,7 +1,7 @@
 import type { AgentStatus, AgentStatuses } from "../types";
 
 const ACTIVE_STATES = new Set(["queued", "replying", "approval"]);
-const TERMINAL_STATES = new Set(["idle", "complete", "error"]);
+const TERMINAL_STATES = new Set(["idle", "complete", "error", "needs_review"]);
 
 function timestamp(value: unknown): number {
   const parsed = Number(value || 0);

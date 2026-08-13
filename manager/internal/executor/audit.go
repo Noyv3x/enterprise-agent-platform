@@ -130,7 +130,7 @@ func validateOperationAction(operation, action string) error {
 	case "terminal":
 		valid = action == "run"
 	case "process":
-		valid = action == "list" || action == "read" || action == "write" || action == "kill"
+		valid = action == "list" || action == "read" || action == "write" || action == "kill" || action == "wait"
 	case "read_file":
 		valid = action == "read"
 	case "write_file":
@@ -221,6 +221,18 @@ func validID(value string) bool {
 	}
 	for _, r := range value {
 		if !(r == '_' || r == '-' || r == '.' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validCompletionOwner(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
 			return false
 		}
 	}

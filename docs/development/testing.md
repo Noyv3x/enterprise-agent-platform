@@ -86,6 +86,16 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
+后台 task 的反刷屏回归必须证明：只要当前 session 仍有活动责任，`schedule.create` 就在 Platform 调用和审批前被机械拒绝；取得匹配 target 的权威进程终态并解除全部责任后恢复允许；显式 service 不登记责任且不被误拦。
+
+机械完成守卫的清理回归必须证明：由 todo、有限后台 task 或 recurring decision 触发的 `needs_review` 只保留责任 sidecar 精确登记且属于本 Run 的 task id，同 Run 的普通前台和未登记后台进程仍被清理；显式用户取消、idle timeout、普通异常和 sidecar 损坏不保留任何进程。Manager 重启恢复回归必须覆盖命令在停机窗口以 `0` 和非零退出、终态文件缺失/损坏/符号链接，以及仍运行/无法确认两类状态，证明只有真实 `0` 可恢复为 completed，真实非零保留 exit code，其余绝不伪成功。还必须覆盖启动意图已持久但 PID 证据尚未出现、host task 无法重接、确认后状态文件重新进入裁剪、同 owner 第 257 个 task 在启动前拒绝，以及委派 Run 在任何副作用、审批或 Manager 请求前拒绝后台进程。
+
+scope cleanup 回归必须登记真实 session task responsibility，证明 Manager/本地进程清理确认后，即使 `delete_sessions=false` 也只删除精确 scope family/lifecycle 的 `.background-tasks.json`，同时保留 journal、todo、approval 与相邻 scope/lifecycle；`delete_sessions=true` 只在同一 Manager 确认后删除整个 family。还必须覆盖 Manager 已有 pre-start intent 而 Runtime context/sidecar 均为空、Manager stop 后本地提交失败并重试、Runtime 本地提交后 acknowledge 失败并重试两处崩溃窗口，证明 Manager evidence 在本地提交前保持 pinned、内存 context 只在全部确认后删除。Manager admission 竞态必须用确定性同步点证明 fence 等待 fence 前已 admitted 的 terminal start 完成登记、拒绝 fence 期间同 family/lifecycle 的新 start、允许相邻 family 与未命中 lifecycle 启动，并让 evidence 上限预检包含所有已 admitted 后登记的 task；重叠 cleanup 必须有界拒绝，测试不能依赖 sleep 推测时序。私有 HTTP 测试必须验证 scope-only 请求的 bearer 与闭世界字段、evidence 的数量上限和字段闭世界；任一步未确认都不得报告成功或影响相邻 scope/lifecycle。
+
+Agent 自主执行回归还必须覆盖：`process.wait` 的自然成功、非零终态、超时不杀进程、取消与等待期间无 idle timeout；后台 terminal 的默认 `task`、显式 `service`、非法前台分类和闭世界 schema，并证明 task 未观察终态或 wait timeout 时阻止假完成、wait/read/kill 以匹配 target 观察 `completed|failed|cancelled` 后放行、Runtime-only 分类不进入 Manager 请求。后台 task 责任必须覆盖 needs_review 后的新 Run、新 Coordinator/Runtime 重启恢复与可信提示注入，以及 service 不落盘、session/scope cleanup 删除；独立 sidecar 的负例必须覆盖损坏 JSON、身份漂移、未知字段、符号链接、硬链接、错误 owner、非普通文件、宽松权限和原子替换失败保留旧状态。todo 的 session 隔离、原子恢复、限额、压缩后仅活动项注入和活动项阻止假完成，并证明 todo 文本即使伪造系统边界也只能作为不可信数据出现；todo、后台 task 与 recurring decision 三类机械完成守卫还必须分别断言终态仍为 `needs_review`、error 是独立明确 blocker、终态 content/Python `partial_content` 是最后一段真实诊断，并验证 Platform 以需复核样式持久化正文和真实工作记录且绝不从其中发布 `MEDIA:` 附件。语义压缩在工具历史超过摘要输入预算时仍保留最早目标/验收条件和最新用户请求，保留未完成目标、证据、文件、blocker 和下一步，摘要模型的输入与输出都清除 Token、认证头、JWT、私钥、带密码连接串、敏感配置字段和 URL 参数，同时保留普通 process/file id；同一 Run 首次自动压缩后必须继续对新增工具循环计量并支持二次及多次自动压缩，断言旧 handoff 被迭代更新而不归档或堆叠，活动 journal 始终只有一个 handoff。最终提交点前的摘要失败或客户端中断必须保持本轮压缩开始前的 journal/archive/state 完全不变并释放 session 门闩，提交点后的迟到断线则必须完成安全方向的有界提交。archive 总大小边界必须在写入任何新条目前整体拒绝，过界失败不能修改 archive 或 journal。批量委派的受限并发、输入顺序结果、leaf 默认不可递归、父取消和父复验提示，并证明父模型不能覆盖子 Agent 的可信系统提示；recurring scheduled Run 的 continue 决策保留 next、complete 决策停止计划、遗漏决策经有界提醒后进入 needs_review、once 不要求决策，以及 needs_review/blocked 在同一事务暂停计划并清空 next。current-occurrence 动作必须覆盖普通/委派/伪造 recurring 身份拒绝、重复幂等和 revision 竞态；测试不得通过自然语言匹配“已完成”或“继续”来授权计划变更。
+
+委派安全测试还必须覆盖 child 写入后父直接结束被阻止、父执行后续聚焦验证才放行、纯只读 child 不阻止、batch 任一 child 有副作用即触发复验、嵌套子 Agent 共享根树总创建预算，以及全局 admission 饱和立即拒绝且取消已启动 child 能释放名额；不能把每层独立计数或模型 metadata 当作可信预算。
+
 涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。使用亚秒真实计时器的用例只在正常 Runtime test suite 中执行一次；Quality 门不得并发重复运行它们来模拟压力，因为共享 runner 调度会把测试阈值变成伪产品语义。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
 
 ## 前端
@@ -105,7 +115,7 @@ npm run build
 - 登录、401 会话失效和账号切换取消；
 - 空数组/对象 selector 的稳定 snapshot；
 - SSE 与轮询竞态、频道切换和迟到响应；
-- 工作记录仅在工具调用时出现，最终输出时自动折叠；
+- 工作记录仅在工具调用时出现，运行中保持无折叠控件的紧凑进度行，Run 终态后自动折叠且可展开查看完整详情与持久化阶段性说明；还必须覆盖超过旧 8 段/30 条窗口的长 Run、多个事件落在同一秒时仍按单调 `sequence` 排序、同一 `tool_call_id` 完成时原位更新、阶段性说明进入时间线后不再残留于 `stream_messages` 或重复渲染完整气泡，以及条目、单项详情和总详情达到防滥用硬界后出现带准确计数的显式截断标记；
 - 审批、失败发送恢复和连续短消息；
 - 浏览器首帧加载与终端预览可用性；
 - 手机动态视口、长代码/表格和 Composer 不扩大页面；

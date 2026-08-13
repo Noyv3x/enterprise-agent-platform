@@ -1189,6 +1189,35 @@ class SkillStoreTests(unittest.TestCase):
                 self.assertIn(extension, instructions)
                 self.assertIn("verify", instructions.casefold())
 
+                description = skill["description"].casefold()
+                self.assertIn("professional", description)
+                self.assertTrue(
+                    "polished" in description or "presentation-ready" in description
+                )
+                self.assertIn("audience", instructions.casefold())
+                self.assertIn("professional", instructions.casefold())
+                self.assertIn("default", instructions.casefold())
+                self.assertRegex(
+                    instructions.casefold(),
+                    r"(contrast|readable|readability)",
+                )
+                self.assertRegex(
+                    instructions.casefold(),
+                    r"(render|pixel-level preview)",
+                )
+
+        format_contracts = {
+            "spreadsheets": ("column widths", "print"),
+            "documents": ("heading hierarchy", "image aspect ratios"),
+            "presentations": ("safe margins", "unintended overlaps"),
+            "pdf-documents": ("page boxes", "awkward pagination"),
+        }
+        for skill_id, phrases in format_contracts.items():
+            instructions = store.load("private:user-1", skill_id)["instructions"].casefold()
+            with self.subTest(skill_id=skill_id, contract="visual-quality"):
+                for phrase in phrases:
+                    self.assertIn(phrase, instructions)
+
     def test_user_skill_shadows_bundled_skill_without_upgrade_overwrite(self):
         bundled_root = Path(self.temporary.name) / "bundled"
         package = self.create_bundled_skill(

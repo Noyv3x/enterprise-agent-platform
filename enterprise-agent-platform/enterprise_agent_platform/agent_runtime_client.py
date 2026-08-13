@@ -112,6 +112,9 @@ class AgentClient(Protocol):
         scope_key: str,
         lifecycle_id: str,
         session_id: str,
+        *,
+        model: str | dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -201,6 +204,7 @@ _PROGRESS_EVENT_TYPES = frozenset(
 # silent/broken connection rather than total task duration.
 AGENT_RUNTIME_REQUEST_TIMEOUT_SECONDS = 30.0
 AGENT_RUNTIME_EVENT_IDLE_TIMEOUT_SECONDS = 60.0
+AGENT_RUNTIME_COMPACTION_TIMEOUT_SECONDS = 300.0
 _MODEL_IMAGE_BYTES = 10 * 1024 * 1024
 _MODEL_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024
 _INLINE_IMAGE_MIME_TYPES = {
@@ -549,17 +553,32 @@ class AgentRuntimeClient:
         scope_key: str,
         lifecycle_id: str,
         session_id: str,
+        *,
+        model: str | dict[str, Any] | None = None,
+        reasoning_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        model_payload = self._model_payload(model, reasoning_config, {})
+        if not model_payload:
+            raise ValueError("model is required for Agent session compaction")
         body = {
             "scope_key": self._required_id("scope_key", scope_key),
             "lifecycle_id": self._required_id("lifecycle_id", lifecycle_id),
             "session_id": self._required_id("session_id", session_id),
+            "model": model_payload,
         }
+        if self.gateway_base_url:
+            body["gateway"] = {
+                "base_url": self.gateway_base_url,
+                "token": self.gateway_token,
+            }
         result, _ = self._json_request(
             "POST",
             "/v1/sessions/compact",
             body,
-            timeout=self.request_timeout_seconds,
+            timeout=max(
+                self.request_timeout_seconds,
+                AGENT_RUNTIME_COMPACTION_TIMEOUT_SECONDS,
+            ),
             max_response_bytes=64 * 1024,
         )
         if set(result) != {
@@ -958,6 +977,17 @@ class AgentRuntimeClient:
             if event_type in _TERMINAL_EVENTS - {"run.completed"}:
                 terminal_type = event_type
                 terminal_error = _error_message(payload) or event_type
+                terminal_output = _text_from_content(
+                    payload.get("output", payload.get("content"))
+                )
+                if terminal_output:
+                    final_output = terminal_output
+                event_session = str(payload.get("session_id") or "").strip()
+                if event_session:
+                    final_session_id = event_session
+                raw_usage = payload.get("usage")
+                if isinstance(raw_usage, dict):
+                    usage = raw_usage
                 for key in ("input_message_ids", "unconsumed_input_message_ids"):
                     values = payload.get(key)
                     if isinstance(values, list):

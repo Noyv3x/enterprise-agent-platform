@@ -81,6 +81,44 @@ describe("MessageBody", () => {
     expect(screen.getByText("**still generating")).toBeTruthy();
   });
 
+  it("renders inline and block mathematics with visible KaTeX and MathML semantics", async () => {
+    const { container } = renderLocalized(
+      <MessageBody content={["Inline $E = mc^2$.", "", "$$", "\\int_0^1 x^2 \\, dx", "$$"].join("\n")} />,
+    );
+
+    const formulas = await screen.findAllByText("E = mc^2", { selector: "annotation" });
+    expect(formulas).toHaveLength(1);
+    expect(container.querySelectorAll(".katex")).toHaveLength(2);
+    expect(container.querySelectorAll(".katex-mathml math")).toHaveLength(2);
+    expect(container.querySelectorAll('.katex-html[aria-hidden="true"]')).toHaveLength(2);
+    const display = screen.getByRole("region", { name: "Mathematical formula, scroll horizontally" });
+    expect(display).toHaveClass("katex-display");
+    expect(display).toHaveAttribute("tabindex", "0");
+    expect(display.querySelector("annotation")).toHaveTextContent("\\int_0^1 x^2 \\, dx");
+  });
+
+  it("keeps malformed streaming math readable and disables trusted KaTeX links", async () => {
+    const { container } = renderLocalized(
+      <MessageBody
+        content={[
+          "Streaming $E = mc^2",
+          "",
+          "$\\href{javascript:alert(1)}{unsafe}$",
+          "",
+          "$\\includegraphics{https://example.test/tracker.png}$",
+          "",
+          "$\\notARealCommand{x}$",
+        ].join("\n")}
+      />,
+    );
+
+    expect(await screen.findByText("Streaming $E = mc^2")).toBeTruthy();
+    expect(container.querySelector('.katex a[href^="javascript:"]')).toBeNull();
+    expect(container.querySelector(".katex img")).toBeNull();
+    expect(container.querySelectorAll("annotation")).toHaveLength(3);
+    expect(container).toHaveTextContent("notARealCommand");
+  });
+
   it("copies the original full message from the message action", async () => {
     const user = userEvent.setup();
     const writeText = vi.fn().mockResolvedValue(undefined);

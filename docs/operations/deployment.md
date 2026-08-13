@@ -117,6 +117,16 @@ Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：
 
 Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回确认前必须等待匹配进程退出及其控制器完成输出、进程登记与 Sandbox 活动计数落盘。更新、reset、测试目录回收和 Sandbox 停止都不能在该屏障返回后再次收到旧 wait/watch goroutine 的迟到写入。
 
+Manager executor 还是后台进程终态的唯一权威。`process.wait` 只在完整 execution context、精确 scope、lifecycle、target 与 process id 全部匹配时等待，并使用 Runtime 策略契约规定的默认值和上下限；等待超时或调用方取消只结束本次观察，不向进程发送终止信号，也不把 `running` 或 `orphaned` 降级成完成。自然终态与重复读取必须返回同一份有界快照，供 Runtime 解除当前 session 的有限后台任务责任。
+
+Sandbox 后台命令的受管 wrapper 必须在自身退出前把真实 shell exit code 原子写入同一受管进程目录，Manager 的持久进程记录同时绑定该终态文件。Manager 重启后若发现 PID 已停止，只有读取到格式、类型和范围都合法的终态文件时才能恢复 `completed` 或带真实 exit code 的 `failed`；终态文件缺失、损坏、为符号链接或无法读取时必须恢复为不带伪造 exit code 的 `failed`（仍无法确认是否停止时保持 `orphaned`），绝不能因为进程当前不在运行就推断为成功。终态记录随对应进程记录的有界裁剪一起删除。
+
+Runtime 请求清理单个 Run 时可附带由 Runtime 自身完成守卫计算的有限后台 task id 保留集合。Manager 只接受数量和格式有界、且精确属于同一 run/scope/lifecycle、当前为受管后台进程的 id；集合中任一身份不匹配都使清理失败关闭。匹配集合以外的同 Run 进程必须正常停止并等待控制器结算。普通取消、idle timeout、scope cleanup 与部署生命周期清理没有保留集合。
+
+有限后台 task 在 Manager 中还有一个不含 session 原文的 completion owner 摘要。Manager 在进程启动前持久化 intent；Runtime 启动 Run 时以同一摘要和精确 execution context 列出尚未 acknowledge 的 task，补齐本地责任 sidecar。未 acknowledge 的 task 即使已经终止也不受普通终态 TTL/数量裁剪；Runtime 必须先把本地责任原子写成 `resolved` tombstone，再对终态 task acknowledge，Manager 确认后才能删除 tombstone。acknowledge 不接受活动进程、错误 owner、其它 scope/lifecycle/context 或任意模型参数。该持久握手只用于有限 task，前台命令和 service 不进入对账集合。
+
+completion-required task 同时支持 Sandbox 与经过逐次审批的 host target。Sandbox task 使用 PID、输出和 exit 文件跨 Manager 重启继续观察；host 子进程按 Manager service 生命周期受控，正常终态仍保存真实 exit code，但 Manager 非正常退出或重启期间遗失控制器时必须从预提交 intent 恢复为 `failed` 且 exit code 未知，再经同一 reconciliation 交给 Runtime，不能自动重启宿主命令。这样宿主批处理不会因管理器重启重复产生副作用。
+
 ## 验收
 
 安装或更新至少验证：

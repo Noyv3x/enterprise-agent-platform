@@ -1,34 +1,30 @@
-/* <AgentWorkCard/> — the collapsible Agent tool-call card.
-   Per-run open/closed memory lives in the store (expandedAgentRuns) keyed by runId:
-   active runs default open, completed runs default closed, and once the user
-   toggles, the choice persists (TOGGLE_AGENT_RUN). When the final response starts,
-   the live card collapses once so the answer can take focus; that automatic state
-   is deliberately local so a later steered turn can expand the work record again.
-   The card subscribes to ONLY its own run's flag, so a toggle re-renders just this
-   disclosure even though the parent <MessageBubble> is memoized. Ant Design's
-   controlled Collapse supplies the keyboard-operable disclosure surface.
+/* Compact Agent work history.
+   Active runs render a non-interactive gateway-style progress list. Completed
+   runs start collapsed; opening the run reveals compact rows, and each row
+   exposes its full detail only through its own disclosure. */
 
-   The step formatters are exported so <MessageList>/<MessageBubble> can decide
-   whether a run has tool-call steps without duplicating the logic. */
-
-import { useLayoutEffect, useState } from "react";
-import { Collapse } from "antd";
+import { Collapse, type CollapseProps } from "antd";
 import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
-import type { ActivityStep, AgentStatus, AgentWork } from "../../types";
+import type { ActivityStep, AgentStatus, AgentWork, IconName } from "../../types";
 import { Icon } from "../common/Icon";
+import { MessageBody } from "./MessageBody";
 
 type Work = AgentWork | AgentStatus;
+type ProcessState = "running" | "completed" | "failed";
+type ProcessKind = "tool" | "commentary" | "notice";
 
 interface ProcessLineEntry {
   key: string;
   line: string;
-  tool: string;
+  title: string;
   rawTool: string;
+  preview: string;
   detail: string;
-  state: "running" | "completed" | "failed";
+  state: ProcessState;
+  kind: ProcessKind;
 }
 
 const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
@@ -48,15 +44,31 @@ const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   delegate_task: "chat.activity.toolName.delegate_task",
 };
 
-function isAgentProcessStep(step: ActivityStep): boolean {
-  const stage = String(step?.stage || "").toLowerCase();
+function stepStage(step: ActivityStep): string {
+  return String(step?.stage || "").toLowerCase();
+}
+
+function isAgentToolStep(step: ActivityStep): boolean {
+  const stage = stepStage(step);
   return stage === "tool" || stage.startsWith("tool.");
 }
 
+function isCommentaryStep(step: ActivityStep): boolean {
+  return stepStage(step) === "assistant.message";
+}
+
+function isTruncationStep(step: ActivityStep): boolean {
+  return stepStage(step) === "work.truncated";
+}
+
+function isVisibleProcessStep(step: ActivityStep): boolean {
+  return isAgentToolStep(step) || isCommentaryStep(step) || isTruncationStep(step);
+}
+
 function isAnonymousToolNoise(step: ActivityStep): boolean {
-  const stage = String(step?.stage || "").toLowerCase();
+  if (!isAgentToolStep(step)) return false;
+  const stage = stepStage(step);
   if (stage === "tool.arguments.delta") return true;
-  if (stage !== "tool" && !stage.startsWith("tool.")) return false;
   const tool = String(step?.tool || step?.label || "").trim().toLowerCase();
   if (tool && tool !== "tool") return false;
   const detail = String(step?.detail || "").trim().toLowerCase();
@@ -64,29 +76,16 @@ function isAnonymousToolNoise(step: ActivityStep): boolean {
 }
 
 function mergeIdentity(step: ActivityStep): string {
-  const stage = String(step?.stage || "").toLowerCase();
-  if ((stage === "tool" || stage.startsWith("tool.")) && step?.tool_call_id) {
-    return `tool:${step.tool_call_id}`;
-  }
+  if (isAgentToolStep(step) && step?.tool_call_id) return `tool:${step.tool_call_id}`;
   return "";
 }
 
-function isTerminalToolStep(step: ActivityStep): boolean {
-  const stage = String(step?.stage || "").toLowerCase();
-  const status = String(step?.tool_status || "").toLowerCase();
-  return (
-    stage.endsWith("completed") ||
-    stage.endsWith("failed") ||
-    status === "completed" ||
-    status === "failed"
-  );
-}
-
-function compactAgentProcessSteps(work: Work | null | undefined): ActivityStep[] {
+function compactVisibleProcessSteps(work: Work | null | undefined): ActivityStep[] {
   const compacted: ActivityStep[] = [];
   const identityIndexes = new Map<string, number>();
+
   for (const rawStep of work?.activity || []) {
-    if (!isAgentProcessStep(rawStep) || isAnonymousToolNoise(rawStep)) continue;
+    if (!isVisibleProcessStep(rawStep) || isAnonymousToolNoise(rawStep)) continue;
     const step = { ...rawStep };
     const identity = mergeIdentity(step);
     const existingIndex = identity ? identityIndexes.get(identity) : undefined;
@@ -99,17 +98,7 @@ function compactAgentProcessSteps(work: Work | null | undefined): ActivityStep[]
         detail: step.detail || previous.detail,
         line: step.line || previous.line,
       };
-      if (identity.startsWith("tool:") && isTerminalToolStep(step)) {
-        compacted.splice(existingIndex, 1);
-        compacted.push(merged);
-        identityIndexes.clear();
-        compacted.forEach((item, index) => {
-          const itemIdentity = mergeIdentity(item);
-          if (itemIdentity) identityIndexes.set(itemIdentity, index);
-        });
-      } else {
-        compacted[existingIndex] = merged;
-      }
+      compacted[existingIndex] = merged;
       continue;
     }
     if (identity) identityIndexes.set(identity, compacted.length);
@@ -118,13 +107,17 @@ function compactAgentProcessSteps(work: Work | null | undefined): ActivityStep[]
   return compacted;
 }
 
+function compactToolSteps(work: Work | null | undefined): ActivityStep[] {
+  return compactVisibleProcessSteps(work).filter(isAgentToolStep);
+}
+
 function displayToolName(rawTool: string, translate: Translator): string {
   const key = TOOL_MESSAGE_KEYS[rawTool.toLowerCase()];
   return key ? translate(key) : rawTool;
 }
 
 function agentStepLine(step: ActivityStep, translate: Translator): string {
-  const stage = String(step?.stage || "").toLowerCase();
+  const stage = stepStage(step);
   const detail = step?.detail || "";
   const rawTool = step?.tool || step?.label || translate("chat.activity.toolFallback");
   const tool = displayToolName(rawTool, translate);
@@ -140,49 +133,90 @@ function agentStepLine(step: ActivityStep, translate: Translator): string {
   );
 }
 
-function agentStepState(step: ActivityStep): "running" | "completed" | "failed" {
-  const stage = String(step?.stage || "").toLowerCase();
+function agentStepState(step: ActivityStep): ProcessState {
+  const stage = stepStage(step);
   const status = String(step?.tool_status || "").toLowerCase();
   if (status === "failed" || stage.endsWith("failed")) return "failed";
-  if (status === "completed" || stage.endsWith("completed")) return "completed";
+  if (
+    isCommentaryStep(step) ||
+    status === "completed" ||
+    stage.endsWith("completed")
+  ) return "completed";
   return "running";
 }
 
-function agentStepStateText(
-  state: "running" | "completed" | "failed",
-  translate: Translator,
-): string {
+function agentStepStateText(state: ProcessState, translate: Translator): string {
   return translate(`chat.activity.state.${state}` as MessageKey);
 }
 
-function agentProcessLineEntries(
-  work: Work | null | undefined,
-  translate: Translator,
-): ProcessLineEntry[] {
+function oneLinePreview(value: string, maximum = 96): string {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= maximum) return compact;
+  return `${compact.slice(0, maximum - 1).trimEnd()}…`;
+}
+
+function processEntry(step: ActivityStep, index: number, translate: Translator): ProcessLineEntry | null {
+  const stage = stepStage(step);
+  const rawDetail = String(step?.detail || "").trim();
+  const omittedCharacters = Math.max(0, Number(step?.detail_truncated_chars || 0));
+  const detailNotice = omittedCharacters
+    ? translate("chat.activity.truncatedCharacters", { count: omittedCharacters })
+    : "";
+  const detail = [rawDetail, detailNotice].filter(Boolean).join("\n\n");
+  const state = agentStepState(step);
+  const identity = mergeIdentity(step);
+  const key = identity || `${stage || "step"}:${String(step?.at || index)}:${index}`;
+
+  if (isTruncationStep(step)) {
+    const omittedEvents = Math.max(1, Number(step?.omitted_events || 1));
+    const message = translate("chat.activity.truncatedEvents", { count: omittedEvents });
+    return {
+      key,
+      line: message,
+      title: translate("chat.activity.truncatedTitle"),
+      rawTool: "work.truncated",
+      preview: message,
+      detail: message,
+      state: "failed",
+      kind: "notice",
+    };
+  }
+
+  if (isCommentaryStep(step)) {
+    return {
+      key,
+      line: detail,
+      title: translate("chat.activity.agentUpdate"),
+      rawTool: "assistant.message",
+      preview: oneLinePreview(String(step?.line || detail)),
+      detail,
+      state,
+      kind: "commentary",
+    };
+  }
+  if (!isAgentToolStep(step)) return null;
+  const rawTool = String(step?.tool || step?.label || translate("chat.activity.toolFallback")).trim();
+  return {
+    key,
+    line: agentStepLine(step, translate),
+    title: displayToolName(rawTool, translate),
+    rawTool: rawTool.toLowerCase(),
+    preview: oneLinePreview(detail),
+    detail,
+    state,
+    kind: "tool",
+  };
+}
+
+function processEntries(work: Work | null | undefined, translate: Translator): ProcessLineEntry[] {
   const entries: ProcessLineEntry[] = [];
   const keyCounts = new Map<string, number>();
-  let previousLine = "";
-  let previousIdentity = "";
-  for (const [index, step] of compactAgentProcessSteps(work).entries()) {
-    const line = agentStepLine(step, translate);
-    if (!line) continue;
-    const stage = String(step?.stage || "").toLowerCase();
-    const identity = mergeIdentity(step);
-    if (line === previousLine && identity && identity === previousIdentity) continue;
-    previousLine = line;
-    previousIdentity = identity;
-    const baseKey = identity || `${stage || "step"}:${String(step?.at || index)}:${line}`;
-    const occurrence = keyCounts.get(baseKey) || 0;
-    keyCounts.set(baseKey, occurrence + 1);
-    const rawTool = String(step?.tool || step?.label || translate("chat.activity.toolFallback")).trim();
-    entries.push({
-      key: occurrence ? `${baseKey}:${occurrence}` : baseKey,
-      line,
-      tool: displayToolName(rawTool, translate),
-      rawTool: rawTool.toLowerCase(),
-      detail: String(step?.detail || "").trim(),
-      state: agentStepState(step),
-    });
+  for (const [index, step] of compactVisibleProcessSteps(work).entries()) {
+    const entry = processEntry(step, index, translate);
+    if (!entry) continue;
+    const occurrence = keyCounts.get(entry.key) || 0;
+    keyCounts.set(entry.key, occurrence + 1);
+    entries.push(occurrence ? { ...entry, key: `${entry.key}:${occurrence}` } : entry);
   }
   return entries;
 }
@@ -191,145 +225,182 @@ export function agentProcessLines(
   work: Work | null | undefined,
   translate: Translator = defaultTranslate,
 ): string[] {
-  return agentProcessLineEntries(work, translate).map((entry) => entry.line);
+  return compactToolSteps(work).map((step) => agentStepLine(step, translate));
 }
 
 export function hasAgentProcessSteps(work: Work | null | undefined): boolean {
-  return compactAgentProcessSteps(work).length > 0;
+  return compactToolSteps(work).length > 0 || (work?.activity || []).some(
+    (step) => isTruncationStep(step) && Number(step.omitted_tool_events || 0) > 0,
+  );
 }
 
 export function hasAgentBrowserStep(work: Work | null | undefined): boolean {
-  return compactAgentProcessSteps(work).some((step) =>
+  return compactToolSteps(work).some((step) =>
     String(step?.tool || step?.label || "").trim().toLowerCase() === "browser",
   );
 }
 
-function agentWorkTitle(work: Work | null | undefined, translate: Translator): string {
-  if (work?.state === "error") return translate("chat.work.failed");
-  return translate("chat.work.view");
+function entryIcon(entry: ProcessLineEntry): IconName {
+  if (entry.kind === "commentary") return "message";
+  if (entry.kind === "notice") return "alert";
+  return entry.state === "failed" ? "alert" : "checkCircle";
 }
 
-export function AgentWorkCard({
-  work,
-  active,
-  finalOutputStarted = false,
-}: {
-  work: Work;
-  active: boolean;
-  finalOutputStarted?: boolean;
-}) {
-  const dispatch = useDispatch();
+function EntryState({ entry }: { entry: ProcessLineEntry }) {
+  return (
+    <span className="agent-work__item-state" aria-hidden="true">
+      {entry.state === "running" ? <i /> : <Icon name={entryIcon(entry)} size={13} />}
+    </span>
+  );
+}
+
+function EntrySummary({ entry, expandable }: { entry: ProcessLineEntry; expandable: boolean }) {
   const { t } = useI18n();
-
-  const text = active ? agentStatusText(work, t) || t("chat.status.processing") : agentWorkTitle(work, t);
-  const queuedCount = Number(work?.queued_count || 0);
-  const waiting = active ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1)) : 0;
-  const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
-
-  // undefined means no stored preference, so active runs default open.
-  // Subscribing to the single flag keeps re-renders scoped.
-  const stored = useStore((state) => state.expandedAgentRuns[runId]);
-  const [autoCollapsed, setAutoCollapsed] = useState(finalOutputStarted);
-
-  // Collapse in a layout effect so the first response token and the collapsed
-  // disclosure are painted together. Keeping this separate from `stored` means
-  // an injected follow-up (output clears, same run continues) expands by default,
-  // while a user can still reopen the card after the one-time collapse.
-  useLayoutEffect(() => {
-    setAutoCollapsed(finalOutputStarted);
-  }, [runId, finalOutputStarted]);
-
-  const preferredExpanded = stored === undefined ? active : stored;
-  const expanded = !autoCollapsed && preferredExpanded;
-
-  const processEntries = agentProcessLineEntries(work, t);
-  const currentEntry = active
-    ? [...processEntries].reverse().find((entry) => entry.state === "running")
-    : undefined;
-  const current = active && currentEntry
-    ? t("chat.activity.currentTool", {
-        tool: currentEntry.tool,
-        status: agentStepStateText(currentEntry.state, t),
-      })
-    : active
-      ? t("chat.status.processing")
-      : t("chat.work.completed");
-
-  const onToggle = (keys: string | string[]) => {
-    const nextExpanded = (Array.isArray(keys) ? keys : [keys]).includes("process");
-    if (nextExpanded && autoCollapsed) setAutoCollapsed(false);
-    dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: nextExpanded } });
-  };
-
-  const header = (
-    <div className="agent-work__summary">
-        {active ? (
-          <span className="agent-work__live" aria-hidden="true"><i /></span>
-        ) : (
-          <span className={cx("agent-work__done", work?.state === "error" && "agent-work__done--failed")}>
-            <Icon name={work?.state === "error" ? "alert" : "checkCircle"} size={15} />
-          </span>
-        )}
-        <div className="agent-work__main">
-          <span className="agent-work__title">{text}</span>
-          <span className="agent-work__step" role="status" aria-live="polite" aria-atomic="true">
-            {active ? current : t("chat.work.records", { count: processEntries.length })}
-          </span>
-        </div>
-        {waiting > 0 ? (
-          <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
-        ) : null}
-        <span className="agent-work__chevron" aria-hidden="true" />
+  return (
+    <div className="agent-work__item-summary">
+      <EntryState entry={entry} />
+      <span className="agent-work__tool">{entry.title}</span>
+      {entry.preview ? <span className="agent-work__preview">{entry.preview}</span> : null}
+      <span className="agent-work__item-label">{agentStepStateText(entry.state, t)}</span>
+      {expandable ? <span className="agent-work__entry-chevron" aria-hidden="true" /> : null}
     </div>
   );
-  const log = processEntries.length ? (
-    <div className="agent-work__log" role="list">
-      {processEntries.map((entry) => (
+}
+
+function EntryDetail({ entry }: { entry: ProcessLineEntry }) {
+  const { t } = useI18n();
+  if (!entry.detail) return null;
+  if (entry.kind === "commentary") {
+    return <div className="agent-work__commentary"><MessageBody content={entry.detail} /></div>;
+  }
+  if (entry.rawTool === "terminal") {
+    return (
+      <div className="agent-work__command">
+        <span className="agent-work__prompt" aria-hidden="true">$</span>
+        <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{entry.detail}</code></pre>
+      </div>
+    );
+  }
+  return <div className="agent-work__detail">{entry.detail}</div>;
+}
+
+function ActiveProcessList({ entries }: { entries: ProcessLineEntry[] }) {
+  return (
+    <div className="agent-work__log agent-work__log--live" role="list">
+      {entries.map((entry) => (
         <div
           className={cx("agent-work__item", `agent-work__item--${entry.state}`)}
           data-tool={entry.rawTool}
           key={entry.key}
           role="listitem"
         >
-          <span className="agent-work__item-state" aria-hidden="true">
-            {entry.state === "running" ? (
-              <i />
-            ) : (
-              <Icon name={entry.state === "failed" ? "alert" : "checkCircle"} size={14} />
-            )}
-          </span>
-          <div className="agent-work__item-main">
-            <div className="agent-work__item-head">
-              <span className="agent-work__tool">{entry.tool}</span>
-              <span className="agent-work__item-label">
-                {agentStepStateText(entry.state, t)}
-              </span>
-            </div>
-            {entry.detail ? (
-              entry.rawTool === "terminal" ? (
-                <div className="agent-work__command">
-                  <span className="agent-work__prompt" aria-hidden="true">$</span>
-                  <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}>
-                    <code>{entry.detail}</code>
-                  </pre>
-                </div>
-              ) : (
-                <div className="agent-work__detail">{entry.detail}</div>
-              )
-            ) : null}
-          </div>
+          <EntrySummary entry={entry} expandable={false} />
         </div>
       ))}
     </div>
-  ) : null;
+  );
+}
 
+function CompletedProcessList({ entries }: { entries: ProcessLineEntry[] }) {
+  const items: CollapseProps["items"] = entries.map((entry) => ({
+    key: entry.key,
+    label: <EntrySummary entry={entry} expandable={!!entry.detail} />,
+    children: <EntryDetail entry={entry} />,
+    collapsible: entry.detail ? "header" : "disabled",
+    showArrow: false,
+    className: cx("agent-work__item", `agent-work__item--${entry.state}`),
+  }));
   return (
     <Collapse
-      className={cx(
-        "agent-work",
-        active ? "agent-work--active" : "agent-work--complete",
-        expanded && "agent-work--expanded",
+      className="agent-work__log agent-work__entry-list"
+      bordered={false}
+      ghost
+      classNames={{
+        header: "agent-work__entry-header",
+        title: "agent-work__entry-title",
+        body: "agent-work__entry-body",
+      }}
+      items={items}
+    />
+  );
+}
+
+function WorkSummary({
+  work,
+  active,
+  entries,
+  expanded = false,
+}: {
+  work: Work;
+  active: boolean;
+  entries: ProcessLineEntry[];
+  expanded?: boolean;
+}) {
+  const { t } = useI18n();
+  const warning = work?.state === "error" || work?.state === "needs_review";
+  const text = active
+    ? agentStatusText(work, t) || t("chat.status.processing")
+    : warning ? t("chat.work.failed") : t("chat.work.view");
+  const currentEntry = active
+    ? [...entries].reverse().find((entry) => entry.state === "running")
+    : undefined;
+  const status = active && currentEntry
+    ? t("chat.activity.currentTool", {
+        tool: currentEntry.title,
+        status: agentStepStateText(currentEntry.state, t),
+      })
+    : active ? t("chat.status.processing") : t("chat.work.records", { count: entries.length });
+  const queuedCount = Number(work?.queued_count || 0);
+  const waiting = active
+    ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1))
+    : 0;
+
+  return (
+    <div className="agent-work__summary">
+      {active ? (
+        <span className="agent-work__live" aria-hidden="true"><i /></span>
+      ) : (
+        <span className={cx("agent-work__done", warning && "agent-work__done--failed")}>
+          <Icon name={warning ? "alert" : "checkCircle"} size={14} />
+        </span>
       )}
+      <div className="agent-work__main">
+        <span className="agent-work__title">{text}</span>
+        <span className="agent-work__step" role="status" aria-live="polite" aria-atomic="true">
+          {status}
+        </span>
+      </div>
+      {waiting > 0 ? (
+        <span className="agent-status__queue">{t("chat.work.waitingCount", { count: waiting })}</span>
+      ) : null}
+      {!active ? <span className={cx("agent-work__chevron", expanded && "is-open")} aria-hidden="true" /> : null}
+    </div>
+  );
+}
+
+export function AgentWorkCard({ work, active }: { work: Work; active: boolean }) {
+  const dispatch = useDispatch();
+  const { t } = useI18n();
+  const entries = processEntries(work, t);
+  const runId = work?.run_id || `${work?.scope_type || "agent"}:${work?.scope_id || ""}:${work?.started_at || ""}`;
+  const expanded = useStore((state) => state.expandedAgentRuns[runId] === true);
+
+  if (active) {
+    return (
+      <div className="agent-work agent-work--active">
+        <WorkSummary work={work} active entries={entries} />
+        <ActiveProcessList entries={entries} />
+      </div>
+    );
+  }
+
+  const onToggle = (keys: string | string[]) => {
+    const nextExpanded = (Array.isArray(keys) ? keys : [keys]).includes("process");
+    dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: nextExpanded } });
+  };
+  return (
+    <Collapse
+      className={cx("agent-work", "agent-work--complete", expanded && "agent-work--expanded")}
       activeKey={expanded ? ["process"] : []}
       bordered={false}
       ghost
@@ -341,8 +412,8 @@ export function AgentWorkCard({
       onChange={onToggle}
       items={[{
         key: "process",
-        label: header,
-        children: log,
+        label: <WorkSummary work={work} active={false} entries={entries} expanded={expanded} />,
+        children: <CompletedProcessList entries={entries} />,
         showArrow: false,
       }]}
     />

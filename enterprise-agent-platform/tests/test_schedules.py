@@ -6,11 +6,12 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from enterprise_agent_platform.agent_runtime_client import AgentResult
+from enterprise_agent_platform.agent_runtime_client import AgentResult, AgentRuntimeRunError
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.schedules import next_occurrence, normalize_schedule
 from enterprise_agent_platform.server import serve_in_thread
@@ -102,6 +103,18 @@ class BlockThenFailAgent(RecordingAgent):
             }
         )
         raise RuntimeError("generation failed after blocked tool")
+
+
+class NeedsReviewAgent(RecordingAgent):
+    def generate(self, **kwargs):
+        self.calls.append(kwargs)
+        raise AgentRuntimeRunError(
+            "scheduled-review-run",
+            "needs_review",
+            "recurring occurrence omitted its required decision",
+            session_id=kwargs["session_id"],
+            raw={"terminal_event": "run.needs_review"},
+        )
 
 
 class ScheduleTimeTests(unittest.TestCase):
@@ -212,6 +225,31 @@ class ScheduleServiceTests(unittest.TestCase):
             }
         )["data"]["schedule"]
 
+    @staticmethod
+    def _complete_current_context(
+        service: EnterpriseService,
+        actor: dict,
+        schedule_id: int,
+        schedule_run_id: int,
+        **overrides,
+    ) -> dict:
+        scope = service.agent_scopes.get_private_scope(int(actor["id"]))
+        run = service.schedules.get_run(schedule_run_id)
+        assert scope is not None
+        assert run is not None
+        return {
+            "scope_key": scope.scope_key,
+            "lifecycle_id": scope.lifecycle_id,
+            "owner_user_id": int(actor["id"]),
+            "source_message_id": int(run["source_message_id"]),
+            "trigger": "scheduled",
+            "unattended": True,
+            "schedule_id": str(schedule_id),
+            "schedule_run_id": str(schedule_run_id),
+            "schedule_recurring": True,
+            **overrides,
+        }
+
     def test_run_now_reuses_private_agent_with_exact_metadata_contract(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -239,6 +277,7 @@ class ScheduleServiceTests(unittest.TestCase):
                 self.assertIs(call["metadata"]["unattended"], True)
                 self.assertEqual(call["metadata"]["schedule_id"], str(schedule["id"]))
                 self.assertEqual(call["metadata"]["schedule_run_id"], str(run["id"]))
+                self.assertIs(call["metadata"]["schedule_recurring"], True)
                 self.assertTrue(call["metadata"]["scheduled_for"].endswith("Z"))
 
                 service.run_private_schedule_now(admin, schedule["id"])
@@ -249,6 +288,290 @@ class ScheduleServiceTests(unittest.TestCase):
                 first_report = next(item for item in seeded if item["content"] == "scheduled report")
                 self.assertEqual(first_report["role"], "assistant")
             finally:
+                service.close()
+
+    def test_scheduled_run_can_atomically_complete_only_its_current_schedule(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                initial = service.schedules.get(admin["id"], schedule["id"])
+                accepted = service._materialize_schedule_occurrence(
+                    schedule["id"],
+                    scheduled_for=int(initial["next_run_at"]),
+                    trigger="scheduled",
+                    expected_revision=int(initial["revision"]),
+                )
+                run_id = int(accepted["run"]["id"])
+                self.assertTrue(agent.started.wait(timeout=2))
+                active = service.schedules.get(admin["id"], schedule["id"])
+                stale_next_run_at = int(active["next_run_at"])
+                stale_revision = int(active["revision"])
+                context = self._complete_current_context(
+                    service,
+                    admin,
+                    schedule["id"],
+                    run_id,
+                )
+
+                with self.assertRaises(ServiceError) as wrong_owner:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": {**context, "owner_user_id": admin["id"] + 1},
+                        }
+                    )
+                self.assertEqual(wrong_owner.exception.status, 403)
+
+                first = service.invoke_agent_runtime_tool(
+                    {
+                        "tool": "schedule",
+                        "action": "complete_current",
+                        "arguments": {},
+                        "context": context,
+                    }
+                )["data"]
+                self.assertTrue(first["completed"])
+                self.assertFalse(first["already_completed"])
+                completed = service.schedules.get(admin["id"], schedule["id"])
+                self.assertEqual(completed["state"], "completed")
+                self.assertEqual(completed["enabled"], 0)
+                self.assertIsNone(completed["next_run_at"])
+                self.assertEqual(completed["revision"], stale_revision + 1)
+
+                duplicate = service.invoke_agent_runtime_tool(
+                    {
+                        "tool": "schedule",
+                        "action": "complete_current",
+                        "arguments": {},
+                        "context": context,
+                    }
+                )["data"]
+                self.assertTrue(duplicate["already_completed"])
+                self.assertEqual(
+                    service.schedules.get(admin["id"], schedule["id"])["revision"],
+                    completed["revision"],
+                )
+
+                run_count = service.db.scalar(
+                    "SELECT COUNT(*) FROM agent_schedule_runs WHERE schedule_id = ?",
+                    (schedule["id"],),
+                )
+                with self.assertRaises(ServiceError) as stale_dispatch:
+                    service._materialize_schedule_occurrence(
+                        schedule["id"],
+                        scheduled_for=stale_next_run_at,
+                        trigger="scheduled",
+                        expected_revision=stale_revision,
+                    )
+                self.assertEqual(stale_dispatch.exception.status, 409)
+                self.assertEqual(
+                    service.db.scalar(
+                        "SELECT COUNT(*) FROM agent_schedule_runs WHERE schedule_id = ?",
+                        (schedule["id"],),
+                    ),
+                    run_count,
+                )
+
+                agent.release.set()
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=5)
+                with self.assertRaises(ServiceError) as expired:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": context,
+                        }
+                    )
+                self.assertEqual(expired.exception.status, 409)
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_continue_current_is_repeatable_and_does_not_modify_the_schedule(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                initial = service.schedules.get(admin["id"], schedule["id"])
+                accepted = service._materialize_schedule_occurrence(
+                    schedule["id"],
+                    scheduled_for=int(initial["next_run_at"]),
+                    trigger="scheduled",
+                    expected_revision=int(initial["revision"]),
+                )
+                run_id = int(accepted["run"]["id"])
+                self.assertTrue(agent.started.wait(timeout=2))
+                context = self._complete_current_context(
+                    service,
+                    admin,
+                    schedule["id"],
+                    run_id,
+                )
+                before = service.schedules.get(admin["id"], schedule["id"])
+
+                def decide() -> dict:
+                    return service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "continue_current",
+                            "arguments": {},
+                            "context": context,
+                        }
+                    )["data"]
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(lambda _: decide(), range(2)))
+                self.assertTrue(all(result["continued"] for result in results))
+                after = service.schedules.get(admin["id"], schedule["id"])
+                self.assertEqual(after["state"], "active")
+                self.assertEqual(after["enabled"], 1)
+                self.assertEqual(after["revision"], before["revision"])
+                self.assertEqual(after["next_run_at"], before["next_run_at"])
+            finally:
+                agent.release.set()
+                service.close()
+
+    def test_complete_current_rejects_arguments_and_non_scheduled_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                scope = service.agent_scopes.get_private_scope(admin["id"])
+                self.assertIsNotNone(scope)
+                with self.assertRaises(ServiceError) as arguments_error:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {"schedule_id": schedule["id"]},
+                            "context": {"scope_key": scope.scope_key},
+                        }
+                    )
+                self.assertEqual(arguments_error.exception.status, 400)
+                with self.assertRaises(ServiceError) as non_object_arguments:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": [],
+                            "context": {"scope_key": scope.scope_key},
+                        }
+                    )
+                self.assertEqual(non_object_arguments.exception.status, 400)
+                with self.assertRaises(ServiceError) as ordinary_run:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": {
+                                "scope_key": scope.scope_key,
+                                "lifecycle_id": scope.lifecycle_id,
+                                "owner_user_id": admin["id"],
+                                "trigger": "interactive",
+                                "unattended": False,
+                            },
+                        }
+                    )
+                self.assertEqual(ordinary_run.exception.status, 403)
+                with self.assertRaises(ServiceError) as missing_identity:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": {
+                                "scope_key": scope.scope_key,
+                                "lifecycle_id": scope.lifecycle_id,
+                                "owner_user_id": admin["id"],
+                                "trigger": "scheduled",
+                                "unattended": True,
+                            },
+                        }
+                    )
+                self.assertEqual(missing_identity.exception.status, 403)
+                with self.assertRaises(ServiceError) as once_identity:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "continue_current",
+                            "arguments": {},
+                            "context": {
+                                "scope_key": scope.scope_key,
+                                "lifecycle_id": scope.lifecycle_id,
+                                "owner_user_id": admin["id"],
+                                "trigger": "scheduled",
+                                "unattended": True,
+                                "schedule_recurring": False,
+                            },
+                        }
+                    )
+                self.assertEqual(once_identity.exception.status, 403)
+            finally:
+                service.close()
+
+    def test_complete_current_rejects_changed_revision_and_mismatched_job(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = BlockingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                accepted = service.run_private_schedule_now(admin, schedule["id"])
+                run_id = int(accepted["run"]["id"])
+                self.assertTrue(agent.started.wait(timeout=2))
+                context = self._complete_current_context(
+                    service,
+                    admin,
+                    schedule["id"],
+                    run_id,
+                )
+                run = service.schedules.get_run(run_id)
+                job = service.jobs.get(int(run["durable_job_id"]))
+                service.db.execute(
+                    "UPDATE durable_jobs SET scope_id = ? WHERE id = ?",
+                    (str(admin["id"] + 1), job.id),
+                )
+                with self.assertRaises(ServiceError) as mismatched_job:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": context,
+                        }
+                    )
+                self.assertEqual(mismatched_job.exception.status, 409)
+
+                service.db.execute(
+                    "UPDATE durable_jobs SET scope_id = ? WHERE id = ?",
+                    (str(admin["id"]), job.id),
+                )
+                service.pause_private_schedule(admin, schedule["id"])
+                with self.assertRaises(ServiceError) as changed_revision:
+                    service.invoke_agent_runtime_tool(
+                        {
+                            "tool": "schedule",
+                            "action": "complete_current",
+                            "arguments": {},
+                            "context": context,
+                        }
+                    )
+                self.assertEqual(changed_revision.exception.status, 409)
+                current = service.schedules.get(admin["id"], schedule["id"])
+                self.assertEqual(current["state"], "paused")
+                self.assertEqual(current["enabled"], 0)
+            finally:
+                agent.release.set()
                 service.close()
 
     def test_private_prompt_has_deterministic_utc_clock_and_user_timezone(self):
@@ -323,6 +646,11 @@ class ScheduleServiceTests(unittest.TestCase):
                 run = service.private_schedule_runs(admin, schedule["id"])["runs"][0]
                 self.assertEqual(run["status"], "blocked")
                 self.assertIn("terminal command needs approval", run["error"])
+                paused = service.schedules.get(admin["id"], schedule["id"])
+                self.assertEqual(paused["state"], "paused")
+                self.assertEqual(paused["enabled"], 0)
+                self.assertIsNone(paused["next_run_at"])
+                paused_revision = paused["revision"]
                 response = service.db.query_one(
                     "SELECT content FROM messages WHERE id = ?",
                     (run["response_message_id"],),
@@ -344,6 +672,47 @@ class ScheduleServiceTests(unittest.TestCase):
                 self.assertEqual(restored["status"], "blocked")
                 self.assertEqual(restored["response_message_id"], run["response_message_id"])
                 self.assertIn("terminal command needs approval", restored["error"])
+                self.assertEqual(
+                    service.schedules.get(admin["id"], schedule["id"])["revision"],
+                    paused_revision,
+                )
+            finally:
+                service.close()
+
+    def test_needs_review_atomically_pauses_recurring_schedule_and_clears_next_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=NeedsReviewAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                due = int(time.time()) - 1
+                service.db.execute(
+                    "UPDATE agent_schedules SET next_run_at = ? WHERE id = ?",
+                    (due, schedule["id"]),
+                )
+                self.assertEqual(service._dispatch_due_schedules(timestamp=int(time.time())), 1)
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=5)
+
+                run = service.schedules.latest_run(schedule["id"])
+                self.assertEqual(run["status"], "needs_review")
+                paused = service.schedules.get(admin["id"], schedule["id"])
+                self.assertEqual(paused["state"], "paused")
+                self.assertEqual(paused["enabled"], 0)
+                self.assertIsNone(paused["next_run_at"])
+                self.assertEqual(service.schedules.due(int(time.time()) + 10_000), [])
+
+                revision = paused["revision"]
+                self.assertFalse(
+                    service.schedules.update_run_status_and_pause_current_schedule(
+                        run["id"],
+                        "needs_review",
+                        error="duplicate recovery",
+                    )
+                )
+                self.assertEqual(
+                    service.schedules.get(admin["id"], schedule["id"])["revision"],
+                    revision,
+                )
             finally:
                 service.close()
 
@@ -942,6 +1311,7 @@ class ScheduleServiceTests(unittest.TestCase):
                 self.assertIsNotNone(run["durable_job_id"])
                 self.assertEqual(run["status"], "succeeded")
                 self.assertEqual(len(agent.calls), 1)
+                self.assertIs(agent.calls[0]["metadata"]["schedule_recurring"], True)
             finally:
                 recovered.close()
 

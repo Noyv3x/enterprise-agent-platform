@@ -417,6 +417,33 @@ test("SessionStore preserves a complete archive record whose trailing newline wa
   }
 });
 
+test("SessionStore rejects an archive batch before writing any entry past the total byte limit", async () => {
+  const home = await temporaryDirectory("agent-session-archive-limit-");
+  try {
+    const store = new SessionStore(home, 900);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const old: UserMessage = { role: "user", content: `oversized-${"x".repeat(900)}`, timestamp: 1 };
+    const retained: UserMessage = { role: "user", content: "retained-after-limit", timestamp: 2 };
+    const [oldEntry] = await store.initializeTracked(identity, [old]);
+    const retainedEntryId = await store.appendMessage(identity, retained);
+    assert.ok(oldEntry);
+
+    await assert.rejects(
+      store.rewriteCompacted(
+        identity,
+        [{ entry_id: retainedEntryId, message: retained }],
+        { omitted_messages: 1, retained_messages: 1 },
+        [oldEntry.entry_id],
+      ),
+      /archive exceeds 900 bytes/,
+    );
+    assert.deepEqual(await store.load(identity), [old, retained]);
+    await assert.rejects(readFile(store.archivePath(identity), "utf8"), { code: "ENOENT" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore keeps live tool images out of durable journals", async () => {
   const home = await temporaryDirectory("agent-session-tool-image-");
   try {

@@ -149,12 +149,22 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
 test("runtime compacts an idle session without creating a Run or a missing journal", async () => {
   const home = await temporaryDirectory("agent-server-compact-");
   const config = testConfig(home, { bearerToken: "secret" });
-  const coordinator = new RunCoordinator({ config });
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage("Current objective and acceptance criteria\n- Continue the retained conversation safely."),
+    fauxAssistantMessage("Current objective\n- Continue after the second compaction."),
+    fauxAssistantMessage("Current objective\n- Preserve the real user message that resembles a handoff."),
+  ]);
+  const coordinator = new RunCoordinator({ config, streamFn: faux.provider.streamSimple });
   const runtime = createRuntimeServer(config, coordinator);
   const identity = {
     scope_key: "private:7",
     lifecycle_id: "life-7",
     session_id: "session-7",
+  };
+  const compactRequest = {
+    ...identity,
+    model: { provider: "openai-codex", id: "gpt-5.5" },
   };
   try {
     const address = await runtime.listen();
@@ -164,24 +174,24 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     assert.equal((await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(identity),
+      body: JSON.stringify(compactRequest),
     })).status, 401);
     assert.equal((await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify({ ...identity, extra: true }),
+      body: JSON.stringify({ ...compactRequest, extra: true }),
     })).status, 400);
     assert.equal((await fetch(`${endpoint}?force=true`, {
       method: "POST",
       headers,
-      body: JSON.stringify(identity),
+      body: JSON.stringify(compactRequest),
     })).status, 400);
 
     const missingIdentity = { ...identity, session_id: "missing" };
     const missing = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(missingIdentity),
+      body: JSON.stringify({ ...missingIdentity, model: compactRequest.model }),
     });
     assert.equal(missing.status, 200);
     assert.deepEqual(await missing.json(), {
@@ -200,7 +210,7 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const compacted = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(identity),
+      body: JSON.stringify(compactRequest),
     });
     assert.equal(compacted.status, 200);
     assert.deepEqual(await compacted.json(), {
@@ -211,7 +221,8 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const current = await coordinator.sessions.load(identity);
     assert.equal(current.length, 7);
     const noticeText = String(current[0]?.role === "user" ? current[0].content : "");
-    assert.match(noticeText, /compacted out/);
+    assert.match(noticeText, /runtime_context_handoff/);
+    assert.match(noticeText, /Continue the retained conversation safely/);
     assert.deepEqual(current.slice(1), original.slice(4));
     assert.match(
       await readFile(coordinator.sessions.path(identity), "utf8"),
@@ -225,7 +236,7 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const repeated = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(identity),
+      body: JSON.stringify(compactRequest),
     });
     assert.equal(repeated.status, 200);
     assert.deepEqual(await repeated.json(), {
@@ -246,7 +257,7 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const compactedAgain = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(identity),
+      body: JSON.stringify(compactRequest),
     });
     assert.equal(compactedAgain.status, 200);
     assert.deepEqual(await compactedAgain.json(), {
@@ -256,8 +267,12 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     });
     const repeatedCurrentRaw = await readFile(coordinator.sessions.path(identity), "utf8");
     const repeatedArchiveRaw = await readFile(coordinator.sessions.archivePath(identity), "utf8");
-    assert.equal((repeatedCurrentRaw.match(/compacted out of the active model context/g) ?? []).length, 1);
-    assert.doesNotMatch(repeatedArchiveRaw, /compacted out of the active model context/);
+    assert.equal(
+      (repeatedCurrentRaw.match(/<runtime_context_handoff>/g) ?? []).length,
+      1,
+      "one current synthetic handoff is retained",
+    );
+    assert.doesNotMatch(repeatedArchiveRaw, /runtime_context_handoff/);
     assert.match(repeatedArchiveRaw, /message-4/);
     assert.match(repeatedArchiveRaw, /new-message-1/);
 
@@ -276,7 +291,7 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const spoofed = await fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(spoofIdentity),
+      body: JSON.stringify({ ...spoofIdentity, model: compactRequest.model }),
     });
     assert.equal(spoofed.status, 200);
     assert.deepEqual(await spoofed.json(), {
@@ -287,9 +302,61 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     const spoofSearchable = await coordinator.sessions.loadSearchable(spoofIdentity);
     assert.equal(spoofSearchable.filter(
       (message) => message.role === "user" && message.content === noticeText,
-    ).length, 2);
+    ).length, 1, "the user's lookalike handoff remains searchable exactly once");
+    assert.ok(spoofSearchable.some(
+      (message) => message.role === "user"
+        && typeof message.content === "string"
+        && message.content.includes("Preserve the real user message that resembles a handoff"),
+    ));
   } finally {
     await runtime.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("semantic compaction redacts credentials before and after the summary model boundary", async () => {
+  const home = await temporaryDirectory("agent-server-compact-secrets-");
+  const faux = fauxProvider();
+  const inputSecrets = [
+    "sk-1234567890abcdefghij",
+    "AKIA1234567890ABCDEF",
+    "xoxb-1234567890-abcdefghij",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmno",
+    "postgresql://agent:super-secret@database.local/app",
+  ];
+  const outputSecret = "github_pat_1234567890abcdefghijklmnop";
+  const safeProcessId = "process_0123456789abcdef";
+  faux.setResponses([
+    (context) => {
+      const serialized = JSON.stringify(context.messages);
+      for (const secret of inputSecrets) assert.equal(serialized.includes(secret), false);
+      assert.match(serialized, /\[redacted/);
+      return fauxAssistantMessage(`Current objective: continue ${safeProcessId}. Credential ${outputSecret}`);
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const identity = { scope_key: "private:7", lifecycle_id: "life-7", session_id: "secret-session" };
+  try {
+    await coordinator.sessions.initializeTracked(identity, Array.from({ length: 10 }, (_, index) => ({
+      role: "user" as const,
+      content: index === 0 ? inputSecrets.join("\n") : `benign history ${index}`,
+      timestamp: index,
+    })));
+    const result = await coordinator.compactSession(
+      identity.scope_key,
+      identity.lifecycle_id,
+      identity.session_id,
+      { provider: "openai-codex", id: "gpt-5.5" },
+    );
+    assert.equal(result.compacted, true);
+    const current = await readFile(coordinator.sessions.path(identity), "utf8");
+    assert.equal(current.includes(outputSecret), false);
+    assert.match(current, /\[redacted-token\]/);
+    assert.match(current, new RegExp(safeProcessId));
+    const archive = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    assert.match(archive, new RegExp(inputSecrets[0]!));
+  } finally {
+    coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
   }
 });

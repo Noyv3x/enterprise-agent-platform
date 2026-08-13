@@ -73,7 +73,7 @@ Platform 对 Embeddings 请求使用有界 connect/read/body 预算，禁止带 
 
 Skill 采用 Hermes 风格的“索引后按需读取”机制：正常 Run 只收到有界元数据索引，必须显式 `load`/`read` 才能取得正文或附件。后台学习复盘可以创建新的私有 Skill，也可以在同一次复盘中先读取、再精确替换自己此前创建的 Skill；它不得自动改写用户创建、用户置顶、已归档、已停用或仓库预置的 Skill，也不得删除或停用任何 Skill。`.skill-usage.json` 是 owner-only 的可信来源，记录 `user/agent` 来源、状态、置顶、使用与修补计数；缺失或旧记录一律按用户所有处理并失败关闭。所有自动写入在最终文件系统提交前重新核验私人 scope、lifecycle、活动账户、运行中的复盘 job 和持久变更预算，并重复执行提示词注入、凭据与大小检查。
 
-仓库预置 spreadsheet、document、presentation 和 PDF 文件产出 Skill。它们面向“制作表格/报告/演示稿/PDF”等明确交付意图主动触发，使用 Sandbox 预装的受控文档生成库，在 `/workspace` 产出可下载文件并通过 `MEDIA: /workspace/<relative-path>` 交还 Platform。Runtime 自动追加文件复验时，只在成功复验已经清除相关变更后把此前的规范交付标记保留到终态结果；Platform 再按当前 scope 映射、校验并保存附件。预置说明不得要求临时联网安装任意包、调用外部文档转换服务或把 Markdown 当作默认成品；用户明确要求其它格式或只要聊天内小表格时才采用相应结果。
+仓库预置 spreadsheet、document、presentation 和 PDF 文件产出 Skill。它们面向“制作表格/报告/演示稿/PDF”等明确交付意图主动触发，使用 Sandbox 预装的受控文档生成库，在 `/workspace` 产出可下载文件并通过 `MEDIA: /workspace/<relative-path>` 交还 Platform。默认目标不是“勉强生成一个能打开的文件”，而是无需用户再次排版即可直接交付的成品：先判断受众与用途，再采用一致的视觉层级、克制配色、清晰留白与对齐、适合内容密度的版式，并兼顾可读性、无障碍与后续编辑；缺少品牌规范时使用中性专业主题，已有品牌或模板时遵循用户材料而不擅自改色。每类 Skill 还必须执行格式专属的布局与内容复验，避免截断、越界、不可读字号、拥挤表格、失真图片和装饰性噪声。Runtime 自动追加文件复验时，只在成功复验已经清除相关变更后把此前的规范交付标记保留到终态结果；Platform 再按当前 scope 映射、校验并保存附件。预置说明不得要求临时联网安装任意包、调用外部文档转换服务或把 Markdown 当作默认成品；用户明确要求其它格式或只要聊天内小表格时才采用相应结果。
 
 ## Sylver Lining 工作平台
 

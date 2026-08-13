@@ -60,7 +60,10 @@ test("compaction archives the exact durable entries when recovery removes an orp
   const home = await temporaryDirectory("agent-session-orphan-compaction-");
   const workspace = await temporaryDirectory("agent-session-orphan-compaction-workspace-");
   const faux = fauxProvider();
-  faux.setResponses([async () => fauxAssistantMessage("compaction completed safely")]);
+  faux.setResponses([
+    async () => fauxAssistantMessage("Current objective\n- Continue after repairing the interrupted history."),
+    async () => fauxAssistantMessage("compaction completed safely"),
+  ]);
   const coordinator = new RunCoordinator({
     config: testConfig(home, { compactionThreshold: 0.000001 }),
     streamFn: faux.provider.streamSimple,

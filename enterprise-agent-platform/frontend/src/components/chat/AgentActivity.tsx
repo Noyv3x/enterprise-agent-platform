@@ -10,10 +10,8 @@ import { AgentWorkCard, hasAgentBrowserStep } from "./AgentWorkCard";
 
 export function AgentActivity({
   status,
-  finalOutputStarted = false,
 }: {
   status: AgentStatus;
-  finalOutputStarted?: boolean;
 }) {
   const preview = useChatPreviewContext();
   const showBrowserPreview = Boolean(
@@ -28,11 +26,7 @@ export function AgentActivity({
         <Icon name="bot" size={18} />
       </div>
       <div className={cx("agent-activity__content", showBrowserPreview && "has-browser-preview")}>
-        <AgentWorkCard
-          work={status}
-          active={true}
-          finalOutputStarted={finalOutputStarted}
-        />
+        <AgentWorkCard work={status} active={true} />
         {showBrowserPreview && preview?.scope ? (
           <BrowserWorkPreview
             scope={preview.scope}

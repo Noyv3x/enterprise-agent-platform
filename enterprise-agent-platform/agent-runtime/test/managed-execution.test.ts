@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { loadConfig } from "../src/config.js";
+import { PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS } from "../src/design-contract.generated.js";
 import { ManagerExecutorClient } from "../src/executor.js";
 import { RunCoordinator, RunValidationError } from "../src/run-coordinator.js";
 import { createTools, managedExecutionBinding } from "../src/tools.js";
@@ -55,6 +56,27 @@ test("managed execution audit bindings exactly match Manager call projections", 
     managedExecutionBinding("process", { target: "sandbox", action: "write", process_id: "process-1", input: "x" }, workspace),
     { operation: "process", action: "write", arguments: { process_id: "process-1", input: "x" } },
   );
+  assert.deepEqual(
+    managedExecutionBinding("process", { target: "sandbox", action: "wait", process_id: "process-1" }, workspace),
+    {
+      operation: "process",
+      action: "wait",
+      arguments: { process_id: "process-1", timeout_ms: PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS },
+    },
+  );
+  assert.deepEqual(
+    managedExecutionBinding("process", {
+      target: "host",
+      action: "wait",
+      process_id: "process-2",
+      timeout_ms: 12_345,
+    }, workspace),
+    {
+      operation: "process",
+      action: "wait",
+      arguments: { process_id: "process-2", timeout_ms: 12_345 },
+    },
+  );
   for (const [toolName, action, arguments_] of [
     ["read_file", "read", { path: "/workspace/a", offset: 2 }],
     ["write_file", "write", { path: "/workspace/a", content: "new" }],
@@ -98,6 +120,149 @@ test("Manager process snapshots preserve orphaned as an active, unconfirmed stat
   }
 });
 
+test("Manager process wait parses the per-call timeout flag and terminal snapshot", async () => {
+  const home = await temporaryDirectory("managed-process-wait-");
+  const socketPath = join(home, "manager.sock");
+  const manager = new FakeManager(socketPath);
+  await manager.listen();
+  try {
+    const client = new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 5_000);
+    const result = await client.process({
+      run_id: "run-wait",
+      scope_id: "private:42",
+      lifecycle_id: "life-42",
+      tool_call_id: "tool-wait",
+      execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
+      receipt: {
+        audit_id: "audit-wait",
+        executor_id: "executor-wait",
+        target: "sandbox",
+      },
+    }, "wait", { process_id: "process-wait", timeout_ms: 100 });
+
+    const waited = result.result as JsonObject;
+    assert.equal(waited.wait_timed_out, true);
+    assert.equal(waited.status, "running");
+    assert.equal(waited.id, "process-wait");
+  } finally {
+    await manager.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Manager process wait transport deadline covers the requested long poll", async () => {
+  const home = await temporaryDirectory("managed-process-wait-deadline-");
+  const socketPath = join(home, "manager.sock");
+  const manager = new FakeManager(socketPath);
+  manager.waitResponseDelayMs = 75;
+  await manager.listen();
+  try {
+    const client = new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 20);
+    const result = await client.process({
+      run_id: "run-wait-deadline",
+      scope_id: "private:42",
+      lifecycle_id: "life-42",
+      tool_call_id: "tool-wait-deadline",
+      execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
+      receipt: {
+        audit_id: "audit-wait-deadline",
+        executor_id: "executor-wait-deadline",
+        target: "sandbox",
+      },
+    }, "wait", { process_id: "process-wait", timeout_ms: 100 });
+
+    assert.equal((result.result as JsonObject).wait_timed_out, true);
+  } finally {
+    await manager.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Manager scope cleanup uses a scope-only request and rejects open response shapes", async () => {
+  const home = await temporaryDirectory("managed-scope-cleanup-protocol-");
+  const socketPath = join(home, "manager.sock");
+  const manager = new FakeManager(socketPath);
+  const owner = "7".repeat(64);
+  manager.cleanupResponse = {
+    confirmed: true,
+    completion_tasks: [{
+      scope_id: "private:42/delegate/child",
+      lifecycle_id: "life-42",
+      execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
+      completion_owner_id: owner,
+      process_id: "process_cleanup_evidence",
+      target: "sandbox",
+    }],
+  };
+  await manager.listen();
+  try {
+    const client = new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 5_000);
+    const result = await client.cleanupScope({ scope_id: "private:42", lifecycle_id: "life-42" });
+    assert.equal(result.completion_tasks[0]?.process_id, "process_cleanup_evidence");
+    const request = manager.requests.find((candidate) => candidate.path === "/v1/executor/scopes/cleanup");
+    assert.deepEqual(request?.body, { scope_id: "private:42", lifecycle_id: "life-42" });
+
+    manager.cleanupResponse = { ...manager.cleanupResponse, command: "injected" };
+    await assert.rejects(
+      client.cleanupScope({ scope_id: "private:42", lifecycle_id: "life-42" }),
+      /invalid scope cleanup response/,
+    );
+    manager.cleanupResponse = {
+      confirmed: true,
+      completion_tasks: [{
+        ...(result.completion_tasks[0] as unknown as JsonObject),
+        command: "injected",
+      }],
+    };
+    await assert.rejects(
+      client.cleanupScope({ scope_id: "private:42", lifecycle_id: "life-42" }),
+      /invalid scope cleanup completion evidence/,
+    );
+  } finally {
+    await manager.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("finite task metadata and completion-guard preservation are Runtime-owned Manager fields", async () => {
+  const home = await temporaryDirectory("managed-task-private-contract-");
+  const socketPath = join(home, "manager.sock");
+  const manager = new FakeManager(socketPath);
+  await manager.listen();
+  try {
+    const client = new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 5_000);
+    const identity = {
+      run_id: "run-task-contract",
+      scope_id: "private:42",
+      lifecycle_id: "life-42",
+      tool_call_id: "tool-task-contract",
+      execution_context: { sandbox_id: "agent_42", workspace_id: "workspace_42" },
+      receipt: {
+        audit_id: "audit-task-contract",
+        executor_id: "executor-task-contract",
+        target: "sandbox" as const,
+      },
+    };
+    const owner = "a".repeat(64);
+    await client.terminal(identity, { command: "sleep 30", cwd: "/workspace", background: true }, undefined, owner);
+    await client.cancelRun({
+      run_id: identity.run_id,
+      scope_id: identity.scope_id,
+      lifecycle_id: identity.lifecycle_id,
+      execution_context: identity.execution_context,
+    }, ["proc_owned"]);
+    const terminal = manager.requests.find((request) => request.path === "/v1/executor/terminal")?.body;
+    assert.equal(terminal?.completion_required, true);
+    assert.equal(terminal?.completion_owner_id, owner);
+    assert.equal((terminal?.arguments as JsonObject).background_kind, undefined);
+    const cleanup = manager.requests.find((request) => request.path === "/v1/executor/runs/cancel")?.body;
+    assert.deepEqual(cleanup?.preserve_process_ids, ["proc_owned"]);
+  } finally {
+    await manager.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("managed execution skips sandbox approval, requires one-shot host approval, and inherits identity", async () => {
   const home = await temporaryDirectory("managed-execution-");
   const socketPath = join(home, "manager.sock");
@@ -112,6 +277,7 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
     fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "child task" }), { stopReason: "toolUse" }),
     fauxAssistantMessage(fauxToolCall("terminal", { command: "printf child" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("child complete"),
+    fauxAssistantMessage(fauxToolCall("terminal", { command: "npm run check" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("parent complete"),
   ]);
   const coordinator = new RunCoordinator({
@@ -154,10 +320,10 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
     assert.ok(auditIndexes[1]! < startedIndexes[1]!);
 
     const audits = manager.requests.filter((request) => request.path === "/v1/executor/audit");
-    assert.equal(audits.length, 5);
+    assert.equal(audits.length, 6);
     assert.deepEqual(
       audits.map((request) => request.body.target),
-      ["sandbox", "host", "sandbox", "sandbox", "sandbox"],
+      ["sandbox", "host", "sandbox", "sandbox", "sandbox", "sandbox"],
     );
     for (const audit of audits) {
       assert.deepEqual(audit.body.execution_context, execution_context);
@@ -181,7 +347,7 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
     assert.match(String(audits[4]?.body.scope_id), /\/delegate\//);
 
     const terminalCalls = manager.requests.filter((request) => request.path === "/v1/executor/terminal");
-    assert.equal(terminalCalls.length, 3);
+    assert.equal(terminalCalls.length, 4);
     for (const terminal of terminalCalls) {
       assert.equal(typeof terminal.body.audit_id, "string");
       assert.equal(typeof terminal.body.executor_id, "string");
@@ -202,7 +368,12 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
     assert.deepEqual(await coordinator.previewProcessSummary("private:42", "life-42"), {
       running_terminal_count: 1,
     });
+    const cleanupIdentity = { scope_key: "private:42", lifecycle_id: "life-42", session_id: "session-42" };
+    await coordinator.sessions.backgroundTaskState(cleanupIdentity).register("process_cleanup", "sandbox");
+    await stat(coordinator.sessions.backgroundTaskPath(cleanupIdentity));
     assert.equal(await coordinator.cleanupScope("private:42", "life-42"), 0);
+    await assert.rejects(stat(coordinator.sessions.backgroundTaskPath(cleanupIdentity)), { code: "ENOENT" });
+    await stat(coordinator.sessions.path(cleanupIdentity));
     assert.equal(
       manager.requests.filter((request) => request.path === "/v1/executor/scopes/cleanup").length,
       1,
@@ -334,6 +505,8 @@ interface CapturedRequest {
 class FakeManager {
   readonly requests: CapturedRequest[] = [];
   orphanTerminal = false;
+  waitResponseDelayMs = 0;
+  cleanupResponse: JsonObject = { confirmed: true, completion_tasks: [] };
   private readonly server = createServer((request, response) => void this.route(request, response));
 
   constructor(
@@ -399,6 +572,14 @@ class FakeManager {
         });
         return;
       }
+      if (path === "/v1/executor/tasks/reconcile") {
+        send(response, 200, { processes: [] });
+        return;
+      }
+      if (path === "/v1/executor/tasks/acknowledge") {
+        send(response, 200, { confirmed: true });
+        return;
+      }
       if (path === "/v1/executor/file") {
         const arguments_ = body.arguments as JsonObject;
         send(response, 200, {
@@ -408,11 +589,36 @@ class FakeManager {
         return;
       }
       if (path === "/v1/executor/process") {
+        if (body.action === "wait") {
+          if (this.waitResponseDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, this.waitResponseDelayMs));
+          }
+          const arguments_ = body.arguments as JsonObject;
+          send(response, 200, {
+            result: {
+              id: arguments_.process_id,
+              run_id: body.run_id,
+              scope_key: body.scope_id,
+              lifecycle_id: body.lifecycle_id,
+              command: "sleep 30",
+              cwd: "/workspace",
+              status: "running",
+              stdout: "working",
+              stderr: "",
+              started_at: new Date().toISOString(),
+              background: true,
+              wait_timed_out: true,
+            },
+          });
+          return;
+        }
         send(response, 200, { result: [] });
         return;
       }
       if (path === "/v1/executor/runs/cancel" || path === "/v1/executor/scopes/cleanup") {
-        send(response, 200, { confirmed: true });
+        send(response, 200, path === "/v1/executor/scopes/cleanup"
+          ? this.cleanupResponse
+          : { confirmed: true });
         return;
       }
       if (path === "/v1/executor/scopes/processes") {

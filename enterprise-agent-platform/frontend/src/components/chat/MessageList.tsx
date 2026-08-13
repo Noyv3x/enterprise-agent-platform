@@ -89,14 +89,6 @@ function currentTurnStreams(status: AgentStatus): StreamMsg[] {
   return newestTurnId ? streams.filter((stream) => stream.turn_id === newestTurnId) : streams;
 }
 
-/** A finalized stream segment can be narration emitted before a later tool call.
- * Only the current visible live buffer means the Agent has started presenting
- * its answer; tool-start finalization clears this buffer and reopens the card. */
-function hasLiveFinalOutput(status: AgentStatus): boolean {
-  const stream = status.stream_message;
-  return stream?.active !== false && !!stream?.content?.trim();
-}
-
 /** Synthesize pseudo-messages from streaming buffers for <MessageBubble>. */
 function agentStreamingMessages(
   status: AgentStatus,
@@ -281,11 +273,7 @@ export function MessageList({
     if (isAgentActive(status) && status) {
       items.push(
         hasAgentProcessSteps(status) ? (
-          <AgentActivity
-            key="agent-activity"
-            status={status}
-            finalOutputStarted={hasLiveFinalOutput(status)}
-          />
+          <AgentActivity key="agent-activity" status={status} />
         ) : (
           <AgentTyping key="agent-typing" status={status} />
         ),

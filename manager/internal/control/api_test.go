@@ -14,9 +14,14 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/executor"
+	technicalidentity "github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/operation"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type statusReporter struct {
@@ -82,6 +87,135 @@ func TestAPICapabilityMatrix(t *testing.T) {
 				t.Fatalf("status = %d, want %d; body=%s", response.Code, test.wantStatus, response.Body.String())
 			}
 		})
+	}
+}
+
+type executorRouteEngine struct{}
+
+func (executorRouteEngine) Preflight(context.Context) error                         { return nil }
+func (executorRouteEngine) Pull(context.Context, release.Manifest) error            { return nil }
+func (executorRouteEngine) Prepare(context.Context, release.Manifest) error         { return nil }
+func (executorRouteEngine) StopFixed(context.Context) error                         { return nil }
+func (executorRouteEngine) StartFixed(context.Context, release.Manifest) error      { return nil }
+func (executorRouteEngine) Migrate(context.Context, release.Manifest) error         { return nil }
+func (executorRouteEngine) Probe(context.Context, release.Manifest) error           { return nil }
+func (executorRouteEngine) Logs(context.Context, string, int) (string, error)       { return "", nil }
+func (executorRouteEngine) EnsureSandbox(context.Context, driver.SandboxSpec) error { return nil }
+func (executorRouteEngine) StopSandbox(context.Context, string) error               { return nil }
+func (executorRouteEngine) RemoveSandbox(context.Context, string) error             { return nil }
+func (executorRouteEngine) SandboxRunning(context.Context, string) (bool, error)    { return true, nil }
+func (executorRouteEngine) ExecArgs(driver.SandboxSpec, string, string, []string) (string, []string) {
+	return "/bin/true", nil
+}
+
+func TestExecutorTaskRoutesAreAuthenticatedClosedWorldAndPreserveTasks(t *testing.T) {
+	root := t.TempDir()
+	engine := executorRouteEngine{}
+	active := technicalidentity.CompileTimeActiveProfile()
+	sandboxes, err := sandbox.Open(active, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes, err := executor.NewProcessManager(active, engine, sandboxes, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := executor.NewFileService(active, sandboxes, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &executor.Service{
+		Audits:    executor.AuditStore{Dir: filepath.Join(root, "control"), Log: logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)},
+		Processes: processes,
+		Files:     files,
+	}
+	api := &API{Executor: service, ExecutorToken: "executor-token-0123456789abcdef"}
+	identity := executor.Identity{
+		RunID: "run-route", ScopeID: "private:1", LifecycleID: "life-1", ToolCallID: "tool-route",
+		ExecutionContext: executor.ExecutionContext{SandboxID: "private-1", WorkspaceID: "user-1"},
+	}
+	arguments := json.RawMessage(`{"command":"sleep 30","cwd":"/workspace","background":true}`)
+	auditRequest := executor.AuditRequest{Identity: identity, AuditID: "audit-route", Target: "host", Operation: "terminal", Action: "run", Arguments: arguments, Details: map[string]any{"command": "sleep 30"}}
+	receipt, err := service.Audit(auditRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := strings.Repeat("b", 64)
+	started, err := service.Terminal(context.Background(), executor.Call{
+		Identity: identity, AuditID: receipt.AuditID, ExecutorID: receipt.ExecutorID, Target: "host", Action: "run", Arguments: arguments,
+		CompletionRequired: true, CompletionOwnerID: owner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processID := started["result"].(executor.ProcessSnapshot).ID
+
+	request := func(path, body, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, req)
+		return response
+	}
+	baseIdentity := `"scope_id":"private:1","lifecycle_id":"life-1","execution_context":{"sandbox_id":"private-1","workspace_id":"user-1"}`
+	unauthorized := request("/v1/executor/tasks/reconcile", `{`+baseIdentity+`,"completion_owner_id":"`+owner+`"}`, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized reconcile status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	unknown := request("/v1/executor/tasks/reconcile", `{`+baseIdentity+`,"completion_owner_id":"`+owner+`","command":"injected"}`, api.ExecutorToken)
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown reconciliation field status=%d body=%s", unknown.Code, unknown.Body.String())
+	}
+	reconciled := request("/v1/executor/tasks/reconcile", `{`+baseIdentity+`,"completion_owner_id":"`+owner+`"}`, api.ExecutorToken)
+	if reconciled.Code != http.StatusOK || !strings.Contains(reconciled.Body.String(), processID) {
+		t.Fatalf("reconcile status=%d body=%s", reconciled.Code, reconciled.Body.String())
+	}
+	cancelled := request("/v1/executor/runs/cancel", `{`+baseIdentity+`,"run_id":"run-route","preserve_process_ids":["`+processID+`"]}`, api.ExecutorToken)
+	if cancelled.Code != http.StatusOK || !strings.Contains(cancelled.Body.String(), `"confirmed":true`) {
+		t.Fatalf("preserving cancel status=%d body=%s", cancelled.Code, cancelled.Body.String())
+	}
+	if snapshot, getErr := processes.Get("private:1", "life-1", "host", processID); getErr != nil || snapshot.Status != "running" {
+		t.Fatalf("preserved process was stopped: snapshot=%#v err=%v", snapshot, getErr)
+	}
+	cleanupUnauthorized := request("/v1/executor/scopes/cleanup", `{"scope_id":"private:1","lifecycle_id":"life-1"}`, "")
+	if cleanupUnauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized cleanup status=%d body=%s", cleanupUnauthorized.Code, cleanupUnauthorized.Body.String())
+	}
+	cleanupUnknown := request("/v1/executor/scopes/cleanup", `{`+baseIdentity+`}`, api.ExecutorToken)
+	if cleanupUnknown.Code != http.StatusBadRequest {
+		t.Fatalf("cleanup accepted execution context: status=%d body=%s", cleanupUnknown.Code, cleanupUnknown.Body.String())
+	}
+	cleaned := request("/v1/executor/scopes/cleanup", `{"scope_id":"private:1","lifecycle_id":"life-1"}`, api.ExecutorToken)
+	if cleaned.Code != http.StatusOK {
+		t.Fatalf("scope-only cleanup status=%d body=%s", cleaned.Code, cleaned.Body.String())
+	}
+	var cleanupBody map[string]any
+	if err := json.Unmarshal(cleaned.Body.Bytes(), &cleanupBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(cleanupBody) != 2 || cleanupBody["confirmed"] != true {
+		t.Fatalf("cleanup response is not closed-world: %#v", cleanupBody)
+	}
+	tasks, ok := cleanupBody["completion_tasks"].([]any)
+	if !ok || len(tasks) != 1 {
+		t.Fatalf("cleanup evidence missing: %#v", cleanupBody)
+	}
+	evidence, ok := tasks[0].(map[string]any)
+	if !ok || len(evidence) != 6 || evidence["process_id"] != processID || evidence["completion_owner_id"] != owner || evidence["target"] != "host" {
+		t.Fatalf("cleanup evidence is not closed-world or exact: %#v", tasks[0])
+	}
+	if _, leaked := evidence["command"]; leaked {
+		t.Fatal("cleanup evidence leaked command data")
+	}
+	acknowledged := request("/v1/executor/tasks/acknowledge", `{`+baseIdentity+`,"completion_owner_id":"`+owner+`","process_id":"`+processID+`"}`, api.ExecutorToken)
+	if acknowledged.Code != http.StatusOK || !strings.Contains(acknowledged.Body.String(), `"confirmed":true`) {
+		t.Fatalf("acknowledge status=%d body=%s", acknowledged.Code, acknowledged.Body.String())
+	}
+	replayed := request("/v1/executor/scopes/cleanup", `{"scope_id":"private:1","lifecycle_id":"life-1"}`, api.ExecutorToken)
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"completion_tasks":[]`) {
+		t.Fatalf("acknowledged cleanup evidence replayed: status=%d body=%s", replayed.Code, replayed.Body.String())
 	}
 }
 

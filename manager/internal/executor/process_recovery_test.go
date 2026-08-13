@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
@@ -429,6 +431,21 @@ func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
 	if !activeProcessStatus(recovered.Status) || !strings.Contains(recovered.Stdout, "line-5") {
 		t.Fatalf("running process was not reconstructed with output: %#v", recovered)
 	}
+	waited, err := second.Wait(
+		context.Background(),
+		call.ScopeID,
+		call.LifecycleID,
+		"sandbox",
+		call.ExecutionContext,
+		snapshot.ID,
+		100*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !waited.WaitTimedOut || !activeProcessStatus(waited.Status) {
+		t.Fatalf("recovered running process was not waitable: %#v", waited)
+	}
 	stopped, err := second.Kill(call.ScopeID, call.LifecycleID, "sandbox", snapshot.ID)
 	if err != nil {
 		second.mu.Lock()
@@ -447,3 +464,511 @@ func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
 		t.Fatalf("confirmed stop left a live managed PID file: %v", err)
 	}
 }
+
+func TestRecoveredTerminalStateRequiresAuthoritativeExitFile(t *testing.T) {
+	service, root := newTestService(t)
+	processes := service.Processes
+	tests := []struct {
+		name       string
+		content    *string
+		symlink    bool
+		wantStatus string
+		wantCode   *int
+	}{
+		{name: "zero", content: stringPointer("0\n"), wantStatus: "completed", wantCode: intPointer(0)},
+		{name: "nonzero", content: stringPointer("23\n"), wantStatus: "failed", wantCode: intPointer(23)},
+		{name: "missing", wantStatus: "failed"},
+		{name: "malformed", content: stringPointer("not-an-exit\n"), wantStatus: "failed"},
+		{name: "symlink", content: stringPointer("0\n"), symlink: true, wantStatus: "failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			exitFile := filepath.Join(root, "exit-"+test.name)
+			if test.content != nil {
+				if test.symlink {
+					target := exitFile + ".target"
+					if err := os.WriteFile(target, []byte(*test.content), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(target, exitFile); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(exitFile, []byte(*test.content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			process := &managedProcess{
+				snapshot:     ProcessSnapshot{Status: "running", StartedAt: time.Now().UTC()},
+				hostExitFile: exitFile,
+				stdout:       &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+			}
+			processes.restoreRecoveredTerminalState(process, time.Now().UTC())
+			if process.snapshot.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", process.snapshot.Status, test.wantStatus)
+			}
+			if test.wantCode == nil {
+				if process.snapshot.ExitCode != nil {
+					t.Fatalf("unproven terminal state invented exit code %d", *process.snapshot.ExitCode)
+				}
+			} else if process.snapshot.ExitCode == nil || *process.snapshot.ExitCode != *test.wantCode {
+				t.Fatalf("exit code = %#v, want %d", process.snapshot.ExitCode, *test.wantCode)
+			}
+		})
+	}
+}
+
+func TestUnacknowledgedTaskTerminalIsPinnedUntilRuntimeAcknowledges(t *testing.T) {
+	service, root := newTestService(t)
+	processes := service.Processes
+	processes.completedRecordTTL = time.Millisecond
+	finished := time.Now().UTC().Add(-time.Hour)
+	stateDir := filepath.Join(filepath.Dir(processes.Sandboxes.StatePath), "processes", "pinned")
+	environment := filepath.Join(root, "environment")
+	if err := os.MkdirAll(filepath.Join(environment, "processes"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	process := &managedProcess{
+		snapshot: ProcessSnapshot{
+			ID: "proc_pinned", RunID: "run-pinned", ScopeKey: "private:1", LifecycleID: "life-1",
+			Target: "sandbox", Status: "failed", StartedAt: finished.Add(-time.Minute), FinishedAt: &finished,
+			Background: true,
+		},
+		sandboxID: "private-1", workspaceID: "user-1",
+		spec: driver.SandboxSpec{Environment: environment}, stateFile: filepath.Join(stateDir, "proc_pinned.json"),
+		completionOwnerID: strings.Repeat("a", 64), completionToolCallID: "tool-pinned",
+		done: make(chan struct{}), stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	close(process.done)
+	processes.processes[process.snapshot.ID] = process
+	if err := processes.persistProcess(process); err != nil {
+		t.Fatal(err)
+	}
+	processes.pruneCompleted(time.Now())
+	if _, ok := processes.processes[process.snapshot.ID]; !ok {
+		t.Fatal("unacknowledged task terminal was pruned")
+	}
+	identity := TaskIdentity{
+		ScopeID: "private:1", LifecycleID: "life-1",
+		ExecutionContext:  ExecutionContext{SandboxID: "private-1", WorkspaceID: "user-1"},
+		CompletionOwnerID: strings.Repeat("a", 64),
+	}
+	reconciled, err := processes.ReconcileTasks(identity)
+	if err != nil || len(reconciled) != 1 || reconciled[0].ID != process.snapshot.ID {
+		t.Fatalf("reconciled = %#v, err=%v", reconciled, err)
+	}
+	if !processes.AcknowledgeTask(TaskProcessIdentity{TaskIdentity: identity, ProcessID: process.snapshot.ID}) {
+		t.Fatal("terminal task acknowledgement failed")
+	}
+	processes.pruneCompleted(time.Now())
+	if _, ok := processes.processes[process.snapshot.ID]; ok {
+		t.Fatal("acknowledged expired terminal remained pinned")
+	}
+}
+
+func TestCancelRunPreservesOnlyExactCompletionTask(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 is required for the sandbox process protocol")
+	}
+	root := t.TempDir()
+	engine := localSandboxEngine{}
+	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := identity()
+	base.RunID = "run-preserve"
+	taskCall := Call{Identity: base, Target: "sandbox", CompletionRequired: true, CompletionOwnerID: strings.Repeat("b", 64)}
+	task, err := processes.Run(context.Background(), taskCall, terminalArguments{Command: "sleep 30", Background: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceIdentity := base
+	serviceIdentity.ToolCallID = "tool-service"
+	serviceProcess, err := processes.Run(context.Background(), Call{Identity: serviceIdentity, Target: "sandbox"}, terminalArguments{Command: "sleep 30", Background: true})
+	if err != nil {
+		processes.CleanupScope(base.ScopeID, base.LifecycleID)
+		t.Fatal(err)
+	}
+	defer processes.CleanupScope(base.ScopeID, base.LifecycleID)
+	confirmed := processes.CancelRun(RunIdentity{
+		RunID: base.RunID, ScopeID: base.ScopeID, LifecycleID: base.LifecycleID,
+		ExecutionContext: base.ExecutionContext, PreserveProcessIDs: []string{task.ID},
+	})
+	if !confirmed {
+		t.Fatal("run cleanup did not confirm non-preserved process termination")
+	}
+	preserved, err := processes.Get(base.ScopeID, base.LifecycleID, "sandbox", task.ID)
+	if err != nil || !activeProcessStatus(preserved.Status) {
+		t.Fatalf("finite task was not preserved: %#v, %v", preserved, err)
+	}
+	removed, err := processes.Get(base.ScopeID, base.LifecycleID, "sandbox", serviceProcess.ID)
+	if err != nil || removed.Status != "cancelled" {
+		t.Fatalf("unregistered background process escaped cleanup: %#v, %v", removed, err)
+	}
+	wrong := processes.CancelRun(RunIdentity{
+		RunID: base.RunID, ScopeID: base.ScopeID, LifecycleID: base.LifecycleID,
+		ExecutionContext:   ExecutionContext{SandboxID: "other", WorkspaceID: base.ExecutionContext.WorkspaceID},
+		PreserveProcessIDs: []string{task.ID},
+	})
+	if wrong {
+		t.Fatal("mismatched execution context preserved a process")
+	}
+}
+
+func TestHostCompletionIntentRecoversAsFailedUnknownInsteadOfReplaying(t *testing.T) {
+	root := t.TempDir()
+	engine := engineStub{}
+	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	process := &managedProcess{
+		snapshot: ProcessSnapshot{
+			ID: "proc_host_crash", RunID: "run-host", ScopeKey: "private:1", LifecycleID: "life-1",
+			Target: "host", Command: "side-effecting-host-command", CWD: "/workspace", Status: "running",
+			StartedAt: now, Background: true,
+		},
+		sandboxID: "private-1", workspaceID: "user-1",
+		stateFile:         filepath.Join(filepath.Dir(sandboxes.StatePath), "processes", "host", "proc_host_crash.json"),
+		completionOwnerID: strings.Repeat("c", 64), completionToolCallID: "tool-host", starting: true,
+		done: make(chan struct{}), stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	if err := first.persistProcess(process); err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := second.Get("private:1", "life-1", "host", process.snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != "failed" || recovered.ExitCode != nil {
+		t.Fatalf("host crash recovery invented success: %#v", recovered)
+	}
+	tasks, err := second.ReconcileTasks(TaskIdentity{
+		ScopeID: "private:1", LifecycleID: "life-1",
+		ExecutionContext:  ExecutionContext{SandboxID: "private-1", WorkspaceID: "user-1"},
+		CompletionOwnerID: strings.Repeat("c", 64),
+	})
+	if err != nil || len(tasks) != 1 || tasks[0].ID != process.snapshot.ID {
+		t.Fatalf("host crash task was not recoverable: %#v, %v", tasks, err)
+	}
+}
+
+func TestAcknowledgedHostTaskRecordReentersNormalPruningAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	engine := engineStub{}
+	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := time.Now().UTC()
+	stateFile := filepath.Join(filepath.Dir(sandboxes.StatePath), "processes", "host", "proc_host_ack.json")
+	state := persistedProcess{
+		Snapshot: ProcessSnapshot{
+			ID: "proc_host_ack", RunID: "run-host", ScopeKey: "private:1", LifecycleID: "life-1",
+			Target: "host", Command: "true", CWD: "/workspace", Status: "completed", ExitCode: intPointer(0),
+			StartedAt: finished.Add(-time.Second), FinishedAt: &finished, Background: true,
+		},
+		SandboxID: "private-1", WorkspaceID: "user-1", CompletionOwnerID: strings.Repeat("f", 64),
+		CompletionToolCallID: "tool-host", CompletionAcknowledged: true,
+	}
+	if err := atomicfile.WriteJSON(stateFile, state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recovered.Get("private:1", "life-1", "host", "proc_host_ack"); err != nil {
+		t.Fatalf("fresh acknowledged record was not loaded for normal retention: %v", err)
+	}
+	recovered.pruneCompleted(finished.Add(2 * time.Hour))
+	if _, err := recovered.Get("private:1", "life-1", "host", "proc_host_ack"); err == nil {
+		t.Fatal("expired acknowledged host record was not pruned")
+	}
+	if _, err := os.Lstat(stateFile); !os.IsNotExist(err) {
+		t.Fatalf("pruned acknowledged host state file leaked: %v", err)
+	}
+}
+
+func TestCompletionOwnerAdmissionStopsBeforeThe257thUnacknowledgedTask(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	owner := strings.Repeat("d", 64)
+	for index := 0; index < 256; index++ {
+		id := fmt.Sprintf("proc_limit_%03d", index)
+		processes.processes[id] = &managedProcess{
+			snapshot:          ProcessSnapshot{ID: id, Status: "running", StartedAt: time.Now().UTC(), Background: true},
+			completionOwnerID: owner,
+			stdout:            &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+		}
+	}
+	if err := processes.reserveCompletionOwner(owner); err == nil || !strings.Contains(err.Error(), "256") {
+		t.Fatalf("257th unacknowledged task was admitted: %v", err)
+	}
+	processes.processes["proc_limit_000"].completionAcknowledged = true
+	if err := processes.reserveCompletionOwner(owner); err != nil {
+		t.Fatalf("acknowledged task did not release owner capacity: %v", err)
+	}
+	processes.releaseCompletionOwner(owner)
+}
+
+func TestRecoveredStartingSandboxIntentWithoutPIDFailsClosedAsOrphaned(t *testing.T) {
+	root := t.TempDir()
+	engine := localSandboxEngine{}
+	registry := filepath.Join(root, "manager", "sandboxes.json")
+	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), registry, "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := sandboxes.Ensure(context.Background(), identity().ExecutionContext.SandboxID, identity().ExecutionContext.WorkspaceID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateFile := filepath.Join(filepath.Dir(sandboxes.StatePath), "processes", spec.AgentHash, "proc_starting.json")
+	state := persistedProcess{
+		Snapshot: ProcessSnapshot{
+			ID: "proc_starting", RunID: "run-starting", ScopeKey: "private:1", LifecycleID: "life-1",
+			Target: "sandbox", Command: "side-effecting-command", CWD: "/workspace", Status: "running",
+			StartedAt: time.Now().UTC(), Background: true,
+		},
+		SandboxID: identity().ExecutionContext.SandboxID, WorkspaceID: identity().ExecutionContext.WorkspaceID,
+		PIDFile:           filepath.ToSlash(filepath.Join(contract.ContainerAgentEnv, "processes", "proc_starting.pid")),
+		HostPIDFile:       filepath.Join(spec.Environment, "processes", "proc_starting.pid"),
+		CompletionOwnerID: strings.Repeat("e", 64), CompletionToolCallID: "tool-starting", Starting: true,
+	}
+	if err := atomicfile.WriteJSON(stateFile, state, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := recovered.Get("private:1", "life-1", "sandbox", "proc_starting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Status != "orphaned" || snapshot.StopConfirmed == nil || *snapshot.StopConfirmed {
+		t.Fatalf("uncertain startup was not preserved fail-closed: %#v", snapshot)
+	}
+	killed, killErr := recovered.Kill("private:1", "life-1", "sandbox", "proc_starting")
+	if killErr == nil || killed.Status != "orphaned" || killed.StopConfirmed == nil || *killed.StopConfirmed {
+		t.Fatalf("missing startup PID was falsely confirmed by kill: snapshot=%#v err=%v", killed, killErr)
+	}
+	tasks, err := recovered.ReconcileTasks(TaskIdentity{
+		ScopeID: "private:1", LifecycleID: "life-1",
+		ExecutionContext: identity().ExecutionContext, CompletionOwnerID: strings.Repeat("e", 64),
+	})
+	if err != nil || len(tasks) != 1 || tasks[0].ID != "proc_starting" {
+		t.Fatalf("uncertain startup disappeared from reconciliation: %#v, %v", tasks, err)
+	}
+}
+
+func TestScopeCleanupReturnsPinnedCompletionEvidenceUntilAcknowledged(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	owner := strings.Repeat("9", 64)
+	done := make(chan struct{})
+	close(done)
+	process := &managedProcess{
+		snapshot: ProcessSnapshot{
+			ID: "proc_cleanup_evidence", RunID: "run-cleanup", ScopeKey: "private:1/delegate/child",
+			LifecycleID: "life-1", Target: "sandbox", Status: "cancelled", StartedAt: time.Now().UTC(), Background: true,
+		},
+		sandboxID: "private-1", workspaceID: "user-1", completionOwnerID: owner,
+		done: done, stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	processes.processes[process.snapshot.ID] = process
+
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := processes.CleanupScopeWithEvidence("private:1", "life-1")
+		if err != nil || !result.Confirmed || len(result.CompletionTasks) != 1 {
+			t.Fatalf("cleanup attempt %d lost pinned evidence: result=%#v err=%v", attempt+1, result, err)
+		}
+		evidence := result.CompletionTasks[0]
+		if evidence.ProcessID != process.snapshot.ID || evidence.ScopeID != process.snapshot.ScopeKey ||
+			evidence.LifecycleID != "life-1" || evidence.Target != "sandbox" ||
+			evidence.CompletionOwnerID != owner || evidence.ExecutionContext.SandboxID != "private-1" ||
+			evidence.ExecutionContext.WorkspaceID != "user-1" {
+			t.Fatalf("cleanup evidence changed trusted identity: %#v", evidence)
+		}
+		process.mu.Lock()
+		acknowledged := process.completionAcknowledged
+		process.mu.Unlock()
+		if acknowledged {
+			t.Fatal("Manager acknowledged cleanup evidence before Runtime local commit")
+		}
+	}
+	if !processes.AcknowledgeTask(TaskProcessIdentity{
+		TaskIdentity: TaskIdentity{
+			ScopeID: process.snapshot.ScopeKey, LifecycleID: "life-1",
+			ExecutionContext:  ExecutionContext{SandboxID: "private-1", WorkspaceID: "user-1"},
+			CompletionOwnerID: owner,
+		},
+		ProcessID: process.snapshot.ID,
+	}) {
+		t.Fatal("Runtime acknowledgement was rejected")
+	}
+	result, err := processes.CleanupScopeWithEvidence("private:1", "life-1")
+	if err != nil || !result.Confirmed || len(result.CompletionTasks) != 0 {
+		t.Fatalf("acknowledged evidence was replayed: result=%#v err=%v", result, err)
+	}
+}
+
+func TestScopeCleanupEvidenceLimitFailsBeforeProcessMutation(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	for index := 0; index <= maxScopeCleanupCompletionEvidence; index++ {
+		done := make(chan struct{})
+		close(done)
+		id := fmt.Sprintf("proc_cleanup_limit_%04d", index)
+		processes.processes[id] = &managedProcess{
+			snapshot:  ProcessSnapshot{ID: id, ScopeKey: "private:limit", LifecycleID: "life-1", Target: "host", Status: "cancelled", StartedAt: time.Now().UTC(), Background: true},
+			sandboxID: "private-limit", workspaceID: "user-limit", completionOwnerID: strings.Repeat("8", 64),
+			done: done, stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+		}
+	}
+	active := &managedProcess{
+		snapshot:  ProcessSnapshot{ID: "proc_cleanup_limit_active", ScopeKey: "private:limit", LifecycleID: "life-1", Target: "host", Status: "running", StartedAt: time.Now().UTC(), Background: true},
+		sandboxID: "private-limit", workspaceID: "user-limit", done: make(chan struct{}),
+		stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	processes.processes[active.snapshot.ID] = active
+	if _, err := processes.CleanupScopeWithEvidence("private:limit", "life-1"); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized cleanup evidence was not rejected: %v", err)
+	}
+	if snapshot := processes.snapshot(active); snapshot.Status != "running" || active.stopRequested {
+		t.Fatalf("cleanup mutated a process before evidence admission: %#v", snapshot)
+	}
+}
+
+func TestScopeCleanupFenceDrainsAdmittedStartsAndPreservesAdjacentAdmission(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	if err := processes.reserveProcessSlot("private:1/delegate/child", "life-1"); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := processes.CleanupScopeWithEvidenceContext(context.Background(), "private:1", "life-1")
+		result <- err
+	}()
+	waitForCleanupFence(t, processes, scopeCleanupFence{scopeID: "private:1", lifecycleID: "life-1"})
+	if err := processes.reserveProcessSlot("private:1", "life-1"); err == nil || !strings.Contains(err.Error(), "cleanup") {
+		t.Fatalf("same-family start entered an active cleanup fence: %v", err)
+	}
+	for _, identity := range []processStartIdentity{
+		{scopeID: "private:1", lifecycleID: "life-2"},
+		{scopeID: "private:10/delegate/child", lifecycleID: "life-1"},
+	} {
+		if err := processes.reserveProcessSlot(identity.scopeID, identity.lifecycleID); err != nil {
+			t.Fatalf("adjacent start was blocked by cleanup fence: identity=%#v err=%v", identity, err)
+		}
+		processes.releaseProcessSlot(identity.scopeID, identity.lifecycleID)
+	}
+	if _, err := processes.CleanupScopeWithEvidenceContext(context.Background(), "private:1/delegate/child", "life-1"); err == nil || !strings.Contains(err.Error(), "overlapping") {
+		t.Fatalf("overlapping cleanup was not rejected: %v", err)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("cleanup returned before admitted start settled: %v", err)
+	default:
+	}
+	done := make(chan struct{})
+	close(done)
+	processes.mu.Lock()
+	processes.processes["proc_admitted_cleanup"] = &managedProcess{
+		snapshot: ProcessSnapshot{
+			ID: "proc_admitted_cleanup", ScopeKey: "private:1/delegate/child", LifecycleID: "life-1",
+			Target: "host", Status: "cancelled", StartedAt: time.Now().UTC(), Background: true,
+		},
+		sandboxID: "private-1", workspaceID: "user-1", completionOwnerID: strings.Repeat("7", 64),
+		done: done, stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	processes.releaseProcessSlotLocked("private:1/delegate/child", "life-1")
+	processes.mu.Unlock()
+	if err := <-result; err != nil {
+		t.Fatalf("cleanup failed after admitted start registered: %v", err)
+	}
+}
+
+func TestScopeCleanupEvidenceLimitIncludesAStartAdmittedBeforeTheFence(t *testing.T) {
+	service, _ := newTestService(t)
+	processes := service.Processes
+	for index := 0; index < maxScopeCleanupCompletionEvidence; index++ {
+		done := make(chan struct{})
+		close(done)
+		id := fmt.Sprintf("proc_pending_limit_%04d", index)
+		processes.processes[id] = &managedProcess{
+			snapshot:  ProcessSnapshot{ID: id, ScopeKey: "private:pending-limit", LifecycleID: "life-1", Target: "host", Status: "cancelled", StartedAt: time.Now().UTC(), Background: true},
+			sandboxID: "private-limit", workspaceID: "user-limit", completionOwnerID: strings.Repeat("6", 64),
+			done: done, stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+		}
+	}
+	active := &managedProcess{
+		snapshot:  ProcessSnapshot{ID: "proc_pending_limit_active", ScopeKey: "private:pending-limit", LifecycleID: "life-1", Target: "host", Status: "running", StartedAt: time.Now().UTC(), Background: true},
+		sandboxID: "private-limit", workspaceID: "user-limit", done: make(chan struct{}),
+		stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	processes.processes[active.snapshot.ID] = active
+	if err := processes.reserveProcessSlot("private:pending-limit/delegate/child", "life-1"); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := processes.CleanupScopeWithEvidenceContext(context.Background(), "private:pending-limit", "life-1")
+		result <- err
+	}()
+	waitForCleanupFence(t, processes, scopeCleanupFence{scopeID: "private:pending-limit", lifecycleID: "life-1"})
+	done := make(chan struct{})
+	close(done)
+	processes.mu.Lock()
+	processes.processes["proc_pending_limit_late"] = &managedProcess{
+		snapshot:  ProcessSnapshot{ID: "proc_pending_limit_late", ScopeKey: "private:pending-limit/delegate/child", LifecycleID: "life-1", Target: "host", Status: "cancelled", StartedAt: time.Now().UTC(), Background: true},
+		sandboxID: "private-limit", workspaceID: "user-limit", completionOwnerID: strings.Repeat("6", 64),
+		done: done, stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
+	}
+	processes.releaseProcessSlotLocked("private:pending-limit/delegate/child", "life-1")
+	processes.mu.Unlock()
+	if err := <-result; err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("cleanup evidence preflight ignored the admitted start: %v", err)
+	}
+	if snapshot := processes.snapshot(active); snapshot.Status != "running" || active.stopRequested {
+		t.Fatalf("oversized admitted evidence mutated active process: %#v", snapshot)
+	}
+}
+
+func waitForCleanupFence(t *testing.T, processes *ProcessManager, fence scopeCleanupFence) {
+	t.Helper()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	for {
+		processes.mu.Lock()
+		_, installed := processes.cleanupFences[fence]
+		changed := processes.cleanupFenceChanged
+		processes.mu.Unlock()
+		if installed {
+			return
+		}
+		select {
+		case <-changed:
+		case <-timer.C:
+			t.Fatal("scope cleanup fence was not installed")
+		}
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+func intPointer(value int) *int          { return &value }

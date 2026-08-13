@@ -60,6 +60,7 @@ export interface AttachmentRequest {
 export interface RunMetadata extends JsonObject {
   parent_run_id?: string;
   delegation_depth?: number;
+  delegation_role?: "leaf" | "orchestrator";
   idempotency_key?: string;
   source_message_id?: number;
   approval_owner_run_id?: string;
@@ -71,6 +72,7 @@ export interface RunMetadata extends JsonObject {
   review_job_id?: number;
   schedule_id?: string;
   schedule_run_id?: string;
+  schedule_recurring?: boolean;
   scheduled_for?: string;
   available_skills?: unknown;
 }
@@ -249,6 +251,9 @@ export interface GatewayToolRequest {
     unattended?: boolean;
     review_mode?: string;
     review_job_id?: number;
+    schedule_id?: string;
+    schedule_run_id?: string;
+    schedule_recurring?: boolean;
   };
 }
 
