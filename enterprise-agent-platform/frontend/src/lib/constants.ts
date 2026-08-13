@@ -1,51 +1,10 @@
 /* Shared data constants. */
 
-import type { AdminPage, PermissionGroup, ThinkingDepthOption } from "../types";
+import type { AdminPage, ThinkingDepthOption } from "../types";
 
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 export const SSE_RECONNECT_MS = 3000;
-
-export const FALLBACK_PERMISSION_GROUPS: PermissionGroup[] = [
-  {
-    id: "admin",
-    label: "admin",
-    description: "admin",
-    permissions: [
-      "read_workspace",
-      "chat",
-      "private_agent",
-      "manage_channels",
-      "manage_knowledge",
-      "manage_users",
-      "system_settings",
-    ],
-  },
-  {
-    id: "manager",
-    label: "manager",
-    description: "manager",
-    permissions: [
-      "read_workspace",
-      "chat",
-      "private_agent",
-      "manage_channels",
-      "manage_knowledge",
-    ],
-  },
-  {
-    id: "member",
-    label: "member",
-    description: "member",
-    permissions: ["read_workspace", "chat", "private_agent"],
-  },
-  {
-    id: "viewer",
-    label: "viewer",
-    description: "viewer",
-    permissions: ["read_workspace"],
-  },
-];
 
 export const THINKING_DEPTH_OPTIONS: ThinkingDepthOption[] = [
   ["none", "none"],

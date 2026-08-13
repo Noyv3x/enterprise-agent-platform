@@ -4402,7 +4402,6 @@ class PlatformServiceTests(unittest.TestCase):
                 service.private_status(member)["execution"]["session_id"],
                 "agent-platform-private-u2",
             )
-            self.assertEqual(service.model_secret_env(), {})
             service.close()
 
 
@@ -5351,7 +5350,6 @@ class PlatformServiceTests(unittest.TestCase):
                 )
                 self.assertTrue(firecrawl_item["configured"])
                 self.assertNotEqual(firecrawl_item["masked"], "firecrawl-secret")
-                self.assertNotIn("CODEX_OAUTH_ACCESS_TOKEN", service.model_secret_env())
                 with self.assertRaises(ServiceError):
                     service.set_secret(admin, "OPENAI_API_KEY", "sk-test-value")
             finally:
@@ -8594,8 +8592,6 @@ class PlatformHTTPTests(unittest.TestCase):
                         {
                             "public_base_url": "https://agents.example",
                             "trusted_proxy": True,
-                            "host": "127.0.0.1",
-                            "port": 8766,
                             "session_ttl_seconds": 7200,
                         }
                     ),
@@ -8608,7 +8604,11 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(security["public_base_url"], "https://agents.example")
                 self.assertTrue(security["secure_cookie_enabled"])
                 self.assertTrue(security["trusted_proxy"])
-                self.assertTrue(security["listen_restart_required"])
+                self.assertNotIn("listen_restart_required", security)
+                self.assertNotIn("host", security)
+                self.assertNotIn("port", security)
+                self.assertEqual(security["applied_host"], config.host)
+                self.assertEqual(security["applied_port"], config.port)
                 self.assertEqual(security["session_ttl_seconds"], 7200)
 
                 conn.request(
@@ -8637,8 +8637,9 @@ class PlatformHTTPTests(unittest.TestCase):
                     service.update_platform_security_config(admin, {"public_base_url": "javascript:alert(1)"})
                 self.assertEqual(bad_url.exception.status, 400)
                 with self.assertRaises(ServiceError) as bad_port:
-                    service.update_platform_security_config(admin, {"port": 70000})
+                    service.update_platform_security_config(admin, {"port": 8766})
                 self.assertEqual(bad_port.exception.status, 400)
+                self.assertIn("not Platform settings", bad_port.exception.message)
                 with self.assertRaises(ServiceError) as bad_secret:
                     service.update_platform_security_config(admin, {"session_secret": "short"})
                 self.assertEqual(bad_secret.exception.status, 400)

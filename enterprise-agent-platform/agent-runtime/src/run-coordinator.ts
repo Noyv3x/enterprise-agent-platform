@@ -61,7 +61,6 @@ import {
   isMailMutation,
   isScheduleMutation,
   managedExecutionBinding,
-  readRegularFileRange,
 } from "./tools.js";
 import type {
   ApprovalDecision,
@@ -2794,7 +2793,6 @@ function runInputFingerprint(request: RunInputRequest): string {
     ...(attachment.path === undefined ? {} : { path: attachment.path }),
     ...(attachment.name === undefined ? {} : { name: attachment.name }),
     ...(attachment.mime_type === undefined ? {} : { mime_type: attachment.mime_type }),
-    ...(attachment.url === undefined ? {} : { url: attachment.url }),
   }));
   return stableHash(canonicalJson({
     message_id: request.message_id,
@@ -2803,6 +2801,14 @@ function runInputFingerprint(request: RunInputRequest): string {
     input: request.input,
     attachments,
   }));
+}
+
+function assertClosedAttachment(attachment: Record<string, unknown>): void {
+  assertOnlyKeys(attachment, ["path", "name", "mime_type"], "attachment");
+  const mimeType = typeof attachment.mime_type === "string" ? attachment.mime_type.trim().toLowerCase() : "";
+  if (mimeType.startsWith("image/")) {
+    throw new Error("image attachments must be inlined into input blocks");
+  }
 }
 
 function resolvedAttachmentPaths(
@@ -3625,11 +3631,7 @@ function validateRunInputRequest(request: RunInputRequest): void {
         if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
           throw new Error("attachment entries must be objects");
         }
-        assertOnlyKeys(
-          attachment as Record<string, unknown>,
-          ["path", "name", "mime_type", "url"],
-          "attachment",
-        );
+        assertClosedAttachment(attachment as Record<string, unknown>);
       }
     }
   } catch (error) {
@@ -3719,11 +3721,7 @@ function validateRunRequest(request: RunRequest): void {
       if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
         throw new Error("attachment entries must be objects");
       }
-      assertOnlyKeys(
-        attachment as Record<string, unknown>,
-        ["path", "name", "mime_type", "url"],
-        "attachment",
-      );
+      assertClosedAttachment(attachment as Record<string, unknown>);
     }
   }
   if (
@@ -3786,48 +3784,22 @@ function assertMaximumLength(value: string, maximum: number, name: string): void
   if (value.length > maximum) throw new Error(`${name} must contain at most ${maximum} characters`);
 }
 
-const MAX_MODEL_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_MODEL_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
-
 async function buildPrompt(request: RunRequest, signal?: AbortSignal): Promise<UserMessage> {
   let content: string | Array<TextContent | ImageContent> = typeof request.input === "string"
     ? request.input
     : addUntrustedImageNotices(request.input, "user_input");
   if (request.attachments?.length) {
     const blocks: Array<TextContent | ImageContent> = typeof content === "string" ? [{ type: "text", text: content }] : content.slice();
-    let imageBytes = 0;
     for (const attachment of request.attachments) {
       if (signal?.aborted) throw abortError();
-      if (attachment.path && attachment.mime_type?.startsWith("image/")) {
-        const path = resolveWorkspacePath(request.workspace, attachment.path);
-        const selected = await readRegularFileRange(
-          path,
-          0,
-          MAX_MODEL_IMAGE_BYTES,
-          signal,
-          MAX_MODEL_IMAGE_BYTES,
-        );
-        imageBytes += selected.buffer.length;
-        if (imageBytes > MAX_MODEL_IMAGE_TOTAL_BYTES) {
-          throw new Error(`Model image attachments exceed ${MAX_MODEL_IMAGE_TOTAL_BYTES} bytes in total`);
-        }
-        blocks.push({ type: "text", text: untrustedImageNotice("attachment") });
-        blocks.push({
-          type: "image",
-          data: selected.buffer.toString("base64"),
-          mimeType: attachment.mime_type,
-        });
-      } else {
-        blocks.push({
-          type: "text",
-          text: frameUntrustedText("attachment.metadata", JSON.stringify({
-            mime_type: attachment.mime_type ?? null,
-            name: attachment.name ?? null,
-            path: attachment.path ?? null,
-            url: attachment.url ?? null,
-          })),
-        });
-      }
+      blocks.push({
+        type: "text",
+        text: frameUntrustedText("attachment.metadata", JSON.stringify({
+          mime_type: attachment.mime_type ?? null,
+          name: attachment.name ?? null,
+          path: attachment.path ?? null,
+        })),
+      });
     }
     content = blocks;
   }

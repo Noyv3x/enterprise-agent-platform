@@ -682,8 +682,6 @@ OAUTH_CREDENTIAL_EXPORT_KIND = "agent-platform.oauth-credentials"
 OAUTH_CREDENTIAL_EXPORT_VERSION = 1
 PLATFORM_SETTING_PUBLIC_BASE_URL = "platform_public_base_url"
 PLATFORM_SETTING_TRUSTED_PROXY = "platform_trusted_proxy"
-PLATFORM_SETTING_HOST = "platform_host"
-PLATFORM_SETTING_PORT = "platform_port"
 PLATFORM_SETTING_SESSION_TTL = "platform_session_ttl_seconds"
 BRANDING_CONFIG_SETTING = "ui_branding_v1"
 BRANDING_LOGO_SETTING = "ui_branding_logo_v1"
@@ -2680,8 +2678,6 @@ class EnterpriseService:
 
     def platform_security_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        desired_host = self.get_setting(PLATFORM_SETTING_HOST) or self.config.host
-        desired_port = self._desired_platform_port()
         public_base_url = self.public_base_url()
         admin_row = self.db.query_one("SELECT password_hash FROM users WHERE username = ?", ("admin",))
         admin_default_password_active = bool(admin_row and verify_password("admin", str(admin_row["password_hash"])))
@@ -2699,11 +2695,8 @@ class EnterpriseService:
                 "public_base_url": public_base_url,
                 "secure_cookie_enabled": urllib.parse.urlparse(public_base_url).scheme == "https",
                 "trusted_proxy": self.trust_forwarded_headers(),
-                "host": desired_host,
-                "port": desired_port,
                 "applied_host": self.config.host,
                 "applied_port": self.config.port,
-                "listen_restart_required": desired_host != self.config.host or desired_port != self.config.port,
                 "session_ttl_seconds": self._effective_session_ttl_seconds(),
                 "session_secret_configured": env_session_secret or bool(session_secret_row),
                 "session_secret_source": "env" if env_session_secret else ("stored" if session_secret_row else "generated"),
@@ -2724,14 +2717,8 @@ class EnterpriseService:
             self.set_setting(PLATFORM_SETTING_PUBLIC_BASE_URL, public_base_url)
         if "trusted_proxy" in body:
             self.set_setting(PLATFORM_SETTING_TRUSTED_PROXY, "1" if parse_bool(body.get("trusted_proxy")) else "0")
-        if "host" in body:
-            host = self._validate_listen_host(str(body.get("host") or ""))
-            self.set_setting(PLATFORM_SETTING_HOST, host)
-            restart_required = restart_required or host != self.config.host
-        if "port" in body:
-            port = self._validate_listen_port(body.get("port"))
-            self.set_setting(PLATFORM_SETTING_PORT, str(port))
-            restart_required = restart_required or port != self.config.port
+        if "host" in body or "port" in body:
+            raise ServiceError(400, "listen host and port are not Platform settings")
         if "session_ttl_seconds" in body:
             ttl = self._validate_session_ttl(body.get("session_ttl_seconds"))
             self.set_setting(PLATFORM_SETTING_SESSION_TTL, str(ttl))
@@ -2752,15 +2739,6 @@ class EnterpriseService:
         result["session_secret_restart_required"] = session_secret_restart_required
         return result
 
-    def _desired_platform_port(self) -> int:
-        value = self.get_setting(PLATFORM_SETTING_PORT)
-        if value:
-            try:
-                return self._validate_listen_port(value)
-            except ServiceError:
-                return int(self.config.port)
-        return int(self.config.port)
-
     @staticmethod
     def _validate_public_base_url(value: str) -> str:
         url = value.strip().rstrip("/")
@@ -2768,25 +2746,6 @@ class EnterpriseService:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ServiceError(400, "public base URL must be an http(s) URL")
         return url
-
-    @staticmethod
-    def _validate_listen_host(value: str) -> str:
-        host = value.strip()
-        if not host:
-            raise ServiceError(400, "listen host is required")
-        if len(host) > 253 or any(ch.isspace() for ch in host):
-            raise ServiceError(400, "listen host is invalid")
-        return host
-
-    @staticmethod
-    def _validate_listen_port(value: Any) -> int:
-        try:
-            port = int(value)
-        except (TypeError, ValueError) as exc:
-            raise ServiceError(400, "listen port must be an integer") from exc
-        if port < 1 or port > 65535:
-            raise ServiceError(400, "listen port must be between 1 and 65535")
-        return port
 
     @staticmethod
     def _validate_session_ttl(value: Any) -> int:
@@ -14872,10 +14831,7 @@ class EnterpriseService:
         row = self.db.query_one("SELECT value FROM settings WHERE key = ? AND secret = 1", (key,))
         if row:
             return str(row["value"])
-        return os.getenv(key, "")
-
-    def model_secret_env(self) -> dict[str, str]:
-        return {}
+        return ""
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
         provider = self._active_oauth_provider()
@@ -14909,7 +14865,7 @@ class EnterpriseService:
         found = {row["key"]: row for row in rows}
         items = []
         for key in sorted(known_keys):
-            value = found.get(key, {}).get("value") or os.getenv(key, "")
+            value = found.get(key, {}).get("value") or ""
             items.append({
                 "key": key,
                 "configured": bool(value),

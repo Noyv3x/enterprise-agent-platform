@@ -102,7 +102,7 @@ Platform 是展示品牌的唯一所有者。`ui_branding_v1` 保存 schema vers
 - `platform_trusted_proxy`
 - `platform_session_ttl_seconds`
 
-public URL、trusted proxy 和 session TTL 可影响请求处理。session TTL 的出厂默认、上下限、Cookie `Max-Age` 与活动续期规则见[安全与信任边界](../design/security-and-trust.md)；新值只作用于之后签发或续期的会话。公网 listen 和容器端口只属于 Manager，Platform 设置不能生成宿主 unit。
+public URL、trusted proxy 和 session TTL 可影响请求处理。session TTL 的出厂默认、上下限、Cookie `Max-Age` 与活动续期规则见[安全与信任边界](../design/security-and-trust.md)；新值只作用于之后签发或续期的会话。公网 listen 和容器端口只属于 Manager，Platform 安全配置只回传当前进程的 `applied_host` / `applied_port`，不持久化、不接受、也不假装能重启后改绑 listen。
 
 ### Runtime 与模型
 

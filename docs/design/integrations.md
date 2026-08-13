@@ -19,7 +19,7 @@
 
 ## 模型 OAuth
 
-平台提供 Codex OAuth 和 Grok OAuth。Codex 使用设备码流程；Grok 使用浏览器授权后粘贴 callback URL 的流程。Python 完成 OAuth 会话、state/PKCE 校验、token 交换、刷新、导入导出和持久化。这些供应商 refresh token 的寿命独立于浏览器登录 Cookie；浏览器会话续期不能刷新 OAuth、Telegram 或邮箱凭据，这些凭据失效也不能单独使浏览器登录过期。
+平台提供 Codex OAuth 和 Grok OAuth。Codex 使用设备码流程；Grok 使用浏览器授权后粘贴 callback URL 的流程。Python 完成 OAuth 会话、state/PKCE 校验、token 交换、刷新、导入导出和持久化。这些供应商 refresh token 的寿命独立于浏览器登录 Cookie；浏览器会话续期不能刷新 OAuth、Telegram 或邮箱凭据，这些凭据失效也不能单独使浏览器登录过期。OAuth 与 Firecrawl 等产品 secret 只从 Platform secret 行读取，不以进程环境双读。
 
 Runtime 的锁定 Pi 元数据是可执行模型的唯一能力目录，OAuth 成功后供应商返回的账号目录是可用性的唯一来源。两个集合必须求交：供应商结果不能创造 Runtime 不认识的模型，Runtime 清单也不能补入账号目录没有返回的模型。当前凭据从未成功发现目录时返回不可用；同一凭据最近一次成功目录可以带 stale 标志继续使用。文档和产品代码不得硬编码动态模型 ID、退役名单或默认版本。
 

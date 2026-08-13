@@ -124,7 +124,7 @@ Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理�
 
 ## 凭据与敏感数据
 
-OAuth refresh token、邮箱应用密码、session secret、内部 token 和其它 secret 保存在 Platform SQLite 的专用凭据表或 `settings` 表，并只返回“已配置”状态；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。
+OAuth refresh token、邮箱应用密码、session secret、内部 token 和其它 secret 保存在 Platform SQLite 的专用凭据表或 `settings` 表，并只返回“已配置”状态；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。读取这些 secret 只查对应 settings 行；进程环境不是第二套凭据库。新库可以把 Manager 注入的 session secret 一次性写入该行，之后只读持久化值。
 
 Sylver Lining 工作平台的 Personal API Token 使用每用户专用凭据行，并只接受可安全放入 Bearer header 的非空可见 ASCII。出站 origin 固定为代码锁定的官方 HTTPS 地址，产品请求、用户、模型和数据库内容均不能覆盖；候选 Token 必须先完成 `/api/auth/me` 验证再保存，验证失败不得覆盖既有连接。用户自助与管理员代目标账号执行的查看、验证、连接、重连和断开使用独立闭世界接口，并按目标本地用户从入口起共享同一串行锁；目标用户 ID 只来自管理员路由 path，普通成员在任何远端请求前收到拒绝。管理员保存采用“远端身份预览—本地目标与远端身份明确确认—再次验证后提交”流程，确认必须携带预览中的远端用户 ID，身份变化或连接竞态返回冲突，不能把一个有效但错误的 Token 静默贴到另一账号。
 

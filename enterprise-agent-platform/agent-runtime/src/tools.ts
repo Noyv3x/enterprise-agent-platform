@@ -995,18 +995,6 @@ const browserSchema = Type.Object({
   arguments: Type.Optional(browserArgumentsSchema),
 }, { additionalProperties: false });
 
-function prepareBrowserArguments(value: unknown): Static<typeof browserSchema> {
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const source = value as Record<string, unknown>;
-    if (Object.hasOwn(source, "tool") && source.tool === "browser") {
-      const prepared = { ...source };
-      delete prepared.tool;
-      return prepared as Static<typeof browserSchema>;
-    }
-  }
-  return value as Static<typeof browserSchema>;
-}
-
 const rfc3339Schema = Type.String({
   minLength: 20,
   maxLength: 40,
@@ -1666,7 +1654,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     label: "Browser",
     description: gatewayDescription("browser"),
     parameters: browserSchema,
-    prepareArguments: prepareBrowserArguments,
+
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       const browserArguments = objectValue(params.arguments);
@@ -2298,11 +2286,8 @@ export async function classifyToolCall(
     "click",
     "type",
     "press",
-    "download",
     "close",
-    "close_tab",
     "cleanup",
-    "close_session",
   ].includes(String(values.action || ""))) {
     let approval;
     try {

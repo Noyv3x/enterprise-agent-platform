@@ -8,6 +8,7 @@ import {
 import { useI18n } from "../../i18n";
 import { endpoints } from "../../lib/endpoints";
 import { registerPlatformUpdatingHandler } from "../../lib/api";
+import { PUBLIC_UPDATE_STATES } from "../../container-contract.generated";
 import type { PlatformUpdateState, PlatformUpdateStatus } from "../../types";
 import { Brand } from "../common/Brand";
 import { LanguageSelect } from "../common/LanguageSelect";
@@ -17,12 +18,7 @@ const DEFAULT_POLL_MS = 5_000;
 const MIN_POLL_MS = 750;
 const MAX_POLL_MS = 30_000;
 const STATUS_TIMEOUT_MS = 5_000;
-const KNOWN_STATES = new Set<PlatformUpdateState>([
-  "idle",
-  "waiting_for_tasks",
-  "updating",
-  "failed",
-]);
+const PUBLIC_STATES = new Set<string>(PUBLIC_UPDATE_STATES);
 
 function normalizedRetryAfter(value: unknown): number {
   const parsed = Number(value);
@@ -33,10 +29,10 @@ function normalizedRetryAfter(value: unknown): number {
 function normalizeStatus(value: unknown): PlatformUpdateStatus {
   if (!value || typeof value !== "object") throw new Error("Invalid platform update status");
   const raw = value as Record<string, unknown>;
-  const state = String(raw.state ?? raw.phase ?? "") as PlatformUpdateState;
-  if (!KNOWN_STATES.has(state)) throw new Error("Invalid platform update state");
+  const state = String(raw.state || "");
+  if (!PUBLIC_STATES.has(state)) throw new Error("Invalid platform update state");
   return {
-    state,
+    state: state as PlatformUpdateState,
     ...(typeof raw.phase === "string" ? { phase: raw.phase } : {}),
     ...(typeof raw.operation_id === "string" ? { operation_id: raw.operation_id } : {}),
     retry_after_ms: normalizedRetryAfter(raw.retry_after_ms),

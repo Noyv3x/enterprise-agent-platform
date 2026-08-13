@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { mkdir, open, rename, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { ExecutionTarget } from "./container-contract.generated.js";
+import { EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import type { SessionIdentity } from "./session-store.js";
 import { id, nowIso } from "./utils.js";
 
@@ -10,7 +10,7 @@ export const MAX_BACKGROUND_TASK_OBLIGATIONS = 256;
 
 const MAX_BACKGROUND_TASK_STATE_BYTES = 1024 * 1024;
 const PROCESS_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
-const EXECUTION_TARGETS = new Set<ExecutionTarget>(["sandbox", "host"]);
+const ALLOWED_EXECUTION_TARGETS = new Set<ExecutionTarget>(EXECUTION_TARGETS);
 
 export interface BackgroundTaskObligation {
   process_id: string;
@@ -325,7 +325,7 @@ function validateProcessId(value: unknown): asserts value is string {
 }
 
 function validateTarget(value: unknown): asserts value is ExecutionTarget {
-  if (typeof value !== "string" || !EXECUTION_TARGETS.has(value as ExecutionTarget)) {
+  if (typeof value !== "string" || !ALLOWED_EXECUTION_TARGETS.has(value as ExecutionTarget)) {
     throw new Error("Background task target must be sandbox or host");
   }
 }

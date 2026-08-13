@@ -1,7 +1,7 @@
 import { Table, Typography, type TableProps } from "antd";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useI18n } from "../../../i18n";
-import { FALLBACK_PERMISSION_GROUPS } from "../../../lib/constants";
+
 import { useStore } from "../../../store/useStore";
 import type { User } from "../../../types";
 import { CreateAccountForm } from "./CreateAccountForm";
@@ -27,7 +27,7 @@ export function AccountManagement({
   const users = useStore((state) => state.users);
   const containerRef = useRef<HTMLElement>(null);
   const [layout, setLayout] = useState<"table" | "list">("table");
-  const groups = permissionGroups.length ? permissionGroups : FALLBACK_PERMISSION_GROUPS;
+  const groups = permissionGroups;
 
   useLayoutEffect(() => {
     const container = containerRef.current;

@@ -697,15 +697,12 @@ export type ThinkingDepthOption = [value: string, label: string];
 export interface SecurityConfigValues {
   public_base_url?: string;
   trusted_proxy?: boolean;
-  host?: string;
-  port?: number | string;
   session_ttl_seconds?: number | string;
   session_secret_configured?: boolean;
   session_secret_source?: string;
   secure_cookie_enabled?: boolean;
   admin_default_password_active?: boolean;
   allow_default_admin_password?: boolean;
-  listen_restart_required?: boolean;
   applied_host?: string;
   applied_port?: number | string;
   bootstrap_password_file_exists?: boolean;

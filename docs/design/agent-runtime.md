@@ -21,6 +21,8 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 本地与 Quality 的 Runtime 测试入口把依赖亚秒真实计时的文件隔离到串行进程，其余文件才并行；完整规则见[测试与验证](../development/testing.md)。
 
+浏览器 live 调用只接受当前 schema 的 action 名，不为历史别名或 `tool` 字段做转换。附件只保留 path/name/mime 元数据；模型图片只来自已经内联的 input block。执行 target 闭世界只使用生成契约中的 `sandbox|host`。
+
 ## Run 状态机
 
 顶层 Run 先进入 FIFO 并发队列，再依次经历 `queued`、`running` 和一个终态。终态为 `completed`、`failed`、`cancelled` 或 `needs_review`。只有顶层 Run 消耗全局并发名额；委派子 Run 共享父 Run 的执行槽、Sandbox 与工作区，但保持派生 scope、独立 session 和事件。

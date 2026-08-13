@@ -4,11 +4,11 @@
    never trigger a render (the store notifies subscribers). Endpoint → state
    mapping preserves the established ordering and guards (loadInitial fan-out,
    channel-switch race guard, mergePendingMessages,
-   mention-error swallow, token-usage day re-sync, audit ordering, Promise.all
+   token-usage day re-sync, audit ordering, Promise.all
    batches).
    ===================================================================== */
 
-import { api, isApiRequestCancelled } from "../lib/api";
+import { api } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
@@ -35,7 +35,6 @@ import type {
   Id,
   KnowledgeConfigResponse,
   KnowledgeStatusResponse,
-  MentionTargetsResponse,
   Message,
   OAuthProvidersResponse,
   PermissionGroupsResponse,
@@ -173,20 +172,6 @@ export async function loadChannels(store: AppStore): Promise<void> {
   const state = store.getState();
   if (!state.activeChannelId && state.channels.length) {
     store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: state.channels[0].id });
-  }
-}
-
-export async function loadMentionTargets(store: AppStore): Promise<void> {
-  try {
-    const result = await api<MentionTargetsResponse>(endpoints.mentionTargets.path());
-    store.dispatch({ type: "SET_MENTION_TARGETS", payload: result.targets || [] });
-  } catch (error) {
-    // A session reset invalidates the whole response, including this fallback.
-    // Re-throw so an outgoing account's cancelled loader cannot clear data that
-    // already belongs to the newly authenticated account.
-    if (isApiRequestCancelled(error)) throw error;
-    // Mention autocomplete is best-effort; never block hydration on it.
-    store.dispatch({ type: "SET_MENTION_TARGETS", payload: [] });
   }
 }
 
@@ -603,19 +588,6 @@ export async function loadTokenUsage(store: AppStore): Promise<void> {
 }
 
 /* --------------------------------------------------------- orchestrators */
-
-export async function loadSettings(store: AppStore): Promise<void> {
-  await Promise.all([
-    loadSecrets(store),
-    loadRuntime(store),
-    loadSecurityConfig(store),
-    loadAgentRuntimeConfig(store),
-    loadTelegramConfig(store),
-    loadAutoUpdateConfig(store),
-    loadKnowledgeAdmin(store),
-    loadOAuthProviders(store),
-  ]);
-}
 
 export async function loadMessageAudit(store: AppStore): Promise<void> {
   if (!store.getState().channels.length) await loadChannels(store);

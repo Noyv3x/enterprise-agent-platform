@@ -480,9 +480,7 @@ export type SecurityConfigResponse = SecurityConfigState;
 export interface SecurityConfigUpdateRequest {
   public_base_url: string;
   trusted_proxy: boolean;
-  host: string;
   /** raw input strings — backend parses; do not coerce to number. */
-  port: string;
   session_ttl_seconds: string;
   session_secret: string;
 }

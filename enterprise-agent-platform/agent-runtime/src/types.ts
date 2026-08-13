@@ -54,7 +54,6 @@ export interface AttachmentRequest {
   path?: string;
   name?: string;
   mime_type?: string;
-  url?: string;
 }
 
 export interface RunMetadata extends JsonObject {

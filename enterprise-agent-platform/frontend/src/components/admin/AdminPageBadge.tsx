@@ -17,7 +17,6 @@ export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): numbe
     security.secure_cookie_enabled === false,
     security.admin_default_password_active,
     security.allow_default_admin_password,
-    security.listen_restart_required,
   ].filter(Boolean).length;
 
   switch (pageId) {

@@ -1,6 +1,6 @@
 /* <SecuritySettings/> — public-facing security config form and read-only status board.
 
-   Numbers (port / session_ttl_seconds) are kept as STRING state and sent raw —
+   Numbers (session_ttl_seconds) are kept as STRING state and sent raw —
    the backend parses them; coercing to Number would change the payload. The
    session secret is never seeded (empty = keep existing) and clears after save.
    Form state re-seeds whenever the loaded securityConfig object changes (initial
@@ -22,8 +22,6 @@ import { LANAccessSettings } from "./LANAccessSettings";
 interface SecurityFormState {
   publicBaseUrl: string;
   trustedProxy: boolean;
-  host: string;
-  port: string;
   sessionTtl: string;
   sessionSecret: string;
 }
@@ -32,8 +30,6 @@ function seedForm(security: SecurityConfigValues): SecurityFormState {
   return {
     publicBaseUrl: security.public_base_url || "",
     trustedProxy: !!security.trusted_proxy,
-    host: security.host || "127.0.0.1",
-    port: String(security.port || 8765),
     sessionTtl: String(security.session_ttl_seconds || 7 * 24 * 60 * 60),
     sessionSecret: "",
   };
@@ -54,10 +50,6 @@ export function SecuritySettings() {
   const publicUrlHintId = useId();
   const trustedProxyLabelId = useId();
   const trustedProxyHintId = useId();
-  const hostId = useId();
-  const hostHintId = useId();
-  const portId = useId();
-  const portHintId = useId();
   const sessionTtlId = useId();
   const sessionTtlHintId = useId();
   const sessionSecretId = useId();
@@ -80,8 +72,6 @@ export function SecuritySettings() {
     void saveSecurityConfig(store, {
       public_base_url: form.publicBaseUrl,
       trusted_proxy: form.trustedProxy,
-      host: form.host,
-      port: form.port,
       session_ttl_seconds: form.sessionTtl,
       session_secret: form.sessionSecret,
     });
@@ -126,35 +116,6 @@ export function SecuritySettings() {
               <span id={trustedProxyHintId}>{t("admin.security.trustProxyHint")}</span>
             </div>
           </div>
-          <Field label={t("admin.security.host")}>
-            <div className="field-stack">
-              <Input
-                id={hostId}
-                aria-label={t("admin.security.host")}
-                value={form.host}
-                placeholder="127.0.0.1"
-                aria-describedby={hostHintId}
-                onChange={(event) => setForm((prev) => ({ ...prev, host: event.target.value }))}
-              />
-              <div className="field-help" id={hostHintId}>{t("admin.security.appliedRestartHint", { value: security.applied_host || "-" })}</div>
-            </div>
-          </Field>
-          <Field label={t("admin.security.port")}>
-            <div className="field-stack">
-              <Input
-                id={portId}
-                aria-label={t("admin.security.port")}
-                type="number"
-                min="1"
-                max="65535"
-                step="1"
-                value={form.port}
-                aria-describedby={portHintId}
-                onChange={(event) => setForm((prev) => ({ ...prev, port: event.target.value }))}
-              />
-              <div className="field-help" id={portHintId}>{t("admin.security.appliedRestartHint", { value: security.applied_port || "-" })}</div>
-            </div>
-          </Field>
           <Field label={t("admin.security.sessionTtl")}>
             <div className="field-stack">
               <Input
@@ -226,10 +187,8 @@ export function SecuritySettings() {
         />
         <StatusRow
           label={t("admin.security.listenAddress")}
-          ok={!security.listen_restart_required}
-          value={`${security.applied_host || "-"}:${security.applied_port || "-"}${
-            security.listen_restart_required ? t("admin.security.pendingRestartSuffix") : ""
-          }`}
+          ok={Boolean(security.applied_host && security.applied_port)}
+          value={`${security.applied_host || "-"}:${security.applied_port || "-"}`}
         />
         <StatusRow
           label={t("admin.security.bootstrapFile")}

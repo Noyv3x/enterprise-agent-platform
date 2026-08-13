@@ -17,12 +17,12 @@ import {
   loadKnowledgeAdmin,
   loadKnowledgeStatus,
   loadMessageAudit,
+  loadOAuthProviders,
   loadPrivateConversations,
   loadPrivateMessages,
   loadRuntime,
   loadSessionBootstrap,
   loadSecrets,
-  loadSettings,
   loadTelegramConfig,
   loadTokenUsage,
   loadUsers,
@@ -310,8 +310,7 @@ export async function saveSecurityConfig(
   });
 }
 
-/** Save the platform-owned Agent runtime settings, then refresh all dependent
- * runtime and model state. */
+/** Save the platform-owned Agent runtime settings, then refresh Runtime and OAuth catalogs. */
 export async function saveAgentRuntimeConfig(
   store: AppStore,
   body: AgentRuntimeConfigUpdateRequest,
@@ -320,7 +319,7 @@ export async function saveAgentRuntimeConfig(
   await runBusy(store, "admin:agent-runtime:save", async () => {
     await api(endpoints.updateAgentRuntimeConfig.path(), { method: "PUT", body: JSON.stringify(body) });
     onSuccess?.();
-    await loadSettings(store);
+    await Promise.all([loadAgentRuntimeConfig(store), loadOAuthProviders(store)]);
     toast(t("admin.toast.agentRuntimeSaved"), { type: "ok", title: t("admin.toast.complete") });
   });
 }

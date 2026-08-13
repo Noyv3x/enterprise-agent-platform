@@ -498,7 +498,7 @@ test("browser schema omits unsupported interactions and download deletion", () =
   assert.match(browser.description, /put url, tab_id, ref, selector, text.*inside arguments/);
 });
 
-test("browser prepares only its exact redundant tool discriminator before strict validation", () => {
+test("browser live arguments reject extra tool and identity fields", () => {
   const tools = createTools({
     runId: "run",
     request: {} as never,
@@ -509,45 +509,32 @@ test("browser prepares only its exact redundant tool discriminator before strict
     markSideEffect: () => undefined,
   });
   const browser = tools.find((tool) => tool.name === "browser");
-  assert.ok(browser?.prepareArguments);
+  assert.ok(browser);
+  assert.equal(browser.prepareArguments, undefined);
 
-  const redundant = {
-    tool: "browser",
+  const valid = {
     action: "navigate",
     arguments: { url: "https://example.com/" },
   };
-  const prepared = browser.prepareArguments(redundant);
-  assert.deepEqual(prepared, {
-    action: "navigate",
-    arguments: { url: "https://example.com/" },
-  });
   assert.doesNotThrow(() => validateToolArguments(
     browser,
-    { ...fauxToolCall("browser", redundant), arguments: prepared },
+    { ...fauxToolCall("browser", valid), arguments: valid },
   ));
 
-  const mismatched = { ...redundant, tool: "web" };
-  assert.equal(browser.prepareArguments(mismatched), mismatched);
-  const preparedMismatch = browser.prepareArguments(mismatched);
+  const withToolField = { ...valid, tool: "browser" };
   assert.throws(
     () => validateToolArguments(
       browser,
-      { ...fauxToolCall("browser", mismatched), arguments: preparedMismatch as Record<string, unknown> },
+      { ...fauxToolCall("browser", withToolField), arguments: withToolField },
     ),
     /root: must not have additional properties/,
   );
 
-  const injectedIdentity = { ...redundant, user_id: "other-user" };
-  const preparedIdentity = browser.prepareArguments(injectedIdentity);
-  assert.deepEqual(preparedIdentity, {
-    action: "navigate",
-    arguments: { url: "https://example.com/" },
-    user_id: "other-user",
-  });
+  const injectedIdentity = { ...valid, user_id: "other-user" };
   assert.throws(
     () => validateToolArguments(
       browser,
-      { ...fauxToolCall("browser", injectedIdentity), arguments: preparedIdentity },
+      { ...fauxToolCall("browser", injectedIdentity), arguments: injectedIdentity },
     ),
     /root: must not have additional properties/,
   );
