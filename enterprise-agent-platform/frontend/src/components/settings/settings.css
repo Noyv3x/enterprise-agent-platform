@@ -9,12 +9,17 @@
   gap: 20px;
 }
 
-.notification-setting .ant-typography {
+.notification-setting .eap-typography {
   margin-bottom: 0;
 }
 
 .account-identity {
   padding: 0;
+  overflow: hidden;
+  border-color: var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
 }
 
 .account-identity__body {
@@ -54,6 +59,11 @@
 
 .settings-card {
   padding: 0;
+  overflow: hidden;
+  border-color: var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
 }
 
 .settings-card__body {
@@ -105,8 +115,9 @@
   gap: 4px;
   padding: 20px;
   text-align: center;
-  border: 1px dashed var(--border);
-  border-radius: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
 }
 
 .mail-account-list {
@@ -121,9 +132,9 @@
   gap: 16px;
   min-width: 0;
   padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
 }
 
 .mail-account__identity {
@@ -166,9 +177,9 @@
   min-width: 0;
   margin-block: 16px;
   padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: var(--surface-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
 }
 
 .sylver-platform-identity__header {

@@ -126,6 +126,12 @@ export function KnowledgeCreateCard({
   const uploadForm = (
     <div className="knowledge-import">
       <Dragger
+        classNames={{
+          root: "knowledge-import__upload",
+          trigger: "knowledge-import__dropzone",
+          list: "knowledge-import__file-list",
+          item: "knowledge-import__file-item",
+        }}
         accept={ACCEPTED_DOCUMENTS}
         multiple
         maxCount={10}
@@ -140,9 +146,9 @@ export function KnowledgeCreateCard({
         }}
         onChange={({ fileList }) => setFiles(fileList.slice(0, 10))}
       >
-        <p className="ant-upload-drag-icon"><Icon name="upload" size={34} /></p>
-        <p className="ant-upload-text">{t("knowledge.importDrop")}</p>
-        <p className="ant-upload-hint">{t("knowledge.importFormats")}</p>
+        <p className="knowledge-import__drop-icon"><Icon name="upload" size={34} /></p>
+        <p className="knowledge-import__drop-title">{t("knowledge.importDrop")}</p>
+        <p className="knowledge-import__drop-hint">{t("knowledge.importFormats")}</p>
       </Dragger>
       <Typography.Text type={totalBytes > MAX_TOTAL_BYTES ? "danger" : "secondary"}>
         {t("knowledge.importSelection", {

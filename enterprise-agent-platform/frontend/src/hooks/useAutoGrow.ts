@@ -19,6 +19,15 @@ export function useAutoGrow(
     const animate = mounted.current;
     mounted.current = true;
 
+    // An empty textarea must keep the CSS-defined single-line baseline. Using
+    // scrollHeight here would measure a wrapped placeholder and make the blank
+    // composer several lines tall on narrow screens.
+    if (!value) {
+      el.style.removeProperty("height");
+      el.classList.remove("is-scrollable");
+      return;
+    }
+
     const previousHeight = el.getBoundingClientRect().height;
     el.style.height = "auto";
     const fullHeight = el.scrollHeight;

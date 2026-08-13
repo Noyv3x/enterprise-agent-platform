@@ -2,6 +2,8 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
@@ -10,6 +12,8 @@ import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import { TestUiProviders } from "../../test/TestUiProviders";
 import { LoginView } from "./LoginView";
+
+const designSystemStyles = readFileSync(resolve(process.cwd(), "src/design-system.css"), "utf8");
 
 describe("LoginView", () => {
   beforeEach(() => {
@@ -47,6 +51,9 @@ describe("LoginView", () => {
     expect(card).toContainElement(screen.getByRole("combobox", { name: "Language" }));
     expect(screen.getByLabelText("Username")).toBeRequired();
     expect(screen.getByLabelText("Password")).toBeRequired();
+    expect(designSystemStyles).toMatch(
+      /\.auth--login \.auth__logo\s*\{[^}]*width:\s*min\(440px, 88%\)/,
+    );
   });
 
   it("keeps failed authentication inline and submits the entered credentials", async () => {

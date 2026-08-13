@@ -36,6 +36,10 @@
   min-height: 0;
   padding: 0;
   overflow: hidden;
+  border-color: var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
 }
 
 .knowledge-browser__body {
@@ -84,14 +88,22 @@
 
 .knowledge-document-card {
   width: 100%;
-  background: color-mix(in srgb, var(--surface-2) 72%, var(--surface));
-  transition: border-color var(--t-fast), box-shadow var(--t-fast);
+  border-color: transparent;
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface-2) 70%, var(--surface));
+  box-shadow: none;
+  transition: border-color var(--t-fast), background-color var(--t-fast);
 }
 
-.knowledge-document-card:hover,
+.knowledge-document-card:hover {
+  border-color: var(--hairline);
+  background: var(--surface-2);
+}
+
 .knowledge-document-card.is-selected {
   border-color: var(--accent-line);
-  box-shadow: var(--shadow-1);
+  background: var(--accent-soft);
+  box-shadow: none;
 }
 
 .knowledge-document-card__body {
@@ -172,7 +184,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .knowledge-document-viewer__bar > span {
@@ -250,6 +262,50 @@
 .knowledge-import {
   display: grid;
   gap: 14px;
+}
+
+.knowledge-import__dropzone {
+  border-color: var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface-2);
+  transition: border-color var(--t-fast), background-color var(--t-fast);
+}
+
+.knowledge-import__dropzone:hover {
+  border-color: var(--accent-line);
+  background: color-mix(in srgb, var(--accent-soft) 38%, var(--surface-2));
+}
+
+.knowledge-import__file-list {
+  margin-top: 10px;
+}
+
+.knowledge-import__file-item {
+  border-radius: var(--r-sm);
+}
+
+.knowledge-import__drop-icon,
+.knowledge-import__drop-title,
+.knowledge-import__drop-hint {
+  margin: 0;
+}
+
+.knowledge-import__drop-icon {
+  margin-bottom: 10px;
+  color: var(--accent);
+}
+
+.knowledge-import__drop-title {
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.knowledge-import__drop-hint {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .knowledge-import__actions {

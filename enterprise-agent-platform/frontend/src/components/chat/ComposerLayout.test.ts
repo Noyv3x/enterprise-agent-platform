@@ -4,7 +4,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
-const globalStyles = readFileSync(new URL("../../styles.css", import.meta.url), "utf8");
 const chatStyles = readFileSync(new URL("./chat.css", import.meta.url), "utf8");
 
 function escapePattern(value: string): string {
@@ -34,12 +33,14 @@ function declarations(source: string, selector: string): Map<string, string> {
 
 describe("Composer layout contract", () => {
   it("lets the textarea fill the button row without intrinsic-width overflow", () => {
-    const field = declarations(globalStyles, ".composer__field");
-    const textarea = declarations(globalStyles, ".composer__field textarea");
+    const field = declarations(chatStyles, ".composer__field");
+    const textarea = declarations(chatStyles, ".composer__field textarea");
 
     expect(field.get("display")).toBe("flex");
     expect(field.get("align-items")).toBe("flex-end");
-    expect(field.get("padding")).toBe("7px");
+    expect(field.get("padding")).toBe("2px");
+    expect(field.get("border")).toBe("0");
+    expect(field.get("background")).toBe("transparent");
     expect(textarea.get("flex")).toBe("1 1 0");
     expect(textarea.get("min-width")).toBe("0");
   });
@@ -59,5 +60,18 @@ describe("Composer layout contract", () => {
     expect(coarse.get("width")).toBe("44px");
     expect(coarse.get("min-width")).toBe("44px");
     expect(coarse.get("height")).toBe("44px");
+  });
+
+  it("targets the configured Ant Design prefix for upload progress", () => {
+    expect(chatStyles).toContain(".msg-upload .eap-progress");
+    expect(chatStyles).not.toContain(".msg-upload .ant-progress");
+  });
+
+  it("removes decorative work-card sweeps and provides local reduced motion", () => {
+    const sweep = declarations(chatStyles, ".agent-work--active .agent-work__summary::after");
+
+    expect(sweep.get("display")).toBe("none");
+    expect(chatStyles).toContain("@media (prefers-reduced-motion: reduce)");
+    expect(chatStyles).toContain("transition-duration: 0.001ms !important");
   });
 });

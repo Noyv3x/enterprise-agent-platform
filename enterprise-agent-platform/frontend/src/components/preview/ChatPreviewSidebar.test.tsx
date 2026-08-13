@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   memoryRender: vi.fn(),
   skillsRender: vi.fn(),
   skillsCanManageRender: vi.fn(),
+  mobile: false,
 }));
 
 vi.mock("./usePreviewAvailability", () => ({
@@ -118,6 +119,20 @@ describe("ChatPreviewSidebar", () => {
     mocks.memoryRender.mockClear();
     mocks.skillsRender.mockClear();
     mocks.skillsCanManageRender.mockClear();
+    mocks.mobile = false;
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string): MediaQueryList => ({
+        matches: query === "(max-width: 520px)" && mocks.mobile,
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
   });
 
   afterEach(() => {
@@ -281,6 +296,31 @@ describe("ChatPreviewSidebar", () => {
 
     expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
     await waitFor(() => expect(browserButton).toHaveFocus());
+  });
+
+  it("moves focus into a full-width mobile preview and makes covered controls inert", async () => {
+    mocks.mobile = true;
+    const user = userEvent.setup();
+    renderSidebar();
+    const skillsButton = screen.getByRole("button", { name: "Open Skill manager" });
+    const chat = screen.getByText("Chat content").closest(".chat");
+    const rail = screen.getByRole("navigation", { name: "Agent side tools" });
+
+    await user.click(skillsButton);
+
+    const close = screen.getByRole("button", { name: "Close preview" });
+    await waitFor(() => expect(close).toHaveFocus());
+    expect(chat).toHaveAttribute("inert");
+    expect(chat).toHaveAttribute("aria-hidden", "true");
+    expect(rail).toHaveAttribute("inert");
+    expect(rail).toHaveAttribute("aria-hidden", "true");
+
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(skillsButton).toHaveFocus());
+    expect(chat).not.toHaveAttribute("inert");
+    expect(chat).not.toHaveAttribute("aria-hidden");
+    expect(rail).not.toHaveAttribute("inert");
   });
 
   it("keeps scheduled tasks and live previews mutually exclusive", async () => {

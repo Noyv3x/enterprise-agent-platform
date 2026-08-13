@@ -54,7 +54,10 @@
 
 .memory-card__surface {
   width: 100%;
-  background: color-mix(in srgb, var(--surface-2) 72%, var(--surface));
+  overflow: hidden;
+  border-color: var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface);
   box-shadow: var(--shadow-1);
 }
 
@@ -113,9 +116,9 @@
   display: grid;
   gap: 10px;
   padding: 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-lg);
-  background: var(--surface-2);
+  background: color-mix(in srgb, var(--surface-2) 72%, var(--surface));
 }
 
 .memory-add .eap-form-item,
@@ -147,7 +150,7 @@
 
 .memory-card.is-editing .memory-card__surface {
   border-color: var(--accent-line);
-  background: var(--surface);
+  background: color-mix(in srgb, var(--accent-soft) 24%, var(--surface));
 }
 
 .memory-card.is-blocked .memory-card__surface {

@@ -42,6 +42,9 @@ describe("KnowledgeCreateCard", () => {
     );
     const input = container.querySelector<HTMLInputElement>('input[type="file"]');
     expect(input).not.toBeNull();
+    expect(container.querySelector(".knowledge-import__dropzone")).not.toBeNull();
+    expect(container.querySelector(".knowledge-import__drop-icon")).not.toBeNull();
+    expect(container.querySelector('[class^="ant-upload-"]')).toBeNull();
     const first = new File(["# One"], "one.md", { type: "text/markdown" });
     const second = new File(["Two"], "two.txt", { type: "text/plain" });
     fireEvent.change(input!, { target: { files: [first, second] } });

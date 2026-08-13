@@ -26,27 +26,33 @@ export function AntDesignProvider({ children }: { children: ReactNode }) {
   const themeConfig = useMemo(() => {
     const palette = theme === "dark"
       ? {
-          colorBgContainer: "#191c24",
-          colorBgElevated: "#20242d",
-          colorFillAlter: "#252a35",
-          colorBorder: "#454a56",
-          colorBorderSecondary: "#2c303a",
-          colorText: "#e5e8ee",
-          colorTextSecondary: "#a3a9b4",
+          colorBgBase: "#0d0f13",
+          colorBgLayout: "#0d0f13",
+          colorBgContainer: "#181a20",
+          colorBgElevated: "#202229",
+          colorFillAlter: "#24272e",
+          colorFillSecondary: "#2a2d35",
+          colorBorder: "#3a3d46",
+          colorBorderSecondary: "#2c2f37",
+          colorText: "#f5f5f7",
+          colorTextSecondary: "#a1a1a6",
+          colorTextTertiary: "#85858b",
         }
       : {
+          colorBgBase: "#f5f7fa",
+          colorBgLayout: "#f5f7fa",
           colorBgContainer: "#ffffff",
           colorBgElevated: "#ffffff",
-          colorFillAlter: "#f2f4f7",
-          colorBorder: "#c8cdd6",
-          colorBorderSecondary: "#dde1e7",
-          colorText: "#1b2130",
-          colorTextSecondary: "#616978",
+          colorFillAlter: "#f1f3f6",
+          colorFillSecondary: "#e9ecf1",
+          colorBorder: "#d4d8df",
+          colorBorderSecondary: "#e3e6eb",
+          colorText: "#1d1d1f",
+          colorTextSecondary: "#636366",
+          colorTextTertiary: "#7c7c82",
         };
     return {
-      algorithm: theme === "dark"
-        ? [antTheme.darkAlgorithm, antTheme.compactAlgorithm]
-        : [antTheme.defaultAlgorithm, antTheme.compactAlgorithm],
+      algorithm: theme === "dark" ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
       cssVar: { prefix: "eap", key: "platform" },
       hashed: false,
       token: {
@@ -54,37 +60,81 @@ export function AntDesignProvider({ children }: { children: ReactNode }) {
         colorInfo: branding.primary_color,
         ...palette,
         borderRadius: 10,
-        borderRadiusLG: 12,
-        controlHeight: 36,
+        borderRadiusLG: 14,
+        borderRadiusSM: 8,
+        borderRadiusXS: 6,
+        controlHeight: 38,
         controlHeightLG: 44,
+        controlHeightSM: 32,
         fontSize: 14,
+        fontSizeHeading1: 30,
+        fontSizeHeading2: 24,
+        fontSizeHeading3: 20,
+        fontSizeHeading4: 17,
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif",
-        motionDurationFast: "0.12s",
+        lineHeight: 1.5,
+        lineWidth: 1,
+        motionDurationFast: "0.1s",
         motionDurationMid: "0.18s",
+        motionDurationSlow: "0.28s",
+        boxShadow: theme === "dark"
+          ? "0 10px 32px rgba(0, 0, 0, 0.38)"
+          : "0 10px 32px rgba(25, 31, 43, 0.12)",
+        boxShadowSecondary: theme === "dark"
+          ? "0 18px 56px rgba(0, 0, 0, 0.52)"
+          : "0 18px 56px rgba(25, 31, 43, 0.16)",
       },
       components: {
         Button: {
-          borderRadius: 9,
-          controlHeight: 36,
+          borderRadius: 10,
+          controlHeight: 38,
           fontWeight: 600,
+          defaultShadow: "none",
+          primaryShadow: "none",
+          dangerShadow: "none",
         },
         Card: {
-          bodyPadding: 20,
+          borderRadiusLG: 16,
+          bodyPadding: 22,
+          headerHeight: 54,
+          headerFontSize: 15,
+        },
+        Drawer: {
+          borderRadiusLG: 18,
+          paddingLG: 20,
         },
         Form: {
           itemMarginBottom: 0,
           verticalLabelPadding: "0 0 6px",
         },
+        Input: {
+          activeShadow: `0 0 0 3px color-mix(in srgb, ${branding.primary_color} 20%, transparent)`,
+          paddingBlock: 8,
+        },
         Menu: {
           activeBarBorderWidth: 0,
-          itemBorderRadius: 8,
+          itemBorderRadius: 10,
           itemHeight: 40,
           itemMarginInline: 0,
+        },
+        Modal: {
+          borderRadiusLG: 20,
+          padding: 22,
+        },
+        Segmented: {
+          borderRadius: 10,
+          itemSelectedBg: palette.colorBgElevated,
+          trackBg: palette.colorFillAlter,
         },
         Table: {
           cellPaddingBlockMD: 12,
           cellPaddingInlineMD: 16,
-          headerBorderRadius: 10,
+          headerBorderRadius: 12,
+          headerBg: palette.colorFillAlter,
+          rowHoverBg: palette.colorFillAlter,
+        },
+        Tooltip: {
+          borderRadius: 8,
         },
       },
     };

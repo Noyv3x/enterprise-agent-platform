@@ -1,5 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Badge, Button, Tooltip } from "antd";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { AgentPreviewScope } from "../../types";
@@ -51,8 +52,10 @@ export function ChatPreviewSidebar({
   const tasksButton = useRef<HTMLButtonElement>(null);
   const browserButton = useRef<HTMLButtonElement>(null);
   const terminalButton = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
   const previousOpen = useRef<SidePanelKind | null>(null);
   const browserControlSequence = useRef(0);
+  const fullWidthPreview = useMediaQuery("(max-width: 520px)");
   const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
   const browserActive = !!scope && state.browserActive;
   const browserIntentCurrent = Boolean(scopeKey) && browserIntentScopeKey === scopeKey;
@@ -74,6 +77,7 @@ export function ChatPreviewSidebar({
     || (openPreview === "browser" && browserVisible)
     || (openPreview === "terminal" && terminalActive)
   ) ? openPreview : null;
+  const mobilePreviewOpen = fullWidthPreview && visiblePreview !== null;
 
   useEffect(() => {
     setOpenPreview(null);
@@ -117,6 +121,12 @@ export function ChatPreviewSidebar({
       else document.querySelector<HTMLElement>(".composer textarea")?.focus();
     });
   }, [openPreview]);
+
+  useEffect(() => {
+    if (!mobilePreviewOpen) return;
+    const frame = requestAnimationFrame(() => closeButton.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [mobilePreviewOpen, visiblePreview]);
 
   const closePreview = useCallback(() => {
     setOpenPreview(null);
@@ -243,10 +253,21 @@ export function ChatPreviewSidebar({
   return (
     <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
       <ChatPreviewContext.Provider value={previewContext}>
-        <div className="chat">{children}</div>
+        <div
+          className="chat"
+          inert={mobilePreviewOpen}
+          aria-hidden={mobilePreviewOpen || undefined}
+        >
+          {children}
+        </div>
       </ChatPreviewContext.Provider>
       {hasPreviews ? (
-        <nav className="chat-preview__rail" aria-label={t("preview.sidebarLabel")}>
+        <nav
+          className="chat-preview__rail"
+          aria-label={t("preview.sidebarLabel")}
+          inert={mobilePreviewOpen}
+          aria-hidden={mobilePreviewOpen || undefined}
+        >
           {memoryActive ? (
             <Tooltip title={t("memory.open")} placement="left">
               <Button
@@ -353,6 +374,7 @@ export function ChatPreviewSidebar({
             </div>
             <Tooltip title={t("preview.close")}>
               <Button
+                ref={closeButton}
                 className="chat-preview__close"
                 type="text"
                 shape="circle"

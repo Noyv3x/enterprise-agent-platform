@@ -27,11 +27,20 @@
   align-items: center;
   gap: 8px;
   padding: 12px 6px;
-  border-left: 1px solid var(--line);
-  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border-left: 1px solid var(--hairline);
+  background: var(--surface);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+
+@supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .chat-preview__rail {
+    background: color-mix(in srgb, var(--surface) 82%, transparent);
+    -webkit-backdrop-filter: saturate(145%) blur(18px);
+    backdrop-filter: saturate(145%) blur(18px);
+  }
+}
+
 
 .chat-preview__toggle {
   position: relative;
@@ -39,17 +48,17 @@
   height: 40px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface-2) 72%, var(--surface));
   color: var(--muted);
   cursor: pointer;
-  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast), transform var(--t-fast);
+  transition: background-color var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
 
 .chat-preview__toggle.chat-preview__toggle {
-  border-color: var(--line);
-  background: var(--surface-2);
+  border-color: var(--hairline);
+  background: color-mix(in srgb, var(--surface-2) 72%, var(--surface));
   color: var(--muted);
 }
 
@@ -62,8 +71,6 @@
   background: var(--surface-3);
   color: var(--ink);
 }
-
-.chat-preview__toggle:active { transform: translateY(.5px); }
 
 .chat-preview__toggle.chat-preview__toggle.is-active {
   border-color: var(--accent-line);
@@ -104,9 +111,9 @@
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  border-left: 1px solid var(--line-strong);
+  border-left: 1px solid var(--hairline);
   background: var(--surface);
-  box-shadow: -12px 0 30px -24px color-mix(in srgb, var(--ink) 35%, transparent);
+  box-shadow: -12px 0 30px -24px color-mix(in srgb, var(--ink) 28%, transparent);
   overflow: hidden;
   contain: layout paint;
 }
@@ -119,8 +126,8 @@
   justify-content: space-between;
   gap: 12px;
   padding: 11px 13px 11px 15px;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--surface) 90%, var(--surface-2));
 }
 
 .chat-preview__heading {
@@ -136,8 +143,8 @@
   display: grid;
   place-items: center;
   flex: none;
-  border: 1px solid var(--accent-line);
-  border-radius: var(--r-sm);
+  border: 1px solid color-mix(in srgb, var(--accent-line) 68%, var(--hairline));
+  border-radius: var(--r-md);
   background: var(--accent-soft);
   color: var(--accent-soft-ink);
 }
@@ -213,7 +220,7 @@
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  border-color: var(--line);
+  border-color: var(--hairline);
   color: var(--muted);
   font-size: 11px;
   line-height: 20px;
@@ -229,7 +236,7 @@
   min-height: 300px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--line);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-lg);
   background: var(--surface);
 }
@@ -244,7 +251,7 @@
 .browser-preview__window {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--line-strong);
+  border: 1px solid color-mix(in srgb, var(--line-strong) 84%, transparent);
   border-radius: var(--r-lg);
   background: hsl(222 13% 11%);
   box-shadow: var(--shadow-2);
@@ -428,7 +435,7 @@
   display: grid;
   grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
-  border: 1px solid var(--line-strong);
+  border: 1px solid color-mix(in srgb, var(--line-strong) 84%, transparent);
   border-radius: var(--r-lg);
   background: hsl(222 15% 9%);
   box-shadow: var(--shadow-2);
@@ -728,8 +735,10 @@
   .terminal-preview__output { padding-inline: 13px; font-size: 11.5px; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .preview-status__indicator::after {
-    animation: none;
+@media (prefers-reduced-transparency: reduce) {
+  .chat-preview__rail {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
 }

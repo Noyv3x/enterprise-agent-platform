@@ -1,10 +1,8 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
-import "./styles.css";
 import "./design-system.css";
 import "./components/ui/platform-components.css";
-import "./styles/workspace-modern.css";
 
 const root = document.getElementById("react-root");
 if (!root) {

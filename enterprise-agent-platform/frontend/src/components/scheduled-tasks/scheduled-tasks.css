@@ -43,7 +43,7 @@
   justify-items: center;
   gap: 10px;
   min-height: 220px;
-  border: 1px dashed var(--line);
+  border: 1px dashed var(--line-strong);
   border-radius: var(--r-lg);
   color: var(--muted);
   font-size: 13px;
@@ -60,17 +60,17 @@
 }
 
 .schedule-card__surface.eap-card {
-  border-color: var(--line);
+  overflow: hidden;
+  border-color: var(--hairline);
   border-radius: var(--r-lg);
   background: var(--surface);
-  box-shadow: none;
-  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+  box-shadow: var(--shadow-1);
+  transition: border-color var(--t-fast), background-color var(--t-fast);
 }
 
 .schedule-card__surface.eap-card:hover {
   border-color: var(--accent-line);
-  box-shadow: var(--shadow-1);
-  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--accent-soft) 14%, var(--surface));
 }
 
 .schedule-card__body {
@@ -126,16 +126,6 @@
   font-size: 11.5px;
 }
 
-.schedule-status.is-running .eap-badge-status-dot,
-.schedule-run__status.is-running .eap-badge-status-dot {
-  animation: schedule-pulse 1.7s ease-out infinite;
-}
-
-@keyframes schedule-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 36%, transparent); }
-  50% { box-shadow: 0 0 0 4px transparent; }
-}
-
 .schedule-card__prompt.eap-typography {
   margin: 0;
   color: var(--ink);
@@ -145,7 +135,7 @@
 
 .schedule-card__facts.eap-descriptions {
   padding: 10px 12px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   background: var(--surface-2);
 }
@@ -183,7 +173,7 @@
   flex-wrap: wrap;
   margin-top: auto;
   padding-top: 4px;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--hairline);
 }
 
 .schedule-runs {
@@ -200,9 +190,9 @@
   gap: 8px;
   min-width: 0;
   padding: 12px 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--hairline);
   border-radius: var(--r-md);
-  background: var(--surface);
+  background: var(--surface-2);
 }
 
 .schedule-run__times {
