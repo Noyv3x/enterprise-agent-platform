@@ -96,7 +96,7 @@ Agent 自主执行回归还必须覆盖：`process.wait` 的自然成功、非�
 
 委派安全测试还必须覆盖 child 写入后父直接结束被阻止、父执行后续聚焦验证才放行、纯只读 child 不阻止、batch 任一 child 有副作用即触发复验、嵌套子 Agent 共享根树总创建预算，以及全局 admission 饱和立即拒绝且取消已启动 child 能释放名额；不能把每层独立计数或模型 metadata 当作可信预算。
 
-涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。使用亚秒真实计时器、或与这些断言共享 waitUntil/deadline 窗口的文件，必须由 Runtime 测试入口放进独立的 `--test-concurrency=1` 进程；其余编译后的 `*.test.js` 才允许有界并行。Quality 与顶层 `test.sh` 都只通过 `npm run test:compiled` 跑这一次完整入口，不得再开第二套并发 suite 来模拟压力。串行名单是闭世界：名单中的文件必须存在于编译产物，其余 `*.test.js` 自动进入并行进程；新增亚秒墙钟用例必须先加入该名单。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。使用亚秒真实计时器、或与这些断言共享 waitUntil/deadline 窗口的文件，必须由 Runtime 测试入口放进独立的 `--test-concurrency=1` 进程；其余编译后的 `*.test.js` 才允许有界并行。Quality 与顶层 `test.sh` 都只通过 `npm run test:compiled` 跑这一次完整入口，不得再开第二套并发 suite 来模拟压力。串行名单是闭世界：名单中的文件必须存在于编译产物，其余 `*.test.js` 自动进入并行进程；新增亚秒墙钟用例必须先加入该名单。证明“活动不被空闲守卫误杀”时，测试空闲窗口必须大于 runner 调度抖动，不能用几十毫秒的空隙去当产品语义。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
 
 ## 前端
 

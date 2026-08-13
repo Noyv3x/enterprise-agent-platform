@@ -6,6 +6,9 @@ import { RunCoordinator } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
+/** Wide enough that CI scheduling between model/tool turns is not the product idle. */
+const SURVIVES_SCHEDULER_IDLE_MS = 400;
+
 test("RunCoordinator inactivity timeout cancels a run without side effects", async () => {
   const home = await temporaryDirectory("agent-idle-timeout-");
   const workspace = await temporaryDirectory("agent-idle-timeout-workspace-");
@@ -155,13 +158,13 @@ test("active foreground terminal work can exceed the run idle duration", async (
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("terminal", {
-      command: "sleep 0.20; printf finished",
-      timeout_ms: 1_000,
+      command: "sleep 0.80; printf finished",
+      timeout_ms: 2_000,
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("terminal complete"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 50 }),
+    config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS }),
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -178,7 +181,7 @@ test("active foreground terminal work can exceed the run idle duration", async (
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "terminal complete");
-    assert.ok(Date.now() - started >= 120, "the run should outlive the configured idle window while active");
+    assert.ok(Date.now() - started >= SURVIVES_SCHEDULER_IDLE_MS, "the run should outlive the configured idle window while active");
     assert.equal(
       coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
       false,
@@ -211,7 +214,7 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
     fauxAssistantMessage("background task complete"),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 50 }),
+    config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS }),
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -224,7 +227,7 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "background task complete");
-    assert.ok(Date.now() - started >= 150, "the process wait should outlive the idle window");
+    assert.ok(Date.now() - started >= 150, "the process wait should outlive the previous 50 ms idle window");
     assert.equal(
       coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
       false,
@@ -293,7 +296,7 @@ test("background terminal output does not keep a later hung model turn active", 
     }),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 80 }),
+    config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS }),
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -427,7 +430,7 @@ test("inactivity after a completed side effect marks the run needs_review", asyn
     }),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 60 }),
+    config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS }),
     streamFn: faux.provider.streamSimple,
   });
   try {
@@ -440,7 +443,7 @@ test("inactivity after a completed side effect marks the run needs_review", asyn
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.idleTimedOut, true);
     assert.equal(completed.sideEffectsStarted, true);
-    assert.match(completed.error || "", /idle timeout 60 ms/);
+    assert.match(completed.error || "", new RegExp(`idle timeout ${SURVIVES_SCHEDULER_IDLE_MS} ms`));
     assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.needs_review"));
   } finally {
     coordinator.shutdown();
@@ -515,7 +518,7 @@ test("external cancellation cannot be reclassified as an idle timeout during cle
     async () => await new Promise<never>(() => undefined),
   ]);
   const coordinator = new RunCoordinator({
-    config: testConfig(home, { runIdleTimeoutMs: 50, cleanupGraceMs: 120 }),
+    config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS, cleanupGraceMs: 200 }),
     streamFn: faux.provider.streamSimple,
   });
   try {
