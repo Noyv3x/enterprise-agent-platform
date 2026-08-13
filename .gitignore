@@ -49,3 +49,6 @@ tmp/
 temp/
 *.log
 /manager/agent-platform-manager
+
+# Local Grok session and workflow files
+.grok/

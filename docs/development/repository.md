@@ -18,7 +18,7 @@
 └── scripts/                       # 文档同步与仓库工具
 ```
 
-运行数据库、日志、OAuth token、附件、workspace、生成的托管配置和 Runtime 状态位于平台数据目录，不属于仓库。
+运行数据库、日志、OAuth token、附件、workspace、生成的托管配置和 Runtime 状态位于平台数据目录，不属于仓库。本地 `.grok/` 会话与 workflow 文件也不属于产品源码。
 
 ## 文档权威
 
