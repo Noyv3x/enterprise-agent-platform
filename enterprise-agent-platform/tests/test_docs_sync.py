@@ -55,7 +55,6 @@ class DocsSyncTests(unittest.TestCase):
     def manifest() -> dict[str, object]:
         return {
             "version": 3,
-            "forbidden_top_level_files": ["CLAUDE.md"],
             "coverage": {
                 "code_include": [
                     ".gitignore",
@@ -477,15 +476,10 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("target must not be executable", executable.stderr)
         self.run_command("sync", expect=0)
 
-    def test_check_rejects_forbidden_file_broken_link_and_unmapped_code(self) -> None:
+    def test_check_rejects_broken_link_and_unmapped_code(self) -> None:
         self.initialize_git()
         self.write_fixture()
         self.run_command("sync", expect=0)
-
-        (self.root / "CLAUDE.md").write_text("forbidden\n", encoding="utf-8")
-        forbidden = self.run_command("check", expect=1)
-        self.assertIn("top-level instruction file is forbidden", forbidden.stderr)
-        (self.root / "CLAUDE.md").unlink()
 
         feature = self.root / "docs/design/feature.md"
         feature.write_text("# Feature\n\n[Missing](missing.md)\n", encoding="utf-8")
@@ -501,17 +495,19 @@ class DocsSyncTests(unittest.TestCase):
         unmapped = self.run_command("check", expect=1)
         self.assertIn("covered production path has no documentation domain", unmapped.stderr)
 
-    def test_manifest_cannot_remove_forbidden_file_guards(self) -> None:
+    def test_check_allows_only_the_claude_agents_compatibility_pointer(self) -> None:
         self.initialize_git()
-        self.write_fixture()
         manifest = self.manifest()
-        manifest["forbidden_top_level_files"] = ["OTHER.md"]
-        (self.root / "docs/domains.json").write_text(
-            json.dumps(manifest, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        result = self.run_command("sync", expect=1)
-        self.assertIn("must permanently forbid: claude.md", result.stderr)
+        manifest["coverage"]["document_include"].append("claude.md")  # type: ignore[index,union-attr]
+        self.manifest_domain(manifest, "documentation-governance")["documents"].append("claude.md")  # type: ignore[union-attr]
+        self.write_fixture(manifest)
+        (self.root / "claude.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        self.run_command("sync", expect=0)
+        self.run_command("check", expect=0)
+
+        (self.root / "claude.md").write_text("# Independent rules\n", encoding="utf-8")
+        invalid = self.run_command("check", expect=1)
+        self.assertIn("must contain only @AGENTS.md", invalid.stderr)
 
     def test_check_rejects_invalid_contract_bounds(self) -> None:
         self.initialize_git()
@@ -758,13 +754,21 @@ class DocsSyncTests(unittest.TestCase):
         help_result = self.run_command("check-change", "--help", expect=0)
         self.assertIn("INDEX", help_result.stdout)
 
-    def test_index_check_reads_staged_forbidden_file_after_worktree_deletion(self) -> None:
-        base = self.ready_repository()
-        forbidden = self.root / "CLAUDE.md"
-        forbidden.write_text("staged forbidden instructions\n", encoding="utf-8")
-        self.git("add", "CLAUDE.md")
-        forbidden.unlink()
+    def test_index_check_reads_staged_invalid_claude_pointer_after_worktree_repair(self) -> None:
+        self.initialize_git()
+        manifest = self.manifest()
+        manifest["coverage"]["document_include"].append("claude.md")  # type: ignore[index,union-attr]
+        self.manifest_domain(manifest, "documentation-governance")["documents"].append("claude.md")  # type: ignore[union-attr]
+        self.write_fixture(manifest)
+        compatibility = self.root / "claude.md"
+        compatibility.write_text("@AGENTS.md\n", encoding="utf-8")
+        self.run_command("sync", expect=0)
+        self.run_command("check", expect=0)
+        base = self.commit("baseline")
 
+        compatibility.write_text("# Staged independent rules\n", encoding="utf-8")
+        self.git("add", "claude.md")
+        compatibility.write_text("@AGENTS.md\n", encoding="utf-8")
         result = self.run_command(
             "check-change",
             "--base",
@@ -773,7 +777,7 @@ class DocsSyncTests(unittest.TestCase):
             "INDEX",
             expect=1,
         )
-        self.assertIn("top-level instruction file is forbidden", result.stderr)
+        self.assertIn("must contain only @AGENTS.md", result.stderr)
 
     def test_index_check_reads_staged_manifest_after_worktree_repair(self) -> None:
         base = self.ready_repository()

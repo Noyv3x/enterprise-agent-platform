@@ -28,13 +28,15 @@ from urllib.parse import unquote, urlsplit
 
 
 MANIFEST_PATH = PurePosixPath("docs/domains.json")
+CLAUDE_COMPATIBILITY_PATH = "claude.md"
+CLAUDE_COMPATIBILITY_CONTENT = "@AGENTS.md\n"
+ROOT_DOCUMENT_PATHS = {"AGENTS.md", CLAUDE_COMPATIBILITY_PATH}
 REQUIRED_RUNTIME_POLICIES = {
     "run_idle_timeout",
     "max_turns_per_run",
     "terminal_timeout",
     "process_wait_timeout",
 }
-REQUIRED_FORBIDDEN_TOP_LEVEL_FILES = {"claude.md"}
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 DOMAIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 ZERO_SHA_RE = re.compile(r"^0+$")
@@ -136,7 +138,6 @@ class Coverage:
 @dataclass(frozen=True)
 class Manifest:
     version: int
-    forbidden_top_level_files: tuple[str, ...]
     coverage: Coverage
     domains: tuple[Domain, ...]
     contracts: tuple[Contract, ...]
@@ -368,27 +369,11 @@ def load_manifest(root: Path) -> Manifest:
     )
     _reject_unknown_keys(
         raw,
-        {"version", "forbidden_top_level_files", "coverage", "domains", "contracts"},
+        {"version", "coverage", "domains", "contracts"},
         "documentation manifest",
     )
     if raw.get("version") != 3:
         raise DocsSyncError("documentation manifest version must be 3")
-
-    forbidden = _expect_string_list(
-        raw.get("forbidden_top_level_files"),
-        "forbidden_top_level_files",
-    )
-    for path in forbidden:
-        if "/" in path or "\\" in path:
-            raise DocsSyncError("forbidden_top_level_files may contain only top-level file names")
-    missing_guards = REQUIRED_FORBIDDEN_TOP_LEVEL_FILES - {
-        path.casefold() for path in forbidden
-    }
-    if missing_guards:
-        raise DocsSyncError(
-            "forbidden_top_level_files must permanently forbid: "
-            + ", ".join(sorted(missing_guards))
-        )
 
     coverage_raw = _expect_object(raw.get("coverage"), "coverage")
     _reject_unknown_keys(
@@ -460,9 +445,9 @@ def load_manifest(root: Path) -> Manifest:
         )
         for document in documents:
             _reject_symlink_chain(root, document, f"{label}.document")
-            if document != "AGENTS.md" and not _is_beneath(document, "docs"):
+            if document not in ROOT_DOCUMENT_PATHS and not _is_beneath(document, "docs"):
                 raise DocsSyncError(
-                    f"{label}.documents must stay under docs/ (except behavior-only AGENTS.md): {document}"
+                    f"{label}.documents must stay under docs/ (except governed root instruction entries): {document}"
                 )
         for pattern in (*code, *tests):
             _glob_regex(pattern)
@@ -545,7 +530,6 @@ def load_manifest(root: Path) -> Manifest:
 
     manifest = Manifest(
         version=3,
-        forbidden_top_level_files=forbidden,
         coverage=coverage,
         domains=tuple(domains),
         contracts=tuple(contracts),
@@ -814,7 +798,6 @@ def _parse_historical_manifest(raw: Any, label: str) -> Manifest:
     # Current repository guards never inherit policy fields from old commits.
     return Manifest(
         version,
-        (),
         coverage,
         tuple(domains),
         tuple(contracts),
@@ -2327,11 +2310,6 @@ def validate_current_tree(
     repository_files: Sequence[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
-    forbidden_names = {name.casefold() for name in manifest.forbidden_top_level_files}
-    for entry in root.iterdir():
-        if entry.name.casefold() in forbidden_names:
-            errors.append(f"top-level instruction file is forbidden: {entry.name}")
-
     files = (
         tuple(repository_files)
         if repository_files is not None
@@ -2361,6 +2339,18 @@ def validate_current_tree(
 
     for contract in manifest.contracts:
         document_owners.setdefault(contract.source, set()).update(contract.domains)
+
+    if CLAUDE_COMPATIBILITY_PATH in document_owners:
+        compatibility_path = _safe_path(root, CLAUDE_COMPATIBILITY_PATH)
+        if compatibility_path.is_file():
+            try:
+                compatibility_content = compatibility_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                compatibility_content = ""
+            if compatibility_content != CLAUDE_COMPATIBILITY_CONTENT:
+                errors.append(
+                    f"{CLAUDE_COMPATIBILITY_PATH} must contain only @AGENTS.md as the compatibility pointer"
+                )
 
     for domain in manifest.domains:
         for code_pattern in domain.code:
