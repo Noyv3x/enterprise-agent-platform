@@ -133,7 +133,8 @@
   font-weight: 650;
 }
 
-.msg-attachment--xlsx {
+.msg-attachment--xlsx,
+.msg-attachment--preview {
   overflow: hidden;
   border: 1px solid var(--line);
   width: min(680px, 100%);
@@ -243,6 +244,44 @@
   max-height: min(68vh, 720px);
   border: 1px solid var(--line);
   border-radius: var(--r-md);
+}
+
+.document-preview__section-name {
+  padding: 8px 10px 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.document-preview__text {
+  min-width: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px 10px;
+}
+
+.document-preview__text p {
+  margin: 0 0 8px;
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.document-preview__text p:last-child { margin-bottom: 0; }
+
+.document-preview__empty,
+.document-preview__limited {
+  padding: 8px 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+.document-preview-dialog { width: min(760px, calc(100vw - 32px)) !important; }
+
+.document-preview-dialog .document-preview__text {
+  max-height: min(68vh, 640px);
 }
 
 .chip {
@@ -506,7 +545,8 @@
     padding: 9px 10px;
   }
 
-  .msg-attachment--xlsx {
+  .msg-attachment--xlsx,
+  .msg-attachment--preview {
     width: 100%;
   }
 

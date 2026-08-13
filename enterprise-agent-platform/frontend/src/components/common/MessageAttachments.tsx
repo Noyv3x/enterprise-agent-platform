@@ -7,8 +7,8 @@ import { safeUrl } from "../../lib/api";
 import { useI18n } from "../../i18n";
 import { formatFileSize } from "../../utils/format";
 import type { Attachment } from "../../types";
+import { AttachmentPreviewCard } from "./AttachmentPreviewCard";
 import { Icon } from "./Icon";
-import { XlsxAttachmentCard } from "./XlsxAttachmentCard";
 
 export function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
   const { t } = useI18n();
@@ -35,7 +35,7 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
         }
         if (attachment.preview_url) {
           return (
-            <XlsxAttachmentCard
+            <AttachmentPreviewCard
               key={String(attachment.id)}
               attachment={attachment}
             />

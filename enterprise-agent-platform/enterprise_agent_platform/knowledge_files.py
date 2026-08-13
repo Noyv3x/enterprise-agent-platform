@@ -34,6 +34,14 @@ MAX_XLSX_PREVIEW_CELLS = 2_000
 MAX_XLSX_PREVIEW_CELL_CHARS = 500
 MAX_XLSX_PREVIEW_SHARED_STRINGS = 100_000
 MAX_XLSX_PREVIEW_WORKBOOK_SHEETS = 1_000
+MAX_DOCUMENT_PREVIEW_BYTES = MAX_XLSX_PREVIEW_BYTES
+MAX_DOCX_PREVIEW_PARAGRAPHS = 80
+MAX_DOCX_PREVIEW_BLOCK_CHARS = 500
+MAX_PPTX_PREVIEW_SLIDES = 12
+MAX_PPTX_PREVIEW_BLOCKS = 24
+MAX_PPTX_PREVIEW_BLOCK_CHARS = 400
+MAX_PDF_PREVIEW_PAGES = 8
+MAX_PDF_PREVIEW_PAGE_CHARS = 2_000
 
 
 _CANONICAL_MEDIA_TYPES = {
@@ -229,11 +237,106 @@ def extract_xlsx_preview(data: bytes) -> dict[str, object]:
                 maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
             )
             _validate_archive_identity(archive, names, ".xlsx")
-            return _extract_xlsx_preview(archive, names)
+            return {"kind": "xlsx", **_extract_xlsx_preview(archive, names)}
     except KnowledgeFileError:
         raise
     except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
         raise KnowledgeFileError("XLSX preview is malformed or unsupported") from exc
+
+
+def extract_docx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML document."""
+
+    if not data or len(data) > MAX_DOCUMENT_PREVIEW_BYTES or not data.startswith(b"PK"):
+        raise KnowledgeFileError("DOCX preview input is invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = _validate_archive(
+                archive,
+                maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
+                maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
+            )
+            _validate_archive_identity(archive, names, ".docx")
+            return _extract_docx_preview(archive, names)
+    except KnowledgeFileError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise KnowledgeFileError("DOCX preview is malformed or unsupported") from exc
+
+
+def extract_pptx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML presentation."""
+
+    if not data or len(data) > MAX_DOCUMENT_PREVIEW_BYTES or not data.startswith(b"PK"):
+        raise KnowledgeFileError("PPTX preview input is invalid")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = _validate_archive(
+                archive,
+                maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
+                maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
+            )
+            _validate_archive_identity(archive, names, ".pptx")
+            return _extract_pptx_preview(archive, names)
+    except KnowledgeFileError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise KnowledgeFileError("PPTX preview is malformed or unsupported") from exc
+
+
+def extract_pdf_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded preview of an existing PDF text layer."""
+
+    if not data or len(data) > MAX_DOCUMENT_PREVIEW_BYTES or not data.startswith(b"%PDF-"):
+        raise KnowledgeFileError("PDF preview input is invalid")
+    try:
+        reader = PdfReader(io.BytesIO(data), strict=True)
+        if reader.is_encrypted:
+            raise KnowledgeFileError("encrypted PDF documents are not supported")
+        page_count = len(reader.pages)
+        if page_count > MAX_PDF_PAGES:
+            raise KnowledgeFileError("PDF contains too many pages")
+        truncated = page_count > MAX_PDF_PREVIEW_PAGES
+        sections: list[dict[str, object]] = []
+        for index, page in enumerate(reader.pages[:MAX_PDF_PREVIEW_PAGES], start=1):
+            raw = str(page.extract_text() or "")
+            text = _preview_text(raw, maximum=MAX_PDF_PREVIEW_PAGE_CHARS)
+            page_truncated = len(raw) > len(text)
+            truncated = truncated or page_truncated
+            sections.append(
+                _preview_section(
+                    [text] if text else [],
+                    page_truncated,
+                    index=index,
+                )
+            )
+    except KnowledgeFileError:
+        raise
+    except Exception as exc:
+        raise KnowledgeFileError("PDF preview is malformed or unsupported") from exc
+    if not any(section["blocks"] for section in sections):
+        raise KnowledgeFileError(
+            "PDF has no extractable text; scanned documents cannot be previewed"
+        )
+    return {
+        "kind": "pdf",
+        "section_count": page_count,
+        "sections": sections,
+        "truncated": truncated,
+    }
+
+
+def extract_attachment_preview(filename: str, data: bytes) -> dict[str, object]:
+    suffix = PurePosixPath(str(filename or "")).suffix.casefold()
+    if suffix == ".xlsx":
+        return extract_xlsx_preview(data)
+    if suffix == ".docx":
+        return extract_docx_preview(data)
+    if suffix == ".pptx":
+        return extract_pptx_preview(data)
+    if suffix == ".pdf":
+        return extract_pdf_preview(data)
+    raise KnowledgeFileError("attachment preview type is unsupported")
 
 
 def _decode_text(data: bytes) -> str:
@@ -562,10 +665,100 @@ def _xlsx_column_index(reference: str) -> int | None:
     return value - 1
 
 
-def _preview_text(value: object) -> str:
+def _preview_text(value: object, *, maximum: int = MAX_XLSX_PREVIEW_CELL_CHARS) -> str:
     return str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")[
-        :MAX_XLSX_PREVIEW_CELL_CHARS
+        : max(0, int(maximum))
     ]
+
+
+def _preview_section(
+    blocks: list[str],
+    truncated: bool,
+    *,
+    index: int | None = None,
+    title: str = "",
+) -> dict[str, object]:
+    section: dict[str, object] = {"title": title, "blocks": blocks, "truncated": truncated}
+    if index is not None:
+        section["index"] = index
+    return section
+
+
+def _extract_docx_preview(
+    archive: zipfile.ZipFile,
+    names: set[str],
+) -> dict[str, object]:
+    if "word/document.xml" not in names:
+        raise KnowledgeFileError("DOCX document content is missing")
+    blocks: list[str] = []
+    truncated = False
+    for element in _root(
+        archive,
+        "word/document.xml",
+        maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+    ).iter():
+        if _local_name(element.tag) != "p":
+            continue
+        raw = _element_text(element)
+        if not raw:
+            continue
+        if len(blocks) >= MAX_DOCX_PREVIEW_PARAGRAPHS:
+            truncated = True
+            break
+        text = _preview_text(raw, maximum=MAX_DOCX_PREVIEW_BLOCK_CHARS)
+        truncated = truncated or len(raw) > len(text)
+        blocks.append(text)
+    return {
+        "kind": "docx",
+        "section_count": 1,
+        "sections": [_preview_section(blocks, truncated)],
+        "truncated": truncated,
+    }
+
+
+def _extract_pptx_preview(
+    archive: zipfile.ZipFile,
+    names: set[str],
+) -> dict[str, object]:
+    slides = sorted(
+        (
+            name
+            for name in names
+            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+        ),
+        key=_natural_key,
+    )
+    if not slides:
+        raise KnowledgeFileError("PPTX document contains no slides")
+    truncated = len(slides) > MAX_PPTX_PREVIEW_SLIDES
+    sections: list[dict[str, object]] = []
+    for index, name in enumerate(slides[:MAX_PPTX_PREVIEW_SLIDES], start=1):
+        blocks: list[str] = []
+        slide_truncated = False
+        for element in _root(
+            archive,
+            name,
+            maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+        ).iter():
+            if _local_name(element.tag) != "t":
+                continue
+            raw = str(element.text or "").strip()
+            if not raw:
+                continue
+            if len(blocks) >= MAX_PPTX_PREVIEW_BLOCKS:
+                slide_truncated = True
+                break
+            text = _preview_text(raw, maximum=MAX_PPTX_PREVIEW_BLOCK_CHARS)
+            slide_truncated = slide_truncated or len(raw) > len(text)
+            blocks.append(text)
+        truncated = truncated or slide_truncated
+        sections.append(_preview_section(blocks, slide_truncated, index=index))
+    return {
+        "kind": "pptx",
+        "section_count": len(slides),
+        "sections": sections,
+        "truncated": truncated,
+    }
 
 
 def _xlsx_preview_cell(

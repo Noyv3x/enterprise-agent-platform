@@ -762,9 +762,9 @@ class RequestHandler(BaseHTTPRequestHandler):
             token, user = service.change_current_user_password(actor, self._body_json())
             self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
             return
-        m = re.fullmatch(r"/api/attachments/(\d+)/xlsx-preview", path)
+        m = re.fullmatch(r"/api/attachments/(\d+)/(?:preview|xlsx-preview)", path)
         if m and method == "GET":
-            self._json(service.get_attachment_xlsx_preview(actor, int(m.group(1))))
+            self._json(service.get_attachment_preview(actor, int(m.group(1))))
             return
         m = re.fullmatch(r"/api/attachments/(\d+)", path)
         if m and method == "GET":

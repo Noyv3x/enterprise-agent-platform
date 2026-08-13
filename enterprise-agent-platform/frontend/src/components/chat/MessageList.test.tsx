@@ -10,7 +10,11 @@ import { StoreContext } from "../../store/StoreProvider";
 import type { AgentStatus, AppState, Message } from "../../types";
 import { MessageList } from "./MessageList";
 
-function renderMessageList(status: AgentStatus, messages: Message[] = []) {
+function renderMessageList(
+  status: AgentStatus,
+  messages: Message[] = [],
+  mode: "channel" | "private" = "channel",
+) {
   const state: AppState = {
     ...initialAppState,
     user: {
@@ -20,14 +24,18 @@ function renderMessageList(status: AgentStatus, messages: Message[] = []) {
       role: "admin",
     },
     activeChannelId: 1,
-    messages,
-    agentStatuses: { channels: { "1": status }, private: null },
+    messages: mode === "channel" ? messages : [],
+    privateMessages: mode === "private" ? messages : [],
+    agentStatuses: {
+      channels: mode === "channel" ? { "1": status } : {},
+      private: mode === "private" ? status : null,
+    },
   };
   const store = createStore(rootReducer, state);
   const view = render(
     <I18nProvider>
       <StoreContext.Provider value={store}>
-        <MessageList mode="channel" scopeId="1" noChannel={false} forceBottomToken={0} />
+        <MessageList mode={mode} scopeId="1" noChannel={false} forceBottomToken={0} />
       </StoreContext.Provider>
     </I18nProvider>,
   );
@@ -293,7 +301,7 @@ describe("MessageList Agent work records", () => {
 
     fireEvent.click(disclosure!);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    const updateTitle = within(workRecord).getByText("Agent update");
+    const updateTitle = within(workRecord).getByText("AI update");
     const updateRow = updateTitle.closest<HTMLElement>(".agent-work__item");
     expect(updateRow).not.toBeNull();
     if (!updateRow) throw new Error("Expected persisted Agent update row");
@@ -305,6 +313,40 @@ describe("MessageList Agent work records", () => {
       "I checked the focused tests. They cover the persisted update.",
     );
     expect(screen.getByText("Persisted final answer")).toBeVisible();
+  });
+
+  it("hides the Personal AI author label beside agent avatars", () => {
+    renderMessageList(
+      { state: "idle" },
+      [
+        {
+          id: 7,
+          scope_type: "private",
+          scope_id: "1",
+          author_type: "user",
+          user_id: 1,
+          username: "Administrator",
+          content: "hello",
+          created_at: 100,
+        },
+        {
+          id: 8,
+          scope_type: "private",
+          scope_id: "1",
+          author_type: "agent",
+          user_id: null,
+          username: "Private Agent",
+          content: "here is the answer",
+          created_at: 101,
+        },
+      ],
+      "private",
+    );
+
+    expect(screen.getByText("Administrator")).toBeVisible();
+    expect(screen.getByText("here is the answer")).toBeVisible();
+    expect(screen.queryByText("Personal AI")).toBeNull();
+    expect(document.querySelector(".msg--agent .msg__name")).toBeNull();
   });
 
   it("shows one compact status for a joined rapid-message group", () => {

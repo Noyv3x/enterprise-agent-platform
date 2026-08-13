@@ -12,6 +12,7 @@
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生。当前容器路径、环境变量、进程身份和 Camoufox sidecar 只使用 `agent-platform` / `AGENT_PLATFORM_*` / `.agent-platform-runtime.json` target 接口，单个适配器不得引入第二套技术身份。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
+- 聊天中的 XLSX、DOCX、PPTX 与 PDF 预览在 Platform 进程内从已授权附件提取有界文本，不调用外部 Office/PDF 服务，也不把原件交给浏览器查看器。
 - 频道消息撤回只改变 Platform 产品消息可见性；已经提交给 Agent 或外部集成的输入不作追溯撤销，不能把界面撤回解释为 Runtime、Telegram、邮箱或其它集成的取消协议。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
@@ -95,7 +96,7 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 个人 AI 可以配置标准 IMAP/SMTP 邮箱账户与应用专用密码。Platform 使用系统 CA 验证 IMAPS、SMTPS 或 STARTTLS，不增加邮件容器，也不把密码交给 Runtime、Sandbox、日志或工具结果。界面只管理账户、测试连接、立即检查和收信唤醒开关，不实现第二个完整邮件客户端。
 
-`mail` 工具支持列账户、文件夹、搜索、读取、发送、回复、移动、标记与把附件安全保存到当前工作区。所有权由可信私人 scope 派生；频道、委派或其他用户不能访问账户。交互式搜索也必须先用 `UIDNEXT` 限定最近的有界 UID 窗口，不能让 `SEARCH ALL` 为大邮箱生成无界响应；读取完整正文前先读取 `RFC822.SIZE` 并拒绝超限或缺失大小的响应。邮件正文、头部和附件名始终作为不可信工具结果。发送使用持久幂等投递记录：明确成功才完成，明确失败可由新请求重试，结果未知进入 `needs_review`，不得盲目重发；“删除”只移动到 Trash，不执行不可恢复 expunge。
+`mail` 工具支持列账户、文件夹、搜索、读取、发送、回复、移动、标记与把附件安全保存到当前工作区。所有权由可信私人 scope 派生；频道、委派或其他用户不能访问账户。交互式搜索也必须先用 `UIDNEXT` 限定最近的有界 UID 窗口，不能让 `SEARCH ALL` 为大邮箱生成无界响应；读取完整正文前先读取 `RFC822.SIZE` 并拒绝超限或缺失大小的响应。邮件正文、头部和附件名始终作为不可信工具结果，也不得写入用户可见工作记录的 `result`。发送使用持久幂等投递记录：明确成功才完成，明确失败可由新请求重试，结果未知进入 `needs_review`，不得盲目重发；“删除”只移动到 Trash，不执行不可恢复 expunge。
 
 保存邮件附件时，Platform 必须从可信 scope 的工作区根目录 fd 开始，逐段以 `O_DIRECTORY | O_NOFOLLOW` 打开或以 `mkdirat` 创建目标父目录，并验证每一段都是部署用户拥有的真实目录。最终文件只能相对已固定的父目录 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，再验证其类型与 owner；不得先按路径检查、随后重新按字符串路径打开。父目录在保存过程中被替换、重命名或改成符号链接时，写入也不能越过当前 scope 的工作区边界。
 

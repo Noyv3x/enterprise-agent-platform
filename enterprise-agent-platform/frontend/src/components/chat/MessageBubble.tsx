@@ -28,6 +28,7 @@ interface MessageBubbleProps {
   browserPreviewAttached?: boolean;
   canWithdraw?: boolean;
   withdrawing?: boolean;
+  hideAuthorName?: boolean;
   onWithdraw?: (messageId: Message["id"]) => Promise<void> | void;
 }
 
@@ -36,6 +37,7 @@ function MessageBubbleImpl({
   browserPreviewAttached = false,
   canWithdraw = false,
   withdrawing = false,
+  hideAuthorName = false,
   onWithdraw,
 }: MessageBubbleProps) {
   const { t } = useI18n();
@@ -99,6 +101,7 @@ function MessageBubbleImpl({
           isUser={isUser}
           pending={pending}
           streaming={streaming}
+          hideAuthorName={hideAuthorName && !isUser}
           action={messageActions}
         />
         {showWorkCard && agentWork ? (
@@ -140,5 +143,6 @@ export const MessageBubble = memo(
     prev.browserPreviewAttached === next.browserPreviewAttached &&
     prev.canWithdraw === next.canWithdraw &&
     prev.withdrawing === next.withdrawing &&
+    prev.hideAuthorName === next.hideAuthorName &&
     prev.onWithdraw === next.onWithdraw,
 );

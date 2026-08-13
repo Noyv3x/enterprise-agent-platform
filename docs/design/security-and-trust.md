@@ -58,7 +58,7 @@ Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的�
 
 工具审计序列化不得复用于模型历史。模型可见的 tool call 必须保留活动 schema 的原始结构，脱敏占位符仍须符合字段约束；只有工具名精确匹配且仅含既知字段的历史展示 envelope 可以在内存中收敛。工具名不匹配、调用者身份字段或其它未知字段一律失败关闭，不能以兼容为由删除后继续执行。
 
-命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开执行器前脱敏。统一脱敏器覆盖常见客户端的紧凑、等号和分离参数形式；无法安全解析嵌套 shell 求值中的 secret 时直接拒绝。原始 secret 只留在当前执行闭包，不能进入事件 journal、session、预览或错误文本。
+命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开执行器前脱敏。统一脱敏器覆盖常见客户端的紧凑、等号和分离参数形式；无法安全解析嵌套 shell 求值中的 secret 时直接拒绝。原始 secret 只留在当前执行闭包，不能进入事件 journal、session、预览或错误文本。聊天工作记录的展开详情只能持久化闭世界、再次脱敏的 `parameters` 和有界 `result`；write/patch 正文、邮件正文、记忆与跨会话搜索结果以及未脱敏凭据不得进入 `agent_work`。
 
 终端预览和 `process.list/read/stop` 快照复用同一脱敏器后再裁剪。取消和 scope cleanup 尽力终止前台进程；一旦 Manager 报告终止已确认，就必须同时证明对应进程控制器的输出快照、持久登记和 Sandbox 活动计数已经收敛，不能让旧 goroutine 在授权边界返回后继续写 scope 状态。Sandbox 后台进程可跨 Run 保留，但必须有登记、输出上限和管理员可见状态。Sandbox 停止会终止其容器进程，持久挂载数据保留。
 
@@ -114,7 +114,7 @@ Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验
 
 Multipart 正文必须增量读取并先写入 Platform 数据根内 owner-only 的请求 staging 目录；解析过程只保留边界探测所需的小型缓冲区，不得把完整请求或附件复制到内存。服务端完成数量、大小、配额、文件类型和摘要校验后再把 staging 文件流式提交到附件目录；请求成功、失败、取消或超时后都必须清理 staging。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载访问，路径固定为 `/workspace/.agent-platform/attachments`。Platform 不得把自己的数据路径写进普通 Run metadata；唯一例外是由可信配置派生、只进入当前 scope 系统提示的宿主工作区映射。Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
-XLSX 消息预览复用附件读取权限，不提供匿名或跨 scope 入口。Platform 对空 MIME 和 `application/octet-stream` 使用内置、确定性的允许后缀映射，不能依赖基础镜像是否安装 `/etc/mime.types`；该规范化只赋予候选解析器，不能替代内容验证，也不能覆盖调用方明确声明的其它非通用媒体类型。服务端在解析前同时校验规范扩展名、媒体类型、ZIP/Office 容器身份、加密标志、条目路径、条目数、单项大小和累计展开大小；解析仅提取有界工作表、行列、单元格和字符串，公式作为惰性文本展示，不计算、不跟随外部关系、不加载宏或嵌入对象。响应只含纯文本单元格和截断元数据，并设置私有、禁止嗅探的 JSON 头。解析失败返回有界通用错误，原件下载继续可用。
+消息文档预览复用附件读取权限，不提供匿名或跨 scope 入口。当前允许的预览格式只有 XLSX、DOCX、PPTX 和 PDF。Platform 对空 MIME 和 `application/octet-stream` 使用内置、确定性的允许后缀映射，不能依赖基础镜像是否安装 `/etc/mime.types`；该规范化只赋予候选解析器，不能替代内容验证，也不能覆盖调用方明确声明的其它非通用媒体类型。Office 容器在解析前同时校验规范扩展名、媒体类型、ZIP/Office 容器身份、加密标志、条目路径、条目数、单项大小和累计展开大小；PDF 校验 `%PDF-` 签名并拒绝加密文档。解析只提取有界纯文本：工作表单元格、文档段落、幻灯片可见文本或 PDF 已有文本层。公式作为惰性文本展示，不计算、不跟随外部关系、不加载宏、嵌入对象、JavaScript 或外部字体；也不把原件交给浏览器 PDF/Office 查看器。响应只含纯文本块、分页/分表元数据和截断标记，并设置私有、禁止嗅探的 JSON 头。解析失败返回有界通用错误，原件下载继续可用。
 
 邮件附件保存不能使用“父目录 `lstat` 后再按完整路径 `open`”的检查/使用分离流程。Platform 必须固定可信 scope 的 workspace 根 fd，逐段相对父 fd 使用 `O_DIRECTORY | O_NOFOLLOW` 打开目录；缺失目录以 `mkdirat` 创建后重新打开并校验类型与部署用户 owner。最终文件相对固定父 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，随后用 fd 校验普通文件类型与 owner、收紧为 `0600` 并持久化。任何符号链接、特殊文件、owner 异常或并发路径替换都必须 fail closed，且失败清理只能针对同一固定父目录中由本次调用创建的 inode。
 

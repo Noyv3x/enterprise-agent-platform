@@ -49,6 +49,8 @@ from enterprise_agent_platform.service import (
     UploadedFile,
     _ResizableConcurrencyGate,
     agent_tool_detail,
+    agent_tool_parameters,
+    agent_tool_result_preview,
     normalize_attachment_mime,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
@@ -80,6 +82,27 @@ def make_xlsx_attachment() -> bytes:
             b"<row r='1'><c r='A1' t='s'><v>0</v></c><c r='B1'><v>2026</v></c></row>"
             b"<row r='2'><c r='A2' t='s'><v>1</v></c><c r='B2'><v>42</v></c></row>"
             b"</sheetData></worksheet>"
+        ),
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, value in entries.items():
+            archive.writestr(name, value)
+    return output.getvalue()
+
+
+def make_docx_attachment() -> bytes:
+    output = io.BytesIO()
+    entries = {
+        "[Content_Types].xml": (
+            b"<Types><Override PartName='/word/document.xml' "
+            b"ContentType='application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'/>"
+            b"</Types>"
+        ),
+        "word/document.xml": (
+            b"<w:document xmlns:w='w'><w:body>"
+            b"<w:p><w:r><w:t>Quarterly review</w:t></w:r></w:p>"
+            b"<w:p><w:r><w:t>Revenue held at 42.</w:t></w:r></w:p>"
+            b"</w:body></w:document>"
         ),
     }
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -845,6 +868,10 @@ class PlatformServiceTests(unittest.TestCase):
                         ),
                         expected,
                     )
+            self.assertEqual(
+                normalize_attachment_mime("report.pdf", ""),
+                "application/pdf",
+            )
             self.assertEqual(
                 normalize_attachment_mime("report.xlsx", "application/x-custom"),
                 "application/x-custom",
@@ -2022,9 +2049,140 @@ class PlatformServiceTests(unittest.TestCase):
                     [item["sequence"] for item in snapshot["activity"]],
                     sorted(item["sequence"] for item in snapshot["activity"]),
                 )
+                self.assertFalse(any(item.get("parameters") or item.get("result") for item in snapshot["activity"]))
             finally:
                 for patcher in reversed(patches):
                     patcher.stop()
+                service.close()
+
+    def test_agent_work_persists_expanded_parameters_and_results(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "read_file",
+                        "tool_call_id": "read-1",
+                        "arguments": {
+                            "path": "src/app.ts",
+                            "offset": 10,
+                            "limit": 40,
+                            "target": "sandbox",
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "read_file",
+                        "tool_call_id": "read-1",
+                        "result": {
+                            "content": [
+                                {"type": "text", "text": "export function start() {\n  return 1;\n}"}
+                            ]
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "write_file",
+                        "tool_call_id": "write-1",
+                        "arguments": {
+                            "path": "src/secret.ts",
+                            "content": "TOKEN=super-secret",
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.started",
+                        "tool_name": "session_search",
+                        "tool_call_id": "search-1",
+                        "arguments": {
+                            "action": "search",
+                            "query": "AWS_SECRET_ACCESS_KEY=aws-value remember this",
+                        },
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "session_search",
+                        "tool_call_id": "search-1",
+                        "result": {"content": "found AWS_SECRET_ACCESS_KEY=aws-value"},
+                    },
+                )
+                service._record_agent_progress(
+                    "channel",
+                    "1",
+                    {
+                        "event": "tool.failed",
+                        "tool_name": "web",
+                        "tool_call_id": "web-1",
+                        "arguments": {
+                            "action": "search",
+                            "arguments": {"query": "release notes"},
+                        },
+                        "is_error": True,
+                        "error": "search timed out",
+                    },
+                )
+
+                status = service.agent_status(admin, "channel", "1")
+                read = next(item for item in status["activity"] if item.get("tool_call_id") == "read-1")
+                write = next(item for item in status["activity"] if item.get("tool_call_id") == "write-1")
+                search = next(item for item in status["activity"] if item.get("tool_call_id") == "search-1")
+                web = next(item for item in status["activity"] if item.get("tool_call_id") == "web-1")
+                self.assertEqual(
+                    read["parameters"],
+                    {"path": "src/app.ts", "offset": 10, "limit": 40, "target": "sandbox"},
+                )
+                self.assertIn("export function start()", read["result"])
+                self.assertEqual(write["parameters"], {"path": "src/secret.ts"})
+                self.assertNotIn("super-secret", json.dumps(write))
+                self.assertEqual(search["parameters"], {"action": "search"})
+                self.assertNotIn("aws-value", json.dumps(search))
+                self.assertNotIn("result", search)
+                self.assertEqual(web["parameters"], {"action": "search", "query": "release notes"})
+                self.assertEqual(web["result"], "search timed out")
+                self.assertEqual(
+                    agent_tool_parameters(
+                        {
+                            "tool_name": "browser",
+                            "arguments": {
+                                "action": "navigate",
+                                "arguments": {
+                                    "url": "https://user:pass@example.com/private?token=secret"
+                                },
+                            },
+                        }
+                    ),
+                    {"action": "navigate", "host": "example.com"},
+                )
+                self.assertEqual(
+                    agent_tool_result_preview(
+                        {
+                            "event": "tool.completed",
+                            "tool_name": "mail",
+                            "result": {"content": "inbox body"},
+                        }
+                    ),
+                    "",
+                )
+            finally:
                 service.close()
 
     def test_stream_status_keeps_only_latest_runtime_turn_identity(self):
@@ -7748,7 +7906,7 @@ class PlatformHTTPTests(unittest.TestCase):
             )
             self.assertEqual(
                 attachment["preview_url"],
-                f"/api/attachments/{attachment['id']}/xlsx-preview",
+                f"/api/attachments/{attachment['id']}/preview",
             )
             server, thread = serve_in_thread(config, service)
             host, port = server.server_address
@@ -7777,6 +7935,64 @@ class PlatformHTTPTests(unittest.TestCase):
                 response = connection.getresponse()
                 response.read()
                 self.assertEqual(response.status, 401)
+                connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+                service.close()
+
+    def test_docx_attachment_preview_is_authorized_bounded_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            token, admin = service.authenticate("admin", "admin")
+            result = service.send_private_message(
+                admin,
+                "preview this document",
+                [
+                    UploadedFile(
+                        "review.docx",
+                        "application/octet-stream",
+                        make_docx_attachment(),
+                    )
+                ],
+            )
+            message = next(
+                item
+                for item in service.list_messages(
+                    admin,
+                    "private",
+                    str(admin["id"]),
+                )
+                if item["id"] == result["user_message"]["id"]
+            )
+            attachment = message["attachments"][0]
+            self.assertEqual(
+                attachment["mime_type"],
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+            self.assertEqual(
+                attachment["preview_url"],
+                f"/api/attachments/{attachment['id']}/preview",
+            )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            try:
+                connection = http.client.HTTPConnection(host, port, timeout=5)
+                connection.request(
+                    "GET",
+                    attachment["preview_url"],
+                    headers={"Cookie": f"{config.session_cookie_name}={token}"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["kind"], "docx")
+                self.assertEqual(
+                    payload["sections"][0]["blocks"],
+                    ["Quarterly review", "Revenue held at 42."],
+                )
                 connection.close()
             finally:
                 server.shutdown()

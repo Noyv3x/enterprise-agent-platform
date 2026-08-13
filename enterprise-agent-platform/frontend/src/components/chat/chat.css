@@ -1202,6 +1202,72 @@
   overflow-wrap: anywhere;
 }
 
+.agent-work__detail--rich {
+  display: grid;
+  gap: 10px;
+}
+
+.agent-work__facts,
+.agent-work__params {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.agent-work__facts > div,
+.agent-work__params > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.agent-work__facts dt,
+.agent-work__params dt {
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 620;
+}
+
+.agent-work__facts dd,
+.agent-work__params dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-work__params code,
+.agent-work__detail-text,
+.agent-work__result {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.agent-work__section {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.agent-work__section > h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.agent-work__result {
+  max-height: 240px;
+  margin: 0;
+  overflow: auto;
+  padding: 8px 9px;
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--bg) 68%, var(--surface));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .agent-work__commentary .msg__body {
   color: inherit;
   font-size: inherit;

@@ -157,7 +157,7 @@ describe("AgentWorkCard", () => {
     expect(store.getState().expandedAgentRuns["run-collapse"]).toBe(true);
 
     const commandRow = within(card).getByText("Command").closest<HTMLElement>(".agent-work__item");
-    const commentaryRow = within(card).getByText("Agent update").closest<HTMLElement>(".agent-work__item");
+    const commentaryRow = within(card).getByText("AI update").closest<HTMLElement>(".agent-work__item");
     const searchRow = within(card).getByText("File search").closest<HTMLElement>(".agent-work__item");
     expect(commandRow).not.toBeNull();
     expect(commentaryRow).not.toBeNull();
@@ -245,7 +245,7 @@ describe("AgentWorkCard", () => {
     fireEvent.click(disclosure!);
 
     const commandRow = within(card!).getByText("Command").closest<HTMLElement>(".agent-work__item");
-    const commentaryRow = within(card!).getByText("Agent update").closest<HTMLElement>(".agent-work__item");
+    const commentaryRow = within(card!).getByText("AI update").closest<HTMLElement>(".agent-work__item");
     const noticeRow = within(card!).getByText("Records truncated").closest<HTMLElement>(".agent-work__item");
     expect(commandRow).not.toBeNull();
     expect(commentaryRow).not.toBeNull();
@@ -286,8 +286,53 @@ describe("AgentWorkCard", () => {
       </ConfigProvider>,
     );
     const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
-    expect(card).toHaveTextContent("Agent work failed");
+    expect(card).toHaveTextContent("AI work failed");
     expect(card?.querySelector(".agent-work__done")).toHaveClass("agent-work__done--failed");
     expect(card?.querySelector(".agent-work__done--failed svg")).not.toBeNull();
+  });
+
+  it("shows tool facts, parameters, and result when a completed row is opened", () => {
+    const store = createStore(rootReducer, initialAppState);
+    const view = render(
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
+        <StoreContext.Provider value={store}>
+          <I18nProvider>
+            <AgentWorkCard
+              active={false}
+              work={{
+                run_id: "run-detail",
+                state: "complete",
+                activity: [{
+                  stage: "tool.completed",
+                  tool: "read_file",
+                  tool_call_id: "read-1",
+                  tool_status: "completed",
+                  detail: "src/app.ts",
+                  parameters: { path: "src/app.ts", offset: 10, limit: 40, target: "sandbox" },
+                  result: "export function start() {\n  return 1;\n}",
+                  at: 1_700_000_000,
+                  completed_at: 1_700_000_002,
+                }],
+              }}
+            />
+          </I18nProvider>
+        </StoreContext.Provider>
+      </ConfigProvider>,
+    );
+    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
+    expect(within(card!).getByText("View AI work")).toBeVisible();
+    fireEvent.click(card!.querySelector<HTMLElement>(".agent-work__collapse-header")!);
+    const row = within(card!).getByText("Read file").closest<HTMLElement>(".agent-work__item");
+    expect(row).not.toBeNull();
+    fireEvent.click(row!.querySelector<HTMLElement>("[role=button]")!);
+    expect(within(row!).getByText("Tool")).toBeVisible();
+    expect(within(row!).getByText("Status")).toBeVisible();
+    expect(within(row!).getAllByText("Completed").length).toBeGreaterThan(0);
+    expect(within(row!).getByText("Path")).toBeVisible();
+    expect(within(row!).getByText("src/app.ts")).toBeVisible();
+    expect(within(row!).getByText("Offset")).toBeVisible();
+    expect(within(row!).getByText("10")).toBeVisible();
+    expect(within(row!).getByText("Result")).toBeVisible();
+    expect(within(row!).getByText(/export function start/)).toBeVisible();
   });
 });

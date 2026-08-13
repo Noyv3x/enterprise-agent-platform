@@ -23,9 +23,35 @@ interface ProcessLineEntry {
   rawTool: string;
   preview: string;
   detail: string;
+  result: string;
+  parameters: Record<string, string | number | boolean>;
+  startedAt?: number | string;
+  completedAt?: number | string;
   state: ProcessState;
   kind: ProcessKind;
 }
+
+const PARAMETER_LABELS: Partial<Record<string, MessageKey>> = {
+  command: "chat.work.param.command",
+  action: "chat.work.param.action",
+  path: "chat.work.param.path",
+  query: "chat.work.param.query",
+  host: "chat.work.param.host",
+  id: "chat.work.param.id",
+  target: "chat.work.param.target",
+  process_id: "chat.work.param.process_id",
+  timeout_ms: "chat.work.param.timeout_ms",
+  background: "chat.work.param.background",
+  background_kind: "chat.work.param.background_kind",
+  cwd: "chat.work.param.cwd",
+  offset: "chat.work.param.offset",
+  limit: "chat.work.param.limit",
+  file_path: "chat.work.param.file_path",
+  role: "chat.work.param.role",
+  task_count: "chat.work.param.task_count",
+  regex: "chat.work.param.regex",
+  max_results: "chat.work.param.max_results",
+};
 
 const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   terminal: "chat.activity.toolName.terminal",
@@ -155,17 +181,52 @@ function oneLinePreview(value: string, maximum = 96): string {
   return `${compact.slice(0, maximum - 1).trimEnd()}…`;
 }
 
+function closedParameters(step: ActivityStep): Record<string, string | number | boolean> {
+  const raw = step?.parameters;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const parameters: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      parameters[key] = value;
+    }
+  }
+  return parameters;
+}
+
+function formatWorkInstant(value: number | string | undefined, locale: string): string {
+  if (value == null || value === "") return "";
+  const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatParameterValue(value: string | number | boolean): string {
+  return String(value);
+}
+
+function parameterLabel(key: string, translate: Translator): string {
+  const messageKey = PARAMETER_LABELS[key];
+  return messageKey ? translate(messageKey) : key;
+}
+
 function processEntry(step: ActivityStep, index: number, translate: Translator): ProcessLineEntry | null {
   const stage = stepStage(step);
   const rawDetail = String(step?.detail || "").trim();
   const omittedCharacters = Math.max(0, Number(step?.detail_truncated_chars || 0));
+  const omittedResultCharacters = Math.max(0, Number(step?.result_truncated_chars || 0));
   const detailNotice = omittedCharacters
     ? translate("chat.activity.truncatedCharacters", { count: omittedCharacters })
     : "";
+  const resultNotice = omittedResultCharacters
+    ? translate("chat.activity.truncatedCharacters", { count: omittedResultCharacters })
+    : "";
   const detail = [rawDetail, detailNotice].filter(Boolean).join("\n\n");
+  const rawResult = String(step?.result || "").trim();
+  const result = [rawResult, resultNotice].filter(Boolean).join("\n\n");
   const state = agentStepState(step);
   const identity = mergeIdentity(step);
   const key = identity || `${stage || "step"}:${String(step?.at || index)}:${index}`;
+  const parameters = closedParameters(step);
 
   if (isTruncationStep(step)) {
     const omittedEvents = Math.max(1, Number(step?.omitted_events || 1));
@@ -177,6 +238,10 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
       rawTool: "work.truncated",
       preview: message,
       detail: message,
+      result: "",
+      parameters: {},
+      startedAt: step?.at,
+      completedAt: step?.completed_at,
       state: "failed",
       kind: "notice",
     };
@@ -190,6 +255,10 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
       rawTool: "assistant.message",
       preview: oneLinePreview(String(step?.line || detail)),
       detail,
+      result: "",
+      parameters: {},
+      startedAt: step?.at,
+      completedAt: step?.completed_at,
       state,
       kind: "commentary",
     };
@@ -203,6 +272,10 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
     rawTool: rawTool.toLowerCase(),
     preview: oneLinePreview(detail),
     detail,
+    result,
+    parameters,
+    startedAt: step?.at,
+    completedAt: step?.completed_at,
     state,
     kind: "tool",
   };
@@ -268,20 +341,83 @@ function EntrySummary({ entry, expandable }: { entry: ProcessLineEntry; expandab
 }
 
 function EntryDetail({ entry }: { entry: ProcessLineEntry }) {
-  const { t } = useI18n();
-  if (!entry.detail) return null;
+  const { locale, t } = useI18n();
   if (entry.kind === "commentary") {
-    return <div className="agent-work__commentary"><MessageBody content={entry.detail} /></div>;
+    return entry.detail
+      ? <div className="agent-work__commentary"><MessageBody content={entry.detail} /></div>
+      : null;
   }
-  if (entry.rawTool === "terminal") {
-    return (
-      <div className="agent-work__command">
-        <span className="agent-work__prompt" aria-hidden="true">$</span>
-        <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{entry.detail}</code></pre>
-      </div>
-    );
+  if (entry.kind === "notice") {
+    return entry.detail ? <div className="agent-work__detail">{entry.detail}</div> : null;
   }
-  return <div className="agent-work__detail">{entry.detail}</div>;
+
+  const command = entry.rawTool === "terminal"
+    ? String(entry.parameters.command || entry.detail.split("\n\n")[0] || "").trim()
+    : "";
+  const summary = command && (entry.detail === command || entry.detail.startsWith(`${command}\n\n`))
+    ? entry.detail.slice(command.length).trim()
+    : command ? "" : entry.detail;
+  const extraParameters = Object.entries(entry.parameters).filter(([key]) => key !== "command");
+  const started = formatWorkInstant(entry.startedAt, locale);
+  const completed = formatWorkInstant(entry.completedAt, locale);
+  const timeLabel = started && completed && started !== completed
+    ? `${started} – ${completed}`
+    : started || completed;
+
+  return (
+    <div className="agent-work__detail agent-work__detail--rich">
+      <dl className="agent-work__facts">
+        <div>
+          <dt>{t("chat.work.detail.tool")}</dt>
+          <dd>{entry.title}</dd>
+        </div>
+        <div>
+          <dt>{t("chat.work.detail.status")}</dt>
+          <dd>{agentStepStateText(entry.state, t)}</dd>
+        </div>
+        {timeLabel ? (
+          <div>
+            <dt>{t("chat.work.detail.time")}</dt>
+            <dd>{timeLabel}</dd>
+          </div>
+        ) : null}
+      </dl>
+      {command ? (
+        <div className="agent-work__section">
+          <h4>{t("chat.activity.commandPreview")}</h4>
+          <div className="agent-work__command">
+            <span className="agent-work__prompt" aria-hidden="true">$</span>
+            <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
+          </div>
+        </div>
+      ) : null}
+      {extraParameters.length ? (
+        <div className="agent-work__section">
+          <h4>{t("chat.work.detail.parameters")}</h4>
+          <dl className="agent-work__params">
+            {extraParameters.map(([key, value]) => (
+              <div key={key}>
+                <dt>{parameterLabel(key, t)}</dt>
+                <dd><code>{formatParameterValue(value)}</code></dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      ) : null}
+      {summary ? (
+        <div className="agent-work__section">
+          <h4>{t("chat.work.detail.summary")}</h4>
+          <div className="agent-work__detail-text">{summary}</div>
+        </div>
+      ) : null}
+      {entry.result ? (
+        <div className="agent-work__section">
+          <h4>{t("chat.work.detail.result")}</h4>
+          <pre className="agent-work__result" tabIndex={0}><code>{entry.result}</code></pre>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function ActiveProcessList({ entries }: { entries: ProcessLineEntry[] }) {
@@ -301,12 +437,22 @@ function ActiveProcessList({ entries }: { entries: ProcessLineEntry[] }) {
   );
 }
 
+function entryHasExpandedDetail(entry: ProcessLineEntry): boolean {
+  return Boolean(
+    entry.detail
+    || entry.result
+    || Object.keys(entry.parameters).length
+    || entry.startedAt
+    || entry.kind === "tool",
+  );
+}
+
 function CompletedProcessList({ entries }: { entries: ProcessLineEntry[] }) {
   const items: CollapseProps["items"] = entries.map((entry) => ({
     key: entry.key,
-    label: <EntrySummary entry={entry} expandable={!!entry.detail} />,
+    label: <EntrySummary entry={entry} expandable={entryHasExpandedDetail(entry)} />,
     children: <EntryDetail entry={entry} />,
-    collapsible: entry.detail ? "header" : "disabled",
+    collapsible: entryHasExpandedDetail(entry) ? "header" : "disabled",
     showArrow: false,
     className: cx("agent-work__item", `agent-work__item--${entry.state}`),
   }));

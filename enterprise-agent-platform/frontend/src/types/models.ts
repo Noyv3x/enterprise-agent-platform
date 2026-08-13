@@ -124,6 +124,8 @@ export interface Attachment {
   local_preview?: boolean;
 }
 
+export type AttachmentPreviewKind = "xlsx" | "docx" | "pptx" | "pdf";
+
 export interface XlsxPreviewSheet {
   name: string;
   rows: string[][];
@@ -131,12 +133,31 @@ export interface XlsxPreviewSheet {
   truncated: boolean;
 }
 
+export interface AttachmentPreviewSection {
+  title?: string;
+  index?: number;
+  blocks: string[];
+  truncated: boolean;
+}
+
 export interface XlsxAttachmentPreview {
   attachment_id: Id;
   filename: string;
+  kind?: AttachmentPreviewKind;
   sheet_count: number;
   sheets: XlsxPreviewSheet[];
   truncated: boolean;
+}
+
+export interface AttachmentPreview {
+  attachment_id: Id;
+  filename: string;
+  kind: AttachmentPreviewKind;
+  truncated: boolean;
+  sheet_count?: number;
+  sheets?: XlsxPreviewSheet[];
+  section_count?: number;
+  sections?: AttachmentPreviewSection[];
 }
 
 /** A single line in an Agent activity or work log. */
@@ -161,6 +182,12 @@ export interface ActivityStep {
   updated_sequence?: number;
   /** Original detail characters omitted by a Platform safety bound. */
   detail_truncated_chars?: number;
+  /** Closed-world, secret-redacted arguments for the expanded work detail. */
+  parameters?: Record<string, string | number | boolean>;
+  /** Bounded, secret-redacted tool result or error for the expanded work detail. */
+  result?: string;
+  /** Original result characters omitted by a Platform safety bound. */
+  result_truncated_chars?: number;
   /** Work events omitted after the timeline entry bound was reached. */
   omitted_events?: number;
   /** Omitted events known to be real tool calls. */

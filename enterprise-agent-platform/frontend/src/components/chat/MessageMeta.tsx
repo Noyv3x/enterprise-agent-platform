@@ -27,18 +27,20 @@ export function MessageMeta({
   isUser,
   pending,
   streaming,
+  hideAuthorName = false,
   action,
 }: {
   message: Message;
   isUser: boolean;
   pending: boolean;
   streaming: boolean;
+  hideAuthorName?: boolean;
   action?: ReactNode;
 }) {
   const { locale, t } = useI18n();
   return (
     <div className="msg__meta">
-      <span className="msg__name">{authorName(message, isUser, t)}</span>
+      {hideAuthorName ? null : <span className="msg__name">{authorName(message, isUser, t)}</span>}
       {pending ? <Tag className="msg__pending">{t("chat.message.sending")}</Tag> : null}
       {streaming ? <Tag className="msg__pending" color="processing">{t("chat.message.generating")}</Tag> : null}
       <span className="msg__time">{formatMessageTime(message.created_at, locale)}</span>

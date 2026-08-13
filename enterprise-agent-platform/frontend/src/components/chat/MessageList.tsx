@@ -266,6 +266,7 @@ export function MessageList({
           browserPreviewAttached={String(message.id) === retainedBrowserMessageId}
           canWithdraw={canWithdraw}
           withdrawing={withdrawingMessageId === String(message.id)}
+          hideAuthorName={mode === "private"}
           onWithdraw={canWithdraw ? handleWithdraw : undefined}
         />
       );
@@ -289,7 +290,13 @@ export function MessageList({
         );
       }
       for (const streamingMessage of agentStreamingMessages(status, mode, scopeType, scopeId, t)) {
-        items.push(<MessageBubble key={String(streamingMessage.id)} message={streamingMessage} />);
+        items.push(
+          <MessageBubble
+            hideAuthorName={mode === "private"}
+            key={String(streamingMessage.id)}
+            message={streamingMessage}
+          />,
+        );
       }
     } else if (status && status.state === "error") {
       // Terminal failure that could not be persisted as a chat message: surface it

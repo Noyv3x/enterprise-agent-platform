@@ -94,9 +94,9 @@ from .knowledge import (
 )
 from .knowledge_files import (
     KnowledgeFileError,
-    MAX_XLSX_PREVIEW_BYTES,
+    MAX_DOCUMENT_PREVIEW_BYTES,
+    extract_attachment_preview,
     extract_knowledge_file,
-    extract_xlsx_preview,
 )
 from .loopback_http import (
     open_loopback_url,
@@ -481,16 +481,25 @@ SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
 XLSX_ATTACHMENT_MIME_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
+DOCX_ATTACHMENT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+)
+PPTX_ATTACHMENT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
+PDF_ATTACHMENT_MIME_TYPE = "application/pdf"
 MANUAL_COMPACT_COMMAND = "/compact"
 MANUAL_COMPACT_INVOCATION_RE = re.compile(
     rf"^{re.escape(MANUAL_COMPACT_COMMAND)}(?:\s|$)",
     re.IGNORECASE,
 )
 _CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES = {
-    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".docx": DOCX_ATTACHMENT_MIME_TYPE,
     ".xlsx": XLSX_ATTACHMENT_MIME_TYPE,
-    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".pptx": PPTX_ATTACHMENT_MIME_TYPE,
+    ".pdf": PDF_ATTACHMENT_MIME_TYPE,
 }
+PREVIEWABLE_ATTACHMENT_MIME_TYPES = dict(_CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES)
 _GENERIC_ATTACHMENT_MIME_TYPES = {"", "application/octet-stream"}
 MEDIA_TAG_RE = re.compile(
     r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
@@ -545,6 +554,45 @@ def _truncate_agent_work_detail(value: str, maximum: int) -> tuple[str, int]:
     return text[:maximum], len(text) - maximum
 
 
+def _agent_work_parameters_json(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return ""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _agent_work_item_detail_chars(item: dict[str, Any]) -> int:
+    return (
+        len(str(item.get("detail") or ""))
+        + len(str(item.get("result") or ""))
+        + len(_agent_work_parameters_json(item.get("parameters")))
+    )
+
+
+def _fit_agent_work_parameters(value: Any, maximum: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or maximum <= 2:
+        return {}
+    fitted = {
+        str(key)[:64]: item
+        for key, item in value.items()
+        if isinstance(item, (str, int, float, bool)) and item != ""
+    }
+    rendered = _agent_work_parameters_json(fitted)
+    while fitted and len(rendered) > maximum:
+        string_keys = [key for key, item in fitted.items() if isinstance(item, str) and item]
+        if string_keys:
+            key = max(string_keys, key=lambda name: len(str(fitted[name])))
+            overflow = len(rendered) - maximum
+            next_length = max(0, len(str(fitted[key])) - overflow)
+            if next_length == 0:
+                del fitted[key]
+            else:
+                fitted[key] = str(fitted[key])[:next_length]
+        else:
+            fitted.popitem()
+        rendered = _agent_work_parameters_json(fitted)
+    return fitted
+
+
 def _bounded_agent_work_item(
     activity: list[dict[str, Any]],
     item: dict[str, Any],
@@ -559,9 +607,10 @@ def _bounded_agent_work_item(
     if bounded.get("tool_call_id") is not None:
         bounded["tool_call_id"] = str(bounded.get("tool_call_id") or "")[:512]
     detail = str(bounded.get("detail") or "")
+    result = str(bounded.get("result") or "")
     if _is_persistable_agent_work_item(bounded):
         other_detail_chars = sum(
-            len(str(existing.get("detail") or ""))
+            _agent_work_item_detail_chars(existing)
             for index, existing in enumerate(activity)
             if index != replacing_index and _is_persistable_agent_work_item(existing)
         )
@@ -577,6 +626,22 @@ def _bounded_agent_work_item(
         bounded["detail_truncated_chars"] = omitted
     else:
         bounded.pop("detail_truncated_chars", None)
+    remaining = max(0, detail_limit - len(rendered))
+    parameters = _fit_agent_work_parameters(bounded.get("parameters"), remaining)
+    if parameters:
+        bounded["parameters"] = parameters
+        remaining = max(0, remaining - len(_agent_work_parameters_json(parameters)))
+    else:
+        bounded.pop("parameters", None)
+    rendered_result, result_omitted = _truncate_agent_work_detail(result, remaining)
+    if rendered_result:
+        bounded["result"] = rendered_result
+    else:
+        bounded.pop("result", None)
+    if result_omitted:
+        bounded["result_truncated_chars"] = result_omitted
+    else:
+        bounded.pop("result_truncated_chars", None)
     return bounded
 
 
@@ -17049,6 +17114,7 @@ class EnterpriseService:
                         "tool": tool,
                         "tool_call_id": tool_call_id,
                         "at": timestamp,
+                        **_tool_work_detail_fields(event),
                     }
                     item["tool_status"] = terminal_status
                     item["completed_at"] = timestamp
@@ -17062,6 +17128,7 @@ class EnterpriseService:
                         "label": tool,
                         "tool_status": terminal_status,
                         "completed_at": timestamp,
+                        **_tool_work_detail_fields(event),
                     }
                     if detail:
                         updates["detail"] = detail
@@ -17106,6 +17173,7 @@ class EnterpriseService:
                 "tool_call_id": tool_call_id,
                 "tool_status": "running",
                 "at": timestamp,
+                **_tool_work_detail_fields(event),
             }
             if detail:
                 item_data["detail"] = detail
@@ -17787,30 +17855,39 @@ class EnterpriseService:
         actor: dict[str, Any],
         attachment_id: int,
     ) -> dict[str, Any]:
+        return self.get_attachment_preview(actor, attachment_id)
+
+    def get_attachment_preview(
+        self,
+        actor: dict[str, Any],
+        attachment_id: int,
+    ) -> dict[str, Any]:
         attachment, path = self.get_attachment_file(actor, attachment_id)
+        filename = str(attachment.get("filename") or "attachment")
+        suffix = Path(filename).suffix.casefold()
+        expected_mime = PREVIEWABLE_ATTACHMENT_MIME_TYPES.get(suffix)
         if (
-            Path(str(attachment.get("filename") or "")).suffix.casefold() != ".xlsx"
-            or str(attachment.get("mime_type") or "").casefold()
-            != XLSX_ATTACHMENT_MIME_TYPE
+            expected_mime is None
+            or str(attachment.get("mime_type") or "").casefold() != expected_mime
         ):
-            raise ServiceError(415, "attachment is not an XLSX workbook")
+            raise ServiceError(415, "attachment cannot be previewed")
         try:
-            if path.stat().st_size > MAX_XLSX_PREVIEW_BYTES:
-                raise KnowledgeFileError("XLSX preview input is too large")
+            if path.stat().st_size > MAX_DOCUMENT_PREVIEW_BYTES:
+                raise KnowledgeFileError("document preview input is too large")
             with path.open("rb") as handle:
-                data = handle.read(MAX_XLSX_PREVIEW_BYTES + 1)
-            if len(data) > MAX_XLSX_PREVIEW_BYTES:
-                raise KnowledgeFileError("XLSX preview input is too large")
-            preview = extract_xlsx_preview(data)
+                data = handle.read(MAX_DOCUMENT_PREVIEW_BYTES + 1)
+            if len(data) > MAX_DOCUMENT_PREVIEW_BYTES:
+                raise KnowledgeFileError("document preview input is too large")
+            preview = extract_attachment_preview(filename, data)
         except (OSError, KnowledgeFileError) as exc:
             raise ServiceError(
                 422,
-                "XLSX preview is unavailable; the original file can still be downloaded",
-                code="xlsx_preview_unavailable",
+                "Document preview is unavailable; the original file can still be downloaded",
+                code="document_preview_unavailable",
             ) from exc
         return {
             "attachment_id": int(attachment["id"]),
-            "filename": str(attachment.get("filename") or "workbook.xlsx"),
+            "filename": filename,
             **preview,
         }
 
@@ -17852,13 +17929,9 @@ class EnterpriseService:
             "url": f"/api/attachments/{int(row['id'])}",
             "download_url": f"/api/attachments/{int(row['id'])}?download=1",
         }
-        if (
-            Path(str(row.get("filename") or "")).suffix.casefold() == ".xlsx"
-            and mime_type.casefold() == XLSX_ATTACHMENT_MIME_TYPE
-        ):
-            item["preview_url"] = (
-                f"/api/attachments/{int(row['id'])}/xlsx-preview"
-            )
+        suffix = Path(str(row.get("filename") or "")).suffix.casefold()
+        if PREVIEWABLE_ATTACHMENT_MIME_TYPES.get(suffix) == mime_type.casefold():
+            item["preview_url"] = f"/api/attachments/{int(row['id'])}/preview"
         if include_local_path:
             item["local_path"] = str(local_path)
             parts = storage_path.parts
@@ -19227,6 +19300,228 @@ def agent_tool_detail(event: dict[str, Any]) -> str:
         parts = [action, url]
         return " · ".join(part for part in parts if part)[:160]
     return action
+
+
+_RESULT_OMITTED_TOOLS = frozenset({"mail", "memory", "session", "session_search"})
+_AGENT_WORK_TARGET_VALUES = frozenset({"sandbox", "host"})
+_AGENT_WORK_BACKGROUND_KINDS = frozenset({"task", "service"})
+_AGENT_WORK_DELEGATE_ROLES = frozenset({"leaf", "orchestrator"})
+
+
+def _optional_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def agent_tool_parameters(event: dict[str, Any]) -> dict[str, Any]:
+    """Return a closed-world, secret-redacted argument map for expanded work details."""
+
+    tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+    arguments = event.get("arguments")
+    if not isinstance(arguments, dict):
+        return {}
+    if tool == "session_search":
+        action = _safe_tool_summary_text(arguments.get("action"), limit=40)
+        return {"action": action} if action else {}
+    if tool == "terminal":
+        parameters: dict[str, Any] = {}
+        command = _safe_terminal_command_preview(arguments.get("command"))
+        if command:
+            parameters["command"] = command
+        if arguments.get("background") is True:
+            parameters["background"] = True
+        kind = str(arguments.get("background_kind") or "").strip().lower()
+        if kind in _AGENT_WORK_BACKGROUND_KINDS:
+            parameters["background_kind"] = kind
+        timeout_ms = _optional_int(arguments.get("timeout_ms"))
+        if timeout_ms is not None:
+            parameters["timeout_ms"] = timeout_ms
+        target = str(arguments.get("target") or "").strip().lower()
+        if target in _AGENT_WORK_TARGET_VALUES:
+            parameters["target"] = target
+        cwd = _safe_tool_path(arguments.get("cwd")) if arguments.get("cwd") else ""
+        if cwd:
+            parameters["cwd"] = cwd
+        return parameters
+    if tool in {"read_file", "write_file", "patch_file"}:
+        parameters = {}
+        path = _safe_tool_path(arguments.get("path"))
+        if path:
+            parameters["path"] = path
+        target = str(arguments.get("target") or "").strip().lower()
+        if target in _AGENT_WORK_TARGET_VALUES:
+            parameters["target"] = target
+        if tool == "read_file":
+            offset = _optional_int(arguments.get("offset"))
+            if offset is not None:
+                parameters["offset"] = offset
+            limit = _optional_int(arguments.get("limit"))
+            if limit is not None:
+                parameters["limit"] = limit
+        return parameters
+    if tool == "search_files":
+        parameters = {}
+        query = _safe_tool_summary_text(arguments.get("query"), limit=240)
+        if query:
+            parameters["query"] = query
+        path = _safe_tool_path(arguments.get("path"))
+        if path and path != ".":
+            parameters["path"] = path
+        if arguments.get("regex") is True:
+            parameters["regex"] = True
+        max_results = _optional_int(arguments.get("max_results"))
+        if max_results is not None:
+            parameters["max_results"] = max_results
+        return parameters
+    if tool == "process":
+        parameters = {}
+        action = _safe_tool_summary_text(arguments.get("action"), limit=40)
+        if action:
+            parameters["action"] = action
+        process_id = _safe_tool_summary_text(arguments.get("process_id"), limit=80)
+        if process_id:
+            parameters["process_id"] = process_id
+        timeout_ms = _optional_int(arguments.get("timeout_ms"))
+        if timeout_ms is not None:
+            parameters["timeout_ms"] = timeout_ms
+        return parameters
+    if tool == "delegate_task":
+        parameters = {}
+        role = str(arguments.get("role") or "").strip().lower()
+        if role in _AGENT_WORK_DELEGATE_ROLES:
+            parameters["role"] = role
+        tasks = arguments.get("tasks")
+        if isinstance(tasks, list):
+            parameters["task_count"] = len(tasks)
+        return parameters
+
+    action = _safe_tool_summary_text(arguments.get("action"), limit=40)
+    nested = arguments.get("arguments")
+    nested = nested if isinstance(nested, dict) else {}
+    if tool == "mail":
+        return {"action": action} if action else {}
+    if tool == "skill":
+        parameters = {}
+        if action:
+            parameters["action"] = action
+        skill_id = _safe_skill_trace_id(nested.get("id"))
+        if skill_id:
+            parameters["id"] = skill_id
+        if action == "read":
+            file_path = _safe_skill_trace_file_path(nested.get("file_path"))
+            if file_path:
+                parameters["file_path"] = file_path
+        return parameters
+    if tool in {"web", "knowledge", "memory", "session", "browser", "schedule", "sylver_platform"}:
+        parameters = {}
+        if action:
+            parameters["action"] = action
+        if tool == "browser":
+            host = _safe_tool_url(nested.get("url") or arguments.get("url"))
+            if host:
+                parameters["host"] = host
+            return parameters
+        if tool in {"schedule", "sylver_platform", "memory", "session"}:
+            return parameters
+        query = _safe_tool_summary_text(nested.get("query") or nested.get("q"), limit=240)
+        if query:
+            parameters["query"] = query
+        host = _safe_tool_url(nested.get("url"))
+        if host:
+            parameters["host"] = host
+        identifier = _safe_tool_summary_text(
+            nested.get("document_id") or nested.get("id"),
+            limit=80,
+        )
+        if identifier:
+            parameters["id"] = identifier
+        return parameters
+    return {"action": action} if action else {}
+
+
+def _tool_result_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _safe_tool_summary_text(
+            value,
+            limit=4096,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+    if not isinstance(value, dict):
+        return ""
+    content = value.get("content")
+    if isinstance(content, str):
+        return _safe_tool_summary_text(
+            content,
+            limit=4096,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+    if isinstance(content, list):
+        texts = [
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        joined = "\n".join(part for part in texts if part)
+        if joined:
+            return _safe_tool_summary_text(
+                joined,
+                limit=4096,
+                preserve_whitespace=True,
+                redact_paths=False,
+            )
+    details = value.get("details")
+    if isinstance(details, (str, int, float)) and not isinstance(details, bool):
+        return _safe_tool_summary_text(
+            details,
+            limit=1024,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+    return ""
+
+
+def agent_tool_result_preview(event: dict[str, Any]) -> str:
+    """Return a bounded, secret-redacted result or error for expanded work details."""
+
+    tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+    if tool in _RESULT_OMITTED_TOOLS:
+        return ""
+    event_type = str(
+        event.get("event") or event.get("type") or event.get("event_type") or ""
+    ).strip().lower()
+    if event_type not in {"tool.completed", "tool.failed", "completed", "failed", "error"}:
+        return ""
+    parts: list[str] = []
+    error = str(event.get("error") or event.get("reason") or "").strip()
+    if error and (event.get("is_error") is True or event_type in {"tool.failed", "failed", "error"}):
+        redacted = _safe_tool_summary_text(
+            error,
+            limit=500,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+        if redacted:
+            parts.append(redacted)
+    preview = _tool_result_text(event.get("result"))
+    if preview:
+        parts.append(preview)
+    return "\n\n".join(parts)
+
+
+def _tool_work_detail_fields(event: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    parameters = agent_tool_parameters(event)
+    if parameters:
+        fields["parameters"] = parameters
+    result = agent_tool_result_preview(event)
+    if result:
+        fields["result"] = result
+    return fields
 
 
 _SKILL_TRACE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")

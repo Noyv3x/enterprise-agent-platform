@@ -17,7 +17,10 @@ from enterprise_agent_platform import knowledge_files as files_module
 from enterprise_agent_platform.knowledge_files import (
     ExtractedKnowledgeFile,
     KnowledgeFileError,
+    extract_docx_preview,
     extract_knowledge_file,
+    extract_pdf_preview,
+    extract_pptx_preview,
     extract_xlsx_preview,
 )
 
@@ -162,6 +165,7 @@ class KnowledgeFileExtractionTests(unittest.TestCase):
 
         preview = extract_xlsx_preview(xlsx)
 
+        self.assertEqual(preview["kind"], "xlsx")
         self.assertEqual(preview["sheet_count"], 1)
         self.assertFalse(preview["truncated"])
         sheet = preview["sheets"][0]
@@ -185,6 +189,55 @@ class KnowledgeFileExtractionTests(unittest.TestCase):
         })
         with self.assertRaisesRegex(KnowledgeFileError, "unsafe"):
             extract_xlsx_preview(xlsx)
+
+    def test_docx_pptx_and_pdf_previews_return_bounded_text_sections(self):
+        docx = archive({
+            "[Content_Types].xml": content_types(
+                "vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            ),
+            "word/document.xml": (
+                b"<w:document xmlns:w='w'><w:body>"
+                b"<w:p><w:r><w:t>Title line</w:t></w:r></w:p>"
+                b"<w:p><w:r><w:t>Body paragraph</w:t></w:r></w:p>"
+                b"</w:body></w:document>"
+            ),
+        })
+        pptx = archive({
+            "[Content_Types].xml": content_types(
+                "vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+            ),
+            "ppt/slides/slide1.xml": (
+                b"<p:sld xmlns:p='p' xmlns:a='a'><a:t>Quarterly</a:t><a:t>Revenue</a:t></p:sld>"
+            ),
+            "ppt/slides/slide2.xml": (
+                b"<p:sld xmlns:p='p' xmlns:a='a'><a:t>Outlook</a:t></p:sld>"
+            ),
+        })
+        page = mock.Mock()
+        page.extract_text.return_value = "Page one text"
+        second = mock.Mock()
+        second.extract_text.return_value = "Page two text"
+        reader = mock.Mock(is_encrypted=False, pages=[page, second])
+
+        document = extract_docx_preview(docx)
+        slides = extract_pptx_preview(pptx)
+        with mock.patch.object(files_module, "PdfReader", return_value=reader):
+            pdf = extract_pdf_preview(b"%PDF-preview")
+
+        self.assertEqual(document["kind"], "docx")
+        self.assertEqual(document["sections"][0]["blocks"], ["Title line", "Body paragraph"])
+        self.assertEqual(slides["kind"], "pptx")
+        self.assertEqual(slides["section_count"], 2)
+        self.assertEqual(slides["sections"][0]["index"], 1)
+        self.assertEqual(slides["sections"][0]["blocks"], ["Quarterly", "Revenue"])
+        self.assertEqual(pdf["kind"], "pdf")
+        self.assertEqual(pdf["section_count"], 2)
+        self.assertEqual(pdf["sections"][0]["blocks"], ["Page one text"])
+
+        empty_pdf = mock.Mock(is_encrypted=False, pages=[mock.Mock(extract_text=mock.Mock(return_value=""))])
+        with mock.patch.object(files_module, "PdfReader", return_value=empty_pdf):
+            with self.assertRaisesRegex(KnowledgeFileError, "no extractable text"):
+                extract_pdf_preview(b"%PDF-empty")
 
     def test_pdf_uses_existing_text_layer_and_rejects_scans(self):
         page = mock.Mock()
