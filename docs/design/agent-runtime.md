@@ -19,6 +19,8 @@ Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agen
 
 邮件唤醒的 durable Agent job 只保存 Platform 权威源消息引用；Platform 在队列调度和重启/中断恢复边界严格校验该引用后，在内存中重建有界预览任务再提交 Runtime。Runtime 不从 job 键、邮件正文或其它文本猜测账户与 scope 身份。
 
+本地与 Quality 的 Runtime 测试入口把依赖亚秒真实计时的文件隔离到串行进程，其余文件才并行；完整规则见[测试与验证](../development/testing.md)。
+
 ## Run 状态机
 
 顶层 Run 先进入 FIFO 并发队列，再依次经历 `queued`、`running` 和一个终态。终态为 `completed`、`failed`、`cancelled` 或 `needs_review`。只有顶层 Run 消耗全局并发名额；委派子 Run 共享父 Run 的执行槽、Sandbox 与工作区，但保持派生 scope、独立 session 和事件。
