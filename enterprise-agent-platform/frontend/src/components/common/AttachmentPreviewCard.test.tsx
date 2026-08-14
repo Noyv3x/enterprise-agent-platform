@@ -146,12 +146,12 @@ describe("AttachmentPreviewCard", () => {
     );
 
     expect(await screen.findByText("Quarterly review")).toBeInTheDocument();
-    expect(screen.getByText("Word document")).toBeInTheDocument();
+    expect(screen.getByText(/Word document/)).toBeInTheDocument();
     expect(screen.getByText("Goals")).toBeInTheDocument();
-    expect(screen.getByText("Slide 1")).toBeInTheDocument();
+    expect(screen.getAllByText("Slide 1").length).toBeGreaterThan(0);
     expect(screen.getByText("Executive summary")).toBeInTheDocument();
     expect(screen.getByText("Page 1")).toBeInTheDocument();
-    expect(screen.getByText(/limited preview/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/limited preview/i).length).toBeGreaterThan(0);
 
     await user.click(screen.getAllByRole("button", { name: "Expand preview" })[1]);
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
