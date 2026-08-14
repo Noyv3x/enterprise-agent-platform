@@ -12,7 +12,7 @@
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生。当前容器路径、环境变量、进程身份和 Camoufox sidecar 只使用 `agent-platform` / `AGENT_PLATFORM_*` / `.agent-platform-runtime.json` target 接口，单个适配器不得引入第二套技术身份。
 - 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
-- 聊天中的 XLSX、DOCX、PPTX 与 PDF 预览在 Platform 进程内从已授权附件提取有界文本，不调用外部 Office/PDF 服务，也不把原件交给浏览器查看器。
+- 聊天中的 XLSX、DOCX、PPTX 与 PDF 预览在 Platform 进程内从已授权附件提取有界文本，不调用外部 Office/PDF 服务，也不把原件交给浏览器查看器。Agent 写出的 HTML 呈现页不是 Camoufox、Firecrawl 或 Office 预览：它由 Platform 按当前工作区或 HTML 附件读取，并在电脑画面的沙箱 iframe 中显示。
 - 频道消息撤回只改变 Platform 产品消息可见性；已经提交给 Agent 或外部集成的输入不作追溯撤销，不能把界面撤回解释为 Runtime、Telegram、邮箱或其它集成的取消协议。
 - 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
@@ -48,7 +48,7 @@ Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依�
 
 浏览器身份由 scope key 哈希派生，模型不能指定 user id、profile 路径或 session key。每次操作都带派生身份，URL 在操作前后重新校验。浏览器按可信成员模型允许普通内网和回环页面，但拒绝云元数据、链路本地、多播、保留、不可路由目标及 URL 内嵌凭据。
 
-支持 tab、导航、snapshot、截图/vision、链接、图片、下载列表、结构化提取和常见交互；console 不执行任意 JavaScript。预览只读取已有 tab 的 viewport 帧，打开预览不能启动浏览器、创建 tab、导航或改变当前 tab。只读观察保持两秒级低频 JPEG；用户取得人工接管后，同一鉴权 HTTP 边界临时切换为有界的高频 JPEG 轮询，使用 ETag、CSS 像素截图和较低质量压缩避免重复正文与坐标漂移。接管结束、页面隐藏或失焦后立即恢复低频观察，不维持后台高带宽流。
+支持 tab、导航、snapshot、截图/vision、链接、图片、下载列表、结构化提取和常见交互；console 不执行任意 JavaScript。用户界面里的「AI 的电脑」复用这一预览作为浏览器屏幕，不另接 Camoufox 通道，也不因电脑画面统一入口而在打开预览时启动浏览器。预览只读取已有 tab 的 viewport 帧，打开预览不能启动浏览器、创建 tab、导航或改变当前 tab。只读观察保持两秒级低频 JPEG；用户取得人工接管后，同一鉴权 HTTP 边界临时切换为有界的高频 JPEG 轮询，使用 ETag、CSS 像素截图和较低质量压缩避免重复正文与坐标漂移。接管结束、页面隐藏或失焦后立即恢复低频观察，不维持后台高带宽流。
 
 用户可以对当前已授权 tab 取得短期人工接管租约，用限幅坐标鼠标、连续拖拽、滚动、文本与按键协助处理验证码或卡住的页面。连续指针采用有界轨迹协议：前端使用 Pointer Events 与 pointer capture 记录 `down → move[] → up`，本地合并高频 move 后以单个单调 sequence 提交整条轨迹；提交前的取消、失焦或页面隐藏只丢弃本地轨迹并释放租约。Platform 完整校验动作后才消费 sequence；Camoufox 在同一 tab lock 内按有界相对时间执行 Playwright `mouse.down/move/up`，并在异常路径的 `finally` 中保证最终抬键。整条轨迹一旦执行便不提供伪中断协议，客户端也不能逐个堆积 DOM `pointermove` HTTP 请求。
 

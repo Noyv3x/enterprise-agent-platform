@@ -97,7 +97,7 @@ Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_a
 
 Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与知识 Embeddings provider 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。未配置 Embeddings API key 是明确的知识 disabled 状态，不是容器 readiness 失败。
 
-任何时刻最多一个可写 Platform 打开 SQLite。账号级集成凭据、有界登录失败窗口，以及消息 `metadata.agent_work` 中的工作记录详情都属于 SQLite 中的 Platform 状态，必须随同一个候选快照、提交和回滚边界切换；聊天文档预览是从附件原件即时派生的 JSON，不另存一份预览副本。更新不能清空防爆破计数，也不能让旧、新 generation 同时修改连接凭据。已持久化的 session secret 随同一 SQLite 切换，候选切换或 Platform 容器重启不得改写该 secret，因此未到期且未被吊销的浏览器登录在 generation 切换后继续有效；登录 TTL 与活动续期见[安全设计](../design/security-and-trust.md)。容器 listen 继续只来自 Manager 生成的环境与入口参数，不能从 Platform SQLite 回写。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
+任何时刻最多一个可写 Platform 打开 SQLite。账号级集成凭据、有界登录失败窗口，以及消息 `metadata.agent_work` 中的工作记录详情都属于 SQLite 中的 Platform 状态，必须随同一个候选快照、提交和回滚边界切换；聊天文档预览是从附件原件即时派生的 JSON，不另存一份预览副本。电脑画面的文件正文与 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表，也不在观察路径上创建 workspace、启动 Sandbox/Camoufox 或改写文件。更新不能清空防爆破计数，也不能让旧、新 generation 同时修改连接凭据。已持久化的 session secret 随同一 SQLite 切换，候选切换或 Platform 容器重启不得改写该 secret，因此未到期且未被吊销的浏览器登录在 generation 切换后继续有效；登录 TTL 与活动续期见[安全设计](../design/security-and-trust.md)。容器 listen 继续只来自 Manager 生成的环境与入口参数，不能从 Platform SQLite 回写。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
 
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform

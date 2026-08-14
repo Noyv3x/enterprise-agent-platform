@@ -94,6 +94,12 @@ describe("read-only Agent preview endpoints", () => {
     expect(endpoints.terminalPreviews.path("channel", 4)).toBe(
       "/api/agent-previews/terminals?scope_type=channel&scope_id=4",
     );
+    expect(endpoints.previewFile.path("private", "7", "notes/app.ts")).toBe(
+      "/api/agent-previews/file?scope_type=private&scope_id=7&workspace_path=notes%2Fapp.ts",
+    );
+    expect(endpoints.previewPresent.path("private", "7")).toBe(
+      "/api/agent-previews/present?scope_type=private&scope_id=7",
+    );
   });
 });
 

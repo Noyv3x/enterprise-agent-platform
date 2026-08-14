@@ -2937,7 +2937,7 @@ const MAX_BACKGROUND_TASK_CONTINUATIONS = 3;
 const MAX_DELEGATED_VALIDATION_CONTINUATIONS = 2;
 const MAX_PRESERVED_MEDIA_MARKERS = 32;
 const MAX_PRESERVED_MEDIA_MARKER_LENGTH = 4096;
-const PRESERVED_MEDIA_SUFFIX_RE = /\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)$/i;
+const PRESERVED_MEDIA_SUFFIX_RE = /\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa|html?)$/i;
 const UNSAFE_MEDIA_PATH_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 const PROMISE_ONLY_CONTINUATION = "Do not stop at a promise or progress statement. If the request requires action and "
   + "a suitable tool is available, perform the next concrete step now. If action is genuinely unnecessary or "

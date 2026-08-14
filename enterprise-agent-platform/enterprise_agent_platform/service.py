@@ -502,8 +502,32 @@ _CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES = {
 PREVIEWABLE_ATTACHMENT_MIME_TYPES = dict(_CANONICAL_OFFICE_ATTACHMENT_MIME_TYPES)
 _GENERIC_ATTACHMENT_MIME_TYPES = {"", "application/octet-stream"}
 MEDIA_TAG_RE = re.compile(
-    r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?''',
+    r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa|html?)(?=[\s`"',;:)\]}]|$))[`"']?''',
     re.IGNORECASE,
+)
+COMPUTER_FILE_TOOLS = frozenset({"read_file", "write_file", "patch_file"})
+COMPUTER_SEARCH_TOOLS = frozenset({"web", "knowledge", "search_files"})
+COMPUTER_TERMINAL_TOOLS = frozenset({"terminal", "process"})
+COMPUTER_BROWSER_TOOLS = frozenset({"browser"})
+COMPUTER_HTML_SUFFIXES = frozenset({".html", ".htm"})
+COMPUTER_FILE_PREVIEW_MAX_BYTES = 64 * 1024
+COMPUTER_PRESENT_MAX_BYTES = 512 * 1024
+COMPUTER_SEARCH_HIT_LIMIT = 8
+COMPUTER_SEARCH_SNIPPET_MAX = 240
+COMPUTER_WORKSPACE_PATH_MAX = 240
+HTML_ATTACHMENT_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+PRESENT_PAGE_CSP = (
+    "default-src 'none'; "
+    "script-src 'unsafe-inline'; "
+    "style-src 'unsafe-inline'; "
+    "img-src data: blob:; "
+    "font-src data:; "
+    "media-src data: blob:; "
+    "connect-src 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'none'; "
+    "object-src 'none'"
 )
 THINKING_DEPTHS = ("none", "minimal", "low", "medium", "high", "xhigh")
 DEFAULT_THINKING_DEPTH = "medium"
@@ -8897,6 +8921,294 @@ class EnterpriseService:
         return {
             "browser_active": browser.get("active") is True,
             "running_terminal_count": running_terminal_count,
+            "present_available": self._present_source_available(
+                actor,
+                normalized_type,
+                normalized_id,
+            ),
+        }
+
+    def _authorized_preview_scope(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> tuple[str, str, Any]:
+        scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
+        scope_key = (
+            self.agent_scopes.private_scope_key(int(scope_id))
+            if scope_type == "private"
+            else self.agent_scopes.channel_scope_key(scope_id)
+        )
+        return scope_type, scope_id, self.agent_scopes.get_scope(scope_key)
+
+    def _preview_workspace_owner_id(self, scope: Any) -> int | None:
+        if scope is None or str(getattr(scope, "scope_type", "")) != "private":
+            return None
+        try:
+            return int(scope.scope_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _read_workspace_preview_bytes(
+        self,
+        scope: Any,
+        relative_path: str,
+        *,
+        maximum_bytes: int,
+    ) -> bytes:
+        relative = workspace_relative_path(relative_path)
+        if not relative:
+            raise ServiceError(400, "workspace_path must be a current /workspace relative path")
+        reference = self._media_file_reference(
+            f"{CONTAINER_PATHS['workspace']}/{relative}",
+            self._preview_workspace_owner_id(scope),
+            workspace_path=Path(scope.workspace_path),
+        )
+        if reference is None:
+            raise ServiceError(404, "workspace file is not available")
+        try:
+            _path, data = self._read_media_file_reference(*reference)
+        except FileNotFoundError as exc:
+            raise ServiceError(404, "workspace file is not available") from exc
+        except (OSError, RuntimeError) as exc:
+            raise ServiceError(404, "workspace file is not available") from exc
+        if len(data) > maximum_bytes:
+            return data[:maximum_bytes]
+        return data
+
+    def _workspace_file_exists(self, scope: Any, relative_path: str) -> bool:
+        relative = workspace_relative_path(relative_path)
+        if scope is None or not relative:
+            return False
+        try:
+            self._read_workspace_preview_bytes(
+                scope,
+                relative,
+                maximum_bytes=1,
+            )
+        except ServiceError:
+            return False
+        return True
+
+    def _latest_html_attachment_for_scope(
+        self,
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any] | None:
+        rows = self.db.query(
+            """
+            SELECT a.id, a.filename, a.mime_type, a.message_id
+            FROM attachments AS a
+            JOIN messages AS m ON m.id = a.message_id
+            WHERE m.scope_type = ? AND m.scope_id = ?
+              AND m.author_type = 'agent' AND m.hidden_at IS NULL
+            ORDER BY a.id DESC
+            LIMIT 40
+            """,
+            (scope_type, str(scope_id)),
+        )
+        for row in rows:
+            attachment = dict(row)
+            if not _is_html_attachment(attachment):
+                continue
+            message = self.db.query_one(
+                "SELECT metadata_json FROM messages WHERE id = ?",
+                (int(attachment["message_id"]),),
+            )
+            metadata = decode_json((message or {}).get("metadata_json"))
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("needs_review") is True:
+                continue
+            work = metadata.get("agent_work")
+            if isinstance(work, dict) and str(work.get("state") or "") not in {"", "complete"}:
+                continue
+            return {
+                "attachment_id": int(attachment["id"]),
+                "filename": str(attachment.get("filename") or ""),
+            }
+        return None
+
+    def _latest_html_workspace_from_messages(
+        self,
+        scope_type: str,
+        scope_id: str,
+    ) -> str:
+        rows = self.db.query(
+            """
+            SELECT metadata_json FROM messages
+            WHERE scope_type = ? AND scope_id = ?
+              AND author_type = 'agent' AND hidden_at IS NULL
+            ORDER BY id DESC
+            LIMIT 12
+            """,
+            (scope_type, str(scope_id)),
+        )
+        for row in rows:
+            metadata = decode_json(row.get("metadata_json"))
+            if not isinstance(metadata, dict) or metadata.get("needs_review") is True:
+                continue
+            work = metadata.get("agent_work")
+            if not isinstance(work, dict) or str(work.get("state") or "") not in {"", "complete"}:
+                continue
+            activity = work.get("activity")
+            if not isinstance(activity, list):
+                continue
+            latest = latest_computer_work_item(activity)
+            if latest is None:
+                continue
+            tool = _computer_tool_name(latest)
+            if tool not in {"write_file", "patch_file"}:
+                continue
+            parameters = latest.get("parameters") if isinstance(latest.get("parameters"), dict) else {}
+            if str(parameters.get("target") or "").strip().lower() == "host":
+                continue
+            html_path = _html_workspace_path(parameters.get("workspace_path") or "")
+            if html_path:
+                return html_path
+        return ""
+
+    def _resolve_present_source(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any] | None:
+        scope_type, scope_id, scope = self._authorized_preview_scope(
+            actor,
+            scope_type,
+            scope_id,
+        )
+        key = self._conversation_key(scope_type, scope_id)
+        with self._conversation_lock:
+            status = self._copy_status(
+                self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+            )
+        computer = status.get("computer") if isinstance(status.get("computer"), dict) else {}
+        present = computer.get("present") if isinstance(computer.get("present"), dict) else {}
+        live_path = _html_workspace_path(present.get("workspace_path") or "")
+        if live_path and scope is not None and self._workspace_file_exists(scope, live_path):
+            return {"kind": "workspace", "workspace_path": live_path, "scope": scope}
+        message_path = self._latest_html_workspace_from_messages(scope_type, scope_id)
+        if message_path and scope is not None and self._workspace_file_exists(scope, message_path):
+            return {"kind": "workspace", "workspace_path": message_path, "scope": scope}
+        attachment = self._latest_html_attachment_for_scope(scope_type, scope_id)
+        if attachment is not None:
+            return {
+                "kind": "attachment",
+                "attachment_id": int(attachment["attachment_id"]),
+                "scope": scope,
+            }
+        return None
+
+    def _present_source_available(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> bool:
+        try:
+            source = self._resolve_present_source(actor, scope_type, scope_id)
+        except ServiceError:
+            return False
+        if source is None:
+            return False
+        if source.get("kind") == "workspace":
+            return True
+        try:
+            attachment, path = self.get_attachment_file(actor, int(source["attachment_id"]))
+        except ServiceError:
+            return False
+        return _is_html_attachment(attachment) and path.is_file()
+
+    def agent_preview_file(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+        workspace_path: str,
+    ) -> dict[str, Any]:
+        """Return bounded UTF-8 workspace text. Observation only."""
+
+        relative = workspace_relative_path(workspace_path)
+        if not relative:
+            raise ServiceError(400, "workspace_path must be a current /workspace relative path")
+        _scope_type, _scope_id, scope = self._authorized_preview_scope(
+            actor,
+            scope_type,
+            scope_id,
+        )
+        if scope is None:
+            raise ServiceError(404, "workspace file is not available")
+        data = self._read_workspace_preview_bytes(
+            scope,
+            relative,
+            maximum_bytes=COMPUTER_FILE_PREVIEW_MAX_BYTES + 1,
+        )
+        truncated = len(data) > COMPUTER_FILE_PREVIEW_MAX_BYTES
+        if truncated:
+            data = data[:COMPUTER_FILE_PREVIEW_MAX_BYTES]
+        if b"\x00" in data:
+            raise ServiceError(415, "file is not previewable text")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ServiceError(415, "file is not previewable text") from exc
+        text = _safe_tool_summary_text(
+            text,
+            limit=COMPUTER_FILE_PREVIEW_MAX_BYTES,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+        return {
+            "workspace_path": relative,
+            "content": text,
+            "truncated": truncated,
+            "encoding": "utf-8",
+        }
+
+    def agent_preview_present(
+        self,
+        actor: dict[str, Any],
+        scope_type: str,
+        scope_id: str,
+    ) -> dict[str, Any]:
+        """Return the current HTML present page for one chat scope."""
+
+        source = self._resolve_present_source(actor, scope_type, scope_id)
+        if source is None:
+            raise ServiceError(404, "present page is not available")
+        if source.get("kind") == "attachment":
+            attachment, path = self.get_attachment_file(actor, int(source["attachment_id"]))
+            if not _is_html_attachment(attachment):
+                raise ServiceError(404, "present page is not available")
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise ServiceError(404, "present page is not available") from exc
+        else:
+            scope = source.get("scope")
+            if scope is None:
+                raise ServiceError(404, "present page is not available")
+            data = self._read_workspace_preview_bytes(
+                scope,
+                str(source.get("workspace_path") or ""),
+                maximum_bytes=COMPUTER_PRESENT_MAX_BYTES + 1,
+            )
+        if len(data) > COMPUTER_PRESENT_MAX_BYTES:
+            raise ServiceError(413, "present page exceeds the preview size limit")
+        if b"\x00" in data[:8192]:
+            raise ServiceError(415, "present page is not valid HTML")
+        try:
+            html = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ServiceError(415, "present page is not valid HTML") from exc
+        etag = f'"{hashlib.sha256(data).hexdigest()}"'
+        return {
+            "html": html,
+            "etag": etag,
+            "content_type": "text/html; charset=utf-8",
         }
 
     def runtime_status(self, actor: dict[str, Any]) -> dict[str, Any]:
@@ -16736,6 +17048,7 @@ class EnterpriseService:
         copied.pop("_work_timeline_next_sequence", None)
         copied.pop("_work_timeline_tool_seen", None)
         copied.pop("_work_timeline_omitted_tool_call_ids", None)
+        search = copied.pop("_computer_search", None)
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
@@ -16749,6 +17062,11 @@ class EnterpriseService:
             copied["active_input_group"]["message_ids"] = list(
                 copied["active_input_group"].get("message_ids") or []
             )
+        computer = project_computer_clues(copied.get("activity") or [], search)
+        if computer:
+            copied["computer"] = computer
+        else:
+            copied.pop("computer", None)
         return copied
 
     def _record_agent_activity(
@@ -17145,6 +17463,7 @@ class EnterpriseService:
                     else f"完成 {tool}"
                 )
                 status["updated_at"] = timestamp
+                _remember_computer_search(status, event, tool)
                 self._agent_status[key] = status
                 return
 
@@ -17194,6 +17513,7 @@ class EnterpriseService:
             status["activity"] = activity
             status["current_step"] = line
             status["updated_at"] = timestamp
+            _remember_computer_search(status, event, tool)
             self._agent_status[key] = status
 
     def _record_agent_approval_request(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
@@ -19306,6 +19626,345 @@ _RESULT_OMITTED_TOOLS = frozenset({"mail", "memory", "session", "session_search"
 _AGENT_WORK_TARGET_VALUES = frozenset({"sandbox", "host"})
 _AGENT_WORK_BACKGROUND_KINDS = frozenset({"task", "service"})
 _AGENT_WORK_DELEGATE_ROLES = frozenset({"leaf", "orchestrator"})
+_SEARCH_FILES_LINE_RE = re.compile(
+    r"^(?P<path>(?:/workspace/)?(?!(?:/|\.\.(?:/|$)))[^\s:][^:]*)"
+    r"(?::(?:\s*filename match|(?P<line>\d+):(?P<snippet>.*)))?$"
+)
+
+
+def workspace_relative_path(value: Any) -> str:
+    """Return a stable /workspace-relative path, or empty when not a descendant."""
+
+    raw = str(value or "").strip().replace("\\", "/")
+    if (
+        not raw
+        or len(raw) > COMPUTER_WORKSPACE_PATH_MAX
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        return ""
+    logical = Path(CONTAINER_PATHS["workspace"])
+    try:
+        supplied = Path(raw)
+        relative = supplied.relative_to(logical) if supplied.is_absolute() else supplied
+    except ValueError:
+        return ""
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        return ""
+    rendered = relative.as_posix()
+    return rendered if len(rendered) <= COMPUTER_WORKSPACE_PATH_MAX else ""
+
+
+def _html_workspace_path(value: Any) -> str:
+    relative = workspace_relative_path(value)
+    if not relative:
+        return ""
+    suffix = Path(relative).suffix.casefold()
+    return relative if suffix in COMPUTER_HTML_SUFFIXES else ""
+
+
+def _is_html_attachment(attachment: dict[str, Any] | None) -> bool:
+    if not isinstance(attachment, dict):
+        return False
+    suffix = Path(str(attachment.get("filename") or "")).suffix.casefold()
+    mime = str(attachment.get("mime_type") or "").split(";", 1)[0].strip().lower()
+    return suffix in COMPUTER_HTML_SUFFIXES or mime in HTML_ATTACHMENT_MIME_TYPES
+
+
+def _computer_tool_name(item: dict[str, Any]) -> str:
+    return str(item.get("tool") or item.get("label") or "").strip().lower()
+
+
+def _is_computer_work_item(item: dict[str, Any]) -> bool:
+    if not isinstance(item, dict) or item.get("source") == "platform":
+        return False
+    tool = _computer_tool_name(item)
+    return tool in (
+        COMPUTER_FILE_TOOLS
+        | COMPUTER_SEARCH_TOOLS
+        | COMPUTER_TERMINAL_TOOLS
+        | COMPUTER_BROWSER_TOOLS
+    )
+
+
+def latest_computer_work_item(activity: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    latest_sequence = -1
+    for item in activity or []:
+        if not _is_computer_work_item(item):
+            continue
+        try:
+            sequence = int(item.get("updated_sequence") or item.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        if latest is None or sequence >= latest_sequence:
+            latest = item
+            latest_sequence = sequence
+    return latest
+
+
+def _safe_search_hit_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"}:
+        return ""
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        return ""
+    netloc = parsed.hostname
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    path = parsed.path or "/"
+    return _safe_tool_summary_text(
+        urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", "")),
+        limit=500,
+        redact_paths=False,
+    )
+
+
+def _search_hit_text(value: Any, *, limit: int) -> str:
+    return _safe_tool_summary_text(
+        value,
+        limit=limit,
+        preserve_whitespace=False,
+        redact_paths=False,
+    )
+
+
+def _coerce_search_hit(value: Any, *, tool: str) -> dict[str, str] | None:
+    if isinstance(value, str):
+        line = value.strip()
+        if not line or line.lower() in {"no matches", "no results"}:
+            return None
+        match = _SEARCH_FILES_LINE_RE.match(line)
+        if match:
+            relative = workspace_relative_path(match.group("path"))
+            snippet = _search_hit_text(
+                match.group("snippet") or "filename match",
+                limit=COMPUTER_SEARCH_SNIPPET_MAX,
+            )
+            title = Path(relative).name if relative else _search_hit_text(
+                match.group("path"),
+                limit=120,
+            )
+            if not title and not relative:
+                return None
+            hit: dict[str, str] = {"title": title or relative}
+            if relative:
+                hit["workspace_path"] = relative
+            if snippet:
+                hit["snippet"] = snippet
+            return hit
+        title = _search_hit_text(line, limit=160)
+        return {"title": title} if title else None
+    if not isinstance(value, dict):
+        return None
+    title = _search_hit_text(
+        value.get("title") or value.get("name") or value.get("filename") or "",
+        limit=160,
+    )
+    raw_url = value.get("url") or value.get("link") or ""
+    url = _safe_search_hit_url(raw_url)
+    relative = workspace_relative_path(
+        value.get("workspace_path") or value.get("path") or value.get("file") or ""
+    )
+    if raw_url and not url and not relative:
+        return None
+    snippet = _search_hit_text(
+        value.get("snippet")
+        or value.get("description")
+        or value.get("summary")
+        or value.get("excerpt")
+        or value.get("content")
+        or "",
+        limit=COMPUTER_SEARCH_SNIPPET_MAX,
+    )
+    if not title:
+        if url:
+            title = urllib.parse.urlsplit(url).hostname or url
+        elif relative:
+            title = Path(relative).name
+    if not title and not url and not relative:
+        return None
+    hit = {"title": title or relative or url}
+    if url:
+        hit["url"] = url
+    if relative and tool == "search_files":
+        hit["workspace_path"] = relative
+    elif relative and not url:
+        hit["workspace_path"] = relative
+    if snippet:
+        hit["snippet"] = snippet
+    return hit
+
+
+def _search_hit_sources(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict):
+        return []
+    for key in ("web", "results", "hits", "documents", "files", "matches"):
+        items = value.get(key)
+        if isinstance(items, list):
+            return items
+    nested = value.get("data")
+    if nested is not None and nested is not value:
+        return _search_hit_sources(nested)
+    return []
+
+
+def _parse_search_result_payload(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        sources = _search_hit_sources(value)
+        if sources:
+            return sources
+        content = value.get("content")
+        data = value.get("data")
+        if data is not None and data is not value:
+            parsed = _parse_search_result_payload(data)
+            if parsed:
+                return parsed
+        if isinstance(content, list):
+            texts = [
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            joined = "\n".join(part for part in texts if part)
+            if joined:
+                return _parse_search_result_payload(joined)
+        if isinstance(content, str):
+            return _parse_search_result_payload(content)
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return [line.strip() for line in text.splitlines() if line.strip()]
+        return _parse_search_result_payload(decoded)
+    return []
+
+
+def agent_search_hits(event: dict[str, Any]) -> list[dict[str, str]]:
+    """Return a closed-world, bounded search-hit list for the computer screen."""
+
+    tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+    if tool not in COMPUTER_SEARCH_TOOLS:
+        return []
+    hits: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in _parse_search_result_payload(event.get("result")):
+        hit = _coerce_search_hit(raw, tool=tool)
+        if not hit:
+            continue
+        identity = (
+            hit.get("title") or "",
+            hit.get("url") or "",
+            hit.get("workspace_path") or "",
+            hit.get("snippet") or "",
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        hits.append(hit)
+        if len(hits) >= COMPUTER_SEARCH_HIT_LIMIT:
+            break
+    return hits
+
+
+def project_computer_clues(
+    activity: list[dict[str, Any]] | None,
+    search: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Project live computer clues from work rows and bounded search hits."""
+
+    latest = latest_computer_work_item(activity)
+    search_payload = dict(search) if isinstance(search, dict) else None
+    if search_payload is not None:
+        tool = str(search_payload.get("tool") or "").strip().lower()
+        raw_hits = search_payload.get("hits")
+        hits = [
+            hit
+            for hit in raw_hits
+            if isinstance(hit, dict) and str(hit.get("title") or "").strip()
+        ] if isinstance(raw_hits, list) else []
+        if tool in COMPUTER_SEARCH_TOOLS and hits:
+            search_payload = {"tool": tool, "hits": hits[:COMPUTER_SEARCH_HIT_LIMIT]}
+        else:
+            search_payload = {"tool": tool, "hits": []} if tool in COMPUTER_SEARCH_TOOLS else None
+    if latest is None and search_payload is None:
+        return None
+    computer: dict[str, Any] = {}
+    if latest is not None:
+        tool = _computer_tool_name(latest)
+        parameters = latest.get("parameters") if isinstance(latest.get("parameters"), dict) else {}
+        status = str(latest.get("tool_status") or "running").strip().lower()
+        if tool in COMPUTER_FILE_TOOLS:
+            file_clue: dict[str, Any] = {"tool": tool, "status": status or "running"}
+            path = str(parameters.get("path") or "").strip()
+            if path:
+                file_clue["path"] = path
+            target = str(parameters.get("target") or "sandbox").strip().lower()
+            if target in _AGENT_WORK_TARGET_VALUES:
+                file_clue["target"] = target
+            relative = workspace_relative_path(parameters.get("workspace_path") or "")
+            if relative and target != "host":
+                file_clue["workspace_path"] = relative
+            computer["file"] = file_clue
+            html_path = _html_workspace_path(relative) if tool in {"write_file", "patch_file"} else ""
+            if html_path and target != "host":
+                computer["present"] = {"workspace_path": html_path}
+                computer["mode"] = "present"
+            else:
+                computer["mode"] = "file"
+        elif tool in COMPUTER_SEARCH_TOOLS:
+            computer["mode"] = "search"
+        elif tool in COMPUTER_TERMINAL_TOOLS:
+            computer["mode"] = "terminal"
+        elif tool in COMPUTER_BROWSER_TOOLS:
+            computer["mode"] = "browser"
+    if search_payload is not None:
+        computer["search"] = search_payload
+        computer.setdefault("mode", "search")
+    if not computer.get("mode"):
+        return None
+    return computer
+
+
+def _remember_computer_search(
+    status: dict[str, Any],
+    event: dict[str, Any],
+    tool: str,
+) -> None:
+    name = str(tool or "").strip().lower()
+    if name not in COMPUTER_SEARCH_TOOLS:
+        return
+    status["_computer_search"] = {
+        "tool": name,
+        "hits": agent_search_hits({**event, "tool": name, "tool_name": name}),
+    }
 
 
 def _optional_int(value: Any) -> int | None:
@@ -19352,6 +20011,10 @@ def agent_tool_parameters(event: dict[str, Any]) -> dict[str, Any]:
         target = str(arguments.get("target") or "").strip().lower()
         if target in _AGENT_WORK_TARGET_VALUES:
             parameters["target"] = target
+        if target != "host":
+            workspace_path = workspace_relative_path(arguments.get("path"))
+            if workspace_path:
+                parameters["workspace_path"] = workspace_path
         if tool == "read_file":
             offset = _optional_int(arguments.get("offset"))
             if offset is not None:

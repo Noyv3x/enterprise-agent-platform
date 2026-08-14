@@ -568,6 +568,14 @@ export interface OAuthImportResponse extends OAuthFlowResponse {
 export interface AgentPreviewStatusResponse {
   browser_active: boolean;
   running_terminal_count: number;
+  present_available: boolean;
+}
+
+export interface AgentPreviewFileResponse {
+  workspace_path: string;
+  content: string;
+  truncated: boolean;
+  encoding?: string;
 }
 
 export type TerminalProcessStatus = "running" | "completed" | "failed" | "cancelled" | "orphaned";

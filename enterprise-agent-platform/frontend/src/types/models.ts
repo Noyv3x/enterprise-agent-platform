@@ -41,7 +41,8 @@ export type IconName =
   | "browser"
   | "terminal"
   | "calendar"
-  | "sparkles";
+  | "sparkles"
+  | "computer";
 
 /** Top-level workspace view. */
 export type ActiveView =
@@ -236,6 +237,38 @@ export interface AgentReplyTarget {
   created_at?: number;
 }
 
+export type ComputerMode = "file" | "terminal" | "browser" | "search" | "present";
+
+export interface ComputerSearchHit {
+  title: string;
+  url?: string;
+  workspace_path?: string;
+  snippet?: string;
+}
+
+export interface ComputerFileClue {
+  tool?: string;
+  path?: string;
+  workspace_path?: string;
+  target?: "sandbox" | "host" | string;
+  status?: string;
+}
+
+export interface ComputerPresentClue {
+  workspace_path?: string;
+  attachment_id?: Id;
+}
+
+export interface ComputerProjection {
+  mode?: ComputerMode;
+  file?: ComputerFileClue;
+  search?: {
+    tool?: string;
+    hits?: ComputerSearchHit[];
+  };
+  present?: ComputerPresentClue;
+}
+
 /** The agent-work object embedded in a message's metadata (a completed run). */
 export interface AgentWork {
   run_id?: string;
@@ -248,6 +281,7 @@ export interface AgentWork {
   scope_id?: Id;
   activity?: ActivityStep[];
   approval?: AgentApprovalRequest | null;
+  computer?: ComputerProjection;
 }
 
 /** A live agent run status for a scope (superset of AgentWork). */
@@ -285,6 +319,7 @@ export interface ContextUsage {
 
 export interface MessageMetadata {
   local_pending?: boolean;
+  needs_review?: boolean;
   upload?: MessageUploadProgress;
   streaming?: boolean;
   stream_segment?: boolean;

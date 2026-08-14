@@ -1148,6 +1148,8 @@ test("RunCoordinator requests one bounded verification after a file change", asy
       + "MEDIA: /workspace/changed.txt\n"
       + "MEDIA: `/workspace/changed.txt`\n"
       + "MEDIA: /workspace/summary.csv\n"
+      + "MEDIA: /workspace/page.html\n"
+      + "MEDIA: /workspace/deck.htm\n"
       + "MEDIA: /workspace/../secret.txt\n"
       + "MEDIA: /workspace/no-extension\n"
       + "MEDIA: /workspace/changed.txt — still unverified\n"
@@ -1180,7 +1182,9 @@ test("RunCoordinator requests one bounded verification after a file change", asy
     assert.equal(
       completed.result?.content,
       "Verified the updated file.\nMEDIA: \"/workspace/summary.csv\""
-      + "\n\nMEDIA: /workspace/changed.txt",
+      + "\n\nMEDIA: /workspace/changed.txt"
+      + "\nMEDIA: /workspace/page.html"
+      + "\nMEDIA: /workspace/deck.htm",
     );
     assert.equal(await readFile(`${workspace}/changed.txt`, "utf8"), "updated\n");
     assert.equal(faux.state.callCount, 4);

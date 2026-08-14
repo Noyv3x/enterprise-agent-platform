@@ -3,12 +3,13 @@ import { Badge, Button, Tooltip } from "antd";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
-import type { AgentPreviewScope } from "../../types";
+import { useStore } from "../../store/useStore";
+import type { AgentPreviewScope, ComputerMode, Message } from "../../types";
 import { Icon } from "../common/Icon";
 import { Spinner } from "../common/Spinner";
-import { BrowserPreviewView } from "./BrowserPreviewView";
 import { ChatPreviewContext } from "./ChatPreviewContext";
-import { TerminalPreviewView } from "./TerminalPreviewView";
+import { ComputerScreen } from "./ComputerScreen";
+import { deriveComputerSurface, latestComputerStep } from "./computer";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 import "./preview.css";
 
@@ -28,7 +29,9 @@ const SkillsPanel = lazy(() =>
   })),
 );
 
-type SidePanelKind = "memory" | "skills" | "tasks" | "browser" | "terminal";
+type SidePanelKind = "memory" | "skills" | "tasks" | "computer";
+
+const EMPTY_MESSAGES: Message[] = [];
 
 interface ChatPreviewSidebarProps {
   scope: AgentPreviewScope | null;
@@ -42,7 +45,21 @@ export function ChatPreviewSidebar({
   children,
 }: ChatPreviewSidebarProps) {
   const { t } = useI18n();
-  const { state } = usePreviewAvailability(scope);
+  const { state, refresh } = usePreviewAvailability(scope);
+  const status = useStore((storeState) => {
+    if (!scope) return null;
+    return scope.scope_type === "private"
+      ? storeState.agentStatuses.private
+      : storeState.agentStatuses.channels[String(scope.scope_id)] || null;
+  });
+  const messages = useStore((storeState) => {
+    if (!scope) return EMPTY_MESSAGES;
+    return scope.scope_type === "private" ? storeState.privateMessages : storeState.messages;
+  });
+  const computerSurface = useMemo(
+    () => deriveComputerSurface({ status, messages, availability: state }),
+    [messages, state, status],
+  );
   const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
   const [browserIntentPending, setBrowserIntentPending] = useState(false);
   const [browserControlRequestId, setBrowserControlRequestId] = useState(0);
@@ -50,34 +67,43 @@ export function ChatPreviewSidebar({
   const memoryButton = useRef<HTMLButtonElement>(null);
   const skillsButton = useRef<HTMLButtonElement>(null);
   const tasksButton = useRef<HTMLButtonElement>(null);
-  const browserButton = useRef<HTMLButtonElement>(null);
-  const terminalButton = useRef<HTMLButtonElement>(null);
+  const computerButton = useRef<HTMLButtonElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const previousOpen = useRef<SidePanelKind | null>(null);
   const browserControlSequence = useRef(0);
   const fullWidthPreview = useMediaQuery("(max-width: 520px)");
   const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
-  const browserActive = !!scope && state.browserActive;
   const browserIntentCurrent = Boolean(scopeKey) && browserIntentScopeKey === scopeKey;
   const browserIntentVisible = browserIntentCurrent && browserIntentPending;
-  const browserVisible = browserActive || browserIntentVisible;
   const currentBrowserControlRequestId = browserIntentCurrent
     ? browserControlRequestId
     : 0;
-  const terminalCount = scope ? state.runningTerminalCount : 0;
-  const terminalActive = terminalCount > 0;
+  const computerActive = Boolean(scope) && (
+    computerSurface.visible
+    || browserIntentVisible
+    || (state.loading && Boolean(latestComputerStep(status) || status?.computer))
+  );
   const memoryActive = scope?.scope_type === "private";
   const skillsActive = !!scope;
   const tasksActive = scope?.scope_type === "private";
-  const hasPreviews = memoryActive || skillsActive || tasksActive || browserActive || terminalActive;
+  const hasPreviews = memoryActive || skillsActive || tasksActive || computerActive;
   const visiblePreview = (
     (openPreview === "memory" && memoryActive)
     || (openPreview === "skills" && skillsActive)
     || (openPreview === "tasks" && tasksActive)
-    || (openPreview === "browser" && browserVisible)
-    || (openPreview === "terminal" && terminalActive)
+    || (openPreview === "computer" && computerActive)
   ) ? openPreview : null;
   const mobilePreviewOpen = fullWidthPreview && visiblePreview !== null;
+  const computerMode: ComputerMode | null = browserIntentVisible
+    ? (computerSurface.mode || "browser")
+    : computerSurface.mode;
+  const screenSurface = useMemo(
+    () => (browserIntentVisible
+      ? { ...computerSurface, visible: true, mode: computerMode }
+      : computerSurface),
+    [browserIntentVisible, computerMode, computerSurface],
+  );
+  const latestTerminal = latestComputerStep(status);
 
   useEffect(() => {
     setOpenPreview(null);
@@ -88,20 +114,21 @@ export function ChatPreviewSidebar({
   }, [scopeKey]);
 
   useEffect(() => {
-    if (openPreview === "browser" && !browserVisible) {
+    if (openPreview === "computer" && !computerActive) {
       setOpenPreview(null);
       setBrowserControlRequestId(0);
       setBrowserIntentScopeKey("");
     }
-    if (openPreview === "terminal" && !terminalActive) setOpenPreview(null);
     if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
     if (openPreview === "memory" && !memoryActive) setOpenPreview(null);
     if (openPreview === "skills" && !skillsActive) setOpenPreview(null);
-  }, [browserVisible, memoryActive, openPreview, skillsActive, tasksActive, terminalActive]);
+  }, [computerActive, memoryActive, openPreview, skillsActive, tasksActive]);
 
   useEffect(() => {
-    if (browserActive && browserIntentVisible) setBrowserIntentPending(false);
-  }, [browserActive, browserIntentVisible]);
+    if (state.browserActive && browserIntentPending && browserIntentCurrent) {
+      setBrowserIntentPending(false);
+    }
+  }, [browserIntentCurrent, browserIntentPending, state.browserActive]);
 
   useEffect(() => {
     const wasOpen = previousOpen.current;
@@ -113,9 +140,7 @@ export function ChatPreviewSidebar({
         ? skillsButton.current
       : wasOpen === "tasks"
         ? tasksButton.current
-        : wasOpen === "browser"
-          ? browserButton.current
-          : terminalButton.current;
+        : computerButton.current;
     requestAnimationFrame(() => {
       if (trigger?.isConnected) trigger.focus();
       else document.querySelector<HTMLElement>(".composer textarea")?.focus();
@@ -135,11 +160,21 @@ export function ChatPreviewSidebar({
     setBrowserIntentScopeKey("");
   }, []);
 
+  const openComputer = useCallback((mode?: ComputerMode) => {
+    setOpenPreview("computer");
+    if (mode !== "browser") {
+      setBrowserIntentPending(false);
+      setBrowserControlRequestId(0);
+      setBrowserIntentScopeKey("");
+    }
+    void mode;
+  }, []);
+
   const openBrowserAssist = useCallback(() => {
     const requestId = ++browserControlSequence.current;
     setBrowserIntentPending(true);
     setBrowserIntentScopeKey(scopeKey);
-    setOpenPreview("browser");
+    setOpenPreview("computer");
     setBrowserControlRequestId(requestId);
   }, [scopeKey]);
 
@@ -167,27 +202,21 @@ export function ChatPreviewSidebar({
       ? t("skills.title")
     : visiblePreview === "tasks"
       ? t("scheduledTasks.title")
-      : visiblePreview === "browser"
-        ? t("browserPreview.title")
-        : t("terminalPreview.title");
+      : t("computer.title");
   const drawerDescription = visiblePreview === "memory"
     ? t("memory.description")
     : visiblePreview === "skills"
       ? t("skills.description")
     : visiblePreview === "tasks"
       ? t("scheduledTasks.description")
-      : visiblePreview === "browser"
-        ? t("browserPreview.description")
-        : t("terminalPreview.description");
+      : t("computer.description");
   const drawerIcon = visiblePreview === "memory"
     ? "library"
     : visiblePreview === "skills"
       ? "sparkles"
     : visiblePreview === "tasks"
       ? "calendar"
-      : visiblePreview === "browser"
-        ? "browser"
-        : "terminal";
+      : "computer";
   const drawer = useMemo(() => {
     if (!scope || !visiblePreview) return null;
     if (visiblePreview === "memory") {
@@ -236,19 +265,46 @@ export function ChatPreviewSidebar({
         </Suspense>
       );
     }
-    return visiblePreview === "browser" ? (
-      <BrowserPreviewView
+    return (
+      <ComputerScreen
         scope={scope}
-        controlRequestId={currentBrowserControlRequestId || undefined}
+        surface={screenSurface}
+        availabilityError={state.error}
+        onRetryAvailability={refresh}
+        latestTerminalStep={latestTerminal}
+        browserControlRequestId={currentBrowserControlRequestId || undefined}
       />
-    ) : <TerminalPreviewView scope={scope} />;
-  }, [canManageSkills, currentBrowserControlRequestId, scope, t, visiblePreview]);
+    );
+  }, [
+    canManageSkills,
+    computerSurface,
+    screenSurface,
+    currentBrowserControlRequestId,
+    latestTerminal,
+    refresh,
+    scope,
+    scopeKey,
+    state.error,
+    t,
+    visiblePreview,
+  ]);
 
   const previewContext = useMemo(() => ({
     scope,
-    browserDrawerOpen: visiblePreview === "browser",
+    browserDrawerOpen: visiblePreview === "computer" && computerMode === "browser",
+    computerDrawerOpen: visiblePreview === "computer",
+    computerMode,
+    computerSurface,
+    openComputer,
     openBrowserAssist,
-  }), [openBrowserAssist, scope, visiblePreview]);
+  }), [
+    computerMode,
+    computerSurface,
+    openBrowserAssist,
+    openComputer,
+    scope,
+    visiblePreview,
+  ]);
 
   return (
     <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
@@ -313,46 +369,22 @@ export function ChatPreviewSidebar({
               />
             </Tooltip>
           ) : null}
-          {browserActive ? (
-            <Tooltip title={t("preview.openBrowser")} placement="left">
+          {computerActive ? (
+            <Tooltip title={t("computer.show")} placement="left">
               <Button
-                ref={browserButton}
-                className={cx("chat-preview__toggle", visiblePreview === "browser" && "is-active")}
+                ref={computerButton}
+                className={cx("chat-preview__toggle", visiblePreview === "computer" && "is-active")}
                 type="text"
                 shape="circle"
-                aria-label={t("preview.openBrowser")}
+                aria-label={t("computer.show")}
                 aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "browser"}
+                aria-expanded={visiblePreview === "computer"}
                 icon={(
-                  <Badge className="chat-preview__live-badge" classNames={{ indicator: "chat-preview__live-indicator" }} dot>
-                    <Icon name="browser" size={19} />
+                  <Badge className="chat-preview__live-badge" classNames={{ indicator: "chat-preview__live-indicator" }} dot={computerSurface.live || state.browserActive || state.runningTerminalCount > 0}>
+                    <Icon name="computer" size={19} />
                   </Badge>
                 )}
-                onClick={() => togglePreview("browser")}
-              />
-            </Tooltip>
-          ) : null}
-          {terminalActive ? (
-            <Tooltip title={t("preview.openTerminals", { count: terminalCount })} placement="left">
-              <Button
-                ref={terminalButton}
-                className={cx("chat-preview__toggle", visiblePreview === "terminal" && "is-active")}
-                type="text"
-                shape="circle"
-                aria-label={t("preview.openTerminals", { count: terminalCount })}
-                aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "terminal"}
-                icon={(
-                  <Badge
-                    className="chat-preview__terminal-badge"
-                    classNames={{ indicator: "chat-preview__terminal-indicator" }}
-                    count={terminalCount}
-                    size="small"
-                  >
-                    <Icon name="terminal" size={19} />
-                  </Badge>
-                )}
-                onClick={() => togglePreview("terminal")}
+                onClick={() => togglePreview("computer")}
               />
             </Tooltip>
           ) : null}

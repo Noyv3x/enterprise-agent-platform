@@ -3,7 +3,9 @@ import { registerPlatformUpdatingHandler } from "../lib/api";
 import {
   fetchBrowserPreview,
   fetchPreviewAvailability,
+  fetchPreviewFile,
   fetchTerminalPreviews,
+  presentPreviewUrl,
 } from "./previewActions";
 
 const scope = { scope_type: "private", scope_id: "7" } as const;
@@ -100,6 +102,7 @@ describe("preview availability transport", () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       browser_active: true,
       running_terminal_count: 2,
+      present_available: false,
     }), {
       status: 200,
       headers: { "Content-Type": "application/json", ETag: '"status-2"' },
@@ -113,6 +116,7 @@ describe("preview availability transport", () => {
       etag: '"status-2"',
       browserActive: true,
       runningTerminalCount: 2,
+      presentAvailable: false,
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/agent-previews/status?scope_type=private&scope_id=7",
@@ -135,6 +139,7 @@ describe("preview availability transport", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       browser_active: false,
       running_terminal_count: -1,
+      present_available: false,
     }), { status: 200, headers: { "Content-Type": "application/json" } })));
     await expect(
       fetchPreviewAvailability(scope, "", new AbortController().signal),
@@ -154,6 +159,36 @@ describe("preview availability transport", () => {
     ).rejects.toMatchObject({ status: 503, code: "platform_updating" });
     expect(handler).toHaveBeenCalledTimes(1);
     unregister();
+  });
+});
+
+describe("computer file and present transport", () => {
+  it("requests a projected workspace path and maps bounded file text", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      workspace_path: "notes.md",
+      content: "hello",
+      truncated: false,
+      encoding: "utf-8",
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(
+      fetchPreviewFile(scope, "notes.md", new AbortController().signal),
+    ).resolves.toEqual({
+      workspace_path: "notes.md",
+      content: "hello",
+      truncated: false,
+      encoding: "utf-8",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/agent-previews/file?scope_type=private&scope_id=7&workspace_path=notes.md",
+      expect.objectContaining({ credentials: "include", cache: "no-store" }),
+    );
+  });
+
+  it("builds the authenticated present URL without extra client paths", () => {
+    expect(presentPreviewUrl(scope)).toBe(
+      "/api/agent-previews/present?scope_type=private&scope_id=7",
+    );
   });
 });
 

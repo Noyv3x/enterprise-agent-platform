@@ -4,6 +4,7 @@ export interface RealtimePreviewUpdate {
   scope: AgentPreviewScope;
   browserActive?: boolean;
   runningTerminalCount?: number;
+  presentAvailable?: boolean;
 }
 
 type PreviewListener = (update: RealtimePreviewUpdate) => void;

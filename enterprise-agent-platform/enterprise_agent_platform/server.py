@@ -31,6 +31,7 @@ from .service import (
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENTS_PER_MESSAGE,
     MAX_ATTACHMENTS_TOTAL_BYTES,
+    PRESENT_PAGE_CSP,
     EnterpriseService,
     ServiceError,
     UploadedFile,
@@ -874,6 +875,45 @@ class RequestHandler(BaseHTTPRequestHandler):
                 since_revision=since_revision,
             )
             self._preview_json(payload)
+            return
+        if path == "/api/agent-previews/file":
+            if method != "GET":
+                raise ServiceError(405, "method not allowed")
+            if set(query) - {"scope_type", "scope_id", "workspace_path"}:
+                raise ServiceError(
+                    400,
+                    "file preview accepts only scope_type, scope_id, and workspace_path",
+                )
+            if (
+                len(query.get("scope_type", [])) != 1
+                or len(query.get("scope_id", [])) != 1
+                or len(query.get("workspace_path", [])) != 1
+            ):
+                raise ServiceError(
+                    400,
+                    "scope_type, scope_id, and workspace_path are required exactly once",
+                )
+            payload = service.agent_preview_file(
+                actor,
+                first(query, "scope_type", ""),
+                first(query, "scope_id", ""),
+                first(query, "workspace_path", ""),
+            )
+            self._preview_json(payload)
+            return
+        if path == "/api/agent-previews/present":
+            if method != "GET":
+                raise ServiceError(405, "method not allowed")
+            if set(query) - {"scope_type", "scope_id"}:
+                raise ServiceError(400, "present preview accepts only scope_type and scope_id")
+            if len(query.get("scope_type", [])) != 1 or len(query.get("scope_id", [])) != 1:
+                raise ServiceError(400, "scope_type and scope_id are required exactly once")
+            payload = service.agent_preview_present(
+                actor,
+                first(query, "scope_type", ""),
+                first(query, "scope_id", ""),
+            )
+            self._serve_present_page(payload)
             return
         if path == "/api/channels" and method == "GET":
             self._json({"channels": service.list_channels(actor)})
@@ -2166,22 +2206,72 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise ServiceError(400, "invalid Content-Length")
         return length
 
-    def _send_security_headers(self) -> None:
+    def _send_security_headers(
+        self,
+        *,
+        frameable: bool = False,
+        content_security_policy: str | None = None,
+    ) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
+        if frameable:
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+        else:
+            self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; "
-            "script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob:; "
-            "connect-src 'self'; "
-            "object-src 'none'; "
-            "base-uri 'self'; "
-            "form-action 'self'; "
-            "frame-ancestors 'none'",
+            content_security_policy
+            or (
+                "default-src 'self'; "
+                "script-src 'self'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: blob:; "
+                "connect-src 'self'; "
+                "object-src 'none'; "
+                "base-uri 'self'; "
+                "form-action 'self'; "
+                "frame-ancestors 'none'"
+            ),
         )
+
+    def _serve_present_page(self, preview: dict[str, Any]) -> None:
+        html = preview.get("html")
+        etag = str(preview.get("etag") or "")
+        if not isinstance(html, str) or not re.fullmatch(r'"[A-Za-z0-9._:-]{1,128}"', etag):
+            raise ServiceError(502, "invalid present page")
+        body = html.encode("utf-8")
+        response_headers = {
+            "ETag": etag,
+            "Cache-Control": "private, no-cache, max-age=0",
+            "Vary": "Cookie, Authorization",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "Content-Disposition": "inline",
+        }
+        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("Content-Length", "0")
+            self._send_security_headers(
+                frameable=True,
+                content_security_policy=PRESENT_PAGE_CSP,
+            )
+            for key, value in self._with_renewed_session_cookie(response_headers).items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers(
+            frameable=True,
+            content_security_policy=PRESENT_PAGE_CSP,
+        )
+        for key, value in self._with_renewed_session_cookie(response_headers).items():
+            self.send_header(key, value)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionError):
+            return
 
     def _with_renewed_session_cookie(self, headers: dict[str, str] | None) -> dict[str, str]:
         merged = dict(headers or {})

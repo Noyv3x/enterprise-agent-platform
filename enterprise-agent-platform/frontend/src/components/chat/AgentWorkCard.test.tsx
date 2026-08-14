@@ -329,7 +329,7 @@ describe("AgentWorkCard", () => {
     expect(within(row!).getByText("Status")).toBeVisible();
     expect(within(row!).getAllByText("Completed").length).toBeGreaterThan(0);
     expect(within(row!).getByText("Path")).toBeVisible();
-    expect(within(row!).getByText("src/app.ts")).toBeVisible();
+    expect(within(row!).getAllByText("src/app.ts").length).toBeGreaterThan(0);
     expect(within(row!).getByText("Offset")).toBeVisible();
     expect(within(row!).getByText("10")).toBeVisible();
     expect(within(row!).getByText("Result")).toBeVisible();

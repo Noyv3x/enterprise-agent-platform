@@ -30,6 +30,7 @@ import type {
   AgentSkillPatchRequest,
   AgentSkillResponse,
   AgentSkillsResponse,
+  AgentPreviewFileResponse,
   AgentPreviewStatusResponse,
   AgentScheduleResponse,
   AgentScheduleRunsResponse,
@@ -443,6 +444,24 @@ export const endpoints = {
         params.set("since_revision", String(sinceRevision));
       }
       return `/api/agent-previews/terminals?${params.toString()}`;
+    },
+  ),
+  previewFile: ep<void, AgentPreviewFileResponse, [ScopeType, Id, string]>(
+    "GET",
+    (scopeType, scopeId, workspacePath) => {
+      const params = new URLSearchParams({
+        scope_type: scopeType,
+        scope_id: String(scopeId),
+        workspace_path: workspacePath,
+      });
+      return `/api/agent-previews/file?${params.toString()}`;
+    },
+  ),
+  previewPresent: ep<void, Response, [ScopeType, Id]>(
+    "GET",
+    (scopeType, scopeId) => {
+      const params = new URLSearchParams({ scope_type: scopeType, scope_id: String(scopeId) });
+      return `/api/agent-previews/present?${params.toString()}`;
     },
   ),
 

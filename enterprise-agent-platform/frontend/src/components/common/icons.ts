@@ -201,4 +201,9 @@ export const ICONS: Record<IconName, readonly IconPrimitive[]> = {
     ["path", { d: "m5 14 .75 2.25L8 17l-2.25.75L5 20l-.75-2.25L2 17l2.25-.75L5 14z" }],
     ["path", { d: "m19 13 .75 2.25L22 16l-2.25.75L19 19l-.75-2.25L16 16l2.25-.75L19 13z" }],
   ],
+  computer: [
+    ["rect", { x: 3, y: 4, width: 18, height: 12, rx: 2 }],
+    ["path", { d: "M8 20h8" }],
+    ["path", { d: "M12 16v4" }],
+  ],
 };

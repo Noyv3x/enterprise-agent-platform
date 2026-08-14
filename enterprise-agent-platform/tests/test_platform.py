@@ -2148,10 +2148,19 @@ class PlatformServiceTests(unittest.TestCase):
                 web = next(item for item in status["activity"] if item.get("tool_call_id") == "web-1")
                 self.assertEqual(
                     read["parameters"],
-                    {"path": "src/app.ts", "offset": 10, "limit": 40, "target": "sandbox"},
+                    {
+                        "path": "src/app.ts",
+                        "offset": 10,
+                        "limit": 40,
+                        "target": "sandbox",
+                        "workspace_path": "src/app.ts",
+                    },
                 )
                 self.assertIn("export function start()", read["result"])
-                self.assertEqual(write["parameters"], {"path": "src/secret.ts"})
+                self.assertEqual(
+                    write["parameters"],
+                    {"path": "src/secret.ts", "workspace_path": "src/secret.ts"},
+                )
                 self.assertNotIn("super-secret", json.dumps(write))
                 self.assertEqual(search["parameters"], {"action": "search"})
                 self.assertNotIn("aws-value", json.dumps(search))

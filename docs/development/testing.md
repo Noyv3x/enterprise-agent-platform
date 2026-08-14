@@ -68,7 +68,7 @@ python3 -m compileall enterprise_agent_platform tests
 
 Quality 门禁把 `tests/test_*.py` 顶层测试模块作为不可拆分单元，按稳定排序确定性分配到四个并行分片；分片编号从 `0` 开始。Pull Request、`main` push 和手工触发都必须运行全部四个分片，四者的并集必须与闭世界枚举完全相等且交集为空，不能按测试方法拆分、按变更跳过模块或把空分片当作成功。可从仓库根用 `python3 scripts/python_test_shard.py --shard-index 0 --shard-count 4 --list` 查看任一分片；去掉 `--list` 会运行该分片。稳定命名的 `Python 3.11` 聚合门禁只有在全部分片成功时才成功，任一分片失败、取消或未完成都必须使聚合门禁失败。Python 字节码编译是与测试分片无关的完整源码检查，CI 只需由一个分片执行一次。
 
-Python 测试位于 `tests/test_*.py`。新增路由、配置、数据库迁移、权限、任务恢复、自动更新或托管服务行为时，应测试成功、拒绝、重启恢复和竞态边界。
+Python 测试位于 `tests/test_*.py`。新增路由、配置、数据库迁移、权限、任务恢复、自动更新或托管服务行为时，应测试成功、拒绝、重启恢复和竞态边界。电脑画面相关 Platform 测试必须覆盖：从既有 `tool.started/updated/completed/failed` 投影文件/搜索/呈现线索且不新增 Runtime 工具；`workspace_path` 只接受当前 `/workspace` 相对路径；宿主文件拒绝正文读取；`.html`/`.htm` 可作为 `MEDIA` 交付但聊天预览仍只有 XLSX/DOCX/PPTX/PDF；呈现页与文件正文走与 `MEDIA` 相同的 fd-rooted 鉴权，并拒绝穿越、符号链接、跨 scope 和过大正文。
 
 学习闭环测试必须覆盖十回合/十工具节奏、重启恢复、来源幂等、lifecycle 轮换和所有非私人/非交互排除项；复盘失败不得影响已持久回复，更新预约期间不得领取新任务。还必须注入领取和终态落盘的短暂数据库错误，证明 worker 会有界退避并继续处理，已领取任务在未落盘时仍阻塞更新。前台 `skill.load/read` 的工具轨迹测试必须证明安全 Skill id（以及 read 的安全相对路径）进入复盘 payload，同时正文、patch 内容和工具结果不进入轨迹。Gateway 测试必须用确定性并发覆盖复盘 memory 查询的“授权复验与查询同一 SQLite 快照”、复盘写入返回快照不丢失 review identity，以及普通 automatic memory 写入与账号撤权、lifecycle reset、父任务终结的线性化；延迟到达的旧请求必须失败关闭。复盘 Skill `list/load/read` 还必须覆盖“终态或撤权先发生则不触碰文件”和“读取先线性化则撤权等待”的两种顺序，并证明 ledger 独立锁不会形成 conversation→DB / DB→conversation 反向死锁。每个复盘 durable job 的二十单位共享变更预算必须覆盖 reconcile 按子动作计费、memory 失败回滚、Skill 写入持久预扣且失败可计费、memory 与 Skill 跨调用累计、任务重排/进程重启不重置和耗尽拒绝。Skill 测试必须覆盖可信 created_by、既有状态默认 user-owned、精确 patch 次数、读前写、bundled/user/pinned/archived 拒绝、agent-created bundled id/名称冲突、注入扫描、高置信凭据拒绝与认证文档/占位符放行，以及原子状态文件损坏。Runtime 测试还要证明复盘工具白名单、免批仅限完整 review context、父 session 不被写入且临时 session 终态删除，并要证明复盘的第 `17` 个模型请求在发送前被独立硬上限拒绝、工具说明与提示词都公开二十单位计费，而普通 Run 仍遵循全局模型轮次上限。
 
@@ -118,6 +118,7 @@ npm run build
 - 工作记录仅在工具调用时出现，运行中保持无折叠控件的紧凑进度行，Run 终态后自动折叠且可展开查看完整详情与持久化阶段性说明；单条详情必须覆盖工具身份、状态、时间、脱敏参数和有界结果。还必须覆盖超过旧 8 段/30 条窗口的长 Run、多个事件落在同一秒时仍按单调 `sequence` 排序、同一 `tool_call_id` 完成时原位更新、阶段性说明进入时间线后不再残留于 `stream_messages` 或重复渲染完整气泡，以及条目、单项详情和总详情达到防滥用硬界后出现带准确计数的显式截断标记；个人 AI 的 Agent 消息头像旁不得渲染作者名；
 - 审批、失败发送恢复和连续短消息；
 - 浏览器首帧加载与终端预览可用性；聊天附件预览覆盖 XLSX 表格、DOCX 段落、PPTX 幻灯片和 PDF 文本页，以及解析失败时下载仍可用；
+- 电脑画面：空闲对话不出现空白监视器；文件/终端/浏览器/搜索/呈现页随当前可见工具切换且共用一个右侧槽；画中画在 Composer 上方，点击只展开只读竖屏；三语文案为「AI 的电脑 / AI computer / AI 的電腦」与「显示 AI 的电脑 / Show the AI computer / 顯示 AI 的電腦」；记忆/技能/定时任务仍是独立轨道项；浏览器与终端不再各占实时按钮；展开电脑后卸载画中画；HTML 呈现只使用不含 `allow-same-origin` 的沙箱 iframe；接管仍须明确手势，发送前仍须释放租约；
 - 手机动态视口、长代码/表格和 Composer 不扩大页面；
 - 三种 locale 的 key 完整性；
 - 更新维护页在 Store/登录失败时仍可接管。
@@ -133,7 +134,8 @@ npm run build
 - 路径 traversal、符号链接、受保护目录和 Docker socket；
 - 内网/回环/云元数据 URL 与重定向；
 - owner/scope/provider/browser identity 参数注入；
-- 超大 body、附件、工具输出或搜索响应；
+- 超大 body、附件、工具输出、搜索响应或 HTML 呈现页；
+- 电脑呈现页 iframe 获得产品同源、Cookie 或父页面 DOM，以及文件预览读取宿主路径；
 - 未审批工具、伪造 approval id、无人值守授权绕过；
 - operation 幂等键、expected generation 和 rollback 覆盖竞态。
 

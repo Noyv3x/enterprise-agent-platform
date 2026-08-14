@@ -41,6 +41,7 @@ describe("usePreviewAvailability", () => {
         etag: '"status-1"',
         browserActive: true,
         runningTerminalCount: 2,
+        presentAvailable: false,
       })
       .mockResolvedValueOnce({ kind: "unchanged" });
 
@@ -49,6 +50,7 @@ describe("usePreviewAvailability", () => {
     expect(result.current.state).toEqual({
       browserActive: true,
       runningTerminalCount: 2,
+      presentAvailable: false,
       loading: false,
       error: "",
     });
@@ -71,6 +73,7 @@ describe("usePreviewAvailability", () => {
         etag: '"visible"',
         browserActive: false,
         runningTerminalCount: 1,
+        presentAvailable: false,
       });
 
     const { result } = renderHook(() => usePreviewAvailability(scope));
@@ -95,6 +98,7 @@ describe("usePreviewAvailability", () => {
         etag: '"stale"',
         browserActive: true,
         runningTerminalCount: 9,
+        presentAvailable: false,
       });
       await Promise.resolve();
     });
@@ -107,6 +111,7 @@ describe("usePreviewAvailability", () => {
       etag: '"initial"',
       browserActive: false,
       runningTerminalCount: 0,
+      presentAvailable: false,
     });
     const { result } = renderHook(() => usePreviewAvailability(scope));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -131,6 +136,7 @@ describe("usePreviewAvailability", () => {
       etag: '"status"',
       browserActive: false,
       runningTerminalCount: 0,
+      presentAvailable: false,
     });
     renderHook(() => usePreviewAvailability(scope));
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -165,6 +171,7 @@ describe("usePreviewAvailability", () => {
     expect(result.current.state).toEqual({
       browserActive: false,
       runningTerminalCount: 0,
+      presentAvailable: false,
       loading: true,
       error: "",
     });
@@ -177,6 +184,7 @@ describe("usePreviewAvailability", () => {
         etag: '"old"',
         browserActive: true,
         runningTerminalCount: 4,
+        presentAvailable: false,
       });
       await Promise.resolve();
     });
@@ -188,6 +196,7 @@ describe("usePreviewAvailability", () => {
         etag: '"new"',
         browserActive: false,
         runningTerminalCount: 2,
+        presentAvailable: false,
       });
       await Promise.resolve();
     });
@@ -200,6 +209,7 @@ describe("usePreviewAvailability", () => {
     expect(result.current.state).toEqual({
       browserActive: false,
       runningTerminalCount: 0,
+      presentAvailable: false,
       loading: false,
       error: "",
     });

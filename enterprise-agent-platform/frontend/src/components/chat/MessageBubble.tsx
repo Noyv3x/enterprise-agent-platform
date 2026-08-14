@@ -13,8 +13,6 @@ import { messageFingerprintKey } from "../../utils/fingerprint";
 import type { Message } from "../../types";
 import { Icon } from "../common/Icon";
 import { MessageAttachments } from "../common/MessageAttachments";
-import { BrowserWorkPreview } from "../preview/BrowserWorkPreview";
-import { useChatPreviewContext } from "../preview/ChatPreviewContext";
 import { AgentWorkCard, hasAgentProcessSteps } from "./AgentWorkCard";
 import { KnowledgeSuggestions } from "./KnowledgeSuggestions";
 import { MessageBody } from "./MessageBody";
@@ -25,7 +23,6 @@ import { WithdrawMessageButton } from "./WithdrawMessageButton";
 
 interface MessageBubbleProps {
   message: Message;
-  browserPreviewAttached?: boolean;
   canWithdraw?: boolean;
   withdrawing?: boolean;
   hideAuthorName?: boolean;
@@ -34,14 +31,12 @@ interface MessageBubbleProps {
 
 function MessageBubbleImpl({
   message,
-  browserPreviewAttached = false,
   canWithdraw = false,
   withdrawing = false,
   hideAuthorName = false,
   onWithdraw,
 }: MessageBubbleProps) {
   const { t } = useI18n();
-  const preview = useChatPreviewContext();
   const isUser = message.author_type === "user";
   const suggestions = message.metadata?.knowledge_suggestions || [];
   const agentWork = message.metadata?.agent_work || null;
@@ -49,17 +44,6 @@ function MessageBubbleImpl({
   const pending = !!message.metadata?.local_pending;
   const attachments = message.attachments || [];
   const showWorkCard = !!agentWork && hasAgentProcessSteps(agentWork);
-  const previewScopeMatches = Boolean(
-    preview?.scope
-    && (!message.scope_type || message.scope_type === preview.scope.scope_type)
-    && (message.scope_id == null || String(message.scope_id) === String(preview.scope.scope_id)),
-  );
-  const showBrowserPreview = Boolean(
-    browserPreviewAttached
-    && showWorkCard
-    && previewScopeMatches
-    && preview?.browserDrawerOpen === false,
-  );
   const scheduledTask = message.metadata?.scheduled_task;
   const upload = message.metadata?.upload;
   const messageActions = message.content || (canWithdraw && onWithdraw) ? (
@@ -85,7 +69,6 @@ function MessageBubbleImpl({
         `msg--${message.author_type}`,
         pending && "msg--pending",
         streaming && "msg--streaming",
-        showBrowserPreview && "msg--browser-preview",
       )}
     >
       {isUser ? (
@@ -104,17 +87,7 @@ function MessageBubbleImpl({
           hideAuthorName={hideAuthorName && !isUser}
           action={messageActions}
         />
-        {showWorkCard && agentWork ? (
-          showBrowserPreview && preview?.scope ? (
-            <div className="agent-work-preview-row">
-              <AgentWorkCard work={agentWork} active={false} />
-              <BrowserWorkPreview
-                scope={preview.scope}
-                onTakeControl={preview.openBrowserAssist}
-              />
-            </div>
-          ) : <AgentWorkCard work={agentWork} active={false} />
-        ) : null}
+        {showWorkCard && agentWork ? <AgentWorkCard work={agentWork} active={false} /> : null}
         {message.content ? <MessageBody content={message.content} /> : null}
         {attachments.length ? <MessageAttachments attachments={attachments} /> : null}
         {pending && upload ? (
@@ -140,7 +113,6 @@ export const MessageBubble = memo(
   MessageBubbleImpl,
   (prev, next) =>
     messageFingerprintKey(prev.message) === messageFingerprintKey(next.message) &&
-    prev.browserPreviewAttached === next.browserPreviewAttached &&
     prev.canWithdraw === next.canWithdraw &&
     prev.withdrawing === next.withdrawing &&
     prev.hideAuthorName === next.hideAuthorName &&

@@ -50,7 +50,7 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 `target=sandbox` 是默认值，在主 Agent 独立容器内执行。路径以 `/workspace` 为默认 cwd，只允许映射到该 Agent 的 workspace、HOME 和 env；后台进程登记在 Sandbox，决定其空闲生命周期。
 
-Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的逻辑交付声明。Platform 必须从当前服务端 scope 取得权威 `workspace_path`，仅把精确 `/workspace` 后代映射到该根，再从根目录 fd 逐段使用 `O_DIRECTORY | O_NOFOLLOW` 固定父目录，并以 `O_NOFOLLOW` 打开普通、单链接文件；大小复核和读取都使用同一个文件 fd，路径或叶节点在检查期间被替换时失败关闭。模型文本、owner id 推测、其它 scope 路径、`..` 穿越、符号链接和中央容器中偶然存在的 `/workspace` 都不能获得读取权限。Runtime 在内部复验间保存标记只保留完整一行、具受支持后缀且不含穿越或控制字符的规范路径文本，不授予文件权限，也不能把临时回复的尾随说明带入终态输出。
+Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的逻辑交付声明。受支持后缀包含既有交付格式以及本版本用于呈现页的 `.html` / `.htm`。Platform 必须从当前服务端 scope 取得权威 `workspace_path`，仅把精确 `/workspace` 后代映射到该根，再从根目录 fd 逐段使用 `O_DIRECTORY | O_NOFOLLOW` 固定父目录，并以 `O_NOFOLLOW` 打开普通、单链接文件；大小复核和读取都使用同一个文件 fd，路径或叶节点在检查期间被替换时失败关闭。模型文本、owner id 推测、其它 scope 路径、`..` 穿越、符号链接和中央容器中偶然存在的 `/workspace` 都不能获得读取权限。Runtime 在内部复验间保存标记只保留完整一行、具受支持后缀且不含穿越或控制字符的规范路径文本，不授予文件权限，也不能把临时回复的尾随说明带入终态输出。电脑画面读取工作区文件正文或 HTML 呈现页必须复用同一条 fd-rooted 授权路径，不能另开按字符串重解析的预览通道。
 
 只有 `run.completed` 的成功回复可以进入上述交付边界。`failed`、`cancelled` 或 `needs_review` 即使保留了阶段性正文，也不得调用媒体提取、复制文件或创建附件记录；其中出现的 `MEDIA:` 只按普通可见诊断文本处理。
 
@@ -114,7 +114,7 @@ Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验
 
 Multipart 正文必须增量读取并先写入 Platform 数据根内 owner-only 的请求 staging 目录；解析过程只保留边界探测所需的小型缓冲区，不得把完整请求或附件复制到内存。服务端完成数量、大小、配额、文件类型和摘要校验后再把 staging 文件流式提交到附件目录；请求成功、失败、取消或超时后都必须清理 staging。只有允许的位图格式可以内联给模型；其余附件通过当前 scope 的只读 Sandbox 挂载访问，路径固定为 `/workspace/.agent-platform/attachments`。Platform 不得把自己的数据路径写进普通 Run metadata；唯一例外是由可信配置派生、只进入当前 scope 系统提示的宿主工作区映射。Manager 不得把其它 scope 或全局附件根挂入 Sandbox。Agent 生成附件只能从当前 workspace、平台管理的媒体目录和显式媒体根返回，并在解析真实路径后再次校验。
 
-消息文档预览复用附件读取权限，不提供匿名或跨 scope 入口。当前允许的预览格式只有 XLSX、DOCX、PPTX 和 PDF。Platform 对空 MIME 和 `application/octet-stream` 使用内置、确定性的允许后缀映射，不能依赖基础镜像是否安装 `/etc/mime.types`；该规范化只赋予候选解析器，不能替代内容验证，也不能覆盖调用方明确声明的其它非通用媒体类型。Office 容器在解析前同时校验规范扩展名、媒体类型、ZIP/Office 容器身份、加密标志、条目路径、条目数、单项大小和累计展开大小；PDF 校验 `%PDF-` 签名并拒绝加密文档。解析只提取有界纯文本：工作表单元格、文档段落、幻灯片可见文本或 PDF 已有文本层。公式作为惰性文本展示，不计算、不跟随外部关系、不加载宏、嵌入对象、JavaScript 或外部字体；也不把原件交给浏览器 PDF/Office 查看器。响应只含纯文本块、分页/分表元数据和截断标记，并设置私有、禁止嗅探的 JSON 头。解析失败返回有界通用错误，原件下载继续可用。
+消息文档预览复用附件读取权限，不提供匿名或跨 scope 入口。当前允许在聊天卡片中预览的格式只有 XLSX、DOCX、PPTX 和 PDF。HTML 附件可以下载，并可作为电脑呈现页的已授权来源，但不能改走 Office/PDF 解析器，也不能以内联 HTML 响应代替沙箱 iframe。Platform 对空 MIME 和 `application/octet-stream` 使用内置、确定性的允许后缀映射，不能依赖基础镜像是否安装 `/etc/mime.types`；该规范化只赋予候选解析器，不能替代内容验证，也不能覆盖调用方明确声明的其它非通用媒体类型。Office 容器在解析前同时校验规范扩展名、媒体类型、ZIP/Office 容器身份、加密标志、条目路径、条目数、单项大小和累计展开大小；PDF 校验 `%PDF-` 签名并拒绝加密文档。解析只提取有界纯文本：工作表单元格、文档段落、幻灯片可见文本或 PDF 已有文本层。公式作为惰性文本展示，不计算、不跟随外部关系、不加载宏、嵌入对象、JavaScript 或外部字体；也不把原件交给浏览器 PDF/Office 查看器。响应只含纯文本块、分页/分表元数据和截断标记，并设置私有、禁止嗅探的 JSON 头。解析失败返回有界通用错误，原件下载继续可用。
 
 邮件附件保存不能使用“父目录 `lstat` 后再按完整路径 `open`”的检查/使用分离流程。Platform 必须固定可信 scope 的 workspace 根 fd，逐段相对父 fd 使用 `O_DIRECTORY | O_NOFOLLOW` 打开目录；缺失目录以 `mkdirat` 创建后重新打开并校验类型与部署用户 owner。最终文件相对固定父 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，随后用 fd 校验普通文件类型与 owner、收紧为 `0600` 并持久化。任何符号链接、特殊文件、owner 异常或并发路径替换都必须 fail closed，且失败清理只能针对同一固定父目录中由本次调用创建的 inode。
 
@@ -146,9 +146,15 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 不可信内容与提示词注入
 
-用户显示名、职位、频道名、网页、浏览器、邮件正文与头部、知识、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
+用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、知识、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
 
 知识上传文件是不可信输入。文件名必须规范化并只用于展示/下载头，不能成为宿主路径；媒体类型不能单独决定解析器。ZIP 容器在解压前检查闭合格式身份、条目数、路径、加密标志和累计展开大小，拒绝绝对路径、`..`、符号链接式条目与压缩炸弹。文档解析不执行宏、公式、脚本、外链或嵌入对象；PDF/Office/OpenDocument 解析异常只返回有界通用错误，不能把原始载荷、内部路径或解析器诊断注入日志和模型上下文。原件下载始终使用 `attachment` disposition、`nosniff` 与同源鉴权，不能以内联 HTML/SVG/Office 内容响应。
+
+## 电脑画面与呈现页
+
+电脑画面是当前 scope 可见工具的只读投影，不是第二套文件/进程执行入口。文件正文和搜索命中必须有界、脱敏并以纯文本渲染；`target=host` 的文件调用不得把宿主正文读进预览。终端预览继续只读。浏览器接管规则不变，不能因为电脑画面统一了浏览器与终端入口就省略明确手势或扩大 tab/lease 范围。
+
+HTML 呈现页只来自当前 scope 工作区中已成功写出的 `.html` / `.htm`，或同一 scope 已授权的 HTML 附件。Platform 用与 `MEDIA` 相同的 fd-rooted 读取拿到单页正文后，经已认证、禁止嗅探的 `GET /api/agent-previews/present` 交给前端；文件正文走 `GET /api/agent-previews/file`。前端只能把呈现页放进 `sandbox` 且不含 `allow-same-origin` 的 iframe。响应 CSP 必须禁止连接父页、提交表单和加载除 `data:`/`blob:` 与必要内联脚本样式以外的网络资源；不得设置 `allow-same-origin`、不得共享产品 Cookie、不得把呈现页文档放进父页面 DOM。本版本不提供工作区静态资源服务器，相对外链失败是预期行为。呈现页不是 Camoufox，不能借此取得接管、剪贴板或任意地址栏。
 
 ## 浏览器接管与局域网
 

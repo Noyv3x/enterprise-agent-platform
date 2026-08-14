@@ -9,6 +9,7 @@ const REALTIME_MIN_INTERVAL_MS = 2_000;
 export interface PreviewAvailabilityState {
   browserActive: boolean;
   runningTerminalCount: number;
+  presentAvailable: boolean;
   loading: boolean;
   error: string;
 }
@@ -26,6 +27,7 @@ function emptyState(key: string, loading: boolean): StoredPreviewAvailabilitySta
     scopeKey: key,
     browserActive: false,
     runningTerminalCount: 0,
+    presentAvailable: false,
     loading,
     error: "",
   };
@@ -93,6 +95,7 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
             scopeKey: key,
             browserActive: result.browserActive,
             runningTerminalCount: result.runningTerminalCount,
+            presentAvailable: result.presentAvailable,
             loading: false,
             error: "",
           });
@@ -152,7 +155,8 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
       if (scopeKey(update.scope) !== key) return;
       if (
         update.browserActive === undefined &&
-        update.runningTerminalCount === undefined
+        update.runningTerminalCount === undefined &&
+        update.presentAvailable === undefined
       ) {
         requestNow.current();
         return;
@@ -164,6 +168,9 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
           : {}),
         ...(update.runningTerminalCount !== undefined
           ? { runningTerminalCount: update.runningTerminalCount }
+          : {}),
+        ...(update.presentAvailable !== undefined
+          ? { presentAvailable: update.presentAvailable }
           : {}),
         loading: false,
         error: "",
@@ -190,6 +197,7 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
   const state: PreviewAvailabilityState = {
     browserActive: current.browserActive,
     runningTerminalCount: current.runningTerminalCount,
+    presentAvailable: current.presentAvailable,
     loading: current.loading,
     error: current.error,
   };

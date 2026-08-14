@@ -2,6 +2,7 @@ import { _invokePlatformUpdating, _invokeSessionExpired, api, ApiError } from ".
 import { endpoints } from "../lib/endpoints";
 import { t } from "../i18n";
 import type {
+  AgentPreviewFileResponse,
   AgentPreviewScope,
   AgentPreviewStatusResponse,
   TerminalPreviewProcess,
@@ -10,12 +11,14 @@ import type {
 const MAX_BROWSER_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_TERMINAL_SNAPSHOT_BYTES = 2 * 1024 * 1024;
 const MAX_PREVIEW_STATUS_BYTES = 64 * 1024;
+const MAX_FILE_PREVIEW_BYTES = 96 * 1024;
 
 export interface PreviewAvailabilitySnapshot {
   kind: "snapshot";
   etag: string;
   browserActive: boolean;
   runningTerminalCount: number;
+  presentAvailable: boolean;
 }
 
 export interface PreviewAvailabilityUnchanged {
@@ -215,6 +218,7 @@ export async function fetchPreviewAvailability(
     typeof body.running_terminal_count !== "number" ||
     !Number.isInteger(body.running_terminal_count) ||
     body.running_terminal_count < 0
+    || typeof body.present_available !== "boolean"
   ) {
     throw new Error(t("preview.loadFailed"));
   }
@@ -223,7 +227,40 @@ export async function fetchPreviewAvailability(
     etag: response.headers.get("etag") || "",
     browserActive: body.browser_active,
     runningTerminalCount: body.running_terminal_count,
+    presentAvailable: body.present_available,
   };
+}
+
+export async function fetchPreviewFile(
+  scope: AgentPreviewScope,
+  workspacePath: string,
+  signal: AbortSignal,
+): Promise<AgentPreviewFileResponse> {
+  const response = await fetch(
+    endpoints.previewFile.path(scope.scope_type, scope.scope_id, workspacePath),
+    {
+      method: "GET",
+      credentials: "include",
+      cache: "no-store",
+      signal,
+    },
+  );
+  if (!response.ok) throw await previewError(response);
+  assertBoundedResponse(response, MAX_FILE_PREVIEW_BYTES, t("computer.file.failed"));
+  const body = (await response.json()) as Partial<AgentPreviewFileResponse>;
+  if (typeof body.workspace_path !== "string" || typeof body.content !== "string") {
+    throw new Error(t("computer.file.failed"));
+  }
+  return {
+    workspace_path: body.workspace_path,
+    content: body.content,
+    truncated: body.truncated === true,
+    encoding: typeof body.encoding === "string" ? body.encoding : "utf-8",
+  };
+}
+
+export function presentPreviewUrl(scope: AgentPreviewScope): string {
+  return endpoints.previewPresent.path(scope.scope_type, scope.scope_id);
 }
 
 export async function fetchBrowserPreview(

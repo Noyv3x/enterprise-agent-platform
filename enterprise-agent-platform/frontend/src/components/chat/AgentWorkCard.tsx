@@ -35,6 +35,7 @@ const PARAMETER_LABELS: Partial<Record<string, MessageKey>> = {
   command: "chat.work.param.command",
   action: "chat.work.param.action",
   path: "chat.work.param.path",
+  workspace_path: "chat.work.param.workspace_path",
   query: "chat.work.param.query",
   host: "chat.work.param.host",
   id: "chat.work.param.id",

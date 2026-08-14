@@ -24,7 +24,7 @@ Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base UR
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
-浏览器预览帧缓存、人工接管租约与输入 sequence 都是 Platform/Camoufox 进程内的短期协调状态，不写入 SQLite、Runtime session、workspace、消息或备份。Platform 重启使租约失效；完整拖拽在单次 Camoufox tab lock 内以 `finally` 抬键，因此不需要通过持久数据恢复半个指针手势。
+浏览器预览帧缓存、人工接管租约与输入 sequence 都是 Platform/Camoufox 进程内的短期协调状态，不写入 SQLite、Runtime session、workspace、消息或备份。电脑画面的文件正文、搜索命中投影和 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表、不进入备份清单，也不把 write/patch 正文写入 `agent_work`。文件正文走 `GET /api/agent-previews/file`，HTML 呈现页走 `GET /api/agent-previews/present`；二者与既有 `/api/agent-previews/status|browser|terminals` 一样只观察当前 scope，不得创建 workspace、启动 Sandbox/Camoufox 或改写文件。Platform 重启使租约失效，并丢弃未持久化的电脑投影；呈现页在重启后只能从当前工作区仍存在的 HTML 文件或已成功交付的 HTML 附件重建。完整拖拽在单次 Camoufox tab lock 内以 `finally` 抬键，因此不需要通过持久数据恢复半个指针手势。
 
 ## Agent scope
 
@@ -119,7 +119,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 文件下载优先逐字节返回保存的原件，并使用原媒体类型、同源鉴权和安全 `Content-Disposition`；手工创建的条目导出为 UTF-8 Markdown。下载不触发重新提取、索引或 provider 调用。列表与正文 API 只返回文件元数据，不把原件 BLOB 塞入 JSON。
 
-聊天附件原件和附件元数据仍属于消息 scope。XLSX、DOCX、PPTX 与 PDF 预览都是从已授权附件原件即时生成的有界派生 JSON，不单独持久化，也不进入知识索引、模型上下文或备份清单。XLSX 只读取有限数量的工作表、行、列、单元格和字符串；DOCX 只读取有限段落；PPTX 只读取有限幻灯片及其可见文本；PDF 只读取有限页的已有文本层，不进行 OCR。响应带 `kind`，并明确标记截断。扫描件或无文本 PDF、损坏容器和加密文档返回预览失败，不修改附件，不改变下载语义。
+聊天附件原件和附件元数据仍属于消息 scope。成功回复可以把 `.html` / `.htm` 作为 `MEDIA: /workspace/<relative-path>` 交付物保存为普通附件；聊天卡片不为 HTML 生成 Office/PDF 那种预览 JSON，电脑画面需要时再按附件 id 或工作区相对路径即时读取单页 HTML。XLSX、DOCX、PPTX 与 PDF 预览都是从已授权附件原件即时生成的有界派生 JSON，不单独持久化，也不进入知识索引、模型上下文或备份清单。XLSX 只读取有限数量的工作表、行、列、单元格和字符串；DOCX 只读取有限段落；PPTX 只读取有限幻灯片及其可见文本；PDF 只读取有限页的已有文本层，不进行 OCR。响应带 `kind`，并明确标记截断。扫描件或无文本 PDF、损坏容器和加密文档返回预览失败，不修改附件，不改变下载语义。
 
 索引以 generation 构建：文档与待摄取 job 同事务落库，job 只引用 `document_id + expected_hash + generation_id`，不复制原文。worker 重新读取权威文档，在完整写入所有块与向量时再原子标记该文档 ready；只有覆盖全部当前文档的 ready generation 可原子切为 active。配置或模型变化时在 shadow generation 重建，不让半成品混入查询。
 
@@ -133,7 +133,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 文档产出 bundled skills 以文件类型分工，至少覆盖 spreadsheet、document、presentation 和 PDF。它们共享同一交付契约：在当前 workspace 生成真实文件、验证、用 `MEDIA: /workspace/<relative-path>` 回传、保留最终产物并清理自己创建的中间文件；Platform 只按当前 Agent scope 的权威工作区解释该逻辑路径，Runtime 的成功内部复验不得丢失已经产生的交付标记，失败复验则不得恢复标记。它们也共享视觉交付基线：先识别受众和使用场景，使用一致且专业的字体层级、间距、对齐和有限配色，保证文字、图表和表格在目标页面或画布内清晰可读，并通过格式专属复验避免溢出、截断、失真与机械默认样式。表格请求默认产出 XLSX，除非用户明确只需要聊天内的简短 Markdown 表格。预置 Skill 不承担在线 Office 编辑或执行不可信文档内容。
 
-消息 `metadata.agent_work.activity` 是已完成 Run 的持久工作过程：只在 Run 实际调用工具时存在，可同时包含工具生命周期和工具边界前已经对用户展示的阶段性 Agent 文本。Platform 在当前 Run 内为每个新过程项分配严格递增的 `sequence`；阶段性文本在结束边界追加并从 finalized stream buffer 移除，工具在首次真实调用时追加，之后按 `tool_call_id` 原位更新而不改变 `sequence`。因此阶段性文本在活动界面只由紧凑时间线展示一次，也不会在 `stream_messages` 形成第二份无界副本；该旧字段仅供前端读取升级前的瞬时状态，新状态的流式正文只存在于 `stream_message`。最终快照直接从该时间线投影，不再分别截取文本段和工具列表后按秒级时间重排；当前最终答案仍不复制到其中。每条工具过程项的 `detail` 只承担紧凑行摘要；展开详情另用闭世界、脱敏后的 `parameters` 和有界 `result`。`parameters` 只保留对用户有用的允许字段，不复制 write/patch 正文、邮件正文、跨会话搜索原文或未脱敏凭据。`result` 来自已执行工具的 journal 结果或错误，邮件、记忆和跨会话搜索结果不得写入。`detail`、`parameters` 与 `result` 计入同一单项 32 KiB、全部 512 KiB 详情预算。正常合法 Run 完整保留；仅异常流超过 512 条过程项或上述详情硬界时，使用带省略事件/字符计数的显式截断项或字段。该字段属于消息 scope，与对应消息一同分页、备份、隐藏或删除，不另建会话或记忆副本。
+消息 `metadata.agent_work.activity` 是已完成 Run 的持久工作过程：只在 Run 实际调用工具时存在，可同时包含工具生命周期和工具边界前已经对用户展示的阶段性 Agent 文本。Platform 在当前 Run 内为每个新过程项分配严格递增的 `sequence`；阶段性文本在结束边界追加并从 finalized stream buffer 移除，工具在首次真实调用时追加，之后按 `tool_call_id` 原位更新而不改变 `sequence`。因此阶段性文本在活动界面只由紧凑时间线展示一次，也不会在 `stream_messages` 形成第二份无界副本；该旧字段仅供前端读取升级前的瞬时状态，新状态的流式正文只存在于 `stream_message`。最终快照直接从该时间线投影，不再分别截取文本段和工具列表后按秒级时间重排；当前最终答案仍不复制到其中。每条工具过程项的 `detail` 只承担紧凑行摘要；展开详情另用闭世界、脱敏后的 `parameters` 和有界 `result`。`parameters` 只保留对用户有用的允许字段，不复制 write/patch 正文、邮件正文、跨会话搜索原文或未脱敏凭据。文件工具在路径可解析到当前 `/workspace` 后代时，必须额外投影稳定的工作区相对路径 `workspace_path`，供电脑画面读取文件正文或识别 HTML 呈现页；宿主绝对路径仍只以折叠后的展示 `path` 出现，不能用来取文件。搜索类工具的电脑画面另用闭世界、有界的命中列表（标题、URL 或相对路径、摘要）作为当前 `agent_status` 上的即时投影，不把原始 journal 或未脱敏结果交给前端解析。`result` 来自已执行工具的 journal 结果或错误，邮件、记忆和跨会话搜索结果不得写入。`detail`、`parameters` 与 `result` 计入同一单项 32 KiB、全部 512 KiB 详情预算。正常合法 Run 完整保留；仅异常流超过 512 条过程项或上述详情硬界时，使用带省略事件/字符计数的显式截断项或字段。该字段属于消息 scope，与对应消息一同分页、备份、隐藏或删除，不另建会话或记忆副本。
 
 bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用 `.agent-platform/`。Skill 不提供双路径回退，也不根据管理员品牌选择路径。
 

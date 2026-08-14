@@ -571,6 +571,7 @@ export const chatMessages = defineMessages({
   "chat.work.param.command": { "zh-CN": "命令", en: "Command", "zh-TW": "命令" },
   "chat.work.param.action": { "zh-CN": "动作", en: "Action", "zh-TW": "動作" },
   "chat.work.param.path": { "zh-CN": "路径", en: "Path", "zh-TW": "路徑" },
+  "chat.work.param.workspace_path": { "zh-CN": "工作区路径", en: "Workspace path", "zh-TW": "工作區路徑" },
   "chat.work.param.query": { "zh-CN": "查询", en: "Query", "zh-TW": "查詢" },
   "chat.work.param.host": { "zh-CN": "主机", en: "Host", "zh-TW": "主機" },
   "chat.work.param.id": { "zh-CN": "标识", en: "ID", "zh-TW": "識別" },

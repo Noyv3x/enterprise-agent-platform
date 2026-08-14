@@ -9,7 +9,7 @@
 .composer__field,
 .agent-work { box-shadow: var(--shadow-card); }
 
-.chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; height: 100%; }
+.chat { display: grid; grid-template-rows: 1fr auto auto; min-height: 0; height: 100%; }
 
 .telegram-link__body { min-width: 0; display: grid; gap: 10px; }
 

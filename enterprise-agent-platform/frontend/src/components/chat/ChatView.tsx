@@ -19,6 +19,7 @@ import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
 import { MessageList } from "./MessageList";
 import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";
+import { ComputerPip } from "../preview/ComputerPip";
 import { PersonalAiComposerFocusContext } from "../shell/PersonalAiGuideContext";
 import "./chat.css";
 
@@ -71,6 +72,7 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   return (
     <ChatPreviewSidebar scope={previewScope} canManageSkills={canChat}>
       <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken} />
+      <ComputerPip />
       <Composer
         mode={mode}
         scopeId={scopeId}

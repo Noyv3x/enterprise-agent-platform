@@ -50,7 +50,11 @@ class PreviewStatusServiceTests(unittest.TestCase):
 
                 self.assertEqual(
                     status,
-                    {"browser_active": False, "running_terminal_count": 0},
+                    {
+                        "browser_active": False,
+                        "running_terminal_count": 0,
+                        "present_available": False,
+                    },
                 )
                 self.assertEqual(agent.summary_calls, [])
                 ensure_scope.assert_not_called()
@@ -99,7 +103,11 @@ class PreviewStatusServiceTests(unittest.TestCase):
 
                 self.assertEqual(
                     status,
-                    {"browser_active": True, "running_terminal_count": 3},
+                    {
+                        "browser_active": True,
+                        "running_terminal_count": 3,
+                        "present_available": False,
+                    },
                 )
                 self.assertEqual(agent.summary_calls, [(scope.scope_key, scope.lifecycle_id)])
                 self.assertEqual(listed.call_count, 1)
@@ -141,7 +149,11 @@ class PreviewStatusServiceTests(unittest.TestCase):
 
                 self.assertEqual(
                     status,
-                    {"browser_active": False, "running_terminal_count": 1},
+                    {
+                        "browser_active": False,
+                        "running_terminal_count": 1,
+                        "present_available": False,
+                    },
                 )
                 capture.assert_not_called()
             finally:
@@ -157,6 +169,7 @@ class PreviewStatusHTTPTests(unittest.TestCase):
                 return_value={
                     "browser_active": True,
                     "running_terminal_count": 2,
+                    "present_available": False,
                 }
             )
             server, thread = serve_in_thread(config, service)
@@ -192,7 +205,11 @@ class PreviewStatusHTTPTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(
                     body,
-                    {"browser_active": True, "running_terminal_count": 2},
+                    {
+                        "browser_active": True,
+                        "running_terminal_count": 2,
+                        "present_available": False,
+                    },
                 )
                 self.assertTrue(etag)
                 self.assertEqual(
