@@ -32,6 +32,7 @@ export function ComputerScreen({
     <div className="computer-screen">
       {availabilityError ? (
         <InlineAlert
+          className="computer-screen__alert"
           variant="warning"
           action={(
             <Button size="small" type="link" onClick={onRetryAvailability}>
@@ -42,20 +43,22 @@ export function ComputerScreen({
           {availabilityError}
         </InlineAlert>
       ) : null}
-      {surface.mode === "file" ? <FileComputerView scope={scope} file={surface.file} /> : null}
-      {surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} /> : null}
-      {surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} /> : null}
-      {surface.mode === "browser" ? (
-        <BrowserPreviewView
-          scope={scope}
-          controlRequestId={browserControlRequestId}
-        />
-      ) : null}
-      {surface.mode === "terminal" ? (
-        <div className="computer-terminal">
-          <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
-        </div>
-      ) : null}
+      <div className={`computer-screen__viewport is-${surface.mode || "empty"}`}>
+        {surface.mode === "file" ? <FileComputerView scope={scope} file={surface.file} /> : null}
+        {surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} /> : null}
+        {surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} /> : null}
+        {surface.mode === "browser" ? (
+          <BrowserPreviewView
+            scope={scope}
+            controlRequestId={browserControlRequestId}
+          />
+        ) : null}
+        {surface.mode === "terminal" ? (
+          <div className="computer-terminal">
+            <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }

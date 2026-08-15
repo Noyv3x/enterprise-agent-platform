@@ -10,6 +10,7 @@ from unittest import mock
 
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
+    COMPUTER_FILE_PREVIEW_MAX_BYTES,
     COMPUTER_PRESENT_MAX_BYTES,
     PRESENT_PAGE_CSP,
     ServiceError,
@@ -189,6 +190,361 @@ class ComputerSearchProjectionTests(unittest.TestCase):
                 service.close()
 
 
+class ComputerFileDraftProjectionTests(unittest.TestCase):
+    @staticmethod
+    def _activate(service: EnterpriseService, actor: dict[str, object]) -> dict[str, object]:
+        task: dict[str, object] = {
+            "scope_type": "private",
+            "scope_id": str(actor["id"]),
+            "user_message": {"id": 71, "content": "write it"},
+            "actor": actor,
+            "content": "write it",
+        }
+        key = f"private:{actor['id']}"
+        with service._conversation_lock:
+            service._agent_status[key] = service._status_for_task(
+                task,
+                "replying",
+                queued_count=0,
+            )
+        return task
+
+    @staticmethod
+    def _draft_event(
+        *,
+        tool: str = "write_file",
+        tool_call_id: str = "write-draft-1",
+        kind: str = "file",
+        workspace_path: str = "src/app.ts",
+        content: str = "draft text",
+        revision: object = 1,
+        complete: object = False,
+        truncated: object = False,
+        discarded: object = False,
+    ) -> dict[str, object]:
+        draft: dict[str, object] = {
+            "workspace_path": workspace_path,
+            "kind": kind,
+            "revision": revision,
+            "complete": complete,
+            "truncated": truncated,
+            "discarded": discarded,
+        }
+        if discarded is not True:
+            draft["content"] = content
+        return {
+            "event": "tool.arguments.delta",
+            "tool_name": tool,
+            "tool_call_id": tool_call_id,
+            "file_draft": draft,
+        }
+
+    def test_write_draft_is_live_only_monotonic_and_cleared_by_terminal_event(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                target = Path(scope.workspace_path) / "src" / "app.ts"
+                target.parent.mkdir()
+                target.write_text("committed old text", encoding="utf-8")
+                task = self._activate(service, actor)
+
+                secret_draft = "draft TOKEN=super-secret\nline two"
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(content=secret_draft),
+                )
+                status = service.agent_status(actor, "private", str(actor["id"]))
+                self.assertEqual(
+                    status["computer"],
+                    {
+                        "mode": "file",
+                        "file": {
+                            "source": "draft",
+                            "draft_kind": "file",
+                            "tool": "write_file",
+                            "target": "sandbox",
+                            "tool_call_id": "write-draft-1",
+                            "workspace_path": "src/app.ts",
+                            "status": "drafting",
+                            "revision": "draft:write-draft-1:1",
+                        },
+                    },
+                )
+                self.assertNotIn("super-secret", json.dumps(status))
+                self.assertNotIn("_computer_file_draft", status)
+                preview = service.agent_preview_file(
+                    actor,
+                    "private",
+                    str(actor["id"]),
+                    "src/app.ts",
+                )
+                self.assertEqual(preview["source"], "draft")
+                self.assertEqual(preview["draft_kind"], "file")
+                self.assertEqual(preview["revision"], "draft:write-draft-1:1")
+                self.assertIn("TOKEN=•••", preview["content"])
+                self.assertNotIn("super-secret", preview["content"])
+
+                snapshot = service._agent_work_snapshot(task, "complete")
+                self.assertNotIn("draft text", json.dumps(snapshot))
+                self.assertNotIn("super-secret", json.dumps(snapshot))
+                self.assertNotIn("computer", snapshot)
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(content="stale", revision=1, complete=True),
+                )
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["revision"],
+                    "draft:write-draft-1:1",
+                )
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(
+                        tool="patch_file",
+                        tool_call_id="write-draft-1",
+                        kind="replacement",
+                        content="identity swap",
+                        revision=2,
+                    ),
+                )
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["revision"],
+                    "draft:write-draft-1:1",
+                )
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(content="final draft", revision=2, complete=True),
+                )
+                pending = service.agent_status(actor, "private", str(actor["id"]))
+                self.assertEqual(pending["computer"]["file"]["status"], "pending")
+                self.assertEqual(pending["computer"]["file"]["revision"], "draft:write-draft-1:2")
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["content"],
+                    "final draft",
+                )
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    {
+                        "event": "tool.failed",
+                        "tool_name": "write_file",
+                        "tool_call_id": "another-tool",
+                        "execution_started": False,
+                    },
+                )
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["source"],
+                    "draft",
+                )
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    {
+                        "event": "tool.completed",
+                        "tool_name": "write_file",
+                        "tool_call_id": "write-draft-1",
+                        "arguments": {"path": "/workspace/src/app.ts", "target": "sandbox"},
+                    },
+                )
+                committed = service.agent_preview_file(
+                    actor,
+                    "private",
+                    str(actor["id"]),
+                    "src/app.ts",
+                )
+                self.assertEqual(committed["source"], "workspace")
+                self.assertEqual(committed["content"], "committed old text")
+                completed = service.agent_status(actor, "private", str(actor["id"]))
+                self.assertNotEqual(
+                    completed.get("computer", {}).get("file", {}).get("revision"),
+                    "draft:write-draft-1:2",
+                )
+            finally:
+                service.close()
+
+    def test_patch_replacement_draft_can_be_discarded(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                target = Path(scope.workspace_path) / "src" / "app.ts"
+                target.parent.mkdir()
+                target.write_text("committed", encoding="utf-8")
+                self._activate(service, actor)
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(
+                        tool="patch_file",
+                        tool_call_id="patch-draft-1",
+                        kind="replacement",
+                        content="replacement fragment",
+                        complete=True,
+                    ),
+                )
+                preview = service.agent_preview_file(
+                    actor,
+                    "private",
+                    str(actor["id"]),
+                    "src/app.ts",
+                )
+                self.assertEqual(preview["source"], "draft")
+                self.assertEqual(preview["draft_kind"], "replacement")
+                self.assertEqual(preview["content"], "replacement fragment")
+
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(
+                        tool="patch_file",
+                        tool_call_id="patch-draft-1",
+                        kind="replacement",
+                        revision=2,
+                        discarded=True,
+                    ),
+                )
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["source"],
+                    "workspace",
+                )
+                self.assertNotIn(
+                    "computer",
+                    service.agent_status(actor, "private", str(actor["id"])),
+                )
+            finally:
+                service.close()
+
+    def test_draft_is_unavailable_outside_active_state_and_dropped_by_run_replacement(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                target = Path(scope.workspace_path) / "src" / "app.ts"
+                target.parent.mkdir()
+                target.write_text("workspace version", encoding="utf-8")
+                self._activate(service, actor)
+                service._record_agent_progress(
+                    "private",
+                    str(actor["id"]),
+                    self._draft_event(content="ephemeral version"),
+                )
+                key = f"private:{actor['id']}"
+                with service._conversation_lock:
+                    anomalous = dict(service._agent_status[key])
+                    anomalous["state"] = "idle"
+                    service._agent_status[key] = anomalous
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["source"],
+                    "workspace",
+                )
+                self.assertNotIn(
+                    "computer",
+                    service.agent_status(actor, "private", str(actor["id"])),
+                )
+
+                replacement_task = {
+                    "scope_type": "private",
+                    "scope_id": str(actor["id"]),
+                    "user_message": {"id": 72, "content": "new run"},
+                    "actor": actor,
+                    "content": "new run",
+                }
+                with service._conversation_lock:
+                    service._agent_status[key] = service._status_for_task(
+                        replacement_task,
+                        "replying",
+                        queued_count=0,
+                    )
+                    self.assertNotIn("_computer_file_draft", service._agent_status[key])
+                self.assertEqual(
+                    service.agent_preview_file(
+                        actor,
+                        "private",
+                        str(actor["id"]),
+                        "src/app.ts",
+                    )["source"],
+                    "workspace",
+                )
+            finally:
+                service.close()
+
+    def test_invalid_file_draft_payloads_are_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                self._activate(service, actor)
+                invalid = [
+                    self._draft_event(tool="read_file"),
+                    self._draft_event(tool_call_id=""),
+                    self._draft_event(kind="replacement"),
+                    self._draft_event(revision=0),
+                    self._draft_event(revision=True),
+                    self._draft_event(revision=2**53),
+                    self._draft_event(workspace_path="/workspace/src/app.ts"),
+                    self._draft_event(workspace_path="../app.ts"),
+                    self._draft_event(content="x" * (COMPUTER_FILE_PREVIEW_MAX_BYTES + 1)),
+                    self._draft_event(complete="false"),
+                ]
+                invalid_discard = self._draft_event(discarded=True)
+                invalid_discard["file_draft"]["content"] = "must be omitted"
+                invalid.append(invalid_discard)
+                for event in invalid:
+                    with self.subTest(event=event):
+                        service._record_agent_progress(
+                            "private",
+                            str(actor["id"]),
+                            event,
+                        )
+                        with service._conversation_lock:
+                            internal = service._agent_status[f"private:{actor['id']}"]
+                            self.assertNotIn("_computer_file_draft", internal)
+            finally:
+                service.close()
+
+
 class ComputerPreviewHTTPTests(unittest.TestCase):
     def test_file_preview_reads_workspace_text_and_rejects_host_and_escape(self):
         with tempfile.TemporaryDirectory() as td:
@@ -210,6 +566,7 @@ class ComputerPreviewHTTPTests(unittest.TestCase):
                     "notes/readme.md",
                 )
                 self.assertEqual(payload["workspace_path"], "notes/readme.md")
+                self.assertEqual(payload["source"], "workspace")
                 self.assertIn("hello", payload["content"])
                 self.assertNotIn("super-secret", payload["content"])
 
@@ -256,10 +613,37 @@ class ComputerPreviewHTTPTests(unittest.TestCase):
                     body = json.loads(response.read().decode("utf-8"))
                     self.assertEqual(response.status, 200)
                     self.assertEqual(body["workspace_path"], "notes/readme.md")
+                    self.assertEqual(body["source"], "workspace")
                     self.assertEqual(
                         response.getheader("X-Content-Type-Options"),
                         "nosniff",
                     )
+
+                    ComputerFileDraftProjectionTests._activate(service, actor)
+                    service._record_agent_progress(
+                        "private",
+                        str(actor["id"]),
+                        ComputerFileDraftProjectionTests._draft_event(
+                            workspace_path="notes/readme.md",
+                            content="HTTP draft TOKEN=http-secret",
+                            revision=4,
+                            complete=True,
+                        ),
+                    )
+                    connection = http.client.HTTPConnection(host, port, timeout=5)
+                    connection.request(
+                        "GET",
+                        path,
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    response = connection.getresponse()
+                    draft_body = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(draft_body["source"], "draft")
+                    self.assertEqual(draft_body["draft_kind"], "file")
+                    self.assertEqual(draft_body["revision"], "draft:write-draft-1:4")
+                    self.assertIn("TOKEN=•••", draft_body["content"])
+                    self.assertNotIn("http-secret", json.dumps(draft_body))
                 finally:
                     connection.close()
                     server.shutdown()

@@ -116,6 +116,55 @@ test("tool descriptions route semantic file work away from terminal scripts", ()
   assert.match(writeFile.description, /do not create files by terminal heredoc/);
 });
 
+test("only Codex file schemas require explicit target and prepare omitted sandbox defaults", () => {
+  const fileTools = (provider: "openai-codex" | "xai-oauth") => createTools({
+    runId: `run-${provider}`,
+    request: {
+      scope_key: "private:1",
+      model: { provider, id: "test-model" },
+    } as never,
+    processes: {} as never,
+    gateway: {} as never,
+    querySession: async () => null,
+    delegate: async () => "",
+    markSideEffect: () => undefined,
+  });
+  const codexTools = fileTools("openai-codex");
+  const otherTools = fileTools("xai-oauth");
+
+  for (const [name, arguments_] of [
+    ["write_file", { path: "note.txt", content: "hello" }],
+    ["patch_file", { path: "note.txt", old_text: "hello", new_text: "updated" }],
+  ] as const) {
+    const codex = codexTools.find((tool) => tool.name === name);
+    const other = otherTools.find((tool) => tool.name === name);
+    assert.ok(codex && other);
+    assert.equal(
+      ((codex.parameters as { required?: string[] }).required ?? []).includes("target"),
+      true,
+    );
+    assert.equal(
+      ((other.parameters as { required?: string[] }).required ?? []).includes("target"),
+      false,
+    );
+    assert.ok(codex.prepareArguments);
+    assert.equal(other.prepareArguments, undefined);
+    assert.throws(
+      () => validateToolArguments(codex, fauxToolCall(name, arguments_)),
+      /target/,
+    );
+    const originalArguments = { ...arguments_ };
+    const prepared = codex.prepareArguments(originalArguments);
+    assert.equal(prepared, originalArguments, "compatibility normalization must update model history in place");
+    assert.deepEqual(prepared, { ...arguments_, target: "sandbox" });
+    assert.doesNotThrow(
+      () => validateToolArguments(codex, fauxToolCall(name, prepared)),
+    );
+    const hostPrepared = codex.prepareArguments({ ...arguments_, target: "host" }) as Record<string, unknown>;
+    assert.equal(hostPrepared.target, "host");
+  }
+});
+
 test("delegate_task preserves single-call behavior and batches bounded children concurrently in input order", async () => {
   const started: Array<{ prompt: string; role: string }> = [];
   const releases = new Map<string, {

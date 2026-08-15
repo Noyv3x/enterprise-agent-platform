@@ -29,6 +29,8 @@ export interface ComputerAvailability {
 export interface ComputerSurface {
   visible: boolean;
   live: boolean;
+  runId: string;
+  startedAt: number | null;
   mode: ComputerMode | null;
   latestStep?: ActivityStep | null;
   file: ComputerFileClue | null;
@@ -40,6 +42,8 @@ export interface ComputerSurface {
 const EMPTY_SURFACE: ComputerSurface = {
   visible: false,
   live: false,
+  runId: "",
+  startedAt: null,
   mode: null,
   file: null,
   searchHits: [],
@@ -223,6 +227,11 @@ export function deriveComputerSurface({
   availability: ComputerAvailability;
 }): ComputerSurface {
   const live = isAgentActive(status);
+  const runId = String(status?.run_id || "");
+  const rawStartedAt = Number(status?.started_at);
+  const startedAt = Number.isFinite(rawStartedAt) && rawStartedAt > 0
+    ? rawStartedAt
+    : null;
   const projected = status?.computer;
   const liveStep = latestComputerStep(status);
   const liveMode = projected?.mode || computerModeFromStep(liveStep);
@@ -256,6 +265,8 @@ export function deriveComputerSurface({
     return {
       visible: true,
       live: true,
+      runId,
+      startedAt,
       mode: mode || "file",
       latestStep: liveStep,
       file,
@@ -287,6 +298,8 @@ export function deriveComputerSurface({
       return {
         visible: hasClues,
         live: false,
+        runId,
+        startedAt,
         mode: lastMode === "present" || lastMode === "file" ? "present" : lastMode,
         latestStep: liveStep,
         file,
@@ -301,6 +314,8 @@ export function deriveComputerSurface({
   return {
     visible: true,
     live: false,
+    runId,
+    startedAt,
     mode,
     latestStep: liveStep,
     file,

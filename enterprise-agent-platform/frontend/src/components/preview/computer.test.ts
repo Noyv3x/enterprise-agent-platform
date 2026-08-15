@@ -21,6 +21,8 @@ describe("computer surface derivation", () => {
 
   it("shows a skeleton as soon as a computer tool starts", () => {
     const status: AgentStatus = {
+      run_id: "run-computer-1",
+      started_at: 1_784_376_000,
       state: "replying",
       activity: [{
         stage: "tool",
@@ -38,6 +40,8 @@ describe("computer surface derivation", () => {
     });
     expect(surface.visible).toBe(true);
     expect(surface.live).toBe(true);
+    expect(surface.runId).toBe("run-computer-1");
+    expect(surface.startedAt).toBe(1_784_376_000);
     expect(surface.mode).toBe("file");
     expect(latestComputerStep(status)?.tool).toBe("write_file");
   });
@@ -61,6 +65,38 @@ describe("computer surface derivation", () => {
     expect(surface.present).toMatchObject({
       workspace_path: "deck.html",
       status: "completed",
+    });
+  });
+
+  it("keeps an uncommitted HTML draft in file mode until the tool settles", () => {
+    const surface = deriveComputerSurface({
+      status: {
+        run_id: "run-draft-1",
+        started_at: 1_784_376_010,
+        state: "replying",
+        computer: {
+          mode: "file",
+          file: {
+            tool: "write_file",
+            workspace_path: "page.html",
+            target: "sandbox",
+            source: "draft",
+            draft_kind: "file",
+            status: "drafting",
+            revision: "draft:write-html:2",
+          },
+        },
+      },
+      messages: [],
+      availability: idleAvailability,
+    });
+
+    expect(surface.mode).toBe("file");
+    expect(surface.file).toMatchObject({
+      workspace_path: "page.html",
+      source: "draft",
+      draft_kind: "file",
+      revision: "draft:write-html:2",
     });
   });
 

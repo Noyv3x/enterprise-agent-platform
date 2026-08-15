@@ -112,6 +112,12 @@ function objectValue(value: unknown): JsonObject {
   return value as JsonObject;
 }
 
+function withDefaultSandboxTarget(value: unknown): JsonObject {
+  const arguments_ = objectValue(value);
+  if (!Object.hasOwn(arguments_, "target")) arguments_.target = EXECUTION_TARGETS[0];
+  return arguments_;
+}
+
 function gatewayResult(result: { content?: string; data?: JsonValue; is_error?: boolean }): AgentToolResult<JsonValue> {
   if (result.is_error) throw new Error(result.content || "Platform tool failed");
   return textResult(result.content || JSON.stringify(result.data ?? null, null, 2), result.data ?? null);
@@ -306,35 +312,61 @@ const readFileSchema = Type.Object({
 
 const MAX_PATCH_FILE_BYTES = 10 * 1024 * 1024;
 
+const fileExecutionTargetSchema = Type.Union([
+  Type.Literal(EXECUTION_TARGETS[0]),
+  Type.Literal(EXECUTION_TARGETS[1]),
+]);
+const filePathSchema = Type.String({
+  minLength: 1,
+  description: "Destination path. Relative paths use the selected target's Agent workspace.",
+});
+const writeFileContentSchema = Type.String({
+  description: "Complete UTF-8 file contents.",
+});
+
 const writeFileSchema = Type.Object({
-  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
-  path: Type.String({
-    minLength: 1,
-    description: "Destination path. Relative paths use the selected target's Agent workspace.",
-  }),
-  content: Type.String({
-    description: "Complete UTF-8 file contents.",
-  }),
+  target: Type.Optional(fileExecutionTargetSchema),
+  path: filePathSchema,
+  content: writeFileContentSchema,
 }, { additionalProperties: false });
 
+const codexWriteFileSchema = Type.Object({
+  target: fileExecutionTargetSchema,
+  path: filePathSchema,
+  content: writeFileContentSchema,
+}, { additionalProperties: false });
+
+const patchFilePathSchema = Type.String({
+  minLength: 1,
+  description: "File path. Relative paths use the selected target's Agent workspace.",
+});
+const patchOldTextSchema = Type.String({
+  minLength: 1,
+  description: "Exact existing text to replace. Read the file again before retrying a failed patch.",
+});
+const patchNewTextSchema = Type.String({
+  description: "Replacement text.",
+});
+const expectedReplacementsSchema = Type.Integer({
+  minimum: 1,
+  maximum: 10_000,
+  description: "Required number of exact matches. Defaults to 1.",
+});
+
 const patchFileSchema = Type.Object({
-  target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])])),
-  path: Type.String({
-    minLength: 1,
-    description: "File path. Relative paths use the selected target's Agent workspace.",
-  }),
-  old_text: Type.String({
-    minLength: 1,
-    description: "Exact existing text to replace. Read the file again before retrying a failed patch.",
-  }),
-  new_text: Type.String({
-    description: "Replacement text.",
-  }),
-  expected_replacements: Type.Optional(Type.Integer({
-    minimum: 1,
-    maximum: 10_000,
-    description: "Required number of exact matches. Defaults to 1.",
-  })),
+  target: Type.Optional(fileExecutionTargetSchema),
+  path: patchFilePathSchema,
+  old_text: patchOldTextSchema,
+  new_text: patchNewTextSchema,
+  expected_replacements: Type.Optional(expectedReplacementsSchema),
+}, { additionalProperties: false });
+
+const codexPatchFileSchema = Type.Object({
+  target: fileExecutionTargetSchema,
+  path: patchFilePathSchema,
+  old_text: patchOldTextSchema,
+  new_text: patchNewTextSchema,
+  expected_replacements: Type.Optional(expectedReplacementsSchema),
 }, { additionalProperties: false });
 
 const searchFilesSchema = Type.Object({
@@ -1117,6 +1149,7 @@ function canDelegateTasks(context: ToolFactoryContext): boolean {
 
 export function createTools(context: ToolFactoryContext): AgentTool[] {
   const learningReview = isLearningReviewRun(context.request);
+  const codexFileTargetRequired = context.request.model?.provider === "openai-codex";
   const todoState = context.todoState;
   const loadedSkillIds = new Set<string>();
   const memoryParameters = learningReview
@@ -1363,7 +1396,14 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "write_file",
     label: "Write file",
     description: "Create or replace a complete UTF-8 file atomically. Prefer patch_file for localized edits; do not create files by terminal heredoc.",
-    parameters: writeFileSchema,
+    parameters: codexFileTargetRequired
+      ? codexWriteFileSchema as unknown as typeof writeFileSchema
+      : writeFileSchema,
+    ...(codexFileTargetRequired ? {
+      prepareArguments: (arguments_: unknown) => (
+        withDefaultSandboxTarget(arguments_) as Static<typeof writeFileSchema>
+      ),
+    } : {}),
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
@@ -1399,7 +1439,14 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "patch_file",
     label: "Patch file",
     description: "Replace exact text in a workspace file, refusing ambiguous replacement counts. If a patch fails, re-read the current file before retrying.",
-    parameters: patchFileSchema,
+    parameters: codexFileTargetRequired
+      ? codexPatchFileSchema as unknown as typeof patchFileSchema
+      : patchFileSchema,
+    ...(codexFileTargetRequired ? {
+      prepareArguments: (arguments_: unknown) => (
+        withDefaultSandboxTarget(arguments_) as Static<typeof patchFileSchema>
+      ),
+    } : {}),
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);

@@ -511,6 +511,12 @@ COMPUTER_TERMINAL_TOOLS = frozenset({"terminal", "process"})
 COMPUTER_BROWSER_TOOLS = frozenset({"browser"})
 COMPUTER_HTML_SUFFIXES = frozenset({".html", ".htm"})
 COMPUTER_FILE_PREVIEW_MAX_BYTES = 64 * 1024
+COMPUTER_FILE_DRAFT_TOOL_CALL_ID_MAX = 512
+COMPUTER_FILE_DRAFT_REVISION_MAX = (2**53) - 1
+COMPUTER_FILE_DRAFT_KINDS = {
+    "write_file": "file",
+    "patch_file": "replacement",
+}
 COMPUTER_PRESENT_MAX_BYTES = 512 * 1024
 COMPUTER_SEARCH_HIT_LIMIT = 8
 COMPUTER_SEARCH_SNIPPET_MAX = 240
@@ -9134,13 +9140,35 @@ class EnterpriseService:
         relative = workspace_relative_path(workspace_path)
         if not relative:
             raise ServiceError(400, "workspace_path must be a current /workspace relative path")
-        _scope_type, _scope_id, scope = self._authorized_preview_scope(
+        normalized_type, normalized_id, scope = self._authorized_preview_scope(
             actor,
             scope_type,
             scope_id,
         )
         if scope is None:
             raise ServiceError(404, "workspace file is not available")
+        key = self._conversation_key(normalized_type, normalized_id)
+        with self._conversation_lock:
+            status = self._agent_status.get(key)
+            draft = (
+                dict(status.get("_computer_file_draft") or {})
+                if status and status.get("state") in {"replying", "approval"}
+                else {}
+            )
+        if (
+            draft
+            and draft.get("discarded") is not True
+            and draft.get("workspace_path") == relative
+        ):
+            return {
+                "workspace_path": relative,
+                "content": str(draft.get("content") or ""),
+                "truncated": draft.get("truncated") is True,
+                "encoding": "utf-8",
+                "source": "draft",
+                "draft_kind": str(draft.get("draft_kind") or ""),
+                "revision": _computer_file_draft_revision(draft),
+            }
         data = self._read_workspace_preview_bytes(
             scope,
             relative,
@@ -9166,6 +9194,7 @@ class EnterpriseService:
             "content": text,
             "truncated": truncated,
             "encoding": "utf-8",
+            "source": "workspace",
         }
 
     def agent_preview_present(
@@ -17049,6 +17078,7 @@ class EnterpriseService:
         copied.pop("_work_timeline_tool_seen", None)
         copied.pop("_work_timeline_omitted_tool_call_ids", None)
         search = copied.pop("_computer_search", None)
+        file_draft = copied.pop("_computer_file_draft", None)
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
@@ -17062,7 +17092,16 @@ class EnterpriseService:
             copied["active_input_group"]["message_ids"] = list(
                 copied["active_input_group"].get("message_ids") or []
             )
-        computer = project_computer_clues(copied.get("activity") or [], search)
+        draft_clue = (
+            _computer_file_draft_clue(file_draft)
+            if copied.get("state") in {"replying", "approval"}
+            else None
+        )
+        computer = (
+            {"mode": "file", "file": draft_clue}
+            if draft_clue is not None
+            else project_computer_clues(copied.get("activity") or [], search)
+        )
         if computer:
             copied["computer"] = computer
         else:
@@ -17323,6 +17362,9 @@ class EnterpriseService:
         if not isinstance(event, dict):
             return
         event_type = str(event.get("event") or event.get("type") or event.get("event_type") or "").strip().lower()
+        if event_type == "tool.arguments.delta":
+            self._record_agent_file_draft(scope_type, scope_id, event)
+            return
         if event_type == "approval.request":
             self._record_agent_approval_request(scope_type, scope_id, event)
             return
@@ -17337,6 +17379,8 @@ class EnterpriseService:
             return
         if event_type not in VISIBLE_TOOL_PROGRESS_EVENTS:
             return
+        if event_type in {"tool.completed", "tool.failed"}:
+            self._clear_agent_file_draft(scope_type, scope_id, event)
         if event.get("execution_started") is False:
             # Runtime preflight failures (invalid arguments, policy blocks,
             # denied approvals and truncated model tool calls) did not reach a
@@ -17514,6 +17558,69 @@ class EnterpriseService:
             status["current_step"] = line
             status["updated_at"] = timestamp
             _remember_computer_search(status, event, tool)
+            self._agent_status[key] = status
+
+    def _record_agent_file_draft(
+        self,
+        scope_type: str,
+        scope_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        draft = _validated_computer_file_draft(event)
+        if draft is None:
+            return
+        key = self._conversation_key(scope_type, str(scope_id))
+        with self._conversation_lock:
+            current_status = self._agent_status.get(key)
+            if current_status is None or current_status.get("state") not in {"replying", "approval"}:
+                return
+            status = dict(current_status)
+            current = status.get("_computer_file_draft")
+            same_tool_call_id = (
+                isinstance(current, dict)
+                and current.get("tool_call_id") == draft["tool_call_id"]
+            )
+            if same_tool_call_id and current.get("tool") != draft["tool"]:
+                return
+            same_tool = (
+                same_tool_call_id
+                and current.get("tool") == draft["tool"]
+            )
+            if same_tool and int(current.get("remote_revision") or 0) >= draft["remote_revision"]:
+                return
+            if draft["discarded"]:
+                if not same_tool:
+                    return
+                status.pop("_computer_file_draft", None)
+            else:
+                status["_computer_file_draft"] = draft
+            status["updated_at"] = now_ts()
+            self._agent_status[key] = status
+
+    def _clear_agent_file_draft(
+        self,
+        scope_type: str,
+        scope_id: str,
+        event: dict[str, Any],
+    ) -> None:
+        tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+        tool_call_id = str(event.get("tool_call_id") or "").strip()
+        if tool not in COMPUTER_FILE_DRAFT_KINDS or not _valid_file_draft_tool_call_id(tool_call_id):
+            return
+        key = self._conversation_key(scope_type, str(scope_id))
+        with self._conversation_lock:
+            current_status = self._agent_status.get(key)
+            if current_status is None:
+                return
+            current = current_status.get("_computer_file_draft")
+            if not isinstance(current, dict) or (
+                current.get("tool") != tool
+                or current.get("tool_call_id") != tool_call_id
+            ):
+                return
+            status = dict(current_status)
+            status.pop("_computer_file_draft", None)
+            status["updated_at"] = now_ts()
             self._agent_status[key] = status
 
     def _record_agent_approval_request(self, scope_type: str, scope_id: str, event: dict[str, Any]) -> None:
@@ -19652,6 +19759,103 @@ def workspace_relative_path(value: Any) -> str:
         return ""
     rendered = relative.as_posix()
     return rendered if len(rendered) <= COMPUTER_WORKSPACE_PATH_MAX else ""
+
+
+def _valid_file_draft_tool_call_id(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and value
+        and value == value.strip()
+        and len(value) <= COMPUTER_FILE_DRAFT_TOOL_CALL_ID_MAX
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def _validated_computer_file_draft(event: dict[str, Any]) -> dict[str, Any] | None:
+    tool = str(event.get("tool") or event.get("tool_name") or "").strip().lower()
+    expected_kind = COMPUTER_FILE_DRAFT_KINDS.get(tool)
+    tool_call_id = event.get("tool_call_id")
+    raw = event.get("file_draft")
+    if expected_kind is None or not _valid_file_draft_tool_call_id(tool_call_id):
+        return None
+    if not isinstance(raw, dict) or raw.get("kind") != expected_kind:
+        return None
+    revision = raw.get("revision")
+    if (
+        isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision <= 0
+        or revision > COMPUTER_FILE_DRAFT_REVISION_MAX
+    ):
+        return None
+    workspace_path = raw.get("workspace_path")
+    if not isinstance(workspace_path, str):
+        return None
+    relative = workspace_relative_path(workspace_path)
+    if not relative or workspace_path != relative:
+        return None
+    if not all(isinstance(raw.get(field), bool) for field in ("complete", "truncated", "discarded")):
+        return None
+    discarded = raw["discarded"]
+    if discarded:
+        if "content" in raw:
+            return None
+        content = ""
+        secondary_truncated = False
+    else:
+        content = raw.get("content")
+        if not isinstance(content, str) or "\x00" in content:
+            return None
+        try:
+            if len(content.encode("utf-8")) > COMPUTER_FILE_PREVIEW_MAX_BYTES:
+                return None
+        except UnicodeEncodeError:
+            return None
+        content = _safe_tool_summary_text(
+            content,
+            limit=COMPUTER_FILE_PREVIEW_MAX_BYTES,
+            preserve_whitespace=True,
+            redact_paths=False,
+        )
+        encoded = content.encode("utf-8")
+        secondary_truncated = len(encoded) > COMPUTER_FILE_PREVIEW_MAX_BYTES
+        if secondary_truncated:
+            content = encoded[: COMPUTER_FILE_PREVIEW_MAX_BYTES - 3].decode(
+                "utf-8",
+                errors="ignore",
+            ).rstrip() + "…"
+    return {
+        "tool": tool,
+        "tool_call_id": tool_call_id,
+        "workspace_path": relative,
+        "draft_kind": expected_kind,
+        "content": content,
+        "remote_revision": revision,
+        "complete": raw["complete"],
+        "truncated": raw["truncated"] or secondary_truncated,
+        "discarded": discarded,
+    }
+
+
+def _computer_file_draft_revision(draft: dict[str, Any]) -> str:
+    return f"draft:{draft['tool_call_id']}:{draft['remote_revision']}"
+
+
+def _computer_file_draft_clue(draft: Any) -> dict[str, Any] | None:
+    if not isinstance(draft, dict) or draft.get("discarded") is True:
+        return None
+    if draft.get("tool") not in COMPUTER_FILE_DRAFT_KINDS:
+        return None
+    return {
+        "source": "draft",
+        "draft_kind": draft["draft_kind"],
+        "tool": draft["tool"],
+        "target": "sandbox",
+        "tool_call_id": draft["tool_call_id"],
+        "workspace_path": draft["workspace_path"],
+        "status": "pending" if draft.get("complete") is True else "drafting",
+        "revision": _computer_file_draft_revision(draft),
+    }
 
 
 def _html_workspace_path(value: Any) -> str:

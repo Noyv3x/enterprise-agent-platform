@@ -152,7 +152,7 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 电脑画面与呈现页
 
-电脑画面是当前 scope 可见工具的只读投影，不是第二套文件/进程执行入口。文件正文和搜索命中必须有界、脱敏并以纯文本渲染；`target=host` 的文件调用不得把宿主正文读进预览。终端预览继续只读。浏览器接管规则不变，不能因为电脑画面统一了浏览器与终端入口就省略明确手势或扩大 tab/lease 范围。
+电脑画面是当前 scope 可见工具的只读投影，不是第二套文件/进程执行入口。文件正文和搜索命中必须有界、脱敏并以纯文本渲染；`target=host` 的文件调用不得把宿主正文或文件草稿带进预览。Codex OAuth 文件草稿只能从逐步解析后的累积参数构造，禁止转发可能把凭据切在任意边界的原始 JSON fragment；每个未终结版本先统一脱敏并保留尾部安全窗口，Platform 再执行文件预览同级的二次脱敏和上限。草稿正文不得进入聊天 SSE、工作记录、最终消息、数据库、Runtime session、workspace、memory、搜索或备份，对外查询仍须重新从登录身份派生精确 scope 并匹配当前 Run、sandbox tool call 与工作区相对路径。终端预览继续只读。浏览器接管规则不变，不能因为电脑画面统一了浏览器与终端入口就省略明确手势或扩大 tab/lease 范围。
 
 HTML 呈现页只来自当前 scope 工作区中已成功写出的 `.html` / `.htm`，或同一 scope 已授权的 HTML 附件。Platform 用与 `MEDIA` 相同的 fd-rooted 读取拿到单页正文后，经已认证、禁止嗅探的 `GET /api/agent-previews/present` 交给前端；文件正文走 `GET /api/agent-previews/file`。前端只能把呈现页放进 `sandbox` 且不含 `allow-same-origin` 的 iframe。响应 CSP 必须禁止连接父页、提交表单和加载除 `data:`/`blob:` 与必要内联脚本样式以外的网络资源；不得设置 `allow-same-origin`、不得共享产品 Cookie、不得把呈现页文档放进父页面 DOM。本版本不提供工作区静态资源服务器，相对外链失败是预期行为。呈现页不是 Camoufox，不能借此取得接管、剪贴板或任意地址栏。
 

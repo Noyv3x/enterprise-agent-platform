@@ -135,6 +135,26 @@ Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有
 - `delegation.*`、`context.compacted`、`session.repaired`；
 - `run.idle_timeout`、`run.turn_limit`、`run.cleanup_timeout`。
 
+`tool.arguments.delta` 的默认数据仍只有 `content_index` 与 turn identity，不携带原始 `delta`。当且仅当本次请求是规范 `openai-codex` OAuth provider、锁定 API 为 `openai-codex-responses`，且逐步解析到 sandbox `write_file` 或 `patch_file` 的安全工作区相对路径时，事件可以额外携带：
+
+```json
+{
+  "tool_call_id": "call_...",
+  "tool_name": "write_file",
+  "file_draft": {
+    "workspace_path": "src/app.ts",
+    "kind": "file",
+    "content": "bounded redacted text",
+    "revision": 3,
+    "complete": false,
+    "truncated": false,
+    "discarded": false
+  }
+}
+```
+
+`patch_file` 的 `kind` 固定为 `replacement`，其 `content` 只表示 `new_text` 替换片段。`revision` 在一个 tool call 内严格递增；非终结版本保留尾部安全窗口并只在有界检查点发布，`complete=true` 只表示模型已经输出完整工具参数，不表示参数已通过 schema/策略、工具已执行或文件已提交。若后续增量把 target/path 收敛为 host、工作区外或其它不再允许投影的值，Runtime 发送同一 identity 的 `discarded=true`（省略 `content`）撤回已有草稿。原始 JSON fragment、`old_text`、host/工作区外正文与未脱敏凭据没有事件表示。Platform 可以把该字段投影到当前 Run 的临时文件预览，但不得把正文复制进通用状态 SSE 或持久工作记录。
+
 终态为 `run.completed`、`run.failed`、`run.cancelled` 或 `run.needs_review`。完成数据包含 output/content、session、model、usage、context usage 和输入消费信息。Runtime 可以在 Agent 主循环的单次模型 stream 尚未发布任何非空正文、思考或工具调用时，对明确的瞬时供应商错误做有界可取消重试；重试过程不产生额外 Run、工具工作记录或 session 消息。一旦 stream 已发布内容便不重试，上下文/输出大小、额度、账单、认证、内容策略错误也不重试；预算耗尽后继续使用原终态和 `sideEffectsStarted` 安全分类，Platform 不根据错误字符串重新提交整个 Run。该重试边界不包含 browser 工具结果的视觉辅助模型请求。若 Runtime 在一个含规范 `MEDIA: /workspace/<relative-path>` 的 assistant 回复后自动插入内部文件复验，只有相关变更已被成功复验清除时，`run.completed` 的 output/content 才把该交付标记去重保留下来，即使被持久化的最终 assistant 文本只报告复验结果；复验失败或仍有未确认变更时不恢复标记。Platform 仍是解析并授权附件的唯一边界。
 
 由 Runtime 机械完成守卫产生的 `run.needs_review` 可以在同一个终态 data 中携带有界 `output`/`content`、session、model、usage 和 context usage。该正文只能取自最后一段真实 assistant 阶段性说明，表示尚未成功的进度或 blocker 诊断；`error` 必须继续给出独立的机械失败原因，状态仍是 `needs_review`。Python client 将正文暴露为 `AgentRuntimeRunError.partial_content`，但不得把它转成成功结果。幂等重放必须保持同一非成功状态与诊断。任何非成功终态中的 `MEDIA:` 都只是普通诊断文本，Platform 不解析、不复制也不发布附件。

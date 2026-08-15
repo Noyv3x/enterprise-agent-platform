@@ -25,6 +25,7 @@ import type {
 } from "./background-task-store.js";
 import { CONTAINER_PATHS, EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import { EventJournal } from "./event-journal.js";
+import { CodexFileDraftProjector } from "./file-draft-projector.js";
 import { MODEL_STREAM_MAX_RETRIES, withModelStreamRetry } from "./model-stream-retry.js";
 import { redactToolArgumentsForModelHistory } from "./model-history.js";
 import {
@@ -1018,6 +1019,11 @@ export class RunCoordinator {
       const executionTargets = new Map<string, ExecutionTarget>();
       const executionReceipts = new Map<string, ExecutionAuditReceipt>();
       const startedToolCalls = new Set<string>();
+      const fileDraftProjector = new CodexFileDraftProjector(
+        record.request.model.provider === "openai-codex"
+        && resolved.model.provider === "openai-codex"
+        && resolved.model.api === "openai-codex-responses",
+      );
       const rawTools = createTools({
         runId: record.id,
         request: record.request,
@@ -1621,6 +1627,7 @@ export class RunCoordinator {
         approvedTerminalCwds,
         approvedFilePaths,
         startedToolCalls,
+        fileDraftProjector,
       ));
       this.touchRunActivity(record.id, "building model prompt");
       const prompt = await buildPrompt(record.request, record.controller.signal);
@@ -1847,6 +1854,7 @@ export class RunCoordinator {
     approvedTerminalCwds: Map<string, string>,
     approvedFilePaths: Map<string, string>,
     startedToolCalls: Set<string>,
+    fileDraftProjector: CodexFileDraftProjector,
   ): Promise<void> {
     if (isTerminal(record.status)) return;
     if (event.type === "tool_execution_update" && !startedToolCalls.has(event.toolCallId)) return;
@@ -1888,13 +1896,20 @@ export class RunCoordinator {
       const turn = this.turnIdentity(record.id);
       if (update.type === "text_delta") journal.publish("message.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
       else if (update.type === "thinking_delta") journal.publish("thinking.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
-      else if (update.type === "toolcall_delta") {
+      else if (update.type === "toolcall_delta" || update.type === "toolcall_end") {
         // Incremental JSON fragments can split a credential across arbitrary
-        // boundaries and therefore cannot be redacted safely. Publish only a
-        // progress marker; the later approval, execution.audit, or
-        // tool.started event carries the
-        // complete display-safe argument object.
-        journal.publish("tool.arguments.delta", { content_index: update.contentIndex, ...turn });
+        // boundaries and therefore never enter the journal. The locked Codex
+        // Responses path may instead project a bounded snapshot from Pi's
+        // cumulatively parsed arguments; every other update remains a marker.
+        if (update.type === "toolcall_end") fileDraftProjector.normalizeCompleteTarget(update);
+        const projection = fileDraftProjector.project(update);
+        if (update.type === "toolcall_delta" || projection) {
+          journal.publish("tool.arguments.delta", {
+            content_index: update.contentIndex,
+            ...turn,
+            ...(projection ?? {}),
+          });
+        }
       }
       return;
     }

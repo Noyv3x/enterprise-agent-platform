@@ -53,6 +53,8 @@ Runtime 因未完成 todo、尚未观察到终态的有限后台任务或缺失 
 
 模型可见的 assistant tool call 参数必须始终保持对应活动工具 schema 的规范形状；审计展示对象与模型历史使用不同的序列化边界，不能把 `tool` 名称或其它展示字段写回下一轮上下文。读取旧 session 时只允许在内存模型副本中收敛精确匹配的历史展示 envelope，未知字段、身份字段或不匹配工具名继续由严格 schema 拒绝，原 JSONL 不改写。敏感值替换仍须满足字段的枚举、正则和路径约束；允许任意 JSON 的浏览器提取 schema 必须同时限制深度、条目、节点和字符串大小。
 
+Codex OAuth 的可信模型目录固定到 `openai-codex-responses` API，因此 Runtime 可以消费 Pi 从 `response.function_call_arguments.delta` 形成的逐步解析工具参数。只有这条 provider/API 路径的 sandbox `write_file` 与 `patch_file` 可以产生文件草稿投影：前者取正在形成的 `content`，后者只取 `new_text` 并标记为替换片段。为同时保证缺省 sandbox 调用可实时投影、尚未闭合的参数又不能先误判最终 host 调用，这两个工具只在 Codex OAuth 暴露给模型的 schema 中要求显式 `target`；执行兼容层仍在 schema 校验前把完整调用中意外缺省的 target 补成 sandbox，其它 provider 与其它工具的默认 target 契约不变。Runtime 不转发原始 JSON delta，也不把未完成参数交给校验、审批或工具执行；它对完整累积字符串做凭据形状脱敏、保留尾部安全窗口、按有界检查点发布 `tool.arguments.delta.file_draft`，并在 `toolcall_end` 发布最终草稿版本。草稿事件必须携带稳定 tool call identity、规范 `/workspace` 相对路径、单调 revision、内容类型、完成与截断标记；`target=host`、工作区外路径、其它工具、其它 provider/API 和没有安全路径的增量只保留无正文进度标记。文件仍只在完整参数通过 schema 与策略后由原工具原子提交，草稿不得建立副作用或执行授权。
+
 terminal、process 与文件工具的默认 `target` 是 `sandbox`。每个顶层 Run 接收由 Platform 解析的稳定主 Agent identity；委派 Run 必须继承它，模型不能构造其它 Agent identity。Runtime 把已规范化 cwd、路径、命令、环境和 deadline 发给管理器；管理器创建或唤醒对应 Sandbox，并在容器固定路径 `/workspace`、`/home/agent` 与 `/opt/agent-env` 下执行。Runtime 只消费有界输出和进程句柄，不把管理器控制 socket或容器身份暴露给模型。有限后台 task 的 Manager 私有请求额外携带由 Runtime 对 scope/lifecycle/session 计算的固定摘要和 `completion_required`；这不是模型参数，也不暴露 session 原文或 `background_kind`。
 
 Runtime 不创建、修复或推断宿主 workspace。每条 scope/runtime identity 对应的 workspace、当前 marker 与 alias 必须在接受 Run 前完整存在并匹配；任何未物化、缺失、旧格式或身份漂移都失败关闭，普通更新和恢复也没有放宽入口。

@@ -11,6 +11,7 @@ import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AgentPreviewScope, AppState } from "../../types";
 import { useChatPreviewContext } from "./ChatPreviewContext";
+import { ComputerPip } from "./ComputerPip";
 import { ChatPreviewSidebar } from "./ChatPreviewSidebar";
 
 const mocks = vi.hoisted(() => ({
@@ -107,7 +108,10 @@ function renderSidebar(
 function BrowserAssistFixture() {
   const preview = useChatPreviewContext();
   return (
-    <button type="button" onClick={preview?.openBrowserAssist}>
+    <button
+      type="button"
+      onClick={(event) => preview?.openBrowserAssist(event.currentTarget)}
+    >
       Open browser from work
     </button>
   );
@@ -254,8 +258,12 @@ describe("ChatPreviewSidebar", () => {
     await userEvent.click(computerButton);
 
     expect(computerButton).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("complementary", { name: "AI computer" })).toBeVisible();
-    expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
+    const computerDrawer = screen.getByRole("complementary", { name: "AI computer" });
+    const browserFixture = screen.getByTestId("browser-preview-fixture");
+    expect(computerDrawer).toBeVisible();
+    expect(computerDrawer.querySelector(".chat-preview__body--computer")).not.toBeNull();
+    expect(browserFixture).toBeVisible();
+    expect(browserFixture.closest(".computer-screen__viewport.is-browser")).not.toBeNull();
     expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: undefined }));
   });
 
@@ -339,12 +347,58 @@ describe("ChatPreviewSidebar", () => {
     expect(rail).not.toHaveAttribute("inert");
   });
 
+  it("returns focus to the composer when a mobile PiP opener unmounts", async () => {
+    mocks.mobile = true;
+    const user = userEvent.setup();
+    const state: AppState = {
+      ...initialAppState,
+      agentStatuses: {
+        ...initialAppState.agentStatuses,
+        private: {
+          state: "replying",
+          run_id: "run-mobile-pip",
+          started_at: Math.floor(Date.now() / 1_000),
+          computer: {
+            mode: "search",
+            search: {
+              tool: "web",
+              hits: [{ title: "Live search result", url: "https://example.test" }],
+            },
+          },
+        },
+      },
+    };
+    renderSidebar(
+      privateScope,
+      true,
+      <div className="composer">
+        <textarea aria-label="Message input" />
+        <ComputerPip />
+      </div>,
+      state,
+    );
+    const composer = screen.getByRole("textbox", { name: "Message input" });
+    const pipButton = document.querySelector<HTMLButtonElement>(".computer-pip__button");
+    expect(pipButton).not.toBeNull();
+
+    await user.click(pipButton!);
+
+    expect(pipButton?.isConnected).toBe(false);
+    const close = screen.getByRole("button", { name: "Close preview" });
+    await waitFor(() => expect(close).toHaveFocus());
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(composer).toHaveFocus());
+  });
+
   it("keeps scheduled tasks and the computer drawer mutually exclusive", async () => {
     mocks.availability.browserActive = true;
     renderSidebar();
 
     await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
-    expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
+    const scheduledFixture = await screen.findByTestId("scheduled-tasks-fixture");
+    expect(scheduledFixture).toBeVisible();
+    expect(scheduledFixture.closest(".chat-preview__body")).not.toHaveClass("chat-preview__body--computer");
     expect(screen.queryByTestId("browser-preview-fixture")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));

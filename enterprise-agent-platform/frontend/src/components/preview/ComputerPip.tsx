@@ -1,4 +1,5 @@
 import { Button, Tooltip } from "antd";
+import { useEffect, useState } from "react";
 import { useI18n, type MessageKey } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { ComputerMode } from "../../types";
@@ -18,6 +19,79 @@ const MODE_LABELS: Record<ComputerMode, MessageKey> = {
   search: "computer.mode.search",
   present: "computer.mode.present",
 };
+
+const ELAPSED_TICK_MS = 1_000;
+
+export function formatComputerElapsed(totalSeconds: number): string {
+  const bounded = Math.max(0, Math.floor(totalSeconds));
+  const seconds = bounded % 60;
+  const totalMinutes = Math.floor(bounded / 60);
+  const minutes = totalMinutes % 60;
+  const hours = Math.floor(totalMinutes / 60);
+  const pairs = [minutes, seconds].map((value) => String(value).padStart(2, "0"));
+  return hours > 0
+    ? [String(hours).padStart(2, "0"), ...pairs].join(":")
+    : pairs.join(":");
+}
+
+function ComputerPipControl({
+  label,
+  title,
+  live,
+  runId,
+  startedAt,
+  modeLabel,
+  activityLabel,
+  onOpen,
+}: {
+  label: string;
+  title: string;
+  live: boolean;
+  runId: string;
+  startedAt: number | null;
+  modeLabel: string;
+  activityLabel: string;
+  onOpen: (opener: HTMLElement) => void;
+}) {
+  const { t } = useI18n();
+  const [now, setNow] = useState(() => Date.now());
+  const timing = live && Boolean(runId) && startedAt != null && Number.isFinite(startedAt) && startedAt > 0;
+
+  useEffect(() => {
+    if (!timing) return;
+    setNow(Date.now());
+    const interval = window.setInterval(() => setNow(Date.now()), ELAPSED_TICK_MS);
+    return () => window.clearInterval(interval);
+  }, [runId, startedAt, timing]);
+
+  const elapsed = timing
+    ? formatComputerElapsed(Math.max(0, (now - Number(startedAt) * 1_000) / 1_000))
+    : "";
+  const description = elapsed
+    ? `${modeLabel} · ${activityLabel} · ${t("computer.pip.elapsed", { time: elapsed })}`
+    : `${modeLabel} · ${activityLabel}`;
+  return (
+    <Tooltip title={label}>
+      <Button
+        className="computer-pip__button"
+        type="text"
+        aria-label={label}
+        aria-description={description}
+        onClick={(event) => onOpen(event.currentTarget)}
+      >
+        <span className="computer-pip__caption">
+          <span className="computer-pip__status" aria-hidden="true" />
+          <Icon name="computer" size={13} />
+          <span className="computer-pip__copy">
+            <strong>{title}</strong>
+            <small>{modeLabel} · {activityLabel}</small>
+          </span>
+          {elapsed ? <span className="computer-pip__elapsed" aria-hidden="true">{elapsed}</span> : null}
+        </span>
+      </Button>
+    </Tooltip>
+  );
+}
 
 export function ComputerPip() {
   const { t } = useI18n();
@@ -80,28 +154,23 @@ export function ComputerPip() {
 
   return (
     <div className="computer-pip">
-      <div className={cx("computer-pip__player", surface.live && "is-live")}>
+      <div className={cx(
+        "computer-pip__player",
+        surface.live && "is-live",
+      )}>
         <div className="computer-pip__viewport" aria-hidden="true">
           {content}
         </div>
-        <Tooltip title={label}>
-          <Button
-            className="computer-pip__button"
-            type="text"
-            aria-label={label}
-            aria-description={`${modeLabel} · ${activityLabel}`}
-            onClick={() => preview.openComputer()}
-          >
-            <span className="computer-pip__caption">
-              <span className="computer-pip__status" aria-hidden="true" />
-              <Icon name="computer" size={13} />
-              <span>
-                <strong>{t("computer.title")}</strong>
-                <small>{modeLabel} · {activityLabel}</small>
-              </span>
-            </span>
-          </Button>
-        </Tooltip>
+        <ComputerPipControl
+          label={label}
+          title={t("computer.title")}
+          live={surface.live}
+          runId={surface.runId}
+          startedAt={surface.startedAt}
+          modeLabel={modeLabel}
+          activityLabel={activityLabel}
+          onOpen={(opener) => preview.openComputer(undefined, opener)}
+        />
       </div>
     </div>
   );

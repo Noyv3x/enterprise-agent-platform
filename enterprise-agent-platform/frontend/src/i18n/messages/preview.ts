@@ -45,6 +45,16 @@ export const previewMessages = defineMessages({
     "zh-TW": "暫時無法讀取此檔案。",
   },
   "computer.file.path": { "zh-CN": "路径", en: "Path", "zh-TW": "路徑" },
+  "computer.file.uncommittedDraft": {
+    "zh-CN": "未提交文件草稿",
+    en: "Uncommitted file draft",
+    "zh-TW": "未提交檔案草稿",
+  },
+  "computer.file.replacementDraft": {
+    "zh-CN": "未提交替换片段草稿",
+    en: "Uncommitted replacement draft",
+    "zh-TW": "未提交替換片段草稿",
+  },
   "computer.search.empty": { "zh-CN": "还没有搜索结果。", en: "No search results yet.", "zh-TW": "還沒有搜尋結果。" },
   "computer.search.untitled": { "zh-CN": "未命名结果", en: "Untitled result", "zh-TW": "未命名結果" },
   "computer.present.loading": { "zh-CN": "正在加载呈现页", en: "Loading the page", "zh-TW": "正在載入呈現頁" },
@@ -60,6 +70,11 @@ export const previewMessages = defineMessages({
     "zh-TW": "正在等待終端輸出…",
   },
   "computer.pip.live": { "zh-CN": "工作中", en: "Working", "zh-TW": "工作中" },
+  "computer.pip.elapsed": {
+    "zh-CN": "已用时 {time}",
+    en: "Elapsed {time}",
+    "zh-TW": "已用時間 {time}",
+  },
   "preview.openTerminals": {
     "zh-CN": "展开终端预览（{count}）",
     en: { one: "Open terminal preview ({count})", other: "Open terminal previews ({count})" },

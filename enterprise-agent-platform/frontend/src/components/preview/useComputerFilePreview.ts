@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchPreviewFile } from "../../data/previewActions";
-import type { AgentPreviewScope, ComputerFileClue } from "../../types";
+import type {
+  AgentPreviewFileDraftKind,
+  AgentPreviewFileSource,
+  AgentPreviewScope,
+  ComputerFileClue,
+} from "../../types";
 
 const PENDING_RETRY_DELAY_MS = 320;
 const PENDING_RETRY_LIMIT = 8;
@@ -8,6 +13,9 @@ const PENDING_RETRY_LIMIT = 8;
 export interface ComputerFilePreviewState {
   content: string;
   previousContent: string | null;
+  source: AgentPreviewFileSource;
+  draftKind: AgentPreviewFileDraftKind | null;
+  revision: string;
   truncated: boolean;
   loading: boolean;
   pending: boolean;
@@ -19,6 +27,9 @@ export interface ComputerFilePreviewState {
 const EMPTY_STATE: ComputerFilePreviewState = {
   content: "",
   previousContent: null,
+  source: "workspace",
+  draftKind: null,
+  revision: "",
   truncated: false,
   loading: false,
   pending: false,
@@ -114,6 +125,9 @@ export function useComputerFilePreview(
               previousContent: changed
                 ? (current.value.loaded ? current.value.content : null)
                 : current.value.previousContent,
+              source: result.source,
+              draftKind: result.source === "draft" ? result.draft_kind : null,
+              revision: result.source === "draft" ? result.revision : "",
               truncated: result.truncated,
               loading: false,
               pending: false,
@@ -139,17 +153,29 @@ export function useComputerFilePreview(
           retryTimer = setTimeout(() => void request(attempt + 1), PENDING_RETRY_DELAY_MS);
           return;
         }
-        setStored((current) => current.pathKey === pathKey ? {
-          pathKey,
-          value: {
-            ...current.value,
-            loading: false,
-            pending: waitingForAtomicWrite,
-            error: waitingForAtomicWrite
-              ? ""
-              : error instanceof Error ? error.message : "",
-          },
-        } : current);
+        setStored((current) => {
+          if (current.pathKey !== pathKey) return current;
+          const discardTerminalDraft = !running && current.value.source === "draft";
+          return {
+            pathKey,
+            value: {
+              ...current.value,
+              ...(discardTerminalDraft ? {
+                content: "",
+                previousContent: null,
+                source: "workspace" as const,
+                draftKind: null,
+                revision: "",
+                loaded: false,
+              } : {}),
+              loading: false,
+              pending: waitingForAtomicWrite,
+              error: waitingForAtomicWrite
+                ? ""
+                : error instanceof Error ? error.message : "",
+            },
+          };
+        });
       }
     };
 

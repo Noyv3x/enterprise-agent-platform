@@ -781,12 +781,29 @@ class AgentRuntimeClientTests(unittest.TestCase):
             self.assertEqual(call["path"], "/v1/runs")
             self.assertEqual(call["body"]["metadata"]["idempotency_key"], "agent-job:42")
 
-    def test_progress_callback_only_receives_tool_and_approval_events(self):
+    def test_progress_callback_receives_file_drafts_without_retaining_their_content(self):
         self.runtime.events = [
             _event(1, "run.started", {"status": "running"}),
             _event(2, "message.delta", {"delta": "Done"}),
-            _event(3, "tool.arguments.delta", {"delta": '{"path":', "content_index": 0}),
-            _event(4, "tool.arguments.delta", {"delta": '"README.md"}', "content_index": 0}),
+            _event(3, "tool.arguments.delta", {"content_index": 0}),
+            _event(
+                4,
+                "tool.arguments.delta",
+                {
+                    "content_index": 0,
+                    "tool_name": "write_file",
+                    "tool_call_id": "draft-1",
+                    "file_draft": {
+                        "workspace_path": "README.md",
+                        "kind": "file",
+                        "content": "draft TOKEN=super-secret",
+                        "revision": 1,
+                        "complete": False,
+                        "truncated": False,
+                        "discarded": False,
+                    },
+                },
+            ),
             _event(5, "tool.started", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
             _event(6, "tool.updated", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
             _event(7, "tool.completed", {"tool_name": "read_file", "tool_call_id": "tool-1"}),
@@ -816,13 +833,37 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(result.content, "Done")
         self.assertEqual(
             [item["event"] for item in progress],
-            ["tool.started", "tool.updated", "tool.completed", "approval.request", "approval.responded"],
+            [
+                "tool.arguments.delta",
+                "tool.arguments.delta",
+                "tool.started",
+                "tool.updated",
+                "tool.completed",
+                "approval.request",
+                "approval.responded",
+            ],
         )
         self.assertEqual(
             [item["runtime_event_type"] for item in progress],
-            ["tool.started", "tool.updated", "tool.completed", "approval.requested", "approval.resolved"],
+            [
+                "tool.arguments.delta",
+                "tool.arguments.delta",
+                "tool.started",
+                "tool.updated",
+                "tool.completed",
+                "approval.requested",
+                "approval.resolved",
+            ],
         )
-        self.assertEqual([item.get("tool") for item in progress[:3]], ["read_file"] * 3)
+        self.assertEqual(progress[1]["file_draft"]["content"], "draft TOKEN=super-secret")
+        self.assertEqual([item.get("tool") for item in progress[2:5]], ["read_file"] * 3)
+        retained_draft = next(
+            event
+            for event in result.raw["events"]
+            if event.get("sequence") == 4
+        )["data"]["file_draft"]
+        self.assertNotIn("content", retained_draft)
+        self.assertEqual(retained_draft["revision"], 1)
 
     def test_approval_callback_maps_platform_choice_to_runtime_decision(self):
         self.runtime.events = [

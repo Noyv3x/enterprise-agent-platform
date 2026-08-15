@@ -1987,6 +1987,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 approval = status.get("approval") or {}
                 activity = status.get("activity") or []
                 last_activity = activity[-1] if activity else {}
+                computer = status.get("computer") or {}
+                computer_file = computer.get("file") or {}
                 jobs = status.get("jobs") or {}
                 token_tuple = (
                     latest,
@@ -1997,6 +1999,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     len(activity),
                     last_activity.get("stage"),
                     last_activity.get("line"),
+                    computer_file.get("revision"),
                     stream.get("content"),
                     len(status.get("stream_messages") or []),
                     approval.get("run_id"),

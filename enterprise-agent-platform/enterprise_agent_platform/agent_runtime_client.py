@@ -187,6 +187,7 @@ _PLATFORM_EVENT_NAMES = {
 }
 _PROGRESS_EVENT_TYPES = frozenset(
     {
+        "tool.arguments.delta",
         "tool.started",
         "tool.updated",
         "tool.completed",
@@ -879,7 +880,7 @@ class AgentRuntimeClient:
                 return False
 
             event_count += 1
-            raw_events.append(wire)
+            raw_events.append(_diagnostic_runtime_event(wire))
             del raw_events[:-50]
             event_type = str(wire.get("type") or wire.get("event") or frame_event or "").strip()
             event_data = wire.get("data")
@@ -1452,6 +1453,23 @@ def _http_error_message(response_body: str, fallback: str) -> str:
         if clean_body:
             return clean_body[:1000]
     return str(fallback or "request failed")
+
+
+def _diagnostic_runtime_event(wire: dict[str, Any]) -> dict[str, Any]:
+    """Copy one Runtime event without retaining ephemeral file draft text."""
+
+    diagnostic = dict(wire)
+    data = wire.get("data")
+    if not isinstance(data, dict):
+        return diagnostic
+    diagnostic_data = dict(data)
+    file_draft = data.get("file_draft")
+    if isinstance(file_draft, dict):
+        diagnostic_draft = dict(file_draft)
+        diagnostic_draft.pop("content", None)
+        diagnostic_data["file_draft"] = diagnostic_draft
+    diagnostic["data"] = diagnostic_data
+    return diagnostic
 
 
 def _callback_timestamp(value: Any) -> Any:

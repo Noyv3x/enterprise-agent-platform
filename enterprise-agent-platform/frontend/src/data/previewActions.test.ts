@@ -169,6 +169,7 @@ describe("computer file and present transport", () => {
       content: "hello",
       truncated: false,
       encoding: "utf-8",
+      source: "workspace",
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
     await expect(
@@ -178,11 +179,49 @@ describe("computer file and present transport", () => {
       content: "hello",
       truncated: false,
       encoding: "utf-8",
+      source: "workspace",
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/agent-previews/file?scope_type=private&scope_id=7&workspace_path=notes.md",
       expect.objectContaining({ credentials: "include", cache: "no-store" }),
     );
+  });
+
+  it("maps a revisioned uncommitted replacement draft", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      workspace_path: "src/value.ts",
+      content: "nextValue",
+      truncated: false,
+      encoding: "utf-8",
+      source: "draft",
+      draft_kind: "replacement",
+      revision: "draft:patch-1:2",
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    await expect(
+      fetchPreviewFile(scope, "src/value.ts", new AbortController().signal),
+    ).resolves.toEqual({
+      workspace_path: "src/value.ts",
+      content: "nextValue",
+      truncated: false,
+      encoding: "utf-8",
+      source: "draft",
+      draft_kind: "replacement",
+      revision: "draft:patch-1:2",
+    });
+  });
+
+  it("rejects a draft response without its kind and monotonic revision", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      workspace_path: "notes.md",
+      content: "partial",
+      truncated: false,
+      source: "draft",
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    await expect(
+      fetchPreviewFile(scope, "notes.md", new AbortController().signal),
+    ).rejects.toThrow();
   });
 
   it("builds the authenticated present URL without extra client paths", () => {

@@ -571,12 +571,28 @@ export interface AgentPreviewStatusResponse {
   present_available: boolean;
 }
 
-export interface AgentPreviewFileResponse {
+export type AgentPreviewFileSource = "draft" | "workspace";
+export type AgentPreviewFileDraftKind = "file" | "replacement";
+
+interface AgentPreviewFileResponseBase {
   workspace_path: string;
   content: string;
   truncated: boolean;
   encoding?: string;
 }
+
+export type AgentPreviewFileResponse = AgentPreviewFileResponseBase & (
+  | {
+      source: "workspace";
+      draft_kind?: never;
+      revision?: never;
+    }
+  | {
+      source: "draft";
+      draft_kind: AgentPreviewFileDraftKind;
+      revision: string;
+    }
+);
 
 export type TerminalProcessStatus = "running" | "completed" | "failed" | "cancelled" | "orphaned";
 

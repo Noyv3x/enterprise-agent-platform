@@ -26,6 +26,8 @@ Runtime 的锁定 Pi 元数据是可执行模型的唯一能力目录，OAuth �
 
 Codex 账号目录先按供应商 priority 排序；Grok 目录保留供应商响应及其 alias 的顺序。交集后的第一项是该账号当前的推荐默认候选，Runtime 静态目录不得覆盖该顺序。用户已经明确保存且仍在交集中的模型选择继续保留，模型新品发布、同 provider 重验和目录刷新都不能静默改写它；未显式选择的账号在每次执行时采用当前推荐候选，但不把候选反写成显式设置。切换 provider 且没有同时明确选择模型时清空旧 provider 的模型值。OAuth 管理卡必须把“推荐模型”和“可用模型数量”明确标注，不能把一个无说明的默认值表现成完整目录。
 
+Codex OAuth 的锁定 Responses 适配器可以消费模型函数调用的参数增量；Runtime 只把其中 `write_file.content` 和 `patch_file.new_text` 投影为当前 Run 的有界、脱敏、未提交文件草稿，工具执行和最终工作区写入仍保持原子边界。仅 Codex 的这两个工具在提供给模型的 schema 中要求显式 `target`；完整调用省略它时，Runtime 在校验、执行和会话历史写入前规范为 `sandbox`，显式 `host` 不得被改写，且不会产生草稿预览。Grok 及其它模型路径的 schema 和行为不变。该能力不增加 OAuth scope、token 交换、凭据存储、供应商目录或新的外部连接。
+
 ## SearXNG 搜索
 
 网页搜索直接请求受管 SearXNG JSON `/search`，不经过 Firecrawl。请求固定为 general 类别，可带语言和页码；平台在统一预算内读取若干页，过滤重复、格式错误、本地地址和含敏感参数的 URL，直到达到请求数量。

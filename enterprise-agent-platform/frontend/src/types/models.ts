@@ -251,6 +251,8 @@ export interface ComputerFileClue {
   path?: string;
   workspace_path?: string;
   target?: "sandbox" | "host" | string;
+  source?: "draft" | "workspace";
+  draft_kind?: "file" | "replacement";
   status?: string;
   tool_call_id?: string;
   sequence?: number;

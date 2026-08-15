@@ -99,6 +99,8 @@ Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 genera
 
 任何时刻最多一个可写 Platform 打开 SQLite。账号级集成凭据、有界登录失败窗口，以及消息 `metadata.agent_work` 中的工作记录详情都属于 SQLite 中的 Platform 状态，必须随同一个候选快照、提交和回滚边界切换；聊天文档预览是从附件原件即时派生的 JSON，不另存一份预览副本。电脑画面的文件正文与 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表，也不在观察路径上创建 workspace、启动 Sandbox/Camoufox 或改写文件。更新不能清空防爆破计数，也不能让旧、新 generation 同时修改连接凭据。已持久化的 session secret 随同一 SQLite 切换，候选切换或 Platform 容器重启不得改写该 secret，因此未到期且未被吊销的浏览器登录在 generation 切换后继续有效；登录 TTL 与活动续期见[安全设计](../design/security-and-trust.md)。容器 listen 继续只来自 Manager 生成的环境与入口参数，不能从 Platform SQLite 回写。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
 
+模型尚未完成文件工具参数时，面向电脑画面的未提交草稿只存在于当前 Run 的 Runtime→Platform 进程内瞬态链路；正文不写入 SQLite、消息、更新快照或 release 资产，相关进程重启、generation 切换或 Run 结束都会丢弃它。现有认证文件预览 HTTP 路径按精确 scope/path 读取正文，SSE 只公布有界 revision 元数据；该能力不新增服务、端口、持久目录、配置项或数据库迁移。最终工作区文件仍由 Sandbox 工具原子写入，并在完成后取代草稿成为权威预览。
+
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```

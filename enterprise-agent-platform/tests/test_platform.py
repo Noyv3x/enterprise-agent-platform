@@ -618,6 +618,33 @@ class ProgressAgent(RecordingAgent):
         )
 
 
+class FileDraftProgressAgent(RecordingAgent):
+    def generate(self, **kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "tool.arguments.delta",
+                    "tool_name": "write_file",
+                    "tool_call_id": "persistent-draft-check",
+                    "file_draft": {
+                        "workspace_path": "notes/private.txt",
+                        "kind": "file",
+                        "content": "ephemeral-file-draft-never-persist",
+                        "revision": 1,
+                        "complete": True,
+                        "truncated": False,
+                        "discarded": False,
+                    },
+                }
+            )
+        return AgentResult(
+            content="finished without persisting the draft",
+            session_id=kwargs["session_id"],
+            raw={"ok": True},
+        )
+
+
 class FakeTelegramBot:
     def __init__(self):
         self.sent = []
@@ -1750,6 +1777,35 @@ class PlatformServiceTests(unittest.TestCase):
 
 
 
+
+    def test_file_draft_is_absent_from_persisted_agent_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=FileDraftProgressAgent(),
+            )
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                service.send_private_message(actor, "prepare a private file")
+                service.wait_for_agent_idle("private", str(actor["id"]))
+                message = service.list_messages(
+                    actor,
+                    "private",
+                    str(actor["id"]),
+                )[-1]
+                stored = service.db.query(
+                    "SELECT metadata_json FROM messages WHERE id = ?",
+                    (int(message["id"]),),
+                )[0]["metadata_json"]
+                self.assertNotIn("ephemeral-file-draft-never-persist", stored)
+                self.assertNotIn("persistent-draft-check", stored)
+                self.assertNotIn("file_draft", stored)
+                self.assertNotIn(
+                    "computer",
+                    service.agent_status(actor, "private", str(actor["id"])),
+                )
+            finally:
+                service.close()
 
     def test_channel_uses_shared_agent_session_and_passive_kb_suggestions(self):
         with tempfile.TemporaryDirectory() as td:
@@ -8984,6 +9040,143 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIn("SSE Alice", next_update)
                 conn.close()
             finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_scope_events_stream_uses_file_draft_revision_without_leaking_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            task = {
+                "scope_type": "channel",
+                "scope_id": "1",
+                "user_message": {"id": 91, "content": "write it"},
+                "actor": {"id": 1, "username": "admin", "display_name": "Administrator"},
+                "content": "write it",
+            }
+            with service._conversation_lock:
+                service._agent_status["channel:1"] = service._status_for_task(
+                    task,
+                    "replying",
+                    queued_count=0,
+                )
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                token, _ = service.authenticate("admin", "admin")
+                connection.request(
+                    "GET",
+                    "/api/channels/1/events",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                buffer = b""
+
+                def next_update() -> tuple[dict[str, object], str]:
+                    nonlocal buffer
+                    deadline = time.time() + 5
+                    while time.time() < deadline:
+                        chunk = response.read(1)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                        while b"\n\n" in buffer:
+                            block, buffer = buffer.split(b"\n\n", 1)
+                            text = block.decode("utf-8")
+                            if not text.startswith("event: update"):
+                                continue
+                            data = next(
+                                line.removeprefix("data: ")
+                                for line in text.splitlines()
+                                if line.startswith("data: ")
+                            )
+                            return json.loads(data), text
+                    self.fail("timed out waiting for scope SSE update")
+
+                next_update()
+                base_event = {
+                    "event": "tool.arguments.delta",
+                    "tool_name": "write_file",
+                    "tool_call_id": "sse-draft",
+                }
+                with mock.patch(
+                    "enterprise_agent_platform.service.now_ts",
+                    return_value=1_700_000_000,
+                ):
+                    service._record_agent_progress(
+                        "channel",
+                        "1",
+                        {
+                            **base_event,
+                            "file_draft": {
+                                "workspace_path": "src/app.ts",
+                                "kind": "file",
+                                "content": "first secret draft",
+                                "revision": 1,
+                                "complete": False,
+                                "truncated": False,
+                                "discarded": False,
+                            },
+                        },
+                    )
+                first, first_text = next_update()
+                first_file = first["agent_status"]["computer"]["file"]
+                self.assertEqual(first_file["revision"], "draft:sse-draft:1")
+                self.assertNotIn("first secret draft", first_text)
+                self.assertNotIn("content", first_file)
+
+                with mock.patch(
+                    "enterprise_agent_platform.service.now_ts",
+                    return_value=1_700_000_000,
+                ):
+                    service._record_agent_progress(
+                        "channel",
+                        "1",
+                        {
+                            **base_event,
+                            "file_draft": {
+                                "workspace_path": "src/app.ts",
+                                "kind": "file",
+                                "content": "second secret draft",
+                                "revision": 2,
+                                "complete": True,
+                                "truncated": False,
+                                "discarded": False,
+                            },
+                        },
+                    )
+                second, second_text = next_update()
+                second_file = second["agent_status"]["computer"]["file"]
+                self.assertEqual(second_file["revision"], "draft:sse-draft:2")
+                self.assertEqual(second_file["status"], "pending")
+                self.assertNotIn("second secret draft", second_text)
+
+                with mock.patch(
+                    "enterprise_agent_platform.service.now_ts",
+                    return_value=1_700_000_000,
+                ):
+                    service._record_agent_progress(
+                        "channel",
+                        "1",
+                        {
+                            "event": "tool.failed",
+                            "tool_name": "write_file",
+                            "tool_call_id": "sse-draft",
+                            "execution_started": False,
+                        },
+                    )
+                terminal, terminal_text = next_update()
+                self.assertNotEqual(
+                    terminal["agent_status"].get("computer", {}).get("file", {}).get("revision"),
+                    "draft:sse-draft:2",
+                )
+                self.assertNotIn("second secret draft", terminal_text)
+            finally:
+                connection.close()
                 server.shutdown()
                 server.server_close()
                 service.close()

@@ -1,19 +1,26 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { ChatPreviewContext } from "./ChatPreviewContext";
-import { ComputerPip } from "./ComputerPip";
+import { ComputerPip, formatComputerElapsed } from "./ComputerPip";
 import type { ComputerSurface } from "./computer";
 
+const mocks = vi.hoisted(() => ({
+  browserPreviewHook: vi.fn(),
+}));
+
 vi.mock("./useBrowserPreview", () => ({
-  useBrowserPreview: () => ({
-    state: { frameUrl: "", tabId: "", error: "", title: "", url: "" },
-  }),
+  useBrowserPreview: (...args: unknown[]) => {
+    mocks.browserPreviewHook(...args);
+    return {
+      state: { frameUrl: "", tabId: "", error: "", title: "", url: "" },
+    };
+  },
 }));
 
 vi.mock("./useTerminalPreviews", () => ({
@@ -41,6 +48,8 @@ vi.mock("../../data/previewActions", async () => {
 const surface: ComputerSurface = {
   visible: true,
   live: true,
+  runId: "run-1",
+  startedAt: null,
   mode: "file",
   file: { workspace_path: "notes.md", path: "notes.md", target: "sandbox" },
   searchHits: [],
@@ -51,18 +60,91 @@ const surface: ComputerSurface = {
 describe("ComputerPip", () => {
   beforeEach(() => {
     localStorage.setItem(LOCALE_STORAGE_KEY, "en");
+    mocks.browserPreviewHook.mockClear();
     vi.mocked(fetchPreviewFile).mockReset();
     vi.mocked(fetchPreviewFile).mockResolvedValue({
       workspace_path: "notes.md",
       content: "const answer = 42;",
       truncated: false,
       encoding: "utf-8",
+      source: "workspace",
     });
   });
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     localStorage.clear();
+  });
+
+  it("formats elapsed time as MM:SS before one hour and HH:MM:SS afterwards", () => {
+    expect(formatComputerElapsed(5)).toBe("00:05");
+    expect(formatComputerElapsed(3_725)).toBe("01:02:05");
+  });
+
+  it("ticks from the authoritative run start, hides when non-live, and resets for a new run", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T12:00:05.000Z"));
+    const context = (computerSurface: ComputerSurface) => ({
+      scope: { scope_type: "private" as const, scope_id: "7" },
+      browserDrawerOpen: false,
+      computerDrawerOpen: false,
+      computerMode: "search" as const,
+      computerSurface,
+      openComputer: vi.fn(),
+      openBrowserAssist: vi.fn(),
+    });
+    const liveSurface: ComputerSurface = {
+      ...surface,
+      mode: "search",
+      file: null,
+      searchHits: [{ title: "Live result" }],
+      runId: "run-timed-1",
+      startedAt: Date.parse("2026-08-15T12:00:00.000Z") / 1_000,
+    };
+    const rendered = render(
+      <I18nProvider>
+        <ChatPreviewContext.Provider value={context(liveSurface)}>
+          <ComputerPip />
+        </ChatPreviewContext.Provider>
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("00:05")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Show the AI computer" }))
+      .toHaveAccessibleDescription("Search · Working · Elapsed 00:05");
+    expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.getByText("00:06")).toBeVisible();
+    expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
+
+    rendered.rerender(
+      <I18nProvider>
+        <ChatPreviewContext.Provider value={context({ ...liveSurface, live: false })}>
+          <ComputerPip />
+        </ChatPreviewContext.Provider>
+      </I18nProvider>,
+    );
+    expect(screen.queryByText("00:06")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show the AI computer" }))
+      .toHaveAccessibleDescription("Search · Read only");
+
+    const nextStartedAt = Date.now() / 1_000;
+    rendered.rerender(
+      <I18nProvider>
+        <ChatPreviewContext.Provider value={context({
+          ...liveSurface,
+          runId: "run-timed-2",
+          startedAt: nextStartedAt,
+        })}>
+          <ComputerPip />
+        </ChatPreviewContext.Provider>
+      </I18nProvider>,
+    );
+    expect(screen.getByText("00:00")).toBeVisible();
   });
 
   it("stays hidden when the computer surface is idle", () => {
@@ -110,6 +192,7 @@ describe("ComputerPip", () => {
     expect(screen.getByText("AI computer")).toBeVisible();
     await userEvent.click(button);
     expect(openComputer).toHaveBeenCalledTimes(1);
+    expect(openComputer).toHaveBeenCalledWith(undefined, button);
     expect(openBrowserAssist).not.toHaveBeenCalled();
   });
 

@@ -73,15 +73,26 @@ export function FileComputerView({ scope, file, compact = false }: FileComputerV
   const { state, refresh, hostTarget, workspacePath, running } = useComputerFilePreview(scope, file);
 
   const path = file?.path || workspacePath;
+  const draftLabel = state.source === "draft"
+    ? t(state.draftKind === "replacement"
+      ? "computer.file.replacementDraft"
+      : "computer.file.uncommittedDraft")
+    : "";
   return (
     <section
       className={cx("computer-file", compact && "computer-file--compact")}
       aria-busy={state.loading || state.pending}
+      data-source={state.loaded ? state.source : undefined}
+      data-draft-kind={state.source === "draft" ? state.draftKind || undefined : undefined}
+      data-revision={state.revision || undefined}
     >
       {path ? (
         <header className="computer-file__meta">
           {!compact ? <span>{t("computer.file.path")}</span> : null}
-          <strong>{path}</strong>
+          <span className="computer-file__identity">
+            <strong>{path}</strong>
+            {draftLabel ? <span className="computer-file__draft-label">{draftLabel}</span> : null}
+          </span>
         </header>
       ) : null}
       {hostTarget ? (

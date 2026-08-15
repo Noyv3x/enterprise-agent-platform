@@ -8,8 +8,8 @@ export interface ChatPreviewContextValue {
   computerDrawerOpen: boolean;
   computerMode: ComputerMode | null;
   computerSurface: ComputerSurface | null;
-  openComputer: (mode?: ComputerMode) => void;
-  openBrowserAssist: () => void;
+  openComputer: (mode?: ComputerMode, opener?: HTMLElement | null) => void;
+  openBrowserAssist: (opener?: HTMLElement | null) => void;
 }
 
 export const ChatPreviewContext = createContext<ChatPreviewContextValue | null>(null);

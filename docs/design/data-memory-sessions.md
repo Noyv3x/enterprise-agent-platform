@@ -24,7 +24,7 @@ Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base UR
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
 
-浏览器预览帧缓存、人工接管租约与输入 sequence 都是 Platform/Camoufox 进程内的短期协调状态，不写入 SQLite、Runtime session、workspace、消息或备份。电脑画面的文件正文、搜索命中投影和 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表、不进入备份清单，也不把 write/patch 正文写入 `agent_work`。文件正文走 `GET /api/agent-previews/file`，HTML 呈现页走 `GET /api/agent-previews/present`；二者与既有 `/api/agent-previews/status|browser|terminals` 一样只观察当前 scope，不得创建 workspace、启动 Sandbox/Camoufox 或改写文件。Platform 重启使租约失效，并丢弃未持久化的电脑投影；呈现页在重启后只能从当前工作区仍存在的 HTML 文件或已成功交付的 HTML 附件重建。完整拖拽在单次 Camoufox tab lock 内以 `finally` 抬键，因此不需要通过持久数据恢复半个指针手势。
+浏览器预览帧缓存、人工接管租约与输入 sequence 都是 Platform/Camoufox 进程内的短期协调状态，不写入 SQLite、Runtime session、workspace、消息或备份。电脑画面的文件正文、搜索命中投影和 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表、不进入备份清单，也不把 write/patch 正文写入 `agent_work`。Codex OAuth 参数流产生的文件草稿只允许存在于 Runtime 有界事件 journal、Python 当前 SSE 消费闭包与 Platform 当前 Run 内存状态；Python 返回结果中的诊断事件副本必须删除草稿正文，Platform 对外 `agent_status` / 聊天 SSE 只投影路径、草稿类型和单调 revision。文件正文与当前草稿都走 `GET /api/agent-previews/file`，响应以 `source=workspace|draft` 区分正式文件和未提交草稿；HTML 呈现页走 `GET /api/agent-previews/present`。这些端点与既有 `/api/agent-previews/status|browser|terminals` 一样只观察当前 scope，不得创建 workspace、启动 Sandbox/Camoufox 或改写文件。工具失败/完成、Run 替换、scope lifecycle 变化或 Platform 重启都丢弃草稿；成功完成后只能从正式工作区重建。呈现页在重启后只能从当前工作区仍存在的 HTML 文件或已成功交付的 HTML 附件重建。完整拖拽在单次 Camoufox tab lock 内以 `finally` 抬键，因此不需要通过持久数据恢复半个指针手势。
 
 ## Agent scope
 

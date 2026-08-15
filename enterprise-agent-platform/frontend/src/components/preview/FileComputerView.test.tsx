@@ -46,6 +46,7 @@ describe("FileComputerView", () => {
         content: "# Created\n\nFinal contents",
         truncated: false,
         encoding: "utf-8",
+        source: "workspace",
       });
 
     const started: ComputerFileClue = {
@@ -114,12 +115,14 @@ describe("FileComputerView", () => {
         content: "const value = 1;",
         truncated: false,
         encoding: "utf-8",
+        source: "workspace",
       })
       .mockResolvedValueOnce({
         workspace_path: "src/value.ts",
         content: "const value = 2;",
         truncated: false,
         encoding: "utf-8",
+        source: "workspace",
       });
 
     const initial: ComputerFileClue = {
@@ -148,6 +151,146 @@ describe("FileComputerView", () => {
     expect(fetchPreviewFile).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps successive file drafts labeled as uncommitted before settling on the workspace", async () => {
+    vi.mocked(fetchPreviewFile)
+      .mockResolvedValueOnce({
+        workspace_path: "src/draft.ts",
+        content: "export const value = 1;",
+        truncated: false,
+        encoding: "utf-8",
+        source: "draft",
+        draft_kind: "file",
+        revision: "draft:write-draft:1",
+      })
+      .mockResolvedValueOnce({
+        workspace_path: "src/draft.ts",
+        content: "export const value = 12;",
+        truncated: false,
+        encoding: "utf-8",
+        source: "draft",
+        draft_kind: "file",
+        revision: "draft:write-draft:2",
+      })
+      .mockResolvedValueOnce({
+        workspace_path: "src/draft.ts",
+        content: "export const value = 12;",
+        truncated: false,
+        encoding: "utf-8",
+        source: "workspace",
+      });
+
+    const running: ComputerFileClue = {
+      tool: "write_file",
+      path: "src/draft.ts",
+      workspace_path: "src/draft.ts",
+      target: "sandbox",
+      status: "running",
+      tool_call_id: "write-draft",
+      revision: "draft:write-draft:1",
+    };
+    const rendered = render(view(running));
+
+    expect(await screen.findByText("Uncommitted file draft")).toBeVisible();
+    expect(screen.getByText("export const value = 1;")).toBeVisible();
+    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-source", "draft");
+
+    rendered.rerender(view({ ...running, revision: "draft:write-draft:2" }));
+    expect(await screen.findByText("export const value = 12;")).toBeVisible();
+    expect(screen.getByText("Uncommitted file draft")).toBeVisible();
+    expect(fetchPreviewFile).toHaveBeenCalledTimes(2);
+
+    rendered.rerender(view({
+      ...running,
+      status: "completed",
+      updated_sequence: 3,
+      revision: "write-draft:3:completed",
+    }));
+    await waitFor(() => {
+      expect(fetchPreviewFile).toHaveBeenCalledTimes(3);
+      expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
+      expect(rendered.container.querySelector(".computer-file"))
+        .toHaveAttribute("data-source", "workspace");
+    });
+  });
+
+  it("identifies a patch draft as an uncommitted replacement fragment", async () => {
+    vi.mocked(fetchPreviewFile).mockResolvedValueOnce({
+      workspace_path: "src/value.ts",
+      content: "const value = nextValue;",
+      truncated: false,
+      encoding: "utf-8",
+      source: "draft",
+      draft_kind: "replacement",
+      revision: "draft:patch-draft:4",
+    });
+
+    const rendered = render(view({
+      tool: "patch_file",
+      path: "src/value.ts",
+      workspace_path: "src/value.ts",
+      target: "sandbox",
+      status: "running",
+      tool_call_id: "patch-draft",
+      revision: "draft:patch-draft:4",
+    }));
+
+    expect(await screen.findByText("Uncommitted replacement draft")).toBeVisible();
+    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-draft-kind", "replacement");
+  });
+
+  it("does not let a late draft overwrite the completed workspace revision", async () => {
+    let resolveOld: ((value: Awaited<ReturnType<typeof fetchPreviewFile>>) => void) | undefined;
+    vi.mocked(fetchPreviewFile)
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveOld = resolve;
+      }))
+      .mockResolvedValueOnce({
+        workspace_path: "src/race.ts",
+        content: "committed workspace",
+        truncated: false,
+        encoding: "utf-8",
+        source: "workspace",
+      });
+
+    const first: ComputerFileClue = {
+      tool: "write_file",
+      path: "src/race.ts",
+      workspace_path: "src/race.ts",
+      target: "sandbox",
+      status: "running",
+      tool_call_id: "race",
+      revision: "draft:race:1",
+    };
+    const rendered = render(view(first));
+    await waitFor(() => expect(fetchPreviewFile).toHaveBeenCalledTimes(1));
+    rendered.rerender(view({
+      ...first,
+      status: "completed",
+      updated_sequence: 2,
+      revision: "race:2:completed",
+    }));
+
+    expect(await screen.findByText("committed workspace")).toBeVisible();
+    expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
+    await act(async () => {
+      resolveOld?.({
+        workspace_path: "src/race.ts",
+        content: "older draft",
+        truncated: false,
+        encoding: "utf-8",
+        source: "draft",
+        draft_kind: "file",
+        revision: "draft:race:1",
+      });
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("committed workspace")).toBeVisible();
+    expect(screen.queryByText("older draft")).not.toBeInTheDocument();
+    expect(rendered.container.querySelector(".computer-file"))
+      .toHaveAttribute("data-source", "workspace");
+  });
+
   it("renders a large snapshot as one complete text node without thousands of animated spans", async () => {
     const largeContent = Array.from({ length: 241 }, (_value, index) => `line ${index}`).join("\n");
     vi.mocked(fetchPreviewFile).mockResolvedValueOnce({
@@ -155,6 +298,7 @@ describe("FileComputerView", () => {
       content: largeContent,
       truncated: false,
       encoding: "utf-8",
+      source: "workspace",
     });
 
     const rendered = render(view({

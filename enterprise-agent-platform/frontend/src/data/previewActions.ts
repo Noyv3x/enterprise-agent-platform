@@ -247,16 +247,33 @@ export async function fetchPreviewFile(
   );
   if (!response.ok) throw await previewError(response);
   assertBoundedResponse(response, MAX_FILE_PREVIEW_BYTES, t("computer.file.failed"));
-  const body = (await response.json()) as Partial<AgentPreviewFileResponse>;
+  const body = (await response.json()) as Partial<AgentPreviewFileResponse> & Record<string, unknown>;
   if (typeof body.workspace_path !== "string" || typeof body.content !== "string") {
     throw new Error(t("computer.file.failed"));
   }
-  return {
+  const common = {
     workspace_path: body.workspace_path,
     content: body.content,
     truncated: body.truncated === true,
     encoding: typeof body.encoding === "string" ? body.encoding : "utf-8",
   };
+  if (body.source === "workspace") {
+    return { ...common, source: "workspace" };
+  }
+  if (
+    body.source === "draft"
+    && (body.draft_kind === "file" || body.draft_kind === "replacement")
+    && typeof body.revision === "string"
+    && body.revision.length > 0
+  ) {
+    return {
+      ...common,
+      source: "draft",
+      draft_kind: body.draft_kind,
+      revision: body.revision,
+    };
+  }
+  throw new Error(t("computer.file.failed"));
 }
 
 export function presentPreviewUrl(scope: AgentPreviewScope): string {

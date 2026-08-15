@@ -70,6 +70,7 @@ export function ChatPreviewSidebar({
   const computerButton = useRef<HTMLButtonElement>(null);
   const closeButton = useRef<HTMLButtonElement>(null);
   const previousOpen = useRef<SidePanelKind | null>(null);
+  const previewOpener = useRef<HTMLElement | null>(null);
   const browserControlSequence = useRef(0);
   const fullWidthPreview = useMediaQuery("(max-width: 520px)");
   const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
@@ -134,13 +135,8 @@ export function ChatPreviewSidebar({
     const wasOpen = previousOpen.current;
     previousOpen.current = openPreview;
     if (!wasOpen || openPreview) return;
-    const trigger = wasOpen === "memory"
-      ? memoryButton.current
-      : wasOpen === "skills"
-        ? skillsButton.current
-      : wasOpen === "tasks"
-        ? tasksButton.current
-        : computerButton.current;
+    const trigger = previewOpener.current;
+    previewOpener.current = null;
     requestAnimationFrame(() => {
       if (trigger?.isConnected) trigger.focus();
       else document.querySelector<HTMLElement>(".composer textarea")?.focus();
@@ -160,7 +156,8 @@ export function ChatPreviewSidebar({
     setBrowserIntentScopeKey("");
   }, []);
 
-  const openComputer = useCallback((mode?: ComputerMode) => {
+  const openComputer = useCallback((mode?: ComputerMode, opener?: HTMLElement | null) => {
+    previewOpener.current = opener || null;
     setOpenPreview("computer");
     if (mode !== "browser") {
       setBrowserIntentPending(false);
@@ -170,7 +167,8 @@ export function ChatPreviewSidebar({
     void mode;
   }, []);
 
-  const openBrowserAssist = useCallback(() => {
+  const openBrowserAssist = useCallback((opener?: HTMLElement | null) => {
+    previewOpener.current = opener || null;
     const requestId = ++browserControlSequence.current;
     setBrowserIntentPending(true);
     setBrowserIntentScopeKey(scopeKey);
@@ -178,7 +176,8 @@ export function ChatPreviewSidebar({
     setBrowserControlRequestId(requestId);
   }, [scopeKey]);
 
-  const togglePreview = useCallback((kind: SidePanelKind) => {
+  const togglePreview = useCallback((kind: SidePanelKind, opener: HTMLElement) => {
+    previewOpener.current = opener;
     setOpenPreview((current) => current === kind ? null : kind);
     setBrowserIntentPending(false);
     setBrowserControlRequestId(0);
@@ -335,7 +334,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "memory"}
                 icon={<Icon name="library" size={19} />}
-                onClick={() => togglePreview("memory")}
+                onClick={(event) => togglePreview("memory", event.currentTarget)}
               />
             </Tooltip>
           ) : null}
@@ -350,7 +349,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "skills"}
                 icon={<Icon name="sparkles" size={19} />}
-                onClick={() => togglePreview("skills")}
+                onClick={(event) => togglePreview("skills", event.currentTarget)}
               />
             </Tooltip>
           ) : null}
@@ -365,7 +364,7 @@ export function ChatPreviewSidebar({
                 aria-controls="chat-side-panel"
                 aria-expanded={visiblePreview === "tasks"}
                 icon={<Icon name="calendar" size={19} />}
-                onClick={() => togglePreview("tasks")}
+                onClick={(event) => togglePreview("tasks", event.currentTarget)}
               />
             </Tooltip>
           ) : null}
@@ -384,7 +383,7 @@ export function ChatPreviewSidebar({
                     <Icon name="computer" size={19} />
                   </Badge>
                 )}
-                onClick={() => togglePreview("computer")}
+                onClick={(event) => togglePreview("computer", event.currentTarget)}
               />
             </Tooltip>
           ) : null}
@@ -416,7 +415,10 @@ export function ChatPreviewSidebar({
               />
             </Tooltip>
           </header>
-          <div className="chat-preview__body">{drawer}</div>
+          <div className={cx(
+            "chat-preview__body",
+            visiblePreview === "computer" && "chat-preview__body--computer",
+          )}>{drawer}</div>
         </aside>
       ) : null}
     </div>
