@@ -8,11 +8,31 @@ function scopeTypeFor(mode: ChatMode): "private" | "channel" {
   return mode === "private" ? "private" : "channel";
 }
 
-function flattenActivity(activity: AgentStatus["activity"]): string[] {
-  return (activity || []).map(
-    (item) =>
-      `${item.source || ""}:${item.stage}:${item.label}:${item.detail}:${item.line || ""}:${item.tool || ""}:${item.tool_call_id || ""}:${item.tool_status || ""}:${item.approval_id || ""}:${item.approval_choice || ""}:${item.emoji || ""}:${item.at}:${item.completed_at || ""}:${item.sequence || ""}:${item.updated_sequence || ""}:${item.detail_truncated_chars || ""}:${item.omitted_events || ""}:${item.omitted_tool_events || ""}`,
-  );
+function flattenActivity(activity: AgentStatus["activity"]): unknown[] {
+  return (activity || []).map((item) => ({
+    source: item.source || "",
+    stage: item.stage || "",
+    label: item.label || "",
+    detail: item.detail || "",
+    line: item.line || "",
+    tool: item.tool || "",
+    tool_call_id: item.tool_call_id || "",
+    tool_status: item.tool_status || "",
+    approval_id: item.approval_id || "",
+    approval_choice: item.approval_choice || "",
+    approval_responder: item.approval_responder || "",
+    emoji: item.emoji || "",
+    at: item.at || "",
+    completed_at: item.completed_at || "",
+    sequence: item.sequence || "",
+    updated_sequence: item.updated_sequence || "",
+    detail_truncated_chars: item.detail_truncated_chars || "",
+    parameters: item.parameters || null,
+    result: item.result || "",
+    result_truncated_chars: item.result_truncated_chars || "",
+    omitted_events: item.omitted_events || "",
+    omitted_tool_events: item.omitted_tool_events || "",
+  }));
 }
 
 export function messageFingerprint(message: Message): unknown {
@@ -68,6 +88,7 @@ export function messageFingerprint(message: Message): unknown {
           scope_type: work.scope_type || "",
           scope_id: work.scope_id == null ? "" : String(work.scope_id),
           activity: flattenActivity(work.activity),
+          computer: work.computer || null,
         }
       : null,
   };
@@ -91,6 +112,7 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
     scope_id: status.scope_id == null ? "" : String(status.scope_id),
     current_step: status.current_step || "",
     activity: flattenActivity(status.activity),
+    computer: status.computer || null,
     stream_message: status.stream_message
       ? {
           id: status.stream_message.id,

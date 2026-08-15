@@ -85,6 +85,30 @@ describe("messageFingerprintKey", () => {
     });
     expect(after).not.toBe(before);
   });
+
+  it("observes tool evidence added without changing the lifecycle summary", () => {
+    const work = {
+      state: "complete" as const,
+      activity: [{
+        stage: "tool",
+        tool: "terminal",
+        tool_call_id: "terminal-1",
+        tool_status: "completed",
+        parameters: { command: "npm test" },
+      }],
+    };
+    const before = messageFingerprintKey({ ...base, metadata: { agent_work: work } });
+    const after = messageFingerprintKey({
+      ...base,
+      metadata: {
+        agent_work: {
+          ...work,
+          activity: [{ ...work.activity[0], result: "42 passed" }],
+        },
+      },
+    });
+    expect(after).not.toBe(before);
+  });
 });
 
 describe("agentStatusFingerprint", () => {
@@ -128,6 +152,25 @@ describe("agentStatusFingerprint", () => {
         state: "accepted",
         message_count: 2,
         message_ids: [10, 11],
+      },
+    });
+    expect(after).not.toEqual(before);
+  });
+
+  it("observes computer projection updates", () => {
+    const status: AgentStatus = {
+      state: "working",
+      computer: {
+        mode: "file",
+        file: { tool: "write_file", workspace_path: "src/app.ts", status: "running" },
+      },
+    };
+    const before = agentStatusFingerprint(status);
+    const after = agentStatusFingerprint({
+      ...status,
+      computer: {
+        ...status.computer,
+        file: { ...status.computer?.file, status: "completed" },
       },
     });
     expect(after).not.toEqual(before);

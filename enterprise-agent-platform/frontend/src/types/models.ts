@@ -252,11 +252,22 @@ export interface ComputerFileClue {
   workspace_path?: string;
   target?: "sandbox" | "host" | string;
   status?: string;
+  tool_call_id?: string;
+  sequence?: number;
+  updated_sequence?: number;
+  /** Changes whenever the projected tool lifecycle advances, even for the same path. */
+  revision?: string;
 }
 
 export interface ComputerPresentClue {
   workspace_path?: string;
   attachment_id?: Id;
+  status?: string;
+  tool_call_id?: string;
+  sequence?: number;
+  updated_sequence?: number;
+  /** Forces a sandboxed page reload after a same-path rewrite completes. */
+  revision?: string;
 }
 
 export interface ComputerProjection {

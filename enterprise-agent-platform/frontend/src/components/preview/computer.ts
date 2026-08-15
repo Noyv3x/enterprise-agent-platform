@@ -30,6 +30,7 @@ export interface ComputerSurface {
   visible: boolean;
   live: boolean;
   mode: ComputerMode | null;
+  latestStep?: ActivityStep | null;
   file: ComputerFileClue | null;
   searchHits: ComputerSearchHit[];
   searchTool: string;
@@ -76,6 +77,14 @@ function stepSequence(step: ActivityStep): number {
   return Number.isFinite(value) ? value : 0;
 }
 
+function stepRevision(step: ActivityStep): string {
+  return [
+    String(step.tool_call_id || toolName(step) || "tool"),
+    String(stepSequence(step)),
+    String(step.tool_status || "running"),
+  ].join(":");
+}
+
 export function latestComputerStep(work: AgentWork | AgentStatus | null | undefined): ActivityStep | null {
   let latest: ActivityStep | null = null;
   let latestSequence = -1;
@@ -120,6 +129,31 @@ function fileClueFromStep(step: ActivityStep | null): ComputerFileClue | null {
     workspace_path: parameters.workspace_path != null ? String(parameters.workspace_path) : undefined,
     target: parameters.target != null ? String(parameters.target) : "sandbox",
     status: String(step.tool_status || "running"),
+    tool_call_id: step.tool_call_id,
+    sequence: step.sequence,
+    updated_sequence: step.updated_sequence,
+    revision: stepRevision(step),
+  };
+}
+
+function presentClueFromStep(step: ActivityStep | null): ComputerPresentClue | null {
+  if (!step || !COMPUTER_FILE_TOOLS.has(toolName(step))) return null;
+  const tool = toolName(step);
+  const parameters = step.parameters || {};
+  const workspacePath = String(parameters.workspace_path || "");
+  const target = String(parameters.target || "sandbox").toLowerCase();
+  if (
+    (tool !== "write_file" && tool !== "patch_file")
+    || target === "host"
+    || !isHtmlWorkspacePath(workspacePath)
+  ) return null;
+  return {
+    workspace_path: workspacePath,
+    status: String(step.tool_status || "running"),
+    tool_call_id: step.tool_call_id,
+    sequence: step.sequence,
+    updated_sequence: step.updated_sequence,
+    revision: stepRevision(step),
   };
 }
 
@@ -141,7 +175,11 @@ export function presentClueFromMessages(messages: Message[]): ComputerPresentClu
     for (let attachmentIndex = attachments.length - 1; attachmentIndex >= 0; attachmentIndex -= 1) {
       const attachment = attachments[attachmentIndex];
       if (isHtmlAttachment(attachment)) {
-        return { attachment_id: attachment.id };
+        return {
+          attachment_id: attachment.id,
+          status: "completed",
+          revision: `message:${String(message.id)}:attachment:${String(attachment.id)}`,
+        };
       }
     }
     const step = latestComputerStep(work);
@@ -152,7 +190,14 @@ export function presentClueFromMessages(messages: Message[]): ComputerPresentClu
       && String(step.parameters?.target || "sandbox") !== "host"
       && isHtmlWorkspacePath(workspacePath)
     ) {
-      return { workspace_path: workspacePath };
+      return {
+        workspace_path: workspacePath,
+        status: String(step.tool_status || "completed"),
+        tool_call_id: step.tool_call_id,
+        sequence: step.sequence,
+        updated_sequence: step.updated_sequence,
+        revision: stepRevision(step),
+      };
     }
   }
   return null;
@@ -182,10 +227,24 @@ export function deriveComputerSurface({
   const liveStep = latestComputerStep(status);
   const liveMode = projected?.mode || computerModeFromStep(liveStep);
   const liveWork = Boolean(live && (liveMode || projected));
-  const file = projected?.file || fileClueFromStep(liveStep);
+  const stepFile = fileClueFromStep(liveStep);
+  const file = projected?.file
+    ? { ...(stepFile || {}), ...projected.file }
+    : stepFile;
   const searchHits = projected?.search?.hits || [];
   const searchTool = projected?.search?.tool || "";
-  const present = presentFromProjection(projected) || presentClueFromMessages(messages);
+  const stepPresent = presentClueFromStep(liveStep);
+  const projectedPresent = presentFromProjection(projected);
+  const currentPresent = projectedPresent
+    ? { ...(stepPresent || {}), ...projectedPresent }
+    : stepPresent;
+  const historicalPresent = presentClueFromMessages(messages);
+  const availabilityUnconfirmed = availability.loading || Boolean(availability.error);
+  const present = currentPresent || (
+    availability.presentAvailable || availabilityUnconfirmed
+      ? historicalPresent
+      : null
+  );
   const presentReadable = availability.presentAvailable || Boolean(present);
   const hasClues = liveWork || Boolean(present);
 
@@ -198,6 +257,7 @@ export function deriveComputerSurface({
       visible: true,
       live: true,
       mode: mode || "file",
+      latestStep: liveStep,
       file,
       searchHits,
       searchTool,
@@ -228,6 +288,7 @@ export function deriveComputerSurface({
         visible: hasClues,
         live: false,
         mode: lastMode === "present" || lastMode === "file" ? "present" : lastMode,
+        latestStep: liveStep,
         file,
         searchHits,
         searchTool,
@@ -241,6 +302,7 @@ export function deriveComputerSurface({
     visible: true,
     live: false,
     mode,
+    latestStep: liveStep,
     file,
     searchHits,
     searchTool,

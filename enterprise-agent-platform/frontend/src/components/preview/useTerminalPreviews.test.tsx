@@ -45,7 +45,7 @@ describe("useTerminalPreviews", () => {
       { id: "term-1", output: "ready\n", status: "running", running: true },
     ]);
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
     expect(result.current.state.processes[0]?.output).toBe("ready\n");
     expect(result.current.state.revision).toBe("preview_epoch:4");
     expect(fetchPreviewsMock.mock.calls[1]?.[1]).toBe('"terminal-one"');

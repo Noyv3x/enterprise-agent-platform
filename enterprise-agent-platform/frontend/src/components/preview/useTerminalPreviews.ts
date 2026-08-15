@@ -3,7 +3,10 @@ import { fetchTerminalPreviews } from "../../data/previewActions";
 import type { AgentPreviewScope, TerminalPreviewProcess } from "../../types";
 import type { PreviewConnection } from "./useBrowserPreview";
 
-const POLL_INTERVAL_MS = 2_000;
+// Terminal previews are mounted only while their read-only surface is visible.
+// A one-second conditional poll keeps short commands and output tails legible
+// without introducing a PTY or a second streaming protocol.
+const POLL_INTERVAL_MS = 1_000;
 
 export interface TerminalPreviewsState {
   connection: PreviewConnection;

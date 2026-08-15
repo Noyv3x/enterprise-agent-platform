@@ -1,59 +1,86 @@
-import { useEffect, useState } from "react";
-import { fetchPreviewFile } from "../../data/previewActions";
+import { Button } from "antd";
+import type { CSSProperties } from "react";
 import { useI18n } from "../../i18n";
+import { cx } from "../../lib/cx";
 import type { AgentPreviewScope, ComputerFileClue } from "../../types";
 import { EmptyState } from "../common/EmptyState";
 import { InlineAlert } from "../common/InlineAlert";
 import { Skeleton } from "../common/Skeleton";
+import { useComputerFilePreview } from "./useComputerFilePreview";
 
 interface FileComputerViewProps {
   scope: AgentPreviewScope;
   file: ComputerFileClue | null;
+  compact?: boolean;
 }
 
-export function FileComputerView({ scope, file }: FileComputerViewProps) {
-  const { t } = useI18n();
-  const workspacePath = file?.workspace_path || "";
-  const hostTarget = String(file?.target || "sandbox").toLowerCase() === "host";
-  const [content, setContent] = useState("");
-  const [truncated, setTruncated] = useState(false);
-  const [loading, setLoading] = useState(!hostTarget && Boolean(workspacePath));
-  const [error, setError] = useState("");
+interface LineStyle extends CSSProperties {
+  "--computer-line-delay": string;
+}
 
-  useEffect(() => {
-    if (hostTarget || !workspacePath) {
-      setContent("");
-      setTruncated(false);
-      setLoading(false);
-      setError("");
-      return;
-    }
-    const controller = new AbortController();
-    setLoading(true);
-    setError("");
-    void fetchPreviewFile(scope, workspacePath, controller.signal)
-      .then((result) => {
-        if (controller.signal.aborted) return;
-        setContent(result.content);
-        setTruncated(result.truncated);
-        setLoading(false);
-      })
-      .catch((cause: unknown) => {
-        if (controller.signal.aborted || (cause instanceof DOMException && cause.name === "AbortError")) {
-          return;
-        }
-        setError(cause instanceof Error ? cause.message : t("computer.file.failed"));
-        setLoading(false);
-      });
-    return () => controller.abort();
-  }, [hostTarget, scope.scope_id, scope.scope_type, t, workspacePath]);
+const MAX_ANIMATED_FILE_LINES = 240;
+const MAX_ANIMATED_FILE_CHARS = 24_000;
+
+function FileSnapshot({
+  content,
+  previousContent,
+  snapshot,
+  running,
+  compact,
+}: {
+  content: string;
+  previousContent: string | null;
+  snapshot: number;
+  running: boolean;
+  compact: boolean;
+}) {
+  const normalizedContent = content.replace(/\r\n?/g, "\n");
+  const withinAnimatedSize = normalizedContent.length <= MAX_ANIMATED_FILE_CHARS;
+  const lines = withinAnimatedSize ? normalizedContent.split("\n") : [];
+  const animateLines = withinAnimatedSize && lines.length <= MAX_ANIMATED_FILE_LINES;
+  const previousLines = animateLines
+    ? previousContent?.replace(/\r\n?/g, "\n").split("\n") || []
+    : [];
+  return (
+    <pre
+      className={cx("computer-file__content", compact && "computer-file__content--compact")}
+      data-snapshot={snapshot}
+      data-render-mode={animateLines ? "lines" : "plain"}
+    >
+      <code className={animateLines ? undefined : "computer-file__plain"}>
+        {animateLines ? lines.map((line, index) => {
+          const changed = previousContent === null || previousLines[index] !== line;
+          const className = previousContent === null
+            ? "computer-file__line is-new"
+            : changed ? "computer-file__line is-changed" : "computer-file__line";
+          const style: LineStyle = {
+            "--computer-line-delay": `${Math.min(index, compact ? 10 : 28) * (compact ? 18 : 24)}ms`,
+          };
+          return (
+            <span className={className} key={`${snapshot}:${index}`} style={style}>
+              {line || "\u00a0"}
+            </span>
+          );
+        }) : content}
+        {running ? <span className="computer-file__caret" aria-hidden="true" /> : null}
+      </code>
+    </pre>
+  );
+}
+
+export function FileComputerView({ scope, file, compact = false }: FileComputerViewProps) {
+  const { t } = useI18n();
+  const { state, refresh, hostTarget, workspacePath, running } = useComputerFilePreview(scope, file);
 
   const path = file?.path || workspacePath;
   return (
-    <section className="computer-file">
+    <section
+      className={cx("computer-file", compact && "computer-file--compact")}
+      aria-busy={state.loading || state.pending}
+    >
       {path ? (
         <header className="computer-file__meta">
-          <span>{t("computer.file.path")}</span>
+          {!compact ? <span>{t("computer.file.path")}</span> : null}
           <strong>{path}</strong>
         </header>
       ) : null}
@@ -63,17 +90,33 @@ export function FileComputerView({ scope, file }: FileComputerViewProps) {
           title={t("computer.mode.file")}
           text={t("computer.file.host")}
         />
-      ) : loading ? (
-        <div className="computer-file__loading" role="status" aria-busy="true">
-          <Skeleton width="100%" height={180} label={t("computer.file.loading")} />
-        </div>
-      ) : error ? (
-        <InlineAlert variant="error">{error}</InlineAlert>
-      ) : content ? (
+      ) : state.loaded ? (
         <>
-          <pre className="computer-file__content">{content}</pre>
-          {truncated ? <p className="computer-file__truncated">{t("computer.file.truncated")}</p> : null}
+          <FileSnapshot
+            content={state.content}
+            previousContent={state.previousContent}
+            snapshot={state.snapshot}
+            running={running}
+            compact={compact}
+          />
+          {state.truncated && !compact ? (
+            <p className="computer-file__truncated">{t("computer.file.truncated")}</p>
+          ) : null}
         </>
+      ) : state.loading || state.pending ? (
+        <div className="computer-file__loading" role="status" aria-busy="true">
+          <Skeleton width="100%" height={compact ? "100%" : 180} label={t("computer.file.loading")} />
+        </div>
+      ) : state.error ? (
+        <InlineAlert
+          className="computer-file__error"
+          variant="error"
+          action={compact ? undefined : (
+            <Button size="small" type="link" onClick={refresh}>{t("computer.retry")}</Button>
+          )}
+        >
+          {state.error || t("computer.file.failed")}
+        </InlineAlert>
       ) : (
         <EmptyState icon="doc" title={t("computer.mode.file")} text={t("computer.file.empty")} />
       )}

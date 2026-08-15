@@ -27,8 +27,6 @@ export function ComputerScreen({
   browserControlRequestId,
 }: ComputerScreenProps) {
   const { t } = useI18n();
-  const pendingCommand = String(latestTerminalStep?.parameters?.command || latestTerminalStep?.detail || "");
-  const pendingCwd = String(latestTerminalStep?.parameters?.cwd || "");
 
   return (
     <div className="computer-screen">
@@ -46,7 +44,7 @@ export function ComputerScreen({
       ) : null}
       {surface.mode === "file" ? <FileComputerView scope={scope} file={surface.file} /> : null}
       {surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} /> : null}
-      {surface.mode === "present" ? <PresentComputerView scope={scope} /> : null}
+      {surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} /> : null}
       {surface.mode === "browser" ? (
         <BrowserPreviewView
           scope={scope}
@@ -55,23 +53,7 @@ export function ComputerScreen({
       ) : null}
       {surface.mode === "terminal" ? (
         <div className="computer-terminal">
-          {pendingCommand || pendingCwd ? (
-            <dl className="computer-terminal__pending">
-              {pendingCwd ? (
-                <>
-                  <dt>{t("terminalPreview.cwd")}</dt>
-                  <dd>{pendingCwd}</dd>
-                </>
-              ) : null}
-              {pendingCommand ? (
-                <>
-                  <dt>{t("terminalPreview.command")}</dt>
-                  <dd>{pendingCommand}</dd>
-                </>
-              ) : null}
-            </dl>
-          ) : null}
-          <TerminalPreviewView scope={scope} />
+          <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
         </div>
       ) : null}
     </div>

@@ -18,18 +18,26 @@ type ProcessKind = "tool" | "commentary" | "notice";
 
 interface ProcessLineEntry {
   key: string;
-  line: string;
   title: string;
   rawTool: string;
   preview: string;
   detail: string;
+  detailNotice: string;
   result: string;
+  resultNotice: string;
   parameters: Record<string, string | number | boolean>;
   startedAt?: number | string;
   completedAt?: number | string;
   state: ProcessState;
   kind: ProcessKind;
 }
+
+type ToolFamily = "file" | "terminal" | "search" | "browser" | "generic";
+
+const FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
+const TERMINAL_TOOLS = new Set(["terminal", "process"]);
+const SEARCH_TOOLS = new Set(["search_files", "web", "knowledge", "session", "session_search"]);
+const SESSION_IDENTITY_TOOLS = new Set(["session", "session_search"]);
 
 const PARAMETER_LABELS: Partial<Record<string, MessageKey>> = {
   command: "chat.work.param.command",
@@ -210,6 +218,141 @@ function parameterLabel(key: string, translate: Translator): string {
   return messageKey ? translate(messageKey) : key;
 }
 
+function toolFamily(rawTool: string): ToolFamily {
+  if (FILE_TOOLS.has(rawTool)) return "file";
+  if (TERMINAL_TOOLS.has(rawTool)) return "terminal";
+  if (SEARCH_TOOLS.has(rawTool)) return "search";
+  if (rawTool === "browser") return "browser";
+  return "generic";
+}
+
+function parameterText(entry: ProcessLineEntry, key: string): string {
+  const value = entry.parameters[key];
+  return value == null ? "" : String(value).trim();
+}
+
+function distinctValues(values: string[]): string[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    const normalized = value.replace(/\s+/g, " ").trim();
+    if (!normalized || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+function entryObjectValues(entry: ProcessLineEntry): string[] {
+  const family = toolFamily(entry.rawTool);
+  if (family === "file") {
+    return distinctValues([
+      parameterText(entry, "workspace_path"),
+      parameterText(entry, "path"),
+    ]);
+  }
+  if (entry.rawTool === "terminal") {
+    return distinctValues([parameterText(entry, "command")]);
+  }
+  if (entry.rawTool === "process") {
+    return distinctValues([
+      parameterText(entry, "action"),
+      parameterText(entry, "process_id"),
+    ]);
+  }
+  if (family === "search") {
+    return distinctValues([
+      parameterText(entry, "query"),
+      parameterText(entry, "path"),
+      parameterText(entry, "host"),
+      parameterText(entry, "id"),
+    ]);
+  }
+  if (family === "browser") {
+    return distinctValues([
+      parameterText(entry, "action"),
+      parameterText(entry, "host"),
+    ]);
+  }
+  return distinctValues([
+    parameterText(entry, "action"),
+    parameterText(entry, "id"),
+    parameterText(entry, "file_path"),
+    parameterText(entry, "path"),
+    parameterText(entry, "query"),
+    parameterText(entry, "host"),
+    parameterText(entry, "process_id"),
+  ]);
+}
+
+function identityOnlyAction(entry: ProcessLineEntry): string {
+  const action = parameterText(entry, "action");
+  if (!action) return "";
+  if (SESSION_IDENTITY_TOOLS.has(entry.rawTool)) return action;
+  const detail = entry.detail.replace(/\s+/g, " ").trim();
+  const normalizedAction = action.replace(/\s+/g, " ").trim();
+  const hasOtherContext = Object.entries(entry.parameters).some(([key, value]) => (
+    key !== "action"
+    && value !== ""
+    && !(key === "target" && value === "sandbox")
+  ));
+  return !hasOtherContext && detail === normalizedAction ? action : "";
+}
+
+function terminalCommand(entry: ProcessLineEntry): string {
+  if (entry.rawTool !== "terminal") return "";
+  return parameterText(entry, "command") || entry.detail.split("\n\n")[0]?.trim() || "";
+}
+
+function semanticDetail(entry: ProcessLineEntry): string {
+  const detail = entry.detail.trim();
+  if (!detail) return "";
+  const command = terminalCommand(entry);
+  if (command && (detail === command || detail.startsWith(`${command}\n\n`))) {
+    return detail.slice(command.length).trim();
+  }
+  const objects = entryObjectValues(entry);
+  if (toolFamily(entry.rawTool) === "file" && !objects.length) {
+    // Legacy file rows stored the path only in detail. The row preview already
+    // carries that object, so it must not create a duplicate, empty disclosure.
+    return "";
+  }
+  const normalized = detail.replace(/\s+/g, " ").trim();
+  const candidates = [
+    ...objects,
+    identityOnlyAction(entry),
+    objects.join(" · "),
+    objects.join(": "),
+  ].map((value) => value.replace(/\s+/g, " ").trim()).filter(Boolean);
+  return candidates.includes(normalized) ? "" : detail;
+}
+
+function entryPreview(rawTool: string, detail: string, parameters: ProcessLineEntry["parameters"]): string {
+  const partial: ProcessLineEntry = {
+    key: "",
+    title: "",
+    rawTool,
+    preview: "",
+    detail,
+    detailNotice: "",
+    result: "",
+    resultNotice: "",
+    parameters,
+    state: "running",
+    kind: "tool",
+  };
+  const family = toolFamily(rawTool);
+  if (family === "file") return entryObjectValues(partial)[0] || oneLinePreview(detail);
+  if (rawTool === "terminal") return oneLinePreview(terminalCommand(partial));
+  if (rawTool === "process") return oneLinePreview(entryObjectValues(partial).join(" · ") || detail);
+  if (
+    SESSION_IDENTITY_TOOLS.has(rawTool)
+    && detail.replace(/\s+/g, " ").trim() === identityOnlyAction(partial)
+  ) return "";
+  if (family === "search" || family === "browser") {
+    return oneLinePreview(entryObjectValues(partial).join(" · ") || detail);
+  }
+  return oneLinePreview(detail || entryObjectValues(partial).join(" · "));
+}
+
 function processEntry(step: ActivityStep, index: number, translate: Translator): ProcessLineEntry | null {
   const stage = stepStage(step);
   const rawDetail = String(step?.detail || "").trim();
@@ -219,11 +362,9 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
     ? translate("chat.activity.truncatedCharacters", { count: omittedCharacters })
     : "";
   const resultNotice = omittedResultCharacters
-    ? translate("chat.activity.truncatedCharacters", { count: omittedResultCharacters })
+    ? translate("chat.activity.truncatedResultCharacters", { count: omittedResultCharacters })
     : "";
-  const detail = [rawDetail, detailNotice].filter(Boolean).join("\n\n");
   const rawResult = String(step?.result || "").trim();
-  const result = [rawResult, resultNotice].filter(Boolean).join("\n\n");
   const state = agentStepState(step);
   const identity = mergeIdentity(step);
   const key = identity || `${stage || "step"}:${String(step?.at || index)}:${index}`;
@@ -234,12 +375,13 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
     const message = translate("chat.activity.truncatedEvents", { count: omittedEvents });
     return {
       key,
-      line: message,
       title: translate("chat.activity.truncatedTitle"),
       rawTool: "work.truncated",
       preview: message,
       detail: message,
+      detailNotice: "",
       result: "",
+      resultNotice: "",
       parameters: {},
       startedAt: step?.at,
       completedAt: step?.completed_at,
@@ -251,12 +393,13 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
   if (isCommentaryStep(step)) {
     return {
       key,
-      line: detail,
       title: translate("chat.activity.agentUpdate"),
       rawTool: "assistant.message",
-      preview: oneLinePreview(String(step?.line || detail)),
-      detail,
+      preview: oneLinePreview(String(step?.line || rawDetail)),
+      detail: rawDetail,
+      detailNotice,
       result: "",
+      resultNotice: "",
       parameters: {},
       startedAt: step?.at,
       completedAt: step?.completed_at,
@@ -266,14 +409,16 @@ function processEntry(step: ActivityStep, index: number, translate: Translator):
   }
   if (!isAgentToolStep(step)) return null;
   const rawTool = String(step?.tool || step?.label || translate("chat.activity.toolFallback")).trim();
+  const normalizedTool = rawTool.toLowerCase();
   return {
     key,
-    line: agentStepLine(step, translate),
     title: displayToolName(rawTool, translate),
-    rawTool: rawTool.toLowerCase(),
-    preview: oneLinePreview(detail),
-    detail,
-    result,
+    rawTool: normalizedTool,
+    preview: entryPreview(normalizedTool, rawDetail, parameters),
+    detail: rawDetail,
+    detailNotice,
+    result: rawResult,
+    resultNotice,
     parameters,
     startedAt: step?.at,
     completedAt: step?.completed_at,
@@ -330,91 +475,163 @@ function EntryState({ entry }: { entry: ProcessLineEntry }) {
 
 function EntrySummary({ entry, expandable }: { entry: ProcessLineEntry; expandable: boolean }) {
   const { t } = useI18n();
+  const filePreviewTitle = toolFamily(entry.rawTool) === "file" && entry.preview
+    ? entry.preview
+    : undefined;
   return (
     <div className="agent-work__item-summary">
       <EntryState entry={entry} />
       <span className="agent-work__tool">{entry.title}</span>
-      {entry.preview ? <span className="agent-work__preview">{entry.preview}</span> : null}
+      {entry.preview ? (
+        <span className="agent-work__preview" title={filePreviewTitle}>{entry.preview}</span>
+      ) : null}
       <span className="agent-work__item-label">{agentStepStateText(entry.state, t)}</span>
       {expandable ? <span className="agent-work__entry-chevron" aria-hidden="true" /> : null}
     </div>
   );
 }
 
+function detailParameterEntries(entry: ProcessLineEntry): Array<[string, string | number | boolean]> {
+  const family = toolFamily(entry.rawTool);
+  return Object.entries(entry.parameters).filter(([key, value]) => {
+    if (value === "") return false;
+    if (key === "action" && identityOnlyAction(entry)) return false;
+    if (family === "file" && (key === "path" || key === "workspace_path")) return false;
+    if (entry.rawTool === "terminal" && key === "command") return false;
+    if (key === "target" && value === "sandbox") return false;
+    return true;
+  });
+}
+
+function parameterSectionKey(entry: ProcessLineEntry): MessageKey {
+  const family = toolFamily(entry.rawTool);
+  if (family === "file") return "chat.work.detail.fileContext";
+  if (entry.rawTool === "terminal") return "chat.work.detail.executionContext";
+  if (entry.rawTool === "process") return "chat.work.detail.processContext";
+  if (family === "search") return "chat.work.detail.searchContext";
+  if (family === "browser") return "chat.work.detail.browserContext";
+  return "chat.work.detail.actionContext";
+}
+
+function resultSectionKey(entry: ProcessLineEntry): MessageKey {
+  if (entry.state === "failed") return "chat.work.detail.error";
+  const family = toolFamily(entry.rawTool);
+  if (family === "file") {
+    return entry.rawTool === "read_file"
+      ? "chat.work.detail.fileContent"
+      : "chat.work.detail.changeResult";
+  }
+  if (entry.rawTool === "process") return "chat.work.detail.processResult";
+  if (family === "terminal") return "chat.work.detail.terminalOutput";
+  if (family === "search") return "chat.work.detail.searchResults";
+  if (family === "browser") return "chat.work.detail.browserResult";
+  return "chat.work.detail.result";
+}
+
+function DetailParameters({ entry }: { entry: ProcessLineEntry }) {
+  const { t } = useI18n();
+  const parameters = detailParameterEntries(entry);
+  if (!parameters.length) return null;
+  return (
+    <div className="agent-work__section">
+      <h4>{t(parameterSectionKey(entry))}</h4>
+      <dl className="agent-work__params">
+        {parameters.map(([key, value]) => (
+          <div key={key}>
+            <dt>{parameterLabel(key, t)}</dt>
+            <dd><code>{formatParameterValue(value)}</code></dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function DetailResult({ entry }: { entry: ProcessLineEntry }) {
+  const { t } = useI18n();
+  if (!entry.result) return null;
+  return (
+    <div className="agent-work__section">
+      <h4>{t(resultSectionKey(entry))}</h4>
+      <pre
+        className={cx("agent-work__result", entry.state === "failed" && "agent-work__result--error")}
+        tabIndex={0}
+      ><code>{entry.result}</code></pre>
+    </div>
+  );
+}
+
+function DetailNotice({ children }: { children: string }) {
+  if (!children) return null;
+  return <div className="agent-work__omission" role="note">{children}</div>;
+}
+
 function EntryDetail({ entry }: { entry: ProcessLineEntry }) {
   const { locale, t } = useI18n();
   if (entry.kind === "commentary") {
-    return entry.detail
-      ? <div className="agent-work__commentary"><MessageBody content={entry.detail} /></div>
-      : null;
+    return entry.detail || entry.detailNotice ? (
+      <div className="agent-work__commentary">
+        {entry.detail ? <MessageBody content={entry.detail} /> : null}
+        <DetailNotice>{entry.detailNotice}</DetailNotice>
+      </div>
+    ) : null;
   }
-  if (entry.kind === "notice") {
-    return entry.detail ? <div className="agent-work__detail">{entry.detail}</div> : null;
-  }
+  if (entry.kind === "notice") return null;
 
-  const command = entry.rawTool === "terminal"
-    ? String(entry.parameters.command || entry.detail.split("\n\n")[0] || "").trim()
-    : "";
-  const summary = command && (entry.detail === command || entry.detail.startsWith(`${command}\n\n`))
-    ? entry.detail.slice(command.length).trim()
-    : command ? "" : entry.detail;
-  const extraParameters = Object.entries(entry.parameters).filter(([key]) => key !== "command");
+  const family = toolFamily(entry.rawTool);
+  const command = terminalCommand(entry);
+  const summary = semanticDetail(entry);
   const started = formatWorkInstant(entry.startedAt, locale);
   const completed = formatWorkInstant(entry.completedAt, locale);
   const timeLabel = started && completed && started !== completed
     ? `${started} – ${completed}`
     : started || completed;
+  const commandSection = command ? (
+    <div className="agent-work__section">
+      <h4>{t("chat.activity.commandPreview")}</h4>
+      <div className="agent-work__command">
+        <span className="agent-work__prompt" aria-hidden="true">$</span>
+        <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
+      </div>
+    </div>
+  ) : null;
+  const summarySection = summary ? (
+    <div className="agent-work__section">
+      <h4>{t(entry.state === "failed" && !entry.result
+        ? "chat.work.detail.error"
+        : "chat.work.detail.summary")}</h4>
+      <div className="agent-work__detail-text">{summary}</div>
+    </div>
+  ) : null;
 
   return (
-    <div className="agent-work__detail agent-work__detail--rich">
-      <dl className="agent-work__facts">
-        <div>
-          <dt>{t("chat.work.detail.tool")}</dt>
-          <dd>{entry.title}</dd>
-        </div>
-        <div>
-          <dt>{t("chat.work.detail.status")}</dt>
-          <dd>{agentStepStateText(entry.state, t)}</dd>
-        </div>
-        {timeLabel ? (
-          <div>
-            <dt>{t("chat.work.detail.time")}</dt>
-            <dd>{timeLabel}</dd>
-          </div>
-        ) : null}
-      </dl>
-      {command ? (
-        <div className="agent-work__section">
-          <h4>{t("chat.activity.commandPreview")}</h4>
-          <div className="agent-work__command">
-            <span className="agent-work__prompt" aria-hidden="true">$</span>
-            <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
-          </div>
-        </div>
-      ) : null}
-      {extraParameters.length ? (
-        <div className="agent-work__section">
-          <h4>{t("chat.work.detail.parameters")}</h4>
-          <dl className="agent-work__params">
-            {extraParameters.map(([key, value]) => (
-              <div key={key}>
-                <dt>{parameterLabel(key, t)}</dt>
-                <dd><code>{formatParameterValue(value)}</code></dd>
-              </div>
-            ))}
-          </dl>
-        </div>
-      ) : null}
-      {summary ? (
-        <div className="agent-work__section">
-          <h4>{t("chat.work.detail.summary")}</h4>
-          <div className="agent-work__detail-text">{summary}</div>
-        </div>
-      ) : null}
-      {entry.result ? (
-        <div className="agent-work__section">
-          <h4>{t("chat.work.detail.result")}</h4>
-          <pre className="agent-work__result" tabIndex={0}><code>{entry.result}</code></pre>
+    <div className="agent-work__detail agent-work__detail--rich" data-family={family}>
+      {family === "file" ? (
+        <>
+          <DetailResult entry={entry} />
+          <DetailParameters entry={entry} />
+          {summarySection}
+        </>
+      ) : entry.rawTool === "terminal" ? (
+        <>
+          {commandSection}
+          <DetailResult entry={entry} />
+          <DetailParameters entry={entry} />
+          {summarySection}
+        </>
+      ) : (
+        <>
+          <DetailParameters entry={entry} />
+          <DetailResult entry={entry} />
+          {summarySection}
+        </>
+      )}
+      <DetailNotice>{entry.detailNotice}</DetailNotice>
+      <DetailNotice>{entry.resultNotice}</DetailNotice>
+      {timeLabel ? (
+        <div className="agent-work__detail-meta">
+          <span>{t("chat.work.detail.time")}</span>
+          <span>{timeLabel}</span>
         </div>
       ) : null}
     </div>
@@ -439,37 +656,80 @@ function ActiveProcessList({ entries }: { entries: ProcessLineEntry[] }) {
 }
 
 function entryHasExpandedDetail(entry: ProcessLineEntry): boolean {
+  if (entry.kind === "notice") return false;
+  if (entry.kind === "commentary") return Boolean(entry.detail || entry.detailNotice);
   return Boolean(
-    entry.detail
-    || entry.result
-    || Object.keys(entry.parameters).length
-    || entry.startedAt
-    || entry.kind === "tool",
+    entry.result
+    || entry.resultNotice
+    || entry.detailNotice
+    || semanticDetail(entry)
+    || terminalCommand(entry)
+    || detailParameterEntries(entry).length,
   );
 }
 
 function CompletedProcessList({ entries }: { entries: ProcessLineEntry[] }) {
-  const items: CollapseProps["items"] = entries.map((entry) => ({
-    key: entry.key,
-    label: <EntrySummary entry={entry} expandable={entryHasExpandedDetail(entry)} />,
-    children: <EntryDetail entry={entry} />,
-    collapsible: entryHasExpandedDetail(entry) ? "header" : "disabled",
-    showArrow: false,
-    className: cx("agent-work__item", `agent-work__item--${entry.state}`),
-  }));
   return (
-    <Collapse
-      className="agent-work__log agent-work__entry-list"
-      bordered={false}
-      ghost
-      classNames={{
-        header: "agent-work__entry-header",
-        title: "agent-work__entry-title",
-        body: "agent-work__entry-body",
-      }}
-      items={items}
-    />
+    <div className="agent-work__log agent-work__entry-list" role="list">
+      {entries.map((entry) => {
+        const expandable = entryHasExpandedDetail(entry);
+        if (!expandable) {
+          return (
+            <div
+              className={cx("agent-work__item", `agent-work__item--${entry.state}`)}
+              data-tool={entry.rawTool}
+              key={entry.key}
+              role="listitem"
+            >
+              <EntrySummary entry={entry} expandable={false} />
+            </div>
+          );
+        }
+        const items: CollapseProps["items"] = [{
+          key: entry.key,
+          label: <EntrySummary entry={entry} expandable />,
+          children: <EntryDetail entry={entry} />,
+          showArrow: false,
+          className: cx("agent-work__item", `agent-work__item--${entry.state}`),
+        }];
+        return (
+          <div className="agent-work__entry-row" data-tool={entry.rawTool} key={entry.key} role="listitem">
+            <Collapse
+              className="agent-work__entry-disclosure"
+              bordered={false}
+              ghost
+              classNames={{
+                header: "agent-work__entry-header",
+                title: "agent-work__entry-title",
+                body: "agent-work__entry-body",
+              }}
+              items={items}
+            />
+          </div>
+        );
+      })}
+    </div>
   );
+}
+
+function completedWorkSummary(entries: ProcessLineEntry[], translate: Translator): string {
+  const tools = entries.filter((entry) => entry.kind === "tool");
+  const fileCount = tools.filter((entry) => toolFamily(entry.rawTool) === "file").length;
+  const terminalCount = tools.filter((entry) => toolFamily(entry.rawTool) === "terminal").length;
+  const searchCount = tools.filter((entry) => toolFamily(entry.rawTool) === "search").length;
+  const browserCount = tools.filter((entry) => toolFamily(entry.rawTool) === "browser").length;
+  const categorizedCount = fileCount + terminalCount + searchCount + browserCount;
+  const otherCount = Math.max(0, tools.length - categorizedCount);
+  const parts = [
+    fileCount ? translate("chat.work.summary.fileActions", { count: fileCount }) : "",
+    terminalCount ? translate("chat.work.summary.terminalActions", { count: terminalCount }) : "",
+    searchCount ? translate("chat.work.summary.searchActions", { count: searchCount }) : "",
+    browserCount ? translate("chat.work.summary.browserActions", { count: browserCount }) : "",
+    otherCount ? translate("chat.work.summary.otherActions", { count: otherCount }) : "",
+  ].filter(Boolean);
+  return parts.length
+    ? parts.join(" · ")
+    : translate("chat.work.records", { count: entries.length });
 }
 
 function WorkSummary({
@@ -496,7 +756,7 @@ function WorkSummary({
         tool: currentEntry.title,
         status: agentStepStateText(currentEntry.state, t),
       })
-    : active ? t("chat.status.processing") : t("chat.work.records", { count: entries.length });
+    : active ? t("chat.status.processing") : completedWorkSummary(entries, t);
   const queuedCount = Number(work?.queued_count || 0);
   const waiting = active
     ? (work?.state === "replying" ? queuedCount : Math.max(0, queuedCount - 1))
