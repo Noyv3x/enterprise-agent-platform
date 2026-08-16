@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -8,6 +8,51 @@ import type { RunRequest } from "../src/types.js";
 import { temporaryDirectory, testConfig } from "./helpers.js";
 
 const ACTIVE_TODO_REVIEW_ERROR = "Agent run stopped with unfinished Runtime todo items; review is required before resuming";
+
+test("a simple tool-backed task runs directly without creating or prompting a todo checklist", async () => {
+  const home = await temporaryDirectory("agent-todo-simple-run-");
+  const workspace = await temporaryDirectory("agent-todo-simple-workspace-");
+  await writeFile(`${workspace}/status.txt`, "ready\n", "utf8");
+  const faux = fauxProvider();
+  faux.setResponses([
+    (context) => {
+      assert.doesNotMatch(context.systemPrompt || "", /<task_execution_policy>/);
+      const todo = context.tools?.find((tool) => tool.name === "todo");
+      assert.ok(todo);
+      assert.match(todo.description, /at least three distinct, independently trackable steps/);
+      assert.match(todo.description, /simple one- or two-step work/);
+      return fauxAssistantMessage(fauxToolCall("read_file", {
+        path: "status.txt",
+      }), { stopReason: "toolUse" });
+    },
+    (context) => {
+      assert.doesNotMatch(context.systemPrompt || "", /<task_execution_policy>/);
+      assert.match(JSON.stringify(context.messages), /ready/);
+      return fauxAssistantMessage("The status is ready.");
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const request = baseRequest(workspace, "simple-tool-task");
+  try {
+    const completed = await coordinator.wait(coordinator.createRun({
+      ...request,
+      input: "Read status.txt and report its status.",
+    }).id);
+
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "The status is ready.");
+    assert.deepEqual(await coordinator.sessions.loadActiveTodos(identityFor(request)), []);
+    await assert.rejects(stat(coordinator.sessions.todoPath(identityFor(request))), { code: "ENOENT" });
+    const toolEvents = coordinator.getJournal(completed.id)?.list().filter(
+      (event) => event.type === "tool.started",
+    ) ?? [];
+    assert.deepEqual(toolEvents.map((event) => event.data.tool_name), ["read_file"]);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
 
 test("unfinished todos exhaust bounded continuations and force needs_review without inventing side effects", async () => {
   const home = await temporaryDirectory("agent-todo-run-guard-");

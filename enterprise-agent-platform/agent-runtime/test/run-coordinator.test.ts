@@ -2,12 +2,15 @@ import assert from "node:assert/strict";
 import { mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import {
+  fauxAssistantMessage,
+  fauxProvider,
+  fauxThinking,
+  fauxToolCall,
+} from "@earendil-works/pi-ai/providers/faux";
 import { productModelCatalogs } from "../src/model-resolver.js";
 import {
   adaptImageContentForModel,
-  appendSkillPolicy,
-  availableSkillIndex,
   contextUsageForCompletedTurn,
   durableRunResultMessages,
   prepareSessionHistoryForModel,
@@ -17,6 +20,7 @@ import {
   sanitizeToolResultForJournal,
   serializeCompactionHistory,
 } from "../src/run-coordinator.js";
+import { appendSkillPolicy, availableSkillIndex } from "../src/system-prompt/prompt-assembly.js";
 import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
@@ -325,7 +329,7 @@ test("available skill policy validates, escapes, and bounds metadata without inj
   assert.match(prompt, /Do not load skills for weak topical overlap/);
   assert.match(prompt, /Only the main instructions returned by skill\.load may guide the current task/);
   assert.match(prompt, /skill\.list can discover other skills/);
-  assert.match(appendSkillPolicy("base", undefined), /<available_skills>\n\[\]\n<\/available_skills>/);
+  assert.doesNotMatch(appendSkillPolicy("base", undefined), /<available_skills>\n\[/);
 });
 
 test("completed-turn context usage prefers provider measurements and reports capacity", () => {
@@ -508,7 +512,8 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.match(rootPrompt, /^Root prompt\./);
+    assert.ok(rootPrompt.indexOf("<execution_discipline>") < rootPrompt.indexOf("Root prompt."));
+    assert.ok(rootPrompt.indexOf("Root prompt.") < rootPrompt.indexOf("<available_skills>\n"));
     assert.match(rootPrompt, /<execution_discipline>/);
     assert.match(rootPrompt, /take the concrete action before claiming it has started or completed/);
     assert.match(rootPrompt, /collapsing unrelated work into an ad-hoc script/);
@@ -518,7 +523,8 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     assert.match(rootPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(rootPrompt, /unloaded secret instructions/);
     assert.ok(rootPrompt.indexOf("</memory_policy>") < rootPrompt.indexOf("<skill_policy>"));
-    assert.match(childPrompt, /^Root prompt\./);
+    assert.ok(childPrompt.indexOf("<execution_discipline>") < childPrompt.indexOf("Root prompt."));
+    assert.ok(childPrompt.indexOf("Root prompt.") < childPrompt.indexOf("<available_skills>\n"));
     assert.match(childPrompt, /<execution_discipline>/);
     assert.match(childPrompt, /Both memory targets are isolated to this Agent scope/);
     assert.match(childPrompt, /"id":"code-review"/);
@@ -1003,7 +1009,7 @@ test("process write cannot inject a hardline command into a background shell", a
   }
 });
 
-test("RunCoordinator retries promise-only final responses at most twice", async () => {
+test("RunCoordinator retries promise-only final responses at most once", async () => {
   const home = await temporaryDirectory("agent-execution-review-");
   const workspace = await temporaryDirectory("agent-execution-review-workspace-");
   const faux = fauxProvider();
@@ -1013,14 +1019,11 @@ test("RunCoordinator retries promise-only final responses at most twice", async 
       return fauxAssistantMessage("好的，我现在开始检查并修改。");
     },
     (context) => {
-      assert.match(JSON.stringify(context.messages), /Do not stop at a promise or progress statement/);
+      const serialized = JSON.stringify(context.messages);
+      assert.equal((serialized.match(/Do not stop at a promise or progress statement/g) ?? []).length, 1);
       return fauxAssistantMessage("I'm still working on it.");
     },
-    (context) => {
-      const serialized = JSON.stringify(context.messages);
-      assert.equal((serialized.match(/Do not stop at a promise or progress statement/g) ?? []).length, 2);
-      return fauxAssistantMessage("正在处理，请稍候。");
-    },
+    fauxAssistantMessage("This response must not be requested."),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
@@ -1035,9 +1038,9 @@ test("RunCoordinator retries promise-only final responses at most twice", async 
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.equal(completed.result?.content, "正在处理，请稍候。");
-    assert.equal(faux.state.callCount, 3);
-    assert.equal(faux.getPendingResponseCount(), 0);
+    assert.equal(completed.result?.content, "I'm still working on it.");
+    assert.equal(faux.state.callCount, 2);
+    assert.equal(faux.getPendingResponseCount(), 1);
     const durable = await coordinator.sessions.load({
       scope_key: "scope",
       lifecycle_id: "life",
@@ -1046,14 +1049,26 @@ test("RunCoordinator retries promise-only final responses at most twice", async 
     const durableText = JSON.stringify(durable);
     assert.doesNotMatch(durableText, /Do not stop at a promise or progress statement/);
     assert.doesNotMatch(durableText, /好的，我现在开始检查并修改/);
-    assert.doesNotMatch(durableText, /I'm still working on it/);
+    assert.match(durableText, /I'm still working on it/);
     assert.equal(
       durable.filter((message) => message.role === "assistant").length,
       1,
     );
+    const searchable = await coordinator.sessions.loadSearchable({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "execution-review",
+    });
+    const searchableText = JSON.stringify(searchable);
+    assert.doesNotMatch(searchableText, /Do not stop at a promise or progress statement/);
+    assert.doesNotMatch(searchableText, /好的，我现在开始检查并修改/);
     assert.doesNotMatch(
       JSON.stringify(completed.result?.messages),
       /Do not stop at a promise or progress statement/,
+    );
+    assert.doesNotMatch(
+      JSON.stringify(completed.result?.messages),
+      /好的，我现在开始检查并修改/,
     );
     assert.equal(
       coordinator.getJournal(run.id)?.list().filter(
@@ -1068,13 +1083,143 @@ test("RunCoordinator retries promise-only final responses at most twice", async 
   }
 });
 
+test("RunCoordinator makes one ephemeral recovery attempt after a thinking-only tool response", async () => {
+  const home = await temporaryDirectory("agent-empty-after-tool-");
+  const workspace = await temporaryDirectory("agent-empty-after-tool-workspace-");
+  await writeFile(`${workspace}/evidence.txt`, "verified evidence\n", "utf8");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("read_file", { path: "evidence.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    (context) => {
+      assert.match(JSON.stringify(context.messages), /verified evidence/);
+      return fauxAssistantMessage(
+        fauxThinking("I have the evidence but omitted the visible answer."),
+        { stopReason: "stop" },
+      );
+    },
+    (context) => {
+      const serialized = JSON.stringify(context.messages);
+      assert.equal((serialized.match(/last response contained no visible answer/g) ?? []).length, 1);
+      assert.match(serialized, /verified evidence/);
+      return fauxAssistantMessage("", { stopReason: "stop" });
+    },
+    fauxAssistantMessage("This response must not be requested."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "empty-after-tool",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "read the evidence and report it",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "");
+    assert.equal(faux.state.callCount, 3);
+    assert.equal(faux.getPendingResponseCount(), 1);
+
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.filter((event) => event.type === "tool.started").length, 1);
+    assert.equal(events.filter((event) => event.type === "tool.completed").length, 1);
+    assert.equal(events.filter((event) => event.type === "tool.failed").length, 0);
+    assert.deepEqual(
+      events.filter((event) => event.type === "message.final").map((event) => event.data.turn_index),
+      [1, 3],
+    );
+
+    const durable = await coordinator.sessions.load({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "empty-after-tool",
+    });
+    const searchable = await coordinator.sessions.loadSearchable({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "empty-after-tool",
+    });
+    for (const retained of [
+      JSON.stringify(durable),
+      JSON.stringify(searchable),
+      JSON.stringify(completed.result?.messages),
+    ]) {
+      assert.doesNotMatch(retained, /last response contained no visible answer/);
+      assert.doesNotMatch(retained, /I have the evidence but omitted the visible answer/);
+      assert.match(retained, /verified evidence/);
+    }
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator turns a tool-backed empty response into one visible recovered answer", async () => {
+  const home = await temporaryDirectory("agent-empty-after-tool-success-");
+  const workspace = await temporaryDirectory("agent-empty-after-tool-success-workspace-");
+  await writeFile(`${workspace}/evidence.txt`, "verified evidence\n", "utf8");
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("read_file", { path: "evidence.txt" }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("", { stopReason: "stop" }),
+    (context) => {
+      const serialized = JSON.stringify(context.messages);
+      assert.equal((serialized.match(/last response contained no visible answer/g) ?? []).length, 1);
+      assert.match(serialized, /verified evidence/);
+      return fauxAssistantMessage("The file contains verified evidence.");
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const run = coordinator.createRun({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "empty-after-tool-success",
+      workspace,
+      system_prompt: "You are an Agent.",
+      input: "read the evidence and report it",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const completed = await coordinator.wait(run.id);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.result?.content, "The file contains verified evidence.");
+    assert.equal(faux.state.callCount, 3);
+    assert.equal(faux.getPendingResponseCount(), 0);
+
+    const events = coordinator.getJournal(run.id)?.list() ?? [];
+    assert.equal(events.filter((event) => event.type === "tool.started").length, 1);
+    assert.equal(events.filter((event) => event.type === "tool.completed").length, 1);
+    const durable = await coordinator.sessions.load({
+      scope_key: "scope",
+      lifecycle_id: "life",
+      session_id: "empty-after-tool-success",
+    });
+    for (const retained of [JSON.stringify(durable), JSON.stringify(completed.result?.messages)]) {
+      assert.doesNotMatch(retained, /last response contained no visible answer/);
+      assert.match(retained, /The file contains verified evidence/);
+    }
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 test("execution-review messages remain ephemeral across context compaction", async () => {
   const home = await temporaryDirectory("agent-execution-review-compaction-");
   const workspace = await temporaryDirectory("agent-execution-review-compaction-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage("I will start checking now."),
-    fauxAssistantMessage("I'm working on it."),
     fauxAssistantMessage("No action was needed after inspection."),
   ]);
   const summaries = fauxProvider();
@@ -1108,6 +1253,7 @@ test("execution-review messages remain ephemeral across context compaction", asy
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "No action was needed after inspection.");
+    assert.equal(faux.state.callCount, 2);
     assert.ok(
       coordinator.getJournal(run.id)?.list().some(
         (event) => event.type === "context.compacted",
@@ -1121,7 +1267,6 @@ test("execution-review messages remain ephemeral across context compaction", asy
     const searchableText = JSON.stringify(searchable);
     assert.doesNotMatch(searchableText, /Do not stop at a promise or progress statement/);
     assert.doesNotMatch(searchableText, /I will start checking now/);
-    assert.doesNotMatch(searchableText, /I'm working on it/);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

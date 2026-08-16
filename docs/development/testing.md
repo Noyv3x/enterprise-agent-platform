@@ -86,6 +86,8 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
+提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明只改变回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀不变、空动态状态不生成占位块。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
+
 后台 task 的反刷屏回归必须证明：只要当前 session 仍有活动责任，`schedule.create` 就在 Platform 调用和审批前被机械拒绝；取得匹配 target 的权威进程终态并解除全部责任后恢复允许；显式 service 不登记责任且不被误拦。
 
 机械完成守卫的清理回归必须证明：由 todo、有限后台 task 或 recurring decision 触发的 `needs_review` 只保留责任 sidecar 精确登记且属于本 Run 的 task id，同 Run 的普通前台和未登记后台进程仍被清理；显式用户取消、idle timeout、普通异常和 sidecar 损坏不保留任何进程。Manager 重启恢复回归必须覆盖命令在停机窗口以 `0` 和非零退出、终态文件缺失/损坏/符号链接，以及仍运行/无法确认两类状态，证明只有真实 `0` 可恢复为 completed，真实非零保留 exit code，其余绝不伪成功。还必须覆盖启动意图已持久但 PID 证据尚未出现、host task 无法重接、确认后状态文件重新进入裁剪、同 owner 第 257 个 task 在启动前拒绝，以及委派 Run 在任何副作用、审批或 Manager 请求前拒绝后台进程。

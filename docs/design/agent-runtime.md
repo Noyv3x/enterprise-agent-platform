@@ -17,6 +17,16 @@ Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、知
 
 Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agent 显示名称作为闭合结构化数据写入系统提示。Runtime 和工具说明使用中性 `Agent` 术语，不固化源码维护方名称，也不把品牌文本解释为指令、权限或内部 identity。
 
+## 提示词组装与执行纪律
+
+Runtime 必须以单一、确定性的组装边界构造模型系统提示，顺序固定为“Runtime 稳定策略前缀 → Platform-authored system context → Runtime 动态状态”。稳定前缀只放置当前 Run 类型和工具能力真正需要的执行、记忆、Skill、追加输入或定时发生策略；对同一能力集合必须保持字节稳定，不混入时间、回忆结果、活动 sidecar 或技能索引。Platform 仍通过现有私有协议的单个 `system_prompt` 传入品牌、模式、工作区与用户/频道上下文；Platform 是这个系统上下文的可信作者，但其中嵌入的用户、频道、品牌和知识载荷仍保持各自闭合的不可信数据 framing。Runtime 不从其自然语言内容反向推断权限或执行身份。回忆记忆、活动 todo、有限后台责任和可用 Skill 索引等动态数据放在末层；其中的历史正文、todo 正文和 Skill 元数据继续使用闭合不可信数据 framing，Runtime-owned id、状态和后台责任则明确标识为权威状态。普通 Run 主组装路径不为空状态生成仅有形式的动态块。
+
+与单个工具选择相关的软策略应优先放在该工具的稳定 schema 说明中，不应为空状态在每个 Run 重复提高其显著性。Runtime 不按用户输入长度、关键词、模型供应商或已发生的工具次数猜测任务复杂度，也不自动代替模型建立执行清单。模型可在同一轮中请求彼此独立的读取、检索和其它明确允许并行的工具；Pi 工具循环依据每个工具的 `executionMode` 并发执行纯并行批次，包含任一顺序工具的批次保持有序。
+
+提示词只负责比例适当的自主行动、真实工具证据、失败后替代路径和完成前验证等行为引导。Runtime 机械完成守卫仅约束已经形成的可验证责任，包括模型明确建立后仍活动的 todo、尚未观察终态的有限后台任务、recurring occurrence 决策和委派副作用的父 Agent 复验；不得把模型未选择的计划形式本身变成完成条件。普通本 Run 文件改动的聚焦验证仍是一次有界软提示，不是机械责任。这些硬守卫不能扩展工具权限、替代审批或伪造外部终态。
+
+对没有建立这类机械责任的普通模型停止，Runtime 优先使用有界软恢复而不是把启发式判断升级为 `needs_review`。只有未执行行动的承诺式终稿时，最多追加一次不持久的继续提示；已经得到工具结果后模型以空终稿停止时，也最多追加一次不持久提示，要求基于已有证据给出自包含结果或真实 blocker。这些提示不得持久到 session、不得重发已产生可见增量的 provider request，也不得重放已完成的工具。软恢复预算耗尽后使用模型当前真实输出和 Run 状态收口，不伪造完成证据。
+
 邮件唤醒的 durable Agent job 只保存 Platform 权威源消息引用；Platform 在队列调度和重启/中断恢复边界严格校验该引用后，在内存中重建有界预览任务再提交 Runtime。Runtime 不从 job 键、邮件正文或其它文本猜测账户与 scope 身份。
 
 本地与 Quality 的 Runtime 测试入口把依赖亚秒真实计时的文件隔离到串行进程，其余文件才并行；完整规则见[测试与验证](../development/testing.md)。
@@ -47,7 +57,9 @@ Python 在调用时向内部授权端点请求当前访问凭据，并同时复�
 
 Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、todo、memory、skill、knowledge、web、browser、mail、sylver_platform、schedule、session、session_search 和 delegate_task。
 
-`todo` 是当前 Runtime session 内的结构化执行清单，不是平台业务任务、计划任务或长期记忆。模型可以读取、整体替换或按稳定 id 合并至多 256 项 `pending|in_progress|completed|cancelled` 任务；每项正文有界。权威清单保存在 Runtime-owned session sidecar，工具结果只作为模型可见审计副本，不能从 caller seed、用户正文或未配对的历史工具结果恢复授权状态。压缩只重新注入 `pending` 与 `in_progress` 项。普通 Run 准备结束时仍有活动项，且没有可验证的外部 blocker 时，Runtime 必须要求继续执行或显式更新状态；有界延续预算耗尽后只要仍有活动项，本 Run 就必须进入 `needs_review`，即使尚未记录其它副作用，也不能把未完成任务记为 `completed`。真实 blocker 对应的活动项保持原状态，供下一次同 session Run 恢复；只有全部项均为 `completed` 或 `cancelled` 时才允许正常完成。
+`todo` 是当前 Runtime session 内的结构化执行清单，不是平台业务任务、计划任务或长期记忆。它只用于预计至少三个彼此独立、可追踪的执行步骤，或用户一次提出多个可分别完成的任务。直接回答、单一动作和一两个简单步骤直接执行；围绕同一个小改动的例行读取、修改与聚焦验证是一条线性工作，不为了形式拆成清单。执行中发现任务已经演变为这类复杂工作时可以再创建清单。
+
+模型可以读取、整体替换或按稳定 id 合并至多 256 项 `pending|in_progress|completed|cancelled` 任务；每项正文有界。创建清单后，模型同一时刻只保持一项 `in_progress`，开始具体工作时及时更新，工作确已完成并经适当验证后立即标记 `completed`，放弃的工作标记 `cancelled`，仅为执行中新发现且确属必要的工作追加项目。Runtime 不自动创建 todo；空清单不向系统提示注入 todo 策略，选择门槛由稳定工具 schema 说明引导。权威清单保存在 Runtime-owned session sidecar，工具结果只作为模型可见审计副本，不能从 caller seed、用户正文或未配对的历史工具结果恢复授权状态。压缩只重新注入 `pending` 与 `in_progress` 项。普通 Run 准备结束时仍有活动项，且没有可验证的外部 blocker 时，Runtime 必须要求继续执行或显式更新状态；有界延续预算耗尽后只要仍有活动项，本 Run 就必须进入 `needs_review`，即使尚未记录其它副作用，也不能把未完成任务记为 `completed`。真实 blocker 对应的活动项保持原状态，供下一次同 session Run 恢复；只有全部项均为 `completed` 或 `cancelled` 时才允许正常完成。
 
 Runtime 因未完成 todo、尚未观察到终态的有限后台任务或缺失 recurring occurrence 决策而机械转入 `needs_review` 时，必须保留模型最后一段非空、非 Runtime 临时指令的阶段性说明作为有界诊断结果，并在 `run.needs_review` 终态中同时携带该内容与明确 blocker。这个结果只表示“停止位置与已有进度”，其 Run 状态、持久幂等状态和 Platform durable job 都必须继续是 `needs_review`，不得因存在 `result` 或正文而升级为 `completed`。诊断结果不得恢复或发布 `MEDIA:` 交付标记；需要复核的 Run 没有附件交付权。
 

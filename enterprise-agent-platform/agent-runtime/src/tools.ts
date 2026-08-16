@@ -1553,8 +1553,10 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         label: "Todo",
         description: [
           "Maintain the structured execution checklist for this Runtime session.",
+          "Use it only when the work has at least three distinct, independently trackable steps or the user requested multiple separately completable tasks.",
+          "Skip it for direct answers, a single read/query/command or small single-file change when that is the whole request, and simple one- or two-step work; routine inspection, one small change, and its focused verification are one linear task, not a ceremonial checklist.",
           "Use read to inspect the complete list, replace to set the complete list, and merge to add a new item or update an existing Runtime-issued id.",
-          "Keep multi-step work pending or in_progress until it is actually verified; mark abandoned work cancelled rather than deleting evidence mid-task.",
+          "Once a checklist exists, keep only one item in_progress, update it when work starts, mark it completed immediately after it is actually finished and appropriately verified, mark abandoned work cancelled, and append only newly discovered necessary work.",
           "This is not a scheduled-task tool, process watcher, durable memory, or shared knowledge store.",
           "For a background command that this run must finish, use process.wait; for a real future time trigger, use schedule; for stable cross-session facts, use memory.",
           "Never put credentials or other secrets in todo content.",
