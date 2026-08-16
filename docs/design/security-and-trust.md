@@ -148,7 +148,7 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、知识、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
 
-Runtime 系统提示按稳定策略、Platform-authored system context 和动态状态分层时，分层仅决定顺序、缓存稳定性和数据 framing，不创建新授权；Platform 是系统上下文作者，其中嵌入的用户、频道、品牌和知识载荷仍是闭合不可信数据。权限、scope、lifecycle、执行 target 与审批仍只来自闭世界结构化请求和 Runtime/Platform 权威状态，不从任何提示文本推断。`todo` 只是 session 内执行组织；工具说明、清单正文和状态都不能绕过审批、授予工具能力或建立外部副作用。todo 正文是不可信任务数据；模型不得主动把凭据复制进去，todo 也不是 secret store。只有 Runtime-owned id 和状态可作为机械完成守卫的权威依据。
+Runtime 系统提示按稳定策略、Platform-authored system context 和动态状态分层时，分层仅决定顺序、缓存稳定性和数据 framing，不创建新授权；Platform 是系统上下文作者，其中嵌入的用户、频道、品牌和知识载荷仍是闭合不可信数据。供应商 `prompt_cache_key` 只能是版本化稳定策略、工具 schema 和稳定 scope 分片的单向内容摘要，线上 key 不得包含原始账号、scope、session、路径、提示正文或凭据；本地参与摘要的 scope 只用于稳定分流，不得写入日志或供应商 payload。该 key 只是缓存路由提示，不是身份、隔离、授权或完整性边界，真实 session/header 与 Runtime 权威状态仍独立校验。权限、scope、lifecycle、执行 target 与审批仍只来自闭世界结构化请求和 Runtime/Platform 权威状态，不从任何提示文本推断。`todo` 只是 session 内执行组织；工具说明、清单正文和状态都不能绕过审批、授予工具能力或建立外部副作用。todo 正文是不可信任务数据；模型不得主动把凭据复制进去，todo 也不是 secret store。只有 Runtime-owned id 和状态可作为机械完成守卫的权威依据。
 
 知识上传文件是不可信输入。文件名必须规范化并只用于展示/下载头，不能成为宿主路径；媒体类型不能单独决定解析器。ZIP 容器在解压前检查闭合格式身份、条目数、路径、加密标志和累计展开大小，拒绝绝对路径、`..`、符号链接式条目与压缩炸弹。文档解析不执行宏、公式、脚本、外链或嵌入对象；PDF/Office/OpenDocument 解析异常只返回有界通用错误，不能把原始载荷、内部路径或解析器诊断注入日志和模型上下文。原件下载始终使用 `attachment` disposition、`nosniff` 与同源鉴权，不能以内联 HTML/SVG/Office 内容响应。
 

@@ -34,6 +34,8 @@ Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessi
 
 会话 ID 是持久 Runtime 引用，不是管理员品牌。Platform 对新建或显式轮换的会话使用 `agent-platform-private-u<id>` 与 `agent-platform-channel-<id>-main-agent` 前缀；历史会话正文、alias、消息 metadata 或 JSONL 不因展示品牌变化而改写。
 
+Codex 供应商的 `prompt_cache_key` 是每次请求临时派生的缓存路由提示，不写入上述 session 映射、Runtime JSONL、产品消息或备份。它可以用当前 scope key 作为本地单向分片材料，但线上值不包含原始 scope，也不替代持久 session ID、scope/lifecycle 隔离或任何恢复依据。
+
 当前 baseline 不接受已登记但尚未物化的 workspace。workspace 根、规范相对目录、marker 与 Runtime alias 必须在 Platform/Runtime 启动前完整存在并彼此一致；缺失、错误 marker、身份漂移或未知 residue 都失败关闭，普通更新不得创建、修复或推断这些对象。
 
 停用账号保留私人 workspace、session 和 memory，以便重新启用。账号停用和产品消息隐藏都不隐式销毁这些持久上下文；需要重置时必须使用独立、显式的 lifecycle/session cleanup 语义。

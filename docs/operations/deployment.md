@@ -101,6 +101,8 @@ Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 genera
 
 模型尚未完成文件工具参数时，面向电脑画面的未提交草稿只存在于当前 Run 的 Runtime→Platform 进程内瞬态链路；正文不写入 SQLite、消息、更新快照或 release 资产，相关进程重启、generation 切换或 Run 结束都会丢弃它。现有认证文件预览 HTTP 路径按精确 scope/path 读取正文，SSE 只公布有界 revision 元数据；该能力不新增服务、端口、持久目录、配置项或数据库迁移。最终工作区文件仍由 Sandbox 工具原子写入，并在完成后取代草稿成为权威预览。
 
+Codex 提示缓存优化同样不新增部署状态：`prompt_cache_key` 只在 Runtime 组装 provider 请求时由稳定策略、工具 schema 和当前 scope 的本地单向分片派生，不写入镜像、SQLite、session、更新快照或发布清单。进程重启后从相同可执行策略重算；供应商缓存未命中时完整请求仍按相同权限与语义执行，不得把缓存可用性纳入 readiness 或发布成功条件。
+
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```

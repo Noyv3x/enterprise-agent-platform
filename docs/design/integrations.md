@@ -28,6 +28,8 @@ Codex 账号目录先按供应商 priority 排序；Grok 目录保留供应商�
 
 Codex OAuth 的锁定 Responses 适配器可以消费模型函数调用的参数增量；Runtime 只把其中 `write_file.content` 和 `patch_file.new_text` 投影为当前 Run 的有界、脱敏、未提交文件草稿，工具执行和最终工作区写入仍保持原子边界。仅 Codex 的这两个工具在提供给模型的 schema 中要求显式 `target`；完整调用省略它时，Runtime 在校验、执行和会话历史写入前规范为 `sandbox`，显式 `host` 不得被改写，且不会产生草稿预览。Grok 及其它模型路径的 schema 和行为不变。该能力不增加 OAuth scope、token 交换、凭据存储、供应商目录或新的外部连接。
 
+Codex OAuth 请求还使用 Runtime 生成的内容寻址 `prompt_cache_key`：Platform 把稳定身份、工作区和知识工具说明放在精确 UTC 与被动知识建议之前，Runtime 再用稳定策略、实际工具 schema 和不透明 scope 分片形成 provider 路由提示。该优化不改变 OAuth token、真实 session/header、模型目录或权限复验，也不对私有 OAuth 端点的实际命中作保证。
+
 ## SearXNG 搜索
 
 网页搜索直接请求受管 SearXNG JSON `/search`，不经过 Firecrawl。请求固定为 general 类别，可带语言和页码；平台在统一预算内读取若干页，过滤重复、格式错误、本地地址和含敏感参数的 URL，直到达到请求数量。

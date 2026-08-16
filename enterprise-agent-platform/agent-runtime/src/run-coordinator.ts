@@ -9,8 +9,10 @@ import {
   estimateContextTokens,
 } from "@earendil-works/pi-agent-core";
 import type {
+  Api,
   AssistantMessage,
   ImageContent,
+  Model,
   TextContent,
   ToolCall,
   ToolResultMessage,
@@ -85,6 +87,7 @@ import {
   assembleSystemPrompt,
   buildSystemPromptParts,
 } from "./system-prompt/prompt-assembly.js";
+import { withCodexPromptCacheKey } from "./system-prompt/prompt-cache-key.js";
 import { frameUntrustedText, untrustedImageNotice } from "./untrusted-content.js";
 import type { TodoItem } from "./todo-store.js";
 import {
@@ -1023,11 +1026,12 @@ export class RunCoordinator {
       const executionTargets = new Map<string, ExecutionTarget>();
       const executionReceipts = new Map<string, ExecutionAuditReceipt>();
       const startedToolCalls = new Set<string>();
-      const fileDraftProjector = new CodexFileDraftProjector(
+      const codexOAuthProvider = (
         record.request.model.provider === "openai-codex"
         && resolved.model.provider === "openai-codex"
-        && resolved.model.api === "openai-codex-responses",
+        && resolved.model.api === "openai-codex-responses"
       );
+      const fileDraftProjector = new CodexFileDraftProjector(codexOAuthProvider);
       const rawTools = createTools({
         runId: record.id,
         request: record.request,
@@ -1211,7 +1215,7 @@ export class RunCoordinator {
         },
       }));
       let agent: Agent | undefined;
-      const systemPrompt = assembleSystemPrompt(buildSystemPromptParts({
+      const systemPromptParts = buildSystemPromptParts({
         platformSystemPrompt: record.request.system_prompt,
         ...(recalledMemory ? { recalledMemory } : {}),
         activeTodos: activeTodosAtStart,
@@ -1222,7 +1226,8 @@ export class RunCoordinator {
         scheduledRun: isTopLevelScheduledRun(record.request.metadata),
         recurringScheduledRun: isRecurringScheduledRun(record.request.metadata),
         interactiveInputs: acceptsInteractiveInputs(record),
-      }));
+      });
+      const systemPrompt = assembleSystemPrompt(systemPromptParts);
       const agentOptions: ConstructorParameters<typeof Agent>[0] = {
         initialState: {
           systemPrompt,
@@ -1233,6 +1238,14 @@ export class RunCoordinator {
         },
         sessionId: record.request.session_id,
         getApiKey: resolved.getApiKey,
+        ...(codexOAuthProvider ? {
+          onPayload: (payload: unknown, model: Model<Api>) => withCodexPromptCacheKey(
+            payload,
+            model,
+            systemPromptParts.stable,
+            record.request.scope_key,
+          ),
+        } : {}),
         // Pi's default execution policy respects each tool's executionMode:
         // batches containing a sequential tool remain ordered, while pure
         // parallel/read-only batches can overlap. Approval preflight remains

@@ -8,6 +8,7 @@ import {
   fauxThinking,
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
+import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { productModelCatalogs } from "../src/model-resolver.js";
 import {
   adaptImageContentForModel,
@@ -20,7 +21,12 @@ import {
   sanitizeToolResultForJournal,
   serializeCompactionHistory,
 } from "../src/run-coordinator.js";
-import { appendSkillPolicy, availableSkillIndex } from "../src/system-prompt/prompt-assembly.js";
+import { codexPromptCacheKey } from "../src/system-prompt/prompt-cache-key.js";
+import {
+  appendSkillPolicy,
+  availableSkillIndex,
+  buildSystemPromptParts,
+} from "../src/system-prompt/prompt-assembly.js";
 import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
@@ -3051,6 +3057,123 @@ test("an invisible overload after a mutation retries only the next model turn", 
       1,
       "retrying the empty provider attempt must not replay the completed mutation",
     );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("RunCoordinator replaces only the Codex OAuth payload cache key and preserves provider session identity", async () => {
+  const home = await temporaryDirectory("agent-prompt-cache-key-");
+  const workspace = await temporaryDirectory("agent-prompt-cache-key-workspace-");
+  const faux = fauxProvider();
+  const observations: Array<{
+    provider: string;
+    api: string;
+    sessionId: string | undefined;
+    payload: Record<string, unknown>;
+    replaced: unknown;
+    hasOnPayload: boolean;
+  }> = [];
+  faux.setResponses([
+    fauxAssistantMessage("Codex cache payload inspected."),
+    fauxAssistantMessage("Non-Codex payload inspected."),
+  ]);
+  const streamFn: StreamFn = async (model, context, options) => {
+    const normalizedTools = convertResponsesTools(context.tools ?? [], { strict: null });
+    assert.ok(normalizedTools.every((tool) => tool.type === "function" && typeof tool.name === "string"));
+    const payload: Record<string, unknown> = {
+      instructions: context.systemPrompt,
+      prompt_cache_key: options?.sessionId,
+      tools: normalizedTools,
+    };
+    const replaced = options?.onPayload
+      ? await options.onPayload(payload, model)
+      : undefined;
+    observations.push({
+      provider: model.provider,
+      api: model.api,
+      sessionId: options?.sessionId,
+      payload,
+      replaced,
+      hasOnPayload: options?.onPayload !== undefined,
+    });
+    return faux.provider.streamSimple(model, context, options);
+  };
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn,
+  });
+  try {
+    const codexSessionId = "session-remains-provider-identity";
+    const platformSystemPrompt = "Platform context with a per-Run UTC suffix.";
+    const codex = coordinator.createRun({
+      scope_key: "cache-key-scope-codex",
+      lifecycle_id: "life-codex",
+      session_id: codexSessionId,
+      workspace,
+      system_prompt: platformSystemPrompt,
+      input: "inspect Codex payload wiring",
+      model: { provider: "openai-codex", id: "gpt-5.5" },
+    });
+    const codexCompleted = await coordinator.wait(codex.id);
+    assert.equal(codexCompleted.status, "completed", codexCompleted.error);
+
+    const xaiModelId = productModelCatalogs()["xai-oauth"].models[0]?.id;
+    assert.ok(xaiModelId, "locked Pi catalog must include an xAI model");
+    const xai = coordinator.createRun({
+      scope_key: "cache-key-scope-xai",
+      lifecycle_id: "life-xai",
+      session_id: "xai-session",
+      workspace,
+      system_prompt: "Other provider context.",
+      input: "inspect non-Codex payload wiring",
+      model: { provider: "xai-oauth", id: xaiModelId },
+    });
+    const xaiCompleted = await coordinator.wait(xai.id);
+    assert.equal(xaiCompleted.status, "completed", xaiCompleted.error);
+
+    assert.equal(observations.length, 2);
+    const codexObservation = observations.find((entry) => entry.provider === "openai-codex");
+    assert.ok(codexObservation);
+    assert.equal(codexObservation.api, "openai-codex-responses");
+    assert.equal(codexObservation.sessionId, codexSessionId, "Pi must still receive the real session id");
+    assert.equal(codexObservation.hasOnPayload, true);
+    assert.equal(codexObservation.payload.prompt_cache_key, codexSessionId);
+    assert.ok(codexObservation.replaced && typeof codexObservation.replaced === "object");
+    const replacedPayload = codexObservation.replaced as Record<string, unknown>;
+    const stablePrompt = buildSystemPromptParts({
+      platformSystemPrompt,
+      activeTodos: [],
+      activeBackgroundTasks: [],
+      learningReview: false,
+      canWriteMemory: false,
+      scheduledRun: false,
+      recurringScheduledRun: false,
+      interactiveInputs: false,
+    }).stable;
+    assert.equal(
+      replacedPayload.prompt_cache_key,
+      codexPromptCacheKey(
+        stablePrompt,
+        codexObservation.payload.tools as unknown[],
+        "cache-key-scope-codex",
+      ),
+    );
+    assert.match(String(replacedPayload.prompt_cache_key), /^pck_[0-9a-f]{24}$/);
+    assert.notEqual(replacedPayload.prompt_cache_key, codexSessionId);
+    assert.doesNotMatch(String(replacedPayload.prompt_cache_key), /cache-key-scope-codex|session-remains/);
+    assert.equal(replacedPayload.instructions, codexObservation.payload.instructions);
+    assert.deepEqual(replacedPayload.tools, codexObservation.payload.tools);
+
+    const xaiObservation = observations.find((entry) => entry.provider === "xai");
+    assert.ok(xaiObservation);
+    assert.equal(xaiObservation.api, "openai-completions");
+    assert.equal(xaiObservation.sessionId, "xai-session");
+    assert.equal(xaiObservation.hasOnPayload, false);
+    assert.equal(xaiObservation.replaced, undefined);
+    assert.equal(xaiObservation.payload.prompt_cache_key, "xai-session");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

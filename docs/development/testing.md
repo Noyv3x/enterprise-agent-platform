@@ -86,7 +86,7 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
-提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明只改变回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀不变、空动态状态不生成占位块。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
+提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明同一 scope 内只改变精确时间、知识建议、回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀和内容寻址的 Codex 缓存 key 不变，稳定策略、规范工具 schema 或 scope 分片改变时 key 必须改变，空动态状态不生成占位块；捕获的 provider payload 还必须证明线上 key 不含原始 scope 且没有替代真实 session/header，普通单元测试不得把确定性 key 误报成供应商实际 cache hit。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
 
 后台 task 的反刷屏回归必须证明：只要当前 session 仍有活动责任，`schedule.create` 就在 Platform 调用和审批前被机械拒绝；取得匹配 target 的权威进程终态并解除全部责任后恢复允许；显式 service 不登记责任且不被误拦。
 
@@ -120,7 +120,7 @@ npm run build
 - 工作记录仅在工具调用时出现，运行中保持无折叠控件的紧凑进度行，Run 终态后自动折叠且可展开查看持久化阶段性说明与有实质证据的工具详情；只有状态/时间的工具行不得出现空展开入口，文件、终端、搜索和浏览器详情必须优先显示操作对象与有界结果或错误，通用状态和时间不得重复占据主内容。还必须覆盖超过旧 8 段/30 条窗口的长 Run、多个事件落在同一秒时仍按单调 `sequence` 排序、同一 `tool_call_id` 完成时原位更新、阶段性说明进入时间线后不再残留于 `stream_messages` 或重复渲染完整气泡，以及条目、单项详情和总详情达到防滥用硬界后出现带准确计数的显式截断标记；个人 AI 的 Agent 消息头像旁不得渲染作者名；
 - 审批、失败发送恢复和连续短消息；
 - 浏览器首帧加载与终端预览可用性；聊天附件预览覆盖 XLSX 表格、DOCX 段落、PPTX 幻灯片和 PDF 文本页，以及解析失败时下载仍可用；
-- 电脑画面：空闲对话不出现空白监视器；文件/终端/浏览器/搜索/呈现页随当前可见工具切换且共用一个右侧槽；画中画在 Composer 上方靠右保持迷你 16:9，不占满输入列，各模式在数据到达后显示真实紧凑内容，点击只展开只读竖屏；文件 started 阶段的 404 保持等待并在同路径 completed 后显示最终正文，patch 必须刷新旧快照，动画遵守 reduced-motion；短终端命令即使错过进程轮询也用有界工具结果呈现命令与输出；HTML started 阶段不提前挂载 404 iframe、完成后加载且同路径重写可刷新；三语文案为「AI 的电脑 / AI computer / AI 的電腦」与「显示 AI 的电脑 / Show the AI computer / 顯示 AI 的電腦」；记忆/技能/定时任务仍是独立轨道项；浏览器与终端不再各占实时按钮；展开电脑后卸载画中画；HTML 呈现只使用不含 `allow-same-origin` 的沙箱 iframe；接管仍须明确手势，发送前仍须释放租约；
+- 电脑画面：空闲对话不出现空白监视器；文件/终端/浏览器/搜索/呈现页随当前可见工具切换且共用一个右侧槽；画中画在 Composer 上方靠右保持迷你 16:9，不占满输入列，各模式在数据到达后显示真实紧凑内容，点击只展开只读竖屏；前端在连续 draft revision 快于正文请求时必须保持单在途并最终追到最新版，大小正文都只对已经取得的权威字符做平滑渐进显示，不在封顶行延迟后成批出现，非前缀替换与 reduced-motion 立即收敛到安全新值；文件 started 阶段的 404 保持等待并在同路径 completed 后显示最终正文，patch 必须刷新旧快照；短终端命令即使错过进程轮询也用有界工具结果呈现命令与输出；HTML started 阶段不提前挂载 404 iframe、完成后加载且同路径重写可刷新；三语文案为「AI 的电脑 / AI computer / AI 的電腦」与「显示 AI 的电脑 / Show the AI computer / 顯示 AI 的電腦」；记忆/技能/定时任务仍是独立轨道项；浏览器与终端不再各占实时按钮；展开电脑后卸载画中画；HTML 呈现只使用不含 `allow-same-origin` 的沙箱 iframe；接管仍须明确手势，发送前仍须释放租约；
 - 手机动态视口、长代码/表格和 Composer 不扩大页面；
 - 三种 locale 的 key 完整性；
 - 更新维护页在 Store/登录失败时仍可接管。
