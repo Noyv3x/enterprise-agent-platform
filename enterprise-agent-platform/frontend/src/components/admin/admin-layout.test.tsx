@@ -2,6 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeContext } from "../../context/ThemeContext";
@@ -64,7 +65,8 @@ describe("Ant Design administration surfaces", () => {
     vi.unstubAllGlobals();
   });
 
-  it("renders grouped navigation and the compact page switcher", () => {
+  it("renders grouped navigation and suppresses the switcher's nested focus shadow", async () => {
+    const user = userEvent.setup();
     renderAdmin(<AdminPager activeId="accounts" />);
 
     const navigation = screen.getByRole("navigation", { name: "Administration navigation" });
@@ -73,8 +75,21 @@ describe("Ant Design administration surfaces", () => {
       .toHaveClass("eap-menu-item-selected");
     expect(within(navigation).getByText("Agent runtime")).toBeInTheDocument();
     const switcher = screen.getByText("Administration page").closest(".eap-admin-page-switcher");
-    expect(screen.getByRole("combobox", { name: "Administration page" })).toBeInTheDocument();
+    const combobox = screen.getByRole("combobox", { name: "Administration page" });
+    const select = combobox.closest(".eap-select");
+    expect(combobox).toBeInTheDocument();
     expect(within(switcher as HTMLElement).getByText("Accounts & permissions")).toBeInTheDocument();
+
+    await user.click(combobox);
+    expect(combobox).toHaveAttribute("aria-expanded", "true");
+    expect(select).toHaveClass("eap-select-open");
+    await user.click(combobox);
+
+    expect(combobox).toHaveAttribute("aria-expanded", "false");
+    expect(select).not.toHaveClass("eap-select-open");
+    expect(select).toHaveClass("eap-select-focused");
+    expect(combobox).toHaveFocus();
+    expect(combobox).toHaveStyle({ boxShadow: "none" });
   });
 
   it("renders the account page with an empty store", () => {

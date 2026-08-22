@@ -14,6 +14,14 @@ const ANT_LOCALES = {
   "zh-TW": zhTW,
 } satisfies Record<Locale, typeof enUS>;
 
+const SELECT_CONFIG = {
+  styles: {
+    // The Select shell owns the visible focus ring. Its focused input must not
+    // inherit the global focus shadow and draw a second, clipped inner ring.
+    input: { boxShadow: "none" },
+  },
+};
+
 /**
  * Bridges platform-owned theme/i18n state into the component library. Product
  * copy remains in our i18n catalog; Ant Design locale only covers built-in UI.
@@ -145,6 +153,7 @@ export function AntDesignProvider({ children }: { children: ReactNode }) {
       prefixCls="eap"
       componentSize={coarsePointer ? "large" : "middle"}
       locale={ANT_LOCALES[locale]}
+      select={SELECT_CONFIG}
       theme={themeConfig}
     >
       <div className="eap-component-root">{children}</div>
