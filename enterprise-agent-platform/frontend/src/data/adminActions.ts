@@ -20,7 +20,6 @@ import {
   loadOAuthProviders,
   loadPrivateConversations,
   loadPrivateMessages,
-  loadRuntime,
   loadSessionBootstrap,
   loadSecrets,
   loadTelegramConfig,

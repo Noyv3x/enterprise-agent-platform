@@ -1049,11 +1049,6 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                     "UPDATE users SET active = 1 WHERE id = ?",
                     (int(actor["id"]),),
                 )
-                self.assertTrue(
-                    service.skills.automatic_patch_allowed(
-                        scope.scope_key, created["id"]
-                    )
-                )
                 with self.assertRaises(ServiceError) as unread:
                     service.invoke_agent_runtime_tool(
                         {
@@ -1144,19 +1139,10 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                     finally:
                         revoke_finished.set()
 
-                with (
-                    mock.patch.object(
-                        service.skills,
-                        "automatic_patch_allowed",
-                        side_effect=AssertionError(
-                            "advisory check must not authorize writes"
-                        ),
-                    ),
-                    mock.patch.object(
-                        service.skills,
-                        "_patch_document",
-                        side_effect=paused_patch,
-                    ),
+                with mock.patch.object(
+                    service.skills,
+                    "_patch_document",
+                    side_effect=paused_patch,
                 ):
                     patch_thread = threading.Thread(target=invoke_patch)
                     patch_thread.start()

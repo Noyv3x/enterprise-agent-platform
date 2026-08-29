@@ -33,9 +33,8 @@ export interface RuntimeConfig {
   cleanupGraceMs: number;
   maxConcurrency: number;
   maxQueuedRuns: number;
-  executionMode: "manager" | "local";
-  managerSocketPath?: string;
-  managerToken?: string;
+  managerSocketPath: string;
+  managerToken: string;
   managerRequestTimeoutMs: number;
 }
 

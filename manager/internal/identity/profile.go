@@ -107,10 +107,6 @@ func (p Profile) ControlSocketPath(runtimeRoot string) (string, error) {
 	return filepath.Join(runtimeRoot, filepath.FromSlash(p.RuntimeSocketPath)), nil
 }
 
-func (p Profile) ManagerInstallPath(binHome string) string {
-	return filepath.Join(binHome, p.ManagerBinary)
-}
-
 func (p Profile) Label(suffix string) string {
 	return p.LabelPrefix + "." + suffix
 }

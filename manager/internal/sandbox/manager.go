@@ -267,21 +267,6 @@ func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
 	m.registry.Records[sandboxID] = record
 	return m.persistLocked()
 }
-func (m *Manager) Touch(sandboxID string, now time.Time) error {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
-	unlock := m.lockEnsure(sandboxID)
-	defer unlock()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	record, ok := m.registry.Records[sandboxID]
-	if !ok {
-		return errors.New("sandbox is not registered")
-	}
-	record.LastActivityAt = now.UTC()
-	m.registry.Records[sandboxID] = record
-	return m.persistLocked()
-}
 
 func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 	unlockMaintenance := m.lockMaintenance()

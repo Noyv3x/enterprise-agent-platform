@@ -9,11 +9,11 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "tsc -p tsconfig.json",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/server.js",
     "test": "npm run build && npm run test:compiled",
-    "test:compiled": "node --test scripts/run-compiled-tests.test.mjs && node scripts/run-compiled-tests.mjs"
+    "test:compiled": "node --test --test-concurrency=1 dist/test/*.test.js"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.6",

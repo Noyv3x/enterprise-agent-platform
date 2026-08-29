@@ -9,7 +9,6 @@ import os
 import re
 import shutil
 import signal
-import socket
 import stat
 import sys
 import tempfile
@@ -2511,7 +2510,7 @@ def make_server(
     listen_host: str | None = None,
     listen_port: int | None = None,
 ) -> EnterpriseHTTPServer:
-    config = config or PlatformConfig.from_env(Path(__file__).resolve().parents[1])
+    config = config or PlatformConfig.from_env()
     service = service or EnterpriseService(config)
     return EnterpriseHTTPServer(
         (

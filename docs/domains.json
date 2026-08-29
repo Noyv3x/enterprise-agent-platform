@@ -242,8 +242,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/service.py"
       ],
       "tests": [
-        "enterprise-agent-platform/agent-runtime/test/*.test.ts",
-        "enterprise-agent-platform/agent-runtime/scripts/*.test.mjs"
+        "enterprise-agent-platform/agent-runtime/test/*.test.ts"
       ]
     },
     {

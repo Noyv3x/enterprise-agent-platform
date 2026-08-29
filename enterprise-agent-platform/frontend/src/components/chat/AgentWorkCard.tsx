@@ -4,7 +4,7 @@
    exposes its full detail only through its own disclosure. */
 
 import { Collapse, type CollapseProps } from "antd";
-import { t as defaultTranslate, useI18n, type MessageKey, type Translator } from "../../i18n";
+import { useI18n, type MessageKey, type Translator } from "../../i18n";
 import { cx } from "../../lib/cx";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
@@ -149,23 +149,6 @@ function compactToolSteps(work: Work | null | undefined): ActivityStep[] {
 function displayToolName(rawTool: string, translate: Translator): string {
   const key = TOOL_MESSAGE_KEYS[rawTool.toLowerCase()];
   return key ? translate(key) : rawTool;
-}
-
-function agentStepLine(step: ActivityStep, translate: Translator): string {
-  const stage = stepStage(step);
-  const detail = step?.detail || "";
-  const rawTool = step?.tool || step?.label || translate("chat.activity.toolFallback");
-  const tool = displayToolName(rawTool, translate);
-  const detailSuffix = detail && detail !== rawTool ? ` · ${detail}` : "";
-  if (step?.tool_status === "failed" || stage.endsWith("failed")) {
-    return translate("chat.activity.toolFailed", { tool, detail: detailSuffix });
-  }
-  return translate(
-    step?.tool_status === "completed" || stage.endsWith("completed")
-      ? "chat.activity.toolCompleted"
-      : "chat.activity.toolRunning",
-    { emoji: step?.emoji || "⚙️", tool, detail: detailSuffix },
-  );
 }
 
 function agentStepState(step: ActivityStep): ProcessState {
@@ -440,22 +423,9 @@ function processEntries(work: Work | null | undefined, translate: Translator): P
   return entries;
 }
 
-export function agentProcessLines(
-  work: Work | null | undefined,
-  translate: Translator = defaultTranslate,
-): string[] {
-  return compactToolSteps(work).map((step) => agentStepLine(step, translate));
-}
-
 export function hasAgentProcessSteps(work: Work | null | undefined): boolean {
   return compactToolSteps(work).length > 0 || (work?.activity || []).some(
     (step) => isTruncationStep(step) && Number(step.omitted_tool_events || 0) > 0,
-  );
-}
-
-export function hasAgentBrowserStep(work: Work | null | undefined): boolean {
-  return compactToolSteps(work).some((step) =>
-    String(step?.tool || step?.label || "").trim().toLowerCase() === "browser",
   );
 }
 

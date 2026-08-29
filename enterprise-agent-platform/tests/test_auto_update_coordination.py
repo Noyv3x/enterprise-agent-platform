@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import shutil
 import sqlite3
 import tempfile
 import threading

@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { messages, type MessageKey } from "./catalog";
-import { SUPPORTED_LOCALES, type Locale, type MessageParams, type MessageValue } from "./types";
+import type { Locale, MessageParams, MessageValue } from "./types";
 
 export { SUPPORTED_LOCALES } from "./types";
 export type { Locale, MessageParams } from "./types";

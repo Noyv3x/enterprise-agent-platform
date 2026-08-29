@@ -3,9 +3,8 @@ import { readFile, rm } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("RunCoordinator repairs a durable assistant tool call with no result", async () => {
   const home = await temporaryDirectory("agent-session-recovery-");

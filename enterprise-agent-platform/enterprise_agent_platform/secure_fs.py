@@ -170,263 +170,6 @@ def open_private_child_directory_fd(
         raise
 
 
-def ensure_private_child_directory_fd(
-    parent_fd: int,
-    name: str,
-    *,
-    mode: int = 0o700,
-    staging_fd: int | None = None,
-    staging_name: str | None = None,
-    expected_existing_identity: tuple[int, int] | None = None,
-    require_empty: bool = False,
-) -> int:
-    """Open or create one private child below an already pinned parent.
-
-    Existing entries are validation-only: an unsafe type, owner, group or mode
-    is never repaired. Missing entries are published from a caller-bound,
-    Agent-invisible staging directory with ``RENAME_NOREPLACE``; direct
-    ``mkdirat`` followed by a pathname reopen cannot prove it opened the inode
-    it created. The caller owns the returned descriptor.
-    """
-
-    _require_leaf_name(name)
-    if (staging_fd is None) != (staging_name is None):
-        raise UnsafePrivatePathError(
-            "private directory staging identity is incomplete"
-        )
-    existing_fd: int | None = None
-    try:
-        existing_fd = open_private_child_directory_fd(parent_fd, name, mode=mode)
-    except FileNotFoundError:
-        if expected_existing_identity is not None:
-            raise UnsafePrivatePathError(
-                f"private directory disappeared before publication: {name}"
-            )
-    else:
-        try:
-            if staging_fd is None or staging_name is None:
-                if expected_existing_identity is not None:
-                    opened = os.fstat(existing_fd)
-                    if (opened.st_dev, opened.st_ino) != expected_existing_identity:
-                        raise UnsafePrivatePathError(
-                            f"private directory changed before publication: {name}"
-                        )
-                return existing_fd
-
-            _require_leaf_name(staging_name)
-            opened = os.fstat(existing_fd)
-            if (
-                expected_existing_identity is None
-                or (opened.st_dev, opened.st_ino) != expected_existing_identity
-            ):
-                _remove_empty_private_directory_staging(
-                    staging_fd,
-                    staging_name,
-                    expected_device=opened.st_dev,
-                )
-                raise UnsafePrivatePathError(
-                    f"private directory appeared before publication: {name}"
-                )
-            _remove_empty_private_directory_staging(
-                staging_fd,
-                staging_name,
-                expected_device=opened.st_dev,
-                sync_parent=False,
-            )
-            _sync_private_directory_publication(
-                parent_fd,
-                name,
-                existing_fd,
-                staging_fd,
-                mode=mode,
-                require_empty=require_empty,
-            )
-            return existing_fd
-        except BaseException:
-            os.close(existing_fd)
-            raise
-
-    if staging_fd is None or staging_name is None:
-        raise UnsafePrivatePathError(
-            "private directory creation requires transaction-bound staging"
-        )
-    _require_leaf_name(staging_name)
-    if os.fstat(parent_fd).st_dev != os.fstat(staging_fd).st_dev:
-        raise UnsafePrivatePathError(
-            "private directory staging is on another filesystem"
-        )
-    try:
-        os.mkdir(staging_name, mode=mode, dir_fd=staging_fd)
-        os.fsync(staging_fd)
-    except FileExistsError:
-        # A deterministic residue can only be reused after its exact metadata
-        # and empty contents are validated below.
-        pass
-    fd = open_private_child_directory_fd(
-        staging_fd,
-        staging_name,
-        mode=mode,
-    )
-    try:
-        if os.listdir(fd):
-            raise UnsafePrivatePathError(
-                f"private directory staging is not empty: {staging_name}"
-            )
-        os.fsync(fd)
-        verify_private_child_directory_fd(
-            staging_fd,
-            staging_name,
-            fd,
-            mode=mode,
-        )
-        try:
-            _rename_noreplace(staging_fd, staging_name, parent_fd, name)
-        except FileExistsError as exc:
-            _remove_empty_private_directory_staging(
-                staging_fd,
-                staging_name,
-                child_fd=fd,
-                expected_device=os.fstat(parent_fd).st_dev,
-            )
-            raise UnsafePrivatePathError(
-                f"private directory appeared during publication: {name}"
-            ) from exc
-        verify_private_child_directory_fd(parent_fd, name, fd, mode=mode)
-        if os.listdir(fd):
-            raise UnsafePrivatePathError(
-                f"private directory gained contents during publication: {name}"
-            )
-        _sync_private_directory_publication(
-            parent_fd,
-            name,
-            fd,
-            staging_fd,
-            mode=mode,
-            require_empty=True,
-        )
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def _remove_empty_private_directory_staging(
-    staging_fd: int,
-    staging_name: str,
-    *,
-    child_fd: int | None = None,
-    expected_device: int | None = None,
-    sync_parent: bool = True,
-) -> None:
-    """Remove only one exact, owner-only and empty directory residue."""
-
-    _require_leaf_name(staging_name)
-    owns_child_fd = child_fd is None
-    try:
-        if child_fd is None:
-            try:
-                child_fd = open_private_child_directory_fd(
-                    staging_fd,
-                    staging_name,
-                )
-            except FileNotFoundError:
-                return
-        opened = verify_private_child_directory_fd(
-            staging_fd,
-            staging_name,
-            child_fd,
-        )
-        if expected_device is not None and opened.st_dev != expected_device:
-            raise UnsafePrivatePathError(
-                f"private directory staging is on another filesystem: {staging_name}"
-            )
-        if os.listdir(child_fd):
-            raise UnsafePrivatePathError(
-                f"private directory staging is not empty: {staging_name}"
-            )
-        # Bind cleanup to the same directory entry that was proven empty.  The
-        # staging root is Agent-invisible and single-writer, but this second
-        # check still turns an unexpected replacement into a fail-closed
-        # residue instead of unlinking by an unchecked pathname.
-        current = verify_private_child_directory_fd(
-            staging_fd,
-            staging_name,
-            child_fd,
-        )
-        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            raise UnsafePrivatePathError(
-                f"private directory staging changed before cleanup: {staging_name}"
-            )
-        os.rmdir(staging_name, dir_fd=staging_fd)
-        if sync_parent:
-            os.fsync(staging_fd)
-    finally:
-        if owns_child_fd and child_fd is not None:
-            os.close(child_fd)
-
-
-def _sync_private_directory_publication(
-    parent_fd: int,
-    name: str,
-    child_fd: int,
-    staging_fd: int,
-    *,
-    mode: int,
-    require_empty: bool,
-) -> os.stat_result:
-    """Commit or replay one exact cross-directory publication durably.
-
-    The staged child is empty when first renamed, so persisting source-name
-    removal before destination-name creation is the recoverable ordering: a
-    crash before the final parent sync can at worst require recreating an empty
-    directory. Exact-final replay uses the same barrier even when the staging
-    name is already absent.
-    """
-
-    published = verify_private_child_directory_fd(
-        parent_fd,
-        name,
-        child_fd,
-        mode=mode,
-    )
-    identity = (published.st_dev, published.st_ino)
-
-    def reprove() -> os.stat_result:
-        current = verify_private_child_directory_fd(
-            parent_fd,
-            name,
-            child_fd,
-            mode=mode,
-        )
-        if (current.st_dev, current.st_ino) != identity:
-            raise UnsafePrivatePathError(
-                f"private directory changed after publication: {name}"
-            )
-        if require_empty and os.listdir(child_fd):
-            raise UnsafePrivatePathError(
-                f"private directory gained contents during publication: {name}"
-            )
-        return current
-
-    try:
-        os.fsync(child_fd)
-        os.fsync(staging_fd)
-        os.fsync(parent_fd)
-    except OSError as exc:
-        # renameat2 has already moved the pinned inode into the final
-        # namespace. Reprove that exact effect before exposing a recovery
-        # identity; the first durability error remains visible to callers.
-        try:
-            reprove()
-        except (OSError, UnsafePrivatePathError):
-            raise
-        raise PrivatePublicationCommittedError(
-            f"private directory publication durability failed: {name}",
-            identity,
-        ) from exc
-    return reprove()
-
-
 def verify_private_child_directory_fd(
     parent_fd: int,
     name: str,
@@ -462,13 +205,6 @@ def _require_leaf_name(name: str) -> None:
         or "\x00" in name
     ):
         raise UnsafePrivatePathError("private leaf name is unsafe")
-
-
-def stat_private_entry_at(parent_fd: int, name: str) -> os.stat_result:
-    """Return no-follow metadata for one entry in a pinned directory."""
-
-    _require_leaf_name(name)
-    return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
 
 
 def _require_private_regular_file_identity(
@@ -746,40 +482,6 @@ def _rename_exchange(
         2,
     ) != 0:
         error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-
-
-def _rename_noreplace(
-    left_fd: int,
-    left_name: str,
-    right_fd: int,
-    right_name: str,
-) -> None:
-    _require_leaf_name(left_name)
-    _require_leaf_name(right_name)
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        function = libc.renameat2
-    except AttributeError as exc:
-        raise OSError(errno.ENOSYS, "renameat2 is unavailable") from exc
-    function.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    function.restype = ctypes.c_int
-    if function(
-        left_fd,
-        os.fsencode(left_name),
-        right_fd,
-        os.fsencode(right_name),
-        1,
-    ) != 0:
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(error, os.strerror(error), right_name)
         raise OSError(error, os.strerror(error))
 
 
@@ -1141,12 +843,6 @@ def _open_private_child_directory(parent_fd: int, name: str, *, display: str) ->
         return fd
 
 
-def _open_private_file_at(parent_fd: int, name: str) -> int:
-    """Open the final leaf relative to an already trusted directory fd."""
-
-    return os.open(name, _private_file_open_flags(), 0o600, dir_fd=parent_fd)
-
-
 def write_private_file_below_exclusive(root: Path, relative: Path, data: bytes) -> None:
     """Create a private file below ``root`` using only pinned directory fds.
 
@@ -1333,13 +1029,6 @@ def copy_private_file_exclusive(
     finally:
         if source_fd >= 0:
             os.close(source_fd)
-
-
-def tighten_sqlite_files(path: Path) -> None:
-    """Tighten SQLite's database and sidecar files when they exist."""
-
-    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
-        ensure_private_file(candidate)
 
 
 def tighten_sqlite_files_at(

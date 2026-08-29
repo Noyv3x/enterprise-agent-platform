@@ -4,9 +4,8 @@ import { createConnection } from "node:net";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { productModelCatalogs } from "../src/model-resolver.js";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import { createRuntimeServer } from "../src/server.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("runtime refuses to start with an empty configured bearer token", async () => {
   const home = await temporaryDirectory("agent-server-empty-token-");
@@ -366,7 +365,10 @@ test("runtime approval and joined-input endpoints reject unknown fields", async 
   const workspace = await temporaryDirectory("agent-server-approval-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "touch approved.txt && stat approved.txt",
+      target: "host",
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("approved"),
   ]);
   const config = testConfig(home, { bearerToken: "secret", approvalTimeoutMs: 5_000 });
@@ -475,7 +477,7 @@ test("runtime approval and joined-input endpoints reject unknown fields", async 
 test("runtime rejects a slow JSON request body at the configured deadline", async () => {
   const home = await temporaryDirectory("agent-server-body-deadline-");
   const config = testConfig(home, { bearerToken: "secret", requestBodyTimeoutMs: 30 });
-  const runtime = createRuntimeServer(config);
+  const runtime = createRuntimeServer(config, new RunCoordinator({ config }));
   let socket: ReturnType<typeof createConnection> | undefined;
   try {
     const address = await runtime.listen();
@@ -519,32 +521,20 @@ test("runtime rejects a slow JSON request body at the configured deadline", asyn
 
 test("runtime exposes only bounded read-only processes owned by a root scope", async () => {
   const home = await temporaryDirectory("agent-server-preview-");
-  const workspace = await temporaryDirectory("agent-server-preview-workspace-");
   const config = testConfig(home, { bearerToken: "secret" });
   const coordinator = new RunCoordinator({ config });
+  const revision = "preview_abcdef0123456789abcdef0123456789:1";
+  coordinator.previewProcesses = async (_scope, _lifecycle, sinceRevision) => sinceRevision === revision
+    ? { processes: [], revision, unchanged: true }
+    : {
+        revision,
+        processes: [
+          processPreview("process_root", "root"),
+          processPreview("process_child", "child"),
+        ],
+      };
   const runtime = createRuntimeServer(config, coordinator);
   try {
-    const root = await coordinator.processes.run({
-      runId: "root-run",
-      scopeKey: "private:9",
-      lifecycleId: "life-9",
-      command: "printf root",
-      cwd: workspace,
-    });
-    const child = await coordinator.processes.run({
-      runId: "child-run",
-      scopeKey: "private:9/delegate/child",
-      lifecycleId: "life-9",
-      command: "printf child",
-      cwd: workspace,
-    });
-    await coordinator.processes.run({
-      runId: "sibling-run",
-      scopeKey: "private:90",
-      lifecycleId: "life-9",
-      command: "printf sibling",
-      cwd: workspace,
-    });
     const address = await runtime.listen();
     const base = `http://${address.host}:${address.port}`;
     const query = "scope_key=private%3A9&lifecycle_id=life-9";
@@ -564,7 +554,7 @@ test("runtime exposes only bounded read-only processes owned by a root scope", a
     };
     assert.match(body.revision, /^preview_[a-f0-9]{32}:\d+$/);
     assert.equal(body.unchanged, undefined);
-    assert.deepEqual(new Set(body.processes.map((process) => process.id)), new Set([root.id, child.id]));
+    assert.deepEqual(new Set(body.processes.map((process) => process.id)), new Set(["process_root", "process_child"]));
     for (const process of body.processes) {
       for (const internal of ["pid", "run_id", "scope_key", "lifecycle_id", "stdout", "stderr"]) {
         assert.equal(internal in process, false);
@@ -598,57 +588,16 @@ test("runtime exposes only bounded read-only processes owned by a root scope", a
   } finally {
     await runtime.close();
     await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
   }
 });
 
 test("runtime exposes a lightweight live-process summary without terminal output", async () => {
   const home = await temporaryDirectory("agent-server-preview-summary-");
-  const workspace = await temporaryDirectory("agent-server-preview-summary-workspace-");
   const config = testConfig(home, { bearerToken: "secret" });
   const coordinator = new RunCoordinator({ config });
+  coordinator.previewProcessSummary = async () => ({ running_terminal_count: 2 });
   const runtime = createRuntimeServer(config, coordinator);
   try {
-    await coordinator.processes.run({
-      runId: "completed-run",
-      scopeKey: "private:9",
-      lifecycleId: "life-9",
-      command: "printf completed-summary-secret",
-      cwd: workspace,
-    });
-    await coordinator.processes.run({
-      runId: "root-live-run",
-      scopeKey: "private:9",
-      lifecycleId: "life-9",
-      command: "printf root-summary-secret; sleep 30",
-      cwd: workspace,
-      background: true,
-    });
-    await coordinator.processes.run({
-      runId: "child-live-run",
-      scopeKey: "private:9/delegate/child",
-      lifecycleId: "life-9",
-      command: "printf child-summary-secret; sleep 30",
-      cwd: workspace,
-      background: true,
-    });
-    await coordinator.processes.run({
-      runId: "sibling-live-run",
-      scopeKey: "private:90",
-      lifecycleId: "life-9",
-      command: "printf sibling-summary-secret; sleep 30",
-      cwd: workspace,
-      background: true,
-    });
-    await coordinator.processes.run({
-      runId: "old-life-live-run",
-      scopeKey: "private:9",
-      lifecycleId: "old-life",
-      command: "printf old-life-summary-secret; sleep 30",
-      cwd: workspace,
-      background: true,
-    });
-
     const address = await runtime.listen();
     const base = `http://${address.host}:${address.port}`;
     const query = "scope_key=private%3A9&lifecycle_id=life-9";
@@ -672,12 +621,24 @@ test("runtime exposes a lightweight live-process summary without terminal output
     assert.doesNotMatch(raw, /summary-secret|command|stdout|stderr|output|processes/);
 
   } finally {
-    coordinator.processes.killScope("private:9");
-    coordinator.processes.killScope("private:90");
-    await coordinator.processes.waitForScopeExit("private:9", undefined, 5_000);
-    await coordinator.processes.waitForScopeExit("private:90", undefined, 5_000);
     await runtime.close();
     await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
   }
 });
+
+function processPreview(id: string, output: string) {
+  return {
+    id,
+    title: "Terminal",
+    command: "printf [redacted]",
+    cwd: "/workspace",
+    output,
+    status: "completed" as const,
+    running: false,
+    exit_code: 0,
+    started_at: new Date(0).toISOString(),
+    updated_at: new Date(0).toISOString(),
+    finished_at: new Date(0).toISOString(),
+    truncated: false,
+  };
+}

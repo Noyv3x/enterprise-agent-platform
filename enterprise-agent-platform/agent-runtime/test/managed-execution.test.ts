@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { rm, stat } from "node:fs/promises";
+import { rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,30 +10,20 @@ import { ManagerExecutorClient } from "../src/executor.js";
 import { RunCoordinator, RunValidationError } from "../src/run-coordinator.js";
 import { createTools, managedExecutionBinding } from "../src/tools.js";
 import type { JsonObject, RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { fakeExecutionManager, temporaryDirectory, testConfig } from "./helpers.js";
 
 const MANAGER_TOKEN = "manager-executor-test-token";
 
-test("production configuration fails closed without Manager identity and forbids local fallback", () => {
+test("production configuration fails closed without Manager identity", () => {
   assert.throws(
     () => loadConfig({ AGENT_RUNTIME_TOKEN: "runtime", AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1" }),
     /Manager executor bearer token is required/,
-  );
-  assert.throws(
-    () => loadConfig({
-      AGENT_RUNTIME_TOKEN: "runtime",
-      AGENT_RUNTIME_EXECUTOR_MODE: "local",
-      AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
-      NODE_ENV: "production",
-    }),
-    /local execution fallback is disabled in production/,
   );
   const configured = loadConfig({
     AGENT_RUNTIME_TOKEN: "runtime",
     AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     AGENT_MANAGER_EXECUTOR_TOKEN: MANAGER_TOKEN,
   });
-  assert.equal(configured.executionMode, "manager");
   assert.equal(configured.managerSocketPath, "/run/agent-platform-manager/manager.sock");
 });
 
@@ -87,6 +77,35 @@ test("managed execution audit bindings exactly match Manager call projections", 
       managedExecutionBinding(toolName, { target: "sandbox", ...arguments_ }, workspace),
       { operation: toolName, action, arguments: arguments_ },
     );
+  }
+});
+
+test("Manager executor client fails fast for missing, non-socket, and symlink paths", async () => {
+  const home = await temporaryDirectory("manager-socket-validation-");
+  const regularPath = join(home, "regular");
+  const socketPath = join(home, "manager.sock");
+  const linkedPath = join(home, "manager-link.sock");
+  const manager = new FakeManager(socketPath);
+  try {
+    assert.throws(
+      () => new ManagerExecutorClient(join(home, "missing.sock"), MANAGER_TOKEN, 5_000),
+      /socket is unavailable/,
+    );
+    await writeFile(regularPath, "not a socket", "utf8");
+    assert.throws(
+      () => new ManagerExecutorClient(regularPath, MANAGER_TOKEN, 5_000),
+      /non-symlink Unix socket/,
+    );
+    await manager.listen();
+    await symlink(socketPath, linkedPath);
+    assert.throws(
+      () => new ManagerExecutorClient(linkedPath, MANAGER_TOKEN, 5_000),
+      /non-symlink Unix socket/,
+    );
+    assert.doesNotThrow(() => new ManagerExecutorClient(socketPath, MANAGER_TOKEN, 5_000));
+  } finally {
+    await manager.close().catch(() => undefined);
+    await rm(home, { recursive: true, force: true });
   }
 });
 
@@ -282,7 +301,6 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
   ]);
   const coordinator = new RunCoordinator({
     config: testConfig(home, {
-      executionMode: "manager",
       managerSocketPath: socketPath,
       managerToken: MANAGER_TOKEN,
       managerRequestTimeoutMs: 5_000,
@@ -389,7 +407,6 @@ test("execution identity cannot be injected through a tool call or malformed run
   const tools = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
-    processes: {} as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",
@@ -406,10 +423,10 @@ test("execution identity cannot be injected through a tool call or malformed run
   const home = await temporaryDirectory("managed-identity-");
   const coordinator = new RunCoordinator({
     config: testConfig(home, {
-      executionMode: "manager",
       managerSocketPath: join(home, "missing.sock"),
       managerToken: MANAGER_TOKEN,
     }),
+    executor: fakeExecutionManager(),
   });
   try {
     const missingContext = managedRequest();
@@ -459,7 +476,6 @@ test("Manager audit errors fail the tool before tool.started without requesting 
   ]);
   const coordinator = new RunCoordinator({
     config: testConfig(home, {
-      executionMode: "manager",
       managerSocketPath: socketPath,
       managerToken: MANAGER_TOKEN,
       managerRequestTimeoutMs: 5_000,

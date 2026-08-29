@@ -6,10 +6,7 @@ import hashlib
 import io
 import json
 import os
-import shutil
 import sqlite3
-import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -18,7 +15,6 @@ import urllib.parse
 import zipfile
 import zlib
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -4905,12 +4901,12 @@ class PlatformServiceTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
                 sent = service.send_private_message(admin, "do not restore this after clear")
                 self.assertTrue(agent.started.wait(timeout=2))
-                before = service.agent_scopes.get_private_scope(admin["id"])
+                before = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(admin["id"]))
                 self.assertIsNotNone(before)
 
                 cleared = service.clear_private_messages(admin, admin["id"])
                 self.assertEqual(cleared["deleted"], 1)
-                after = service.agent_scopes.get_private_scope(admin["id"])
+                after = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(admin["id"]))
                 self.assertIsNotNone(after)
                 self.assertEqual(after.session_id, before.session_id)
                 self.assertEqual(after.workspace_path, before.workspace_path)
@@ -4946,7 +4942,7 @@ class PlatformServiceTests(unittest.TestCase):
                 _, admin = service.authenticate("admin", "admin")
                 sent = service.send_private_message(admin, "keep this if rotation fails")
                 service.wait_for_agent_idle("private", str(admin["id"]), timeout=3)
-                before = service.agent_scopes.get_private_scope(admin["id"])
+                before = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(admin["id"]))
                 with mock.patch.object(
                     service.agent_scopes,
                     "rotate_session",
@@ -4957,7 +4953,7 @@ class PlatformServiceTests(unittest.TestCase):
                 rotate.assert_not_called()
                 cleanup.assert_not_called()
 
-                after = service.agent_scopes.get_private_scope(admin["id"])
+                after = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(admin["id"]))
                 self.assertEqual(after.session_id, before.session_id)
                 messages = service.audit_private_messages(admin, admin["id"])["messages"]
                 self.assertEqual(messages, [])

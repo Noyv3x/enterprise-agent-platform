@@ -24,7 +24,7 @@ const TEST_RUNTIME_TOKEN = "config-test-token";
 function runtimeEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
-    AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    AGENT_MANAGER_EXECUTOR_TOKEN: "manager-test-token",
     AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     ...overrides,
   };
@@ -46,7 +46,7 @@ test("runtime bearer token is mandatory and rejects missing or blank values", ()
 test("runtime bearer token accepts trimmed direct and file-backed values but rejects an empty file", async () => {
   assert.equal(loadConfig({
     AGENT_RUNTIME_TOKEN: "  direct-token \n",
-    AGENT_RUNTIME_EXECUTOR_MODE: "local",
+    AGENT_MANAGER_EXECUTOR_TOKEN: "manager-test-token",
     AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
   }).bearerToken, "direct-token");
   const home = await temporaryDirectory("agent-runtime-config-token-");
@@ -55,14 +55,14 @@ test("runtime bearer token accepts trimmed direct and file-backed values but rej
     await writeFile(tokenFile, "  file-token \n", { encoding: "utf8", mode: 0o600 });
     assert.equal(loadConfig({
       AGENT_RUNTIME_TOKEN_FILE: tokenFile,
-      AGENT_RUNTIME_EXECUTOR_MODE: "local",
+      AGENT_MANAGER_EXECUTOR_TOKEN: "manager-test-token",
       AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
     }).bearerToken, "file-token");
     await writeFile(tokenFile, " \n\t", "utf8");
     assert.throws(
       () => loadConfig({
         AGENT_RUNTIME_TOKEN_FILE: tokenFile,
-        AGENT_RUNTIME_EXECUTOR_MODE: "local",
+        AGENT_MANAGER_EXECUTOR_TOKEN: "manager-test-token",
         AGENT_PLATFORM_TECHNICAL_PROFILE: "agent-platform-v1",
       }),
       /AGENT_RUNTIME_TOKEN or AGENT_RUNTIME_TOKEN_FILE to a non-empty value/,
@@ -76,7 +76,7 @@ test("runtime requires the target technical profile", () => {
   assert.throws(
     () => loadConfig({
       AGENT_RUNTIME_TOKEN: TEST_RUNTIME_TOKEN,
-      AGENT_RUNTIME_EXECUTOR_MODE: "local",
+      AGENT_MANAGER_EXECUTOR_TOKEN: "manager-test-token",
     }),
     /AGENT_PLATFORM_TECHNICAL_PROFILE must be agent-platform-v1/,
   );

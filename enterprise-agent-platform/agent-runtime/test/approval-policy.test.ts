@@ -13,15 +13,15 @@ import { temporaryDirectory } from "./helpers.js";
 test("terminal approval keys and displays bind the exact raw command and execution shape", async () => {
   const workspace = await temporaryDirectory("agent-approval-policy-");
   try {
-    const base = await classifyToolCall("terminal", { command: "printf ok" }, workspace);
-    const controlled = await classifyToolCall("terminal", {
+    const base = await hostPolicy("terminal", { command: "printf ok" }, workspace);
+    const controlled = await hostPolicy("terminal", {
       command: "\u001b[31mprintf ok\u001b[0m\r\n",
       cwd: ".",
       background: false,
     }, workspace);
     assert.match(controlled.hardBlock || "", /control characters/);
-    const ascii = await classifyToolCall("terminal", { command: "printf K" }, workspace);
-    const fullwidth = await classifyToolCall("terminal", { command: "printf Ｋ" }, workspace);
+    const ascii = await hostPolicy("terminal", { command: "printf K" }, workspace);
+    const fullwidth = await hostPolicy("terminal", { command: "printf Ｋ" }, workspace);
     assert.notEqual(
       ascii.approvalKey,
       fullwidth.approvalKey,
@@ -31,14 +31,14 @@ test("terminal approval keys and displays bind the exact raw command and executi
     assert.equal(fullwidth.displayArguments?.command, "printf Ｋ");
     assert.notEqual(
       base.approvalKey,
-      (await classifyToolCall("terminal", { command: "printf changed" }, workspace)).approvalKey,
+      (await hostPolicy("terminal", { command: "printf changed" }, workspace)).approvalKey,
     );
     assert.notEqual(
       base.approvalKey,
-      (await classifyToolCall("terminal", { command: "printf ok", cwd: "/tmp" }, workspace)).approvalKey,
+      (await hostPolicy("terminal", { command: "printf ok", cwd: "/tmp" }, workspace)).approvalKey,
     );
-    const configuredDefault = await classifyToolCall("terminal", { command: "printf ok" }, workspace, 12_345);
-    const explicitDefault = await classifyToolCall(
+    const configuredDefault = await hostPolicy("terminal", { command: "printf ok" }, workspace, 12_345);
+    const explicitDefault = await hostPolicy(
       "terminal",
       { command: "printf ok", timeout_ms: 12_345 },
       workspace,
@@ -48,14 +48,14 @@ test("terminal approval keys and displays bind the exact raw command and executi
     assert.equal(configuredDefault.displayArguments?.timeout_ms, 12_345);
     assert.notEqual(
       configuredDefault.approvalKey,
-      (await classifyToolCall("terminal", { command: "printf ok", timeout_ms: 12_346 }, workspace, 12_345)).approvalKey,
+      (await hostPolicy("terminal", { command: "printf ok", timeout_ms: 12_346 }, workspace, 12_345)).approvalKey,
     );
     assert.notEqual(
       base.approvalKey,
-      (await classifyToolCall("terminal", { command: "printf ok", background: true }, workspace)).approvalKey,
+      (await hostPolicy("terminal", { command: "printf ok", background: true }, workspace)).approvalKey,
     );
-    const background = await classifyToolCall("terminal", { command: "printf ok", background: true }, workspace, 12_345);
-    const backgroundTimed = await classifyToolCall(
+    const background = await hostPolicy("terminal", { command: "printf ok", background: true }, workspace, 12_345);
+    const backgroundTimed = await hostPolicy(
       "terminal",
       { command: "printf ok", background: true, timeout_ms: 12_345 },
       workspace,
@@ -71,41 +71,41 @@ test("terminal approval keys and displays bind the exact raw command and executi
 
 test("terminal approval rejects commands that cannot be displayed completely", async () => {
   const exact = "x".repeat(APPROVAL_ARGUMENT_MAX_BYTES);
-  assert.ok((await classifyToolCall("terminal", { command: exact })).approvalKey);
+  assert.ok((await hostPolicy("terminal", { command: exact })).approvalKey);
 
-  const oversized = await classifyToolCall("terminal", { command: `${exact}x` });
+  const oversized = await hostPolicy("terminal", { command: `${exact}x` });
   assert.match(oversized.hardBlock || "", /complete approval display limit/);
   assert.equal(oversized.approvalKey, undefined);
 
-  const multibyte = await classifyToolCall("terminal", {
+  const multibyte = await hostPolicy("terminal", {
     command: "界".repeat(Math.floor(APPROVAL_ARGUMENT_MAX_BYTES / 3) + 1),
   });
   assert.match(multibyte.hardBlock || "", /UTF-8 bytes/);
   assert.equal(multibyte.displayArguments, undefined);
 });
 
-test("file approval keys bind canonical target and every execution argument", async () => {
+test("file approval keys bind the Manager path projection and every execution argument", async () => {
   const workspace = await temporaryDirectory("agent-file-approval-policy-");
   const outside = await temporaryDirectory("agent-file-approval-outside-");
   try {
     await symlink(outside, `${workspace}/link`);
-    const direct = await classifyToolCall("write_file", {
+    const direct = await hostPolicy("write_file", {
       path: `${outside}/note.txt`,
       content: "approved content",
     }, workspace);
-    const throughLink = await classifyToolCall("write_file", {
+    const throughLink = await hostPolicy("write_file", {
       path: "link/note.txt",
       content: "approved content",
     }, workspace);
-    assert.equal(direct.approvalKey, throughLink.approvalKey);
+    assert.notEqual(direct.approvalKey, throughLink.approvalKey);
     assert.notEqual(
       direct.approvalKey,
-      (await classifyToolCall("write_file", {
+      (await hostPolicy("write_file", {
         path: `${outside}/other.txt`,
         content: "approved content",
       }, workspace)).approvalKey,
     );
-    const changedContent = await classifyToolCall("write_file", {
+    const changedContent = await hostPolicy("write_file", {
       path: `${outside}/note.txt`,
       content: "different content",
     }, workspace);
@@ -113,13 +113,13 @@ test("file approval keys bind canonical target and every execution argument", as
     assert.match(JSON.stringify(direct.displayArguments), /content omitted: 16 UTF-8 bytes/);
     assert.doesNotMatch(JSON.stringify(direct.displayArguments), /approved content/);
 
-    const firstPatch = await classifyToolCall("patch_file", {
+    const firstPatch = await hostPolicy("patch_file", {
       path: `${outside}/note.txt`,
       old_text: "old",
       new_text: "first",
       expected_replacements: 1,
     }, workspace);
-    const secondPatch = await classifyToolCall("patch_file", {
+    const secondPatch = await hostPolicy("patch_file", {
       path: `${outside}/note.txt`,
       old_text: "old",
       new_text: "second",
@@ -134,10 +134,10 @@ test("file approval keys bind canonical target and every execution argument", as
 });
 
 test("action approval keys bind action and resource", async () => {
-  const writeOne = await classifyToolCall("process", { action: "write", process_id: "one", input: "printf one\n" });
-  const writeTwo = await classifyToolCall("process", { action: "write", process_id: "two", input: "printf one\n" });
-  const changedInput = await classifyToolCall("process", { action: "write", process_id: "one", input: "printf changed\n" });
-  const killOne = await classifyToolCall("process", { action: "kill", process_id: "one" });
+  const writeOne = await hostPolicy("process", { action: "write", process_id: "one", input: "printf one\n" });
+  const writeTwo = await hostPolicy("process", { action: "write", process_id: "two", input: "printf one\n" });
+  const changedInput = await hostPolicy("process", { action: "write", process_id: "one", input: "printf changed\n" });
+  const killOne = await hostPolicy("process", { action: "kill", process_id: "one" });
   assert.notEqual(writeOne.approvalKey, writeTwo.approvalKey);
   assert.notEqual(writeOne.approvalKey, changedInput.approvalKey);
   assert.notEqual(writeOne.approvalKey, killOne.approvalKey);
@@ -172,7 +172,7 @@ test("approved mutation keys bind all arguments and redact body fields", async (
 });
 
 test("process write rejects oversized and hardline input before approval", async () => {
-  const oversized = await classifyToolCall("process", {
+  const oversized = await hostPolicy("process", {
     action: "write",
     process_id: "shell",
     input: "x".repeat(APPROVAL_ARGUMENT_MAX_BYTES + 1),
@@ -180,7 +180,7 @@ test("process write rejects oversized and hardline input before approval", async
   assert.match(oversized.hardBlock || "", /Process input exceeds/);
   assert.equal(oversized.approvalKey, undefined);
   for (const input of ["rm -rf /\n", "command -p rm -rf /\n", "printf 'rm -rf /' | sh\n"]) {
-    assert.ok((await classifyToolCall("process", { action: "write", process_id: "shell", input })).hardBlock);
+    assert.ok((await hostPolicy("process", { action: "write", process_id: "shell", input })).hardBlock);
   }
 });
 
@@ -225,14 +225,14 @@ test("terminal and process write reject executable shell syntax hidden by redact
     "set -- curl -H 'Authorization: touch /tmp/hidden'; eval \"${3#*: }\"",
   ];
   for (const command of hiddenCommands) {
-    const terminal = await classifyToolCall("terminal", { command });
+    const terminal = await hostPolicy("terminal", { command });
     assert.match(
       terminal.hardBlock || "",
       /redacted sensitive value|[Ss]ensitive environment assignment|executable shell syntax|credential inside nested shell evaluation/,
     );
     assert.equal(terminal.approvalKey, undefined);
 
-    const processWrite = await classifyToolCall("process", {
+    const processWrite = await hostPolicy("process", {
       action: "write",
       process_id: "shell",
       input: `${command}\n`,
@@ -249,9 +249,9 @@ test("terminal and process write reject executable shell syntax hidden by redact
     "API_TOKEN='abc123' printf ok",
     "API_TOKEN=\"abc_123-./+=:@%\" printf ok",
   ]) {
-    const terminal = await classifyToolCall("terminal", { command: safeAssignment });
+    const terminal = await hostPolicy("terminal", { command: safeAssignment });
     assert.ok(terminal.approvalKey, `ordinary credential use should remain approvable: ${safeAssignment}`);
-    const processWrite = await classifyToolCall("process", {
+    const processWrite = await hostPolicy("process", {
       action: "write",
       process_id: "shell",
       input: `${safeAssignment}\n`,
@@ -267,9 +267,9 @@ test("terminal and process write reject executable shell syntax hidden by redact
     "tool --api-key='complex secret value'",
     "printf '%s' 'documentation API_TOKEN=complex value'",
   ]) {
-    const terminal = await classifyToolCall("terminal", { command: safeCommand });
+    const terminal = await hostPolicy("terminal", { command: safeCommand });
     assert.ok(terminal.approvalKey, `ordinary credential use should remain approvable: ${safeCommand}`);
-    const processWrite = await classifyToolCall("process", {
+    const processWrite = await hostPolicy("process", {
       action: "write",
       process_id: "shell",
       input: `${safeCommand}\n`,
@@ -291,9 +291,9 @@ test("terminal and process write reject high-risk invisible and bidi controls", 
   ];
   for (const codePoint of codePoints) {
     const control = String.fromCodePoint(codePoint);
-    const terminal = await classifyToolCall("terminal", { command: `printf 'left${control}right'` });
+    const terminal = await hostPolicy("terminal", { command: `printf 'left${control}right'` });
     assert.match(terminal.hardBlock || "", /forbidden control characters/, `U+${codePoint.toString(16)}`);
-    const processWrite = await classifyToolCall("process", {
+    const processWrite = await hostPolicy("process", {
       action: "write",
       process_id: "shell",
       input: `printf 'left${control}right'\n`,
@@ -462,6 +462,15 @@ test("approval command display redacts common attached client credentials withou
     assert.match(redacted, /nested shell evaluation/);
   }
 });
+
+async function hostPolicy(
+  toolName: string,
+  args: Record<string, unknown>,
+  workspace?: string,
+  defaultTerminalTimeoutMs?: number,
+) {
+  return await classifyToolCall(toolName, { target: "host", ...args }, workspace, defaultTerminalTimeoutMs);
+}
 
 function range(first: number, last: number): number[] {
   return Array.from({ length: last - first + 1 }, (_, offset) => first + offset);

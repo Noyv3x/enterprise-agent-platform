@@ -45,7 +45,7 @@ import {
 } from "./model-resolver.js";
 import { ownerUserId, PlatformGateway } from "./platform-gateway.js";
 import { AlwaysApprovalStore, IdempotencyStore, type PersistentIdempotencyRecord } from "./persistence.js";
-import { ProcessRegistry } from "./process-registry.js";
+import type { ProcessPreviewResult, ProcessPreviewSummary } from "./process-registry.js";
 import {
   CURRENT_MODEL_CONTENT_SECURITY_VERSION,
   SessionStore,
@@ -162,6 +162,7 @@ export class SessionBusyError extends Error {
 
 export interface RunCoordinatorOptions {
   config: RuntimeConfig;
+  executor?: ExecutionManager;
   streamFn?: StreamFn;
   visionStreamFn?: StreamFn;
   visionTimeoutMs?: number;
@@ -169,11 +170,10 @@ export interface RunCoordinatorOptions {
 
 export class RunCoordinator {
   readonly sessions: SessionStore;
-  readonly processes: ProcessRegistry;
   readonly gateway: PlatformGateway;
   readonly approvals: ApprovalBroker;
   readonly idempotency: IdempotencyStore;
-  readonly executor: ExecutionManager | undefined;
+  readonly executor: ExecutionManager;
   private readonly config: RuntimeConfig;
   private readonly streamFn: StreamFn | undefined;
   private readonly visionStreamFn: StreamFn;
@@ -211,8 +211,7 @@ export class RunCoordinator {
       throw new Error("visionTimeoutMs must be a positive integer");
     }
     this.sessions = new SessionStore(options.config.home);
-    this.processes = new ProcessRegistry();
-    this.executor = createExecutionManager(options.config);
+    this.executor = options.executor ?? createExecutionManager(options.config);
     this.gateway = new PlatformGateway(options.config.platformUrl, options.config.platformToken);
     this.idempotency = new IdempotencyStore(options.config.home);
     this.approvals = new ApprovalBroker(
@@ -261,10 +260,10 @@ export class RunCoordinator {
       }
       throw new RunValidationError(errorMessage(error));
     }
-    if (this.executor?.managed && !request.execution_context) {
+    if (!request.execution_context) {
       throw new RunValidationError("execution_context is required when Manager execution is enabled");
     }
-    if (this.executor?.managed && request.workspace !== CONTAINER_PATHS.workspace) {
+    if (request.workspace !== CONTAINER_PATHS.workspace) {
       throw new RunValidationError(`Manager execution requires the fixed ${CONTAINER_PATHS.workspace} container path`);
     }
     this.assertScopeAvailable(request);
@@ -470,21 +469,17 @@ export class RunCoordinator {
     record.controller.abort();
     this.agents.get(runId)?.abort();
     this.approvals.cancelRun(runId);
-    if (this.executor?.managed) {
-      void this.executor.cancelRun(runExecutionIdentity(record)).then((confirmed) => {
-        if (!confirmed) {
-          this.journals.get(runId)?.publish("execution.cleanup.failed", {
-            reason: "Manager did not confirm run execution cleanup",
-          });
-        }
-      }).catch((error) => {
+    void this.executor.cancelRun(runExecutionIdentity(record)).then((confirmed) => {
+      if (!confirmed) {
         this.journals.get(runId)?.publish("execution.cleanup.failed", {
-          reason: errorMessage(error),
+          reason: "Manager did not confirm run execution cleanup",
         });
+      }
+    }).catch((error) => {
+      this.journals.get(runId)?.publish("execution.cleanup.failed", {
+        reason: errorMessage(error),
       });
-    } else {
-      this.processes.killRun(runId);
-    }
+    });
     if (record.status === "queued") {
       const queueIndex = this.topLevelQueue.indexOf(runId);
       if (queueIndex >= 0) this.topLevelQueue.splice(queueIndex, 1);
@@ -530,22 +525,13 @@ export class RunCoordinator {
         throw new Error("Agent run cancellation could not be confirmed");
       }
       await this.approvals.clearScope(scopeKey, lifecycleId);
-      let completionTasks: Awaited<ReturnType<ExecutionManager["cleanupScope"]>>["completion_tasks"] = [];
-      if (this.executor?.managed) {
-        const cleaned = await this.executor.cleanupScope({
-          scope_id: scopeKey,
-          ...(lifecycleId ? { lifecycle_id: lifecycleId } : {}),
-        });
-        for (const task of cleaned.completion_tasks) {
-          if (!scopeOwns(scopeKey, task.scope_id) || (lifecycleId && lifecycleId !== task.lifecycle_id)) {
-            throw new Error("Manager returned scope cleanup evidence outside the requested scope family");
-          }
-        }
-        completionTasks = cleaned.completion_tasks;
-      } else {
-        this.processes.killScope(scopeKey, lifecycleId);
-        if (!await this.processes.waitForScopeExit(scopeKey, lifecycleId)) {
-          throw new Error("Agent process cleanup could not be confirmed");
+      const cleaned = await this.executor.cleanupScope({
+        scope_id: scopeKey,
+        ...(lifecycleId ? { lifecycle_id: lifecycleId } : {}),
+      });
+      for (const task of cleaned.completion_tasks) {
+        if (!scopeOwns(scopeKey, task.scope_id) || (lifecycleId && lifecycleId !== task.lifecycle_id)) {
+          throw new Error("Manager returned scope cleanup evidence outside the requested scope family");
         }
       }
       if (deleteSessions) {
@@ -553,19 +539,17 @@ export class RunCoordinator {
       } else {
         await this.sessions.deleteBackgroundTaskScopeFamily(scopeKey, lifecycleId);
       }
-      if (this.executor?.managed) {
-        if (completionTasks.length > 0 && !this.executor.acknowledgeTask) {
-          throw new Error("Manager task acknowledgement is unavailable after scope cleanup");
-        }
-        for (const task of completionTasks) {
-          if (!await this.executor.acknowledgeTask!({
-            scope_id: task.scope_id,
-            lifecycle_id: task.lifecycle_id,
-            execution_context: task.execution_context,
-            completion_owner_id: task.completion_owner_id,
-          }, task.process_id)) {
-            throw new Error("Manager did not acknowledge a cleaned background task");
-          }
+      if (cleaned.completion_tasks.length > 0 && !this.executor.acknowledgeTask) {
+        throw new Error("Manager task acknowledgement is unavailable after scope cleanup");
+      }
+      for (const task of cleaned.completion_tasks) {
+        if (!await this.executor.acknowledgeTask!({
+          scope_id: task.scope_id,
+          lifecycle_id: task.lifecycle_id,
+          execution_context: task.execution_context,
+          completion_owner_id: task.completion_owner_id,
+        }, task.process_id)) {
+          throw new Error("Manager did not acknowledge a cleaned background task");
         }
       }
       for (const key of this.scopeExecutionContexts.keys()) {
@@ -768,8 +752,7 @@ export class RunCoordinator {
     scopeKey: string,
     lifecycleId: string,
     sinceRevision?: string,
-  ): Promise<ReturnType<ProcessRegistry["preview"]>> {
-    if (!this.executor?.managed) return this.processes.preview(scopeKey, lifecycleId, sinceRevision);
+  ): Promise<ProcessPreviewResult> {
     return await this.executor.preview(
       this.scopeExecutionIdentity(scopeKey, lifecycleId),
       sinceRevision,
@@ -779,8 +762,7 @@ export class RunCoordinator {
   async previewProcessSummary(
     scopeKey: string,
     lifecycleId: string,
-  ): Promise<ReturnType<ProcessRegistry["previewSummary"]>> {
-    if (!this.executor?.managed) return this.processes.previewSummary(scopeKey, lifecycleId);
+  ): Promise<ProcessPreviewSummary> {
     return await this.executor.previewSummary(this.scopeExecutionIdentity(scopeKey, lifecycleId));
   }
 
@@ -919,11 +901,7 @@ export class RunCoordinator {
         record.controller.abort();
         this.agents.get(record.id)?.abort();
         this.approvals.cancelRun(record.id);
-        if (this.executor?.managed) {
-          void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
-        } else {
-          this.processes.killRun(record.id);
-        }
+        void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
         rejectIdleTimeout(abortError(idleTimeoutMessage));
       }, pollIntervalMs);
       idleWatchdog.unref();
@@ -950,7 +928,7 @@ export class RunCoordinator {
       let activeBackgroundTasksAtStart: BackgroundTaskObligation[] = [];
       if (!learningReview) {
         try {
-          if (this.executor?.managed && this.executor.reconcileTasks) {
+          if (this.executor.reconcileTasks) {
             const recoveredTasks = await this.executor.reconcileTasks({
               scope_id: record.request.scope_key,
               lifecycle_id: record.request.lifecycle_id,
@@ -1035,7 +1013,6 @@ export class RunCoordinator {
       const rawTools = createTools({
         runId: record.id,
         request: record.request,
-        processes: this.processes,
         gateway: this.gateway,
         querySession: async (action, arguments_, signal) => await this.querySession(
           record,
@@ -1057,14 +1034,12 @@ export class RunCoordinator {
         maxDelegatesPerRun: this.config.maxDelegatesPerRun,
         defaultTerminalTimeoutMs: this.config.terminalTimeoutMs,
         currentAttachmentPaths: () => this.runAttachmentPaths.get(record.id) ?? [],
-        ...(this.executor ? {
-          executor: this.executor,
-          executionReceipt: (toolCallId: string) => {
-            const receipt = executionReceipts.get(toolCallId);
-            if (!receipt) throw new Error("Manager execution is missing its audit receipt");
-            return receipt;
-          },
-        } : {}),
+        executor: this.executor,
+        executionReceipt: (toolCallId: string) => {
+          const receipt = executionReceipts.get(toolCallId);
+          if (!receipt) throw new Error("Manager execution is missing its audit receipt");
+          return receipt;
+        },
         ...(this.config.runIdleTimeoutMs > 0 ? {
           onActivity: (description: string) => this.touchRunActivity(record.id, description),
           activityHeartbeatMs: Math.max(1, Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3))),
@@ -1086,7 +1061,7 @@ export class RunCoordinator {
               ? { ...recordValue(params), path: approvedPath }
               : params;
           let receipt: ExecutionAuditReceipt | undefined;
-          if (this.executor?.managed && isExecutionTool(tool.name)) {
+          if (isExecutionTool(tool.name)) {
             const target = executionTargets.get(toolCallId) ?? EXECUTION_TARGETS[0];
             const auditId = id("audit");
             const binding = managedExecutionBinding(
@@ -1174,8 +1149,8 @@ export class RunCoordinator {
                 executionReview,
                 backgroundTaskState,
                 currentRunBackgroundTaskIds,
-                this.executor?.managed && this.executor.acknowledgeTask
-                  ? async (processId) => await this.executor!.acknowledgeTask!({
+                this.executor.acknowledgeTask
+                  ? async (processId) => await this.executor.acknowledgeTask!({
                     scope_id: record.request.scope_key,
                     lifecycle_id: record.request.lifecycle_id,
                     execution_context: executionContext(record.request),
@@ -1482,7 +1457,6 @@ export class RunCoordinator {
             toolContext.args,
             record.request.workspace,
             this.config.terminalTimeoutMs,
-            this.executor?.managed === true,
           );
           if (policy.hardBlock) return { block: true, reason: policy.hardBlock };
           if (
@@ -1833,14 +1807,10 @@ export class RunCoordinator {
       // successful cleanup semantics. Preserve the pre-existing fail-closed
       // cancellation path for every non-completed terminal state.
       if ((record.status as RunRecord["status"]) !== "completed") {
-        if (this.executor?.managed) {
-          void this.executor.cancelRun(
-            runExecutionIdentity(record),
-            completionGuardPreservedProcessIds,
-          ).catch(() => false);
-        } else {
-          this.processes.killRun(record.id, new Set(completionGuardPreservedProcessIds));
-        }
+        void this.executor.cancelRun(
+          runExecutionIdentity(record),
+          completionGuardPreservedProcessIds,
+        ).catch(() => false);
       }
       this.runActivities.delete(record.id);
     }
@@ -2283,15 +2253,7 @@ export class RunCoordinator {
       this.delegationResults.delete(child.id);
       unsubscribeChildJournal?.();
       signal?.removeEventListener("abort", onAbort);
-      if (this.executor?.managed) {
-        await this.executor.cancelRun(runExecutionIdentity(child)).catch(() => false);
-      } else {
-        this.processes.killScope(child.request.scope_key, child.request.lifecycle_id);
-        await this.processes.waitForScopeExit(
-          child.request.scope_key,
-          child.request.lifecycle_id,
-        ).catch(() => false);
-      }
+      await this.executor.cancelRun(runExecutionIdentity(child)).catch(() => false);
       await this.gateway.invoke(
         child.request,
         child.id,
@@ -2470,7 +2432,6 @@ export class RunCoordinator {
 
   shutdown(): void {
     for (const record of this.runs.values()) if (!isTerminal(record.status)) this.cancel(record.id);
-    if (!this.executor?.managed) this.processes.shutdown();
   }
 
   private drainTopLevelQueue(): void {

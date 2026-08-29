@@ -1,4 +1,5 @@
 import { request as httpRequest } from "node:http";
+import { lstatSync } from "node:fs";
 import { EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import { redactCommandForApproval } from "./approval-policy.js";
 import type {
@@ -93,7 +94,6 @@ export interface ScopeCleanupResult {
 }
 
 export interface ExecutionManager {
-  readonly managed: boolean;
   audit(request: ExecutionAuditRequest, signal?: AbortSignal): Promise<ExecutionAuditReceipt>;
   terminal(
     context: ExecutionCallContext,
@@ -128,7 +128,6 @@ export interface ExecutionManager {
 }
 
 export class ManagerExecutorClient implements ExecutionManager {
-  readonly managed = true;
   private readonly socketPath: string;
   private readonly token: string;
   private readonly requestTimeoutMs: number;
@@ -136,6 +135,15 @@ export class ManagerExecutorClient implements ExecutionManager {
   constructor(socketPath: string, token: string, requestTimeoutMs: number) {
     if (!socketPath.trim()) throw new Error("Manager executor socket path must be non-empty");
     if (!token.trim()) throw new Error("Manager executor token must be non-empty");
+    let socket: ReturnType<typeof lstatSync>;
+    try {
+      socket = lstatSync(socketPath);
+    } catch (error) {
+      throw new Error(`Manager executor socket is unavailable at ${socketPath}: ${errorMessage(error)}`);
+    }
+    if (socket.isSymbolicLink() || !socket.isSocket()) {
+      throw new Error(`Manager executor path must be a non-symlink Unix socket: ${socketPath}`);
+    }
     this.socketPath = socketPath;
     this.token = token;
     this.requestTimeoutMs = requestTimeoutMs;
@@ -396,11 +404,7 @@ export class ManagerExecutorClient implements ExecutionManager {
 }
 
 /** Constructing production mode without the Manager identity fails closed. */
-export function createExecutionManager(config: RuntimeConfig): ExecutionManager | undefined {
-  if (config.executionMode === "local") return undefined;
-  if (!config.managerSocketPath || !config.managerToken) {
-    throw new Error("Manager executor mode requires a socket path and bearer token");
-  }
+export function createExecutionManager(config: RuntimeConfig): ExecutionManager {
   return new ManagerExecutorClient(
     config.managerSocketPath,
     config.managerToken,

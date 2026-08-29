@@ -1,6 +1,7 @@
 import { Button } from "antd";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
+import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { AgentPreviewScope, ComputerFileClue } from "../../types";
@@ -31,27 +32,6 @@ const STREAM_TARGET_FRAMES = 18;
 
 type ProgressiveFilePhase = "draft" | "settle" | "immediate";
 
-function prefersReducedMotion(): boolean {
-  return typeof window !== "undefined"
-    && typeof window.matchMedia === "function"
-    && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-}
-
-function usePrefersReducedMotion(): boolean {
-  const [reduced, setReduced] = useState(prefersReducedMotion);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const update = () => setReduced(query.matches);
-    update();
-    query.addEventListener?.("change", update);
-    return () => query.removeEventListener?.("change", update);
-  }, []);
-
-  return reduced;
-}
-
 function safeSliceEnd(content: string, end: number): number {
   if (end <= 0 || end >= content.length) return end;
   const preceding = content.charCodeAt(end - 1);
@@ -66,7 +46,7 @@ function useProgressiveDraftContent(
   phase: ProgressiveFilePhase,
   identity: string,
 ): { content: string; streaming: boolean } {
-  const reducedMotion = usePrefersReducedMotion();
+  const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const [view, setView] = useState({ content, streamIdentity: "" });
   const displayedRef = useRef(content);
   const streamIdentityRef = useRef("");

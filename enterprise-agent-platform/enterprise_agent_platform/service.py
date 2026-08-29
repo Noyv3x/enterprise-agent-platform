@@ -47,7 +47,7 @@ from .auth import (
     hash_password,
     verify_password,
 )
-from .agent_inputs import AgentRunInput, AgentRunInputStore
+from .agent_inputs import AgentRunInputStore
 from .agent_scopes import (
     AgentExecutionScope,
     AgentScopeManager,
@@ -55,7 +55,7 @@ from .agent_scopes import (
 )
 from .camofox_state import ensure_camofox_runtime_sidecar
 from .config import OAUTH_SECRET_KEYS, PlatformConfig
-from .container_contract_generated import CONTAINER_PATHS, DATABASE_SCHEMA_VERSION
+from .container_contract_generated import CONTAINER_PATHS
 from .db import (
     Database,
     assert_existing_database_profile,
@@ -18276,13 +18276,6 @@ class EnterpriseService:
         if not path.exists() or not path.is_file():
             raise ServiceError(404, "attachment file is missing")
         return self._attachment_from_row(row), path
-
-    def get_attachment_xlsx_preview(
-        self,
-        actor: dict[str, Any],
-        attachment_id: int,
-    ) -> dict[str, Any]:
-        return self.get_attachment_preview(actor, attachment_id)
 
     def get_attachment_preview(
         self,

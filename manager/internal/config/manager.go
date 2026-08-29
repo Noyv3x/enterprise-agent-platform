@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -135,20 +136,9 @@ func (m *Manager) Patch(update Patch) (Public, error) {
 }
 
 func sameLANConfig(left, right Config) bool {
-	if left.LANEnabled != right.LANEnabled || left.LANAddress != right.LANAddress || len(left.DirectAccessCIDRs) != len(right.DirectAccessCIDRs) || len(left.TrustedIngressCIDRs) != len(right.TrustedIngressCIDRs) {
-		return false
-	}
-	for index := range left.DirectAccessCIDRs {
-		if left.DirectAccessCIDRs[index] != right.DirectAccessCIDRs[index] {
-			return false
-		}
-	}
-	for index := range left.TrustedIngressCIDRs {
-		if left.TrustedIngressCIDRs[index] != right.TrustedIngressCIDRs[index] {
-			return false
-		}
-	}
-	return true
+	return left.LANEnabled == right.LANEnabled && left.LANAddress == right.LANAddress &&
+		slices.Equal(left.DirectAccessCIDRs, right.DirectAccessCIDRs) &&
+		slices.Equal(left.TrustedIngressCIDRs, right.TrustedIngressCIDRs)
 }
 
 func public(value Config, lanActive bool, lanError string) Public {

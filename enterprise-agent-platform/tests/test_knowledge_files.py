@@ -352,7 +352,7 @@ class KnowledgeFileStorageTests(unittest.TestCase):
             database = Database(Path(directory) / "platform.db")
             try:
                 knowledge = configured_knowledge(database)
-                document = knowledge.add_document(
+                document, _ = knowledge.add_document_with_status(
                     title="Manual", content="Alpha", summary="Summary", source="Wiki"
                 )
                 expected_hash = hashlib.sha256(

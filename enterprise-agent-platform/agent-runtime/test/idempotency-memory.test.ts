@@ -4,9 +4,8 @@ import { rm, stat } from "node:fs/promises";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { IdempotencyStore } from "../src/persistence.js";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("RunCoordinator deduplicates scope-local idempotency keys during retention", async () => {
   const home = await temporaryDirectory("agent-idempotency-");

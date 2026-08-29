@@ -697,8 +697,6 @@ button,
   margin: 0 auto;
   gap: var(--section-gap);
 }
-.panel__header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; min-width: 0; }
-.panel__header h2 { font-family: var(--font-sans); font-size: 19px; font-weight: 680; }
 .card__head,
 .card__head > div,
 .card__title,

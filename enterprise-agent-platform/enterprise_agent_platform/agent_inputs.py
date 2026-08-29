@@ -98,41 +98,6 @@ class AgentRunInputStore:
             raise RuntimeError("Agent input root insert did not produce a row")
         return self._from_row(dict(row))
 
-    def reserve(
-        self,
-        *,
-        message_id: int,
-        job_id: int,
-        parent_job_id: int,
-        input_group_id: str,
-    ) -> tuple[AgentRunInput, bool]:
-        ts = now_ts()
-        with self.db.transaction() as conn:
-            cursor = conn.execute(
-                """
-                INSERT INTO agent_run_inputs(
-                    message_id, job_id, parent_job_id, input_group_id,
-                    state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'reserved', ?, ?)
-                ON CONFLICT(message_id) DO NOTHING
-                """,
-                (
-                    int(message_id),
-                    int(job_id),
-                    int(parent_job_id),
-                    str(input_group_id),
-                    ts,
-                    ts,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM agent_run_inputs WHERE message_id = ?",
-                (int(message_id),),
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Agent input reservation did not produce a row")
-        return self._from_row(dict(row)), cursor.rowcount > 0
-
     def reserve_and_claim(
         self,
         *,

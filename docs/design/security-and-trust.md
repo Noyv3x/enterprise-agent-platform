@@ -40,6 +40,8 @@ Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真�
 
 ## 工具执行与审计
 
+Runtime 不保留本地 terminal、process 或文件执行后备；生产调用统一经过 Manager executor。启动时 Manager bearer 必须非空，配置的 Unix socket 必须已经存在且确为 socket，否则 Runtime 在开放服务前失败；单元测试只在同一执行接口注入确定性 fake，不能借测试分支改变审批或身份语义。
+
 所有 terminal、process 和文件调用先执行确定性的 hard-block、参数/正文上限、canonical 路径校验和凭据脱敏，再进入执行器。hard-block 不可被目标、历史记录或模型参数覆盖。至少拒绝：
 
 - Docker socket、管理器控制/状态目录和其它容器编排入口；

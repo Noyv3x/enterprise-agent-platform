@@ -83,18 +83,6 @@
   box-shadow: 0 0 0 1px var(--surface-2);
 }
 
-.chat-preview__terminal-indicator {
-  min-width: 16px;
-  height: 16px;
-  padding-inline: 4px;
-  border: 1px solid var(--surface-2);
-  background: var(--accent-solid);
-  color: var(--on-accent);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  line-height: 14px;
-}
-
 .chat-preview__close.chat-preview__close {
   flex: none;
   color: var(--muted);

@@ -234,14 +234,6 @@ func validateReleaseURL(rawURL string) error {
 	}
 	return errReleaseURLPolicy
 }
-func (m Manifest) Digest() (string, error) {
-	data, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	sum := sha256.Sum256(data)
-	return "sha256:" + hex.EncodeToString(sum[:]), nil
-}
 
 type Client struct{ HTTP *http.Client }
 

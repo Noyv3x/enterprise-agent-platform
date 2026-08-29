@@ -607,15 +607,6 @@ class AgentRuntimeClient:
             )
         return result
 
-    def health(self) -> dict[str, Any]:
-        result, _ = self._json_request(
-            "GET",
-            "/health",
-            None,
-            timeout=min(self.request_timeout_seconds, 10.0),
-        )
-        return result
-
     def model_catalog(self) -> dict[str, Any]:
         """Fetch the Runtime-owned trusted model capability catalog."""
 

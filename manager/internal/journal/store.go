@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -165,11 +166,6 @@ func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (
 	}
 	s.state = next
 	return cloneState(next), nil
-}
-
-func (s *Store) Heartbeat(now time.Time) error {
-	_, err := s.MutateState(now, func(state *model.ManagerState) error { return nil })
-	return err
 }
 
 func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operation, bool, error) {
@@ -537,11 +533,6 @@ func cloneState(value model.ManagerState) model.ManagerState {
 }
 func cloneGeneration(value model.Generation) model.Generation {
 	clone := value
-	if value.Images != nil {
-		clone.Images = make(map[string]string, len(value.Images))
-		for k, v := range value.Images {
-			clone.Images[k] = v
-		}
-	}
+	clone.Images = maps.Clone(value.Images)
 	return clone
 }

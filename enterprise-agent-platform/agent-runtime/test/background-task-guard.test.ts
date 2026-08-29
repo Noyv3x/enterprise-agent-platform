@@ -5,10 +5,9 @@ import test from "node:test";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ExecutionManager } from "../src/executor.js";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import { classifyToolCall, createTools, managedExecutionBinding } from "../src/tools.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 const ACTIVE_TASK_REVIEW_ERROR = "Agent run stopped before observing a required background task reach a terminal state; review is required before resuming";
 const BACKGROUND_STATE_REVIEW_ERROR = "Runtime could not safely verify finite background task state; review is required before resuming";
@@ -33,7 +32,6 @@ test("the default background task cannot be ignored and forces needs_review afte
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
     const run = coordinator.createRun(baseRequest(workspace, "ignored-task"));
-    await approveTerminal(coordinator, run.id);
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.error, ACTIVE_TASK_REVIEW_ERROR);
@@ -48,9 +46,6 @@ test("the default background task cannot be ignored and forces needs_review afte
       "Runtime task follow-ups must not become durable conversation content",
     );
     assert.equal((await coordinator.sessions.loadActiveBackgroundTasks(identity("ignored-task"))).length, 1);
-    const preserved = coordinator.processes.list("private:1", "life");
-    assert.equal(preserved.length, 1);
-    assert.equal(preserved[0]?.status, "running", "completion-guard needs_review must preserve its finite task");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -77,7 +72,6 @@ test("process.wait observing a completed task releases the completion guard", as
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
     const run = coordinator.createRun(baseRequest(workspace, "waited-task"));
-    await approveTerminal(coordinator, run.id);
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "The background task reached its verified terminal state.");
@@ -111,7 +105,6 @@ test("a process.wait timeout does not release the background task guard", async 
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
     const run = coordinator.createRun(baseRequest(workspace, "timeout-task"));
-    await approveTerminal(coordinator, run.id);
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.error, ACTIVE_TASK_REVIEW_ERROR);
@@ -149,8 +142,11 @@ test("an orphaned Manager snapshot does not release a persisted background task"
       };
     },
   };
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     await coordinator.sessions.backgroundTaskState(identity("orphaned-task")).register(
       "process_orphaned",
@@ -205,7 +201,6 @@ test("an explicitly declared background service does not block Run completion", 
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
   try {
     const run = coordinator.createRun(baseRequest(workspace, "service"));
-    await approveTerminal(coordinator, run.id);
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "The requested long-lived service was started.");
@@ -244,8 +239,11 @@ test("a delegated Run rejects every background process before Manager audit or e
       return fauxAssistantMessage("I cannot leave a background process in a temporary delegated scope.");
     },
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     const completed = await coordinator.wait(coordinator.createRun({
       ...baseRequest("/workspace", "delegated-background"),
@@ -288,8 +286,11 @@ test("terminal evidence for an unregistered managed service does not enter task 
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The service observation completed without creating a finite-task obligation."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     const completed = await coordinator.wait(coordinator.createRun({
       ...baseRequest("/workspace", "managed-service-evidence"),
@@ -308,7 +309,6 @@ test("background_kind is closed-world, requires background=true, and never enter
   const terminal = createTools({
     runId: "run",
     request: { scope_key: "private:1", lifecycle_id: "life", workspace: "/workspace" } as never,
-    processes: {} as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",
@@ -372,7 +372,6 @@ test("managed background task evidence uses Manager snapshots without forwarding
   const auditArguments: Array<Record<string, unknown>> = [];
   const auditDetails: Array<Record<string, unknown>> = [];
   const manager: ExecutionManager = {
-    managed: true,
     async audit(request) {
       auditArguments.push(request.arguments);
       auditDetails.push(request.details);
@@ -405,8 +404,11 @@ test("managed background task evidence uses Manager snapshots without forwarding
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The managed background task completed."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     const completed = await coordinator.wait(coordinator.createRun({
       ...baseRequest("/workspace", "managed-task"),
@@ -432,7 +434,6 @@ test("Manager task reconciliation repairs a crash before Runtime sidecar registr
   let reconcileCalls = 0;
   let processCalls = 0;
   const manager: ExecutionManager = {
-    managed: true,
     async audit(request) {
       return { audit_id: request.audit_id, executor_id: "executor-reconcile", target: request.target };
     },
@@ -480,8 +481,11 @@ test("Manager task reconciliation repairs a crash before Runtime sidecar registr
     },
     fauxAssistantMessage("Recovered task verified without replay."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     const completed = await coordinator.wait(coordinator.createRun({
       ...baseRequest("/workspace", "reconcile-task"),
@@ -524,8 +528,11 @@ test("run-start reconciliation completes a resolved tombstone acknowledgement be
       return fauxAssistantMessage("The prior task acknowledgement was recovered before this turn.");
     },
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   try {
     const state = coordinator.sessions.backgroundTaskState(identity("resolved-tombstone"));
     await state.register("proc_resolved", "sandbox");
@@ -629,8 +636,11 @@ test("an active task blocks schedule creation before Platform access and termina
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The task finished and the separately requested schedule was created."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   let platformCalls = 0;
   coordinator.gateway.invoke = async (_request, _runId, tool, action) => {
     assert.equal(tool, "schedule");
@@ -692,8 +702,11 @@ test("scope cleanup reaches a Manager pre-start intent without Runtime context o
       return true;
     },
   };
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: fauxProvider().provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: fauxProvider().provider.streamSimple,
+  });
   try {
     assert.equal(await coordinator.cleanupScope("private:1", "life"), 0);
     assert.deepEqual(cleanupIdentities, [{ scope_id: "private:1", lifecycle_id: "life" }]);
@@ -726,8 +739,11 @@ test("scope cleanup retries after local responsibility commit fails and retains 
       return true;
     },
   };
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   const taskIdentity = identity("cleanup-local-retry");
   try {
     const run = coordinator.createRun({
@@ -778,8 +794,11 @@ test("permanent scope cleanup retries acknowledgement after local session commit
       return true;
     },
   };
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  Object.defineProperty(coordinator, "executor", { value: manager });
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: manager,
+    streamFn: faux.provider.streamSimple,
+  });
   const taskIdentity = identity("cleanup-ack-retry");
   try {
     const run = coordinator.createRun({
@@ -846,7 +865,6 @@ function managedSnapshot(status: "running" | "completed") {
 
 function managedBackgroundManager(): ExecutionManager {
   return {
-    managed: true,
     async audit(request) {
       return { audit_id: request.audit_id, executor_id: "executor-managed", target: request.target };
     },
@@ -861,13 +879,6 @@ function managedBackgroundManager(): ExecutionManager {
     async preview() { return { processes: [], revision: "preview_test:restart" }; },
     async previewSummary() { return { running_terminal_count: 0 }; },
   };
-}
-
-async function approveTerminal(coordinator: RunCoordinator, runId: string): Promise<void> {
-  const approval = await waitUntil(() => coordinator.getJournal(runId)?.list().find(
-    (event) => event.type === "approval.requested",
-  ));
-  await coordinator.respondApproval(runId, String(approval.data.approval_id), "once");
 }
 
 async function waitUntil<T>(read: () => T | undefined, timeoutMs = 2_000): Promise<T> {

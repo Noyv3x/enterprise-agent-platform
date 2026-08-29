@@ -48,7 +48,7 @@ Firecrawl API key 作为 Platform secret 注入调用方，不写入 Compose 文
 
 共享 Camoufox 容器包含平台拥有的 camoufox-js 补丁、Playwright Core、锁定浏览器资产和 Xvfb/headless 依赖，不读取宿主 `DISPLAY`。Profile、Cookie、下载与 trace 按 scope identity 写入 bind mount。浏览器包的 `version.json` 必须记录锁定 GitHub tag 的真实 release（当前为 `beta.25`），不能把架构资产文件名中的 `alpha.*` 构建号当作 release；Camofox server 与 camoufox-js 必须解析到同一个持久 cache 目录。容器主 API 可以监听私有容器网络的 `0.0.0.0`，但浏览器进程使用的 connection-pinning proxy 必须始终只监听并返回 loopback 地址；两者不得复用 bind host。
 
-Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依赖和小型运行源文件分开，并在文件系统层完成后才写入发布 revision/version label。该边界只优化构建缓存与推送体积，不改变 `/opt/camofox` 中的文件集、所有权、启动命令或浏览器版本约束。
+Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依赖和小型运行源文件分开，并在文件系统层完成后才写入发布 revision/version label。最终层只复制浏览器、已打补丁依赖、运行包描述和 loopback preload；构建期 lockfile 与补丁脚本不进入运行镜像。该边界只优化构建缓存与推送体积，不改变运行文件的所有权、启动命令或浏览器版本约束。
 
 浏览器身份由 scope key 哈希派生，模型不能指定 user id、profile 路径或 session key。每次操作都带派生身份，URL 在操作前后重新校验。浏览器按可信成员模型允许普通内网和回环页面，但拒绝云元数据、链路本地、多播、保留、不可路由目标及 URL 内嵌凭据。
 

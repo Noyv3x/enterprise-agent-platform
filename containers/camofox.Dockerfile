@@ -66,8 +66,8 @@ RUN apt-get update \
 WORKDIR /opt/camofox
 COPY --from=camofox-build --chown=1000:1000 /opt/camofox/browser ./browser
 COPY --from=camofox-build --chown=1000:1000 /opt/camofox/node_modules ./node_modules
-COPY --from=camofox-build --chown=1000:1000 /opt/camofox/package.json /opt/camofox/package-lock.json ./
-COPY --from=camofox-build --chown=1000:1000 /opt/camofox/patch-runtime.cjs /opt/camofox/loopback-preload.cjs ./
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/package.json ./
+COPY --from=camofox-build --chown=1000:1000 /opt/camofox/loopback-preload.cjs ./
 COPY containers/camofox-entrypoint.sh /usr/local/bin/camofox-entrypoint
 RUN chmod 0755 /usr/local/bin/camofox-entrypoint
 ARG SOURCE_COMMIT=unknown

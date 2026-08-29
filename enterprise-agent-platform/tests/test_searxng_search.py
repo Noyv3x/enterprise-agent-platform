@@ -62,7 +62,7 @@ class SearXNGConfigTests(unittest.TestCase):
             {"AGENT_PLATFORM_DEPLOYMENT_MODE": "container"},
             clear=True,
         ):
-            default = PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
+            default = PlatformConfig.from_env()
         self.assertEqual(default.searxng_api_url, "http://searxng:8080")
         self.assertEqual(default.searxng_timeout_seconds, 20.0)
 
@@ -75,7 +75,7 @@ class SearXNGConfigTests(unittest.TestCase):
             },
             clear=True,
         ):
-            configured = PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
+            configured = PlatformConfig.from_env()
         self.assertEqual(configured.searxng_api_url, "http://127.0.0.1:14567")
         self.assertEqual(configured.searxng_timeout_seconds, 7.5)
 
@@ -90,7 +90,7 @@ class SearXNGConfigTests(unittest.TestCase):
                 clear=True,
             ):
                 with self.assertRaises(ValueError):
-                    PlatformConfig.from_env(Path("/tmp/ubitech-searxng-config"))
+                    PlatformConfig.from_env()
 
 
 class SearXNGSearchTests(unittest.TestCase):

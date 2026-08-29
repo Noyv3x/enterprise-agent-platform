@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import {
+  fakeExecutionManager,
+  temporaryDirectory,
+  testConfig,
+  TestRunCoordinator as RunCoordinator,
+} from "./helpers.js";
 
 /** Wide enough that CI scheduling between model/tool turns is not the product idle. */
 const SURVIVES_SCHEDULER_IDLE_MS = 400;
@@ -170,10 +174,6 @@ test("active foreground terminal work can exceed the run idle duration", async (
   try {
     const started = Date.now();
     const run = coordinator.createRun(baseRequest(workspace));
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ), 10_000);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
       (event) => event.type === "tool.started" && event.data.tool_name === "terminal",
     ), 10_000);
@@ -220,10 +220,6 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
   try {
     const started = Date.now();
     const run = coordinator.createRun(baseRequest(workspace));
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ), 10_000);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "background task complete");
@@ -254,13 +250,15 @@ test("foreground terminal uses the runtime default deadline when timeout_ms is o
   const coordinator = new RunCoordinator({
     config: testConfig(home, { runIdleTimeoutMs: 500, terminalTimeoutMs: 100 }),
     streamFn: faux.provider.streamSimple,
+    executor: fakeExecutionManager({
+      async terminal(_context, arguments_) {
+        assert.equal(arguments_.timeout_ms, 100);
+        throw new Error("Terminal command timed out after 100 ms");
+      },
+    }),
   });
   try {
     const run = coordinator.createRun(baseRequest(workspace));
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ), 10_000);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed");
     assert.equal(completed.result?.content, "reported terminal timeout");
@@ -301,10 +299,6 @@ test("background terminal output does not keep a later hung model turn active", 
   });
   try {
     const run = coordinator.createRun(baseRequest(workspace));
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ), 10_000);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.idleTimedOut, true);
@@ -323,7 +317,10 @@ test("approval waits pause the run inactivity deadline", async () => {
   const workspace = await temporaryDirectory("agent-approval-idle-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "printf approved" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "printf approved",
+      target: "host",
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("approved complete"),
   ]);
   const coordinator = new RunCoordinator({
@@ -361,11 +358,13 @@ test("delegated child activity refreshes the parent inactivity deadline", async 
     fauxAssistantMessage(fauxToolCall("terminal", {
       command: "sleep 0.16; printf child-finished",
       timeout_ms: 1_000,
+      target: "host",
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("child complete"),
     fauxAssistantMessage(fauxToolCall("terminal", {
       command: "printf parent-verified && npm --version >/dev/null # npm run check",
       timeout_ms: 1_000,
+      target: "host",
     }), { stopReason: "toolUse" }),
     fauxAssistantMessage("parent complete"),
   ]);
@@ -435,10 +434,6 @@ test("inactivity after a completed side effect marks the run needs_review", asyn
   });
   try {
     const run = coordinator.createRun(baseRequest(workspace));
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ));
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.idleTimedOut, true);

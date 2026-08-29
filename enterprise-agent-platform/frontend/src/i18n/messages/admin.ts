@@ -8,7 +8,6 @@ const m = (zhCN: MessageValue, en: MessageValue, zhTW: MessageValue): MessageDef
 const plural = (one: string, other: string): MessageValue => ({ one, other });
 
 const baseAdminMessages = defineMessages({
-  "admin.header.eyebrow": m("管理", "Administration", "管理"),
   "admin.pager.ariaLabel": m("管理导航", "Administration navigation", "管理導覽"),
   "admin.pager.mobileLabel": m("管理页面", "Administration page", "管理頁面"),
   "admin.group.people": m("成员与数据", "People & data", "成員與資料"),
@@ -29,7 +28,6 @@ const baseAdminMessages = defineMessages({
   "admin.common.cancel": m("取消", "Cancel", "取消"),
   "admin.common.saving": m("保存中…", "Saving…", "儲存中…"),
   "admin.common.checking": m("检查中…", "Checking…", "檢查中…"),
-  "admin.common.installing": m("安装中…", "Installing…", "安裝中…"),
   "admin.common.setting": m("设置中…", "Setting…", "設定中…"),
   "admin.common.importing": m("导入中…", "Importing…", "匯入中…"),
   "admin.common.exporting": m("导出中…", "Exporting…", "匯出中…"),
@@ -70,7 +68,6 @@ const baseAdminMessages = defineMessages({
   "admin.thinkingDepth.xhigh": m("超高", "Extra high", "超高"),
 
   "admin.accounts.title": m("账户", "Accounts", "帳戶"),
-  "admin.accounts.listDescription": m("管理成员身份、权限和个人 AI 策略。", "Manage member identity, access, and Personal AI policies.", "管理成員身分、權限和個人 AI 策略。"),
   "admin.accounts.empty": m("暂无账户。", "No accounts yet.", "暫無帳戶。"),
   "admin.accounts.count": m("{count} 个账户", plural("{count} account", "{count} accounts"), "{count} 個帳戶"),
   "admin.accounts.column.account": m("账户", "Account", "帳戶"),
@@ -92,9 +89,6 @@ const baseAdminMessages = defineMessages({
   "admin.accounts.enabled": m("账户启用", "Account enabled", "帳戶啟用"),
   "admin.accounts.disabledHint": m("停用后无法登录", "Disabled accounts cannot sign in", "停用後無法登入"),
   "admin.accounts.impersonate": m("管理员代入", "Sign in as account", "管理員代入"),
-  "admin.accounts.impersonateCurrent": m("当前已是此账号", "You are already using this account", "目前已是此帳戶"),
-  "admin.accounts.impersonateTitle": m("以此账号登录", "Sign in as this account", "以此帳戶登入"),
-  "admin.accounts.impersonateDisabled": m("账号已停用", "Account is disabled", "帳戶已停用"),
   "admin.accounts.save": m("保存账户", "Save account", "儲存帳戶"),
   "admin.accounts.create": m("创建账户", "Create account", "建立帳戶"),
   "admin.accounts.createDescription": m("添加成员并配置其初始访问策略。", "Add a member and configure their initial access policy.", "新增成員並設定其初始存取策略。"),
@@ -291,8 +285,6 @@ const baseAdminMessages = defineMessages({
   "admin.branding.useDefaults": m("恢复默认名称与颜色", "Restore default names and color", "恢復預設名稱與顏色"),
   "admin.branding.save": m("保存品牌设置", "Save branding", "儲存品牌設定"),
 
-  "admin.updates.title": m("容器与更新", "Containers and updates", "容器與更新"),
-  "admin.updates.description": m("查看管理器、服务容器与不可变版本状态。", "Inspect the manager, service containers, and immutable releases.", "查看管理器、服務容器與不可變版本狀態。"),
   "admin.updates.managerTitle": m("平台管理器", "Platform manager", "平台管理器"),
   "admin.updates.managerDescription": m("管理器负责容器生命周期、维护页、更新、快照与回滚。", "The manager owns container lifecycle, maintenance, updates, snapshots, and rollback.", "管理器負責容器生命週期、維護頁、更新、快照與回滾。"),
   "admin.updates.idle": m("待命", "Idle", "待命"),
@@ -359,9 +351,6 @@ const baseAdminMessages = defineMessages({
   "admin.security.publicUrlHint": m("设为 https:// 域名后，登录 Cookie 会带 Secure，写请求按该域名校验 Origin/Referer。", "With an https:// URL, sign-in cookies use Secure and write requests validate Origin/Referer against this domain.", "設為 https:// 網域後，登入 Cookie 會使用 Secure，寫入請求依此網域驗證 Origin/Referer。"),
   "admin.security.trustProxy": m("信任反向代理头", "Trust reverse-proxy headers", "信任反向代理標頭"),
   "admin.security.trustProxyHint": m("只在后端端口不能被公网直连时开启；用于真实客户端 IP、X-Forwarded-Host/Proto。", "Enable only when the backend port is not publicly reachable; used for client IP and X-Forwarded-Host/Proto.", "僅在後端連接埠無法由公網直接連線時啟用；用於真實用戶端 IP 與 X-Forwarded-Host/Proto。"),
-  "admin.security.host": m("监听 Host", "Listening host", "監聽 Host"),
-  "admin.security.port": m("监听 Port", "Listening port", "監聽 Port"),
-  "admin.security.appliedRestartHint": m("当前进程：{value}，修改后需重启/重新部署。", "Current process: {value}. Restart or redeploy after changing.", "目前程序：{value}，修改後需重新啟動或部署。"),
   "admin.security.sessionTtl": m("Session TTL 秒", "Session TTL (seconds)", "Session TTL 秒"),
   "admin.security.sessionTtlHint": m("默认 7 天。Cookie 会按此时长保存，使用中剩余不足一半时自动续期；新值只影响之后签发或续期的会话。", "Default is 7 days. Cookies persist for this lifetime and refresh when less than half remains. The new value applies to sessions issued or renewed afterwards.", "預設 7 天。Cookie 會依此時長保存，使用中剩餘不足一半時自動續期；新值只影響之後簽發或續期的工作階段。"),
   "admin.security.rotateSecret": m("轮换 Session Secret", "Rotate session secret", "輪換 Session Secret"),
@@ -380,7 +369,6 @@ const baseAdminMessages = defineMessages({
   "admin.security.allowedAtStartup": m("启动项允许", "Allowed at startup", "啟動選項允許"),
   "admin.security.fromEnv": m("来自环境变量", "From environment variable", "來自環境變數"),
   "admin.security.persisted": m("已持久化", "Persisted", "已持久化"),
-  "admin.security.pendingRestartSuffix": m("，有待重启配置", ", restart pending", "，有待重新啟動設定"),
   "admin.security.exists": m("仍存在", "Still exists", "仍存在"),
   "admin.security.notExists": m("不存在", "Does not exist", "不存在"),
   "admin.security.lanTitle": m("局域网访问", "Local network access", "局域網路存取"),

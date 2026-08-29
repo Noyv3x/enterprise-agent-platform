@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import {
@@ -15,7 +15,6 @@ import {
   contextUsageForCompletedTurn,
   durableRunResultMessages,
   prepareSessionHistoryForModel,
-  RunCoordinator,
   RunInputConflictError,
   RunValidationError,
   sanitizeToolResultForJournal,
@@ -30,7 +29,7 @@ import {
 import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { fakeExecutionManager, temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("semantic compaction input reserves the original objective and latest user request", () => {
   const original = "ORIGINAL_ACCEPTANCE: deliver every verified artifact";
@@ -422,7 +421,7 @@ test("RunCoordinator accepts direct image blocks in active-run input without rea
   let observed: AgentMessage[] = [];
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch inline-image-ready.txt" }),
+      fauxToolCall("terminal", { command: "touch inline-image-ready.txt", target: "host" }),
       { stopReason: "toolUse" },
     ),
     (context) => {
@@ -779,7 +778,10 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
   const workspace = await temporaryDirectory("agent-coordinator-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "touch approved.txt && stat approved.txt",
+      target: "host",
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("finished"),
   ]);
   const config = testConfig(home);
@@ -808,8 +810,9 @@ test("RunCoordinator pauses a sensitive tool until approval", async () => {
     const events = coordinator.getJournal(run.id)?.list() ?? [];
     const approved = events.find((event) => event.type === "tool.started");
     assert.deepEqual(approved?.data.arguments, {
+      target: "host",
       command: "touch approved.txt && stat approved.txt",
-      cwd: workspace,
+      cwd: "/workspace",
       background: false,
       timeout_ms: config.terminalTimeoutMs,
     });
@@ -834,7 +837,7 @@ test("approval and tool events never journal raw terminal credentials", async ()
   const command = `API_TOKEN=${token} printf ok`;
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", { command, target: "host" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("finished"),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
@@ -866,98 +869,6 @@ test("approval and tool events never journal raw terminal credentials", async ()
       ),
       true,
     );
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("terminal execution keeps the canonical cwd that was approved across symlink drift", async () => {
-  const home = await temporaryDirectory("agent-approved-cwd-");
-  const workspace = await temporaryDirectory("agent-approved-cwd-workspace-");
-  const first = `${workspace}/first`;
-  const second = `${workspace}/second`;
-  const link = `${workspace}/current`;
-  await mkdir(first);
-  await mkdir(second);
-  await symlink(first, link);
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", {
-      command: "pwd > approved-cwd.txt && stat approved-cwd.txt",
-      cwd: "current",
-    }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("finished"),
-  ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  try {
-    const run = coordinator.createRun({
-      scope_key: "scope",
-      lifecycle_id: "life",
-      session_id: "approved-cwd",
-      workspace,
-      system_prompt: "You are an Agent.",
-      input: "run it",
-      model: { provider: "openai-codex", id: "gpt-5.5" },
-    });
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ));
-    assert.equal((approval.data.arguments as Record<string, unknown>).cwd, first);
-    await unlink(link);
-    await symlink(second, link);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
-    assert.equal((await coordinator.wait(run.id)).status, "completed");
-    assert.equal((await readFile(`${first}/approved-cwd.txt`, "utf8")).trim(), first);
-    await assert.rejects(readFile(`${second}/approved-cwd.txt`, "utf8"), { code: "ENOENT" });
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("file execution keeps the canonical target that was approved across symlink drift", async () => {
-  const home = await temporaryDirectory("agent-approved-file-");
-  const workspace = await temporaryDirectory("agent-approved-file-workspace-");
-  const first = `${workspace}/first`;
-  const second = `${workspace}/second`;
-  const link = `${workspace}/current`;
-  await mkdir(first);
-  await mkdir(second);
-  await symlink(first, link);
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("write_file", {
-      path: "current/note.txt",
-      content: "approved target\n",
-    }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: `${first}/note.txt` }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("The approved target was written and its contents were verified."),
-    fauxAssistantMessage("The approved canonical target contains the expected text."),
-  ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  try {
-    const run = coordinator.createRun({
-      scope_key: "scope",
-      lifecycle_id: "life",
-      session_id: "approved-file",
-      workspace,
-      system_prompt: "You are an Agent.",
-      input: "write it",
-      model: { provider: "openai-codex", id: "gpt-5.5" },
-    });
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ));
-    assert.equal((approval.data.arguments as Record<string, unknown>).path, `${first}/note.txt`);
-    await unlink(link);
-    await symlink(second, link);
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
-    assert.equal((await coordinator.wait(run.id)).status, "completed");
-    assert.equal(await readFile(`${first}/note.txt`, "utf8"), "approved target\n");
-    await assert.rejects(readFile(`${second}/note.txt`, "utf8"), { code: "ENOENT" });
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -997,13 +908,9 @@ test("process write cannot inject a hardline command into a background shell", a
       input: "start a shell",
       model: { provider: "openai-codex", id: "gpt-5.5" },
     });
-    const approval = await waitUntil(() => coordinator.getJournal(run.id)?.list().find(
-      (event) => event.type === "approval.requested",
-    ));
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     assert.equal((await coordinator.wait(run.id)).status, "completed");
     const events = coordinator.getJournal(run.id)?.list() ?? [];
-    assert.equal(events.filter((event) => event.type === "approval.requested").length, 1);
+    assert.equal(events.filter((event) => event.type === "approval.requested").length, 0);
     const blocked = events.find((event) => event.type === "tool.failed" && event.data.tool_name === "process");
     assert.ok(blocked);
     assert.equal(blocked.data.execution_started, false);
@@ -1283,10 +1190,6 @@ test("execution-review messages remain ephemeral across context compaction", asy
 test("RunCoordinator requests one bounded verification after a file change", async () => {
   const home = await temporaryDirectory("agent-file-validation-");
   const workspace = await temporaryDirectory("agent-file-validation-workspace-");
-  await grantAlways(home, "scope", "write_file", {
-    path: "changed.txt",
-    content: "updated\n",
-  }, workspace);
   await writeFile(`${workspace}/summary.csv`, "status,ok\n", "utf8");
   const faux = fauxProvider();
   faux.setResponses([
@@ -1366,10 +1269,6 @@ test("an unrelated read does not satisfy focused file verification", async () =>
   const home = await temporaryDirectory("agent-focused-validation-");
   const workspace = await temporaryDirectory("agent-focused-validation-workspace-");
   await writeFile(`${workspace}/other.txt`, "other\n", "utf8");
-  await grantAlways(home, "scope", "write_file", {
-    path: "changed.txt",
-    content: "updated\n",
-  }, workspace);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -1415,11 +1314,6 @@ test("an unrelated read does not satisfy focused file verification", async () =>
 test("a failed terminal check does not satisfy file verification", async () => {
   const home = await temporaryDirectory("agent-failed-validation-");
   const workspace = await temporaryDirectory("agent-failed-validation-workspace-");
-  await grantAlways(home, "scope", "write_file", {
-    path: "changed.txt",
-    content: "updated\n",
-  }, workspace);
-  await grantAlways(home, "scope", "terminal", { command: "false # npm test" }, workspace);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -1465,13 +1359,6 @@ test("a failed terminal check does not satisfy file verification", async () => {
 test("a failed automatic verification does not restore a MEDIA marker", async () => {
   const home = await temporaryDirectory("agent-failed-media-validation-");
   const workspace = await temporaryDirectory("agent-failed-media-validation-workspace-");
-  await grantAlways(home, "scope", "write_file", {
-    path: "report.xlsx",
-    content: "not a valid workbook\n",
-  }, workspace);
-  await grantAlways(home, "scope", "terminal", {
-    command: "false # npm test",
-  }, workspace);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -1532,8 +1419,7 @@ test("a successful terminal document verification restores a MEDIA marker", asyn
   const validateCommand = "python3 -c \"from pathlib import Path; "
     + "assert Path('report.xlsx').read_bytes() == b'xlsx'\" "
     + "# openpyxl.load_workbook('/workspace/report.xlsx')";
-  await grantAlways(home, "scope", "terminal", { command: createCommand }, workspace);
-  await grantAlways(home, "scope", "terminal", { command: validateCommand }, workspace);
+  await writeFile(`${workspace}/report.xlsx`, "xlsx", "utf8");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -1583,9 +1469,12 @@ test("a successful terminal document verification restores a MEDIA marker", asyn
 test("a failed mutating terminal command still requires file verification", async () => {
   const home = await temporaryDirectory("agent-failed-mutation-validation-");
   const workspace = await temporaryDirectory("agent-failed-mutation-validation-workspace-");
-  await grantAlways(home, "scope", "terminal", {
-    command: "printf 'updated\\n' > failed-change.txt; false # npm test",
-  }, workspace);
+  const executor = fakeExecutionManager();
+  const terminal = executor.terminal;
+  executor.terminal = async (context, arguments_, signal, completionOwnerId) => {
+    await writeFile(`${workspace}/failed-change.txt`, "updated\n", "utf8");
+    return await terminal(context, arguments_, signal, completionOwnerId);
+  };
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
@@ -1604,7 +1493,7 @@ test("a failed mutating terminal command still requires file verification", asyn
     },
     fauxAssistantMessage("Verified the file written before the command failed."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  const coordinator = new RunCoordinator({ config: testConfig(home), executor, streamFn: faux.provider.streamSimple });
   try {
     const run = coordinator.createRun({
       scope_key: "scope",
@@ -1720,8 +1609,8 @@ test("parallel-mode approval preflight exposes only one pending approval card", 
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage([
-      fauxToolCall("read_file", { path: firstPath }),
-      fauxToolCall("read_file", { path: secondPath }),
+      fauxToolCall("read_file", { path: firstPath, target: "host" }),
+      fauxToolCall("read_file", { path: secondPath, target: "host" }),
     ], { stopReason: "toolUse" }),
     fauxAssistantMessage("finished"),
   ]);
@@ -1776,7 +1665,7 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
   const faux = fauxProvider();
   let consolidatedContext: AgentMessage[] = [];
   const toolTurn = fauxAssistantMessage(
-    fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
+    fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt", target: "host" }),
     { stopReason: "toolUse" },
   );
   toolTurn.usage.input = 11;
@@ -1922,7 +1811,7 @@ test("RunCoordinator rejects an unpreparable input without a false accepted even
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
+      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt", target: "host" }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage("finished without the invalid input"),
@@ -2036,7 +1925,7 @@ test("RunCoordinator accepts concurrent private inputs and injects both", async 
   let attachmentReadContext: AgentMessage[] = [];
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt" }),
+      fauxToolCall("terminal", { command: "touch approved.txt && stat approved.txt", target: "host" }),
       { stopReason: "toolUse" },
     ),
     (context) => {
@@ -2118,7 +2007,7 @@ test("RunCoordinator closes an accepted queued input as unconsumed", async () =>
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch blocker.txt" }),
+      fauxToolCall("terminal", { command: "touch blocker.txt", target: "host" }),
       { stopReason: "toolUse" },
     ),
   ]);
@@ -2181,7 +2070,10 @@ test("unattended scheduled runs reject sensitive tools immediately without reque
   const workspace = await temporaryDirectory("agent-scheduled-no-approval-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch should-not-exist.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "touch should-not-exist.txt",
+      target: "host",
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The command requires a persistent authorization."),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
@@ -2209,7 +2101,7 @@ test("unattended scheduled runs reject sensitive tools immediately without reque
     const failed = events.find((event) => event.type === "tool.failed");
     assert.ok(failed);
     assert.equal(failed.data.unattended_authorization_required, true);
-    assert.match(String(failed.data.reason), /persistent always authorization/);
+    assert.match(String(failed.data.reason), /non-persistable terminal operations/);
     await assert.rejects(readFile(`${workspace}/should-not-exist.txt`, "utf8"), { code: "ENOENT" });
   } finally {
     coordinator.shutdown();
@@ -2260,12 +2152,9 @@ test("unattended runs reject sylver_platform mutations before approval or gatewa
   }
 });
 
-test("unattended scheduled runs accept only a persistent always authorization", async () => {
+test("unattended scheduled runs execute sandbox commands without approval", async () => {
   const home = await temporaryDirectory("agent-scheduled-always-");
   const workspace = await temporaryDirectory("agent-scheduled-always-workspace-");
-  await grantAlways(home, "scope", "terminal", {
-    command: "touch allowed.txt && stat allowed.txt",
-  }, workspace);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("terminal", { command: "touch allowed.txt && stat allowed.txt" }), { stopReason: "toolUse" }),
@@ -2291,7 +2180,6 @@ test("unattended scheduled runs accept only a persistent always authorization", 
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.equal(await readFile(`${workspace}/allowed.txt`, "utf8"), "");
     const events = coordinator.getJournal(run.id)?.list() ?? [];
     assert.equal(events.some((event) => event.type === "approval.requested"), false);
     assert.ok(events.some((event) => event.type === "tool.completed"));
@@ -2309,6 +2197,7 @@ test("unattended scheduled runs cannot reuse an always grant for process input",
     action: "write",
     process_id: "process_not_started",
     input: "printf safe-input\\n",
+    target: "host",
   };
   await grantAlways(home, "scope", "process", processArguments, workspace);
   const faux = fauxProvider();
@@ -2353,7 +2242,10 @@ test("persisted session approval does not authorize an unattended scheduled run"
   const workspace = await temporaryDirectory("agent-scheduled-session-grant-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch session-not-allowed.txt" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "touch session-not-allowed.txt",
+      target: "host",
+    }), { stopReason: "toolUse" }),
     fauxAssistantMessage("The session grant was insufficient."),
   ]);
   const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
@@ -2361,7 +2253,7 @@ test("persisted session approval does not authorize an unattended scheduled run"
   try {
     const policy = await classifyToolCall(
       "terminal",
-      { command: "touch session-not-allowed.txt" },
+      { command: "touch session-not-allowed.txt", target: "host" },
       workspace,
     );
     assert.ok(policy.approvalKey);
@@ -2516,7 +2408,7 @@ test("nested delegated unattended blocks reach the scheduled parent journal", as
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage(
-      fauxToolCall("terminal", { command: "touch delegated-should-not-exist.txt" }),
+      fauxToolCall("terminal", { command: "touch delegated-should-not-exist.txt", target: "host" }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage("The delegated command requires persistent authorization."),
@@ -2552,7 +2444,7 @@ test("nested delegated unattended blocks reach the scheduled parent journal", as
     assert.ok(failed);
     assert.equal(failed.data.tool_name, "terminal");
     assert.equal(typeof failed.data.child_run_id, "string");
-    assert.match(String(failed.data.reason), /persistent always authorization/);
+    assert.match(String(failed.data.reason), /non-persistable terminal operations/);
     assert.equal("result" in failed.data, false, "delegated forwarding must keep only stable fields");
     await assert.rejects(readFile(`${workspace}/delegated-should-not-exist.txt`, "utf8"), { code: "ENOENT" });
   } finally {
@@ -3018,7 +2910,6 @@ test("an invisible overload after a mutation retries only the next model turn", 
   const home = await temporaryDirectory("agent-model-retry-mutation-");
   const workspace = await temporaryDirectory("agent-model-retry-mutation-workspace-");
   const arguments_ = { command: "printf mutation" };
-  await grantAlways(home, "scope", "terminal", arguments_, workspace);
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(

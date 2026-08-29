@@ -9,9 +9,9 @@ import urllib.request
 from unittest import mock
 
 from enterprise_agent_platform.loopback_http import (
+    build_trusted_service_opener,
     open_loopback_url,
     open_private_service_url,
-    open_trusted_service_url,
 )
 
 
@@ -85,7 +85,7 @@ class LoopbackHTTPTests(unittest.TestCase):
             method="GET",
         )
         with self.assertRaises(urllib.error.HTTPError) as raised:
-            open_trusted_service_url(request, timeout=2)
+            build_trusted_service_opener().open(request, timeout=2)
         self.assertEqual(raised.exception.code, 302)
 
     def test_private_service_request_ignores_proxies_and_rejects_redirects(self):

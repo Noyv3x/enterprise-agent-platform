@@ -1,6 +1,4 @@
-import { constants } from "node:fs";
-import { mkdir, open, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { Type, type ImageContent, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
@@ -32,7 +30,7 @@ import type {
 import { executionContext } from "./executor.js";
 import { isLearningReviewRun, type JsonObject, type JsonValue, type RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
-import { ProcessRegistry, processStatusActive } from "./process-registry.js";
+import { processStatusActive } from "./process-registry.js";
 import { isSylverPlatformMutation } from "./sylver-platform-contract.js";
 import {
   MAX_TODO_CONTENT_CHARACTERS,
@@ -44,12 +42,11 @@ import {
   frameUntrustedText,
   untrustedImageNotice,
 } from "./untrusted-content.js";
-import { errorMessage, id, resolveWorkspacePath, stableHash, throwIfAborted, truncate } from "./utils.js";
+import { errorMessage, resolveWorkspacePath, stableHash, throwIfAborted, truncate } from "./utils.js";
 
 export interface ToolFactoryContext {
   runId: string;
   request: RunRequest;
-  processes: ProcessRegistry;
   gateway: PlatformGateway;
   querySession: (action: string, arguments_: JsonObject, signal?: AbortSignal) => Promise<JsonValue>;
   delegate: (
@@ -309,8 +306,6 @@ const readFileSchema = Type.Object({
     description: "Maximum bytes to return. Defaults to 100000.",
   })),
 }, { additionalProperties: false });
-
-const MAX_PATCH_FILE_BYTES = 10 * 1024 * 1024;
 
 const fileExecutionTargetSchema = Type.Union([
   Type.Literal(EXECUTION_TARGETS[0]),
@@ -1183,79 +1178,46 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     ].join(" "),
     parameters: terminalSchema,
     executionMode: "sequential",
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId, params, signal) {
       const background = params.background ?? false;
       if (params.background_kind !== undefined && !background) {
         throw new Error("background_kind is valid only when background=true");
       }
       context.markSideEffect();
-      if (context.executor?.managed) {
-        const binding = managedExecutionBinding(
-          "terminal",
-          params,
-          context.request.workspace,
-          context.defaultTerminalTimeoutMs,
-        );
-        const heartbeat = !background && context.onActivity
-          ? setInterval(
-            () => context.onActivity?.("Manager terminal command still running"),
-            context.activityHeartbeatMs ?? 10_000,
-          )
-          : undefined;
-        heartbeat?.unref();
-        try {
-          const response = await context.executor.terminal(
-            managedCallContext(context, _toolCallId),
-            binding.arguments,
-            signal,
-            background && params.background_kind !== "service"
-              ? backgroundTaskCompletionOwnerId(context.request)
-              : undefined,
-          );
-          const result = response.result;
-          return textResult(
-            processStatusActive(result.status)
-              ? result.status === "orphaned"
-                ? `Process state needs attention and remains active: ${result.id} (pid ${result.pid ?? "unknown"}; termination not confirmed)`
-                : `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
-              : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
-            result as unknown as JsonValue,
-          );
-        } finally {
-          if (heartbeat) clearInterval(heartbeat);
-        }
-      }
-      const cwd = resolveWorkspacePath(context.request.workspace, params.cwd || ".");
-      const options: Parameters<ProcessRegistry["run"]>[0] = {
-        runId: context.runId,
-        scopeKey: context.request.scope_key,
-        lifecycleId: context.request.lifecycle_id,
-        command: params.command,
-        cwd,
-        background,
-        onUpdate(update) {
-          if (!background) context.onActivity?.("terminal command produced output");
-          const output = update.stdout ?? update.stderr ?? "";
-          onUpdate?.(textResult(output, update));
-        },
-      };
-      if (!background && context.onActivity) {
-        options.onActivity = () => context.onActivity?.("terminal command still running");
-        if (context.activityHeartbeatMs !== undefined) {
-          options.activityHeartbeatMs = context.activityHeartbeatMs;
-        }
-      }
-      if (signal) options.signal = signal;
-      const timeoutMs = params.timeout_ms
-        ?? (background ? undefined : context.defaultTerminalTimeoutMs ?? TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS);
-      if (timeoutMs !== undefined) options.timeoutMs = timeoutMs;
-      const result = await context.processes.run(options);
-      return textResult(
-        processStatusActive(result.status)
-          ? `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
-          : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
-        result as unknown as JsonValue,
+      const binding = managedExecutionBinding(
+        "terminal",
+        params,
+        context.request.workspace,
+        context.defaultTerminalTimeoutMs,
       );
+      const heartbeat = !background && context.onActivity
+        ? setInterval(
+          () => context.onActivity?.("Manager terminal command still running"),
+          context.activityHeartbeatMs ?? 10_000,
+        )
+        : undefined;
+      heartbeat?.unref();
+      try {
+        const response = await executionManager(context).terminal(
+          managedCallContext(context, _toolCallId),
+          binding.arguments,
+          signal,
+          background && params.background_kind !== "service"
+            ? backgroundTaskCompletionOwnerId(context.request)
+            : undefined,
+        );
+        const result = response.result;
+        return textResult(
+          processStatusActive(result.status)
+            ? result.status === "orphaned"
+              ? `Process state needs attention and remains active: ${result.id} (pid ${result.pid ?? "unknown"}; termination not confirmed)`
+              : `Process started: ${result.id} (pid ${result.pid ?? "unknown"})`
+            : `${result.stdout}${result.stderr ? `\n[stderr]\n${result.stderr}` : ""}\n[exit ${result.exit_code ?? "unknown"}]`,
+          result as unknown as JsonValue,
+        );
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+      }
     },
   };
 
@@ -1276,79 +1238,32 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         const hardBlock = processWriteHardBlock(input);
         if (hardBlock) throw new Error(`Process input is blocked: ${hardBlock}`);
       }
-      if (context.executor?.managed) {
-        if (params.action === "write" || params.action === "kill") context.markSideEffect();
-        const binding = managedExecutionBinding(
-          "process",
-          params,
-          context.request.workspace,
-          context.defaultTerminalTimeoutMs,
-        );
-        const response = await context.executor.process(
-          managedCallContext(context, _toolCallId),
-          binding.action,
-          binding.arguments,
-          signal,
-        );
-        const result = response.result;
-        if (params.action === "write") return textResult("Input sent", result);
-        if (params.action === "kill") return textResult("Process stop requested", result);
-        if (params.action === "wait" && result && typeof result === "object" && !Array.isArray(result)) {
-          return processWaitTextResult(result as JsonObject);
-        }
-        if (params.action === "read" && result && typeof result === "object" && !Array.isArray(result)) {
-          const snapshot = result as JsonObject;
-          const stdout = typeof snapshot.stdout === "string" ? snapshot.stdout : "";
-          const stderr = typeof snapshot.stderr === "string" ? snapshot.stderr : "";
-          return textResult(`${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`, result);
-        }
-        return textResult(JSON.stringify(result, null, 2), result);
-      }
-      if (params.action === "list") {
-        return textResult(JSON.stringify(
-          context.processes.list(context.request.scope_key, context.request.lifecycle_id),
-          null,
-          2,
-        ));
-      }
-      if (!params.process_id) throw new Error("process_id is required for this action");
-      if (params.action === "read") {
-        const process = context.processes.get(
-          context.request.scope_key,
-          params.process_id,
-          context.request.lifecycle_id,
-        );
-        return textResult(`${process.stdout}${process.stderr ? `\n[stderr]\n${process.stderr}` : ""}`, process as unknown as JsonValue);
-      }
-      if (params.action === "wait") {
-        const waited = await context.processes.wait(
-          context.request.scope_key,
-          params.process_id,
-          context.request.lifecycle_id,
-          params.timeout_ms ?? PROCESS_WAIT_TIMEOUT_DEFAULT_MILLISECONDS,
-          signal,
-        );
-        return processWaitTextResult(waited as unknown as JsonObject);
-      }
-      context.markSideEffect();
-      if (params.action === "write") {
-        const input = params.input ?? "";
-        context.processes.write(
-          context.request.scope_key,
-          params.process_id,
-          input,
-          context.request.lifecycle_id,
-        );
-        return textResult("Input sent");
-      }
-      return textResult(
-        "Process stop requested",
-        context.processes.kill(
-          context.request.scope_key,
-          params.process_id,
-          context.request.lifecycle_id,
-        ) as unknown as JsonValue,
+      if (params.action === "write" || params.action === "kill") context.markSideEffect();
+      const binding = managedExecutionBinding(
+        "process",
+        params,
+        context.request.workspace,
+        context.defaultTerminalTimeoutMs,
       );
+      const response = await executionManager(context).process(
+        managedCallContext(context, _toolCallId),
+        binding.action,
+        binding.arguments,
+        signal,
+      );
+      const result = response.result;
+      if (params.action === "write") return textResult("Input sent", result);
+      if (params.action === "kill") return textResult("Process stop requested", result);
+      if (params.action === "wait" && result && typeof result === "object" && !Array.isArray(result)) {
+        return processWaitTextResult(result as JsonObject);
+      }
+      if (params.action === "read" && result && typeof result === "object" && !Array.isArray(result)) {
+        const snapshot = result as JsonObject;
+        const stdout = typeof snapshot.stdout === "string" ? snapshot.stdout : "";
+        const stderr = typeof snapshot.stderr === "string" ? snapshot.stderr : "";
+        return textResult(`${stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`, result);
+      }
+      return textResult(JSON.stringify(result, null, 2), result);
     },
   };
 
@@ -1360,35 +1275,18 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
-      if (context.executor?.managed) {
-        const binding = managedExecutionBinding("read_file", params, context.request.workspace);
-        const response = await context.executor.file(
-          managedCallContext(context, _toolCallId),
-          binding.action,
-          binding.arguments,
-          signal,
-        );
-        const path = String(params.path);
-        const modelText = await isCurrentAttachmentPath(context, path)
-          ? frameUntrustedText("attachment", response.content)
-          : response.content;
-        return textResult(modelText, response.details ?? null);
-      }
-      const path = resolveWorkspacePath(context.request.workspace, params.path);
-      await assertPinnedReadableTarget(path);
-      const offset = params.offset ?? 0;
-      const limit = params.limit ?? 100_000;
-      const selected = await readRegularFileRange(path, offset, limit, signal);
-      const content = selected.buffer.toString("utf8");
+      const binding = managedExecutionBinding("read_file", params, context.request.workspace);
+      const response = await executionManager(context).file(
+        managedCallContext(context, _toolCallId),
+        binding.action,
+        binding.arguments,
+        signal,
+      );
+      const path = String(params.path);
       const modelText = await isCurrentAttachmentPath(context, path)
-        ? frameUntrustedText("attachment", content)
-        : content;
-      return textResult(modelText, {
-        path,
-        offset,
-        returned: selected.buffer.length,
-        total: selected.total,
-      });
+        ? frameUntrustedText("attachment", response.content)
+        : response.content;
+      return textResult(modelText, response.details ?? null);
     },
   };
 
@@ -1407,31 +1305,15 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
-      if (context.executor?.managed) {
-        context.markSideEffect();
-        const binding = managedExecutionBinding("write_file", params, context.request.workspace);
-        const response = await context.executor.file(
-          managedCallContext(context, _toolCallId),
-          binding.action,
-          binding.arguments,
-          signal,
-        );
-        return textResult(response.content, response.details ?? null);
-      }
-      const path = resolveWorkspacePath(context.request.workspace, params.path);
-      await assertPinnedWritableTarget(path);
       context.markSideEffect();
-      await mkdir(dirname(path), { recursive: true });
-      const temporary = `${path}.${id("tmp")}`;
-      try {
-        await writeFile(temporary, params.content, { encoding: "utf8", mode: 0o600 });
-        await assertPinnedWritableTarget(path);
-        await rename(temporary, path);
-      } catch (error) {
-        await unlink(temporary).catch(() => undefined);
-        throw error;
-      }
-      return textResult(`Wrote ${Buffer.byteLength(params.content)} bytes to ${params.path}`);
+      const binding = managedExecutionBinding("write_file", params, context.request.workspace);
+      const response = await executionManager(context).file(
+        managedCallContext(context, _toolCallId),
+        binding.action,
+        binding.arguments,
+        signal,
+      );
+      return textResult(response.content, response.details ?? null);
     },
   };
 
@@ -1450,42 +1332,15 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
-      if (context.executor?.managed) {
-        context.markSideEffect();
-        const binding = managedExecutionBinding("patch_file", params, context.request.workspace);
-        const response = await context.executor.file(
-          managedCallContext(context, _toolCallId),
-          binding.action,
-          binding.arguments,
-          signal,
-        );
-        return textResult(response.content, response.details ?? null);
-      }
-      const path = resolveWorkspacePath(context.request.workspace, params.path);
-      await assertPinnedWritableTarget(path);
-      const selected = await readRegularFileRange(
-        path,
-        0,
-        MAX_PATCH_FILE_BYTES,
-        signal,
-        MAX_PATCH_FILE_BYTES,
-      );
-      const content = selected.buffer.toString("utf8");
-      const count = content.split(params.old_text).length - 1;
-      const expected = params.expected_replacements ?? 1;
-      if (count !== expected) throw new Error(`Expected ${expected} replacements, found ${count}`);
       context.markSideEffect();
-      const updated = content.split(params.old_text).join(params.new_text);
-      const temporary = `${path}.${id("tmp")}`;
-      try {
-        await writeFile(temporary, updated, { encoding: "utf8", mode: 0o600 });
-        await assertPinnedWritableTarget(path);
-        await rename(temporary, path);
-      } catch (error) {
-        await unlink(temporary).catch(() => undefined);
-        throw error;
-      }
-      return textResult(`Patched ${params.path} (${count} replacement${count === 1 ? "" : "s"})`);
+      const binding = managedExecutionBinding("patch_file", params, context.request.workspace);
+      const response = await executionManager(context).file(
+        managedCallContext(context, _toolCallId),
+        binding.action,
+        binding.arguments,
+        signal,
+      );
+      return textResult(response.content, response.details ?? null);
     },
   };
 
@@ -1496,53 +1351,16 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     parameters: searchFilesSchema,
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
-      if (context.executor?.managed) {
-        const binding = managedExecutionBinding("search_files", params, context.request.workspace);
-        const response = await context.executor.file(
-          managedCallContext(context, _toolCallId),
-          binding.action,
-          binding.arguments,
-          signal,
-        );
-        return textResult(
-          frameUntrustedText("workspace_search", response.content),
-          response.details ?? null,
-        );
-      }
-      const root = resolveWorkspacePath(context.request.workspace, params.path || ".");
-      await assertPinnedReadableTarget(root);
-      const max = params.max_results ?? 100;
-      const flags = params.case_sensitive ? "g" : "gi";
-      let matcher: RegExp;
-      try {
-        matcher = new RegExp(params.regex ? params.query : escapeRegExp(params.query), flags);
-      } catch (error) {
-        throw new Error(`Invalid search expression: ${errorMessage(error)}`);
-      }
-      const results: string[] = [];
-      await walk(root, async (path) => {
-        if (results.length >= max) return;
-        throwIfAborted(signal);
-        const display = relative(context.request.workspace, path);
-        matcher.lastIndex = 0;
-        if (matcher.test(display)) results.push(`${display}: filename match`);
-        if (results.length >= max) return;
-        const info = await stat(path);
-        if (!info.isFile() || info.size > 2_000_000) return;
-        const { buffer } = await readRegularFileRange(path, 0, 2_000_000, signal, 2_000_000);
-        if (buffer.includes(0)) return;
-        const lines = buffer.toString("utf8").split("\n");
-        for (let index = 0; index < lines.length && results.length < max; index += 1) {
-          matcher.lastIndex = 0;
-          if (matcher.test(lines[index] ?? "")) results.push(`${display}:${index + 1}:${truncate(lines[index] ?? "", 500)}`);
-        }
-      }, signal);
+      const binding = managedExecutionBinding("search_files", params, context.request.workspace);
+      const response = await executionManager(context).file(
+        managedCallContext(context, _toolCallId),
+        binding.action,
+        binding.arguments,
+        signal,
+      );
       return textResult(
-        frameUntrustedText(
-          "workspace_search",
-          results.length ? results.join("\n") : "No matches",
-        ),
-        { count: results.length },
+        frameUntrustedText("workspace_search", response.content),
+        response.details ?? null,
       );
     },
   };
@@ -1927,6 +1745,11 @@ function managedCallContext(context: ToolFactoryContext, toolCallId: string): Ex
   };
 }
 
+function executionManager(context: ToolFactoryContext): ExecutionManager {
+  if (!context.executor) throw new Error("Manager execution is unavailable");
+  return context.executor;
+}
+
 export function backgroundTaskCompletionOwnerId(
   request: Pick<RunRequest, "scope_key" | "lifecycle_id" | "session_id">,
 ): string {
@@ -2023,24 +1846,8 @@ async function isCurrentAttachmentPath(
           : []
       );
   if (candidates.length === 0) return false;
-  if (context.executor?.managed) {
-    const target = resolveWorkspacePath(context.request.workspace, path);
-    return candidates.some((candidate) => resolveWorkspacePath(context.request.workspace, candidate) === target);
-  }
-  let target: string;
-  try {
-    target = await realpath(path);
-  } catch {
-    return false;
-  }
-  for (const candidate of candidates) {
-    try {
-      if (await realpath(candidate) === target) return true;
-    } catch {
-      // A stale or deleted attachment cannot identify the file that was read.
-    }
-  }
-  return false;
+  const target = resolveWorkspacePath(context.request.workspace, path);
+  return candidates.some((candidate) => resolveWorkspacePath(context.request.workspace, candidate) === target);
 }
 
 export function isCanonicalPrivateScope(scopeKey: string): boolean {
@@ -2085,7 +1892,6 @@ export async function classifyToolCall(
   args: unknown,
   workspace?: string,
   defaultTerminalTimeoutMs: number = TERMINAL_TIMEOUT_DEFAULT_MILLISECONDS,
-  managedExecution = false,
 ): Promise<ToolPolicyResult> {
   const values = objectValue(args);
   if (toolName === "terminal") {
@@ -2097,140 +1903,62 @@ export async function classifyToolCall(
     }
     const requestedCwd = typeof values.cwd === "string" && values.cwd ? values.cwd : ".";
     const target = requestedExecutionTarget(values.target);
-    if (managedExecution) {
-      const approvedCwd = resolve(workspace || CONTAINER_PATHS.workspace, requestedCwd);
-      if (target === EXECUTION_TARGETS[1] && protectedManagerPath(approvedCwd)) {
-        return { hardBlock: `Accessing protected Manager path ${approvedCwd} is blocked` };
-      }
-      let approval;
-      try {
-        approval = terminalApprovalObject(
-          { ...values, cwd: approvedCwd },
-          workspace || CONTAINER_PATHS.workspace,
-          defaultTerminalTimeoutMs,
-        );
-      } catch (error) {
-        return { hardBlock: errorMessage(error) };
-      }
-      return {
-        ...(target === EXECUTION_TARGETS[1] ? {
-          approvalReason: "Run this command on the host",
-          approvalKey: approval.key,
-          allowSession: false,
-          allowPermanent: false,
-        } : {}),
-        displayArguments: { target, ...approval.displayArguments },
-        approvedCwd,
-        executionTarget: target,
-      };
+    const approvedCwd = resolve(workspace || CONTAINER_PATHS.workspace, requestedCwd);
+    if (target === EXECUTION_TARGETS[1] && protectedManagerPath(approvedCwd)) {
+      return { hardBlock: `Accessing protected Manager path ${approvedCwd} is blocked` };
     }
-    const addressedCwd = workspace ? resolveWorkspacePath(workspace, requestedCwd) : resolve(requestedCwd);
-    const approvedCwd = await canonicalPath(addressedCwd);
-    const approval = terminalApprovalObject(
-      { ...values, cwd: approvedCwd },
-      workspace,
-      defaultTerminalTimeoutMs,
-    );
+    let approval;
+    try {
+      approval = terminalApprovalObject(
+        { ...values, cwd: approvedCwd },
+        workspace || CONTAINER_PATHS.workspace,
+        defaultTerminalTimeoutMs,
+      );
+    } catch (error) {
+      return { hardBlock: errorMessage(error) };
+    }
     return {
-      approvalReason: "Run this command on the host",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
+      ...(target === EXECUTION_TARGETS[1] ? {
+        approvalReason: "Run this command on the host",
+        approvalKey: approval.key,
+        allowSession: false,
+        allowPermanent: false,
+      } : {}),
+      displayArguments: { target, ...approval.displayArguments },
       approvedCwd,
+      executionTarget: target,
     };
   }
   if (["read_file", "write_file", "patch_file", "search_files"].includes(toolName)) {
     const requestedPath = typeof values.path === "string" ? values.path : ".";
     const target = requestedExecutionTarget(values.target);
-    const addressedPath = workspace ? resolveWorkspacePath(workspace, requestedPath) : requestedPath;
     const mutatesFile = toolName === "write_file" || toolName === "patch_file";
-    if (managedExecution) {
-      const approvedPath = resolve(workspace || CONTAINER_PATHS.workspace, requestedPath);
-      if (mutatesFile && protectedWritePath(approvedPath)) {
-        return { hardBlock: `Writing protected host path ${approvedPath} is blocked` };
-      }
-      if (!mutatesFile && protectedReadPath(approvedPath)) {
-        return { hardBlock: `Reading protected host path ${approvedPath} is blocked` };
-      }
-      let approval;
-      try {
-        approval = fileApprovalObject(toolName, approvedPath, values);
-      } catch (error) {
-        return { hardBlock: errorMessage(error) };
-      }
-      return {
-        ...(target === EXECUTION_TARGETS[1] ? {
-          approvalReason: mutatesFile
-            ? "Modify this file on the host"
-            : "Access this file on the host",
-          approvalKey: approval.key,
-          allowSession: false,
-          allowPermanent: false,
-        } : {}),
-        displayArguments: { target, ...approval.displayArguments },
-        approvedPath,
-        executionTarget: target,
-      };
+    const approvedPath = resolve(workspace || CONTAINER_PATHS.workspace, requestedPath);
+    if (mutatesFile && protectedWritePath(approvedPath)) {
+      return { hardBlock: `Writing protected host path ${approvedPath} is blocked` };
     }
-    if (mutatesFile) {
-      let canonicalTarget: string;
-      try {
-        canonicalTarget = await canonicalWritableTarget(addressedPath);
-      } catch (error) {
-        return { hardBlock: errorMessage(error) };
-      }
-      let approval;
-      try {
-        approval = fileApprovalObject(toolName, canonicalTarget, values);
-      } catch (error) {
-        return { hardBlock: errorMessage(error) };
-      }
-      return {
-        approvalReason: !workspace || await isOutsideWorkspace(workspace, addressedPath)
-          ? "Write this file outside the Agent workspace"
-          : "Modify this file in the Agent workspace",
-        approvalKey: approval.key,
-        displayArguments: approval.displayArguments,
-        approvedPath: canonicalTarget,
-      };
+    if (!mutatesFile && protectedReadPath(approvedPath)) {
+      return { hardBlock: `Reading protected host path ${approvedPath} is blocked` };
     }
-    let approvedPath: string;
+    let approval;
     try {
-      approvedPath = await canonicalReadableTarget(addressedPath);
+      approval = fileApprovalObject(toolName, approvedPath, values);
     } catch (error) {
       return { hardBlock: errorMessage(error) };
     }
-    if (!workspace) {
-      if (isAbsolute(requestedPath) || pathTraversesUp(requestedPath)) {
-        let approval;
-        try {
-          approval = fileApprovalObject(toolName, approvedPath, values);
-        } catch (error) {
-          return { hardBlock: errorMessage(error) };
-        }
-        return {
-          approvalReason: "Access this path outside the Agent workspace",
-          approvalKey: approval.key,
-          displayArguments: approval.displayArguments,
-          approvedPath,
-        };
-      }
-      return { approvedPath };
-    }
-    if (await isOutsideWorkspace(workspace, approvedPath)) {
-      let approval;
-      try {
-        approval = fileApprovalObject(toolName, approvedPath, values);
-      } catch (error) {
-        return { hardBlock: errorMessage(error) };
-      }
-      return {
-        approvalReason: "Access this path outside the Agent workspace",
+    return {
+      ...(target === EXECUTION_TARGETS[1] ? {
+        approvalReason: mutatesFile
+          ? "Modify this file on the host"
+          : "Access this file on the host",
         approvalKey: approval.key,
-        displayArguments: approval.displayArguments,
-        approvedPath,
-      };
-    }
-    return { approvedPath };
+        allowSession: false,
+        allowPermanent: false,
+      } : {}),
+      displayArguments: { target, ...approval.displayArguments },
+      approvedPath,
+      executionTarget: target,
+    };
   }
   if (
     toolName === "process"
@@ -2248,27 +1976,19 @@ export async function classifyToolCall(
     } catch (error) {
       return { hardBlock: errorMessage(error) };
     }
-    if (managedExecution) {
-      const target = requestedExecutionTarget(values.target);
-      return {
-        ...(target === EXECUTION_TARGETS[1] ? {
-          approvalReason: "Control this process on the host",
-          approvalKey: approval.key,
-          allowSession: false,
-          allowPermanent: false,
-        } : {}),
-        displayArguments: { target, ...approval.displayArguments },
-        executionTarget: target,
-      };
-    }
+    const target = requestedExecutionTarget(values.target);
     return {
-      approvalReason: "Control this host process",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
-      ...(values.action === "write" ? { allowSession: false, allowPermanent: false } : {}),
+      ...(target === EXECUTION_TARGETS[1] ? {
+        approvalReason: "Control this process on the host",
+        approvalKey: approval.key,
+        allowSession: false,
+        allowPermanent: false,
+      } : {}),
+      displayArguments: { target, ...approval.displayArguments },
+      executionTarget: target,
     };
   }
-  if (toolName === "process" && managedExecution) {
+  if (toolName === "process") {
     const target = requestedExecutionTarget(values.target);
     let approval;
     try {
@@ -2380,28 +2100,6 @@ function requestedExecutionTarget(value: unknown): ExecutionTarget {
   throw new Error("target must be sandbox or host");
 }
 
-async function isOutsideWorkspace(workspace: string, addressedPath: string): Promise<boolean> {
-  const [canonicalWorkspace, canonicalTarget] = await Promise.all([
-    canonicalPath(resolve(workspace)),
-    canonicalPath(resolve(addressedPath)),
-  ]);
-  const fromWorkspace = relative(canonicalWorkspace, canonicalTarget);
-  return fromWorkspace === ".." || fromWorkspace.startsWith("../") || isAbsolute(fromWorkspace);
-}
-
-async function canonicalPath(path: string): Promise<string> {
-  try {
-    return await realpath(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    return await canonicalWriteTarget(path);
-  }
-}
-
-function pathTraversesUp(path: string): boolean {
-  return path.replaceAll("\\", "/").split("/").includes("..");
-}
-
 function protectedWritePath(path: string): boolean {
   if (!path || !isAbsolute(path)) return false;
   const normalized = path.replaceAll("\\", "/");
@@ -2425,131 +2123,6 @@ function protectedManagerPath(path: string): boolean {
     || /^\/var\/lib\/agent-platform\/manager(?:\/|$)/.test(path)
     || /^\/(?:root|home\/[^/]+)\/\.local\/share\/agent-platform\/manager(?:\/|$)/.test(path)
     || /^\/(?:root|home\/[^/]+)\/\.config\/agent-platform(?:\/|$)/.test(path);
-}
-
-export async function assertReadableTargetAllowed(target: string): Promise<void> {
-  await canonicalReadableTarget(target);
-}
-
-async function canonicalReadableTarget(target: string): Promise<string> {
-  const addressed = resolve(target);
-  if (protectedReadPath(addressed)) throw new Error(`Reading protected host path ${addressed} is blocked`);
-  const canonical = await canonicalPath(addressed);
-  if (protectedReadPath(canonical)) throw new Error(`Reading protected host path ${canonical} through a symlink is blocked`);
-  return canonical;
-}
-
-export async function assertWritableTargetAllowed(target: string): Promise<void> {
-  await canonicalWritableTarget(target);
-}
-
-async function canonicalWritableTarget(target: string): Promise<string> {
-  const addressed = resolve(target);
-  if (protectedWritePath(addressed)) throw new Error(`Writing protected host path ${addressed} is blocked`);
-  const canonical = await canonicalWriteTarget(addressed);
-  if (protectedWritePath(canonical)) throw new Error(`Writing protected host path ${canonical} through a symlink is blocked`);
-  return canonical;
-}
-
-async function assertPinnedReadableTarget(target: string): Promise<void> {
-  const addressed = resolve(target);
-  const canonical = await canonicalReadableTarget(addressed);
-  if (canonical !== addressed) {
-    throw new Error(`Readable path changed after policy preflight: ${addressed}`);
-  }
-}
-
-async function assertPinnedWritableTarget(target: string): Promise<void> {
-  const addressed = resolve(target);
-  const canonical = await canonicalWritableTarget(addressed);
-  if (canonical !== addressed) {
-    throw new Error(`Writable path changed after policy preflight: ${addressed}`);
-  }
-}
-
-async function canonicalWriteTarget(target: string): Promise<string> {
-  try {
-    return await realpath(target);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  let cursor = dirname(target);
-  const suffix = [basename(target)];
-  while (true) {
-    try {
-      const canonicalParent = await realpath(cursor);
-      return resolve(canonicalParent, ...suffix);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = dirname(cursor);
-      if (parent === cursor) throw new Error(`Unable to resolve a safe parent for ${target}`);
-      suffix.unshift(basename(cursor));
-      cursor = parent;
-    }
-  }
-}
-
-export async function readRegularFileRange(
-  path: string,
-  offset: number,
-  limit: number,
-  signal?: AbortSignal,
-  maximumTotalBytes?: number,
-): Promise<{ buffer: Buffer; total: number }> {
-  throwIfAborted(signal);
-  // O_NONBLOCK prevents opening a FIFO from pinning the Agent run forever;
-  // O_NOFOLLOW refuses a final-component symlink swapped in after policy
-  // preflight. Descriptor-level stat then closes the lstat/open race for
-  // devices and other non-regular paths.
-  const handle = await open(
-    path,
-    constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
-  );
-  try {
-    const info = await handle.stat();
-    if (!info.isFile()) throw new Error(`Agent file tools require a regular file: ${path}`);
-    if (!Number.isSafeInteger(info.size) || info.size < 0) {
-      throw new Error(`Agent file size is invalid: ${path}`);
-    }
-    if (maximumTotalBytes !== undefined && info.size > maximumTotalBytes) {
-      throw new Error(`File exceeds the ${maximumTotalBytes}-byte tool limit: ${path}`);
-    }
-    const start = Math.min(offset, info.size);
-    const length = Math.max(0, Math.min(limit, info.size - start));
-    const buffer = Buffer.alloc(length);
-    let consumed = 0;
-    while (consumed < length) {
-      throwIfAborted(signal);
-      const { bytesRead } = await handle.read(
-        buffer,
-        consumed,
-        length - consumed,
-        start + consumed,
-      );
-      if (bytesRead === 0) break;
-      consumed += bytesRead;
-    }
-    throwIfAborted(signal);
-    return { buffer: buffer.subarray(0, consumed), total: info.size };
-  } finally {
-    await handle.close();
-  }
-}
-
-async function walk(root: string, visit: (path: string) => Promise<void>, signal?: AbortSignal): Promise<void> {
-  throwIfAborted(signal);
-  const entries = await readdir(root, { withFileTypes: true });
-  for (const entry of entries) {
-    throwIfAborted(signal);
-    if (entry.isSymbolicLink() || entry.name === ".git" || entry.name === "node_modules") continue;
-    const path = resolveWorkspacePath(root, entry.name);
-    if (entry.isDirectory()) await walk(path, visit, signal);
-    else if (entry.isFile()) await visit(path);
-  }
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function gatewayDescription(

@@ -168,7 +168,6 @@ test("todo tool has closed read/replace/merge schemas, returns the full list, an
     const baseContext = {
       runId: "run",
       request: { ...identity, workspace: "/tmp" } as never,
-      processes: {} as never,
       gateway: {} as never,
       querySession: async () => null,
       delegate: async () => "",

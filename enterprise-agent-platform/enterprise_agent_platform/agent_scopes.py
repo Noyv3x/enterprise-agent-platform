@@ -561,9 +561,6 @@ class AgentScopeManager:
         )
         return self._from_row(row) if row else None
 
-    def get_private_scope(self, user_id: int) -> AgentExecutionScope | None:
-        return self.get_scope(self.private_scope_key(int(user_id)))
-
     def update_session_id(self, scope_key: str, session_id: str) -> None:
         if not self._valid_session_id(session_id):
             raise ValueError("invalid Agent session id")

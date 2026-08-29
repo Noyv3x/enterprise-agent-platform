@@ -271,35 +271,33 @@ class ConfigFromEnvTests(unittest.TestCase):
         self._container_env.stop()
 
     def test_container_mode_requires_and_exposes_absolute_manager_paths(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            socket_path = Path("/run/agent-platform-manager/manager.sock")
-            token_path = Path("/run/secrets/agent-platform/manager-token")
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_MANAGER_SOCKET": str(socket_path),
-                    "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
-                },
-                clear=True,
-            ):
-                config = PlatformConfig.from_env(root)
-            self.assertEqual(config.manager_socket, socket_path)
-            self.assertEqual(config.manager_token_file, token_path)
-            self.assertEqual(config.firecrawl_api_url, "http://firecrawl-api:3002")
+        socket_path = Path("/run/agent-platform-manager/manager.sock")
+        token_path = Path("/run/secrets/agent-platform/manager-token")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "AGENT_PLATFORM_MANAGER_SOCKET": str(socket_path),
+                "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
+            },
+            clear=True,
+        ):
+            config = PlatformConfig.from_env()
+        self.assertEqual(config.manager_socket, socket_path)
+        self.assertEqual(config.manager_token_file, token_path)
+        self.assertEqual(config.firecrawl_api_url, "http://firecrawl-api:3002")
 
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
-                    "AGENT_PLATFORM_MANAGER_SOCKET": "relative.sock",
-                    "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
-                },
-                clear=True,
-            ):
-                with self.assertRaisesRegex(ValueError, "must be absolute"):
-                    PlatformConfig.from_env(root)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_PLATFORM_DEPLOYMENT_MODE": "container",
+                "AGENT_PLATFORM_MANAGER_SOCKET": "relative.sock",
+                "AGENT_PLATFORM_MANAGER_TOKEN_FILE": str(token_path),
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be absolute"):
+                PlatformConfig.from_env()
 
     def test_target_profile_uses_only_target_configuration_namespace(self):
         with mock.patch.dict(
@@ -313,7 +311,7 @@ class ConfigFromEnvTests(unittest.TestCase):
             },
             clear=True,
         ):
-            config = PlatformConfig.from_env(Path("/ignored/source/root"))
+            config = PlatformConfig.from_env()
 
         self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
         self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
@@ -340,7 +338,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         ):
             with self.subTest(environment=environment):
                 with mock.patch.dict(os.environ, environment, clear=True):
-                    config = PlatformConfig.from_env(Path("/ignored"))
+                    config = PlatformConfig.from_env()
                 self.assertEqual(config.technical_profile, TARGET_TECHNICAL_PROFILE)
                 self.assertEqual(config.data_dir, Path("/var/lib/agent-platform"))
 
@@ -358,7 +356,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                         ValueError,
                         "technical profile",
                     ):
-                        PlatformConfig.from_env(Path("/tmp"))
+                        PlatformConfig.from_env()
 
     def test_target_profile_rejects_unbound_paths(self):
         for key, value in (
@@ -374,7 +372,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                 }
                 with mock.patch.dict(os.environ, environment, clear=True):
                     with self.assertRaisesRegex(ValueError, "must be"):
-                        PlatformConfig.from_env(Path("/tmp"))
+                        PlatformConfig.from_env()
 
     def test_container_mode_exposes_only_an_absolute_trusted_host_data_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -389,7 +387,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                 clear=True,
             ):
                 self.assertEqual(
-                    PlatformConfig.from_env(root).host_data_root,
+                    PlatformConfig.from_env().host_data_root,
                     host_data_root,
                 )
 
@@ -404,19 +402,19 @@ class ConfigFromEnvTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "AGENT_PLATFORM_HOST_DATA_ROOT must be absolute"
                 ):
-                    PlatformConfig.from_env(root)
+                    PlatformConfig.from_env()
 
     def test_missing_container_mode_is_rejected(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "must be 'container'"):
-                PlatformConfig.from_env(Path("/tmp"))
+                PlatformConfig.from_env()
 
     def test_non_numeric_port_raises_descriptive_value_error(self):
         previous = os.environ.get("AGENT_PLATFORM_PORT")
         os.environ["AGENT_PLATFORM_PORT"] = "not-a-number"
         try:
             with self.assertRaises(ValueError) as ctx:
-                PlatformConfig.from_env(Path("/tmp"))
+                PlatformConfig.from_env()
             message = str(ctx.exception)
             # The error must name the offending variable and explain it clearly,
             # not surface a bare int() ValueError.
@@ -433,7 +431,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         os.environ["AGENT_PLATFORM_PORT"] = "99999"
         try:
             with self.assertRaises(ValueError) as ctx:
-                PlatformConfig.from_env(Path("/tmp"))
+                PlatformConfig.from_env()
             self.assertIn("AGENT_PLATFORM_PORT", str(ctx.exception))
         finally:
             if previous is None:
@@ -446,12 +444,12 @@ class ConfigFromEnvTests(unittest.TestCase):
         previous = os.environ.pop(key, None)
         try:
             self.assertEqual(
-                PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
+                PlatformConfig.from_env().agent_runtime_idle_timeout_seconds,
                 float(RUN_IDLE_TIMEOUT_DEFAULT_SECONDS),
             )
             os.environ[key] = str(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS)
             self.assertEqual(
-                PlatformConfig.from_env(Path("/tmp")).agent_runtime_idle_timeout_seconds,
+                PlatformConfig.from_env().agent_runtime_idle_timeout_seconds,
                 float(RUN_IDLE_TIMEOUT_MINIMUM_SECONDS),
             )
         finally:
@@ -467,7 +465,7 @@ class ConfigFromEnvTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(
-                PlatformConfig.from_env(Path("/tmp")).agent_runtime_model,
+                PlatformConfig.from_env().agent_runtime_model,
                 "",
             )
 
@@ -480,7 +478,7 @@ class ConfigFromEnvTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(
-                PlatformConfig.from_env(Path("/tmp")).agent_runtime_model,
+                PlatformConfig.from_env().agent_runtime_model,
                 "explicit-model",
             )
 
@@ -490,7 +488,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         os.environ[key] = str(RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS + 1)
         try:
             with self.assertRaises(ValueError) as ctx:
-                PlatformConfig.from_env(Path("/tmp"))
+                PlatformConfig.from_env()
             self.assertIn(key, str(ctx.exception))
         finally:
             if previous is None:
@@ -551,7 +549,7 @@ class DeactivateUserTeardownTests(unittest.TestCase):
                 # Provision the user's private host-execution scope.
                 service.send_private_message(bob, "set up my workspace")
                 service.wait_for_agent_idle("private", str(bob["id"]))
-                before = service.agent_scopes.get_private_scope(bob["id"])
+                before = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(bob["id"]))
                 self.assertIsNotNone(before)
 
                 # Deactivation records lifecycle state without deleting the
@@ -568,7 +566,7 @@ class DeactivateUserTeardownTests(unittest.TestCase):
                 service.deactivate_user(admin, bob["id"])
 
                 self.assertEqual(recorded, [bob["id"]])
-                after = service.agent_scopes.get_private_scope(bob["id"])
+                after = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(bob["id"]))
                 self.assertIsNotNone(after)
                 self.assertEqual(after.session_id, before.session_id)
                 self.assertEqual(after.workspace_path, before.workspace_path)
@@ -590,11 +588,11 @@ class DeactivateUserTeardownTests(unittest.TestCase):
                 _, carol = service.authenticate("carol", "carol-pass")
                 service.send_private_message(carol, "workspace please")
                 service.wait_for_agent_idle("private", str(carol["id"]))
-                before = service.agent_scopes.get_private_scope(carol["id"])
+                before = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(carol["id"]))
                 self.assertIsNotNone(before)
 
                 service.deactivate_user(admin, carol["id"])
-                after = service.agent_scopes.get_private_scope(carol["id"])
+                after = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(carol["id"]))
                 self.assertEqual(after, before)
             finally:
                 service.close()

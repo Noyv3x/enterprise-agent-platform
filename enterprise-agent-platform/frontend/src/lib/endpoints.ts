@@ -66,7 +66,6 @@ import type {
   MailAccountsResponse,
   MailAccountTestResponse,
   SessionBootstrapResponse,
-  MentionTargetsResponse,
   OAuthCompleteRequest,
   OAuthFlowResponse,
   OAuthImportRequest,
@@ -235,10 +234,6 @@ export const endpoints = {
   createPrivateMailAccount: ep<MailAccountMutationRequest, MailAccountResponse>(
     "POST",
     () => "/api/private-agent/mail/accounts",
-  ),
-  privateMailAccount: ep<void, MailAccountResponse, [Id]>(
-    "GET",
-    (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}`,
   ),
   updatePrivateMailAccount: ep<MailAccountPatchRequest, MailAccountResponse, [Id]>(
     "PATCH",
@@ -464,9 +459,6 @@ export const endpoints = {
       return `/api/agent-previews/present?${params.toString()}`;
     },
   ),
-
-  /* mentions */
-  mentionTargets: ep<void, MentionTargetsResponse>("GET", () => "/api/mention-targets"),
 
   /* knowledge */
   knowledgeDocuments: ep<void, DocumentsResponse>("GET", () => "/api/knowledge/documents"),

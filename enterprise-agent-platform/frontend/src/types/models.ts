@@ -141,15 +141,6 @@ export interface AttachmentPreviewSection {
   truncated: boolean;
 }
 
-export interface XlsxAttachmentPreview {
-  attachment_id: Id;
-  filename: string;
-  kind?: AttachmentPreviewKind;
-  sheet_count: number;
-  sheets: XlsxPreviewSheet[];
-  truncated: boolean;
-}
-
 export interface AttachmentPreview {
   attachment_id: Id;
   filename: string;

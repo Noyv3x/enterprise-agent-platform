@@ -141,7 +141,7 @@ Manager 生成：
 - `AGENT_RUNTIME_RUN_IDLE_TIMEOUT_MS`、`AGENT_RUNTIME_MAX_TURNS`、`AGENT_RUNTIME_TERMINAL_TIMEOUT_MS`；
 - 容器固定 workspace/HOME/env 路径。
 
-Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.json` 的生成值。Sandbox 空闲和 execution target 必须来自 `container-platform.json`。Runtime token 不能为空；健康检查也需要 token。
+Runtime 没有可由环境选择的 local executor 模式；Manager executor socket/token 缺失时启动失败。Run 空闲、模型轮次和 terminal 默认超时必须等于 `runtime-policy.json` 的生成值。Sandbox 空闲和 execution target 必须来自 `container-platform.json`。Runtime token 不能为空；健康检查也需要 token。
 
 ## Secret
 

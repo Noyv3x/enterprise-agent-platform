@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .config import PlatformConfig
-from .db import Database, migrate_database
+from .db import migrate_database
 from .server import run_server
 from .service import EnterpriseService
 
@@ -33,7 +33,7 @@ def main() -> None:
     args = parser.parse_args()
     cmd = args.cmd
 
-    config = PlatformConfig.from_env(Path(__file__).resolve().parents[1])
+    config = PlatformConfig.from_env()
     if getattr(args, "data", None):
         config = replace(config, data_dir=Path(args.data).expanduser().resolve())
     if getattr(args, "host", None):

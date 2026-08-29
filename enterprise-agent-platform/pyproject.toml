@@ -19,9 +19,7 @@ dependencies = [
 enterprise-agent-platform = "enterprise_agent_platform.__main__:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["enterprise_agent_platform*"]
-namespaces = true
 
 [tool.setuptools.package-data]
 enterprise_agent_platform = [

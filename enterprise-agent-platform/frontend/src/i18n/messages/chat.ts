@@ -26,11 +26,8 @@ export const chatMessages = defineMessages({
   },
   "nav.channel.create": { "zh-CN": "创建公共频道", en: "Create public channel", "zh-TW": "建立公共頻道" },
   "nav.menu.open": { "zh-CN": "打开菜单", en: "Open menu", "zh-TW": "開啟選單" },
-  "nav.menu.close": { "zh-CN": "关闭菜单", en: "Close menu", "zh-TW": "關閉選單" },
   "nav.logout": { "zh-CN": "退出登录", en: "Sign out", "zh-TW": "登出" },
   "nav.userFallback": { "zh-CN": "用户", en: "User", "zh-TW": "使用者" },
-  "nav.role.member": { "zh-CN": "成员", en: "Member", "zh-TW": "成員" },
-  "nav.role.admin": { "zh-CN": "管理员", en: "Administrator", "zh-TW": "管理員" },
   "nav.telegram.linked": {
     "zh-CN": "Telegram 私聊已绑定",
     en: "Telegram direct messages linked",
@@ -219,11 +216,8 @@ export const chatMessages = defineMessages({
   "chat.privateAgent": { "zh-CN": "个人 AI", en: "Personal AI", "zh-TW": "個人 AI" },
   "chat.attachment": { "zh-CN": "附件", en: "attachment", "zh-TW": "附件" },
   "chat.file": { "zh-CN": "文件", en: "file", "zh-TW": "檔案" },
-  "chat.xlsx.workbook": { "zh-CN": "Excel 工作簿", en: "Excel workbook", "zh-TW": "Excel 活頁簿" },
   "chat.xlsx.expand": { "zh-CN": "展开表格预览", en: "Expand spreadsheet preview", "zh-TW": "展開試算表預覽" },
   "chat.xlsx.download": { "zh-CN": "下载工作簿", en: "Download workbook", "zh-TW": "下載活頁簿" },
-  "chat.xlsx.loading": { "zh-CN": "正在加载表格预览…", en: "Loading spreadsheet preview…", "zh-TW": "正在載入試算表預覽…" },
-  "chat.xlsx.unavailable": { "zh-CN": "暂时无法预览，仍可下载原文件。", en: "Preview unavailable. The original file can still be downloaded.", "zh-TW": "暫時無法預覽，仍可下載原始檔案。" },
   "chat.xlsx.empty": { "zh-CN": "工作表没有可预览的单元格。", en: "This sheet has no previewable cells.", "zh-TW": "工作表沒有可預覽的儲存格。" },
   "chat.xlsx.limited": { "zh-CN": "仅显示部分内容，下载文件可查看完整工作簿。", en: "Showing a limited preview. Download the file for the complete workbook.", "zh-TW": "僅顯示部分內容，下載檔案可查看完整活頁簿。" },
   "chat.xlsx.sheet": { "zh-CN": "工作表 {name}", en: "Worksheet {name}", "zh-TW": "工作表 {name}" },
@@ -521,16 +515,10 @@ export const chatMessages = defineMessages({
     en: "View AI work",
     "zh-TW": "檢視 AI 工作過程",
   },
-  "chat.work.completed": { "zh-CN": "已完成", en: "Completed", "zh-TW": "已完成" },
   "chat.work.waiting": {
     "zh-CN": "等待 AI 运行过程",
     en: "Waiting for AI activity",
     "zh-TW": "等待 AI 執行過程",
-  },
-  "chat.work.noTools": {
-    "zh-CN": "本次没有工具调用记录",
-    en: "No tool calls were recorded",
-    "zh-TW": "本次沒有工具呼叫記錄",
   },
   "chat.work.records": {
     "zh-CN": { other: "{count} 条工作记录" },
@@ -567,7 +555,6 @@ export const chatMessages = defineMessages({
     en: { one: "{count} more waiting", other: "{count} more waiting" },
     "zh-TW": { other: "另有 {count} 條等待" },
   },
-  "chat.activity.processing": { "zh-CN": "处理中", en: "Processing", "zh-TW": "處理中" },
   "chat.activity.toolFallback": { "zh-CN": "工具", en: "tool", "zh-TW": "工具" },
   "chat.activity.currentTool": {
     "zh-CN": "{tool} · {status}",
@@ -656,35 +643,6 @@ export const chatMessages = defineMessages({
   "chat.activity.toolName.web": { "zh-CN": "网页搜索", en: "Web search", "zh-TW": "網頁搜尋" },
   "chat.activity.toolName.browser": { "zh-CN": "浏览器", en: "Browser", "zh-TW": "瀏覽器" },
   "chat.activity.toolName.delegate_task": { "zh-CN": "子 Agent", en: "Child Agent", "zh-TW": "子 Agent" },
-  "chat.activity.toolRunning": {
-    "zh-CN": "{emoji} 正在使用 {tool}{detail}",
-    en: "{emoji} Using {tool}{detail}",
-    "zh-TW": "{emoji} 正在使用 {tool}{detail}",
-  },
-  "chat.activity.toolCompleted": {
-    "zh-CN": "✅ 已完成 {tool}{detail}",
-    en: "✅ Completed {tool}{detail}",
-    "zh-TW": "✅ 已完成 {tool}{detail}",
-  },
-  "chat.activity.toolFailed": {
-    "zh-CN": "⚠️ {tool} 执行失败{detail}",
-    en: "⚠️ {tool} failed{detail}",
-    "zh-TW": "⚠️ {tool} 執行失敗{detail}",
-  },
-  "chat.activity.completed": { "zh-CN": "✅ 工作已完成", en: "✅ Work completed", "zh-TW": "✅ 工作已完成" },
-  "chat.activity.error": { "zh-CN": "⚠️ 工作失败{detail}", en: "⚠️ Work failed{detail}", "zh-TW": "⚠️ 工作失敗{detail}" },
-  "chat.activity.queued": { "zh-CN": "⏳ 等待 Agent 处理", en: "⏳ Waiting for Agent", "zh-TW": "⏳ 等待 Agent 處理" },
-  "chat.activity.replying": { "zh-CN": "💬 Agent 正在回复", en: "💬 Agent is replying", "zh-TW": "💬 Agent 正在回覆" },
-  "chat.activity.approval": {
-    "zh-CN": "🛡️ 等待权限审批{detail}",
-    en: "🛡️ Waiting for access approval{detail}",
-    "zh-TW": "🛡️ 等待權限核准{detail}",
-  },
-  "chat.activity.approvalResponded": {
-    "zh-CN": "🛡️ 权限审批已处理{detail}",
-    en: "🛡️ Access approval completed{detail}",
-    "zh-TW": "🛡️ 權限核准已處理{detail}",
-  },
 
   "chat.approval.title": { "zh-CN": "权限审批", en: "Access approval", "zh-TW": "權限核准" },
   "chat.approval.fallbackDescription": {
@@ -704,17 +662,6 @@ export const chatMessages = defineMessages({
 
   "chat.telegram.botFallback": { "zh-CN": "Telegram Bot", en: "Telegram bot", "zh-TW": "Telegram Bot" },
   "chat.telegram.title": { "zh-CN": "Telegram 私聊", en: "Telegram direct messages", "zh-TW": "Telegram 私訊" },
-  "chat.telegram.settingsLabel": {
-    "zh-CN": "Telegram 私聊设置",
-    en: "Telegram direct message settings",
-    "zh-TW": "Telegram 私訊設定",
-  },
-  "chat.telegram.collapse": { "zh-CN": "收起", en: "Collapse", "zh-TW": "收合" },
-  "chat.telegram.collapseLabel": {
-    "zh-CN": "收起 Telegram 私聊设置",
-    en: "Collapse Telegram direct message settings",
-    "zh-TW": "收合 Telegram 私訊設定",
-  },
   "chat.telegram.statusLinked": { "zh-CN": "{bot} 已绑定", en: "{bot} linked", "zh-TW": "{bot} 已綁定" },
   "chat.telegram.statusDisabled": {
     "zh-CN": "管理员尚未启用",

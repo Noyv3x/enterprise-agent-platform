@@ -17,9 +17,6 @@ describe("workspace translations", () => {
     expect(translate("en", "knowledge.searchResults", { query: "guide", count: 1 })).toBe(
       "Search “guide”: 1 result",
     );
-    expect(translate("en", "telegram.expiresInSeconds", { count: 2 })).toBe(
-      "Expires in 2 seconds",
-    );
   });
 
   it("uses the active locale for imperative UI helpers", () => {

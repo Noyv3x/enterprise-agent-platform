@@ -10,11 +10,13 @@ from pathlib import Path
 
 from enterprise_agent_platform import knowledge as knowledge_module
 from enterprise_agent_platform.db import Database
+from enterprise_agent_platform.jobs import DurableJobStore
 from enterprise_agent_platform.knowledge import (
     EmbeddingResponseError,
     KnowledgeBase,
     KnowledgeDisabledError,
     KnowledgeEmbeddingConfig,
+    KNOWLEDGE_INDEX_JOB_KIND,
     OpenAIEmbeddingClient,
     chunk_document,
 )
@@ -51,6 +53,18 @@ def configured_knowledge(db: Database, client=None) -> KnowledgeBase:
     )
 
 
+def queued_index_payloads(
+    db: Database,
+    generation_id: int | None = None,
+) -> list[dict]:
+    return [
+        job.payload
+        for job in DurableJobStore(db).queued(KNOWLEDGE_INDEX_JOB_KIND, limit=None)
+        if generation_id is None
+        or int(job.payload.get("generation_id") or 0) == generation_id
+    ]
+
+
 class KnowledgeConfigurationTests(unittest.TestCase):
     def test_missing_key_disables_mutation_and_search_but_preserves_source_reads(self):
         with tempfile.TemporaryDirectory() as td:
@@ -68,7 +82,7 @@ class KnowledgeConfigurationTests(unittest.TestCase):
                 self.assertEqual(knowledge.list_documents()[0]["title"], "Existing")
                 self.assertEqual(knowledge.get_document(1)["content"], "preserved source")
                 with self.assertRaises(KnowledgeDisabledError):
-                    knowledge.add_document(title="New", content="body")
+                    knowledge.add_document_with_status(title="New", content="body")
                 with self.assertRaises(KnowledgeDisabledError):
                     knowledge.search("body")
                 with self.assertRaises(KnowledgeDisabledError):
@@ -219,17 +233,17 @@ class KnowledgeIndexTests(unittest.TestCase):
             client = FakeEmbeddingClient()
             try:
                 knowledge = configured_knowledge(db, client)
-                alpha = knowledge.add_document(
+                alpha, _ = knowledge.add_document_with_status(
                     title="Alpha Guide",
                     content="# Alpha\n\nalpha deployment procedure",
                     source="runbook",
                 )
-                beta = knowledge.add_document(
+                beta, _ = knowledge.add_document_with_status(
                     title="Beta Guide",
                     content="# Beta\n\nbeta incident procedure",
                     source="runbook",
                 )
-                pending = knowledge.pending_document_refs()
+                pending = queued_index_payloads(db)
                 self.assertEqual(
                     {item["document_id"] for item in pending},
                     {alpha["id"], beta["id"]},
@@ -277,13 +291,15 @@ class KnowledgeIndexTests(unittest.TestCase):
             db = Database(Path(td) / "kb.db")
             try:
                 knowledge = configured_knowledge(db)
-                alpha = knowledge.add_document(title="Alpha", content="alpha reference")
-                for payload in knowledge.pending_document_refs():
+                alpha, _ = knowledge.add_document_with_status(
+                    title="Alpha", content="alpha reference"
+                )
+                for payload in queued_index_payloads(db):
                     knowledge.index_document(payload)
                 old_generation = knowledge.status()["active_generation_id"]
 
                 new_generation = knowledge.prepare_generation(force=True)
-                pending = knowledge.pending_document_refs(new_generation)
+                pending = queued_index_payloads(db, new_generation)
                 self.assertEqual(len(pending), 1)
                 self.assertEqual(knowledge.status()["active_generation_id"], old_generation)
                 self.assertEqual(
@@ -305,11 +321,11 @@ class KnowledgeIndexTests(unittest.TestCase):
             db = Database(Path(td) / "kb.db")
             try:
                 knowledge = configured_knowledge(db)
-                document = knowledge.add_document(
+                document, _ = knowledge.add_document_with_status(
                     title="Mutable",
                     content="alpha original",
                 )
-                payload = knowledge.pending_document_refs()[0]
+                payload = queued_index_payloads(db)[0]
                 replacement = "beta replacement"
                 replacement_hash = knowledge._content_hash(
                     document["title"], replacement, document["source"]
@@ -342,8 +358,10 @@ class KnowledgeIndexTests(unittest.TestCase):
             db = Database(Path(td) / "kb.db")
             try:
                 knowledge = configured_knowledge(db, WrongCount())
-                knowledge.add_document(title="Alpha", content="alpha body")
-                payload = knowledge.pending_document_refs()[0]
+                knowledge.add_document_with_status(
+                    title="Alpha", content="alpha body"
+                )
+                payload = queued_index_payloads(db)[0]
                 with self.assertRaises(EmbeddingResponseError):
                     knowledge.index_document(payload)
                 knowledge.mark_index_failed(payload, "invalid provider response")
@@ -396,7 +414,9 @@ class KnowledgeDedupAndLimitsTests(unittest.TestCase):
             try:
                 knowledge = configured_knowledge(db)
                 with self.assertRaises(ValueError):
-                    knowledge.add_document(title="Oversize", content="x" * 100)
+                    knowledge.add_document_with_status(
+                        title="Oversize", content="x" * 100
+                    )
                 self.assertEqual(db.scalar("SELECT count(*) FROM knowledge_documents"), 0)
             finally:
                 knowledge_module.MAX_CONTENT_CHARS = original

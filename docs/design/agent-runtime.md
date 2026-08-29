@@ -31,7 +31,7 @@ Runtime 必须以单一、确定性的组装边界构造模型系统提示，顺
 
 邮件唤醒的 durable Agent job 只保存 Platform 权威源消息引用；Platform 在队列调度和重启/中断恢复边界严格校验该引用后，在内存中重建有界预览任务再提交 Runtime。Runtime 不从 job 键、邮件正文或其它文本猜测账户与 scope 身份。
 
-本地与 Quality 的 Runtime 测试入口把依赖亚秒真实计时的文件隔离到串行进程，其余文件才并行；完整规则见[测试与验证](../development/testing.md)。
+Runtime 的进程与文件工具始终通过 Manager executor 接口执行，源码和配置不保留只供测试使用的本地执行后备；单元测试在同一接口注入确定性 fake。为避免共享 runner 调度影响亚秒真实计时断言，本地与 Quality 的 Runtime 测试入口直接用 Node test runner 串行执行全部编译测试；完整规则见[测试与验证](../development/testing.md)。
 
 浏览器 live 调用只接受当前 schema 的 action 名，不为历史别名或 `tool` 字段做转换。附件只保留 path/name/mime 元数据；模型图片只来自已经内联的 input block。执行 target 闭世界只使用生成契约中的 `sandbox|host`。
 

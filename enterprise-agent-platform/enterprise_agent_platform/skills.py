@@ -610,30 +610,6 @@ class SkillStore:
                 require_automatic_eligibility=True,
             )
 
-    def automatic_patch_allowed(self, scope_key: str, skill_id: str) -> bool:
-        """Report current review eligibility without granting a write."""
-
-        normalized_id = _validate_skill_id(skill_id)
-        with self._locked_scope(scope_key) as scope_dir:
-            skill_dir = self._find_skill_dir(scope_dir, normalized_id)
-            if skill_dir is None:
-                return False
-            current = self._read_record(skill_dir, include_instructions=False)
-            usage_state = self._read_usage_state(scope_dir)
-            usage_record = self._usage_record(usage_state, normalized_id)
-            if not self._automatic_patch_eligible(usage_record):
-                return False
-            try:
-                self._reject_agent_bundled_conflict(
-                    skill_id=normalized_id,
-                    name=str(current["name"]),
-                )
-            except SkillStoreError as exc:
-                if exc.code == "bundled_skill_conflict":
-                    return False
-                raise
-            return True
-
     def set_enabled(
         self,
         scope_key: str,
@@ -643,12 +619,6 @@ class SkillStore:
         """Enable or disable a Skill without changing its portable document."""
 
         return self.update(scope_key, skill_id, enabled=enabled)
-
-    def enable(self, scope_key: str, skill_id: str) -> dict[str, Any]:
-        return self.set_enabled(scope_key, skill_id, True)
-
-    def disable(self, scope_key: str, skill_id: str) -> dict[str, Any]:
-        return self.set_enabled(scope_key, skill_id, False)
 
     def read_support(
         self,

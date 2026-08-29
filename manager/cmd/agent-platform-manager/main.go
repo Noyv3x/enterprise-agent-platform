@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"syscall"
@@ -1281,15 +1282,7 @@ func maintenanceOperationReferences(operations []model.Operation, allowedOperati
 }
 
 func sameMaintenanceOperationReferences(left, right []maintenanceOperationReference) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(left, right)
 }
 
 func sameMaintenanceSelfUpdateState(left, right selfupdate.State) bool {

@@ -9,17 +9,6 @@ export function isOAuthSecret(key: string): boolean {
   return key.includes("_OAUTH_");
 }
 
-const OAUTH_STATUS_KEYS = {
-  waiting_for_user: "oauth.waitingForUser",
-  waiting_for_callback: "oauth.waitingForCallback",
-  complete: "oauth.complete",
-} as const;
-
-export function oauthStatusLabel(status: string | null | undefined): string {
-  const key = status ? OAUTH_STATUS_KEYS[status as keyof typeof OAUTH_STATUS_KEYS] : undefined;
-  return key ? t(key) : status || t("oauth.waiting");
-}
-
 /** Human error string derived from provider.last_auth_error. */
 export function oauthProviderErrorText(provider: OAuthProvider | null | undefined): string {
   const authError = provider?.last_auth_error;

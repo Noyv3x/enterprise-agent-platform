@@ -26,7 +26,6 @@ import { t } from "../i18n";
 import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { optimisticAttachments } from "../utils/composerFiles";
 import { chatSnapshot } from "../utils/fingerprint";
-import { runBusy } from "./sessionActions";
 import {
   cacheChat,
   cacheVisibleChat,

@@ -438,21 +438,6 @@ class KnowledgeBase:
             return self._injected_client
         return OpenAIEmbeddingClient(config)
 
-    def reload_configuration(self) -> KnowledgeEmbeddingConfig:
-        self._configuration_error = ""
-        try:
-            config = self._load_configuration().validated(require_enabled=False)
-            if config.credential_configured:
-                config = config.validated(require_enabled=True)
-        except ValueError as exc:
-            self._configuration_error = str(exc)
-            self._config = KnowledgeEmbeddingConfig()
-            self._client = None
-            return self.configuration()
-        self._config = config
-        self._client = self._make_client(config)
-        return self.configuration()
-
     def configuration(self) -> KnowledgeEmbeddingConfig:
         return self._config
 
@@ -607,24 +592,6 @@ class KnowledgeBase:
             identity += (identity_extra,)
         payload = "\x00".join(identity).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
-
-    def add_document(
-        self,
-        *,
-        title: str,
-        content: str,
-        summary: str = "",
-        source: str = "",
-        created_by: int | None = None,
-    ) -> dict[str, Any]:
-        doc, _created = self.add_document_with_status(
-            title=title,
-            content=content,
-            summary=summary,
-            source=source,
-            created_by=created_by,
-        )
-        return doc
 
     def add_document_with_status(
         self,
@@ -832,24 +799,6 @@ class KnowledgeBase:
             "original": False,
         }
 
-    def delete_document(self, document_id: int) -> bool:
-        self._require_enabled()
-        with self.db.transaction(immediate=True) as conn:
-            cursor = conn.execute(
-                "DELETE FROM knowledge_documents WHERE id = ?", (int(document_id),)
-            )
-            if cursor.rowcount:
-                conn.execute(
-                    "UPDATE knowledge_index_generations SET "
-                    "document_count = (SELECT count(*) FROM knowledge_document_index "
-                    "WHERE generation_id = knowledge_index_generations.id), "
-                    "ready_document_count = (SELECT count(*) FROM knowledge_document_index "
-                    "WHERE generation_id = knowledge_index_generations.id "
-                    "AND status = 'ready'), updated_at = ?",
-                    (now_ts(),),
-                )
-        return cursor.rowcount > 0
-
     def list_documents(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         return self.db.query(
             "SELECT d.id, d.title, d.summary, d.source, d.created_by, d.created_at, "
@@ -993,31 +942,6 @@ class KnowledgeBase:
             "WHERE id = ?",
             (generation_id, generation_id, timestamp, generation_id),
         )
-
-    def pending_document_refs(
-        self,
-        generation_id: int | None = None,
-        *,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        if generation_id is None:
-            row = self.db.query_one(
-                "SELECT id FROM knowledge_index_generations "
-                "WHERE status = 'building' ORDER BY id DESC LIMIT 1"
-            )
-            if row is None:
-                return []
-            generation_id = int(row["id"])
-        sql = (
-            "SELECT generation_id, document_id, expected_hash "
-            "FROM knowledge_document_index WHERE generation_id = ? "
-            "AND status = 'pending' ORDER BY document_id"
-        )
-        params: list[Any] = [int(generation_id)]
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(max(1, min(int(limit), 10_000)))
-        return self.db.query(sql, params)
 
     def index_document(self, payload: dict[str, Any]) -> dict[str, Any]:
         generation_id, document_id, expected_hash = _validated_job_payload(payload)
@@ -1610,17 +1534,3 @@ def summarize_content(content: str, max_len: int = 220) -> str:
     if len(compact) <= max_len:
         return compact
     return compact[: max_len - 1].rstrip() + "..."
-
-
-def format_passive_suggestions(hits: list[KnowledgeHit]) -> str:
-    if not hits:
-        return ""
-    lines = [
-        "检测到知识库中的以下证据可能对当前工作有帮助。需要完整原文时请调用 knowledge 工具的 read 操作。"
-    ]
-    for hit in hits:
-        lines.append(
-            f"- kb:{hit.document_id}#{hit.chunk_id[:12]} | {hit.title}: "
-            f"{hit.content}"
-        )
-    return "\n".join(lines)

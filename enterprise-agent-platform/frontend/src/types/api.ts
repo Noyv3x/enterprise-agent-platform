@@ -356,12 +356,6 @@ export interface DeleteAgentSkillResponse {
   id: string;
 }
 
-/* --------------------------------------------------------------- mentions */
-
-export interface MentionTargetsResponse {
-  targets: MentionTarget[];
-}
-
 /* -------------------------------------------------------------- knowledge */
 
 export interface DocumentsResponse {

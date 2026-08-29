@@ -3,9 +3,8 @@ import { rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunCoordinator } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 const ACTIVE_TODO_REVIEW_ERROR = "Agent run stopped with unfinished Runtime todo items; review is required before resuming";
 

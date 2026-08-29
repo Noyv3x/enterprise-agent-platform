@@ -86,6 +86,8 @@ npm run build
 
 Runtime 使用 Node test runner。模型流必须使用 deterministic stream fake，覆盖正常工具循环、审批、取消、input 注入、并发、幂等、session 修复、压缩、委派、超时分类和 cleanup。
 
+Runtime 不实现测试专用的本地进程或文件执行器。terminal、process 和文件工具测试必须在生产使用的 `ExecutionManager` 边界注入 deterministic fake，并断言规范请求与响应；不能让测试后备分支进入生产 bundle。
+
 提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明同一 scope 内只改变精确时间、知识建议、回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀和内容寻址的 Codex 缓存 key 不变，稳定策略、规范工具 schema 或 scope 分片改变时 key 必须改变，空动态状态不生成占位块；捕获的 provider payload 还必须证明线上 key 不含原始 scope 且没有替代真实 session/header，普通单元测试不得把确定性 key 误报成供应商实际 cache hit。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
 
 后台 task 的反刷屏回归必须证明：只要当前 session 仍有活动责任，`schedule.create` 就在 Platform 调用和审批前被机械拒绝；取得匹配 target 的权威进程终态并解除全部责任后恢复允许；显式 service 不登记责任且不被误拦。
@@ -98,7 +100,7 @@ Agent 自主执行回归还必须覆盖：`process.wait` 的自然成功、非�
 
 委派安全测试还必须覆盖 child 写入后父直接结束被阻止、父执行后续聚焦验证才放行、纯只读 child 不阻止、batch 任一 child 有副作用即触发复验、嵌套子 Agent 共享根树总创建预算，以及全局 admission 饱和立即拒绝且取消已启动 child 能释放名额；不能把每层独立计数或模型 metadata 当作可信预算。
 
-涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。使用亚秒真实计时器、或与这些断言共享 waitUntil/deadline 窗口的文件，必须由 Runtime 测试入口放进独立的 `--test-concurrency=1` 进程；其余编译后的 `*.test.js` 才允许有界并行。Quality 与顶层 `test.sh` 都只通过 `npm run test:compiled` 跑这一次完整入口，不得再开第二套并发 suite 来模拟压力。串行名单是闭世界：名单中的文件必须存在于编译产物，其余 `*.test.js` 自动进入并行进程；新增亚秒墙钟用例必须先加入该名单。证明“活动不被空闲守卫误杀”时，测试空闲窗口必须大于 runner 调度抖动，不能用几十毫秒的空隙去当产品语义。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
+涉及 Run 空闲、模型轮次和 terminal 默认超时时，测试期望应从 [`runtime-policy.json`](../contracts/runtime-policy.json) 或生成的共享常量获取，不能在多个测试中复制生产数值。其它时间边界从对应配置 helper 获取。长任务回归必须证明持续活动不会被无进展保护误杀，同时快速无限循环会被模型轮次上限停止。前台 terminal 回归必须在事件循环延迟下仍依赖有界执行生命周期而不是定时器回调先后；清理宽限回归必须在 `maxConcurrency=1` 下用后续排队 Run 获得执行槽证明释放，不能把共享 runner 的绝对墙钟延迟当作产品语义。该用例删除临时 session 根时必须使用 Node `rm` 对 `ENOTEMPTY` 的有界重试，覆盖公开 completion 与内部 finally/锁释放之间的正常微任务窗口；重试耗尽仍须失败，不能无限等待或吞掉持久写入。Runtime build 必须先清空 `dist`，避免已删除源码留下的编译测试继续被 glob 误执行。Quality 与顶层 `test.sh` 都只通过 `npm run test:compiled` 启动一次 `node --test --test-concurrency=1 dist/test/*.test.js`，串行执行全部编译测试；不要再维护测试分类器、串行名单或第二套 suite。证明“活动不被空闲守卫误杀”时，测试空闲窗口必须大于 runner 调度抖动，不能用几十毫秒的空隙去当产品语义。需要扩大竞态覆盖时应使用确定性交错、可控时钟或事件屏障，而不是墙钟循环。
 
 ## 前端
 

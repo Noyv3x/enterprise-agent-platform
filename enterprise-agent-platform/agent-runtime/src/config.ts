@@ -79,19 +79,12 @@ function boundedInteger(value: string | undefined, fallback: number, minimum: nu
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
   const bearerToken = loadToken(env);
   validateTechnicalProfile(env);
-  const requestedExecutionMode = env.AGENT_RUNTIME_EXECUTOR_MODE?.trim() || "manager";
-  if (requestedExecutionMode !== "manager" && requestedExecutionMode !== "local") {
-    throw new Error("AGENT_RUNTIME_EXECUTOR_MODE must be manager or local");
-  }
-  if (requestedExecutionMode === "local" && env.NODE_ENV === "production") {
-    throw new Error("The local execution fallback is disabled in production");
-  }
   const managerToken = optionalToken(
     env,
     "AGENT_MANAGER_EXECUTOR_TOKEN",
     "AGENT_MANAGER_EXECUTOR_TOKEN_FILE",
   );
-  if (requestedExecutionMode === "manager" && !managerToken) {
+  if (!managerToken) {
     throw new Error(
       "Manager executor bearer token is required; set AGENT_MANAGER_EXECUTOR_TOKEN or AGENT_MANAGER_EXECUTOR_TOKEN_FILE",
     );
@@ -129,18 +122,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     cleanupGraceMs: positiveInteger(env.AGENT_RUNTIME_CLEANUP_GRACE_MS, 5_000),
     maxConcurrency: boundedInteger(env.AGENT_RUNTIME_MAX_CONCURRENCY, 8, 1, 64),
     maxQueuedRuns: boundedInteger(env.AGENT_RUNTIME_MAX_QUEUED_RUNS, 256, 1, 10_000),
-    executionMode: requestedExecutionMode,
+    managerSocketPath: resolve(
+      env.AGENT_MANAGER_EXECUTOR_SOCKET || TARGET_MANAGER_EXECUTOR_SOCKET_PATH,
+    ),
+    managerToken,
     managerRequestTimeoutMs: positiveInteger(
       env.AGENT_MANAGER_EXECUTOR_REQUEST_TIMEOUT_MS,
       TERMINAL_TIMEOUT_MAXIMUM_MILLISECONDS + 30_000,
     ),
   };
-  if (requestedExecutionMode === "manager") {
-    config.managerSocketPath = resolve(
-      env.AGENT_MANAGER_EXECUTOR_SOCKET || TARGET_MANAGER_EXECUTOR_SOCKET_PATH,
-    );
-    config.managerToken = managerToken!;
-  }
   const platformUrl = env.AGENT_PLATFORM_INTERNAL_URL?.replace(/\/$/, "");
   const platformToken = env.AGENT_PLATFORM_INTERNAL_TOKEN?.trim();
   if (platformUrl) config.platformUrl = platformUrl;

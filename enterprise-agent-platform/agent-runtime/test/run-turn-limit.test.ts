@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { LEARNING_REVIEW_MAX_MODEL_TURNS, RunCoordinator } from "../src/run-coordinator.js";
+import { LEARNING_REVIEW_MAX_MODEL_TURNS } from "../src/run-coordinator.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("a run can finish normally on its final allowed model turn", async () => {
   const home = await temporaryDirectory("agent-turn-limit-complete-");

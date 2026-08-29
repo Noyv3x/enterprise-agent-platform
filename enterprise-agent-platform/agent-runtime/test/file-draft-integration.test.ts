@@ -11,9 +11,7 @@ import {
   type ToolCall,
 } from "@earendil-works/pi-ai";
 import { productModelCatalogs } from "../src/model-resolver.js";
-import { RunCoordinator } from "../src/run-coordinator.js";
-import type { RuntimeEvent } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 const RAW_PROVIDER_DELTA = "RAW_PROVIDER_JSON_FRAGMENT_WITH_SECRET";
 
@@ -92,20 +90,6 @@ function textOfLength(length: number): string {
   return line.repeat(Math.ceil(length / line.length)).slice(0, length);
 }
 
-async function waitForJournalEvent(
-  coordinator: RunCoordinator,
-  runId: string,
-  type: string,
-): Promise<RuntimeEvent> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    const event = coordinator.getJournal(runId)?.list().find((candidate) => candidate.type === type);
-    if (event) return event;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  throw new Error(`Timed out waiting for ${type}`);
-}
-
 test("RunCoordinator journals Codex parsed file drafts without raw provider deltas", async () => {
   const home = await temporaryDirectory("agent-file-draft-home-");
   const workspace = await temporaryDirectory("agent-file-draft-workspace-");
@@ -156,8 +140,6 @@ test("RunCoordinator journals Codex parsed file drafts without raw provider delt
       input: "write and verify the file",
       model: { provider: "openai-codex", id: modelId },
     });
-    const approval = await waitForJournalEvent(coordinator, run.id, "approval.requested");
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
     assert.equal(await readFile(`${workspace}/draft.ts`, "utf8"), finalContent);
@@ -237,8 +219,6 @@ test("Codex file compatibility prepares an omitted complete target as sandbox be
       input: "write and verify the file",
       model: { provider: "openai-codex", id: modelId },
     });
-    const approval = await waitForJournalEvent(coordinator, run.id, "approval.requested");
-    await coordinator.respondApproval(run.id, String(approval.data.approval_id), "once");
     assert.equal((await coordinator.wait(run.id)).status, "completed");
     assert.equal(await readFile(`${workspace}/default-target.txt`, "utf8"), finalContent);
     assert.equal(nextTurnTarget, "sandbox");

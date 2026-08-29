@@ -27,7 +27,6 @@ export const scheduledTaskMessages = defineMessages({
     en: { one: "{count} task", other: "{count} tasks" },
     "zh-TW": "{count} 個任務",
   },
-  "scheduledTasks.prompt": { "zh-CN": "执行指令", en: "Instruction", "zh-TW": "執行指令" },
   "scheduledTasks.schedule": { "zh-CN": "执行计划", en: "Schedule", "zh-TW": "執行計畫" },
   "scheduledTasks.timezone": { "zh-CN": "时区：{timezone}", en: "Time zone: {timezone}", "zh-TW": "時區：{timezone}" },
   "scheduledTasks.nextRun": { "zh-CN": "下次：{time}", en: "Next: {time}", "zh-TW": "下次：{time}" },

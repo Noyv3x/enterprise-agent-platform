@@ -74,17 +74,6 @@ services:
       - ${AGENT_PLATFORM_MANAGER_CONTROL_DIR:?AGENT_PLATFORM_MANAGER_CONTROL_DIR must be set}:/run/agent-platform-manager:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - 'import json,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=2)); raise SystemExit(0 if p.get("service")=="agent-platform" else 1)'
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 30s
-
   agent-runtime:
     <<: *agent-platform-service
     image: ${AGENT_PLATFORM_AGENT_RUNTIME_IMAGE:?AGENT_PLATFORM_AGENT_RUNTIME_IMAGE must be an immutable digest reference}
@@ -110,17 +99,6 @@ services:
       - ${AGENT_PLATFORM_MANAGER_CONTROL_DIR}:/run/agent-platform-manager:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - 'const fs=require("fs");const t=fs.readFileSync("/run/secrets/agent-platform/agent-runtime-token","utf8").trim();fetch("http://127.0.0.1:8766/health",{headers:{authorization:`Bearer $${t}`}}).then(async r=>process.exit(r.ok&&(await r.json()).service==="agent-platform-runtime"?0:1)).catch(()=>process.exit(1))'
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 15s
-
   camofox:
     <<: *agent-platform-service
     image: ${AGENT_PLATFORM_CAMOFOX_IMAGE:?AGENT_PLATFORM_CAMOFOX_IMAGE must be an immutable digest reference}
@@ -142,17 +120,6 @@ services:
       - ${AGENT_PLATFORM_SECRETS_DIR}/camofox-access-key:/run/secrets/agent-platform/camofox-access-key:ro
     tmpfs:
       - /tmp:rw,nosuid,nodev,size=2g
-    healthcheck:
-      test:
-        - CMD
-        - node
-        - -e
-        - 'fetch("http://127.0.0.1:9377/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
-      interval: 10s
-      timeout: 3s
-      retries: 18
-      start_period: 45s
-
   searxng:
     <<: *agent-platform-service
     image: ${AGENT_PLATFORM_SEARXNG_IMAGE:-ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812}

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -408,9 +410,7 @@ func verifyReleaseCore(path, expectedID, channel string, active identity.ActiveP
 
 func cloneStringSet(source map[string]struct{}) map[string]struct{} {
 	result := make(map[string]struct{}, len(source))
-	for value := range source {
-		result[value] = struct{}{}
-	}
+	maps.Copy(result, source)
 	return result
 }
 
@@ -428,15 +428,7 @@ func protectReleaseCoreImages(path, expectedID, channel string, active identity.
 }
 
 func sameStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(left, right)
 }
 
 func readRegularFile(path string, limit int64) ([]byte, error) {

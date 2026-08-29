@@ -3,8 +3,7 @@ import { readFile, rm } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunCoordinator } from "../src/run-coordinator.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("automatic compaction iteratively re-compacts a long tool loop in one Run", async () => {
   const home = await temporaryDirectory("agent-repeated-compaction-");

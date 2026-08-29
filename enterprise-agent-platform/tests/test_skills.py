@@ -161,11 +161,9 @@ class SkillStoreTests(unittest.TestCase):
                 "archived_at": None,
             },
         )
-        self.assertFalse(
-            self.store.automatic_patch_allowed("private:user-1", user_skill["id"])
-        )
-        self.assertTrue(
-            self.store.automatic_patch_allowed("private:user-1", agent_skill["id"])
+        self.assertEqual(
+            usage["skills"][agent_skill["id"]]["created_by"],
+            "agent",
         )
 
         for invalid in ("model", "", None, True):
@@ -189,12 +187,10 @@ class SkillStoreTests(unittest.TestCase):
         skill = self.create_skill(scope, name="Existing package")
         self.usage_path(scope).unlink()
 
-        self.assertFalse(self.store.automatic_patch_allowed(scope, skill["id"]))
         self.assertFalse(self.usage_path(scope).exists())
         other = self.create_skill(scope, name="Recorded package", created_by="agent")
         self.assertNotIn(skill["id"], self.read_usage(scope)["skills"])
         self.assertIn(other["id"], self.read_usage(scope)["skills"])
-        self.assertFalse(self.store.automatic_patch_allowed(scope, skill["id"]))
         self.assertEqual(self.store.get(scope, skill["id"])["id"], skill["id"])
         self.assertEqual(
             {record["id"] for record in self.store.list(scope)},
@@ -427,8 +423,6 @@ class SkillStoreTests(unittest.TestCase):
             name="Agent package",
             created_by="agent",
         )
-        self.assertFalse(self.store.automatic_patch_allowed(scope, "missing-skill"))
-        self.assertFalse(self.store.automatic_patch_allowed(scope, user_skill["id"]))
         with self.assertRaises(SkillStoreError) as user_owned:
             self.store.patch_automatic(
                 scope,
@@ -437,13 +431,11 @@ class SkillStoreTests(unittest.TestCase):
                 "Review sources",
             )
         self.assertEqual(user_owned.exception.code, "automatic_skill_patch_forbidden")
-        self.assertTrue(self.store.automatic_patch_allowed(scope, agent_skill["id"]))
 
         usage = self.read_usage(scope)
         record = usage["skills"][agent_skill["id"]]
         record["pinned"] = True
         self.write_usage(usage, scope)
-        self.assertFalse(self.store.automatic_patch_allowed(scope, agent_skill["id"]))
         with self.assertRaises(SkillStoreError) as pinned:
             self.store.patch_automatic(
                 scope,
@@ -456,7 +448,6 @@ class SkillStoreTests(unittest.TestCase):
         record["pinned"] = False
         record["state"] = "stale"
         self.write_usage(usage, scope)
-        self.assertFalse(self.store.automatic_patch_allowed(scope, agent_skill["id"]))
         with self.assertRaises(SkillStoreError) as stale:
             self.store.patch_automatic(
                 scope,
@@ -469,7 +460,6 @@ class SkillStoreTests(unittest.TestCase):
         record["state"] = "archived"
         record["archived_at"] = "2026-07-30T00:00:00.000000Z"
         self.write_usage(usage, scope)
-        self.assertFalse(self.store.automatic_patch_allowed(scope, agent_skill["id"]))
         with self.assertRaises(SkillStoreError) as archived:
             self.store.patch_automatic(
                 scope,
@@ -507,7 +497,6 @@ class SkillStoreTests(unittest.TestCase):
         self.assertEqual(usage["state"], "active")
         self.assertFalse(usage["pinned"])
         self.assertEqual(usage["patch_count"], 1)
-        self.assertTrue(self.store.automatic_patch_allowed(scope, skill["id"]))
 
     def test_automatic_patch_rechecks_recreated_package_provenance(self):
         scope = "private:auto-patch-recreate"
@@ -518,7 +507,6 @@ class SkillStoreTests(unittest.TestCase):
             created_by="agent",
         )
         skill_id = original["id"]
-        self.assertTrue(self.store.automatic_patch_allowed(scope, skill_id))
 
         self.store.delete(scope, skill_id)
         with mock.patch.object(self.store, "_new_skill_id", return_value=skill_id):
@@ -625,7 +613,6 @@ class SkillStoreTests(unittest.TestCase):
             self.store.load(scope, skill_id)["instructions"],
             "Keep the replacement marker.",
         )
-        self.assertFalse(self.store.automatic_patch_allowed(scope, skill_id))
 
     def test_usage_corruption_and_unsafe_files_fail_closed(self):
         scope = "private:usage-corruption"
@@ -643,7 +630,6 @@ class SkillStoreTests(unittest.TestCase):
                 "Corruption guard",
                 "Changed name",
             ),
-            lambda: self.store.automatic_patch_allowed(scope, skill["id"]),
         ):
             with self.subTest(operation=operation):
                 with self.assertRaises(SkillStoreError) as raised:
@@ -660,7 +646,9 @@ class SkillStoreTests(unittest.TestCase):
             )
             self.usage_path(scope).symlink_to(outside)
             with self.assertRaises(SkillStoreError) as raised:
-                self.store.automatic_patch_allowed(scope, skill["id"])
+                self.store.patch_automatic(
+                    scope, skill["id"], "Corruption guard", "Changed name"
+                )
             self.assertEqual(raised.exception.status, 409)
             self.assertEqual(raised.exception.code, "unsafe_skill_path")
             self.usage_path(scope).unlink()
@@ -668,7 +656,9 @@ class SkillStoreTests(unittest.TestCase):
         self.write_usage(valid_usage, scope)
         self.usage_path(scope).chmod(0o644)
         with self.assertRaises(SkillStoreError) as raised:
-            self.store.automatic_patch_allowed(scope, skill["id"])
+            self.store.patch_automatic(
+                scope, skill["id"], "Corruption guard", "Changed name"
+            )
         self.assertEqual(raised.exception.status, 409)
         self.assertEqual(raised.exception.code, "unsafe_skill_path")
 
@@ -677,7 +667,9 @@ class SkillStoreTests(unittest.TestCase):
         os.link(self.usage_path(scope), hard_link)
         try:
             with self.assertRaises(SkillStoreError) as raised:
-                self.store.automatic_patch_allowed(scope, skill["id"])
+                self.store.patch_automatic(
+                    scope, skill["id"], "Corruption guard", "Changed name"
+                )
             self.assertEqual(raised.exception.status, 409)
             self.assertEqual(raised.exception.code, "unsafe_skill_path")
         finally:
@@ -1055,12 +1047,6 @@ class SkillStoreTests(unittest.TestCase):
         loaded = store.load("private:user-1", "source-verification")
         self.assertIn("primary source", loaded["instructions"])
         self.assertEqual(Path(loaded["skill_dir"]), package.resolve())
-        self.assertFalse(
-            store.automatic_patch_allowed(
-                "private:user-1",
-                "source-verification",
-            )
-        )
         self.assertEqual(
             store.read_support(
                 "private:user-1",
@@ -1088,9 +1074,10 @@ class SkillStoreTests(unittest.TestCase):
                 "private:user-1",
                 "source-verification",
             ),
-            "disable": lambda: store.disable(
+            "disable": lambda: store.set_enabled(
                 "private:user-1",
                 "source-verification",
+                False,
             ),
             "write_support": lambda: store.write_support(
                 "private:user-1",
@@ -1384,7 +1371,6 @@ class SkillStoreTests(unittest.TestCase):
             "Keep support marker.",
         )
         store.update(scope, created["id"], name="Source Verification")
-        self.assertFalse(store.automatic_patch_allowed(scope, created["id"]))
         with self.assertRaises(SkillStoreError) as existing_shadow:
             store.patch_automatic(
                 scope,
@@ -1973,7 +1959,7 @@ class SkillStoreTests(unittest.TestCase):
         )
         self.assertNotIn("enabled", index[0])
 
-        enabled = self.store.enable("private:user-1", hidden["id"])
+        enabled = self.store.set_enabled("private:user-1", hidden["id"], True)
         self.assertTrue(enabled["enabled"])
         self.assertEqual(
             {item["id"] for item in self.store.prompt_index("private:user-1")},

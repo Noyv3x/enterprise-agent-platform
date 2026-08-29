@@ -11,7 +11,6 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
   const tools = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
-    processes: {} as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",
@@ -180,7 +179,6 @@ test("model-history uses schema-compatible redaction for constrained identifiers
   const tools = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
-    processes: {} as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",
@@ -208,7 +206,6 @@ test("model-history bounds arbitrary browser extraction schemas without changing
   const tools = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
-    processes: {} as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",

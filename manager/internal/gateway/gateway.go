@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,12 +106,7 @@ func cloneAccessPolicy(access AccessPolicy) AccessPolicy {
 }
 
 func clonePrefixes(values []netip.Prefix) []netip.Prefix {
-	if values == nil {
-		return nil
-	}
-	result := make([]netip.Prefix, len(values))
-	copy(result, values)
-	return result
+	return slices.Clone(values)
 }
 
 func (h *Handler) ServeHTTP(response http.ResponseWriter, request *http.Request) {

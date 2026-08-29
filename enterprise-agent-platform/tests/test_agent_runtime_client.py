@@ -13,7 +13,6 @@ from enterprise_agent_platform.agent_runtime_client import (
     AGENT_RUNTIME_COMPACTION_TIMEOUT_SECONDS,
     AgentRuntimeClient,
     AgentRuntimeConnectionError,
-    AgentRuntimeHTTPError,
     AgentRuntimeProtocolError,
     AgentRuntimeRunError,
 )
@@ -58,9 +57,6 @@ class _FakeRuntime:
                 if self.path in fake.errors:
                     status, payload = fake.errors[self.path]
                     self._json(status, payload)
-                    return
-                if self.path == "/health":
-                    self._json(200, {"ok": True, "status": "ready"})
                     return
                 if self.path == "/v1/models":
                     self._json(
@@ -910,8 +906,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             {"approval_id": "approval-9", "decision": "once"},
         )
 
-    def test_health_cancel_and_cleanup(self):
-        self.assertTrue(self.client.health()["ok"])
+    def test_cancel_and_cleanup(self):
         self.assertEqual(self.client.cancel_run("run-1")["status"], "cancelled")
         cleanup = self.client.cleanup_scope("private:7", lifecycle_id="life-2")
         self.assertEqual(cleanup["killed"], 2)
@@ -1164,16 +1159,6 @@ class AgentRuntimeClientTests(unittest.TestCase):
         )
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
         self.assertEqual(request["accept"], "application/json")
-
-    def test_http_error_exposes_status_and_runtime_message(self):
-        self.runtime.errors["/health"] = (503, {"error": {"message": "runtime is warming up"}})
-
-        with self.assertRaises(AgentRuntimeHTTPError) as raised:
-            self.client.health()
-
-        self.assertEqual(raised.exception.status_code, 503)
-        self.assertIn("runtime is warming up", str(raised.exception))
-
 
 if __name__ == "__main__":
     unittest.main()

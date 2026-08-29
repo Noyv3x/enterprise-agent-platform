@@ -1,5 +1,3 @@
-import { t } from "../i18n";
-
 export interface TelegramChallengeTiming {
   valid: boolean;
   expired: boolean;
@@ -32,13 +30,4 @@ export function telegramChallengeTiming(
     secondsRemaining,
     minutesRemaining: Math.max(1, Math.ceil(secondsRemaining / 60)),
   };
-}
-
-export function telegramChallengeRelativeLabel(timing: TelegramChallengeTiming): string {
-  if (!timing.valid) return t("telegram.expiryUnknown");
-  if (timing.expired) return t("telegram.challengeExpired");
-  if (timing.secondsRemaining < 60) {
-    return t("telegram.expiresInSeconds", { count: timing.secondsRemaining });
-  }
-  return t("telegram.expiresInMinutes", { count: timing.minutesRemaining });
 }

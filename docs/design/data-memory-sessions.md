@@ -78,7 +78,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 计划任务 occurrence 与当前计划身份由 Platform SQLite 权威保存。Platform 从当前定义派生并随 scheduled Run 透传可信 `schedule_id/schedule_run_id/schedule_recurring`。recurring occurrence 只能以无 id 的空参数 `continue_current` 或 `complete_current` 提交机械决策：前者在单一事务中复验 owner、revision、当前 run/job/source identity 后不修改 schedule，后者在同一边界设置 completed、关闭 enabled 并清空 next run；已经过期或重复的 dispatcher 观察无法取得其它计划能力。若本轮以 `needs_review` 或 `blocked` 结束，Platform 在更新 occurrence 终态的同一事务中仅对仍匹配 `last_run_id` 和 revision 的计划设置 paused、关闭 enabled 并清空 next run，重复恢复幂等且不会暂停较新 revision。计划任务不能用于观察当前 Run 启动的本地进程；这类等待属于 Runtime/Manager process 生命周期。
 
-个人 AI 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。服务重启时：
+个人 AI 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。首次领取 joined child 时，durable job 的 FIFO claim 与 `agent_run_inputs` reservation 必须在同一事务完成；不能先用独立入口留下未取得任务所有权的 reservation。服务重启时：
 
 - 尚未提交的 reserved/unconsumed 输入可重新排队；
 - 已提交或已注入但终态未知的输入与父 job 进入 `needs_review`；

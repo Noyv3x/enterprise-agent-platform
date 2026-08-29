@@ -11,7 +11,7 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .loopback_http import build_loopback_opener, build_trusted_service_opener
+from .loopback_http import build_trusted_service_opener
 
 
 DEFAULT_TIMEOUT_SECONDS = 20.0

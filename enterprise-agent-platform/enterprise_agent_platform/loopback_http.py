@@ -128,17 +128,6 @@ def _validate_service_request_url(value: str) -> None:
         ) from exc
 
 
-def open_trusted_service_url(
-    request: urllib.request.Request,
-    *,
-    timeout: float,
-):
-    """Open a trusted HTTP(S) service URL without forwarding auth on redirects."""
-
-    _validate_service_request_url(request.full_url)
-    return build_trusted_service_opener().open(request, timeout=timeout)
-
-
 def open_private_service_url(
     request: urllib.request.Request,
     *,

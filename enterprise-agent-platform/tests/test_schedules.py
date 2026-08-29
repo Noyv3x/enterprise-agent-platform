@@ -233,7 +233,7 @@ class ScheduleServiceTests(unittest.TestCase):
         schedule_run_id: int,
         **overrides,
     ) -> dict:
-        scope = service.agent_scopes.get_private_scope(int(actor["id"]))
+        scope = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(actor["id"]))
         run = service.schedules.get_run(schedule_run_id)
         assert scope is not None
         assert run is not None
@@ -445,7 +445,7 @@ class ScheduleServiceTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
                 schedule = self._create(service, admin)
-                scope = service.agent_scopes.get_private_scope(admin["id"])
+                scope = service.agent_scopes.get_scope(service.agent_scopes.private_scope_key(admin["id"]))
                 self.assertIsNotNone(scope)
                 with self.assertRaises(ServiceError) as arguments_error:
                     service.invoke_agent_runtime_tool(

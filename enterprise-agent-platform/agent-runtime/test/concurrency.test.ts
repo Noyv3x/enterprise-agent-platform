@@ -1,12 +1,10 @@
 import assert from "node:assert/strict";
-import { access, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { RunCoordinator } from "../src/run-coordinator.js";
-import { classifyToolCall } from "../src/tools.js";
 import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig } from "./helpers.js";
+import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
 
 test("RunCoordinator starts top-level runs in FIFO order at the concurrency limit", async () => {
   const home = await temporaryDirectory("agent-concurrency-");
@@ -215,7 +213,7 @@ test("a delegated child that needs review forces the parent to needs_review", as
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "child side effect" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "touch child-marker && stat child-marker" }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("write_file", { path: "child-marker", content: "child\n" }), { stopReason: "toolUse" }),
     async () => { throw new Error("child provider failed"); },
     fauxAssistantMessage("parent tried to recover"),
   ]);
@@ -226,29 +224,11 @@ test("a delegated child that needs review forces the parent to needs_review", as
   });
   try {
     const parent = coordinator.createRun(request(workspace, "delegate side effect"));
-    await waitUntil(() => Boolean(
-      coordinator.getJournal(parent.id)?.list().some((event) => event.type === "approval.requested"),
-    ));
-    const approval = coordinator.getJournal(parent.id)?.list().find((event) => event.type === "approval.requested");
-    assert.equal(approval?.data.session_id, parent.request.session_id);
-    await coordinator.respondApproval(parent.id, String(approval?.data.approval_id), "session");
     const completed = await withDeadline(coordinator.wait(parent.id));
     assert.equal(completed.status, "needs_review");
     assert.equal(completed.sideEffectsStarted, true);
     assert.match(completed.error || "", /child provider failed/);
-    await access(`${workspace}/child-marker`);
-    const policy = await classifyToolCall(
-      "terminal",
-      { command: "touch child-marker && stat child-marker" },
-      workspace,
-      config.terminalTimeoutMs,
-    );
-    assert.ok(policy.approvalKey);
-    assert.equal(await coordinator.sessions.hasSessionApproval({
-      scope_key: parent.request.scope_key,
-      lifecycle_id: parent.request.lifecycle_id,
-      session_id: parent.request.session_id,
-    }, policy.approvalKey), true);
+    assert.equal(await readFile(`${workspace}/child-marker`, "utf8"), "child\n");
     assert.ok(coordinator.getJournal(parent.id)?.list().some((event) => event.type === "delegation.failed"));
   } finally {
     coordinator.shutdown();
@@ -279,10 +259,6 @@ test("a child write cannot be accepted until the parent performs focused verific
   });
   try {
     const parent = coordinator.createRun(request(workspace, "verify delegated write"));
-    await waitUntil(() => Boolean(coordinator.approvals.latestForRun(parent.id)));
-    const approval = coordinator.approvals.latestForRun(parent.id);
-    assert.ok(approval);
-    await coordinator.respondApproval(parent.id, approval.id, "once");
     const completed = await withDeadline(coordinator.wait(parent.id));
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "parent verified child.txt");
@@ -314,10 +290,6 @@ test("a parent that repeatedly skips delegated side-effect verification enters n
   });
   try {
     const parent = coordinator.createRun(request(workspace, "reject unverified delegated write"));
-    await waitUntil(() => Boolean(coordinator.approvals.latestForRun(parent.id)));
-    const approval = coordinator.approvals.latestForRun(parent.id);
-    assert.ok(approval);
-    await coordinator.respondApproval(parent.id, approval.id, "once");
     const completed = await withDeadline(coordinator.wait(parent.id));
     assert.equal(completed.status, "needs_review");
     assert.match(completed.error || "", /delegated Agent started side effects/i);
@@ -380,10 +352,6 @@ test("batch delegation requires one parent verification when any child has side 
   });
   try {
     const parent = coordinator.createRun(request(workspace, "delegate mixed batch"));
-    await waitUntil(() => Boolean(coordinator.approvals.latestForRun(parent.id)));
-    const approval = coordinator.approvals.latestForRun(parent.id);
-    assert.ok(approval);
-    await coordinator.respondApproval(parent.id, approval.id, "once");
     const completed = await withDeadline(coordinator.wait(parent.id));
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "parent verified batch");

@@ -9,7 +9,7 @@ import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { ActivityStep, AgentStatus } from "../../types";
-import { AgentWorkCard, hasAgentBrowserStep } from "./AgentWorkCard";
+import { AgentWorkCard } from "./AgentWorkCard";
 
 function activityStep(value: ActivityStep): ActivityStep {
   return value;
@@ -21,18 +21,6 @@ describe("AgentWorkCard", () => {
   });
 
   afterEach(cleanup);
-
-  it("recognizes a substantive browser tool step without mistaking tool noise for one", () => {
-    expect(hasAgentBrowserStep({
-      activity: [
-        { stage: "tool", tool: "tool", detail: "tool" },
-        { stage: "tool.started", tool: "browser", tool_call_id: "browser-1", tool_status: "running" },
-      ],
-    })).toBe(true);
-    expect(hasAgentBrowserStep({
-      activity: [{ stage: "tool", tool: "web", tool_call_id: "web-1", tool_status: "running" }],
-    })).toBe(false);
-  });
 
   it("renders active work as compact non-interactive rows without full details", () => {
     const store = createStore(rootReducer, initialAppState);

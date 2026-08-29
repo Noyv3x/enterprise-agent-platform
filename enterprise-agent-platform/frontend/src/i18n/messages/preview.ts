@@ -2,7 +2,6 @@ import { defineMessages } from "../types";
 
 export const previewMessages = defineMessages({
   "preview.sidebarLabel": { "zh-CN": "Agent 侧边工具", en: "Agent side tools", "zh-TW": "Agent 側邊工具" },
-  "preview.openBrowser": { "zh-CN": "展开浏览器预览", en: "Open browser preview", "zh-TW": "展開瀏覽器預覽" },
   "computer.title": { "zh-CN": "AI 的电脑", en: "AI computer", "zh-TW": "AI 的電腦" },
   "computer.show": { "zh-CN": "显示 AI 的电脑", en: "Show the AI computer", "zh-TW": "顯示 AI 的電腦" },
   "computer.description": {
@@ -17,11 +16,6 @@ export const previewMessages = defineMessages({
   "computer.mode.present": { "zh-CN": "呈现页", en: "Page", "zh-TW": "呈現頁" },
   "computer.loading": { "zh-CN": "正在准备 AI 的电脑", en: "Preparing the AI computer", "zh-TW": "正在準備 AI 的電腦" },
   "computer.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
-  "computer.availabilityError": {
-    "zh-CN": "暂时无法确认电脑资源，已保留当前画面。",
-    en: "Computer resources could not be confirmed. The current view is kept.",
-    "zh-TW": "暫時無法確認電腦資源，已保留目前畫面。",
-  },
   "computer.file.loading": { "zh-CN": "正在读取文件…", en: "Loading file…", "zh-TW": "正在讀取檔案…" },
   "computer.file.empty": { "zh-CN": "没有可显示的文件文本。", en: "No file text is available.", "zh-TW": "沒有可顯示的檔案文字。" },
   "computer.file.host": {
@@ -33,11 +27,6 @@ export const previewMessages = defineMessages({
     "zh-CN": "仅显示部分文本。",
     en: "Showing a limited excerpt.",
     "zh-TW": "僅顯示部分文字。",
-  },
-  "computer.file.binary": {
-    "zh-CN": "该文件不是可预览的文本。",
-    en: "This file is not previewable text.",
-    "zh-TW": "此檔案不是可預覽的文字。",
   },
   "computer.file.failed": {
     "zh-CN": "暂时无法读取该文件。",
@@ -57,28 +46,17 @@ export const previewMessages = defineMessages({
   },
   "computer.search.empty": { "zh-CN": "还没有搜索结果。", en: "No search results yet.", "zh-TW": "還沒有搜尋結果。" },
   "computer.search.untitled": { "zh-CN": "未命名结果", en: "Untitled result", "zh-TW": "未命名結果" },
-  "computer.present.loading": { "zh-CN": "正在加载呈现页", en: "Loading the page", "zh-TW": "正在載入呈現頁" },
   "computer.present.failed": {
     "zh-CN": "呈现页无法显示，聊天不受影响。",
     en: "The page could not be shown. Chat is unaffected.",
     "zh-TW": "呈現頁無法顯示，聊天不受影響。",
   },
   "computer.present.title": { "zh-CN": "呈现页", en: "Presented page", "zh-TW": "呈現頁" },
-  "computer.terminal.waiting": {
-    "zh-CN": "正在等待终端输出…",
-    en: "Waiting for terminal output…",
-    "zh-TW": "正在等待終端輸出…",
-  },
   "computer.pip.live": { "zh-CN": "工作中", en: "Working", "zh-TW": "工作中" },
   "computer.pip.elapsed": {
     "zh-CN": "已用时 {time}",
     en: "Elapsed {time}",
     "zh-TW": "已用時間 {time}",
-  },
-  "preview.openTerminals": {
-    "zh-CN": "展开终端预览（{count}）",
-    en: { one: "Open terminal preview ({count})", other: "Open terminal previews ({count})" },
-    "zh-TW": "展開終端預覽（{count}）",
   },
   "preview.close": { "zh-CN": "关闭预览", en: "Close preview", "zh-TW": "關閉預覽" },
   "preview.readOnly": { "zh-CN": "只读", en: "Read only", "zh-TW": "唯讀" },
@@ -101,11 +79,6 @@ export const previewMessages = defineMessages({
   },
 
   "browserPreview.title": { "zh-CN": "浏览器实时预览", en: "Live browser preview", "zh-TW": "瀏覽器即時預覽" },
-  "browserPreview.description": {
-    "zh-CN": "以低帧率查看 Agent 当前浏览器；需要时可接管并协助操作。",
-    en: "Watch the Agent's browser at a low frame rate and take control when assistance is needed.",
-    "zh-TW": "以低幀率檢視 Agent 目前的瀏覽器；需要時可接管並協助操作。",
-  },
   "browserPreview.takeControl": { "zh-CN": "接管浏览器", en: "Take control", "zh-TW": "接管瀏覽器" },
   "browserPreview.endControl": { "zh-CN": "结束协助", en: "End assistance", "zh-TW": "結束協助" },
   "browserPreview.assisting": { "zh-CN": "人工协助中", en: "Human assistance", "zh-TW": "人工協助中" },
@@ -122,22 +95,6 @@ export const previewMessages = defineMessages({
   "browserPreview.typeSend": { "zh-CN": "输入", en: "Type", "zh-TW": "輸入" },
   "browserPreview.controlSurface": { "zh-CN": "可操作的 Agent 浏览器画面", en: "Interactive Agent browser view", "zh-TW": "可操作的 Agent 瀏覽器畫面" },
   "browserPreview.frameAlt": { "zh-CN": "Agent 浏览器的最新画面", en: "Latest Agent browser frame", "zh-TW": "Agent 瀏覽器的最新畫面" },
-  "browserPreview.workTitle": { "zh-CN": "浏览器预览", en: "Browser preview", "zh-TW": "瀏覽器預覽" },
-  "browserPreview.workFrameAlt": {
-    "zh-CN": "Agent 工作中的浏览器画面",
-    en: "Agent browser view during this run",
-    "zh-TW": "Agent 工作中的瀏覽器畫面",
-  },
-  "browserPreview.workLoading": {
-    "zh-CN": "正在准备浏览器画面",
-    en: "Preparing browser view",
-    "zh-TW": "正在準備瀏覽器畫面",
-  },
-  "browserPreview.workTakeControl": {
-    "zh-CN": "打开并接管浏览器",
-    en: "Open and take control of the browser",
-    "zh-TW": "開啟並接管瀏覽器",
-  },
   "browserPreview.loadingFrame": {
     "zh-CN": "正在加载浏览器画面",
     en: "Loading browser view",
@@ -156,11 +113,6 @@ export const previewMessages = defineMessages({
   },
   "browserPreview.page": { "zh-CN": "当前页面", en: "Current page", "zh-TW": "目前頁面" },
   "terminalPreview.title": { "zh-CN": "终端实时预览", en: "Live terminal preview", "zh-TW": "終端即時預覽" },
-  "terminalPreview.description": {
-    "zh-CN": "查看 Agent 当前打开的终端及最新输出；所有终端均为只读。",
-    en: "View the Agent's open terminals and latest output. Every terminal is read only.",
-    "zh-TW": "檢視 Agent 目前開啟的終端及最新輸出；所有終端均為唯讀。",
-  },
   "terminalPreview.count": {
     "zh-CN": "{count} 个终端",
     en: { one: "{count} terminal", other: "{count} terminals" },
@@ -181,8 +133,6 @@ export const previewMessages = defineMessages({
     en: "Manager has not confirmed that this process stopped. It remains active and continues to occupy execution resources.",
     "zh-TW": "Manager 尚未確認該程序已經終止。它仍被視為活動程序並佔用執行資源。",
   },
-  "terminalPreview.cwd": { "zh-CN": "工作目录", en: "Working directory", "zh-TW": "工作目錄" },
-  "terminalPreview.command": { "zh-CN": "命令", en: "Command", "zh-TW": "命令" },
   "terminalPreview.output": { "zh-CN": "只读终端输出", en: "Read-only terminal output", "zh-TW": "唯讀終端輸出" },
   "terminalPreview.emptyOutput": { "zh-CN": "等待终端输出…", en: "Waiting for terminal output…", "zh-TW": "等待終端輸出…" },
   "terminalPreview.truncated": { "zh-CN": "仅显示最新输出", en: "Showing latest output only", "zh-TW": "僅顯示最新輸出" },

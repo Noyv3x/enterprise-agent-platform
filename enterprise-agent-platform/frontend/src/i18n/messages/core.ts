@@ -1,7 +1,6 @@
 import { defineMessages } from "../types";
 
 export const coreMessages = defineMessages({
-  "app.title": { "zh-CN": "Agent Platform", en: "Agent Platform", "zh-TW": "Agent Platform" },
   "app.description": {
     "zh-CN": "{product} - 公共频道、个人 AI、知识库与运行时管理。",
     en: "{product} - public channels, Personal AI, knowledge, and runtime management.",
@@ -20,9 +19,6 @@ export const coreMessages = defineMessages({
   "shell.userMenu.settings": { "zh-CN": "个人设置", en: "Personal settings", "zh-TW": "個人設定" },
   "shell.userMenu.language": { "zh-CN": "界面语言", en: "Interface language", "zh-TW": "介面語言" },
   "shell.userMenu.theme": { "zh-CN": "深色主题", en: "Dark theme", "zh-TW": "深色主題" },
-  "theme.toggle": { "zh-CN": "切换主题", en: "Switch theme", "zh-TW": "切換主題" },
-  "theme.toLight": { "zh-CN": "切换到浅色主题", en: "Switch to light theme", "zh-TW": "切換到淺色主題" },
-  "theme.toDark": { "zh-CN": "切换到深色主题", en: "Switch to dark theme", "zh-TW": "切換到深色主題" },
   "auth.login": { "zh-CN": "登录", en: "Sign in", "zh-TW": "登入" },
   "auth.loggingIn": { "zh-CN": "正在登录…", en: "Signing in…", "zh-TW": "正在登入…" },
   "auth.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },

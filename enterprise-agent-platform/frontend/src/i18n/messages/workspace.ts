@@ -45,8 +45,6 @@ export const workspaceMessages = defineMessages({
     "zh-TW": "目前帳戶",
   },
   "account.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },
-  "account.permissionGroup": { "zh-CN": "权限组", en: "Permission group", "zh-TW": "權限群組" },
-  "account.member": { "zh-CN": "成员", en: "Member", "zh-TW": "成員" },
   "account.displayName": { "zh-CN": "显示名称", en: "Display name", "zh-TW": "顯示名稱" },
   "account.position": { "zh-CN": "职位", en: "Position", "zh-TW": "職位" },
   "account.timezone": { "zh-CN": "时区", en: "Time zone", "zh-TW": "時區" },
@@ -250,37 +248,9 @@ export const workspaceMessages = defineMessages({
     en: "Mention the public-channel Agent",
     "zh-TW": "呼叫公共頻道 Agent",
   },
-  "oauth.waitingForUser": {
-    "zh-CN": "等待网页登录",
-    en: "Waiting for browser sign-in",
-    "zh-TW": "等待網頁登入",
-  },
-  "oauth.waitingForCallback": {
-    "zh-CN": "等待回调 URL",
-    en: "Waiting for callback URL",
-    "zh-TW": "等待回呼 URL",
-  },
-  "oauth.complete": { "zh-CN": "已完成", en: "Complete", "zh-TW": "已完成" },
-  "oauth.waiting": { "zh-CN": "等待中", en: "Waiting", "zh-TW": "等待中" },
   "oauth.reloginRequired": {
     "zh-CN": "需要重新验证：{message}",
     en: "Sign-in required again: {message}",
     "zh-TW": "需要重新驗證：{message}",
-  },
-  "telegram.expiryUnknown": { "zh-CN": "有效期未知", en: "Expiry unknown", "zh-TW": "有效期限未知" },
-  "telegram.challengeExpired": {
-    "zh-CN": "绑定码已过期",
-    en: "Linking code expired",
-    "zh-TW": "綁定碼已過期",
-  },
-  "telegram.expiresInSeconds": {
-    "zh-CN": "{count} 秒后过期",
-    en: { one: "Expires in {count} second", other: "Expires in {count} seconds" },
-    "zh-TW": "{count} 秒後過期",
-  },
-  "telegram.expiresInMinutes": {
-    "zh-CN": "约 {count} 分钟后过期",
-    en: { one: "Expires in about {count} minute", other: "Expires in about {count} minutes" },
-    "zh-TW": "約 {count} 分鐘後過期",
   },
 });

@@ -96,8 +96,7 @@ class PlatformConfig:
         return self.technical_profile.search_health_service
 
     @classmethod
-    def from_env(cls, base_dir: Path | None = None) -> "PlatformConfig":
-        del base_dir
+    def from_env(cls) -> "PlatformConfig":
         profile = select_technical_profile()
         if (
             os.getenv(profile.deployment_mode_environment_variable, "")
