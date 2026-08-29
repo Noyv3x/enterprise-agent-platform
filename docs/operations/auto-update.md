@@ -55,7 +55,7 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 2. 等待已准入短操作退出；
 3. 停止 current Platform writer 与需要切换的固定服务；
 4. 建立并验证 generation 快照；
-5. 运行候选数据库迁移；
+5. 由候选 Platform 的闭世界 entrypoint 规范化当前 baseline 声明的旧 Docker workspace mountpoint，立即降回部署 UID/GID并运行候选数据库迁移；没有匹配残留时兼容步骤无副作用；
 6. 启动候选核心服务并探测；
 7. 必要时激活候选 Manager；
 8. 原子提交 Current、结算 reservation、恢复入口；
@@ -67,7 +67,7 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 
 核心提交门只有 Manager、Platform、Agent Runtime 和公共入口。Camoufox、SearXNG 与 Firecrawl 单项失败记录为 degraded，并由后台指数退避恢复；不得让已经健康的核心 generation 长期停在维护页。用户工作区里的 MCP server 不属于更新 readiness，也不能阻止 generation 提交。
 
-数据库迁移、核心启动或核心 readiness 在提交前失败时，Manager 停止候选、恢复快照和 previous generation、结算 reservation，并把 operation 标为可重试失败。提交后的业务数据不得自动回滚到可能已经分叉的 previous 数据；后续恢复使用新的快照 operation。
+数据库迁移、核心启动或核心 readiness 在提交前失败时，Manager 停止候选、恢复快照和 previous generation、结算 reservation，并把 operation 标为可重试失败。直接 baseline 兼容步骤对旧 Docker 空 mountpoint 的 owner/mode 收紧是单调且与旧 generation 兼容的 workspace 变更，不属于 SQLite 快照，也不在失败回滚时反向放宽；其余数据库与 sidecar 仍按快照边界恢复。提交后的业务数据不得自动回滚到可能已经分叉的 previous 数据；后续恢复使用新的快照 operation。
 
 operation 终态与 Manager state 的半提交窗口必须幂等收敛：
 
@@ -111,7 +111,7 @@ Docker 空间达到预警阈值时，Manager 优先运行安全清理，再决�
 - 全新数据根安装，其中 stable Manager 与 manifest 候选同摘要时不创建 activation；
 - 一个普通 Manager 不同摘要自更新在真实 user-systemd 下提交和回滚；
 - 多个正常任务跨过轮询周期时更新保持排队，空闲后自动继续；
-- 数据库迁移成功、失败、外键回滚和各持久 phase 重启恢复；
+- 数据库迁移成功、失败、外键回滚和各持久 phase 重启恢复；直接旧 baseline 还要覆盖旧 Docker 空 mountpoint 的精确接管、拒绝未知形态、崩溃重试、降权后的真实迁移以及后续 Manager 预建附件挂载目标；
 - 核心 registry 无进展、ENOSPC、核心 readiness 与响应丢失；
 - Firecrawl 等能力不可用时核心 generation 仍提交，能力恢复后自行健康；
 - Current/Previous 快照往返回滚；

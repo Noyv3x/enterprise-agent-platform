@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -18,6 +19,9 @@ from enterprise_agent_platform.skills import (
     _render_sidecar,
     _render_usage_state,
     _validated_document,
+)
+from enterprise_agent_platform.workspace_mount_compat import (
+    normalize_legacy_workspace_mounts,
 )
 
 
@@ -235,6 +239,31 @@ def marker(database_path: Path) -> int:
 
 
 class DatabaseMigrationTests(unittest.TestCase):
+    def test_legacy_mount_compatibility_prepares_skill_destination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            database_path, workspace, _legacy = create_source_database(data_dir)
+            internal = workspace / ".agent-platform"
+            attachments = internal / "attachments"
+            attachments.mkdir(mode=0o755, parents=True)
+            internal.chmod(0o755)
+            with mock.patch(
+                "enterprise_agent_platform.workspace_mount_compat.os.geteuid",
+                return_value=0,
+            ):
+                normalize_legacy_workspace_mounts(
+                    data_dir,
+                    target_uid=os.getuid(),
+                    target_gid=os.getgid(),
+                )
+
+            self.assertEqual(
+                migrate_database(database_path, data_dir=data_dir),
+                TARGET_SCHEMA_VERSION,
+            )
+            self.assertEqual(internal.stat().st_mode & 0o777, 0o700)
+            self.assertTrue((internal / "skills" / SKILL_ID / "SKILL.md").is_file())
+
     def test_copies_legacy_skill_to_portable_and_protected_layout(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory) / "data"

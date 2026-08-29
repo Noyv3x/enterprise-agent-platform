@@ -743,6 +743,7 @@ jobs:
           done
           cp containers/searxng/settings.yml "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/config/settings.yml"
           chmod 0700 \
+            "$AGENT_PLATFORM_DATA_ROOT/data" \
             "$AGENT_PLATFORM_DATA_ROOT/data/workspaces" \
             "$AGENT_PLATFORM_DATA_ROOT/data/runtimes" \
             "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/agent" \
@@ -857,6 +858,105 @@ jobs:
               "firecrawl-rabbitmq": .services["firecrawl-rabbitmq"].image
             } == ($expected[0] | del(."agent-sandbox"))
           ' <<<"$resolved_compose" >/dev/null
+          (
+            cd enterprise-agent-platform
+            sudo -n env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD" \
+              python3 -m unittest tests.test_workspace_mount_compat
+          )
+          docker run --rm --network=none \
+            --user "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID" \
+            --workdir / \
+            --entrypoint /opt/venv/bin/python \
+            --mount "type=bind,src=$AGENT_PLATFORM_DATA_ROOT/data,dst=/var/lib/agent-platform" \
+            --mount "type=bind,src=$PWD/enterprise-agent-platform/tests,dst=/fixture,readonly" \
+            "$AGENT_PLATFORM_PLATFORM_IMAGE" -I -c 'import runpy; from pathlib import Path; fixture = runpy.run_path("/fixture/test_database_migration.py"); fixture["create_source_database"](Path("/var/lib/agent-platform"))'
+          database_marker() {
+            python3 -c 'import sqlite3,sys; from pathlib import Path; uri=Path(sys.argv[1]).resolve().as_uri()+"?mode=ro"; print(sqlite3.connect(uri, uri=True).execute("SELECT version FROM schema_migrations").fetchone()[0])' \
+              "$AGENT_PLATFORM_DATA_ROOT/data/platform.db"
+          }
+          shadow_sentinel="$AGENT_PLATFORM_DATA_ROOT/data/root-python-shadow-loaded"
+          mkdir -m 0700 "$AGENT_PLATFORM_DATA_ROOT/data/enterprise_agent_platform"
+          for shadow in \
+            "$AGENT_PLATFORM_DATA_ROOT/data/enterprise_agent_platform/__init__.py" \
+            "$AGENT_PLATFORM_DATA_ROOT/data/sitecustomize.py"; do
+            printf '%s\n' \
+              'from pathlib import Path' \
+              'Path("/var/lib/agent-platform/root-python-shadow-loaded").write_text("loaded", encoding="utf-8")' \
+              > "$shadow"
+            chmod 0600 "$shadow"
+          done
+          compatibility_workspaces="$AGENT_PLATFORM_DATA_ROOT/data/workspaces"
+          mkdir -p \
+            "$compatibility_workspaces/user-9001" \
+            "$compatibility_workspaces/user-9002/.agent-platform/plans" \
+            "$compatibility_workspaces/user-9003" \
+            "$compatibility_workspaces/user-9004"
+          chmod 0700 \
+            "$compatibility_workspaces/user-9001" \
+            "$compatibility_workspaces/user-9002" \
+            "$compatibility_workspaces/user-9002/.agent-platform/plans" \
+            "$compatibility_workspaces/user-9003" \
+            "$compatibility_workspaces/user-9004"
+          chmod 0755 "$compatibility_workspaces/user-9002/.agent-platform"
+          printf 'preserve-me\n' > "$compatibility_workspaces/user-9002/.agent-platform/plans/keep"
+          chmod 0600 "$compatibility_workspaces/user-9002/.agent-platform/plans/keep"
+          for workspace in user-9001 user-9003 user-9004; do
+            docker run --rm --network=none --user 0:0 --entrypoint sh \
+              --mount "type=bind,src=$compatibility_workspaces/$workspace,dst=/fixture" \
+              "$AGENT_PLATFORM_PLATFORM_IMAGE" -eu -c '
+                mkdir -m 0755 /fixture/.agent-platform
+                mkdir -m 0755 /fixture/.agent-platform/attachments
+              '
+          done
+          docker run --rm --network=none --user 0:0 --entrypoint sh \
+            --mount "type=bind,src=$compatibility_workspaces/user-9003,dst=/fixture" \
+            "$AGENT_PLATFORM_PLATFORM_IMAGE" -eu -c '
+              printf unexpected > /fixture/.agent-platform/attachments/unexpected
+            '
+          docker run --rm --network=none --user 0:0 --entrypoint sh \
+            --env "TARGET_UID=$AGENT_PLATFORM_UID" \
+            --env "TARGET_GID=$AGENT_PLATFORM_GID" \
+            --mount "type=bind,src=$compatibility_workspaces/user-9004,dst=/fixture" \
+            "$AGENT_PLATFORM_PLATFORM_IMAGE" -eu -c '
+              chown "$TARGET_UID:$TARGET_GID" /fixture/.agent-platform/attachments
+              chmod 0755 /fixture/.agent-platform/attachments
+            '
+          if docker compose -f containers/compose.yaml run --rm --no-deps platform migrate; then
+            echo "unsafe legacy workspace mount unexpectedly passed compatibility preflight" >&2
+            exit 1
+          fi
+          test ! -e "$shadow_sentinel"
+          test "$(database_marker)" = 2026080801
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9001/.agent-platform")" = 0:0:755
+          docker run --rm --network=none --user 0:0 --entrypoint sh \
+            --mount "type=bind,src=$compatibility_workspaces/user-9003,dst=/fixture" \
+            "$AGENT_PLATFORM_PLATFORM_IMAGE" -eu -c 'rm -rf /fixture/.agent-platform'
+          scope_hash="$(printf 'private:7' | sha256sum | cut -d' ' -f1)"
+          legacy_scope="$AGENT_PLATFORM_DATA_ROOT/data/agent-skills/$scope_hash"
+          printf unexpected > "$legacy_scope/unexpected"
+          chmod 0600 "$legacy_scope/unexpected"
+          if docker compose -f containers/compose.yaml run --rm --no-deps platform migrate; then
+            echo "invalid source database migration unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test ! -e "$shadow_sentinel"
+          test "$(database_marker)" = 2026080801
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9001/.agent-platform")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:700"
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9004/.agent-platform")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:700"
+          rm "$legacy_scope/unexpected"
+          docker compose -f containers/compose.yaml run --rm --no-deps platform migrate
+          test ! -e "$shadow_sentinel"
+          test "$(database_marker)" = 2026082901
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9001/.agent-platform")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:700"
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9001/.agent-platform/attachments")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:700"
+          test "$(stat -c %u:%g:%a "$compatibility_workspaces/user-9002/.agent-platform")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:700"
+          test "$(<"$compatibility_workspaces/user-9002/.agent-platform/plans/keep")" = preserve-me
+          test -f "$compatibility_workspaces/user-7/.agent-platform/skills/portable-workflow/SKILL.md"
+          test "$(stat -c %u:%g:%a "$AGENT_PLATFORM_DATA_ROOT/data/platform.db")" = "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID:600"
+          if docker compose -f containers/compose.yaml run --rm --no-deps platform sh -c true; then
+            echo "Platform compatibility entrypoint accepted a root shell" >&2
+            exit 1
+          fi
           test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
             "$AGENT_PLATFORM_FIRECRAWL_REDIS_IMAGE" -c 'printf "%s:%s" "$(id -u redis)" "$(id -g redis)"')" = "999:1000"
           test "$(docker run --rm --pull=always --network=none --read-only --entrypoint sh \
@@ -877,6 +977,22 @@ jobs:
             done
             test "$(docker inspect --format '{{.State.Health.Status}}' "$container")" = healthy
           done
+          platform_container="$(docker compose -f containers/compose.yaml ps -q platform)"
+          docker exec \
+            --user "$AGENT_PLATFORM_UID:$AGENT_PLATFORM_GID" \
+            --env "EXPECTED_UID=$AGENT_PLATFORM_UID" \
+            --env "EXPECTED_GID=$AGENT_PLATFORM_GID" \
+            "$platform_container" sh -eu -c '
+              test "$(awk "/^Uid:/ {print \$2 \":\" \$3 \":\" \$4 \":\" \$5}" /proc/1/status)" = "$EXPECTED_UID:$EXPECTED_UID:$EXPECTED_UID:$EXPECTED_UID"
+              test "$(awk "/^Gid:/ {print \$2 \":\" \$3 \":\" \$4 \":\" \$5}" /proc/1/status)" = "$EXPECTED_GID:$EXPECTED_GID:$EXPECTED_GID:$EXPECTED_GID"
+              test "$(awk "/^Groups:/ {print NF}" /proc/1/status)" = 1
+              test "$(awk "/^CapInh:/ {print \$2}" /proc/1/status)" = 0000000000000000
+              test "$(awk "/^CapPrm:/ {print \$2}" /proc/1/status)" = 0000000000000000
+              test "$(awk "/^CapEff:/ {print \$2}" /proc/1/status)" = 0000000000000000
+              test "$(awk "/^CapAmb:/ {print \$2}" /proc/1/status)" = 0000000000000000
+              test "$(awk "/^NoNewPrivs:/ {print \$2}" /proc/1/status)" = 1
+            '
+          test ! -e "$shadow_sentinel"
           searxng_container="$(docker compose -f containers/compose.yaml ps -q searxng)"
           docker inspect "$searxng_container" | jq -e \
             --arg source "$AGENT_PLATFORM_DATA_ROOT/data/runtimes/searxng/config" '

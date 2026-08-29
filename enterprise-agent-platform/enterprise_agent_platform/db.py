@@ -599,7 +599,7 @@ def _assert_pinned_database_profile(
     selected: TechnicalProfile,
     *,
     allow_source_migration: bool = False,
-) -> None:
+) -> int | None:
     """Read the baseline through one pinned, re-proven database inode."""
 
     info = verify_private_file_fd_at(
@@ -609,7 +609,7 @@ def _assert_pinned_database_profile(
         mode=None,
     )
     if info.st_size == 0:
-        return
+        return None
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
@@ -650,12 +650,15 @@ def _assert_pinned_database_profile(
         raise sqlite3.DatabaseError(
             "database does not match the current baseline marker"
         )
+    return markers[0][0]
 
 
 def assert_existing_database_profile(
     path: Path,
     technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
-) -> None:
+    *,
+    allow_source_migration: bool = False,
+) -> int | None:
     """Reject a cross-profile database without opening a writable handle."""
 
     selected = technical_profile(technical_profile_value)
@@ -666,7 +669,7 @@ def assert_existing_database_profile(
         try:
             directory_fd = open_private_directory_fd(path.parent, mode=None)
         except FileNotFoundError:
-            return
+            return None
         verify_private_directory_path_fd(path.parent, directory_fd, mode=None)
         try:
             database_fd = open_private_file_fd_at(
@@ -676,15 +679,17 @@ def assert_existing_database_profile(
                 mode=None,
             )
         except FileNotFoundError:
-            return
+            return None
         _validate_existing_sqlite_sidecars(directory_fd, path.name)
-        _assert_pinned_database_profile(
+        baseline = _assert_pinned_database_profile(
             directory_fd,
             path.name,
             database_fd,
             selected,
+            allow_source_migration=allow_source_migration,
         )
         verify_private_directory_path_fd(path.parent, directory_fd, mode=None)
+        return baseline
     finally:
         if database_fd >= 0:
             os.close(database_fd)

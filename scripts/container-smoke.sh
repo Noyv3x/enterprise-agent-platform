@@ -735,6 +735,13 @@ for fragment in (
     "firecrawl_scrape cold",
     "firecrawl_scrape warm",
     "agent_platform_ci_persistence",
+    "compatibility_workspaces=",
+    "unsafe legacy workspace mount unexpectedly passed compatibility preflight",
+    "invalid source database migration unexpectedly succeeded",
+    "root-python-shadow-loaded",
+    "tests.test_workspace_mount_compat",
+    "/^CapPrm:/",
+    "/^NoNewPrivs:/",
     "python3 scripts/browser-control-compose-smoke.py",
     'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"',
 ):
@@ -781,6 +788,12 @@ for entrypoint in \
 done
 grep -Fq 'migrate|serve|init-admin|print-agent-token)' containers/platform-entrypoint.sh \
   || fail "Platform entrypoint does not dispatch CLI subcommands"
+grep -Fq '/opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat --check-source' containers/platform-entrypoint.sh \
+  || fail "Platform compatibility source check is not isolated from the writable data root"
+grep -Fq 'exec /opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat' containers/platform-entrypoint.sh \
+  || fail "Platform compatibility helper is not isolated from the writable data root"
+grep -Fq 'exec /usr/bin/setpriv' containers/platform-entrypoint.sh \
+  || fail "Platform entrypoint does not use the fixed privilege dropper"
 
 python3 - <<'PY'
 import json
@@ -954,7 +967,15 @@ for name, service in services.items():
 
 platform = services["platform"]
 searxng = services["searxng"]
-for service_name in ("platform", "agent-runtime", "camofox", "searxng"):
+if platform.get("user") != "0:0" or platform.get("init") is not False:
+    raise SystemExit("Platform compatibility entrypoint must start as root without a persistent root init")
+if set(platform.get("cap_drop") or ()) != {"ALL"}:
+    raise SystemExit("Platform compatibility entrypoint must drop the default capability set")
+if set(platform.get("cap_add") or ()) != {
+    "CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID",
+}:
+    raise SystemExit("Platform compatibility entrypoint has an unexpected capability set")
+for service_name in ("agent-runtime", "camofox", "searxng"):
     if services[service_name].get("user") != "23456:23457":
         raise SystemExit(f"{service_name} must run as the target deployment UID/GID")
 searxng_config = [
@@ -980,6 +1001,10 @@ if environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
     raise SystemExit("Platform target technical profile mismatch")
 if environment.get("AGENT_PLATFORM_DEPLOYMENT_MODE") != "container":
     raise SystemExit("Platform is not explicitly in container deployment mode")
+if environment.get("AGENT_PLATFORM_RUN_UID") != "23456" or environment.get("AGENT_PLATFORM_RUN_GID") != "23457":
+    raise SystemExit("Platform compatibility entrypoint target identity mismatch")
+if environment.get("AGENT_PLATFORM_WORKSPACE_MOUNT_COMPAT") != "2026080801-to-2026082901":
+    raise SystemExit("Platform compatibility entrypoint marker mismatch")
 if environment.get("AGENT_PLATFORM_MANAGER_SOCKET") != "/run/agent-platform-manager/manager.sock":
     raise SystemExit("Platform Manager socket contract mismatch")
 if environment.get("AGENT_PLATFORM_MANAGER_TOKEN_FILE") != "/run/secrets/agent-platform/manager-token":

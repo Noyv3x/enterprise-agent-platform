@@ -58,6 +58,6 @@ USER 1000:1000
 WORKDIR /var/lib/agent-platform
 EXPOSE 8765
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=12 \
-  CMD python -c 'import json,urllib.request; p=json.load(urllib.request.urlopen("http://127.0.0.1:8765/healthz", timeout=2)); raise SystemExit(0 if p.get("service")=="agent-platform" else 1)'
+  CMD ["/usr/local/bin/agent-platform-entrypoint", "__healthcheck"]
 ENTRYPOINT ["/usr/local/bin/agent-platform-entrypoint"]
 CMD ["enterprise-agent-platform", "serve", "--host", "0.0.0.0", "--port", "8765", "--data", "/var/lib/agent-platform"]

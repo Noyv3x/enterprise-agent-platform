@@ -144,7 +144,7 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	}
 	paths := []string{spec.Workspace, spec.Home, spec.Environment, filepath.Join(envRoot, "logs")}
 	if spec.Attachments != "" {
-		paths = append(paths, spec.Attachments)
+		paths = append(paths, filepath.Join(spec.Workspace, m.profile.InternalWorkspaceDirectory, "attachments"), spec.Attachments)
 	}
 	for _, path := range paths {
 		if err := ensureOwnedDirectoryBelow(m.DataDir, path, uid, gid); err != nil {

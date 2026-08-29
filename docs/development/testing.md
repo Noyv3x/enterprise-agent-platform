@@ -166,7 +166,7 @@ main 通道测试必须覆盖至少三个线性后代：较旧 workflow 后完�
 
 release 时间测试必须把 `git show --format=%cI` 形式的带偏移时间交给真实 assembler，再把其 schema-2 输出交给 fresh installer 的 manifest 解析路径，证明资产中的 `generated_at` 已规范化为 UTC `Z` 并可安装。另需覆盖正负偏移的等价 UTC 转换，以及无时区、无效日期/偏移和非 RFC 3339 输入拒绝；不得把 installer 改为接受非 canonical 输出。
 
-发布测试只覆盖当前 manifest schema、十个受管镜像和中性 Compose/Manager 资产。fresh install、普通 startup、Candidate watchdog 与 finalize recovery 始终使用编译期唯一 profile；配置、路径、环境或可执行文件名不能选择另一身份。普通更新还要证明未物化 workspace、缺 marker/alias、未知 residue 都在副作用前失败，且不存在按历史 generation、摘要或路径启用的修复能力。
+发布测试只覆盖当前 manifest schema、十个受管镜像和中性 Compose/Manager 资产。fresh install、普通 startup、Candidate watchdog 与 finalize recovery 始终使用编译期唯一 profile；配置、路径、环境或可执行文件名不能选择另一身份。普通更新还要证明未物化 workspace、缺 marker/alias、未知 residue 都在副作用前失败，且除 `2026080801` 到 `2026082901` 直接迁移的闭世界旧 Docker mountpoint 兼容步骤外，不存在按历史 generation、摘要或路径启用的修复能力。该兼容门禁必须证明 root 入口只接受闭合 CLI 命令：非迁移命令在任何数据/secret 操作前降权，`migrate` 还要求镜像内固定兼容标记和部署身份只读确认的精确来源 marker；兼容步骤拒绝未知 owner/group/mode/type、额外或非空项、符号链接、跨设备和身份置换，只非递归收紧固定目录，随后清除附加组并以部署 UID/GID 执行真实迁移。测试必须在数据根放置 shadow Python 包和 `sitecustomize` 并证明 root helper 不会加载，覆盖子已转换/父未转换的重试状态，并断言 PID 1 的全部 capability 集为空。fresh/current 与已规范布局不执行兼容，任意 root shell/命令均拒绝。Manager Sandbox 测试还必须证明在 Docker 调用前安全创建 workspace 内的 `0700 .agent-platform/attachments`，并拒绝任一父级或叶级符号链接及 owner 漂移。
 
 fresh installer 隔离测试必须用可控账户查询 stub 返回当前 UID/GID 的权威 home，同时把 `HOME`、`XDG_BIN_HOME`、`XDG_CONFIG_HOME` 与 `XDG_DATA_HOME` 指向不同的恶意临时目录；stable Manager、配置、user unit 和数据根只能出现在账户 home 派生路径，四个 ambient 根必须保持未创建。`XDG_RUNTIME_DIR` 另行指向 owner-only 临时目录并验证 socket 写入该目录，并至少以非私有 runtime 根证明安装副作用前失败；实现还必须拒绝非绝对、符号链接或错误 owner 的 runtime 根。
 

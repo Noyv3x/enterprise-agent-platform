@@ -61,7 +61,7 @@ Multipart 上传增量写入 `upload-staging/` 下按请求隔离的 `0700` 目�
 
 Sandbox registry 是容器 identity 的真相源；容器名和 writable layer 不是。registry 记录 sandbox/workspace identity、UID/GID、相对挂载与镜像 digest。首次绑定后 `sandbox_id` 不能改绑其它 workspace。
 
-Manager 每次创建或启动容器前验证 workspace、HOME、env 和附件根都位于数据目录内、无符号链接并由部署 UID/GID 拥有。registry 原子写入是 ensure 的提交边界；写入失败必须停止或删除本次创建的容器并恢复调用前记录。
+Manager 每次创建或启动容器前验证 workspace、HOME、env、附件源以及 workspace 内的 `.agent-platform/attachments` 挂载目标都位于数据目录内、无符号链接并由部署 UID/GID 拥有且为 `0700`；缺失挂载目标由 Manager 在调用 Docker 前创建，不能交给 Docker daemon 以 root 代建。registry 原子写入是 ensure 的提交边界；写入失败必须停止或删除本次创建的容器并恢复调用前记录。
 
 Sandbox 系统层修改随容器重建丢失。需持久的软件和文件放入 `/opt/agent-env`、`/home/agent` 或 `/workspace`。
 

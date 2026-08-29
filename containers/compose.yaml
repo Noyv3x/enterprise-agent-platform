@@ -40,7 +40,16 @@ services:
   platform:
     <<: *agent-platform-service
     image: ${AGENT_PLATFORM_PLATFORM_IMAGE:?AGENT_PLATFORM_PLATFORM_IMAGE must be an immutable digest reference}
-    user: ${AGENT_PLATFORM_UID:-1000}:${AGENT_PLATFORM_GID:-1000}
+    user: 0:0
+    init: false
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
     read_only: true
     stop_grace_period: 45s
     environment:
@@ -50,6 +59,9 @@ services:
       AGENT_PLATFORM_HOST: 0.0.0.0
       AGENT_PLATFORM_PORT: "8765"
       AGENT_PLATFORM_DEPLOYMENT_MODE: container
+      AGENT_PLATFORM_RUN_UID: ${AGENT_PLATFORM_UID:-1000}
+      AGENT_PLATFORM_RUN_GID: ${AGENT_PLATFORM_GID:-1000}
+      AGENT_PLATFORM_WORKSPACE_MOUNT_COMPAT: 2026080801-to-2026082901
       AGENT_PLATFORM_PUBLIC_BASE_URL: ${AGENT_PLATFORM_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
       AGENT_PLATFORM_TRUSTED_PROXY: "1"
       AGENT_PLATFORM_AGENT_RUNTIME_URL: http://agent-runtime:8766

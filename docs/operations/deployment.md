@@ -111,6 +111,8 @@ enterprise-agent-platform migrate --data /var/lib/agent-platform
 
 成功后才启动候选 writer。迁移和启动失败由同一 operation 使用更新前快照回滚。本次基线切换只接受契约声明的直接前版本；迁移删除已退役的知识库与原生 Sylver 数据，并在完整预检后把旧 `agent-skills/<scope-hash>/<skill-id>/` 的可移植包原子复制到各 Agent workspace，把 sidecar/usage 复制到 Platform-only `agent-skill-state/<scope-hash>/`。旧 `agent-skills` 不能移动、删除或改写，因为旧 Manager 快照不包含该目录，回滚前一数据库快照后仍由旧 Platform 使用它。Sandbox 容器可跨 fixed-stack 更新保留，因此迁移发布不能把维护态当作 workspace 路径排他锁；apply、原子发布和 staging 清理必须始终相对固定且复核过的目录 fd。预检不能把所有 scope 的文件正文同时留在内存；apply 按 scope 重读源树并与预检指纹比对。文件目标全部持久化后还要再对每个受保护的 portable/state 树做最终精确复核，通过后才能提交数据库事务；事务失败留下的精确目标供原样重试，不同内容、额外项和不安全路径一律失败关闭。需要保留退役知识或原生 Sylver 数据时必须在升级前从快照或旧版本导出。
 
+当前 baseline 的 Compose 以 root 启动同一 Platform entrypoint 并传入已验证的部署 UID/GID，使仍在运行的旧 Manager 也能消费该迁移；普通服务命令在任何数据或 secret 操作前立即降权。固定 `migrate` 先用部署身份、镜像内 isolated Python 只读确认精确 `2026080801` marker，再对旧 Docker 留下的精确 workspace mountpoint 形态执行非递归兼容，最后立即降权运行上述命令。该路径不使用额外 helper 镜像，不由 root 读取数据库或 secret，不接受任意路径/命令；fresh/current 不执行兼容，未知 marker 失败关闭。
+
 Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、启动或挂载 FoundationDB。SearXNG 的完整配置目录只读挂载到 `/etc/searxng`，不能依赖匿名 volume。
 
 ## Agent Sandbox

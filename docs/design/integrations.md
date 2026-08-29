@@ -7,6 +7,7 @@
 - 集成适配器属于产品代码；上游 Git 仓库和缓存不属于产品运行数据。
 - Firecrawl 的官方 URL 和精确 revision 由 [`upstream-sources.json`](../contracts/upstream-sources.json) 锁定。发布工作流和容器验收直接读取并校验该 JSON，在隔离构建上下文中获取、验证和构建；部署机只按 release manifest 拉取镜像，不下载上游源码。
 - Platform、Runtime 和集成容器不得访问 Docker socket；生命周期由宿主管理器统一控制。
+- 当前 `2026082901` Compose 只让 Platform entrypoint 在部署身份只读确认精确旧数据库 marker 后，短暂以最小能力集作为 root 校正旧 Docker 自动创建的 workspace mountpoint；Docker 健康探针虽从容器配置身份进入同一闭合 dropper，也在联网前立即降权。其余固定服务和 Platform 业务进程始终以部署 UID/GID 运行。该临时分支随下一 baseline 删除，不能成为集成容器的通用提权入口。
 - 容器模式下 Platform 只读取 Manager 注入的 Camoufox、SearXNG、Firecrawl 私有 service URL。SQLite 中任何 manage、URL、command 或 source repo 行都不参与解析，Platform API 也不提供安装或重启这些固定服务的入口；修复和重启通过 Manager operation 完成。
 - Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、空闲 session 立即压缩、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。

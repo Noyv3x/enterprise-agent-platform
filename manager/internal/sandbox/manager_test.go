@@ -36,6 +36,47 @@ func TestVerifiedTargetProfileCreatesNeutralSandboxIdentity(t *testing.T) {
 	}
 }
 
+func TestEnsurePreparesNestedAttachmentMountpointBeforeDocker(t *testing.T) {
+	root := t.TempDir()
+	engine := &sandboxEngine{entered: make(chan struct{}), release: make(chan struct{})}
+	manager, err := Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, ensureErr := manager.Ensure(context.Background(), "private-1", "user-1", time.Now())
+		done <- ensureErr
+	}()
+	select {
+	case <-engine.entered:
+	case ensureErr := <-done:
+		t.Fatalf("Ensure failed before reaching Docker: %v", ensureErr)
+	case <-time.After(time.Second):
+		t.Fatal("Ensure did not reach Docker")
+	}
+
+	target := filepath.Join(root, "data", "workspaces", "user-1", ".agent-platform", "attachments")
+	info, statErr := os.Lstat(target)
+	var stat *syscall.Stat_t
+	if statErr == nil {
+		stat, _ = info.Sys().(*syscall.Stat_t)
+	}
+	close(engine.release)
+	if ensureErr := <-done; ensureErr != nil {
+		t.Fatal(ensureErr)
+	}
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		t.Fatalf("nested attachment mountpoint has unsafe mode %v", info.Mode())
+	}
+	if stat == nil || stat.Uid != uint32(manager.UID) || stat.Gid != uint32(manager.GID) {
+		t.Fatalf("nested attachment mountpoint has wrong owner: %#v", info.Sys())
+	}
+}
+
 type sandboxEngine struct {
 	mu          sync.Mutex
 	ensured     []driver.SandboxSpec
@@ -435,6 +476,26 @@ func TestEnsureRejectsSymlinkedBindRoots(t *testing.T) {
 				t.Fatal(err)
 			}
 			if err := os.Symlink(outside, filepath.Join(data, "workspaces", "user-1")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "workspace attachment parent", setup: func(t *testing.T, data, outside string) {
+			t.Helper()
+			workspace := filepath.Join(data, "workspaces", "user-1")
+			if err := os.MkdirAll(workspace, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(workspace, ".agent-platform")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "workspace attachment leaf", setup: func(t *testing.T, data, outside string) {
+			t.Helper()
+			parent := filepath.Join(data, "workspaces", "user-1", ".agent-platform")
+			if err := os.MkdirAll(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(parent, "attachments")); err != nil {
 				t.Fatal(err)
 			}
 		}},
