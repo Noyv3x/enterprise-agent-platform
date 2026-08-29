@@ -1598,8 +1598,11 @@ class Database:
             for relative, (kind, _payload) in tree.items()
             if len(relative) == 1 and kind == "file"
         }
-        if root_files - {".skill-usage.json"} or any(
-            not _SKILL_ID_RE.fullmatch(name) for name in root_directories
+        legacy_lock = tree.get((".lock",))
+        if (
+            root_files - {".lock", ".skill-usage.json"}
+            or legacy_lock not in (None, ("file", b""))
+            or any(not _SKILL_ID_RE.fullmatch(name) for name in root_directories)
         ):
             raise sqlite3.DatabaseError("legacy Skill scope has unknown root entries")
         if len(root_directories) > MAX_SKILLS_PER_SCOPE:

@@ -173,6 +173,7 @@ def create_source_database(
     legacy_scope = data_dir / "agent-skills" / digest
     legacy_scope.mkdir(mode=0o700, parents=True)
     (data_dir / "agent-skills").chmod(0o700)
+    write_private(legacy_scope / ".lock", b"")
     if with_legacy_skill:
         package = legacy_scope / SKILL_ID
         references = package / "references"
@@ -259,6 +260,8 @@ class DatabaseMigrationTests(unittest.TestCase):
                 / hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
             )
             self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
+            self.assertFalse((destination / ".lock").exists())
+            self.assertFalse((state_scope / ".lock").exists())
             self.assertEqual(
                 (package / "references" / "guide.txt").read_bytes(),
                 b"portable support\n",
@@ -386,7 +389,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertTrue(unknown.exists())
 
     def test_unsafe_or_oversized_source_tree_fails_before_copy(self):
-        for case in ("hardlink", "unknown", "directory-limit"):
+        for case in ("hardlink", "unknown", "directory-limit", "nonempty-lock"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 data_dir = Path(directory) / "data"
                 database_path, _workspace, legacy = create_source_database(data_dir)
@@ -398,11 +401,13 @@ class DatabaseMigrationTests(unittest.TestCase):
                 else:
                     if case == "unknown":
                         write_private(package / "unexpected.txt", b"unknown\n")
-                    else:
+                    elif case == "directory-limit":
                         for index in range(64):
                             (package / "references" / f"empty-{index}").mkdir(
                                 mode=0o700
                             )
+                    else:
+                        write_private(legacy / ".lock", b"unexpected\n")
 
                 with self.assertRaises(sqlite3.DatabaseError):
                     migrate_database(database_path, data_dir=data_dir)
@@ -495,6 +500,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             database_path, workspace, legacy = create_source_database(
                 data_dir, with_legacy_skill=False
             )
+            (legacy / ".lock").unlink()
             legacy.rmdir()
             destination = workspace / ".agent-platform" / "skills"
             destination.mkdir(mode=0o700, parents=True)
