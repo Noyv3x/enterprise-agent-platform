@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 from enterprise_agent_platform import db as db_module
+from enterprise_agent_platform.agent_scopes import AgentScopeManager
+from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.db import Database, migrate_database
 from enterprise_agent_platform.skills import (
     SkillStore,
@@ -163,13 +165,18 @@ def create_source_database(
     (data_dir / "workspaces").chmod(0o700)
     database = Database(database_path)
     try:
-        with database.transaction(immediate=True) as connection:
-            connection.execute(
-                "INSERT INTO agent_scopes(scope_key, scope_type, scope_id, session_id, "
-                "lifecycle_id, workspace_path, sandbox_id, created_at, updated_at) "
-                "VALUES (?, 'private', '7', 'session-7', '', ?, 'sandbox-7', 1, 1)",
-                (SCOPE_KEY, WORKSPACE_PATH),
-            )
+        AgentScopeManager(
+            PlatformConfig(
+                data_dir=data_dir,
+                host="127.0.0.1",
+                port=8765,
+                public_base_url="http://127.0.0.1:8765",
+                token_secret="test-secret",
+                token_ttl_seconds=3600,
+                agent_tool_token=None,
+            ),
+            database,
+        ).ensure_private_scope(7)
     finally:
         database.close()
 
