@@ -11,7 +11,6 @@ export const chatMessages = defineMessages({
     "zh-TW": "頻道訊息對平台內有權存取的成員公開",
   },
   "nav.privateAgent": { "zh-CN": "个人 AI", en: "Personal AI", "zh-TW": "個人 AI" },
-  "nav.knowledge": { "zh-CN": "知识库", en: "Knowledge", "zh-TW": "知識庫" },
   "nav.settings": { "zh-CN": "设置", en: "Settings", "zh-TW": "設定" },
   "nav.admin": { "zh-CN": "管理面板", en: "Admin", "zh-TW": "管理面板" },
   "nav.channels.empty": {
@@ -52,11 +51,6 @@ export const chatMessages = defineMessages({
     "zh-CN": "仅你可见的个人 AI 会话",
     en: "A Personal AI conversation visible only to you",
     "zh-TW": "只有你看得到的個人 AI 對話",
-  },
-  "nav.topbar.knowledgeDocuments": {
-    "zh-CN": { other: "{count} 篇文档" },
-    en: { one: "{count} document", other: "{count} documents" },
-    "zh-TW": { other: "{count} 篇文件" },
   },
   "nav.topbar.adminSubtitle": {
     "zh-CN": "系统管理与运行配置",
@@ -156,22 +150,6 @@ export const chatMessages = defineMessages({
     en: "Open example.com, summarize the page, and tell me which browser actions you can perform right now.",
     "zh-TW": "請開啟 example.com，說明頁面內容，並告訴我你現在可以執行哪些網頁操作。",
   },
-  "personalAi.guide.sylver.title": {
-    "zh-CN": "连接 Sylver Lining 工作平台",
-    en: "Connect to the Sylver Lining work platform",
-    "zh-TW": "連接 Sylver Lining 工作平台",
-  },
-  "personalAi.guide.sylver.description": {
-    "zh-CN": "配置账号后读取项目资料，并提交任务、进度和 Wiki 提案。",
-    en: "Once connected, read project context and submit tasks, progress, and Wiki proposals.",
-    "zh-TW": "設定帳戶後讀取專案資料，並提交任務、進度和 Wiki 提案。",
-  },
-  "personalAi.guide.sylver.prompt": {
-    "zh-CN": "请使用 Sylver Lining 工作平台连接，查询我最近参与的项目和待办事项，并整理成简短摘要。",
-    en: "Use my Sylver Lining work-platform connection to find my recent projects and open tasks, then summarize them briefly.",
-    "zh-TW": "請使用 Sylver Lining 工作平台連線，查詢我最近參與的專案和待辦事項，並整理成簡短摘要。",
-  },
-
   "chat.userFallback": { "zh-CN": "用户", en: "User", "zh-TW": "使用者" },
   "chat.you": { "zh-CN": "你", en: "You", "zh-TW": "你" },
   "chat.agent": { "zh-CN": "Agent", en: "Agent", "zh-TW": "Agent" },
@@ -610,6 +588,8 @@ export const chatMessages = defineMessages({
   "chat.work.param.task_count": { "zh-CN": "任务数", en: "Tasks", "zh-TW": "任務數" },
   "chat.work.param.regex": { "zh-CN": "正则", en: "Regex", "zh-TW": "正規" },
   "chat.work.param.max_results": { "zh-CN": "结果上限", en: "Max results", "zh-TW": "結果上限" },
+  "chat.work.param.server": { "zh-CN": "MCP 服务", en: "MCP server", "zh-TW": "MCP 服務" },
+  "chat.work.param.tool": { "zh-CN": "工具", en: "Tool", "zh-TW": "工具" },
   "chat.activity.truncatedTitle": {
     "zh-CN": "记录已截断",
     en: "Records truncated",
@@ -639,7 +619,7 @@ export const chatMessages = defineMessages({
   "chat.activity.toolName.session": { "zh-CN": "会话搜索", en: "Session search", "zh-TW": "工作階段搜尋" },
   "chat.activity.toolName.memory": { "zh-CN": "记忆", en: "Memory", "zh-TW": "記憶" },
   "chat.activity.toolName.skill": { "zh-CN": "Skill", en: "Skill", "zh-TW": "Skill" },
-  "chat.activity.toolName.knowledge": { "zh-CN": "知识库", en: "Knowledge", "zh-TW": "知識庫" },
+  "chat.activity.toolName.mcp": { "zh-CN": "MCP 工具", en: "MCP tool", "zh-TW": "MCP 工具" },
   "chat.activity.toolName.web": { "zh-CN": "网页搜索", en: "Web search", "zh-TW": "網頁搜尋" },
   "chat.activity.toolName.browser": { "zh-CN": "浏览器", en: "Browser", "zh-TW": "瀏覽器" },
   "chat.activity.toolName.delegate_task": { "zh-CN": "子 Agent", en: "Child Agent", "zh-TW": "子 Agent" },

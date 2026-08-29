@@ -23,7 +23,6 @@ import { Drawer } from "../../common/Drawer";
 import { Icon } from "../../common/Icon";
 import { AccountModelSelect } from "./AccountModelSelect";
 import { PermissionGroupSelect, permissionGroupLabel } from "./PermissionGroupSelect";
-import { SylverPlatformAccountDrawer } from "./SylverPlatformAccountDrawer";
 import { ThinkingDepthSelect } from "./ThinkingDepthSelect";
 
 interface AccountEditorProps {
@@ -50,6 +49,7 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
   const fieldId = (name: string) => `${formId}-${name}`;
   const { confirm, dialog } = useConfirm();
   const selfDisabled = user.id === currentUserId;
+  const identityPosition = user.position?.trim();
 
   const dirty =
     displayName !== (user.display_name || "") ||
@@ -117,9 +117,7 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
             <Avatar size={40}>{initials(user.display_name || user.username)}</Avatar>
             <div>
               <Typography.Text strong>{user.username}</Typography.Text>
-              <Typography.Text type="secondary">
-                {permissionGroupLabel(t, user.permission_group || "member", user.permission_group_label)}
-              </Typography.Text>
+              {identityPosition ? <Typography.Text type="secondary">{identityPosition}</Typography.Text> : null}
             </div>
           </div>
           <Form.Item label={t("admin.accounts.displayName")} htmlFor={fieldId("display-name")}>
@@ -163,13 +161,14 @@ function AccountEditor({ user, groups, open, onClose }: AccountEditorProps) {
 }
 
 export function AccountIdentity({ user }: { user: User }) {
+  const position = user.position?.trim();
   return (
     <div className="eap-admin-account-identity">
       <Avatar size={36}>{initials(user.display_name || user.username)}</Avatar>
       <div>
         <Typography.Text strong ellipsis>{user.display_name || user.username}</Typography.Text>
         <Typography.Text type="secondary" ellipsis>
-          @{user.username}{user.position ? ` · ${user.position}` : ""}
+          @{user.username}{position ? ` · ${position}` : ""}
         </Typography.Text>
       </div>
     </div>
@@ -213,7 +212,6 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
   const impersonating = useStore((state) => state.pendingOperations.includes(`admin:accounts:impersonate:${user.id}`));
   const currentUserId = useStore((state) => state.user?.id);
   const [editOpen, setEditOpen] = useState(false);
-  const [sylverOpen, setSylverOpen] = useState(false);
   const { confirm, dialog } = useConfirm();
   const selfDisabled = user.id === currentUserId;
   const canImpersonate = !selfDisabled && !!user.active;
@@ -231,11 +229,6 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
   };
   const menuItems: MenuProps["items"] = [
     {
-      key: "sylver",
-      label: t("admin.accounts.sylver.manage"),
-    },
-    { type: "divider" },
-    {
       key: "impersonate",
       label: t("admin.accounts.impersonate"),
       disabled: impersonateDisabled,
@@ -251,7 +244,6 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
           menu={{
             items: menuItems,
             onClick: ({ key }) => {
-              if (key === "sylver") setSylverOpen(true);
               if (key === "impersonate") void handleImpersonate();
             },
           }}
@@ -264,9 +256,6 @@ export function AccountActions({ user, groups }: { user: User; groups: Permissio
         </Dropdown>
       </Space>
       {editOpen ? <AccountEditor user={user} groups={groups} open onClose={() => setEditOpen(false)} /> : null}
-      {sylverOpen ? (
-        <SylverPlatformAccountDrawer user={user} open onClose={() => setSylverOpen(false)} />
-      ) : null}
       {dialog}
     </>
   );

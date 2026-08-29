@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -462,6 +463,69 @@ func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
 	second.mu.Unlock()
 	if _, err := os.Stat(pidFile); !os.IsNotExist(err) {
 		t.Fatalf("confirmed stop left a live managed PID file: %v", err)
+	}
+}
+
+func TestPrivateMCPProcessReturnsRawOutputWithoutRetainingRequestOrResult(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 is required for the sandbox process protocol")
+	}
+	root := t.TempDir()
+	engine := localSandboxEngine{}
+	registry := filepath.Join(root, "manager", "sandboxes.json")
+	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), registry, "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processes, err := NewProcessManager(testActiveProfile, engine, sandboxes, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := "eyJhcmd1bWVudHMiOnsidG9rZW4iOiJtY3Atc2VjcmV0In19"
+	rawResult := "raw-mcp-result-that-must-not-be-retained"
+	call := Call{Identity: identity(), Target: "sandbox"}
+	immediate, err := processes.Run(context.Background(), call, terminalArguments{
+		Command:        "printf '" + rawResult + "' # /usr/local/bin/agent-platform-mcp " + payload,
+		CWD:            "/workspace",
+		DisplayCommand: `MCP call server="local" tool="mutate"`,
+		PrivateOutput:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if immediate.Stdout != rawResult || immediate.Command != `MCP call server="local" tool="mutate"` {
+		t.Fatalf("immediate MCP result lost or command not projected: %#v", immediate)
+	}
+	retained, err := processes.Get(call.ScopeID, call.LifecycleID, "sandbox", immediate.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retained.Command != immediate.Command || retained.Stdout != privateProcessOutput || strings.Contains(retained.Stdout, rawResult) {
+		t.Fatalf("retained MCP snapshot contains private execution data: %#v", retained)
+	}
+	preview := processes.Preview(call.ScopeID, call.LifecycleID, "")
+	items, ok := preview["processes"].([]map[string]any)
+	if !ok || len(items) != 1 {
+		t.Fatalf("unexpected MCP preview: %#v", preview)
+	}
+	serializedPreview, _ := json.Marshal(items[0])
+	if strings.Contains(string(serializedPreview), payload) || strings.Contains(string(serializedPreview), rawResult) {
+		t.Fatalf("MCP preview leaked private execution data: %s", serializedPreview)
+	}
+	processes.mu.Lock()
+	managed := processes.processes[immediate.ID]
+	processes.mu.Unlock()
+	for _, path := range []string{managed.hostStdoutFile, managed.hostStderrFile} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("private MCP output file was retained at %s: %v", path, err)
+		}
+	}
+	state, err := os.ReadFile(managed.stateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(state), payload) || strings.Contains(string(state), rawResult) {
+		t.Fatalf("MCP state retained private execution data: %s", state)
 	}
 }
 

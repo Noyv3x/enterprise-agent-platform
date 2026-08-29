@@ -11,12 +11,7 @@ import type {
   AgentScheduleRun,
   AutoUpdateConfigState,
   Channel,
-  FullDocument,
   Id,
-  KnowledgeConfigState,
-  KnowledgeDocument,
-  KnowledgeHit,
-  KnowledgeIndexStatus,
   MentionTarget,
   MailAccount,
   MailSecurityMode,
@@ -31,7 +26,6 @@ import type {
   RuntimeMap,
   Secret,
   SecurityConfigState,
-  SylverPlatformConnection,
   TelegramConfigState,
   TokenUsageReport,
   TypingUser,
@@ -247,33 +241,6 @@ export interface MailAccountCheckResponse extends MailAccountResponse {
   stale: boolean;
 }
 
-export interface SylverPlatformConnectionResponse {
-  connection: SylverPlatformConnection | null;
-}
-
-export interface SylverPlatformConnectionUpdateRequest {
-  token: string;
-}
-
-export interface SylverPlatformIdentityPreview {
-  base_url: string;
-  remote_user_id: Id;
-  username: string;
-  full_name: string;
-  title: string;
-  email: string;
-  role: string;
-}
-
-export interface SylverPlatformIdentityPreviewResponse {
-  identity: SylverPlatformIdentityPreview;
-}
-
-export interface AdminSylverPlatformConnectionUpdateRequest {
-  token: string;
-  expected_remote_user_id: Id;
-}
-
 export interface AgentSchedulesResponse {
   schedules: AgentSchedule[];
 }
@@ -354,36 +321,6 @@ export type AgentSkillPatchRequest = Partial<AgentSkillCreateRequest>;
 export interface DeleteAgentSkillResponse {
   deleted: true;
   id: string;
-}
-
-/* -------------------------------------------------------------- knowledge */
-
-export interface DocumentsResponse {
-  documents: KnowledgeDocument[];
-}
-
-export interface CreateDocumentRequest {
-  title: string;
-  source: string;
-  summary: string;
-  content: string;
-}
-
-export interface KnowledgeSearchResponse {
-  results: KnowledgeHit[];
-}
-
-export interface DocumentResponse {
-  document: FullDocument;
-}
-
-export interface KnowledgeImportItem {
-  document: KnowledgeDocument;
-  created: boolean;
-}
-
-export interface KnowledgeImportResponse {
-  documents: KnowledgeImportItem[];
 }
 
 /* ------------------------------------------------------------------ users */
@@ -516,18 +453,6 @@ export interface AutoUpdateConfigUpdateRequest {
 export interface ManagerOperationRequest {
   idempotency_key?: string;
   expected_generation?: number;
-}
-
-export type KnowledgeConfigResponse = KnowledgeConfigState;
-
-export type KnowledgeStatusResponse = KnowledgeIndexStatus;
-
-export interface KnowledgeConfigUpdateRequest {
-  base_url: string;
-  model: string;
-  dimensions: number | null;
-  batch_size: number;
-  api_key: string;
 }
 
 /* ------------------------------------------------------------------ oauth */

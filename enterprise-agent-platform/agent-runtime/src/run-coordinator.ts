@@ -81,7 +81,6 @@ import type {
   ResolvedModel,
 } from "./types.js";
 import { hasLearningReviewMetadata, isLearningReviewRun } from "./types.js";
-import { isSylverPlatformMutation } from "./sylver-platform-contract.js";
 import { redactSensitiveText } from "./sensitive-text.js";
 import {
   assembleSystemPrompt,
@@ -1061,6 +1060,7 @@ export class RunCoordinator {
               ? { ...recordValue(params), path: approvedPath }
               : params;
           let receipt: ExecutionAuditReceipt | undefined;
+          let executionDetails: JsonObject | undefined;
           if (isExecutionTool(tool.name)) {
             const target = executionTargets.get(toolCallId) ?? EXECUTION_TARGETS[0];
             const auditId = id("audit");
@@ -1070,12 +1070,14 @@ export class RunCoordinator {
               record.request.workspace,
               this.config.terminalTimeoutMs,
             );
-            const details = journalToolArguments.get(toolCallId)
+            const details = binding.auditDetails
+              ?? journalToolArguments.get(toolCallId)
               ?? redactToolArgumentsForJournal(
                 tool.name,
                 recordValue(executionParams),
                 record.request.workspace,
               );
+            executionDetails = details;
             journal.publish("execution.audit", {
               audit_id: auditId,
               tool_call_id: toolCallId,
@@ -1104,7 +1106,8 @@ export class RunCoordinator {
           journal.publish("tool.started", {
             tool_call_id: toolCallId,
             tool_name: tool.name,
-            arguments: journalToolArguments.get(toolCallId)
+            arguments: executionDetails
+              ?? journalToolArguments.get(toolCallId)
               ?? redactToolArgumentsForJournal(tool.name, recordValue(params), record.request.workspace),
             execution_started: true,
             ...(receipt ? {
@@ -1493,10 +1496,10 @@ export class RunCoordinator {
           }
           if (
             unattended
-            && toolContext.toolCall.name === "sylver_platform"
-            && isSylverPlatformMutation(recordValue(toolContext.args).action)
+            && toolContext.toolCall.name === "mcp"
+            && recordValue(toolContext.args).action === "call"
           ) {
-            const reason = "Unattended runs cannot modify the Sylver Lining platform";
+            const reason = "Unattended runs cannot call MCP tools";
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
@@ -1936,8 +1939,8 @@ export class RunCoordinator {
       journal.publish(event.isError ? "tool.failed" : "tool.completed", {
         tool_call_id: event.toolCallId,
         tool_name: event.toolName,
-        result: event.toolName === "mail"
-          ? { omitted: true, reason: "mail result content is not retained in the event journal" }
+        result: event.toolName === "mail" || event.toolName === "mcp"
+          ? { omitted: true, reason: `${event.toolName} result content is not retained in the event journal` }
           : sanitizeToolResultForJournal(event.result) as JsonObject,
         is_error: event.isError,
         execution_started: executionStarted,
@@ -3691,6 +3694,8 @@ const UNMARKED_UNTRUSTED_TOOL_RESULT_SOURCES: Readonly<Record<string, string>> =
   web: "web",
   browser: "browser",
   memory: "memory",
+  mcp: "mcp",
+  // Retired tools can remain in durable sessions and still need framing.
   knowledge: "knowledge",
   session: "session",
   session_search: "session_search",

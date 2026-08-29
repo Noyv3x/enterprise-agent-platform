@@ -605,14 +605,11 @@ function displayFileArguments(toolName: string, args: JsonObject): JsonObject {
 export function actionApprovalObject(toolName: string, args: JsonObject): ApprovalObject {
   const action = stringValue(args.action) || "default";
   const nested = objectValue(args.arguments);
-  const executionArguments = toolName === "process"
+  const executionArguments = toolName === "process" || toolName === "mcp"
     ? Object.fromEntries(Object.entries(args).filter(([key]) => key !== "action"))
     : nested;
+  if (toolName === "mcp") validateMcpApprovalValue(executionArguments);
   const identity = { action, arguments: executionArguments };
-  if (toolName === "sylver_platform") {
-    const rawValidationError = sylverPlatformRawApprovalValidationError(identity);
-    if (rawValidationError) throw new Error(rawValidationError);
-  }
   const displayArguments = displayActionArguments(toolName, action, executionArguments);
   const validationError = approvalDisplayValidationError(displayArguments);
   if (validationError) throw new Error(validationError);
@@ -622,33 +619,25 @@ export function actionApprovalObject(toolName: string, args: JsonObject): Approv
   };
 }
 
-function sylverPlatformRawApprovalValidationError(identity: JsonObject): string | undefined {
-  if (containsForbiddenApprovalControls(identity)) {
-    return "Sylver Platform arguments contain forbidden control characters";
-  }
-  if (Buffer.byteLength(canonicalJson(identity), "utf8") > APPROVAL_ARGUMENT_MAX_BYTES) {
-    return `Sylver Platform arguments exceed the complete display limit of ${APPROVAL_ARGUMENT_MAX_BYTES} UTF-8 bytes`;
-  }
-  return undefined;
-}
-
-function containsForbiddenApprovalControls(value: unknown): boolean {
-  if (typeof value === "string") return hasForbiddenTerminalControls(value);
-  if (Array.isArray(value)) return value.some(containsForbiddenApprovalControls);
-  if (value && typeof value === "object") {
-    return Object.entries(value as JsonObject).some(
-      ([key, item]) => hasForbiddenTerminalControls(key) || containsForbiddenApprovalControls(item),
-    );
-  }
-  return false;
-}
-
 /** Build the bounded, display-only argument object stored in Runtime events. */
 export function redactToolArgumentsForJournal(
   toolName: string,
   args: JsonObject,
   workspace?: string,
 ): JsonObject {
+  if (toolName === "mcp") {
+    try {
+      return mcpActivityProjection(args);
+    } catch (error) {
+      return {
+        tool: "mcp",
+        action: "invalid",
+        arguments: {},
+        rejected: true,
+        validation_error: error instanceof Error ? error.message : "Invalid MCP arguments",
+      };
+    }
+  }
   if (toolName === "terminal") {
     try {
       return terminalApprovalObject(args, workspace).displayArguments;
@@ -679,7 +668,7 @@ export function redactToolArgumentsForJournal(
     }
     return result;
   }
-  if (["process", "memory", "skill", "browser", "schedule", "mail", "sylver_platform"].includes(toolName)) {
+  if (["process", "memory", "skill", "browser", "schedule", "mail"].includes(toolName)) {
     try {
       return actionApprovalObject(toolName, args).displayArguments;
     } catch (error) {
@@ -876,6 +865,7 @@ function displayActionArguments(
 }
 
 function redactActionArguments(toolName: string, action: string, args: JsonObject): JsonObject {
+  if (toolName === "mcp") return redactCompleteJson(args) as JsonObject;
   const omittedBodyKeys = omittedActionBodyKeys(toolName, action);
   const display: JsonObject = {};
   for (const [key, value] of Object.entries(args)) {
@@ -883,12 +873,6 @@ function redactActionArguments(toolName: string, action: string, args: JsonObjec
       const body = stringValue(value);
       const label = toolName === "browser" && key === "text" ? "input" : key;
       display[key] = `[${label} omitted: ${Buffer.byteLength(body, "utf8")} UTF-8 bytes]`;
-    } else if (toolName === "sylver_platform" && typeof value === "string") {
-      // External platform writes are meaningful only when the user can see
-      // the exact short body being approved.  Keep it complete (after control
-      // removal and credential redaction); the aggregate 16 KiB check below
-      // fails closed instead of silently truncating a long mutation.
-      display[key] = redactCommand(value);
     } else {
       display[key] = redactJson(value);
     }
@@ -897,6 +881,70 @@ function redactActionArguments(toolName: string, action: string, args: JsonObjec
     display.input = redactCommandForApproval(stringValue(args.input));
   }
   return display;
+}
+
+/** The only MCP projection allowed in execution journals and retained previews. */
+export function mcpActivityProjection(args: JsonObject): JsonObject {
+  const action = stringValue(args.action);
+  if (action !== "list" && action !== "call") throw new Error("mcp action must be list or call");
+  const projected: JsonObject = {};
+  if (typeof args.server === "string") projected.server = args.server;
+  if (action === "call") {
+    if (typeof args.server !== "string" || typeof args.tool !== "string") {
+      throw new Error("mcp call requires server and tool");
+    }
+    projected.tool = args.tool;
+  }
+  validateMcpApprovalValue(projected);
+  return { tool: "mcp", action, arguments: projected };
+}
+
+function validateMcpApprovalValue(
+  value: unknown,
+  depth: number = 0,
+  budget: { nodes: number } = { nodes: 0 },
+): void {
+  budget.nodes += 1;
+  if (depth > 16 || budget.nodes > 2_048) throw new Error("MCP approval arguments exceed structural limits");
+  if (typeof value === "string") {
+    if (hasForbiddenTerminalControls(value)) {
+      throw new Error("MCP approval arguments contain forbidden control characters");
+    }
+    return;
+  }
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("MCP approval arguments contain a non-finite number");
+    return;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 100) throw new Error("MCP approval array exceeds 100 items");
+    for (const item of value) validateMcpApprovalValue(item, depth + 1, budget);
+    return;
+  }
+  if (!value || typeof value !== "object") throw new Error("MCP approval arguments must contain only JSON values");
+  const entries = Object.entries(value);
+  if (entries.length > 100) throw new Error("MCP approval object exceeds 100 fields");
+  for (const [key, item] of entries) {
+    if (hasForbiddenTerminalControls(key)) {
+      throw new Error("MCP approval arguments contain forbidden control characters");
+    }
+    validateMcpApprovalValue(item, depth + 1, budget);
+  }
+}
+
+function redactCompleteJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => redactCompleteJson(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      SENSITIVE_COMMAND_NAME.test(key) || /^(?:pass|passin|passout|pwd)$/i.test(key)
+        ? "[redacted]"
+        : redactCompleteJson(item),
+    ]));
+  }
+  if (typeof value === "string") return redactCommandForApproval(value);
+  return value;
 }
 
 function omittedActionBodyKeys(toolName: string, action: string): string[] {

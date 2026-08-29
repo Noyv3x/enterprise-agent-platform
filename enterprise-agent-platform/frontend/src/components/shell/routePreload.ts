@@ -38,20 +38,16 @@ async function loadRoute<T>(loader: () => Promise<T>): Promise<T> {
   }
 }
 
-export const loadKnowledgeRoute = () =>
-  loadRoute(() => import("../knowledge/KnowledgeView"));
 export const loadSettingsRoute = () =>
   loadRoute(() => import("../settings/SettingsView"));
 export const loadAdminRoute = () =>
   loadRoute(() => import("../admin/AdminPanel"));
 
 export function preloadRoute(view: ActiveView): void {
-  const pending = view === "knowledge"
-    ? loadKnowledgeRoute()
-    : view === "settings"
-      ? loadSettingsRoute()
-      : view === "admin"
-        ? loadAdminRoute()
-        : null;
+  const pending = view === "settings"
+    ? loadSettingsRoute()
+    : view === "admin"
+      ? loadAdminRoute()
+      : null;
   void pending?.catch(() => undefined);
 }

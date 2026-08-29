@@ -48,7 +48,6 @@ import { messageSyncCursor } from "./messageSync";
 import { messageHistoryState } from "./messageHistory";
 import {
   loadChannelMessages,
-  loadDocuments,
   loadPrivateMessages,
   loadPrivateTelegram,
   type AppStore,
@@ -489,10 +488,7 @@ export async function navigateToView(store: AppStore, view: ActiveView): Promise
       () => loadPrivateMessages(store),
       () => loadPrivateTelegram(store),
     ));
-  } else if (view === "knowledge") {
-    await ensureResource(store, resourceKeys.knowledgeList, () => loadDocuments(store));
-  }
-  else if (view === "admin") {
+  } else if (view === "admin") {
     await ensureAdminPageResource(store, store.getState().activeAdminPage);
   }
 }

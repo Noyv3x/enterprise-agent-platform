@@ -49,6 +49,7 @@ type ProcessManager struct {
 
 const maxScopeCleanupCompletionEvidence = 1024
 const scopeCleanupAdmissionWait = 10 * time.Second
+const privateProcessOutput = "[MCP result omitted from retained terminal output]"
 
 type processStartIdentity struct {
 	scopeID     string
@@ -79,6 +80,7 @@ type managedProcess struct {
 	completionOwnerID      string
 	completionToolCallID   string
 	completionAcknowledged bool
+	privateOutput          bool
 	starting               bool
 	stopRequested          bool
 	done                   chan struct{}
@@ -98,6 +100,7 @@ type persistedProcess struct {
 	CompletionOwnerID      string          `json:"completion_owner_id,omitempty"`
 	CompletionToolCallID   string          `json:"completion_tool_call_id,omitempty"`
 	CompletionAcknowledged bool            `json:"completion_acknowledged,omitempty"`
+	PrivateOutput          bool            `json:"private_output,omitempty"`
 	Starting               bool            `json:"starting,omitempty"`
 }
 type boundedBuffer struct {
@@ -131,6 +134,18 @@ func (b *boundedBuffer) String() string {
 	if b.truncated {
 		result += "\n[output truncated by platform manager]\n"
 	}
+	return result
+}
+
+func (b *boundedBuffer) TakeString() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	result := b.value.String()
+	if b.truncated {
+		result += "\n[output truncated by platform manager]\n"
+	}
+	b.value.Reset()
+	b.truncated = false
 	return result
 }
 
@@ -282,7 +297,7 @@ func (m *ProcessManager) releaseProcessSlotLocked(scope, lifecycle string) {
 
 const sandboxProcessWrapper = `
 import os, selectors, sys
-pid_file, stdout_file, stderr_file, exit_file, limit, command = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6]
+pid_file, stdout_file, stderr_file, exit_file, limit, private_output, command = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "private", sys.argv[7]
 out_r, out_w = os.pipe()
 err_r, err_w = os.pipe()
 child = os.fork()
@@ -294,11 +309,11 @@ if child:
         handle.write("%d %s %d %s\n" % (child, child_start, os.getpid(), wrapper_start))
         handle.flush()
         os.fsync(handle.fileno())
-    out_fd = os.open(stdout_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    err_fd = os.open(stderr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    out_fd = 1 if private_output else os.open(stdout_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    err_fd = 2 if private_output else os.open(stderr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     selector = selectors.DefaultSelector()
-    selector.register(out_r, selectors.EVENT_READ, (out_fd, stdout_file))
-    selector.register(err_r, selectors.EVENT_READ, (err_fd, stderr_file))
+    selector.register(out_r, selectors.EVENT_READ, (out_fd, None if private_output else stdout_file))
+    selector.register(err_r, selectors.EVENT_READ, (err_fd, None if private_output else stderr_file))
     while selector.get_map():
         for key, _ in selector.select(timeout=1):
             chunk = os.read(key.fd, 65536)
@@ -306,13 +321,14 @@ if child:
                 selector.unregister(key.fd); os.close(key.fd); continue
             target_fd, target_path = key.data
             os.write(target_fd, chunk)
-            size = os.lseek(target_fd, 0, os.SEEK_END)
-            if size > limit * 2:
+            size = os.lseek(target_fd, 0, os.SEEK_END) if target_path else 0
+            if target_path and size > limit * 2:
                 read_fd = os.open(target_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
                 tail = os.pread(read_fd, limit, size - limit)
                 os.close(read_fd)
                 os.ftruncate(target_fd, 0); os.lseek(target_fd, 0, os.SEEK_SET); os.write(target_fd, tail)
-    os.fsync(out_fd); os.fsync(err_fd); os.close(out_fd); os.close(err_fd)
+    if not private_output:
+        os.fsync(out_fd); os.fsync(err_fd); os.close(out_fd); os.close(err_fd)
     _, status = os.waitpid(child, 0)
     if os.WIFEXITED(status): code = os.WEXITSTATUS(status)
     elif os.WIFSIGNALED(status): code = 128 + os.WTERMSIG(status)
@@ -465,7 +481,11 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 		stdoutFile := filepath.ToSlash(filepath.Join(contract.ContainerAgentEnv, "processes", id+".out"))
 		stderrFile := filepath.ToSlash(filepath.Join(contract.ContainerAgentEnv, "processes", id+".err"))
 		exitFile := filepath.ToSlash(filepath.Join(contract.ContainerAgentEnv, "processes", id+".exit"))
-		name, commandArgs = m.Engine.ExecArgs(spec, cwd, "python3", []string{"-c", sandboxProcessWrapper, pidFile, stdoutFile, stderrFile, exitFile, strconv.FormatInt(m.MaxOutput, 10), args.Command})
+		outputMode := "retained"
+		if args.PrivateOutput {
+			outputMode = "private"
+		}
+		name, commandArgs = m.Engine.ExecArgs(spec, cwd, "python3", []string{"-c", sandboxProcessWrapper, pidFile, stdoutFile, stderrFile, exitFile, strconv.FormatInt(m.MaxOutput, 10), outputMode, args.Command})
 	} else if call.Target == "host" {
 		if cwd == "" {
 			cwd = contract.ContainerWorkspace
@@ -512,7 +532,11 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	} else if call.CompletionOwnerID != "" {
 		stateFile = filepath.Join(filepath.Dir(m.Sandboxes.StatePath), "processes", "host", id+".json")
 	}
-	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: args.Command, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, workspaceID: call.ExecutionContext.WorkspaceID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, hostExitFile: hostExitFile, stateFile: stateFile, completionOwnerID: call.CompletionOwnerID, completionToolCallID: call.ToolCallID, starting: true, done: make(chan struct{}), stdout: stdout, stderr: stderr}
+	displayCommand := args.Command
+	if args.DisplayCommand != "" {
+		displayCommand = args.DisplayCommand
+	}
+	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: displayCommand, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, workspaceID: call.ExecutionContext.WorkspaceID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, hostExitFile: hostExitFile, stateFile: stateFile, completionOwnerID: call.CompletionOwnerID, completionToolCallID: call.ToolCallID, privateOutput: args.PrivateOutput, starting: true, done: make(chan struct{}), stdout: stdout, stderr: stderr}
 	if process.completionOwnerID != "" {
 		if err := m.persistProcess(process); err != nil {
 			cancel()
@@ -579,6 +603,10 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	}
 	m.wait(process)
 	snapshot := m.snapshot(process)
+	if args.PrivateOutput {
+		snapshot.Stdout = process.stdout.TakeString()
+		snapshot.Stderr = process.stderr.TakeString()
+	}
 	_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, snapshot.Status == "orphaned", time.Now())
 	callOpen = false
 	if snapshot.Status == "cancelled" {
@@ -605,7 +633,11 @@ func (m *ProcessManager) wait(process *managedProcess) {
 	process.cancel()
 	finished := time.Now().UTC()
 	process.mu.Lock()
-	process.snapshot.Stdout, process.snapshot.Stderr = process.stdout.String(), process.stderr.String()
+	if process.privateOutput {
+		process.snapshot.Stdout, process.snapshot.Stderr = privateProcessOutput, ""
+	} else {
+		process.snapshot.Stdout, process.snapshot.Stderr = process.stdout.String(), process.stderr.String()
+	}
 	process.snapshot.FinishedAt = &finished
 	if err == nil {
 		code := 0
@@ -635,6 +667,7 @@ func (m *ProcessManager) wait(process *managedProcess) {
 	}
 	background := process.snapshot.Background
 	orphaned := process.snapshot.Status == "orphaned"
+	process.command = nil
 	process.mu.Unlock()
 	if process.hostPIDFile != "" && !orphaned {
 		_ = os.Remove(process.hostPIDFile)
@@ -678,7 +711,7 @@ func (m *ProcessManager) persistProcess(process *managedProcess) error {
 	}
 	snapshot := m.snapshot(process)
 	process.mu.Lock()
-	value := persistedProcess{Snapshot: snapshot, SandboxID: process.sandboxID, WorkspaceID: process.workspaceID, PIDFile: process.pidFile, HostPIDFile: process.hostPIDFile, StdoutFile: process.hostStdoutFile, StderrFile: process.hostStderrFile, ExitFile: process.hostExitFile, CompletionOwnerID: process.completionOwnerID, CompletionToolCallID: process.completionToolCallID, CompletionAcknowledged: process.completionAcknowledged, Starting: process.starting}
+	value := persistedProcess{Snapshot: snapshot, SandboxID: process.sandboxID, WorkspaceID: process.workspaceID, PIDFile: process.pidFile, HostPIDFile: process.hostPIDFile, StdoutFile: process.hostStdoutFile, StderrFile: process.hostStderrFile, ExitFile: process.hostExitFile, CompletionOwnerID: process.completionOwnerID, CompletionToolCallID: process.completionToolCallID, CompletionAcknowledged: process.completionAcknowledged, PrivateOutput: process.privateOutput, Starting: process.starting}
 	process.mu.Unlock()
 	return atomicfile.WriteJSON(process.stateFile, value, 0o600)
 }
@@ -769,7 +802,7 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 			stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
 			_, _ = stdout.Write([]byte(state.Snapshot.Stdout))
 			_, _ = stderr.Write([]byte(state.Snapshot.Stderr))
-			process := &managedProcess{snapshot: state.Snapshot, cancel: func() {}, context: context.Background(), sandboxID: state.SandboxID, workspaceID: record.WorkspaceID, spec: spec, pidFile: state.PIDFile, hostPIDFile: state.HostPIDFile, hostStdoutFile: state.StdoutFile, hostStderrFile: state.StderrFile, hostExitFile: state.ExitFile, stateFile: stateFile, completionOwnerID: state.CompletionOwnerID, completionToolCallID: state.CompletionToolCallID, completionAcknowledged: state.CompletionAcknowledged, starting: state.Starting, done: make(chan struct{}), stdout: stdout, stderr: stderr}
+			process := &managedProcess{snapshot: state.Snapshot, cancel: func() {}, context: context.Background(), sandboxID: state.SandboxID, workspaceID: record.WorkspaceID, spec: spec, pidFile: state.PIDFile, hostPIDFile: state.HostPIDFile, hostStdoutFile: state.StdoutFile, hostStderrFile: state.StderrFile, hostExitFile: state.ExitFile, stateFile: stateFile, completionOwnerID: state.CompletionOwnerID, completionToolCallID: state.CompletionToolCallID, completionAcknowledged: state.CompletionAcknowledged, privateOutput: state.PrivateOutput, starting: state.Starting, done: make(chan struct{}), stdout: stdout, stderr: stderr}
 			if activeProcessStatus(process.snapshot.Status) {
 				if process.starting {
 					if recoveredPID, waitErr := waitForPIDFile(process.hostPIDFile, 2*time.Second); waitErr != nil {
@@ -828,7 +861,7 @@ func (m *ProcessManager) recoverHostCompletionTasks() {
 			snapshot: state.Snapshot, cancel: func() {}, context: context.Background(),
 			sandboxID: state.SandboxID, workspaceID: state.WorkspaceID, stateFile: stateFile,
 			completionOwnerID: state.CompletionOwnerID, completionToolCallID: state.CompletionToolCallID,
-			completionAcknowledged: state.CompletionAcknowledged, starting: false,
+			completionAcknowledged: state.CompletionAcknowledged, privateOutput: state.PrivateOutput, starting: false,
 			done: make(chan struct{}), stdout: stdout, stderr: stderr,
 		}
 		if activeProcessStatus(process.snapshot.Status) || state.Starting {
@@ -1029,6 +1062,10 @@ func (m *ProcessManager) snapshot(process *managedProcess) ProcessSnapshot {
 	process.mu.Lock()
 	defer process.mu.Unlock()
 	value := process.snapshot
+	if process.privateOutput {
+		value.Stdout, value.Stderr = privateProcessOutput, ""
+		return value
+	}
 	value.Stdout, value.Stderr = process.stdout.String(), process.stderr.String()
 	if process.hostStdoutFile != "" {
 		if output, err := readTailFile(process.hostStdoutFile, m.MaxOutput); err == nil {

@@ -5,7 +5,6 @@ const loads = vi.hoisted(() => ({
   updates: vi.fn(async () => undefined),
   agentRuntime: vi.fn(async () => undefined),
   branding: vi.fn(async () => undefined),
-  knowledge: vi.fn(async () => undefined),
   messages: vi.fn(async () => undefined),
   oauth: vi.fn(async () => undefined),
   groups: vi.fn(async () => undefined),
@@ -21,7 +20,6 @@ vi.mock("./loaders", () => ({
   loadAutoUpdateConfig: loads.updates,
   loadAgentRuntimeConfig: loads.agentRuntime,
   loadBrandingConfig: loads.branding,
-  loadKnowledgeAdmin: loads.knowledge,
   loadMessageAudit: loads.messages,
   loadOAuthProviders: loads.oauth,
   loadPermissionGroups: loads.groups,
@@ -37,7 +35,7 @@ import { loadAdminPage } from "./adminResources";
 
 const pages: AdminPageId[] = [
   "accounts", "tokens", "messages", "agent-runtime", "telegram", "branding", "updates",
-  "security", "runtime", "knowledge", "secrets",
+  "security", "runtime", "secrets",
 ];
 
 describe("administration page resources", () => {
@@ -56,7 +54,6 @@ describe("administration page resources", () => {
       updates: ["updates"],
       security: ["security", "updates"],
       runtime: ["runtime"],
-      knowledge: ["knowledge"],
       secrets: ["secrets"],
     };
 

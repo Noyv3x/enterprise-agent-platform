@@ -390,14 +390,6 @@ class DocsSyncTests(unittest.TestCase):
                             "required_paths": ["docker-compose.yaml"],
                             "compose_services": ["api", "redis"],
                         },
-                        "sylver_platform_skill": {
-                            "repository_url": "https://github.com/Sylver-Lining/ubitech-platform-skill.git",
-                            "tracking_ref": "refs/heads/main",
-                            "revision": "3" * 40,
-                            "required_paths": ["SKILL.md", "scripts/ubi.py"],
-                            "skill_sha256": "4" * 64,
-                            "adapter_sha256": "5" * 64,
-                        },
                     },
                 },
                 indent=2,
@@ -1321,43 +1313,20 @@ class DocsSyncTests(unittest.TestCase):
         unsorted = self.run_command("sync", expect=1)
         self.assertIn("compose_services must be sorted", unsorted.stderr)
 
-    def test_upstream_skill_source_requires_a_pinned_skill_digest(self) -> None:
+    def test_upstream_source_contract_rejects_extra_sources(self) -> None:
         self.initialize_git()
         self.write_fixture()
         path = self.root / "docs/contracts/upstream-sources.json"
         contract = json.loads(path.read_text(encoding="utf-8"))
-        contract["sources"]["sylver_platform_skill"] = {
-            "repository_url": "https://github.com/Sylver-Lining/ubitech-platform-skill.git",
-            "tracking_ref": "refs/heads/main",
+        contract["sources"]["unused"] = {
+            "repository_url": "https://example.invalid/unused.git",
             "revision": "3" * 40,
-            "required_paths": ["SKILL.md", "scripts/ubi.py"],
-            "skill_sha256": "invalid",
-            "adapter_sha256": "5" * 64,
+            "required_paths": ["README.md"],
         }
         path.write_text(json.dumps(contract), encoding="utf-8")
 
         invalid = self.run_command("sync", expect=1)
-
-        self.assertIn("lowercase SHA-256 digest", invalid.stderr)
-
-        contract["sources"]["sylver_platform_skill"]["skill_sha256"] = "4" * 64
-        path.write_text(json.dumps(contract), encoding="utf-8")
-        self.run_command("sync", expect=0)
-
-        contract["sources"]["sylver_platform_skill"]["repository_url"] = (
-            "https://github.com/Sylver-Lining/other-private-skill.git"
-        )
-        path.write_text(json.dumps(contract), encoding="utf-8")
-        wrong_source = self.run_command("sync", expect=1)
-        self.assertIn("fixed official URL", wrong_source.stderr)
-        contract["sources"]["sylver_platform_skill"]["repository_url"] = (
-            "https://github.com/Sylver-Lining/ubitech-platform-skill.git"
-        )
-
-        del contract["sources"]["sylver_platform_skill"]
-        path.write_text(json.dumps(contract), encoding="utf-8")
-        missing = self.run_command("sync", expect=1)
-        self.assertIn("missing required sources", missing.stderr)
+        self.assertIn("sources must be exactly: firecrawl", invalid.stderr)
 
     def test_upstream_source_contract_rejects_generated_targets(self) -> None:
         self.initialize_git()

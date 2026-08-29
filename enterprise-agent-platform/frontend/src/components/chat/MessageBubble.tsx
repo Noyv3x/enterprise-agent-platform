@@ -1,7 +1,7 @@
 /* <MessageBubble/> — one user or Agent chat message. React.memo'd and keyed by
    message.id at the list level;
    it re-renders only when a cheap fingerprint (content / streaming / attachments /
-   suggestions / agent_work) changes. Optimistic and synthetic streaming messages flow through
+   agent_work) changes. Optimistic and synthetic streaming messages flow through
    here too (msg--pending / msg--streaming toggle the CSS badges + caret). */
 
 import { Progress } from "antd";
@@ -14,7 +14,6 @@ import type { Message } from "../../types";
 import { Icon } from "../common/Icon";
 import { MessageAttachments } from "../common/MessageAttachments";
 import { AgentWorkCard, hasAgentProcessSteps } from "./AgentWorkCard";
-import { KnowledgeSuggestions } from "./KnowledgeSuggestions";
 import { MessageBody } from "./MessageBody";
 import { MessageMeta } from "./MessageMeta";
 import { CopyButton } from "./CopyButton";
@@ -38,7 +37,6 @@ function MessageBubbleImpl({
 }: MessageBubbleProps) {
   const { t } = useI18n();
   const isUser = message.author_type === "user";
-  const suggestions = message.metadata?.knowledge_suggestions || [];
   const agentWork = message.metadata?.agent_work || null;
   const streaming = !!message.metadata?.streaming;
   const pending = !!message.metadata?.local_pending;
@@ -103,7 +101,6 @@ function MessageBubbleImpl({
             />
           </div>
         ) : null}
-        {suggestions.length ? <KnowledgeSuggestions suggestions={suggestions} /> : null}
       </div>
     </article>
   );

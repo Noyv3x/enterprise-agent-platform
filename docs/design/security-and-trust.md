@@ -4,7 +4,7 @@
 
 ## 信任模型
 
-平台面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个个人 AI 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory 与浏览器 Profile；memory 的 `memory` 与 `user` target 都受同一 Agent scope 隔离，不能作为跨 Agent 共享层，公共资料必须进入知识库。委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
+平台面向彼此可信的内部成员，不试图在同一部署中抵抗恶意租户。每个个人 AI 和频道主 Agent拥有独立 Sandbox、workspace、HOME、session、memory、Skill/MCP 配置与浏览器 Profile；memory 的 `memory` 与 `user` target 都受同一 Agent scope 隔离，不能作为跨 Agent 共享层，跨 Agent 资料必须进入用户明确选择的外部系统或频道文件。委派子 Agent继承父 Sandbox。该隔离减少环境互相污染和误操作，不是针对恶意用户、恶意模型或提示词注入的安全边界。
 
 默认工具在 Sandbox 执行并免人工审批，但仍受不可绕过的 hard-block。模型可以为单次 terminal、文件或进程调用显式选择宿主目标；任何 `target=host` 调用都必须由用户逐次批准，不能形成会话或永久授权。管理器随后才以部署用户执行；terminal 还允许使用该用户已有的免密 `sudo`。这等同把该次操作授予部署用户乃至 root 能力。部署方必须只给可信成员使用，并把部署用户、宿主文件和网络权限控制在可接受范围。
 
@@ -56,7 +56,7 @@ Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的�
 
 只有 `run.completed` 的成功回复可以进入上述交付边界。`failed`、`cancelled` 或 `needs_review` 即使保留了阶段性正文，也不得调用媒体提取、复制文件或创建附件记录；其中出现的 `MEDIA:` 只按普通可见诊断文本处理。
 
-`target=host` 必须由模型在当前 terminal、文件或进程调用中显式选择，并逐次弹出用户审批；只允许 `once` 或 `deny`，不形成 session/always 授权。未批准、超时或通知失败时不得先调用 Manager。批准后管理器在执行前持久化并向聊天发送审计事件；terminal 展示完整实际命令参数、canonical cwd、前后台方式和有效超时，文件与进程工具展示 canonical 目标及完整操作参数。执行后记录结果与副作用。日志可脱敏 secret，但不能隐去影响语义的普通参数。浏览器、Skill、计划等独立业务审批不因命令策略变化而自动取消。邮件发送、回复、移动、标记和保存附件同样逐次审批，审批记录隐藏正文与凭据；邮件唤醒的 unattended Run 无条件拒绝这些动作。
+`target=host` 必须由模型在当前 terminal、文件或进程调用中显式选择，并逐次弹出用户审批；只允许 `once` 或 `deny`，不形成 session/always 授权。未批准、超时或通知失败时不得先调用 Manager。批准后管理器在执行前持久化并向聊天发送审计事件；terminal 展示完整实际命令参数、canonical cwd、前后台方式和有效超时，文件与进程工具展示 canonical 目标及完整操作参数。执行后记录结果与副作用。日志可脱敏 secret，但不能隐去影响语义的普通参数。浏览器、Skill、MCP、计划等独立业务审批不因命令策略变化而自动取消。MCP `call`、邮件发送、回复、移动、标记和保存附件同样逐次审批，审批记录隐藏正文与凭据；unattended Run 无条件拒绝这些动作。
 
 工具审计序列化不得复用于模型历史。模型可见的 tool call 必须保留活动 schema 的原始结构，脱敏占位符仍须符合字段约束；只有工具名精确匹配且仅含既知字段的历史展示 envelope 可以在内存中收敛。工具名不匹配、调用者身份字段或其它未知字段一律失败关闭，不能以兼容为由删除后继续执行。
 
@@ -128,13 +128,9 @@ Manager 的 Sandbox 文件工具从已固定的挂载根目录 fd 逐级处理�
 
 OAuth refresh token、邮箱应用密码、session secret、内部 token 和其它 secret 保存在 Platform SQLite 的专用凭据表或 `settings` 表，并只返回“已配置”状态；数据目录和数据库文件依靠宿主权限保护。当前没有应用层静态加密，文档和界面不得宣称“加密存储”。读取这些 secret 只查对应 settings 行；进程环境不是第二套凭据库。新库可以把 Manager 注入的 session secret 一次性写入该行，之后只读持久化值。
 
-Sylver Lining 工作平台的 Personal API Token 使用每用户专用凭据行，并只接受可安全放入 Bearer header 的非空可见 ASCII。出站 origin 固定为代码锁定的官方 HTTPS 地址，产品请求、用户、模型和数据库内容均不能覆盖；候选 Token 必须先完成 `/api/auth/me` 验证再保存，验证失败不得覆盖既有连接。用户自助与管理员代目标账号执行的查看、验证、连接、重连和断开使用独立闭世界接口，并按目标本地用户从入口起共享同一串行锁；目标用户 ID 只来自管理员路由 path，普通成员在任何远端请求前收到拒绝。管理员保存采用“远端身份预览—本地目标与远端身份明确确认—再次验证后提交”流程，确认必须携带预览中的远端用户 ID，身份变化或连接竞态返回冲突，不能把一个有效但错误的 Token 静默贴到另一账号。
-
-管理员与用户读取都只得到无凭据连接投影，不返回 Token、掩码、前后缀或长度。管理员慢验证完成后、提交前必须重新验证其仍为活动管理员且目标仍存在；失败替换不得修改旧连接。Agent 工具的凭据读取到远端调用完成也持有同一目标串行锁，因此断开或替换返回后不会再有已读取旧 Token 的在途调用；外部平台已经确认接收的请求仍不能撤回。模型、Runtime、Sandbox、工具参数、审批展示、事件和错误均不得取得 Token。远端 JSON 在离开连接器前递归清除敏感字段值和当前 Token 的任何精确回显；身份响应出现 Token 回显时必须拒绝整次验证，不能存储脱敏后的伪身份。连接器拒绝由模型指定 HTTP path/header，拒绝携凭据重定向，并对未知或未分类业务动作失败关闭。外部写动作先按原始完整审批参数计算 UTF-8 上限并拒绝不可见控制字符，只有通过后才生成完整、脱敏的短正文展示；不能让脱敏或控制字符移除把超限正文压缩后绕过限制。写请求发出后的不确定结果必须显式要求读取远端状态，不能诱导盲目重放。审批决定、跳过审查、员工管理、原始 REST 和破坏性删除不因持有远端 Token 获得工具入口。
-
 网页登录密码防爆破采用固定窗口的三重限制：目标账号与真实客户端组合、目标账号跨客户端、真实客户端跨用户名。来源地址只接受 Manager 清洗并重建的可信转发头，否则使用 TCP peer；客户端跨用户名上限在昂贵密码校验前保护 CPU，账号跨客户端上限只阻止错误密码，正确凭据仍可登录，避免攻击者远程锁死指定账号。失败窗口以稳定 session secret 派生的 HMAC 标识持久化到 owner-only Platform 设置，既不保存明文用户名/IP，也不能靠 Platform 重启清零；过期记录和键数量均有硬上限。未知账号与错误密码执行等价 PBKDF2 并返回统一认证错误。限流返回稳定错误码与 `Retry-After`，登录只接受小型、字段精确、无重复键 JSON，并对用户名和密码设置输入上限；不引入永久封号、验证码或外部风控服务。
 
-知识 Embeddings API key 同样属于 Platform secret：管理接口只接受写入或保留既有值，读取只返回是否已配置和有界掩码，不能回传原文。配置提交前必须对目标 provider 做最小探测；请求禁止携带凭据重定向，并限制 URL、响应体、超时、向量数量、顺序、数值和维度。缺少 key 时知识创建、重建和显式检索以 `knowledge_embedding_unconfigured` 失败关闭，不启动本地模型、不回退关键词检索；聊天启动时的被动知识召回则失败开放，只记录 disabled/degraded，不能因此阻断普通回复。
+MCP 清单、server 包和用户自行保存的环境值只位于当前主 Agent 的 `.agent-platform` 工作区。Platform 不把这些值当作平台托管 secret，也不复制到 SQLite、其它 workspace、Runtime metadata、提示词、工作记录或日志；能读写该 Agent 工作区的用户和 Agent 本身可以读取它们，这是用户选择本地 MCP 的明确信任边界。stdio 客户端只接受有界 JSON 清单，以 argv 启动命令，不经过 shell，并将 cwd 约束在当前 `/workspace`；配置指定的环境只注入该次 server 子进程。配置不存在返回空目录，配置损坏、路径越界、协议异常、超时和输出超限全部失败关闭，不搜索 `.claude`、HOME 或其它兼容路径。每个 `call` 都要一次性审批；完整调用参数在脱敏后仍必须全部可见，不允许深度/数量截断，任何字段名或字符串值中的不可见/双向控制字符以及超过完整展示上限的请求都在审批前 hard-block。Manager 只把 `action/server/tool` 投影写入审计、保留快照和终端预览，不保留固定客户端命令的可逆载荷或 MCP 原始输出；Platform 工作记录同样只使用该安全投影。server 工具描述、annotations、结果与错误全部是不可信数据，不能自行授予权限或把一次批准扩展到下一次调用。
 
 OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误。每个 OAuth provider 的账号目录只能与 Runtime 从锁定 Pi 元数据得到的 provider、API、endpoint 和模型能力目录求交；供应商返回的未知模型不能因为排序更高而直接获得执行权限，Runtime 已知但账号目录未返回的模型也不能取得 Token。推荐默认来自交集后的账号顺序，不能通过硬编码旧模型、退役名单或直接采用未校验 ID 绕过这条边界。内部凭据请求必须绑定具体 provider、模型和 scope，并在返回 Token 前用当前账号目录复验。容器只获得其运行所需 secret；Sandbox 不继承 Platform、Manager、registry 或宿主环境的 secret。所有子进程从最小环境开始构造，不能整体透传服务环境。
 
@@ -148,11 +144,11 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 不可信内容与提示词注入
 
-用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、知识、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
+用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、MCP 描述/结果、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
 
-Runtime 系统提示按稳定策略、Platform-authored system context 和动态状态分层时，分层仅决定顺序、缓存稳定性和数据 framing，不创建新授权；Platform 是系统上下文作者，其中嵌入的用户、频道、品牌和知识载荷仍是闭合不可信数据。供应商 `prompt_cache_key` 只能是版本化稳定策略、工具 schema 和稳定 scope 分片的单向内容摘要，线上 key 不得包含原始账号、scope、session、路径、提示正文或凭据；本地参与摘要的 scope 只用于稳定分流，不得写入日志或供应商 payload。该 key 只是缓存路由提示，不是身份、隔离、授权或完整性边界，真实 session/header 与 Runtime 权威状态仍独立校验。权限、scope、lifecycle、执行 target 与审批仍只来自闭世界结构化请求和 Runtime/Platform 权威状态，不从任何提示文本推断。`todo` 只是 session 内执行组织；工具说明、清单正文和状态都不能绕过审批、授予工具能力或建立外部副作用。todo 正文是不可信任务数据；模型不得主动把凭据复制进去，todo 也不是 secret store。只有 Runtime-owned id 和状态可作为机械完成守卫的权威依据。
+Runtime 系统提示按稳定策略、Platform-authored system context 和动态状态分层时，分层仅决定顺序、缓存稳定性和数据 framing，不创建新授权；Platform 是系统上下文作者，其中嵌入的用户、频道和品牌载荷仍是闭合不可信数据。供应商 `prompt_cache_key` 只能是版本化稳定策略、工具 schema 和稳定 scope 分片的单向内容摘要，线上 key 不得包含原始账号、scope、session、路径、提示正文或凭据；本地参与摘要的 scope 只用于稳定分流，不得写入日志或供应商 payload。该 key 只是缓存路由提示，不是身份、隔离、授权或完整性边界，真实 session/header 与 Runtime 权威状态仍独立校验。权限、scope、lifecycle、执行 target 与审批仍只来自闭世界结构化请求和 Runtime/Platform 权威状态，不从任何提示文本推断。`todo` 只是 session 内执行组织；工具说明、清单正文和状态都不能绕过审批、授予工具能力或建立外部副作用。todo 正文是不可信任务数据；模型不得主动把凭据复制进去，todo 也不是 secret store。只有 Runtime-owned id 和状态可作为机械完成守卫的权威依据。
 
-知识上传文件是不可信输入。文件名必须规范化并只用于展示/下载头，不能成为宿主路径；媒体类型不能单独决定解析器。ZIP 容器在解压前检查闭合格式身份、条目数、路径、加密标志和累计展开大小，拒绝绝对路径、`..`、符号链接式条目与压缩炸弹。文档解析不执行宏、公式、脚本、外链或嵌入对象；PDF/Office/OpenDocument 解析异常只返回有界通用错误，不能把原始载荷、内部路径或解析器诊断注入日志和模型上下文。原件下载始终使用 `attachment` disposition、`nosniff` 与同源鉴权，不能以内联 HTML/SVG/Office 内容响应。
+聊天附件与文档预览是不可信输入。文件名必须规范化并只用于展示/下载头，不能成为宿主路径；媒体类型不能单独决定解析器。ZIP 容器在预览前检查闭合格式身份、条目数、路径、加密标志和累计展开大小，拒绝绝对路径、`..`、符号链接式条目与压缩炸弹。预览解析不执行宏、公式、脚本、外链或嵌入对象；PDF/Office 解析异常只返回有界通用错误，不能把原始载荷、内部路径或解析器诊断注入日志和模型上下文。原件下载始终使用 `attachment` disposition、`nosniff` 与同源鉴权，不能以内联 HTML/SVG/Office 内容响应。
 
 ## 电脑画面与呈现页
 
@@ -172,9 +168,11 @@ HTML 呈现页只来自当前 scope 工作区中已成功写出的 `.html` / `.h
 
 后台学习复盘是唯一可跳过 Skill 用户审批的内部路径。它必须同时具有 Platform 生成的 `review_mode`、trigger、unattended、review job、owner、source message、canonical scope 和当前 lifecycle；临时 `session_id` 与幂等 key 必须分别精确等于 `learning-review-<review_job_id>` 和 `agent-learning-review:<review_job_id>`，Runtime 在排队或写入 session 前拒绝任何错配，不能让伪造复盘身份删除普通会话。Runtime 必须将这个完整主体透传到每次复盘 memory 读写和 Skill 请求；Gateway 在任何记忆查询、Skill 读取或副作用前都从 SQLite 反查 running job、当前 lifecycle、激活账号与权限，不能只信 Runtime metadata。复盘 memory `search|read|list` 必须在 lifecycle/review 串行门内，用同一个 SQLite 事务快照完成授权复验和查询；写入则在同一个 `BEGIN IMMEDIATE` 事务内完成复验、预算扣减、变更和返回快照，使 reset、撤权或 job 终结与读写具有明确线性化边界。复盘 Skill `list/load/read` 同样必须把最终复验、文件系统读取与 read-ledger 登记纳入一个保持到读取结束的 lifecycle gate 和 `BEGIN IMMEDIATE` 边界，防止旧 lifecycle 或撤权请求读取当前 Skill。普通私人交互 Run 的 automatic memory 写入同样必须在 lifecycle 门和单一 `BEGIN IMMEDIATE` 事务内，依据当前 scope/lifecycle、账号权限、来源用户消息和 `agent_run_inputs.runtime_run_id` 到 running 父 Agent job 的权威映射复验，不能把早先预检当作持久授权。Runtime 工具白名单和 Platform 动作白名单形成双重边界。复盘不能访问 Sandbox、终端、文件、网络、浏览器、邮件、计划、委派或凭据；Skill create 和 patch 都必须在 lifecycle/review 串行门内重验 scope、账号、权限、来源消息与 running job。Skill 更新还要求同一 Run 先读，再在同一 scope lock 内完成目标包身份重读、`agent-owned + active + unpinned` 资格复核和精确 patch，不接受一个锁外先检查结果作为持久授权。自动 patch 前后都要以 package id 和重新解析的 frontmatter name 拒绝 bundled 遮蔽，并继续执行注入与高置信明文凭据扫描。该扫描覆盖全部可变 Skill 内容写入口，并区分真实 token、PAT、完整 PEM 私钥、实际 Bearer 值与普通认证说明/占位符。复盘创建还必须拒绝 bundled id 或名称冲突，不能用新建包绕过 bundled 只读边界。复盘历史和工具结果仍是不可信数据，用户文本不能把自己变成学习策略或授权。
 
+Skill 的 enabled、来源、状态和 pin 只能从不向 Agent 挂载的 Platform-only 状态层读取，不得信任 workspace sidecar 或同 UID 文件模式。私有 sidecar 以 package 目录的 device、inode 和 ctime 绑定当前实例；同 id 包被删除重建或换链后，遗留状态只能降级为 user-owned，不能继承免审维护权。Skill workspace 扫描、读取、写入、锁和发布都必须基于逐段 no-follow 打开并保持的目录 fd；一旦校验就不得重新按可换链的字符串父路径解析。SKILL.md 和支持文件必须是单硬链普通文件，防止把另一 workspace 的 inode 伪装成当前包内容。
+
 复盘还必须使用独立、不可被全局调大的 `16` 个模型 turn 硬上限；全局上限更小时取较小值。除此之外，每个 review durable job 只有持久共享的二十单位总变更预算：memory 单动作和 Skill create/patch 各计一单位，reconcile 按子动作计费，读操作不计费，重启或重试不重置。memory 在实际变更事务内原子扣减；Skill 因跨数据库/文件系统而在同一 lifecycle 门内先持久预扣，失败也可能耗费单位，以保证任何文件提交都不会逃逸计费。两种限制共同防止异常模型循环耗尽记忆或 Skill 配额。
 
-持久 session 中未带当前安全 envelope 的 web、browser、memory、knowledge、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
+持久 session 中未带当前安全 envelope 的 web、browser、memory、mcp、session、session_search、search_files、schedule 和 skill 工具结果，在重新进入模型上下文时只在内存中重建不可信边界；assistant tool 参数按工具脱敏，不改写原日志。只有当前 Runtime 生成并标记的 Skill 主指令可以保留受控的低优先级流程语义。
 
 ## 安全变更要求
 

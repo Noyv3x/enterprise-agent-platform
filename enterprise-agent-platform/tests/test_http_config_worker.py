@@ -172,47 +172,6 @@ class HTTPServerBehaviorTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
-    def test_non_numeric_limit_query_returns_400_json_not_500(self):
-        with tempfile.TemporaryDirectory() as td:
-            config = make_config(Path(td))
-            service = EnterpriseService(config, agent_client=RecordingAgent())
-            server, thread = serve_in_thread(config, service)
-            host, port = server.server_address
-            try:
-                token, _ = service.authenticate("admin", "admin")
-                conn = http.client.HTTPConnection(host, port, timeout=5)
-                conn.request(
-                    "GET",
-                    "/api/knowledge/search?q=vpn&limit=not-a-number",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                res = conn.getresponse()
-                body = json.loads(res.read().decode("utf-8"))
-                # A bad ?limit is a client error (400), not an unhandled 500.
-                self.assertEqual(res.status, 400)
-                self.assertEqual(body["error"], "invalid limit parameter")
-                self.assertIn("application/json", res.getheader("Content-Type"))
-
-                # Once query parsing succeeds, the unconfigured strong
-                # dependency is reported explicitly rather than disguised as
-                # an empty local-search result.
-                conn.request(
-                    "GET",
-                    "/api/knowledge/search?q=vpn&limit=3",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                res = conn.getresponse()
-                ok_body = json.loads(res.read().decode("utf-8"))
-                self.assertEqual(res.status, 503)
-                self.assertEqual(
-                    ok_body["code"],
-                    "knowledge_embedding_unconfigured",
-                )
-            finally:
-                server.shutdown()
-                server.server_close()
-                service.close()
-                thread.join(timeout=2)
 
     def test_options_returns_204_and_unimplemented_method_is_json_with_security_headers(self):
         with tempfile.TemporaryDirectory() as td:

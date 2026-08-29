@@ -11,12 +11,7 @@ import type {
   AutoUpdateConfigState,
   Channel,
   ChatMode,
-  FullDocument,
   Id,
-  KnowledgeConfigState,
-  KnowledgeDocument,
-  KnowledgeIndexStatus,
-  KnowledgeSearch,
   MentionTarget,
   Message,
   MessageAudit,
@@ -61,11 +56,6 @@ export interface AppState {
   privateTelegram: PrivateTelegram | null;
   privateTelegramExpanded: boolean;
 
-  /* knowledge slice */
-  documents: KnowledgeDocument[];
-  knowledgeSearch: KnowledgeSearch;
-  selectedDocument: FullDocument | null;
-
   /* admin slice */
   users: User[];
   permissionGroups: PermissionGroup[];
@@ -79,8 +69,6 @@ export interface AppState {
   telegramConfig: TelegramConfigState | null;
   autoUpdateConfig: AutoUpdateConfigState | null;
   brandingConfig: BrandingSnapshot | null;
-  knowledgeConfig: KnowledgeConfigState | null;
-  knowledgeStatus: KnowledgeIndexStatus | null;
   securityConfig: SecurityConfigState | null;
   oauthProviders: OAuthProvidersState | null;
   oauthFlows: Record<string, OAuthFlow>;
@@ -156,11 +144,6 @@ export type ChatSliceState = Pick<
   | "privateTelegramExpanded"
 >;
 
-export type KnowledgeSliceState = Pick<
-  AppState,
-  "documents" | "knowledgeSearch" | "selectedDocument"
->;
-
 export type AdminSliceState = Pick<
   AppState,
   | "users"
@@ -175,8 +158,6 @@ export type AdminSliceState = Pick<
   | "telegramConfig"
   | "autoUpdateConfig"
   | "brandingConfig"
-  | "knowledgeConfig"
-  | "knowledgeStatus"
   | "securityConfig"
   | "oauthProviders"
   | "oauthFlows"
@@ -337,20 +318,6 @@ interface SetPrivateTelegramExpandedAction {
   payload: boolean;
 }
 
-/* knowledge slice */
-interface SetDocumentsAction {
-  type: "SET_DOCUMENTS";
-  payload: KnowledgeDocument[];
-}
-interface SetKnowledgeSearchAction {
-  type: "SET_KNOWLEDGE_SEARCH";
-  payload: KnowledgeSearch;
-}
-interface SetSelectedDocumentAction {
-  type: "SET_SELECTED_DOCUMENT";
-  payload: FullDocument | null;
-}
-
 /* admin slice */
 interface SetUsersAction {
   type: "SET_USERS";
@@ -403,14 +370,6 @@ interface SetAutoUpdateConfigAction {
 interface SetBrandingConfigAction {
   type: "SET_BRANDING_CONFIG";
   payload: BrandingSnapshot | null;
-}
-interface SetKnowledgeConfigAction {
-  type: "SET_KNOWLEDGE_CONFIG";
-  payload: KnowledgeConfigState | null;
-}
-interface SetKnowledgeStatusAction {
-  type: "SET_KNOWLEDGE_STATUS";
-  payload: KnowledgeIndexStatus | null;
 }
 interface SetSecurityConfigAction {
   type: "SET_SECURITY_CONFIG";
@@ -500,10 +459,6 @@ export type Action =
   | RestoreNextFailedSendAction
   | SetPrivateTelegramAction
   | SetPrivateTelegramExpandedAction
-  /* knowledge */
-  | SetDocumentsAction
-  | SetKnowledgeSearchAction
-  | SetSelectedDocumentAction
   /* admin */
   | SetUsersAction
   | SetPermissionGroupsAction
@@ -518,8 +473,6 @@ export type Action =
   | SetTelegramConfigAction
   | SetAutoUpdateConfigAction
   | SetBrandingConfigAction
-  | SetKnowledgeConfigAction
-  | SetKnowledgeStatusAction
   | SetSecurityConfigAction
   | SetOAuthProvidersAction
   | SetOAuthStateAction

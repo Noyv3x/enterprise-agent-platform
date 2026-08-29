@@ -41,7 +41,6 @@ import type {
   ChannelCreateRequest,
   ChannelMessagesResponse,
   ChannelsResponse,
-  CreateDocumentRequest,
   CreateUserRequest,
   DeleteBeforeRequest,
   DeleteClearAllRequest,
@@ -49,14 +48,7 @@ import type {
   DeleteAgentScheduleResponse,
   DeleteAgentMemoryResponse,
   DeleteAgentSkillResponse,
-  DocumentResponse,
-  DocumentsResponse,
   ImpersonateUserResponse,
-  KnowledgeSearchResponse,
-  KnowledgeConfigResponse,
-  KnowledgeConfigUpdateRequest,
-  KnowledgeImportResponse,
-  KnowledgeStatusResponse,
   LoginRequest,
   LoginResponse,
   MailAccountCheckResponse,
@@ -85,10 +77,6 @@ import type {
   SecurityConfigResponse,
   SecurityConfigUpdateRequest,
   SetSecretRequest,
-  SylverPlatformConnectionResponse,
-  SylverPlatformConnectionUpdateRequest,
-  SylverPlatformIdentityPreviewResponse,
-  AdminSylverPlatformConnectionUpdateRequest,
   TelegramConfigResponse,
   TelegramConfigUpdateRequest,
   TokenUsageResponse,
@@ -250,49 +238,6 @@ export const endpoints = {
   checkPrivateMailAccount: ep<void, MailAccountCheckResponse, [Id]>(
     "POST",
     (id) => `/api/private-agent/mail/accounts/${encodeURIComponent(String(id))}/check`,
-  ),
-
-  /* private Agent Sylver Lining platform connection */
-  privateSylverPlatformConnection: ep<void, SylverPlatformConnectionResponse>(
-    "GET",
-    () => "/api/private-agent/integrations/sylver-platform",
-  ),
-  updatePrivateSylverPlatformConnection: ep<
-    SylverPlatformConnectionUpdateRequest,
-    SylverPlatformConnectionResponse
-  >(
-    "PUT",
-    () => "/api/private-agent/integrations/sylver-platform",
-  ),
-  deletePrivateSylverPlatformConnection: ep<void, { ok: true }>(
-    "DELETE",
-    () => "/api/private-agent/integrations/sylver-platform",
-  ),
-
-  /* administrator-managed Sylver Lining connection for one account */
-  adminSylverPlatformConnection: ep<void, SylverPlatformConnectionResponse, [Id]>(
-    "GET",
-    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
-  ),
-  verifyAdminSylverPlatformConnection: ep<
-    SylverPlatformConnectionUpdateRequest,
-    SylverPlatformIdentityPreviewResponse,
-    [Id]
-  >(
-    "POST",
-    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform/verify`,
-  ),
-  updateAdminSylverPlatformConnection: ep<
-    AdminSylverPlatformConnectionUpdateRequest,
-    SylverPlatformConnectionResponse,
-    [Id]
-  >(
-    "PUT",
-    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
-  ),
-  deleteAdminSylverPlatformConnection: ep<void, { ok: true }, [Id]>(
-    "DELETE",
-    (userId) => `/api/admin/users/${encodeURIComponent(String(userId))}/integrations/sylver-platform`,
   ),
 
   /* private Agent schedules */
@@ -460,29 +405,6 @@ export const endpoints = {
     },
   ),
 
-  /* knowledge */
-  knowledgeDocuments: ep<void, DocumentsResponse>("GET", () => "/api/knowledge/documents"),
-  createKnowledgeDocument: ep<CreateDocumentRequest, unknown>(
-    "POST",
-    () => "/api/knowledge/documents",
-  ),
-  importKnowledgeDocuments: ep<FormData, KnowledgeImportResponse>(
-    "POST",
-    () => "/api/knowledge/documents/import",
-  ),
-  knowledgeSearch: ep<void, KnowledgeSearchResponse, [string]>(
-    "GET",
-    (query) => `/api/knowledge/search?q=${encodeURIComponent(query)}`,
-  ),
-  knowledgeDocument: ep<void, DocumentResponse, [Id]>(
-    "GET",
-    (id) => `/api/knowledge/documents/${id}`,
-  ),
-  knowledgeDocumentDownload: ep<void, Blob, [Id]>(
-    "GET",
-    (id) => `/api/knowledge/documents/${id}/download`,
-  ),
-
   /* users + permission groups */
   users: ep<void, UsersResponse>("GET", () => "/api/users"),
   createUser: ep<CreateUserRequest, unknown>("POST", () => "/api/users"),
@@ -583,20 +505,6 @@ export const endpoints = {
     "POST",
     (operation) => `/api/system/auto-update/operations/${encodeURIComponent(operation)}`,
   ),
-  knowledgeConfig: ep<void, KnowledgeConfigResponse>(
-    "GET",
-    () => "/api/system/knowledge/config",
-  ),
-  updateKnowledgeConfig: ep<KnowledgeConfigUpdateRequest, KnowledgeConfigResponse>(
-    "PUT",
-    () => "/api/system/knowledge/config",
-  ),
-  knowledgeStatus: ep<void, KnowledgeStatusResponse>("GET", () => "/api/knowledge/status"),
-  reindexKnowledge: ep<Record<string, never>, unknown>(
-    "POST",
-    () => "/api/system/knowledge/reindex",
-  ),
-
   /* system: oauth */
   oauthProviders: ep<void, OAuthProvidersResponse>(
     "GET",

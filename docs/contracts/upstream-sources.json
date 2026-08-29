@@ -14,17 +14,6 @@
         "rabbitmq",
         "redis"
       ]
-    },
-    "sylver_platform_skill": {
-      "repository_url": "https://github.com/Sylver-Lining/ubitech-platform-skill.git",
-      "tracking_ref": "refs/heads/master",
-      "revision": "43823d1329a5bb5732cafce36376af9503ddc903",
-      "required_paths": [
-        "SKILL.md",
-        "scripts/ubi.py"
-      ],
-      "skill_sha256": "60453dcf5224244808996d0f0accc24d0e566a2a597da4a6f2f1f25b6afaf6cc",
-      "adapter_sha256": "b557381a738769c954e14fcd8e9a165f54cf5310ce2ee0af3138c1db0003e15a"
     }
   }
 }

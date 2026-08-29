@@ -34,7 +34,6 @@ const currentUser: User = {
     "chat",
     "private_agent",
     "manage_channels",
-    "manage_knowledge",
     "manage_users",
     "system_settings",
   ],
@@ -103,6 +102,17 @@ describe("application shell controls", () => {
     await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "false"));
   });
 
+  it("does not use a permission group as the identity subtitle", async () => {
+    const user = userEvent.setup();
+    const { container } = renderShell(<UserMenu />, {
+      user: { ...currentUser, position: "" },
+    });
+
+    expect(container.querySelector(".user__role")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Open user menu" }));
+    expect(screen.queryByText("Administrator")).not.toBeInTheDocument();
+  });
+
   it("opens and dismisses one focus-managed mobile navigation drawer", async () => {
     const user = userEvent.setup();
     const { store } = renderShell(<AppShell />);
@@ -113,6 +123,7 @@ describe("application shell controls", () => {
 
     expect(await screen.findByRole("dialog")).toBeVisible();
     expect(screen.getAllByRole("navigation", { name: "Main navigation" })).toHaveLength(1);
+    expect(screen.queryByRole("menuitem", { name: "Knowledge" })).not.toBeInTheDocument();
     expect(store.getState().sidebarOpen).toBe(true);
 
     await user.keyboard("{Escape}");

@@ -24,7 +24,8 @@ RUN apt-get update \
     && chmod 0440 /etc/sudoers.d/agent-platform \
     && install -d -o 1000 -g 1000 -m 0700 /workspace /opt/agent-env
 COPY containers/agent-sandbox-entrypoint.sh /usr/local/bin/agent-sandbox-entrypoint
-RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint
+COPY containers/agent-sandbox-mcp-client.mjs /usr/local/bin/agent-platform-mcp
+RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint /usr/local/bin/agent-platform-mcp
 ARG SOURCE_COMMIT=unknown
 ARG RELEASE_VERSION=development
 LABEL org.opencontainers.image.title="Agent Platform Sandbox" \

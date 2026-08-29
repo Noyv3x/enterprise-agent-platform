@@ -12,9 +12,6 @@ export const resourceKeys = {
   channels: "channels",
   privateChat: "chat:private",
   channelChat: (channelId: string | number) => `chat:channel:${channelId}`,
-  knowledgeList: "knowledge:list",
-  knowledgeSearch: "knowledge:search",
-  knowledgeDocument: (documentId: string | number) => `knowledge:document:${documentId}`,
   admin: (pageId: string) => `admin:${pageId}`,
 } as const;
 

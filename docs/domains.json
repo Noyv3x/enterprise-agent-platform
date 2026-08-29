@@ -33,6 +33,7 @@
     ],
     "code_exclude": [
       "scripts/tests/**",
+      "containers/agent-sandbox-mcp-client.test.mjs",
       "enterprise-agent-platform/enterprise_agent_platform/static/**",
       "enterprise-agent-platform/frontend/scripts/*.test.mjs",
       "enterprise-agent-platform/frontend/src/**/*.test.ts",
@@ -75,13 +76,10 @@
       "code": [
         ".gitignore",
         ".github/**",
-        "scripts/sync_sylver_platform_skill.py",
         "scripts/python_test_shard.py",
         "scripts/test.sh"
       ],
-      "tests": [
-        "scripts/tests/test_sync_sylver_platform_skill.py"
-      ]
+      "tests": []
     },
     {
       "id": "deployment",
@@ -117,8 +115,7 @@
       "code": [
         "enterprise-agent-platform/enterprise_agent_platform/db.py",
         "containers/compose.yaml",
-        "enterprise-agent-platform/enterprise_agent_platform/knowledge.py",
-        "enterprise-agent-platform/enterprise_agent_platform/knowledge_files.py",
+        "enterprise-agent-platform/enterprise_agent_platform/attachment_previews.py",
         "enterprise-agent-platform/enterprise_agent_platform/memory_security.py",
         "enterprise-agent-platform/enterprise_agent_platform/learning.py",
         "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
@@ -130,10 +127,10 @@
       "tests": [
         "enterprise-agent-platform/tests/test_agent_scopes.py",
         "enterprise-agent-platform/tests/test_memory_session_search.py",
-        "enterprise-agent-platform/tests/test_sylver_platform_migration.py",
         "enterprise-agent-platform/tests/test_learning_review.py",
-        "enterprise-agent-platform/tests/test_knowledge_files.py",
-        "enterprise-agent-platform/tests/test_knowledge_db.py",
+        "enterprise-agent-platform/tests/test_attachment_previews.py",
+        "enterprise-agent-platform/tests/test_database_migration.py",
+        "enterprise-agent-platform/tests/test_db.py",
         "enterprise-agent-platform/agent-runtime/test/session-*.test.ts",
         "enterprise-agent-platform/tests/test_container_data_layout.py"
       ]
@@ -160,6 +157,7 @@
         "enterprise-agent-platform/agent-runtime/src/process-registry.ts",
         "enterprise-agent-platform/agent-runtime/src/server.ts",
         "enterprise-agent-platform/agent-runtime/src/tools.ts",
+        "containers/agent-sandbox-mcp-client.mjs",
         "manager/internal/control/**",
         "manager/internal/driver/**",
         "manager/internal/executor/**",
@@ -171,7 +169,8 @@
         "enterprise-agent-platform/tests/test_oauth_more.py",
         "enterprise-agent-platform/tests/test_agent_scopes.py",
         "enterprise-agent-platform/agent-runtime/test/approval-broker.test.ts",
-        "enterprise-agent-platform/agent-runtime/test/model-resolver.test.ts"
+        "enterprise-agent-platform/agent-runtime/test/model-resolver.test.ts",
+        "containers/agent-sandbox-mcp-client.test.mjs"
       ]
     },
     {
@@ -187,10 +186,9 @@
         "enterprise-agent-platform/enterprise_agent_platform/telegram_gateway.py",
         "enterprise-agent-platform/enterprise_agent_platform/schedules.py",
         "enterprise-agent-platform/enterprise_agent_platform/skills.py",
-        "enterprise-agent-platform/enterprise_agent_platform/sylver_platform_*.py",
         "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
-        "scripts/sync_sylver_platform_skill.py",
         "enterprise-agent-platform/camofox-runtime/**",
+        "containers/agent-sandbox-mcp-client.mjs",
         "containers/compose.yaml",
         "containers/compose.dev.yaml",
         "containers/dev.env.example",
@@ -208,8 +206,8 @@
         "enterprise-agent-platform/tests/test_telegram_gateway_lifecycle.py",
         "enterprise-agent-platform/tests/test_browser_preview.py",
         "enterprise-agent-platform/tests/test_container_data_layout.py",
-        "enterprise-agent-platform/tests/test_sylver_platform*.py",
-        "scripts/tests/test_sync_sylver_platform_skill.py"
+        "enterprise-agent-platform/tests/test_workspace_prompt.py",
+        "containers/agent-sandbox-mcp-client.test.mjs"
       ]
     },
     {
@@ -239,10 +237,12 @@
         "enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
-        "enterprise-agent-platform/enterprise_agent_platform/service.py"
+        "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "containers/agent-sandbox-mcp-client.mjs"
       ],
       "tests": [
-        "enterprise-agent-platform/agent-runtime/test/*.test.ts"
+        "enterprise-agent-platform/agent-runtime/test/*.test.ts",
+        "containers/agent-sandbox-mcp-client.test.mjs"
       ]
     },
     {
@@ -258,7 +258,9 @@
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_platform.py",
-        "enterprise-agent-platform/tests/test_http_config_worker.py"
+        "enterprise-agent-platform/tests/test_http_config_worker.py",
+        "enterprise-agent-platform/tests/test_database_migration.py",
+        "enterprise-agent-platform/tests/test_workspace_prompt.py"
       ]
     }
   ],

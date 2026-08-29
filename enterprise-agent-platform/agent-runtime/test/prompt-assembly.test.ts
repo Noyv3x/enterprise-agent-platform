@@ -53,7 +53,9 @@ test("system prompt assembly orders stable policies, Platform context, and volat
   }));
   const assembled = assembleSystemPrompt(parts);
 
+  assert.ok(parts.stable.indexOf("<response_style>") < parts.stable.indexOf("<execution_discipline>"));
   assert.ok(parts.stable.indexOf("<execution_discipline>") < parts.stable.indexOf("<memory_policy>"));
+  assert.match(parts.stable, /Use plain, natural language, lead with the result/);
   assert.ok(parts.stable.indexOf("<memory_policy>") < parts.stable.indexOf("<skill_policy>"));
   assert.ok(parts.stable.indexOf("<skill_policy>") < parts.stable.indexOf("<scheduled_run_policy>"));
   assert.ok(parts.stable.indexOf("<scheduled_run_policy>") < parts.stable.indexOf("Additional user messages"));

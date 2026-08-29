@@ -7,13 +7,11 @@ import {
   Form,
   Input,
   Space,
-  Tag,
   Typography,
 } from "antd";
 import { useEffect, useId, useMemo, useState } from "react";
 import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
-import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { initials } from "../../utils/format";
 import { EmptyState } from "../common/EmptyState";
@@ -21,7 +19,6 @@ import { Icon } from "../common/Icon";
 import { PageHeader } from "../common/PageHeader";
 import { BrowserNotificationSettings } from "./BrowserNotificationSettings";
 import { MailAccountSettings } from "./MailAccountSettings";
-import { SylverPlatformSettings } from "./SylverPlatformSettings";
 import "./settings.css";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -77,10 +74,9 @@ export function SettingsView() {
     );
   }
 
-  const permissionId = user.permission_group || user.role || "member";
-  const permissionLabel = permissionGroupLabel(t, permissionId, user.permission_group_label);
   const profilePending = pendingOperations.includes("account:profile");
   const passwordPending = pendingOperations.includes("account:password");
+  const identityPosition = user.position?.trim();
   const profileDirty =
     displayName !== (user.display_name || user.username || "") ||
     position !== (user.position || "") ||
@@ -138,14 +134,14 @@ export function SettingsView() {
             <Typography.Text strong>{user.display_name || user.username}</Typography.Text>
             <Typography.Text type="secondary">@{user.username}</Typography.Text>
           </div>
-          <div className="account-identity__meta">
-            <Tag color="blue">{permissionLabel}</Tag>
-            {user.position ? <Typography.Text type="secondary">{user.position}</Typography.Text> : null}
-          </div>
+          {identityPosition ? (
+            <div className="account-identity__meta">
+              <Typography.Text type="secondary">{identityPosition}</Typography.Text>
+            </div>
+          ) : null}
         </Card>
         <BrowserNotificationSettings userId={user.id} />
         <MailAccountSettings />
-        {user.permissions?.includes("private_agent") ? <SylverPlatformSettings /> : null}
         <Card
           className="settings-card"
           classNames={{ body: "settings-card__body" }}

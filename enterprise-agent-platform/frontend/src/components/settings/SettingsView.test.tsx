@@ -18,9 +18,6 @@ const accountActions = vi.hoisted(() => ({
 }));
 
 vi.mock("../../data/accountActions", () => accountActions);
-vi.mock("./SylverPlatformSettings", () => ({
-  SylverPlatformSettings: () => <div>SYLVER_SETTINGS_MARKER</div>,
-}));
 
 const user: User = {
   id: 7,
@@ -54,6 +51,8 @@ describe("SettingsView dirty forms", () => {
 
     const displayName = screen.getByRole("textbox", { name: "Display name" });
     const save = screen.getByRole("button", { name: "Save profile" });
+    expect(screen.getByText("Engineer")).toBeVisible();
+    expect(screen.queryByText("Member")).not.toBeInTheDocument();
     expect(save).toBeDisabled();
 
     await userEventApi.clear(displayName);
@@ -64,30 +63,6 @@ describe("SettingsView dirty forms", () => {
     await userEventApi.type(displayName, "Alice");
     expect(save).toBeDisabled();
     expect(accountActions.updateCurrentUser).not.toHaveBeenCalled();
-  });
-
-  it("shows the private platform connector only to users with private Agent permission", () => {
-    const withoutPermission = createStore(rootReducer, initialAppState);
-    withoutPermission.dispatch({ type: "SET_USER", payload: user });
-    const first = render(
-      <StoreContext.Provider value={withoutPermission}>
-        <I18nProvider><SettingsView /></I18nProvider>
-      </StoreContext.Provider>,
-    );
-    expect(screen.queryByText("SYLVER_SETTINGS_MARKER")).not.toBeInTheDocument();
-    first.unmount();
-
-    const withPermission = createStore(rootReducer, initialAppState);
-    withPermission.dispatch({
-      type: "SET_USER",
-      payload: { ...user, permissions: ["private_agent"] },
-    });
-    render(
-      <StoreContext.Provider value={withPermission}>
-        <I18nProvider><SettingsView /></I18nProvider>
-      </StoreContext.Provider>,
-    );
-    expect(screen.getByText("SYLVER_SETTINGS_MARKER")).toBeVisible();
   });
 
   it("tracks password dirty state and blocks a mismatched confirmation", async () => {

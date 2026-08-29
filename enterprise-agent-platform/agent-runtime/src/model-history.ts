@@ -8,6 +8,7 @@ const LEGACY_ACTION_ENVELOPE_TOOLS = new Set([
   "browser",
   "schedule",
   "mail",
+  // Retired tool: keep old persisted envelopes canonical and redacted.
   "sylver_platform",
 ]);
 
@@ -149,6 +150,7 @@ function omittedActionFields(toolName: string, action: string): ReadonlyArray<re
   if (toolName === "mail" && ["send", "reply"].includes(action)) {
     return [["text_body", "text_body"], ["html_body", "html_body"]];
   }
+  // Retired tool: these fields may still exist in durable session history.
   if (toolName === "sylver_platform") {
     if (action === "create_task") return [["description", "description"]];
     if (action === "start_task") return [["note", "note"]];

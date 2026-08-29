@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 type Service struct {
@@ -16,7 +18,20 @@ type Service struct {
 	Files     FileService
 }
 
-func (s *Service) Audit(request AuditRequest) (AuditReceipt, error) { return s.Audits.Record(request) }
+func (s *Service) Audit(request AuditRequest) (AuditReceipt, error) {
+	presentation, err := projectMCPExecution(request.Details)
+	if err != nil {
+		return AuditReceipt{}, err
+	}
+	if presentation != nil {
+		var args terminalArguments
+		if request.Operation != "terminal" || request.Action != "run" || request.Target != "sandbox" || decodeArguments(request.Arguments, &args) != nil || args.Background {
+			return AuditReceipt{}, errors.New("MCP execution must use a foreground sandbox terminal binding")
+		}
+		request.Details = presentation.Details
+	}
+	return s.Audits.Record(request)
+}
 func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, error) {
 	if call.Action != "run" {
 		return nil, errors.New("terminal action must be run")
@@ -51,6 +66,17 @@ func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
+	presentation, err := projectMCPExecution(record.Details)
+	if err != nil {
+		return nil, err
+	}
+	if presentation != nil {
+		if call.Target != "sandbox" || args.Background {
+			return nil, errors.New("MCP execution must use a foreground sandbox terminal binding")
+		}
+		args.DisplayCommand = presentation.Command
+		args.PrivateOutput = true
+	}
 	if err := s.Audits.Started(call, map[string]any{"operation": record.Operation, "arguments": record.Details}); err != nil {
 		return nil, err
 	}
@@ -61,6 +87,79 @@ func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, erro
 		return nil, runErr
 	}
 	return map[string]any{"result": result}, nil
+}
+
+type mcpExecutionPresentation struct {
+	Command string
+	Details map[string]any
+}
+
+func projectMCPExecution(details map[string]any) (*mcpExecutionPresentation, error) {
+	if details["tool"] != "mcp" {
+		return nil, nil
+	}
+	action, ok := details["action"].(string)
+	if !ok || action != "list" && action != "call" {
+		return nil, errors.New("MCP audit projection has an invalid action")
+	}
+	arguments, ok := details["arguments"].(map[string]any)
+	if !ok {
+		return nil, errors.New("MCP audit projection is missing arguments")
+	}
+	projectedArguments := map[string]any{}
+	command := "MCP " + action
+	if serverValue, present := arguments["server"]; present {
+		server, ok := serverValue.(string)
+		if !ok || !validMCPServerID(server) {
+			return nil, errors.New("MCP audit projection has an invalid server")
+		}
+		projectedArguments["server"] = server
+		command += " server=" + strconv.QuoteToASCII(server)
+	} else if action == "call" {
+		return nil, errors.New("MCP call audit projection is missing server")
+	}
+	if action == "call" {
+		tool, ok := arguments["tool"].(string)
+		if !ok || !validMCPToolName(tool) {
+			return nil, errors.New("MCP call audit projection has an invalid tool")
+		}
+		projectedArguments["tool"] = tool
+		command += " tool=" + strconv.QuoteToASCII(tool)
+	}
+	return &mcpExecutionPresentation{
+		Command: command,
+		Details: map[string]any{"tool": "mcp", "action": action, "arguments": projectedArguments},
+	}, nil
+}
+
+func validMCPServerID(value string) bool {
+	if len(value) < 1 || len(value) > 64 {
+		return false
+	}
+	for index, character := range value {
+		if index == 0 && !(character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9') {
+			return false
+		}
+		if !(character == '_' || character == '-' || character == '.' || character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func validMCPToolName(value string) bool {
+	if !utf8.ValidString(value) || len(value) < 1 || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if character <= 0x1f || character >= 0x7f && character <= 0x9f ||
+			character == 0x00ad || character == 0x061c || character == 0x200b ||
+			character == 0x200e || character == 0x200f || character >= 0x202a && character <= 0x202e ||
+			character >= 0x2060 && character <= 0x2069 || character == 0xfeff {
+			return false
+		}
+	}
+	return true
 }
 func (s *Service) Process(ctx context.Context, call Call) (map[string]any, error) {
 	switch call.Action {

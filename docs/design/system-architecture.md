@@ -52,17 +52,16 @@ Python Platform 容器拥有产品业务状态：
 - 登录、会话签名、账号和服务端权限；
 - 频道、私人消息、附件、审计和 token 用量；
 - Agent scope、消息准入、持久任务、短消息合并和计划任务；
-- 自动记忆、知识库、技能、跨会话搜索、后台学习复盘和邮箱账户；
+- 自动记忆、工作区 Skill 管理、跨会话搜索、后台学习复盘和邮箱账户；
 - OAuth 流程、凭据刷新和可见模型目录；
 - Telegram 与面向 Runtime 的内部业务工具 Gateway。
 - 浏览器预览代理、短期人工接管租约和有界原子指针轨迹；电脑画面所需的工作区文件正文、搜索命中投影与 HTML 呈现页读取；
-- 每用户 Sylver Lining 工作平台连接、远端身份验证、凭据和受控 REST 工具代理。
 
 SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务及 Telegram 投递通过持久任务账本记录；进程重启后，安全可重试的任务可重新排队，已开始副作用的任务进入人工复核。Platform 只接受当前数据库 marker 与精确结构，任何其它非空数据库都在修改前拒绝。由权威业务表可重建的派生索引在启动时单独验证自身契约；只有这类派生对象可以从权威数据原地修复，具体边界见[数据、记忆与会话](data-memory-sessions.md)。Platform 不安装依赖、拉取上游源码、调用 Compose 或拥有服务生命周期。
 
 ## Agent Runtime
 
-Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、结构化 todo、受限并行委派、语义上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具。
+Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、结构化 todo、受限并行委派、语义上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具，并通过 Manager 在当前 Agent Sandbox 调用固定的一次性 stdio MCP 客户端。MCP 清单、Skill 与本地 server 包只存在于该主 Agent 的工作区，不进入中央 Runtime 文件系统。
 
 Runtime 不拥有 Docker socket。terminal、process 和文件工具携带主 Agent sandbox identity 调用管理器的容器内 Unix 控制 socket；管理器确保 Sandbox 存在后执行。显式 `target=host` 的单次调用改由管理器以部署用户执行。具体职责见 [Agent Runtime](agent-runtime.md)，协议见 [Runtime API](../reference/runtime-api.md)。
 
@@ -72,7 +71,7 @@ React 应用随 Platform 镜像发布，由 Python 作为静态资源服务。�
 
 ## 外部能力
 
-Camoufox、SearXNG 和 Firecrawl 是固定受管容器。知识索引属于 Platform 业务能力，只通过管理员配置的 OpenAI-compatible Embeddings API 获取向量，不增加知识容器或本地模型。上游 URL 与 revision 由 canonical 契约锁定，CI 在构建时验证并产出不可变镜像；部署机不保留或更新上游 Git checkout。详见[外部集成](integrations.md)。
+Camoufox、SearXNG 和 Firecrawl 是固定受管容器。工作区 MCP server 由用户自行安装，只继承当前 Agent Sandbox 的权限，不进入受管服务闭集。上游 URL 与 revision 由 canonical 契约锁定，CI 在构建时验证并产出不可变镜像；部署机不保留或更新上游 Git checkout。详见[外部集成](integrations.md)。
 
 ## 关键数据流
 
@@ -111,6 +110,6 @@ Camoufox、SearXNG 和 Firecrawl 是固定受管容器。知识索引属于 Plat
 - Runtime 重启通过幂等记录和会话日志区分可重放结果与 `needs_review`。
 - 管理器重启从 operation journal 和容器 label 对账，不从容器名称猜测状态。
 - 启动只能使用当前技术 profile 和配置根；旧目录、进程名或普通 operation 都不能改变技术身份。
-- 搜索、抓取、浏览器和 Embeddings provider 失败只影响对应能力，不能破坏本地消息和知识原文；知识检索必须报告 disabled/degraded，不能静默改走其它后端。
+- 搜索、抓取、浏览器和工作区 MCP server 失败只影响对应能力，不能破坏本地消息与工作区文件；MCP 失败必须明确返回，不能静默改走其它客户端目录。
 - 邮件轮询和回复通知失败只降级对应集成，不阻断对话；更新维护期间不启动新的邮件副作用或唤醒。
 - Run 空闲、模型轮次和 terminal 默认超时只在 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义；容器与更新状态只在 [`container-platform.json`](../contracts/container-platform.json) 定义。

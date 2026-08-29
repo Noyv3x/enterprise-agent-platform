@@ -582,7 +582,7 @@ class ScheduleServiceTests(unittest.TestCase):
                 admin = service.update_current_user(admin, {"timezone": "Asia/Shanghai"})
                 scope = service.agent_scopes.ensure_private_scope(admin["id"])
                 with mock.patch("enterprise_agent_platform.service.now_ts", return_value=1_700_000_000):
-                    prompt = service._private_system_prompt(admin, scope, [])
+                    prompt = service._private_system_prompt(admin, scope)
                 self.assertIn("当前 UTC 时间: 2023-11-14T22:13:20Z", prompt)
                 self.assertIn('"timezone":"Asia/Shanghai"', prompt)
             finally:

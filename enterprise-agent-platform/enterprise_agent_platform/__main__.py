@@ -45,7 +45,11 @@ def main() -> None:
         run_server(config)
         return
     if cmd == "migrate":
-        version = migrate_database(config.db_path, config.technical_profile)
+        version = migrate_database(
+            config.db_path,
+            config.technical_profile,
+            data_dir=config.data_dir,
+        )
         print(json.dumps({"ok": True, "schema_version": version}))
         return
 

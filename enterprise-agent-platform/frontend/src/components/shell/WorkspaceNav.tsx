@@ -24,7 +24,6 @@ export function WorkspaceNav() {
 
   const specs: NavSpec[] = [];
   if (perms.has("private_agent")) specs.push({ view: "private", label: t("nav.privateAgent"), icon: "bot" });
-  specs.push({ view: "knowledge", label: t("nav.knowledge"), icon: "library" });
 
   const items: MenuProps["items"] = specs.map((spec) => ({
     key: spec.view,

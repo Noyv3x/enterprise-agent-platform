@@ -74,6 +74,7 @@ describe("Ant Design administration surfaces", () => {
     expect(within(navigation).getByRole("menuitem", { name: "Accounts & permissions" }))
       .toHaveClass("eap-menu-item-selected");
     expect(within(navigation).getByText("Agent runtime")).toBeInTheDocument();
+    expect(within(navigation).queryByText("Knowledge embeddings")).not.toBeInTheDocument();
     const switcher = screen.getByText("Administration page").closest(".eap-admin-page-switcher");
     const combobox = screen.getByRole("combobox", { name: "Administration page" });
     const select = combobox.closest(".eap-select");
@@ -146,6 +147,7 @@ describe("Ant Design administration surfaces", () => {
       id: 8,
       username: "morgan",
       display_name: "Morgan Lee",
+      position: "Designer",
       permission_group: "member",
       thinking_depth: "medium",
       active: true,
@@ -154,8 +156,10 @@ describe("Ant Design administration surfaces", () => {
 
     screen.getByRole("button", { name: "Edit" }).click();
 
-    expect(await screen.findByRole("dialog", { name: "Edit morgan" })).toBeInTheDocument();
+    const dialog = await screen.findByRole("dialog", { name: "Edit morgan" });
     expect(screen.getByLabelText("Display name")).toHaveValue("Morgan Lee");
+    expect(within(dialog).getByText("Designer")).toBeVisible();
+    expect(within(dialog).queryByText("Member")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Permission group")).toHaveAttribute("role", "combobox");
     expect(screen.getByLabelText("Account enabled")).toHaveAttribute("role", "switch");
   });

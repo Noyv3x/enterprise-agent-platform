@@ -71,13 +71,6 @@ export function messageFingerprint(message: Message): unknown {
           scheduled_for: message.metadata.scheduled_task.scheduled_for,
         }
       : null,
-    knowledge_suggestions: (message.metadata?.knowledge_suggestions || []).map((item) => ({
-      id: item.id,
-      title: item.title,
-      summary: item.summary || "",
-      source: item.source || "",
-      score: item.score ?? null,
-    })),
     agent_work: work
       ? {
           run_id: work.run_id,

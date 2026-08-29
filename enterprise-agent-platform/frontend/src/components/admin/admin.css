@@ -937,92 +937,6 @@
   width: min(520px, 100vw);
 }
 
-.account-drawer.eap-admin-sylver-drawer {
-  width: min(760px, 100vw) !important;
-}
-
-.eap-admin-sylver-content,
-.eap-admin-sylver-current,
-.eap-admin-sylver-preview {
-  display: grid;
-  gap: 16px;
-  min-width: 0;
-}
-
-.eap-admin-sylver-current,
-.eap-admin-sylver-local,
-.eap-admin-sylver-remote {
-  min-width: 0;
-  padding: 14px;
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-md);
-  background: var(--surface-2);
-}
-
-.eap-admin-sylver-section-heading,
-.eap-admin-sylver-local__identity {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-
-.eap-admin-sylver-section-heading {
-  justify-content: space-between;
-}
-
-.eap-admin-sylver-section-label {
-  display: block;
-  margin-bottom: 10px;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.eap-admin-sylver-local__identity > div:nth-child(2) {
-  display: grid;
-  flex: 1;
-  min-width: 0;
-}
-
-.eap-admin-sylver-local__identity > div:nth-child(2) .eap-typography {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.eap-admin-sylver-identity__url {
-  overflow-wrap: anywhere;
-}
-
-.eap-admin-sylver-current > .eap-btn-dangerous {
-  justify-self: start;
-}
-
-.eap-admin-sylver-token-description {
-  margin-bottom: 12px !important;
-}
-
-.eap-admin-sylver-comparison {
-  display: grid;
-  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
-  gap: 12px;
-  min-width: 0;
-}
-
-.eap-admin-sylver-preview > .eap-btn-primary {
-  justify-self: end;
-}
-
-@media (max-width: 640px) {
-  .eap-admin-sylver-comparison {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .eap-admin-sylver-preview > .eap-btn-primary {
-    width: 100%;
-  }
-}
-
 .eap-admin-account-form .eap-select,
 .eap-admin-model-select .eap-select {
   width: 100%;
@@ -1083,16 +997,6 @@
 
 .eap-lan-access-config > .eap-alert {
   margin-bottom: 12px;
-}
-
-.knowledge-embedding-config > .eap-alert,
-.knowledge-embedding-config__status,
-.knowledge-embedding-config > .eap-progress {
-  margin-bottom: 16px;
-}
-
-.knowledge-embedding-config .eap-input-number {
-  width: 100%;
 }
 
 .eap-admin-page .config-grid,
@@ -1436,10 +1340,4 @@
   .eap-admin-shell .eap-btn {
     min-height: 44px;
   }
-
-  .eap-admin-sylver-drawer .eap-btn,
-  .eap-admin-sylver-drawer .eap-input-affix-wrapper {
-    min-height: 44px;
-  }
-
 }

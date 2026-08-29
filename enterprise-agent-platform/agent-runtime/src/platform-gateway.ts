@@ -1,5 +1,4 @@
 import type { GatewayToolRequest, GatewayToolResponse, JsonObject, RunRequest } from "./types.js";
-import { isSylverPlatformAction, isSylverPlatformMutation } from "./sylver-platform-contract.js";
 import { errorMessage, throwIfAborted } from "./utils.js";
 
 export class PlatformGateway {
@@ -198,20 +197,6 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
       },
     };
   }
-  if (request.tool === "knowledge") {
-    if (request.action === "read") {
-      const documentId = request.arguments.document_id;
-      if (typeof documentId !== "number" || !Number.isSafeInteger(documentId) || documentId <= 0) {
-        throw new Error("knowledge read requires a positive integer document_id");
-      }
-      return { method: "GET", url: `${baseUrl}/api/agent/tools/knowledge/documents/${encodeURIComponent(String(documentId))}` };
-    }
-    if (request.action !== "search") throw new Error("knowledge action must be search or read");
-    const query = new URLSearchParams();
-    if (request.arguments.query !== undefined) query.set("q", String(request.arguments.query));
-    if (request.arguments.limit !== undefined) query.set("limit", String(request.arguments.limit));
-    return { method: "GET", url: `${baseUrl}/api/agent/tools/knowledge/search?${query}` };
-  }
   if (request.tool === "web" && !["search", "extract"].includes(request.action)) {
     throw new Error("web action must be search or extract");
   }
@@ -220,17 +205,6 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
     && !["accounts", "folders", "search", "read", "send", "reply", "move", "mark", "save_attachment"].includes(request.action)
   ) {
     throw new Error("mail action is not supported");
-  }
-  if (request.tool === "sylver_platform") {
-    if (!/^private:[1-9][0-9]*$/.test(request.context.scope_key)) {
-      throw new Error("sylver_platform is available only in a canonical private scope");
-    }
-    if (!isSylverPlatformAction(request.action)) {
-      throw new Error("sylver_platform action is not supported");
-    }
-    if (isSylverPlatformMutation(request.action) && !request.context.tool_call_id) {
-      throw new Error("sylver_platform mutation requires a tool_call_id");
-    }
   }
   return { method: "POST", url: `${baseUrl}/internal/agent/tools/${request.tool}`, body: request as unknown as JsonObject };
 }

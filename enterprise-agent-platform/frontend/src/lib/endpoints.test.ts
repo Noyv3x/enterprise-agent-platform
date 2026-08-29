@@ -12,35 +12,6 @@ describe("Telegram link challenge endpoint", () => {
   });
 });
 
-describe("Sylver Lining platform connection endpoint", () => {
-  it("uses one private connection resource for read, update, and disconnect", () => {
-    expect(endpoints.privateSylverPlatformConnection).toMatchObject({ method: "GET" });
-    expect(endpoints.updatePrivateSylverPlatformConnection).toMatchObject({ method: "PUT" });
-    expect(endpoints.deletePrivateSylverPlatformConnection).toMatchObject({ method: "DELETE" });
-    expect(endpoints.privateSylverPlatformConnection.path()).toBe(
-      "/api/private-agent/integrations/sylver-platform",
-    );
-    expect(endpoints.updatePrivateSylverPlatformConnection.path()).toBe(
-      "/api/private-agent/integrations/sylver-platform",
-    );
-    expect(endpoints.deletePrivateSylverPlatformConnection.path()).toBe(
-      "/api/private-agent/integrations/sylver-platform",
-    );
-  });
-
-  it("uses an account-scoped administrator resource and a separate verification action", () => {
-    const path = "/api/admin/users/user%2F7/integrations/sylver-platform";
-    expect(endpoints.adminSylverPlatformConnection).toMatchObject({ method: "GET" });
-    expect(endpoints.verifyAdminSylverPlatformConnection).toMatchObject({ method: "POST" });
-    expect(endpoints.updateAdminSylverPlatformConnection).toMatchObject({ method: "PUT" });
-    expect(endpoints.deleteAdminSylverPlatformConnection).toMatchObject({ method: "DELETE" });
-    expect(endpoints.adminSylverPlatformConnection.path("user/7")).toBe(path);
-    expect(endpoints.verifyAdminSylverPlatformConnection.path("user/7")).toBe(`${path}/verify`);
-    expect(endpoints.updateAdminSylverPlatformConnection.path("user/7")).toBe(path);
-    expect(endpoints.deleteAdminSylverPlatformConnection.path("user/7")).toBe(path);
-  });
-});
-
 describe("channel message withdrawal endpoint", () => {
   it("uses the author-scoped channel message resource", () => {
     expect(endpoints.withdrawChannelMessage).toMatchObject({ method: "DELETE" });
@@ -56,30 +27,6 @@ describe("Agent runtime configuration endpoint", () => {
     expect(endpoints.updateAgentRuntimeConfig).toMatchObject({ method: "PUT" });
     expect(endpoints.agentRuntimeConfig.path()).toBe("/api/system/agent-runtime/config");
     expect(endpoints.updateAgentRuntimeConfig.path()).toBe("/api/system/agent-runtime/config");
-  });
-});
-
-describe("knowledge embeddings administration endpoints", () => {
-  it("uses the platform-owned config, status, and rebuild resources", () => {
-    expect(endpoints.knowledgeConfig).toMatchObject({ method: "GET" });
-    expect(endpoints.updateKnowledgeConfig).toMatchObject({ method: "PUT" });
-    expect(endpoints.knowledgeStatus).toMatchObject({ method: "GET" });
-    expect(endpoints.reindexKnowledge).toMatchObject({ method: "POST" });
-    expect(endpoints.knowledgeConfig.path()).toBe("/api/system/knowledge/config");
-    expect(endpoints.updateKnowledgeConfig.path()).toBe("/api/system/knowledge/config");
-    expect(endpoints.knowledgeStatus.path()).toBe("/api/knowledge/status");
-    expect(endpoints.reindexKnowledge.path()).toBe("/api/system/knowledge/reindex");
-  });
-});
-
-describe("knowledge document file endpoints", () => {
-  it("uses multipart import and stable original download paths", () => {
-    expect(endpoints.importKnowledgeDocuments).toMatchObject({ method: "POST" });
-    expect(endpoints.importKnowledgeDocuments.path()).toBe("/api/knowledge/documents/import");
-    expect(endpoints.knowledgeDocumentDownload).toMatchObject({ method: "GET" });
-    expect(endpoints.knowledgeDocumentDownload.path(42)).toBe(
-      "/api/knowledge/documents/42/download",
-    );
   });
 });
 

@@ -4,7 +4,7 @@
 
 ## 数据所有者
 
-Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元数据、token 用量、Agent scope、记忆、知识、设置、Telegram、邮箱、持久任务和计划任务的权威存储。Runtime 的 JSONL 文件只保存模型会话和工具历史，不替代产品消息库。
+Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元数据、token 用量、Agent scope、记忆、设置、Telegram、邮箱、持久任务和计划任务的权威存储。Runtime 的 JSONL 文件只保存模型会话和工具历史，不替代产品消息库。用户 Skill、MCP 清单与本地 MCP 包属于各主 Agent 的工作区文件，不另存一份数据库配置。
 
 主要数据组如下：
 
@@ -12,13 +12,10 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 - `agent_scopes`、`agent_runtime_scopes`、`agent_runtime_scope_sessions`；
 - `durable_jobs`、`agent_run_inputs`；
 - `agent_memories` 及其 FTS；
-- `knowledge_documents`、`knowledge_document_files`、`knowledge_chunks`、`knowledge_index_generations`、`knowledge_document_index` 与 `knowledge_chunk_embeddings`；
 - `agent_schedules`、`agent_schedule_runs`；
-- `mail_accounts`、`mail_account_credentials`、`sylver_platform_connections`、`sylver_platform_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
+- `mail_accounts`、`mail_account_credentials`、`settings`、`token_usage_events`、Telegram 与外部身份表。
 
 数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
-
-Sylver Lining 连接以本地用户 ID 为主键；连接行保存规范 base URL、已验证的远端身份投影和验证时间，独立凭据行只保存 Token。相同 origin 与远端用户身份不能同时绑定多个本地用户。用户本人和管理员代目标账号执行的变更共享同一个 owner 串行边界；删除本地用户或任一入口断开连接时凭据级联删除。Token 不进入 Runtime session、消息、workspace、Skill、备份清单或任何派生索引。
 
 短期登录失败窗口属于 Platform 安全状态，使用 session secret 派生的不可逆主体标识保存在 secret 设置行，并随当前 SQLite 一起备份、更新和恢复。它只保留当前窗口内的有界时间戳，不保存明文用户名、客户端地址或密码；成功登录、窗口过期和容量回收按认证策略清理相应桶。浏览器登录 Cookie 是 HMAC 签名的瞬时认证状态，不写入用户表或 Runtime JSONL；其 TTL、`Max-Age` 与活动续期见[安全与信任边界](security-and-trust.md)。Platform 重启只要沿用已持久化的 session secret，就不会使未到期且未被吊销的登录失效。listen host/port 不是 Platform 设置行；产品 secret 读取也不把进程环境当作第二份库。
 
@@ -44,7 +41,7 @@ Codex 供应商的 `prompt_cache_key` 是每次请求临时派生的缓存路由
 
 产品消息用于界面、审计、Telegram 投递、跨会话搜索和回复关联。Runtime 会话用于模型上下文、工具调用配对和压缩恢复。两者用 source message、Run、scope、lifecycle 和 session 元数据关联，但任何一方都不能通过模糊文本推断另一方身份。
 
-界面的 `/compact` 是当前 Runtime session 的本地控制操作，不写入产品消息库，也不作为用户消息追加到 Runtime journal。它只把可安全省略的活动 journal 条目归档并原子改写当前上下文；Runtime 生成的上下文提示由 entry 顶层结构化标记区分，正文相同但没有该标记的真实用户消息仍必须归档。archive、产品消息、附件、记忆、知识和 workspace 均不删除，因此压缩前历史仍可通过 `session` 或 `session_search` 找回。
+界面的 `/compact` 是当前 Runtime session 的本地控制操作，不写入产品消息库，也不作为用户消息追加到 Runtime journal。它只把可安全省略的活动 journal 条目归档并原子改写当前上下文；Runtime 生成的上下文提示由 entry 顶层结构化标记区分，正文相同但没有该标记的真实用户消息仍必须归档。archive、产品消息、附件、记忆和 workspace 均不删除，因此压缩前历史仍可通过 `session` 或 `session_search` 找回。
 
 持久 Runtime 会话中的 assistant tool call 是下一轮模型会直接看到的协议样例，因此其参数必须始终保持当前工具 schema 的规范形状。敏感正文只可在 schema 允许的位置替换为有界且符合字段约束的占位符；受正则、枚举或路径规则约束的标识符不能使用破坏约束的通用展示占位符。允许任意 JSON 的字段还必须限制投影深度、条目数、节点数和单字符串字节数。审计专用的 `tool` 名称、展示 envelope、拒绝原因或其它 schema 外字段不得写回模型历史。工具活动 journal 可以使用独立的展示对象，不能与模型历史共用同一个序列化函数。读取既有会话时，Runtime 在不改写 JSONL 的前提下把历史展示 envelope 归一为规范参数后再交给模型；未知字段和身份字段仍失败关闭，不能借归一化扩大工具权限。
 
@@ -62,7 +59,7 @@ Runtime 为本次实际调用的模型按 `provider + model + scope_key` 临时�
 
 每个 Runtime session 还有两个同目录、owner-only、原子替换且彼此 schema 独立的 Runtime 状态 sidecar：一个承载 Agent 自用 todo 清单，另一个承载有明确终点的后台进程责任。两者都绑定精确 scope、lifecycle 和 session，不能由 Platform history seed、用户正文或模型摘要直接创建；读取时必须拒绝符号链接、硬链接、错误 owner、宽松权限、未知字段、损坏 JSON 和身份漂移，scope/session 清理会与 JSONL、archive 一并删除。
 
-todo 工具结果写入 JSONL 供模型和审计查看，但权威状态以 todo sidecar 为准。该状态不是产品业务任务、长期记忆或共享知识，不进入管理员记忆列表；压缩和 Runtime 重启后只把 `pending/in_progress` 项重新注入活动上下文。普通 Run 因活动项进入 `needs_review` 时不得删除或伪造完成这些项；后续同 session Run 从 sidecar 恢复它们，全部完成或明确取消后才可正常终结。
+todo 工具结果写入 JSONL 供模型和审计查看，但权威状态以 todo sidecar 为准。该状态不是产品业务任务、长期记忆或共享资料，不进入管理员记忆列表；压缩和 Runtime 重启后只把 `pending/in_progress` 项重新注入活动上下文。普通 Run 因活动项进入 `needs_review` 时不得删除或伪造完成这些项；后续同 session Run 从 sidecar 恢复它们，全部完成或明确取消后才可正常终结。
 
 后台进程责任 sidecar 只保存 Manager 返回的 process id、规范 target 与登记/更新时间，不保存命令、输出或模型文本。默认 `background_kind=task` 的成功 terminal 调用必须先登记责任；只有相同 session 以匹配 id 与 target 调用 `process.wait|read|kill` 并观察到权威 `completed|failed|cancelled` 才原子解除。超时、`running`、`orphaned`、Run 终止和 Runtime 重启都保留责任；显式 `background_kind=service` 不登记。活动责任以可信 Runtime 段注入后续 Run，并在有界延续耗尽时强制 `needs_review`。存储或身份校验失败必须失败关闭，不能用空状态继续。
 
@@ -91,7 +88,7 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 - `memory`：属于一个 Agent scope 的事实、规则与工作偏好；
 - `user`：该 Agent scope 对当前用户资料的长期认识。
 
-两个 target 只是同一 Agent 内的语义分区，不是共享层；它们都以完整 `scope_key` 作为首要所有权边界。任何查询、召回、人工维护和回复后复盘都只能读取或修改当前 Agent scope 的记录，即使另一 Agent 面向同一用户，也不能读取前者的 `memory` 或 `user` target。跨 Agent、面向全体的公共资料只属于知识库，不能通过省略、替换或弱化 memory scope 构造共享记忆。
+两个 target 只是同一 Agent 内的语义分区，不是共享层；它们都以完整 `scope_key` 作为首要所有权边界。任何查询、召回、人工维护和回复后复盘都只能读取或修改当前 Agent scope 的记录，即使另一 Agent 面向同一用户，也不能读取前者的 `memory` 或 `user` target。跨 Agent 资料必须进入用户明确选择的外部系统或频道文件，不能通过省略、替换或弱化 memory scope 构造共享记忆。
 
 每条记忆包含 tags、来源类型、source Run、source message、内容 hash 和时间。当前写入来源只能是 `manual` 或 `automatic`。所有权和是否允许自动写入从可信 Run context 派生；模型参数不能覆盖 owner 或把 unattended/channel/delegated Run 提升为可写。写入有配额、长度、注入扫描和去重约束，精确限制由代码契约和测试维护。
 
@@ -113,23 +110,11 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 `session` 搜索当前 Runtime session 的活动 JSONL 和 archive，适合找回压缩前的工具历史。`session_search` 搜索平台产品消息，可列出 session、全文搜索并读取指定 session；只有带当前 `session_id` 元数据或可由当前 reply 关系明确归属到该 session 的消息才进入索引，不为缺少会话来源的行合成兼容 session。只有规范个人 AI 与频道主 Agent 可以使用，响应有统一字符预算。
 
-知识库与记忆是不同数据域：知识文档由管理员/有权限成员管理，是全体 Agent 可检索的公共知识层；两个记忆 target 都属于单一 Agent scope，不能互相冒充来源，也不能用记忆承载跨 Agent 共享知识。
-
-`knowledge_documents` 中的规范文本是检索、阅读和重建索引的权威来源；文件导入另以一对一的 `knowledge_document_files` 行保存不可变原件、规范文件名、媒体类型、字节数和 SHA-256，供用户下载与审计。两者与索引状态位于同一 SQLite 事务/备份边界，派生块不重新解析原件。Platform 使用稳定 content hash 和版本化分块器生成带文档 ID、字符偏移、标题路径与 chunk hash 的派生块，再通过管理员配置的 OpenAI-compatible Embeddings API 批量生成向量。向量维度从首个合法响应锁定或与显式配置精确比对；数量、顺序、数值、维度或响应大小不合法时整批失败。
-
-文件导入接受一次最多十个文件，每个不超过 50 MiB、请求总量不超过 100 MiB。当前格式闭集为 TXT、Markdown、CSV、JSON、HTML、PDF、DOCX、XLSX、PPTX 与 ODT；扩展名、声明媒体类型和容器签名必须相容。纯文本按明确编码解码，HTML 删除脚本/样式后保留可见结构，JSON 规范化，Office/OpenDocument 在有界 ZIP 条目数与解压字节预算内读取，PDF 只提取已有文本层。加密文件、损坏容器、扫描件/无文本 PDF、旧二进制 Office 格式、超大压缩包或提取后空正文全部明确拒绝，不运行宏、外链、公式、嵌入对象或 OCR。整批先完成验证与提取，再在一个事务中写入；任一文件失败时整批不产生知识条目。
-
-文件下载优先逐字节返回保存的原件，并使用原媒体类型、同源鉴权和安全 `Content-Disposition`；手工创建的条目导出为 UTF-8 Markdown。下载不触发重新提取、索引或 provider 调用。列表与正文 API 只返回文件元数据，不把原件 BLOB 塞入 JSON。
-
-聊天附件原件和附件元数据仍属于消息 scope。成功回复可以把 `.html` / `.htm` 作为 `MEDIA: /workspace/<relative-path>` 交付物保存为普通附件；聊天卡片不为 HTML 生成 Office/PDF 那种预览 JSON，电脑画面需要时再按附件 id 或工作区相对路径即时读取单页 HTML。XLSX、DOCX、PPTX 与 PDF 预览都是从已授权附件原件即时生成的有界派生 JSON，不单独持久化，也不进入知识索引、模型上下文或备份清单。XLSX 只读取有限数量的工作表、行、列、单元格和字符串；DOCX 只读取有限段落；PPTX 只读取有限幻灯片及其可见文本；PDF 只读取有限页的已有文本层，不进行 OCR。响应带 `kind`，并明确标记截断。扫描件或无文本 PDF、损坏容器和加密文档返回预览失败，不修改附件，不改变下载语义。
-
-索引以 generation 构建：文档与待摄取 job 同事务落库，job 只引用 `document_id + expected_hash + generation_id`，不复制原文。worker 重新读取权威文档，在完整写入所有块与向量时再原子标记该文档 ready；只有覆盖全部当前文档的 ready generation 可原子切为 active。配置或模型变化时在 shadow generation 重建，不让半成品混入查询。
-
-检索只走 active generation 的查询向量与 cosine 相似度，然后按文档限额去重并在字符预算内返回邻接证据；结果始终包含可读的数字 `document_id`、稳定 `chunk_id`、来源偏移和 score。不存在 FTS、`LIKE`、第二检索后端或静默回退。缺少 API key 时知识库标记为 disabled；创建、重建和显式检索返回可诊断错误，文档列表/原文仍可用于配置与恢复。顶层 Run 的被动建议在未配置或 provider 短暂失败时 fail-open 并记录 degraded，不得返回伪装成“无命中”的空结果。
+聊天附件原件和附件元数据仍属于消息 scope。成功回复可以把 `.html` / `.htm` 作为 `MEDIA: /workspace/<relative-path>` 交付物保存为普通附件；聊天卡片不为 HTML 生成 Office/PDF 那种预览 JSON，电脑画面需要时再按附件 id 或工作区相对路径即时读取单页 HTML。XLSX、DOCX、PPTX 与 PDF 预览都是从已授权附件原件即时生成的有界派生 JSON，不单独持久化，也不进入模型上下文或备份清单。XLSX 只读取有限数量的工作表、行、列、单元格和字符串；DOCX 只读取有限段落；PPTX 只读取有限幻灯片及其可见文本；PDF 只读取有限页的已有文本层，不进行 OCR。响应带 `kind`，并明确标记截断。扫描件或无文本 PDF、损坏容器和加密文档返回预览失败，不修改附件，不改变下载语义。
 
 ## 技能数据
 
-用户技能存放在 `agent-skills/<scope-hash>/`，scope key 不直接出现在路径中。每个包以 `SKILL.md` 为可移植主体，`.skill.json` 只保存平台生命周期状态；支持文件只能位于 `references`、`templates`、`scripts` 和 `assets`。
+用户技能存放在当前主 Agent 工作区的 `.agent-platform/skills/<skill-id>/`。包内只有 `SKILL.md` 和 `references`、`templates`、`scripts`、`assets` 中的可移植支持文件；workspace 不承载授权 sidecar。从其它客户端安装流程重定向而来的合法包首次扫描后，Platform 在不向 Sandbox 挂载的 `agent-skill-state/<scope-hash>/` 原子补齐 `user-owned + active + enabled` 状态。Skill 列表与正文读取直接访问 workspace，因此保存后下一次工具调用即可看到；Run 开始时提供给模型的有界索引只在下一 Run 重建。
 
 仓库内 bundled skills 是全局只读层。用户显式创建的 Skill 可用相同 id 或不区分大小写的名称遮蔽预置版本，升级不能覆盖用户文件；后台复盘以 `created_by=agent` 创建时必须同时避开 bundled id 和名称，不能在免审批路径中静默替换预置工作流。
 
@@ -139,16 +124,20 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 
 bundled skill 中需要在 workspace 保存脚本、计划或中间文件的示例必须使用 `.agent-platform/`。Skill 不提供双路径回退，也不根据管理员品牌选择路径。
 
-每个 scope 还保存 owner-only、原子写入的 `.skill-usage.json`。状态以不可变 skill id 为键，记录 `created_by=user|agent`、使用/patch 次数和时间、`active|stale|archived`、pin 与归档时间。既有技能缺少状态时必须安全解释为 `user + active`，自动流程不能因此取得维护权。普通界面或前台 Run 创建的 Skill 都是 user-owned；只有通过可信 `agent_learning_review` context 创建的 Skill 才标记为 agent-owned，模型参数不能声明来源。
+`agent-skill-state/<scope-hash>/` 的 owner-only 原子状态以不可变 skill id 为键，记录 enabled、时间、`created_by=user|agent`、使用/patch 次数、`active|stale|archived`、pin 与归档时间。workspace 中的 `.skill.json`、`.skill-usage.json` 或同 UID 权限位不得参与授权判定。既有技能缺少私有状态时必须安全解释为 `user + active`，自动流程不能因此取得维护权。普通界面或前台 Run 创建的 Skill 都是 user-owned；只有通过可信 `agent_learning_review` context 创建的 Skill 才标记为 agent-owned，模型参数不能声明来源。
+
+MCP 清单固定为 `.agent-platform/mcp.json`，本地 server 文件固定为 `.agent-platform/mcp/<server-id>/`。清单是当前主 Agent 的普通持久工作区数据，不写入 SQLite、Runtime session 或全局配置；`mcp.list/call` 每次重新读取并校验，所以保存后无需重启。每个调用启动一次短命 stdio server 并在结果后退出，不保存跨 Run 连接状态。用户自行写入清单的环境值随工作区备份；平台不得把它投影到提示词、消息、工作记录或其它 Agent。
 
 `skill.patch` 对 `SKILL.md` 或一个支持文件执行精确字符串替换，调用方声明期望替换次数；不使用模糊匹配。目标正文在 scope lock 内通过单文件原子替换提交，主指令完成后重新解析 frontmatter、检查配额并执行提示词注入扫描。patch 不改变 `created_by/state/pinned/enabled` 等授权字段；`.skill.json.updated_at` 与 usage 的 patch 时间/次数只是非授权 telemetry，存储异常后的尽力回滚失败可使其滞后，调用方收到失败时必须重新读取目标正文确认结果，不能盲目重放。所有可变 Skill 写入口（create、完整 update、精确 patch 和 support write）还必须拒绝高置信明文凭据，包括真实 token/PAT、完整 PEM 私钥和带实际值的 Bearer 凭据；普通认证说明、占位符和不含密钥正文的格式示例不得仅因出现相关术语而被拒绝。`skill.load` 记录实际使用；patch 记录维护活动。后台复盘的 `list/load/read` 必须持有 lifecycle/review 串行门，并在覆盖最终授权复验、Skill 文件读取和 read-ledger 登记的同一个 `BEGIN IMMEDIATE` 边界内完成；它们不扣变更预算，但旧 lifecycle、撤权账号或终态 job 不得读取当前 Skill。后台复盘只能创建 Skill，或在本次 Run 已 load/read 后 patch 未 pin、未归档且由后台复盘创建的 Skill；bundled、user-owned、pinned 和 archived Skill 永远不能被自动修改。后台复盘的 create 和 patch 都不能使用一个独立的“先检查”结果授权；Platform 必须先持有 lifecycle/review 串行门，在一个保持到文件提交结束的 `BEGIN IMMEDIATE` 事务内重验当前 scope、账号、权限、来源消息和 running job，再进入 Skill scope lock 完成包创建或精确 patch，使撤权、lifecycle 轮换或删除/重建都不能在验证与写入之间穿越。对自动 patch，该 scope lock 内还必须重新读取当前包和 usage 状态，验证 `created_by=agent + active + unpinned`并随即完成替换。自动 patch 还必须在提交前以当前不可变 package id 和重新解析后的 frontmatter name 复核 bundled 冲突；无论目标事后曾被用户改名，还是本次 patch 企图改名，都不得在免审批路径中遮蔽 bundled Skill。自动复盘不删除、禁用或物理移动 Skill，也不执行 Skill 中的 shell。长期清理只允许未来的确定性 curator 对 agent-owned 状态做可恢复的逻辑 stale/archive，不能自动永久删除。
 
 ## 备份与迁移
 
-备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、agent-skills、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。知识规范文本、导入原件、分块、索引状态与 active generation 位于同一 SQLite 恢复点；向量可由规范文本重建，但恢复后不得把未完整 generation 标记为 active。
+备份必须把 `platform.db`、SQLite sidecar、attachments、workspaces、agent-envs、`agent-skill-state`、`runtimes/agent` 和 Manager generation 状态视为同一恢复点。复制活动数据库前应使用 SQLite 在线备份或先停止服务；直接只复制主数据库文件可能遗漏 WAL 中的数据。工作区备份自然包含每个 Agent 的 Skill、MCP 清单、本地 server 包及用户自行保存的 MCP 凭据，恢复时不能把一个 workspace 配到另一个 scope。
 
 Manager operation journal 是容器 generation、维护预约和更新恢复的唯一编排状态。Platform 只能按匹配 operation id 建立或释放进程内准入门，不能从数据库、容器状态或文件是否消失推断 Manager operation 已完成。
 
-数据库 schema version 单调递增。本次发布只支持从直接前一 baseline `2026080602` 到当前 baseline `2026080801` 的精确迁移：完整保留既有业务数据与结构，并原子新增初始为空的 `sylver_platform_connections` 和 `sylver_platform_credentials`。迁移只在 Manager 已停止 current writer 且快照完成后执行，DDL、marker 更新、外键与精确结构验证位于同一事务。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
+数据库 schema version 单调递增。本次发布只支持从直接前一 baseline `2026080801` 到当前 baseline `2026082901` 的精确迁移。发布管理器先停止 current writer 并创建可回滚快照；迁移随后删除已经退役的六张知识表、两张原生 Sylver 连接/凭据表、知识设置与残留知识索引任务。旧版 `agent-skills/<scope-hash>/<skill-id>/` 必须完整原样保留为前一 generation 的回滚数据：迁移只把 `SKILL.md` 与允许的支持目录复制到对应 workspace 的 `.agent-platform/skills/<skill-id>/`，并把 `.skill.json` 与 scope 根 `.skill-usage.json` 规范化复制到不向 Agent 挂载的 `agent-skill-state/<scope-hash>/`；当前版本不再双读旧目录。知识与原生 Sylver 数据不转入 MCP，因为平台无法替用户选择或安装第三方集成；需要保留时应在升级前从快照或旧版本导出。
+
+Skill 文件复制前必须一次性规划全部旧 scope，并从数据库的规范 scope type/id 推导唯一 workspace：未知 scope、非规范 scope key/workspace、重复目标、符号链接路径组件、硬链接或特殊文件、未知根项、缺失私有状态和任意目标差异/额外项都在创建目录、执行 DDL 或更新 marker 前失败关闭。没有旧 source 的 scope 不检查或改写已经存在的 canonical Skill 目录。缺失目标通过同父 staging 写入，逐文件和目录持久化后原子发布；已存在目标只在完整树、字节和权限精确一致时视为幂等成功，不合并、不覆盖。apply 阶段必须重新从固定的 data/workspaces fd 逐段 no-follow 打开并保持 workspace、`.agent-platform`、protected state parent 与 staging fd；创建、写入、持久化、`renameat2(RENAME_NOREPLACE)`、目标身份读取和最终复核只使用这些 fd，不得重新解析预检时的 Path。staging 清理只能在同父名称仍匹配固定 inode 时执行 no-follow fd 递归；任一替换、未知类型或身份漂移都保留证据并失败关闭，不能用路径递归删除。protected sidecar 在目标包发布或确认后写入该包的 `device/inode/ctime` 身份，避免同 id 重建继承旧的 agent-owned 权限。全部文件目标耐久后，DDL、marker 更新、外键与精确结构验证才进入单一数据库事务；事务失败保留旧 source 与已发布的精确目标，重试只能按相同内容幂等收敛。回滚恢复前一 generation 的数据库快照后，旧 Platform 仍从未改动的 `agent-skills` 读取。普通启动仍只接受当前 baseline，不扫描旧源码布局、不猜测结构。校验覆盖精确的业务表/列集合、关键 CHECK、索引、唯一约束与外键；任何其它来源 marker、未知业务表、额外列或缺失结构都拒绝。
 
 未来数据格式变更必须先更新文档、schema version 和迁移测试；只支持当次发布明确声明的直接来源，不扫描其它产品目录或猜测未声明布局。

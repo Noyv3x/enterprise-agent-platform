@@ -36,13 +36,6 @@ const GUIDE_ITEMS: ReadonlyArray<{
     descriptionKey: "personalAi.guide.web.description",
     promptKey: "personalAi.guide.web.prompt",
   },
-  {
-    id: "sylver",
-    icon: "link",
-    titleKey: "personalAi.guide.sylver.title",
-    descriptionKey: "personalAi.guide.sylver.description",
-    promptKey: "personalAi.guide.sylver.prompt",
-  },
 ];
 
 export function PersonalAiGuideDialog({ onDraftFilled }: { onDraftFilled: () => void }) {

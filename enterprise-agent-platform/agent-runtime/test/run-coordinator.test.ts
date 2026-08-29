@@ -58,6 +58,7 @@ test("unmarked imported session tool results are framed without changing current
     ["web", "web"],
     ["browser", "browser"],
     ["memory", "memory"],
+    ["mcp", "mcp"],
     ["knowledge", "knowledge"],
     ["session", "session"],
     ["session_search", "session_search"],
@@ -523,7 +524,8 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
     assert.match(rootPrompt, /take the concrete action before claiming it has started or completed/);
     assert.match(rootPrompt, /collapsing unrelated work into an ad-hoc script/);
     assert.match(rootPrompt, /Both memory targets are isolated to this Agent scope/);
-    assert.match(rootPrompt, /shared knowledge belongs in the platform knowledge base/);
+    assert.match(rootPrompt, /<response_style>/);
+    assert.match(rootPrompt, /lead with the result/);
     assert.match(rootPrompt, /"id":"code-review"/);
     assert.match(rootPrompt, /\\u003c\/available_skills\\u003e/);
     assert.doesNotMatch(rootPrompt, /unloaded secret instructions/);
@@ -2110,27 +2112,36 @@ test("unattended scheduled runs reject sensitive tools immediately without reque
   }
 });
 
-test("unattended runs reject sylver_platform mutations before approval or gateway dispatch", async () => {
-  const home = await temporaryDirectory("agent-sylver-unattended-");
-  const workspace = await temporaryDirectory("agent-sylver-unattended-workspace-");
+test("unattended runs reject MCP calls before approval or Manager execution", async () => {
+  const home = await temporaryDirectory("agent-mcp-unattended-");
+  const workspace = await temporaryDirectory("agent-mcp-unattended-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(
-      fauxToolCall("sylver_platform", {
-        action: "start_task",
-        arguments: { task_id: 17, note: "Starting task" },
+      fauxToolCall("mcp", {
+        action: "call",
+        server: "local",
+        tool: "change_task",
+        arguments: { task_id: 17 },
       }),
       { stopReason: "toolUse" },
     ),
     fauxAssistantMessage("The external task was not changed."),
   ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  coordinator.gateway.invoke = async () => assert.fail("unattended mutation must not reach the platform gateway");
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+    executor: fakeExecutionManager({
+      async terminal() {
+        return assert.fail("unattended MCP call must not reach Manager execution");
+      },
+    }),
+  });
   try {
     const run = coordinator.createRun({
       scope_key: "private:1",
       lifecycle_id: "life",
-      session_id: "scheduled-sylver",
+      session_id: "scheduled-mcp",
       workspace,
       system_prompt: "You are an Agent.",
       input: "start the external task",
@@ -2144,7 +2155,7 @@ test("unattended runs reject sylver_platform mutations before approval or gatewa
     const failed = events.find((event) => event.type === "tool.failed");
     assert.ok(failed);
     assert.equal(failed.data.unattended_authorization_required, true);
-    assert.match(String(failed.data.reason), /cannot modify the Sylver Lining platform/);
+    assert.match(String(failed.data.reason), /cannot call MCP tools/);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

@@ -59,19 +59,11 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
         text_body: secret,
       },
     }],
-    ["sylver_platform", {
-      tool: "sylver_platform",
-      action: "propose_wiki",
-      arguments: {
-        project_slug: "platform",
-        title: "Security notes",
-        slug: "security-notes",
-        content: secret,
-        source_document_id: "platform/security-notes",
-        content_format: "markdown",
-        order: 0,
-        change_summary: secret,
-      },
+    ["mcp", {
+      action: "call",
+      server: "example",
+      tool: "remember",
+      arguments: { token: secret, value: "safe" },
     }],
     ["delegate_task", { prompt: secret }],
     ["delegate_task", {
@@ -117,18 +109,18 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
     },
     "audit display keeps its explicit tool envelope",
   );
-  assert.deepEqual(
-    redactToolArgumentsForJournal("sylver_platform", {
-      action: "comment_approval",
-      arguments: { approval_id: 7, body: "private comment" },
-    }),
-    {
-      tool: "sylver_platform",
-      action: "comment_approval",
-      arguments: { approval_id: 7, body: "private comment" },
+  const retired = redactToolArgumentsForModelHistory("sylver_platform", {
+    tool: "sylver_platform",
+    action: "propose_wiki",
+    arguments: {
+      project_slug: "platform",
+      content: secret,
+      change_summary: secret,
+      discussion_ref: secret,
     },
-    "Sylver Lining approval display keeps the complete short mutation body",
-  );
+  });
+  assert.doesNotMatch(JSON.stringify(retired), new RegExp(secret));
+  assert.match(JSON.stringify(retired), /content omitted/);
   const delegatedAudit = redactToolArgumentsForJournal("delegate_task", {
     tasks: [
       { prompt: `${secret}-one` },

@@ -17,7 +17,7 @@ describe("messageFingerprintKey", () => {
     expect(after).not.toBe(before);
   });
 
-  it("observes streaming flags and knowledge suggestion details", () => {
+  it("observes streaming flags", () => {
     const streaming = messageFingerprintKey({
       ...base,
       metadata: { streaming: true },
@@ -26,9 +26,6 @@ describe("messageFingerprintKey", () => {
       ...base,
       metadata: {
         streaming: false,
-        knowledge_suggestions: [
-          { id: 3, title: "Runbook", summary: "Updated summary", source: "knowledge" },
-        ],
       },
     });
     expect(complete).not.toBe(streaming);

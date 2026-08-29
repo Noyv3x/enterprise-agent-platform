@@ -1,6 +1,6 @@
 # 外部集成
 
-本文定义平台与模型 OAuth、Knowledge Embeddings API、SearXNG、Firecrawl、Camoufox、Sylver Lining 工作平台、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
+本文定义平台与模型 OAuth、工作区 MCP、SearXNG、Firecrawl、Camoufox、Telegram 和邮箱的边界。部署方法见[部署](../operations/deployment.md)，配置入口见[配置参考](../reference/configuration.md)。
 
 ## 发布与通用原则
 
@@ -11,10 +11,10 @@
 - Platform 与 Agent Runtime 使用唯一的完整客户端契约。scope 清理、空闲 session 立即压缩、终端预览、模型目录、审批响应和活动 run 输入都是必需能力；缺少方法属于程序契约错误，不得按旧 Runtime 能力静默跳过、降级或重新排队。
 - 配置、数据库、Profile、缓存和日志写入数据根的明确 bind mount，不能写进镜像或源码目录。
 - 集成包描述、OCI/release 元数据、HTTP User-Agent 和审计日志前缀使用稳定的中性技术名称，不携带源码维护方或部署方品牌，也不从管理员可变品牌派生。当前容器路径、环境变量、进程身份和 Camoufox sidecar 只使用 `agent-platform` / `AGENT_PLATFORM_*` / `.agent-platform-runtime.json` target 接口，单个适配器不得引入第二套技术身份。
-- 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与本地知识数据。
+- 集成不可用时返回对应能力的明确 degraded/error，不得破坏消息、任务与工作区数据。
 - 聊天中的 XLSX、DOCX、PPTX 与 PDF 预览在 Platform 进程内从已授权附件提取有界文本，不调用外部 Office/PDF 服务，也不把原件交给浏览器查看器。Agent 写出的 HTML 呈现页不是 Camoufox、Firecrawl 或 Office 预览：它由 Platform 按当前工作区或 HTML 附件读取，并在电脑画面的沙箱 iframe 中显示。
 - 频道消息撤回只改变 Platform 产品消息可见性；已经提交给 Agent 或外部集成的输入不作追溯撤销，不能把界面撤回解释为 Runtime、Telegram、邮箱或其它集成的取消协议。
-- 凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。
+- 平台托管凭据只注入需要它的服务，不能进入模型可控 metadata、Sandbox 环境或日志。用户自行安装的 MCP 凭据属于该 Agent 工作区内容，平台不得把它复制到其它 scope、提示词、工作记录或日志。
 - Platform 对受管 SearXNG 与 Firecrawl 只保留实际被状态 API 和调用路径消费的健康探测；服务启动、等待就绪和重试由 Manager operation 负责，不保留无人调用的 Platform readiness 包装入口。
 - 当前 release manifest 只接受当前 schema 的十镜像闭集，不包含迁移 helper 或第二套技术身份；历史镜像、目录或环境变量不能使已退役集成重新进入运行边界。
 
@@ -28,7 +28,7 @@ Codex 账号目录先按供应商 priority 排序；Grok 目录保留供应商�
 
 Codex OAuth 的锁定 Responses 适配器可以消费模型函数调用的参数增量；Runtime 只把其中 `write_file.content` 和 `patch_file.new_text` 投影为当前 Run 的有界、脱敏、未提交文件草稿，工具执行和最终工作区写入仍保持原子边界。仅 Codex 的这两个工具在提供给模型的 schema 中要求显式 `target`；完整调用省略它时，Runtime 在校验、执行和会话历史写入前规范为 `sandbox`，显式 `host` 不得被改写，且不会产生草稿预览。Grok 及其它模型路径的 schema 和行为不变。该能力不增加 OAuth scope、token 交换、凭据存储、供应商目录或新的外部连接。
 
-Codex OAuth 请求还使用 Runtime 生成的内容寻址 `prompt_cache_key`：Platform 把稳定身份、工作区和知识工具说明放在精确 UTC 与被动知识建议之前，Runtime 再用稳定策略、实际工具 schema 和不透明 scope 分片形成 provider 路由提示。该优化不改变 OAuth token、真实 session/header、模型目录或权限复验，也不对私有 OAuth 端点的实际命中作保证。
+Codex OAuth 请求还使用 Runtime 生成的内容寻址 `prompt_cache_key`：Platform 把稳定身份与工作区说明放在精确 UTC 之前，Runtime 再用稳定策略、实际工具 schema 和不透明 scope 分片形成 provider 路由提示。该优化不改变 OAuth token、真实 session/header、模型目录或权限复验，也不对私有 OAuth 端点的实际命中作保证。
 
 ## SearXNG 搜索
 
@@ -60,35 +60,27 @@ Platform 每次操作都重新校验登录用户、scope family、tab 与租约�
 
 同一界面提交新消息时，前端立即把该 scope 的本地接管状态降为只读，并等待已经在途的 acquire/input 及其对应 release 收敛后再发送消息；凡该消息将触发 Agent，Platform 还必须在任务入队前、同一浏览器操作门内撤销发送者本人持有的该 root scope 租约。不同用户持有的租约不能被消息发送者夺取，未触发 Agent 的普通频道消息也不能由服务端隐式撤销他人的协助。这样“人工处理后让 Agent 再试”不依赖 90 秒自然过期，也不会让异步前端释放与 Agent 导航形成竞态。明确结束、失焦、页面隐藏、到期、tab 变化、服务端租约冲突、tab 关闭或 scope cleanup 同样立即把界面降为只读，并尽力释放原租约。共享 Xvfb 不直接暴露为远程桌面。
 
-## Knowledge Embeddings API
-
-知识库是 Platform 内建能力，不运行第三方知识服务或本地模型。管理员只配置一组 OpenAI-compatible Embeddings endpoint、model、可选维度、批大小和 secret API key。缺少 key 时知识能力明确 disabled，不回退到本地 FTS、`LIKE` 或其它 provider。
-
-Platform 对 Embeddings 请求使用有界 connect/read/body 预算，禁止带 Authorization 的重定向，校验响应 content type、index 顺序、数量、有限数值和维度，不把 key、原文或完整 provider 错误写入日志。`429` 和可重试的 `5xx` 通过持久 job 有界退避；认证、结构、模型或维度错误为明确配置失败。配置更新先用最小探测验证，再原子保存并创建 shadow generation；旧 active generation 在新代完整就绪前继续服务。
-
-知识文件解析属于 Platform 内建的确定性导入边界，不把原件发送给 Embeddings provider；provider 只接收有界的提取文本批次。PDF 解析器与标准库 ZIP/XML/HTML/JSON/CSV 解析器只读取本地临时上传，禁止宏、外链和嵌入对象执行，并在进入库代码前执行格式签名、条目数量、声明/实际展开大小与正文字符预算校验。解析失败不得留下部分文档或原件。
-
 ## 不可信内容
 
-搜索、提取、浏览器文本、邮件、知识结果、记忆、历史会话、计划定义/历史和 Skill 附件都可能包含间接提示词注入。返回模型前必须进入防伪闭合的 `untrusted_tool_result` 数据边界，并先中和载荷伪造的同名标签；图片保持图片块，伴随文本仍使用相同边界。
+搜索、提取、浏览器文本、邮件、MCP 结果、记忆、历史会话、计划定义/历史和 Skill 附件都可能包含间接提示词注入。返回模型前必须进入防伪闭合的 `untrusted_tool_result` 数据边界，并先中和载荷伪造的同名标签；图片保持图片块，伴随文本仍使用相同边界。
 
 结构化边界是主要语义防线。共享威胁扫描器只作纵深防护：输入先 NFKC 归一化，检测不可见/双向 Unicode，并使用有界规则。长期记忆、Skill 主指令和计划 prompt 在写入及加载/执行时复查；普通网页内容不因关键词被删除，而是保持可见并始终作为不可信数据。
 
 ## Skill 学习边界
 
-Skill 采用 Hermes 风格的“索引后按需读取”机制：正常 Run 只收到有界元数据索引，必须显式 `load`/`read` 才能取得正文或附件。后台学习复盘可以创建新的私有 Skill，也可以在同一次复盘中先读取、再精确替换自己此前创建的 Skill；它不得自动改写用户创建、用户置顶、已归档、已停用或仓库预置的 Skill，也不得删除或停用任何 Skill。`.skill-usage.json` 是 owner-only 的可信来源，记录 `user/agent` 来源、状态、置顶、使用与修补计数；缺失或旧记录一律按用户所有处理并失败关闭。所有自动写入在最终文件系统提交前重新核验私人 scope、lifecycle、活动账户、运行中的复盘 job 和持久变更预算，并重复执行提示词注入、凭据与大小检查。
+Skill 采用 Hermes 风格的“索引后按需读取”机制：正常 Run 只收到有界元数据索引，必须显式 `load`/`read` 才能取得正文或附件。后台学习复盘可以创建新的私有 Skill，也可以在同一次复盘中先读取、再精确替换自己此前创建的 Skill；它不得自动改写用户创建、用户置顶、已归档、已停用或仓库预置的 Skill，也不得删除或停用任何 Skill。不向 Sandbox 挂载的 `agent-skill-state/<scope-hash>/` 是可信来源，记录 `user/agent` 来源、enabled、状态、置顶、使用与修补计数；workspace sidecar 不参与授权，缺失或旧记录一律按用户所有处理并失败关闭。所有自动写入在最终文件系统提交前重新核验私人 scope、lifecycle、活动账户、运行中的复盘 job 和持久变更预算，并重复执行提示词注入、凭据与大小检查。
 
 仓库预置 spreadsheet、document、presentation 和 PDF 文件产出 Skill。它们面向“制作表格/报告/演示稿/PDF”等明确交付意图主动触发，使用 Sandbox 预装的受控文档生成库，在 `/workspace` 产出可下载文件并通过 `MEDIA: /workspace/<relative-path>` 交还 Platform。默认目标不是“勉强生成一个能打开的文件”，而是无需用户再次排版即可直接交付的成品：先判断受众与用途，再采用一致的视觉层级、克制配色、清晰留白与对齐、适合内容密度的版式，并兼顾可读性、无障碍与后续编辑；缺少品牌规范时使用中性专业主题，已有品牌或模板时遵循用户材料而不擅自改色。每类 Skill 还必须执行格式专属的布局与内容复验，避免截断、越界、不可读字号、拥挤表格、失真图片和装饰性噪声。Runtime 自动追加文件复验时，只在成功复验已经清除相关变更后把此前的规范交付标记保留到终态结果；Platform 再按当前 scope 映射、校验并保存附件。预置说明不得要求临时联网安装任意包、调用外部文档转换服务或把 Markdown 当作默认成品；用户明确要求其它格式或只要聊天内小表格时才采用相应结果。
 
-## Sylver Lining 工作平台
+## 工作区 MCP
 
-该连接器是当前提供方 REST API 的原生适配器，不是 MCP 客户端，也不运行上游 `ubi.py`、`worker.py`、Claude/Codex CLI 或任意远程脚本。提供方 origin 固定为 `https://devops.sylver-lining.org`，产品 API、界面、模型和本地设置均不能覆盖；每个本地用户最多关联一个 Personal API Token。用户可管理自己的连接，管理员可通过独立的目标账号资源查看、预验证、确认替换或断开任意现存账号，但不能读取既有凭据。管理员预验证只返回清洗后的远端身份；确认请求带预期远端用户 ID，Platform 再次请求固定 origin 的 `GET /api/auth/me` 并核对身份后才原子保存连接、凭据和验证快照。用户自助入口同样在保存前完整验证身份；测试通过注入确定性 transport 隔离真实网络。所有读取接口只返回远端身份及 `credential_configured`，永不回传 Token。
+平台不内置 Sylver Lining 或其它业务系统连接器。用户把服务商提供的 Skill 安装到 `/workspace/.agent-platform/skills/<skill-id>/`，把本地 stdio MCP server 安装到 `/workspace/.agent-platform/mcp/<server-id>/`，并在 `/workspace/.agent-platform/mcp.json` 的 `mcpServers` 对象登记 `command`、可选 `args`、`env` 和 `cwd`。该形状兼容常见本地 MCP 配置，但路径必须落在当前 Agent 工作区；Agent 收到 Claude Code 等客户端的安装说明时改写目标目录，不创建 `.claude` 副本。每个私人或频道主 Agent 使用自己的工作区，配置、包与凭据不会自动共享；委派 Agent 继承父主 Agent 的配置。
 
-Runtime 只获得固定、闭世界的 `sylver_platform` 业务动作，不接受 URL、HTTP method、path、header、Token、owner 或 scope。首版读取身份、项目、项目上下文、任务与活动、Wiki 文档、审批详情与评论和通知；写动作只包括创建任务、开始任务、添加任务活动、提交 Wiki 提案和添加普通审批评论。任务列表默认只读当前远端身份获分配的任务，审批列表默认读取 inbox，通知列表默认只读未读通知；模型只有显式覆盖参数才请求其它集合。创建任务必须带至少一个真实 tag、明确起止日期，并以正整数 `milestone_id` 选择里程碑或以显式 `null` 表示用户确认跳过；不能省略该决定。普通任务描述使用首行摘要和后续 `- ` 要点。Platform 在任何写请求前读取项目 workflow：存在且仅存在 `proposed` category 时省略 `status_id` 以保留远端提案闸，并允许传入真实 `proposal_approver_id`；不存在 `proposed` 时必须解析唯一 `backlog` status 并显式发送，此时提供 `proposal_approver_id` 必须在建任务前拒绝，workflow 缺失或歧义同样失败关闭。`start_task` 必须显式提供要写入活动流的简短 note；`propose_wiki` 必须显式提供 `content_format` 和 `order`，不能让未展示的客户端默认值进入写请求。所有写动作逐次审批，unattended Run 只读；原始完整审批参数在任何脱敏前超过 16 KiB 或含不可见控制字符时失败关闭，通过后展示完整的脱敏短正文，展示投影也不得超限。审批决定/拒绝、跳过审查、强制完成、员工管理、任意 REST、直接 Wiki 删除、待处理 Wiki 提案列表和 Apifox 同步不进入首版工具表。远端响应和错误始终是不可信工具结果。
+Sandbox 镜像提供一个无额外依赖的一次性 stdio MCP 客户端。Runtime 的固定 `mcp` 工具通过 Manager 在当前 Sandbox 调用它；客户端每次读取最新清单，以 argv 直接启动 server，完成初始化和一个 `tools/list` 或 `tools/call` 后退出。配置不存在时返回空列表，配置损坏、路径越界、命令失败、协议错误、超时或结果超限时明确失败，不回退到其它客户端目录。所有 `call` 逐次审批；审批展示包含本次实际调用的完整普通参数，只对敏感字段值保留明确的脱敏占位，不可见或双向文本控制字符直接拒绝，完整脱敏展示超限也不得执行。Manager 审计、保留的进程快照、终端预览和平台工作记录只保留 `action/server/tool` 安全投影；固定客户端命令中的可逆请求载荷与原始 stdout/stderr 结果只存在当前执行闭包和 Manager→Runtime 响应，不写入进程输出文件或任何持久/预览记录。MCP 描述、结果和错误始终作为不可信数据；server 进程只能获得清单声明的环境和当前 Sandbox 已有的权限，平台不为它注入其它用户或平台 secret。
 
-Platform 是唯一 HTTP 调用方：凭据只在当前请求闭包中注入，拒绝携带凭据的重定向，限制连接/读取时间、响应类型和正文大小，并只访问代码锁定的官方 origin。解析成功响应后必须递归清除敏感字段值和当前 Token 的任何精确回显；`/api/auth/me` 出现当前 Token 回显时整次身份验证失败，不能把污染身份写入数据库。用户与管理员入口的连接、重连、断开以及 Agent 工具真实调用按同一本地 owner 串行，较早的慢验证不能在较新的断开或重连之后复活旧凭据，管理操作返回后也不能留有使用旧 Token 的在途工具请求。写调用在发送前标记副作用；请求发送后的超时、连接中断、成功响应解析失败或 `5xx` 必须明确报告结果不确定，并要求先读取权威远端状态，不得自动重放。外部平台自己的审批门继续是最终业务边界，本地工具审批不能代替远端权限检查。
+客户端对 config、cwd 与工作区内 command 先打开后从 fd 重新验证边界，并通过该 fd 启动，不让 Sandbox 后台进程在检查与使用之间替换父目录或目标。
 
-上游私有 Skill 只作为开发期规则与接口参考。当前上游没有随仓库提供 OpenAPI，因此仓库同时锁定已审阅 commit、`SKILL.md` 与 `scripts/ubi.py` 摘要；前者提供业务规则，后者是当前固定 REST 路径与复合动作的参考，二者都不作为运行时代码执行。开发机 GitHub 凭据位于 Git 元数据目录的 owner-only 本地文件，本地 checkout 也只缓存于 Git 元数据目录，发布物、镜像和部署机均不包含它。同步工具使用进程内临时认证 header 获取精确仓库/分支并报告两个输入的锁定版本与上游差异；确认规则、接口、文档、连接器与测试已同步后，开发者才显式更新两个摘要及锁定 revision。上游内容不能在 Runtime 动态挂载或直接执行；两个参考输入冲突或出现未审阅接口变化时停止更新而不是猜测。本地 bundled Skill 是受控业务子集，不承诺复制上游 CLI 的 Git/PR、worker、管理接口或专用 UI 提案正文流程。
+首版只支持 stdio 的 `tools/list` 与 `tools/call`。Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接和动态顶层工具注册不进入当前边界；远程服务需要由用户安装本地 stdio 适配器。Sylver Lining 是否提供何种 Skill/MCP 包由其自身维护，平台不锁定其仓库、API、origin、Token 形状或业务动作。
 
 ## Telegram
 
@@ -118,8 +110,8 @@ update id 是入站去重边界；未确认 update 可在重启后重新领取�
 
 本仓库不包含 Firecrawl 的 gitlink、vendored tree 或镜像副本。临时构建 checkout 不得承载产品修改或被推送。平台行为实现于 Python adapter、Agent Runtime、Manager 或平台生成配置；浏览器补丁实现于 `camofox-runtime/`。升级上游先修改源码契约并通过镜像集成验证。
 
-Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，知识索引、Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
+Manager 更新预约是所有有副作用集成 worker 的共同门：maintenance 生效时，Telegram 收发、计划任务和恢复中的 Agent job 都不得启动。只有匹配 operation id 的内部 release 明确解除预约后，Platform 才能统一唤醒这些 worker。
 
-候选启动期间对 workspace、Runtime 与集成 checkpoint 的只读验证不构成解除预约，也不能唤醒邮件、Telegram、计划任务、学习或知识摄取；只有同一 operation 的 Gate 结算明确释放 reservation 后，这些 worker 才按原 checkpoint 恢复。
+候选启动期间对 workspace、Runtime 与集成 checkpoint 的只读验证不构成解除预约，也不能唤醒邮件、Telegram、计划任务或学习；只有同一 operation 的 Gate 结算明确释放 reservation 后，这些 worker 才按原 checkpoint 恢复。
 
 开发环境同样通过外部 Compose/Manager 启动固定服务，再把私有 service URL 注入 Platform；Platform 不提供进程 runner、安装器、Compose 包装器或源码目录配置。测试替身只实现 HTTP 契约，不能重新引入第二套生命周期。

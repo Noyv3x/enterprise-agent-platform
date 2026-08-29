@@ -123,7 +123,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
 
     await visibleGuide();
     expect(screen.getByText("This guide stays in the sidebar, so you can reopen it at any time.")).toBeVisible();
-    expect(screen.getAllByRole("button", { name: /^Try:/ })).toHaveLength(4);
+    expect(screen.getAllByRole("button", { name: /^Try:/ })).toHaveLength(3);
     expect(store.getState().personalAiGuideShownThisSession).toBe(true);
 
     await userEvent.click(screen.getByRole("button", { name: "Got it" }));

@@ -12,7 +12,7 @@ function toolText(result: { content: Array<{ type: string; text?: string }> }): 
     .join("\n");
 }
 
-test("web and knowledge results always receive a closed untrusted boundary", async () => {
+test("web results always receive a closed untrusted boundary", async () => {
   const tools = createTools({
     runId: "run",
     request: { scope_key: "private:1" } as never,
@@ -26,7 +26,7 @@ test("web and knowledge results always receive a closed untrusted boundary", asy
     markSideEffect: () => undefined,
   });
 
-  for (const name of ["web", "knowledge"]) {
+  for (const name of ["web"]) {
     const tool = tools.find((candidate) => candidate.name === name);
     assert.ok(tool);
     const text = toolText(await tool.execute("call", { action: "search", arguments: {} }, undefined));
@@ -57,7 +57,6 @@ test("untrusted gateway and session failures cannot bypass the model data bounda
     ["memory", "memory", { action: "search", arguments: {} }],
     ["skill", "skill.load", { action: "load", arguments: { id: "example" } }],
     ["web", "web", { action: "search", arguments: {} }],
-    ["knowledge", "knowledge", { action: "search", arguments: {} }],
     ["browser", "browser", { action: "snapshot", arguments: {} }],
     ["schedule", "schedule", { action: "list", arguments: {} }],
     ["session", "session", { action: "read", arguments: {} }],

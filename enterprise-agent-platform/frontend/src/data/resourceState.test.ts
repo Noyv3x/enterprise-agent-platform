@@ -13,13 +13,13 @@ describe("resource request state", () => {
     const store = makeStore();
     const load = vi.fn(async () => undefined);
 
-    await expect(runResourceLoad(store, "knowledge:list", load)).resolves.toBe(true);
+    await expect(runResourceLoad(store, "test:list", load)).resolves.toBe(true);
     expect(load).toHaveBeenCalledOnce();
-    expect(store.getState().resourceStates["knowledge:list"]).toMatchObject({
+    expect(store.getState().resourceStates["test:list"]).toMatchObject({
       status: "ready",
       error: "",
     });
-    expect(store.getState().resourceStates["knowledge:list"].updatedAt).toEqual(expect.any(Number));
+    expect(store.getState().resourceStates["test:list"].updatedAt).toEqual(expect.any(Number));
   });
 
   it("keeps the previous timestamp when a refresh fails", async () => {
@@ -42,8 +42,8 @@ describe("resource request state", () => {
   it("does not reload a ready resource until explicitly refreshed", async () => {
     const store = makeStore();
     const load = vi.fn(async () => undefined);
-    await ensureResource(store, "knowledge:list", load);
-    await ensureResource(store, "knowledge:list", load);
+    await ensureResource(store, "test:list", load);
+    await ensureResource(store, "test:list", load);
     expect(load).toHaveBeenCalledOnce();
   });
 
@@ -57,17 +57,17 @@ describe("resource request state", () => {
         }),
     );
 
-    const first = ensureResource(store, "knowledge:search", load);
-    await expect(ensureResource(store, "knowledge:search", load)).resolves.toBe(true);
+    const first = ensureResource(store, "test:search", load);
+    await expect(ensureResource(store, "test:search", load)).resolves.toBe(true);
     expect(load).toHaveBeenCalledOnce();
-    expect(store.getState().resourceStates["knowledge:search"]).toMatchObject({
+    expect(store.getState().resourceStates["test:search"]).toMatchObject({
       status: "loading",
       error: "",
     });
 
     resolveLoad();
     await expect(first).resolves.toBe(true);
-    expect(store.getState().resourceStates["knowledge:search"].status).toBe("ready");
+    expect(store.getState().resourceStates["test:search"].status).toBe("ready");
   });
 
   it("does not start a second explicit refresh while the first is loading", async () => {
@@ -87,7 +87,7 @@ describe("resource request state", () => {
 
   it("clears resource ownership on a session reset", async () => {
     const store = makeStore();
-    await runResourceLoad(store, "knowledge:list", async () => undefined);
+    await runResourceLoad(store, "test:list", async () => undefined);
     store.dispatch({ type: "RESET_SESSION" });
     expect(store.getState().resourceStates).toEqual({});
   });
@@ -97,14 +97,14 @@ describe("resource request state", () => {
     let rejectLoad!: (error: Error) => void;
     const pending = runResourceLoad(
       store,
-      "knowledge:list",
+      "test:list",
       () =>
         new Promise<void>((_resolve, reject) => {
           rejectLoad = reject;
         }),
     );
 
-    expect(store.getState().resourceStates["knowledge:list"].status).toBe("loading");
+    expect(store.getState().resourceStates["test:list"].status).toBe("loading");
     store.dispatch({ type: "RESET_SESSION" });
     rejectLoad(new ApiRequestCancelledError());
 

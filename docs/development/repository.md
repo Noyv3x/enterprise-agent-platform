@@ -35,9 +35,7 @@ Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。其官方 URL
 - 绕过源码契约跟随 branch/tag；
 - 把平台生成配置写入源码 checkout。
 
-集成行为应改在 Python adapter、Runtime 或平台生成配置。知识库是平台自有实现，不从研究用第三方 checkout 复制源码或引入其运行依赖。确实必须修改其它上游时，先取得目标 fork、branch 和发布方式的明确授权。
-
-Sylver Lining 私有 Skill 同样不进入产品 Git tree。开发机的只读 GitHub 凭据和 checkout 只允许位于 `.git/agent-platform-secrets/` 与 `.git/upstreams/`，凭据文件必须 owner-only，且不得写入 remote URL、shell argv、日志、补丁或发布工件。`scripts/sync_sylver_platform_skill.py` 只允许精确的 `https://github.com/Sylver-Lining/ubitech-platform-skill.git`，以禁用 Git HTTP 重定向和凭据助手的临时认证 header fetch，并报告 `SKILL.md` 与 `scripts/ubi.py` 的差异；只有人工审阅并同步文档、固定工具协议和测试后，才允许显式更新 revision 与两个文件摘要。同步流程不复制或执行上游脚本。
+集成行为应改在 Python adapter、Runtime、Sandbox 客户端或平台生成配置。用户自行安装的 Skill/MCP 包只进入对应 Agent workspace，不纳入产品源码或发布输入。确实必须修改其它上游时，先取得目标 fork、branch 和发布方式的明确授权。
 
 ## 源码边界
 
@@ -63,7 +61,7 @@ Sylver Lining 私有 Skill 同样不进入产品 Git tree。开发机的只读 G
 
 面向最终用户的 Agent 使用当前部署配置的 Agent 显示名称；未配置时自称 `Agent`，不提 Pi、Runtime、模型供应商、源码维护方或内部实现。品牌名称只能作为经过校验的结构化展示数据进入 prompt，不能被解释成指令。私人和频道 prompt 都要包含可用的用户姓名、职位和说话人上下文。
 
-记忆、知识、网页、session 和 skill 文件作为不可信数据注入。Prompt 变更不得降低工具积极性、审批约束或所有权边界；相关设计见 [Agent Runtime](../design/agent-runtime.md)。
+记忆、网页、MCP 结果、session 和 Skill 文件作为不可信数据注入。Prompt 变更不得降低工具积极性、审批约束或所有权边界；相关设计见 [Agent Runtime](../design/agent-runtime.md)。
 
 ## Git 变更
 

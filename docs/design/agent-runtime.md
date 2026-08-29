@@ -13,15 +13,15 @@ Runtime 直接依赖 lockfile 中精确版本的 Pi Core 与 Pi AI，不经由�
 - 幂等 Run 结果与可恢复事件 journal；
 - Runtime 可执行模型目录。
 
-Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、知识、技能、计划、邮箱和浏览器业务接口。宿主管理器拥有 Sandbox/host 进程、文件执行和容器生命周期。Runtime 不复制这些状态，也不访问 Docker socket。
+Python Platform 拥有账号、产品消息、OAuth refresh token、记忆、技能、计划、邮箱和浏览器业务接口。宿主管理器拥有 Sandbox/host 进程、文件执行和容器生命周期。Runtime 不复制这些状态，也不访问 Docker socket。
 
 Platform 还拥有当前部署的公开品牌投影，并把经过校验的 Agent 显示名称作为闭合结构化数据写入系统提示。Runtime 和工具说明使用中性 `Agent` 术语，不固化源码维护方名称，也不把品牌文本解释为指令、权限或内部 identity。
 
 ## 提示词组装与执行纪律
 
-Runtime 必须以单一、确定性的组装边界构造模型系统提示，顺序固定为“Runtime 稳定策略前缀 → Platform-authored system context → Runtime 动态状态”。稳定前缀只放置当前 Run 类型和工具能力真正需要的执行、记忆、Skill、追加输入或定时发生策略；对同一能力集合必须保持字节稳定，不混入时间、回忆结果、活动 sidecar 或技能索引。Platform 仍通过现有私有协议的单个 `system_prompt` 传入品牌、模式、工作区与用户/频道上下文；其中稳定的身份、模式和工作区说明必须位于精确时间与按请求变化的知识建议之前。Platform 是这个系统上下文的可信作者，但其中嵌入的用户、频道、品牌和知识载荷仍保持各自闭合的不可信数据 framing。Runtime 不从其自然语言内容反向推断权限或执行身份。回忆记忆、活动 todo、有限后台责任和可用 Skill 索引等动态数据放在末层；其中的历史正文、todo 正文和 Skill 元数据继续使用闭合不可信数据 framing，Runtime-owned id、状态和后台责任则明确标识为权威状态。普通 Run 主组装路径不为空状态生成仅有形式的动态块。
+Runtime 必须以单一、确定性的组装边界构造模型系统提示，顺序固定为“Runtime 稳定策略前缀 → Platform-authored system context → Runtime 动态状态”。稳定前缀只放置当前 Run 类型和工具能力真正需要的执行、回复风格、记忆、Skill、追加输入或定时发生策略；对同一能力集合必须保持字节稳定，不混入时间、回忆结果、活动 sidecar 或技能索引。默认回复风格要求跟随用户语言、使用大白话、先说结果、简单问题简短，并避免套话、官话、无意义标题和重复；用户明确要求的语气与格式仍优先。Platform 仍通过现有私有协议的单个 `system_prompt` 传入品牌、模式、工作区与用户/频道上下文；其中稳定的身份、模式和工作区说明必须位于精确时间之前。Platform 是这个系统上下文的可信作者，但其中嵌入的用户、频道和品牌载荷仍保持各自闭合的不可信数据 framing。Runtime 不从其自然语言内容反向推断权限或执行身份。回忆记忆、活动 todo、有限后台责任和可用 Skill 索引等动态数据放在末层；其中的历史正文、todo 正文和 Skill 元数据继续使用闭合不可信数据 framing，Runtime-owned id、状态和后台责任则明确标识为权威状态。普通 Run 主组装路径不为空状态生成仅有形式的动态块。
 
-这三个逻辑层最终仍形成一个 provider system prompt，不得把分层名称误称为三个独立缓存块。Codex 请求在保留 `session_id` 的会话、header 与 WebSocket 续传用途之外，使用版本化内容摘要作为 `prompt_cache_key`：摘要覆盖字节稳定的 Runtime 策略前缀、规范化后的实际工具 schema 与当前 Agent scope 的稳定分片，使同一 scope 内临时时间、知识建议、回忆、todo、后台责任和 Skill 索引变化时仍路由到相同稳定前缀，策略、工具能力或 scope 变化时则确定失效，也不把多租户流量压入同一热点 key。该 key 只是供应商缓存亲和提示，供应商可以忽略；缓存未命中或 WebSocket 续传回退到完整上下文时，模型语义、工具权限和执行结果必须不变。当前 Codex OAuth 后端没有经过 canary 验证的显式 cache breakpoint，因此不得向私有端点猜测添加公共 API 新字段或把单元测试写成真实命中证明。
+这三个逻辑层最终仍形成一个 provider system prompt，不得把分层名称误称为三个独立缓存块。Codex 请求在保留 `session_id` 的会话、header 与 WebSocket 续传用途之外，使用版本化内容摘要作为 `prompt_cache_key`：摘要覆盖字节稳定的 Runtime 策略前缀、规范化后的实际工具 schema 与当前 Agent scope 的稳定分片，使同一 scope 内临时时间、回忆、todo、后台责任和 Skill 索引变化时仍路由到相同稳定前缀，策略、工具能力或 scope 变化时则确定失效，也不把多租户流量压入同一热点 key。该 key 只是供应商缓存亲和提示，供应商可以忽略；缓存未命中或 WebSocket 续传回退到完整上下文时，模型语义、工具权限和执行结果必须不变。当前 Codex OAuth 后端没有经过 canary 验证的显式 cache breakpoint，因此不得向私有端点猜测添加公共 API 新字段或把单元测试写成真实命中证明。
 
 与单个工具选择相关的软策略应优先放在该工具的稳定 schema 说明中，不应为空状态在每个 Run 重复提高其显著性。Runtime 不按用户输入长度、关键词、模型供应商或已发生的工具次数猜测任务复杂度，也不自动代替模型建立执行清单。模型可在同一轮中请求彼此独立的读取、检索和其它明确允许并行的工具；Pi 工具循环依据每个工具的 `executionMode` 并发执行纯并行批次，包含任一顺序工具的批次保持有序。
 
@@ -57,7 +57,11 @@ Python 在调用时向内部授权端点请求当前访问凭据，并同时复�
 
 ## 工具与执行目标
 
-Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、todo、memory、skill、knowledge、web、browser、mail、sylver_platform、schedule、session、session_search 和 delegate_task。
+Runtime 提供 terminal、process、read_file、write_file、patch_file、search_files、todo、memory、skill、mcp、web、browser、mail、schedule、session、session_search 和 delegate_task。
+
+`skill` 与 `mcp` 都以当前主 Agent 的工作区为唯一用户配置源。用户 Skill 位于 `/workspace/.agent-platform/skills/<skill-id>/SKILL.md`，MCP 清单位于 `/workspace/.agent-platform/mcp.json`，本地 MCP 包与虚拟环境位于 `/workspace/.agent-platform/mcp/<server-id>/`。Platform 系统规则必须要求 Agent 把面向 Claude Code 等其它客户端的 `.claude/skills`、`.claude/skill`、`.mcp.json` 或用户 HOME 安装步骤重定向到这些路径，不能同时维护第二份配置。工作区路径已经按私人或频道主 Agent 隔离；委派 Agent 继承父主 Agent 的同一配置。
+
+用户 Skill 的 `list/load/read` 每次从盘读取，Run 开始时的有界 Skill 索引只在下一 Run 重建；MCP 的 `list/call` 每次重新读取并校验清单。因此保存后无需 watcher、reload API 或重启，当前 Run 可以显式读取新 Skill/MCP，已经发送给模型的工具 schema 与提示前缀则不在半轮中改写。直接安装的可移植 Skill 可以只有合法的 `SKILL.md` 和支持目录；Platform 首次扫描时先完成既有路径、大小、frontmatter、提示词注入与明文凭据校验，再原子补齐 `user-owned + active + enabled` 的平台 sidecar 和 usage 状态，不能把缺少平台私有文件误报为包损坏。仓库预置 Skill 仍是发布镜像中的只读层。
 
 `todo` 是当前 Runtime session 内的结构化执行清单，不是平台业务任务、计划任务或长期记忆。它只用于预计至少三个彼此独立、可追踪的执行步骤，或用户一次提出多个可分别完成的任务。直接回答、单一动作和一两个简单步骤直接执行；围绕同一个小改动的例行读取、修改与聚焦验证是一条线性工作，不为了形式拆成清单。执行中发现任务已经演变为这类复杂工作时可以再创建清单。
 
@@ -75,7 +79,7 @@ Runtime 不创建、修复或推断宿主 workspace。每条 scope/runtime ident
 
 用户上传的安全位图由 Platform 作为有界 image block 内联，不要求中央 Runtime 挂载 Platform 数据。其它上传附件使用 `/workspace/.agent-platform/attachments/...`；Manager 在当前 scope 的只读附件挂载中解析。Runtime 不对中央容器不存在的宿主路径执行 `realpath`，也不能把一个 scope 的附件当成另一个 scope 的当前附件。
 
-Agent 生成的用户交付文件必须先写入当前 `/workspace`，再在最终回复中使用平台文件回传标记 `MEDIA: /workspace/<relative-path>`。受支持后缀包含既有交付格式以及 `.html` / `.htm`。XLSX、DOCX、PPTX 与 PDF 的聊天预览由 Platform 从已授权附件即时生成，不属于 Runtime 协议或模型上下文。用户可见的「AI 的电脑」是 Platform/前端对既有 `read_file` / `write_file` / `patch_file` / `search_files` / `terminal` / `process` / `web` / `knowledge` / `browser` 生命周期以及工作区 HTML 写出或 HTML `MEDIA`/附件的投影；本版本不得新增呈现、桌面或静态站点 Runtime 工具。HTML 页面若要在电脑槽位渲染，由 Platform 按当前 scope 读取该文件或附件，不经过新的 Runtime 调用。该路径是 Sandbox 逻辑路径，不是中央 Platform 容器中的同名路径；Platform 只能把精确的 `/workspace` 后代映射到当前可信 scope 的 `workspace_path`，并从已固定的工作区根目录 fd 逐段以不跟随符号链接的方式打开，最终从同一文件 fd 完成身份、数量、单文件和总字节校验与读取，不能在检查后重新解析路径字符串。Platform 是把该标记转换为消息附件的唯一边界，Runtime 不能把任意宿主路径或纯文本文件名伪装成附件。如果 Runtime 在含交付标记的回复后自动追加内部文件复验，只有相关变更已由成功的复验工具清除时，才把被隐藏中间回复中的规范 `/workspace` 标记去重保留到 Run 终态 output；复验失败或仍有未确认变更时不得恢复标记，成功复验则不能让已声明的交付物消失。两种情况都不能跳过 Platform 校验。内置表格、文字文档、演示稿和 PDF Skill 应在相应产出请求中主动使用，默认交付 XLSX、DOCX、PPTX 或 PDF，而不是仅返回 Markdown 表格、代码片段或“文件已生成”的文字说明。Skill 必须把视觉质量作为交付条件：根据用途选择专业且克制的主题，建立一致层级、间距、对齐和色彩，避免默认库样式直接外露；同时要求生成后进行内容、结构与格式专属布局校验，清理自身临时产物并保留最终文件。
+Agent 生成的用户交付文件必须先写入当前 `/workspace`，再在最终回复中使用平台文件回传标记 `MEDIA: /workspace/<relative-path>`。受支持后缀包含既有交付格式以及 `.html` / `.htm`。XLSX、DOCX、PPTX 与 PDF 的聊天预览由 Platform 从已授权附件即时生成，不属于 Runtime 协议或模型上下文。用户可见的「AI 的电脑」是 Platform/前端对既有 `read_file` / `write_file` / `patch_file` / `search_files` / `terminal` / `process` / `web` / `browser` 生命周期以及工作区 HTML 写出或 HTML `MEDIA`/附件的投影；本版本不得新增呈现、桌面或静态站点 Runtime 工具。HTML 页面若要在电脑槽位渲染，由 Platform 按当前 scope 读取该文件或附件，不经过新的 Runtime 调用。该路径是 Sandbox 逻辑路径，不是中央 Platform 容器中的同名路径；Platform 只能把精确的 `/workspace` 后代映射到当前可信 scope 的 `workspace_path`，并从已固定的工作区根目录 fd 逐段以不跟随符号链接的方式打开，最终从同一文件 fd 完成身份、数量、单文件和总字节校验与读取，不能在检查后重新解析路径字符串。Platform 是把该标记转换为消息附件的唯一边界，Runtime 不能把任意宿主路径或纯文本文件名伪装成附件。如果 Runtime 在含交付标记的回复后自动追加内部文件复验，只有相关变更已由成功的复验工具清除时，才把被隐藏中间回复中的规范 `/workspace` 标记去重保留到 Run 终态 output；复验失败或仍有未确认变更时不得恢复标记，成功复验则不能让已声明的交付物消失。两种情况都不能跳过 Platform 校验。内置表格、文字文档、演示稿和 PDF Skill 应在相应产出请求中主动使用，默认交付 XLSX、DOCX、PPTX 或 PDF，而不是仅返回 Markdown 表格、代码片段或“文件已生成”的文字说明。Skill 必须把视觉质量作为交付条件：根据用途选择专业且克制的主题，建立一致层级、间距、对齐和色彩，避免默认库样式直接外露；同时要求生成后进行内容、结构与格式专属布局校验，清理自身临时产物并保留最终文件。
 
 模型在一次 Run 中发出的、随后因真实工具调用而结束的阶段性说明属于用户已经看见的工作过程。Platform 必须在不改变 Runtime 流协议的前提下，将这些已结束的文本段与工具首次调用写入同一条带严格递增序号的时间线；工具更新按 `tool_call_id` 原位合并，最终消息的 `agent_work.activity` 直接从该时间线生成，不能用秒级时间重新排序或静默截取尾部。Platform 还可从已经过 journal 脱敏的工具参数和结果投影闭世界 `parameters` 与有界 `result`，供展开详情使用，但不能把 Runtime 事件原文、邮件正文或跨会话搜索原文写入消息 metadata。当前仍活动的最终回答不属于过程文本，不能在 metadata 中复制。没有真实工具事件时仍不得生成工作记录。异常事件或正文触发 Platform 的有界防滥用限制时必须携带明确的省略计数。
 
@@ -85,9 +89,9 @@ Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化�
 
 Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和规范化逻辑路径；Manager 是宿主映射的最终可信边界。Manager 必须把 `/workspace`、`/home/agent`、`/opt/agent-env` 或绝对宿主路径解析为不可变的根与相对路径，从根目录 fd 逐段以不跟随符号链接的方式打开。文件 read/write/patch/search 与 terminal cwd 都不能在检查后重新按字符串解析；patch 在同一个已固定父目录中完成读取与原子替换，terminal 子进程从已固定目录 fd 切换 cwd。审批后路径被替换为符号链接、非目录或受保护路径时，本次调用失败且批准不可复用。
 
-来自网页、浏览器、知识、记忆、session 和技能附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
+来自网页、浏览器、MCP、记忆、session 和 Skill 附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
 
-`sylver_platform` 只出现在规范私人 scope。它使用固定 action union 回调 Platform，不允许模型提供网络位置、认证或所有权字段；读取动作无需审批，创建任务、开始任务、记录活动、Wiki 提案和普通审批评论只允许交互式 Run 并逐次审批。审批对象绑定完整参数；Runtime 在任何脱敏前按原始完整参数计算 UTF-8 大小并拒绝不可见控制字符，通过后才生成完整、脱敏的短正文展示。原始参数或展示投影任一超过审批上限都在调用前失败关闭，不能截断、仅显示长度或借脱敏收缩绕过。Runtime 在发送任何写动作前标记副作用，且不暴露审批决定、跳过审查、强制完成、员工管理、通用 HTTP 或破坏性删除动作。
+`mcp` 是固定的通用工具，不把每个外部 server 的动态 schema 注册为新的顶层 Runtime 工具。`list` 返回当前清单中的 server 和其 `tools/list` 有界结果；`call` 接受清单内 server id、tool name 与有界 JSON arguments，并逐次请求用户批准。Runtime 通过 Manager 在当前 Sandbox 内调用镜像自带的一次性 stdio 客户端；客户端以 argv 而非 shell 启动清单中的命令，完成 `initialize → notifications/initialized → tools/list|tools/call` 后退出。清单、命令、环境、工作目录、协议消息和返回体都有大小、数量、路径与超时上限；server stderr 和不匹配的 JSON-RPC 消息不能越过工具结果边界。模型不能为一次调用改写 command、env、cwd、URL、owner、scope 或 transport。首版不实现 Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接或后台 server；需要这些能力时由用户安装一个本地 stdio 适配器。
 
 terminal 的前台进程在其有界工具 deadline 内以显式执行生命周期保持 Run 活动，不能只依赖与空闲 watchdog 竞争的定时心跳；有明确终点且能在工具上限内结束的复制、转换、扫描和批处理必须优先以前台方式执行，并给出足够的 `timeout_ms`。`background=true` 时模型还可以声明 Runtime-only 的 `background_kind=task|service`，省略时固定为 `task`；非后台调用不得携带该字段。`task` 表示当前 session 必须确认终点的有界工作：Runtime 从成功的 terminal 结果把 process id、执行 target 和登记时间写入独立、owner-only、原子替换且绑定精确 scope/lifecycle/session 的责任 sidecar；只有同一 session 的 `process.wait|read|kill` 对同一 id 与 target 返回 `completed|failed|cancelled` 才解除。wait timeout、`running`、`orphaned`、Runtime 重启或上一 Run 进入 `needs_review` 都不算完成。后续 Run 必须从 sidecar 恢复并以可信 Runtime 状态注入这些责任。模型试图在仍有活动 task 时结束，Runtime 进行有界延续并要求 `process.wait`，预算耗尽后强制 `needs_review`，即使没有其它副作用也不能报告成功；sidecar 损坏或身份漂移同样失败关闭。`service` 表示用户确实要求独立存续的长期服务，不登记完成责任且不阻止 Run 结束，但模型仍应检查其就绪状态。`background_kind` 本身不发送给 Manager；Runtime 只为 task 派生闭合的 completion-required 元数据，Manager 的执行绑定和审计仍只依据规范 command、target、cwd、background 与 timeout。
 
@@ -119,17 +123,17 @@ Runtime 不从最终回复中的“继续”“完成”文字猜测决策。rec
 
 ## 记忆与技能注入
 
-顶层 Run 启动前，Runtime 尝试召回当前 Agent scope 内的 Agent 记忆和用户资料记忆；失败不阻止 Run。两个 target 都不能跨 Agent 召回，公共知识只从平台知识库检索。注入采用独立字符预算、完整记录边界和明确的不可信数据标签。
+顶层 Run 启动前，Runtime 尝试召回当前 Agent scope 内的 Agent 记忆和用户资料记忆；失败不阻止 Run。两个 target 都不能跨 Agent 召回；共享资料由用户放入明确共享的外部系统或频道文件，而不是借记忆跨 Agent 传播。注入采用独立字符预算、完整记录边界和明确的不可信数据标签。
 
 只有规范私人、顶层、交互式 Run 可以自动写入或整理正式记忆，不再经过候选审批。记忆只保存稳定身份、长期偏好、持续约束和跨会话有价值的事实；任务进度、临时 TODO、一次性路径或当前回复内容不得写入长期记忆，重复或过时事实应合并或替换。计划任务、邮件唤醒、频道和委派 Run 默认只读记忆，不能被外部内容诱导修改。可用技能只在系统提示中注入精简索引；完整 `SKILL.md` 及支持文件必须由 Agent 按需加载。
 
-每个主 Agent 的系统提示同时说明 Sandbox 逻辑工作区 `/workspace` 和由可信部署配置派生的当前宿主映射。Agent 默认在工作区创建并保存交付物，保持目录有序，并在确认无用后清理自己产生的临时中间文件；不得以“整理”为由删除上传附件、用户文件或含义不明的内容。宿主映射只用于帮助理解路径关系，不改变 Sandbox 默认执行目标，也不进入公共状态、数据库或普通工具 metadata。
+每个主 Agent 的系统提示同时说明 Sandbox 逻辑工作区 `/workspace` 和由可信部署配置派生的当前宿主映射。Agent 默认在工作区创建并保存交付物，保持目录有序，并在确认无用后清理自己产生的临时中间文件；不得以“整理”为由删除上传附件、用户文件或含义不明的内容。提示还明确给出 Skill/MCP 标准路径和重定向规则：收到其它客户端的安装说明时只提取可移植包、命令与参数，改写目标路径到 `.agent-platform`，不创建 `.claude` 等影子配置。宿主映射只用于帮助理解路径关系，不改变 Sandbox 默认执行目标，也不进入公共状态、数据库或普通工具 metadata。
 
 ## 学习复盘 Run
 
 Platform 可创建 `metadata.review_mode=memory_skill`、`trigger=learning_review`、`unattended=true` 的内部 Run。Runtime 只在规范私人顶层 scope、无 parent/delegation、带正整数 `review_job_id` 和来源消息，且 `session_id=learning-review-<review_job_id>`、`metadata.idempotency_key=agent-learning-review:<review_job_id>` 时接受该组合。`learning-review-<正整数>` session 和 `agent-learning-review:<正整数>` 幂等命名空间只保留给完整复盘身份；普通 Run 即使不声明 review metadata 也不能占用。校验发生在排队和 session 初始化前；普通请求不能通过单独设置字段或借用普通 session 取得复盘权限。Platform 提交复盘时必须进入与普通 Run 相同的每 scope lifecycle start barrier，在持有门闩时立即重验账号、权限、lifecycle、来源消息和 running job，并把门闩保持到 Runtime 明确接受 Run。停用、撤权或显式 lifecycle reset 必须终结该 scope 的 queued/running 复盘任务，并在同一 lifecycle 门闩下清理先于 reset 被接受的 Run。接受回调再次发现 job 或 lifecycle 已失效时还必须终结 job 并取消该 Run，使旧 lifecycle 的复盘不可在清理完成后留存。
 
-复盘沿用 Hermes 的“先交付回复，再独立审查”原则，但使用平台持久任务而不是进程内 daemon。它使用独立 session 和有界近期历史，不接受追加输入，不委派，不显示流式内容，也不写父 session；终态后 Runtime 精确删除该临时 session。复盘每次最多发起 `16` 个模型 turn；若全局 `maxTurnsPerRun` 更小则取较小值，不得通过调高普通 Run 上限扩大这条免审批自动写路径。每个 review job 另有由 Platform 权威执行且跨重启保留的二十单位总变更预算：memory 单动作、reconcile 子动作和 Skill create/patch 共享计费，读取免费；工具说明与复盘系统提示必须明确该限制，Runtime 自身不能把一次 reconcile 错算成一次。前台工具轨迹只保存有界、安全摘要；`skill.load` 与 `skill.read` 必须保留严格校验后的 Skill id，使复盘能优先检查本轮实际使用的 Skill，`skill.read` 可附安全相对文件路径，但 Skill 正文、patch 内容和工具结果不得进入轨迹。工具集合硬限制为 memory 与 skill：memory 可读并可 `store|replace|forget|reconcile`，不能 clear；skill 可 `list|load|read|create|patch`，现有 Skill 必须先在同一 Run load/read。terminal、process、文件、web、browser、mail、schedule、knowledge、session 和 delegate 都不存在于模型工具表。
+复盘沿用 Hermes 的“先交付回复，再独立审查”原则，但使用平台持久任务而不是进程内 daemon。它使用独立 session 和有界近期历史，不接受追加输入，不委派，不显示流式内容，也不写父 session；终态后 Runtime 精确删除该临时 session。复盘每次最多发起 `16` 个模型 turn；若全局 `maxTurnsPerRun` 更小则取较小值，不得通过调高普通 Run 上限扩大这条免审批自动写路径。每个 review job 另有由 Platform 权威执行且跨重启保留的二十单位总变更预算：memory 单动作、reconcile 子动作和 Skill create/patch 共享计费，读取免费；工具说明与复盘系统提示必须明确该限制，Runtime 自身不能把一次 reconcile 错算成一次。前台工具轨迹只保存有界、安全摘要；`skill.load` 与 `skill.read` 必须保留严格校验后的 Skill id，使复盘能优先检查本轮实际使用的 Skill，`skill.read` 可附安全相对文件路径，但 Skill 正文、patch 内容和工具结果不得进入轨迹。工具集合硬限制为 memory 与 skill：memory 可读并可 `store|replace|forget|reconcile`，不能 clear；skill 可 `list|load|read|create|patch`，现有 Skill 必须先在同一 Run load/read。terminal、process、文件、web、browser、mail、mcp、schedule、session 和 delegate 都不存在于模型工具表。
 
 复盘中的 memory/skill 允许动作不弹用户审批，但 Runtime Gateway 必须在 memory 读写和全部 Skill 请求中透传完整的可信复盘主体：parent/delegation、trigger、unattended、review mode/job、owner、source message、scope 和 lifecycle。Python Gateway 在任何记忆查询、Skill 读取或写入之前都必须反查对应 `agent_learning_review` durable job 仍在 running，并重新校验账号激活与权限、owner、canonical scope、lifecycle 与 source message；旧 lifecycle、终态 job 或已撤权账号发出的延迟读请求必须在访问数据前以 403 失败关闭。复盘 Skill `list/load/read` 的最终复验、文件读取和 read-ledger 登记处于同一个 lifecycle gate 与 `BEGIN IMMEDIATE` 边界内，但不扣变更预算。Skill 创建来源由 Gateway 标为 agent；patch 只能作用于未 pin、active 且 agent-owned 的包。任何校验失败、模型失败或临时 session 清理失败都不能撤回或改写前台回复，也不能递归触发另一轮学习。
 

@@ -10,7 +10,7 @@ Platform 只接受 target-only 容器基线：`AGENT_PLATFORM_DEPLOYMENT_MODE` �
 |---|---|---|
 | `~/.config/agent-platform/manager.toml` | Manager | 公网监听、release channel、registry、数据根、更新轮询和 Docker 参数 |
 | Manager secret 文件 | Manager | control/executor token 与 registry 凭据 |
-| SQLite `settings` | Platform | 产品设置、OAuth、Telegram、模型、知识和可在管理界面更新的 secret |
+| SQLite `settings` | Platform | 产品设置、OAuth、Telegram、模型和可在管理界面更新的 secret |
 | release manifest | CI / Manager | 源 commit、协议/数据库版本、Manager 校验和和镜像 digest |
 | Manager 生成的容器环境 | Manager | 固定容器网络、mount、内部 endpoint、token file 和运行限制 |
 | Agent scope metadata | Platform / Manager | 主 Agent identity、workspace 相对标识和 Sandbox 生命周期 |
@@ -77,7 +77,7 @@ Platform 容器只接受 Manager 生成的 target-only 最小环境：
 - 内部监听 host/port、public base URL 和 trusted proxy；
 - Agent Runtime、Camoufox、SearXNG 与 Firecrawl 的私有 service URL；
 - 对应内部 token file；
-- 媒体、HTTP/SSE 并发、附件配额、job lease、知识索引 retry、Telegram delivery 与 schedule poll 等运行限制；
+- 媒体、HTTP/SSE 并发、附件配额、job lease、Telegram delivery 与 schedule poll 等运行限制；
 - `AGENT_PLATFORM_MAX_CONCURRENT_UPLOADS` 是独立于普通 HTTP worker 的上传并发上限，默认 `4`；`AGENT_PLATFORM_UPLOAD_IDLE_TIMEOUT_SECONDS` 是相邻两次 socket 读取之间的空闲上限，默认 `120` 秒。它们都不构成上传总耗时上限。
 
 这些字段都是 Manager 生成的容器启动接口，不是生产部署的用户配置入口。新增字段必须先归属 Manager TOML、Platform SQLite 或 release manifest 之一。Platform 不读取其它环境前缀，也不提供双读或自动转换。
@@ -114,17 +114,13 @@ public URL、trusted proxy 和 session TTL 可影响请求处理。session TTL �
 
 模型 provider 只接受受支持 OAuth 类型，model ID 必须来自当前 OAuth 账号目录与 Runtime 实时能力目录的交集。`agent_runtime_model=""` 表示部署默认使用自动推荐，账号 `model_name=""` 表示继承该部署策略；新实例和未显式选择模型的账号不持久化某个具体产品版本作为默认值。Platform 在需要执行时以 OAuth 供应商顺序解析安全交集的推荐候选；账号未完成 OAuth、当前凭据从未成功获取目录或交集为空时，目录与自动选择明确不可用，不能使用完整 Runtime 清单或固定版本回退。已有显式选择不被目录故障改写，但它只有仍在当前交集中才能取得执行 Token；OAuth 重验和只修改其它 Runtime 字段不能填充或覆盖模型设置，切换 provider 且没有同时提供模型时把部署模型恢复为空。更新这些设置使用单一事务并作用于后续 Run；固定 Runtime 容器的生命周期只属于 Manager，Platform 不因模型设置变化重启它。
 
-### 知识与集成
+### 集成
 
-知识配置只包含 `knowledge_embedding_base_url`、`knowledge_embedding_model`、可选 `knowledge_embedding_dimensions`、`knowledge_embedding_batch_size` 和 secret `KNOWLEDGE_EMBEDDING_API_KEY`。base URL 必须是不含凭据的 HTTPS URL（测试只允许精确回环 HTTP），model 和数值字段有服务端长度/范围上限。API 只回传 `credential_configured` 和有界 mask，不回填 key。保存新配置前先执行最小 embedding 探测，成功后原子保存并调度新 generation 重建。缺少 API key 时知识功能 disabled，不启动本地模型也不改走 FTS/LIKE。
-
-知识文件导入复用平台上传边界：单文件最多 50 MiB、单请求最多十个且总计最多 100 MiB，HTTP 客户端不设总墙钟超时，服务端在连续 120 秒未收到字节时终止。提取后的每份规范正文仍受知识正文字符上限约束；ZIP 文档另有不可配置的安全条目数和累计展开大小硬上限，不能通过管理员设置放宽。
-
-托管 Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key、知识 Embeddings API key 和 Telegram secret 由 Platform secret store 管理。
+托管 Firecrawl/SearXNG/Camoufox 始终来自 release manifest，不提供通过数据库切换源码 repo、任意 endpoint 或 command 的生产入口。Firecrawl API key 和 Telegram secret 由 Platform secret store 管理。
 
 私人邮箱账户使用 IMAP/SMTP host、port、TLS 模式、用户名、启用状态、轮询间隔和收信唤醒开关；应用密码写入独立凭据行且 API 只返回 `credential_configured`。普通用户只能管理自己的账户。轮询间隔有服务端上下限，更新维护状态统一暂停轮询、投递与唤醒。
 
-Sylver Lining 工作平台连接属于每用户产品设置，不是 Manager 或容器环境配置。提供方 origin 固定为 `https://devops.sylver-lining.org`；普通用户通过 `/api/private-agent/integrations/sylver-platform` 提交自己的候选 Personal API Token，管理员通过 `/api/admin/users/{user_id}/integrations/sylver-platform` 代表目标账号读取、确认替换或断开，并通过其 `/verify` 子资源预览候选远端身份。Platform 在每次保存前请求 `/api/auth/me` 验证并核对远端身份，再把 Token 写入独立凭据行。读取只返回固定 origin、身份投影和 `credential_configured`。origin 不提供环境变量或产品覆盖，凭据不进入 Sandbox、Runtime metadata 或开发期上游 Git 凭据；管理员入口也不能回读任何凭据表示。
+Skill/MCP 不属于管理员全局设置。每个主 Agent 的唯一用户配置位于其工作区：`.agent-platform/skills/<skill-id>/`、`.agent-platform/mcp.json` 和 `.agent-platform/mcp/<server-id>/`。MCP 清单顶层只接受 `mcpServers`；每项只接受 `command`、可选字符串数组 `args`、字符串对象 `env` 和工作区内 `cwd`。保存文件后下一次 `skill.list/load/read` 或 `mcp.list/call` 自动读取，不提供 reload、兼容目录或数据库副本。Sylver Lining 等服务商由用户自行按其 Skill/MCP 安装说明接入，平台没有专用 origin、Token 或账号绑定配置。
 
 ### Telegram 与自动更新
 
@@ -145,7 +141,7 @@ Runtime 没有可由环境选择的 local executor 模式；Manager executor soc
 
 ## Secret
 
-Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl、Knowledge Embeddings、Telegram 和每用户 Sylver Lining Personal API Token。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些 secret。
+Platform secret store 保存 OAuth、session、Agent tool、Runtime、Firecrawl 和 Telegram secret。Manager secret 目录保存 registry 凭据与彼此分离的 control/executor token。二者不得相互整库注入；Sandbox 不接收这些平台 secret。用户自行写入 MCP 清单的环境值属于该 Agent 工作区文件和备份，不升级为 Platform secret，也不得出现在提示词、工作记录或日志。
 
 `secret` 标志不等于静态加密。安全性依赖数据目录所有权和文件权限；界面不得宣称“加密存储”。secret 值不能进入文档、日志、Run metadata、release manifest、operation journal 或 Git。
 

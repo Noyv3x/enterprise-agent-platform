@@ -21,10 +21,4 @@ describe("admin translations", () => {
     expect(translate("en", "admin.accounts.impersonateConfirm", { name: "Avery" }))
       .toContain("Avery");
   });
-
-  it("localizes the knowledge embedding states in all interface languages", () => {
-    expect(translate("zh-CN", "admin.knowledge.status.disabled")).toBe("已禁用");
-    expect(translate("en", "admin.knowledge.status.indexing")).toBe("Indexing");
-    expect(translate("zh-TW", "admin.knowledge.status.degraded")).toBe("異常");
-  });
 });

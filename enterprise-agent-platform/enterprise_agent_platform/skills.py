@@ -15,10 +15,16 @@ import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from .prompt_security import prompt_threat_reasons
-from .secure_fs import ensure_private_directory
+from .secure_fs import (
+    UnsafePrivatePathError,
+    ensure_private_directory,
+    open_private_child_directory_fd,
+    open_private_directory_fd,
+    verify_private_child_directory_fd,
+)
 
 
 MAX_SKILLS_PER_SCOPE = 100
@@ -28,6 +34,7 @@ MAX_DESCRIPTION_CHARS = 1024
 MAX_INSTRUCTIONS_BYTES = 64 * 1024
 MAX_TAGS = 20
 MAX_SUPPORT_FILES = 64
+MAX_SUPPORT_DIRECTORIES = MAX_SUPPORT_FILES
 MAX_SUPPORT_FILE_BYTES = 512 * 1024
 MAX_SUPPORT_TOTAL_BYTES = 5 * 1024 * 1024
 DEFAULT_PROMPT_INDEX_CHARS = 32 * 1024
@@ -47,23 +54,7 @@ BUNDLED_METADATA_FILES = frozenset(
 )
 DEFAULT_BUNDLED_SKILLS_DIR = Path(__file__).with_name("bundled_skills")
 _SKILL_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
-_SCOPE_CREATE_ORPHAN_RE = re.compile(
-    r"^\.create-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-[0-9a-f]{12}$"
-)
-_SCOPE_DELETE_ORPHAN_RE = re.compile(
-    r"^\.delete-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-[0-9a-f]{12}$"
-)
-_SCOPE_SUPPORT_DELETE_ORPHAN_RE = re.compile(
-    r"^\.support-delete-[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?-[0-9a-f]{16}$"
-)
-_SCOPE_USAGE_WRITE_ORPHAN_RE = re.compile(
-    r"^\.\.skill-usage\.json\.[0-9a-f]{16}\.tmp$"
-)
 _SUPPORT_WRITE_ORPHAN_RE = re.compile(r"^\..+\.[0-9a-f]{16}\.tmp$")
-_SKILL_ROOT_WRITE_ORPHAN_RES = (
-    re.compile(r"^\.SKILL\.md\.[0-9a-f]{16}\.tmp$"),
-    re.compile(r"^\.\.skill\.json\.[0-9a-f]{16}\.tmp$"),
-)
 _FRONTMATTER_KEYS = ("name", "description", "version", "category", "tags")
 _MAX_SKILL_DOCUMENT_BYTES = MAX_INSTRUCTIONS_BYTES + 16 * 1024
 _MAX_SIDECAR_BYTES = 16 * 1024
@@ -112,10 +103,9 @@ SkillError = SkillStoreError
 class SkillStore:
     """Filesystem-backed, per-Agent Skill packages with bundled defaults.
 
-    Scope keys never appear in filesystem paths. Each key is mapped to a
-    SHA-256 directory below ``<data_dir>/agent-skills``. The package's
-    ``SKILL.md`` is portable; the private ``.skill.json`` sidecar contains only
-    platform lifecycle state.
+    User packages live below the current scope's workspace at
+    ``.agent-platform/skills``. The package's ``SKILL.md`` is portable; the
+    Platform lifecycle state lives outside the Agent-mounted workspace.
 
     Repository-owned packages below ``bundled_skills`` are a global, read-only
     layer. They are visible in every scope without copying release files into
@@ -125,25 +115,48 @@ class SkillStore:
 
     def __init__(
         self,
-        data_dir: Path | str,
+        workspace_root: Path | str,
+        workspace_for_scope: Callable[[str], Path | str],
         *,
+        state_root: Path | str | None = None,
         bundled_skills_dir: Path | str | None = DEFAULT_BUNDLED_SKILLS_DIR,
     ):
-        requested_data_dir = Path(data_dir).expanduser()
+        requested_workspace_root = Path(workspace_root).expanduser()
         try:
-            ensured_data_dir = ensure_private_directory(requested_data_dir)
-            self.data_dir = ensured_data_dir.resolve(strict=True)
-            self.root = ensure_private_directory(self.data_dir / "agent-skills").resolve(
-                strict=True
-            )
+            self.workspace_root = ensure_private_directory(
+                requested_workspace_root
+            ).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
             raise SkillStoreError(
                 500,
                 f"cannot prepare Skill storage: {exc}",
                 code="skill_storage_unavailable",
             ) from exc
+        self._workspace_for_scope = workspace_for_scope
+        requested_state_root = (
+            Path(state_root).expanduser()
+            if state_root is not None
+            else self.workspace_root.parent / "agent-skill-state"
+        )
+        try:
+            self.state_root = ensure_private_directory(requested_state_root).resolve(
+                strict=True
+            )
+            try:
+                self.state_root.relative_to(self.workspace_root)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError("Skill state storage must be outside workspaces")
+        except (OSError, RuntimeError) as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot prepare Skill state storage: {exc}",
+                code="skill_storage_unavailable",
+            ) from exc
         self._scope_locks_guard = threading.Lock()
         self._scope_thread_locks: dict[str, threading.RLock] = {}
+        self._operation = threading.local()
         self._bundled_root: Path | None = None
         self._bundled_records: dict[str, dict[str, Any]] = {}
         self._bundled_skill_dirs: dict[str, Path] = {}
@@ -351,62 +364,93 @@ class SkillStore:
                 "created_at": now,
                 "updated_at": now,
             }
-            target = scope_dir / skill_id
-            staging = scope_dir / f".create-{skill_id}-{secrets.token_hex(6)}"
+            scope_fd = self._operation.paths[str(scope_dir)]
+            staging_name = f".create-{skill_id}-{secrets.token_hex(6)}"
+            staging_dir: Path | None = None
             target_created = False
+
+            def rollback_package() -> None:
+                if staging_dir is None:
+                    return
+                entry_name = skill_id if target_created else staging_name
+                try:
+                    _remove_pinned_directory_entry(
+                        scope_fd,
+                        entry_name,
+                        self._operation.paths[str(staging_dir)],
+                    )
+                except (OSError, UnsafePrivatePathError):
+                    pass
+                if target_created:
+                    self._restore_usage_state(scope_dir, old_usage_bytes)
+                    _remove_tree_quietly(self._state_directory() / skill_id)
+
             try:
-                staging.mkdir(mode=0o700)
-                staging.chmod(0o700)
+                os.mkdir(staging_name, mode=0o700, dir_fd=scope_fd)
+                staging_dir = self._pin_child_directory(scope_dir, staging_name)
                 _atomic_write_bytes(
-                    staging / "SKILL.md",
+                    staging_dir / "SKILL.md",
                     _render_skill_document(document).encode("utf-8"),
                 )
+                staging_fd = self._operation.paths[str(staging_dir)]
+                verify_private_child_directory_fd(
+                    scope_fd,
+                    staging_name,
+                    staging_fd,
+                    mode=None,
+                )
+                os.rename(
+                    staging_name,
+                    skill_id,
+                    src_dir_fd=scope_fd,
+                    dst_dir_fd=scope_fd,
+                )
+                target_created = True
+                verify_private_child_directory_fd(
+                    scope_fd,
+                    skill_id,
+                    staging_fd,
+                    mode=None,
+                )
+                _fsync_directory(scope_dir)
+                created_skill_dir = staging_dir
+                self._operation.skill_ids[str(created_skill_dir)] = skill_id
+                package_info = os.fstat(staging_fd)
+                sidecar["package_dev"] = int(package_info.st_dev)
+                sidecar["package_ino"] = int(package_info.st_ino)
+                sidecar["package_ctime_ns"] = int(package_info.st_ctime_ns)
+                state_skill_dir = ensure_private_directory(
+                    self._state_directory() / skill_id
+                )
                 _atomic_write_bytes(
-                    staging / ".skill.json",
+                    state_skill_dir / ".skill.json",
                     _render_sidecar(sidecar),
                 )
-                os.replace(staging, target)
-                target_created = True
-                _fsync_directory(scope_dir)
                 usage_state["skills"][skill_id] = _default_usage_record(
                     created_by=normalized_created_by
                 )
                 self._write_usage_state(scope_dir, usage_state)
             except SkillStoreError:
-                _remove_tree_quietly(staging)
-                if target_created:
-                    _remove_tree_quietly(target)
-                    self._restore_usage_state(
-                        scope_dir,
-                        old_usage_bytes,
-                    )
-                    _fsync_directory(scope_dir)
+                rollback_package()
                 raise
+            except UnsafePrivatePathError as exc:
+                rollback_package()
+                raise SkillStoreError(
+                    409,
+                    f"unsafe Skill create path: {exc}",
+                    code="unsafe_skill_path",
+                ) from exc
             except OSError as exc:
-                _remove_tree_quietly(staging)
-                if target_created:
-                    _remove_tree_quietly(target)
-                    self._restore_usage_state(
-                        scope_dir,
-                        old_usage_bytes,
-                    )
-                    _fsync_directory(scope_dir)
+                rollback_package()
                 raise SkillStoreError(
                     500,
                     f"cannot create Skill: {exc}",
                     code="skill_write_failed",
                 ) from exc
             except BaseException:
-                _remove_tree_quietly(staging)
-                if target_created:
-                    _remove_tree_quietly(target)
-                    self._restore_usage_state(
-                        scope_dir,
-                        old_usage_bytes,
-                    )
-                    _fsync_directory(scope_dir)
+                rollback_package()
                 raise
-            return self._read_record(target, include_instructions=False)
+            return self._read_record(created_skill_dir, include_instructions=False)
 
     def update(
         self,
@@ -467,7 +511,7 @@ class SkillStore:
             if document_unchanged:
                 try:
                     _atomic_write_bytes(
-                        skill_dir / ".skill.json",
+                        self._sidecar_path(skill_dir),
                         _render_sidecar(sidecar),
                     )
                 except OSError as exc:
@@ -485,61 +529,104 @@ class SkillStore:
 
         with self._locked_scope(scope_key) as scope_dir:
             skill_dir = self._require_skill_dir(scope_dir, skill_id)
-            normalized_id = skill_dir.name
+            normalized_id = self._skill_id_for_path(skill_dir)
             record = self._read_record(skill_dir, include_instructions=False)
             usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
             self._validate_package_tree(skill_dir)
-            resolved_scope = scope_dir.resolve(strict=True)
-            resolved_skill = skill_dir.resolve(strict=True)
-            if resolved_skill.parent != resolved_scope:
+            scope_fd = self._operation.paths[str(scope_dir)]
+            skill_fd = self._operation.paths[str(skill_dir)]
+            entry = os.stat(normalized_id, dir_fd=scope_fd, follow_symlinks=False)
+            opened = os.fstat(skill_fd)
+            if (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino):
                 raise SkillStoreError(
                     409,
-                    "refusing to delete a Skill outside its scope",
+                    "refusing to delete a replaced Skill package",
                     code="unsafe_skill_path",
                 )
-            tombstone = scope_dir / f".delete-{skill_id}-{secrets.token_hex(6)}"
+            tombstone_name = f".delete-{normalized_id}-{secrets.token_hex(6)}"
+            detached = False
+
+            def rollback_detach() -> None:
+                if not detached:
+                    return
+                try:
+                    verify_private_child_directory_fd(
+                        scope_fd,
+                        tombstone_name,
+                        skill_fd,
+                        mode=None,
+                    )
+                    try:
+                        os.stat(
+                            normalized_id,
+                            dir_fd=scope_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        return
+                    os.rename(
+                        tombstone_name,
+                        normalized_id,
+                        src_dir_fd=scope_fd,
+                        dst_dir_fd=scope_fd,
+                    )
+                    verify_private_child_directory_fd(
+                        scope_fd,
+                        normalized_id,
+                        skill_fd,
+                        mode=None,
+                    )
+                    self._restore_usage_state(scope_dir, old_usage_bytes)
+                    _fsync_directory(scope_dir)
+                except (OSError, SkillStoreError, UnsafePrivatePathError):
+                    pass
+
             try:
-                os.replace(skill_dir, tombstone)
+                os.rename(
+                    normalized_id,
+                    tombstone_name,
+                    src_dir_fd=scope_fd,
+                    dst_dir_fd=scope_fd,
+                )
+                detached = True
+                verify_private_child_directory_fd(
+                    scope_fd,
+                    tombstone_name,
+                    skill_fd,
+                    mode=None,
+                )
                 _fsync_directory(scope_dir)
                 usage_state["skills"].pop(normalized_id, None)
                 self._write_usage_state(scope_dir, usage_state)
             except OSError as exc:
-                if tombstone.exists() and not skill_dir.exists():
-                    try:
-                        os.replace(tombstone, skill_dir)
-                        self._restore_usage_state(scope_dir, old_usage_bytes)
-                        _fsync_directory(scope_dir)
-                    except (OSError, SkillStoreError):
-                        pass
+                rollback_detach()
                 raise SkillStoreError(
                     500,
                     f"cannot delete Skill: {exc}",
                     code="skill_write_failed",
                 ) from exc
             except SkillStoreError:
-                if tombstone.exists() and not skill_dir.exists():
-                    try:
-                        os.replace(tombstone, skill_dir)
-                        self._restore_usage_state(scope_dir, old_usage_bytes)
-                        _fsync_directory(scope_dir)
-                    except (OSError, SkillStoreError):
-                        pass
+                rollback_detach()
                 raise
             except BaseException:
-                if tombstone.exists() and not skill_dir.exists():
-                    try:
-                        os.replace(tombstone, skill_dir)
-                        self._restore_usage_state(scope_dir, old_usage_bytes)
-                        _fsync_directory(scope_dir)
-                    except (OSError, SkillStoreError):
-                        pass
+                rollback_detach()
                 raise
             try:
-                shutil.rmtree(tombstone)
-            except OSError:
-                # The visible deletion already committed. A hidden tombstone is
-                # safe to clean on maintenance and must not resurrect the Skill.
-                pass
+                _remove_pinned_directory_entry(
+                    scope_fd,
+                    tombstone_name,
+                    skill_fd,
+                )
+            except (OSError, UnsafePrivatePathError) as exc:
+                _remove_tree_quietly(self._state_directory() / normalized_id)
+                raise SkillStoreError(
+                    500,
+                    "Skill was detached but its private deletion cleanup failed",
+                    code="skill_delete_cleanup_failed",
+                ) from exc
+            _remove_tree_quietly(self._state_directory() / normalized_id)
             return record
 
     def patch(
@@ -705,6 +792,8 @@ class SkillStore:
                     code="support_size_exceeded",
                 )
 
+            sidecar = self._read_sidecar(skill_dir, expected_id=skill_id)
+            self._ensure_support_parents(skill_dir, relative)
             target = self._support_target(skill_dir, relative, must_exist=False)
             old_bytes: bytes | None = None
             if target.exists():
@@ -715,14 +804,12 @@ class SkillStore:
                     label="supporting file",
                 )
                 old_bytes = old_text.encode("utf-8")
-            self._ensure_support_parents(skill_dir, relative)
-            sidecar = self._read_sidecar(skill_dir, expected_id=skill_id)
             sidecar["updated_at"] = _utc_now()
             try:
                 _atomic_write_bytes(target, encoded)
                 _atomic_write_bytes(
-                    skill_dir / ".skill.json",
-                    _render_sidecar(sidecar),
+                    self._sidecar_path(skill_dir),
+                    _render_sidecar(self._bind_sidecar(sidecar, skill_dir)),
                 )
             except (OSError, SkillStoreError) as exc:
                 self._rollback_support_write(target, old_bytes)
@@ -763,7 +850,7 @@ class SkillStore:
                 os.replace(target, tombstone)
                 try:
                     _atomic_write_bytes(
-                        skill_dir / ".skill.json",
+                        self._sidecar_path(skill_dir),
                         _render_sidecar(sidecar),
                     )
                 except BaseException:
@@ -776,6 +863,10 @@ class SkillStore:
                     # A hidden scope tombstone is safe for later maintenance.
                     pass
                 self._remove_empty_support_parents(skill_dir, target.parent)
+                _atomic_write_bytes(
+                    self._sidecar_path(skill_dir),
+                    _render_sidecar(self._bind_sidecar(sidecar, skill_dir)),
+                )
             except SkillStoreError:
                 raise
             except OSError as exc:
@@ -851,8 +942,10 @@ class SkillStore:
         scope_digest = hashlib.sha256(normalized_scope.encode("utf-8")).hexdigest()
         scope_thread_lock = self._thread_lock_for_scope(scope_digest)
         with scope_thread_lock:
-            scope_dir = self._scope_directory(normalized_scope)
-            lock_path = scope_dir / ".lock"
+            state_dir = ensure_private_directory(self.state_root / scope_digest).resolve(
+                strict=True
+            )
+            lock_path = state_dir / ".lock"
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
@@ -874,13 +967,92 @@ class SkillStore:
                     code="unsafe_skill_path",
                 ) from exc
             try:
-                self._cleanup_owned_orphans(scope_dir)
-                yield scope_dir
+                scope_dir = self._scope_directory(normalized_scope)
+                try:
+                    scope_fd = open_private_directory_fd(scope_dir, mode=None)
+                except (OSError, UnsafePrivatePathError) as exc:
+                    raise SkillStoreError(
+                        409,
+                        f"unsafe Skill scope directory: {exc}",
+                        code="unsafe_skill_path",
+                    ) from exc
+                self._operation.fds = [scope_fd]
+                self._operation.paths = {f"/proc/self/fd/{scope_fd}": scope_fd}
+                self._operation.skill_ids = {}
+                self._operation.state_dir = state_dir
+                anchored_scope = Path(f"/proc/self/fd/{scope_fd}")
+                try:
+                    yield anchored_scope
+                finally:
+                    for opened_fd in reversed(self._operation.fds):
+                        try:
+                            os.close(opened_fd)
+                        except OSError:
+                            pass
+                    self._operation.fds = []
+                    self._operation.paths = {}
+                    self._operation.skill_ids = {}
+                    self._operation.state_dir = None
             finally:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_UN)
                 finally:
                     os.close(fd)
+
+    def _state_directory(self) -> Path:
+        state_dir = getattr(self._operation, "state_dir", None)
+        if not isinstance(state_dir, Path):
+            raise RuntimeError("Skill state accessed outside the scope lock")
+        return state_dir
+
+    def _pin_child_directory(self, parent: Path, name: str) -> Path:
+        parent_fd = getattr(self._operation, "paths", {}).get(str(parent))
+        if parent_fd is None:
+            raise RuntimeError("Skill directory accessed outside its pinned parent")
+        try:
+            child_fd = open_private_child_directory_fd(parent_fd, name, mode=None)
+        except FileNotFoundError as exc:
+            raise SkillStoreError(
+                409,
+                f"Skill directory changed while opening: {name}",
+                code="unsafe_skill_path",
+            ) from exc
+        except (OSError, UnsafePrivatePathError) as exc:
+            raise SkillStoreError(
+                409,
+                f"unsafe Skill directory {name}: {exc}",
+                code="unsafe_skill_path",
+            ) from exc
+        path = Path(f"/proc/self/fd/{child_fd}")
+        self._operation.fds.append(child_fd)
+        self._operation.paths[str(path)] = child_fd
+        return path
+
+    def _skill_id_for_path(self, skill_dir: Path) -> str:
+        skill_id = getattr(self._operation, "skill_ids", {}).get(str(skill_dir))
+        return skill_id or skill_dir.name
+
+    def _sidecar_path(self, skill_dir: Path, *, create_parent: bool = False) -> Path:
+        parent = self._state_directory() / self._skill_id_for_path(skill_dir)
+        if create_parent:
+            parent = ensure_private_directory(parent)
+        return parent / ".skill.json"
+
+    def _bind_sidecar(self, sidecar: dict[str, Any], skill_dir: Path) -> dict[str, Any]:
+        info = os.fstat(self._operation.paths[str(skill_dir)])
+        sidecar.update(
+            package_dev=int(info.st_dev),
+            package_ino=int(info.st_ino),
+            package_ctime_ns=int(info.st_ctime_ns),
+        )
+        return sidecar
+
+    def _pin_skill_directory(self, scope_dir: Path, skill_id: str) -> Path:
+        skill_dir = self._pin_child_directory(scope_dir, skill_id)
+        if not hasattr(self._operation, "skill_ids"):
+            self._operation.skill_ids = {}
+        self._operation.skill_ids[str(skill_dir)] = skill_id
+        return skill_dir
 
     def _thread_lock_for_scope(self, scope_digest: str) -> threading.RLock:
         with self._scope_locks_guard:
@@ -890,260 +1062,41 @@ class SkillStore:
                 self._scope_thread_locks[scope_digest] = lock
             return lock
 
-    def _cleanup_owned_orphans(self, scope_dir: Path) -> None:
-        """Remove only artifacts produced by interrupted store transactions."""
-
-        try:
-            entries = list(scope_dir.iterdir())
-        except OSError as exc:
-            raise SkillStoreError(
-                500,
-                f"cannot inspect Skill transaction artifacts: {exc}",
-                code="skill_read_failed",
-            ) from exc
-
-        scope_changed = False
-        for entry in entries:
-            name = entry.name
-            directory_orphan = bool(
-                _SCOPE_CREATE_ORPHAN_RE.fullmatch(name)
-                or _SCOPE_DELETE_ORPHAN_RE.fullmatch(name)
-            )
-            support_orphan = bool(
-                _SCOPE_SUPPORT_DELETE_ORPHAN_RE.fullmatch(name)
-            )
-            usage_orphan = bool(_SCOPE_USAGE_WRITE_ORPHAN_RE.fullmatch(name))
-            if not directory_orphan and not support_orphan and not usage_orphan:
-                continue
-            self._require_direct_child(scope_dir, entry, label="transaction artifact")
-            if directory_orphan:
-                self._validate_orphan_tree(entry, scope_dir)
-                try:
-                    shutil.rmtree(entry)
-                except OSError as exc:
-                    raise SkillStoreError(
-                        500,
-                        f"cannot clean Skill transaction artifact: {exc}",
-                        code="skill_write_failed",
-                    ) from exc
-            else:
-                _inspect_private_file_size(
-                    entry,
-                    max_bytes=(
-                        _MAX_USAGE_STATE_BYTES
-                        if usage_orphan
-                        else MAX_SUPPORT_FILE_BYTES
-                    ),
-                    missing_status=500,
-                    label=(
-                        "Skill usage write artifact"
-                        if usage_orphan
-                        else "support deletion artifact"
-                    ),
-                )
-                try:
-                    entry.unlink()
-                except OSError as exc:
-                    raise SkillStoreError(
-                        500,
-                        f"cannot clean support transaction artifact: {exc}",
-                        code="skill_write_failed",
-                    ) from exc
-            scope_changed = True
-
-        for entry in entries:
-            if entry.name.startswith(".") or not _SKILL_ID_RE.fullmatch(entry.name):
-                continue
-            try:
-                info = entry.lstat()
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                raise SkillStoreError(
-                    500,
-                    f"cannot inspect Skill package: {exc}",
-                    code="skill_read_failed",
-                ) from exc
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                # Normal package validation will report the precise corruption.
-                continue
-            self._cleanup_skill_write_orphans(entry)
-
-        if scope_changed:
-            _fsync_directory(scope_dir)
-
-    def _cleanup_skill_write_orphans(self, skill_dir: Path) -> None:
-        for entry in list(skill_dir.iterdir()):
-            if any(
-                pattern.fullmatch(entry.name)
-                for pattern in _SKILL_ROOT_WRITE_ORPHAN_RES
-            ):
-                self._require_direct_child(
-                    skill_dir,
-                    entry,
-                    label="Skill write artifact",
-                )
-                _inspect_private_file_size(
-                    entry,
-                    max_bytes=_MAX_SKILL_DOCUMENT_BYTES,
-                    missing_status=500,
-                    label="Skill write artifact",
-                )
-                try:
-                    entry.unlink()
-                except OSError as exc:
-                    raise SkillStoreError(
-                        500,
-                        f"cannot clean Skill write artifact: {exc}",
-                        code="skill_write_failed",
-                    ) from exc
-                _fsync_directory(skill_dir)
-
-        for directory_name in SUPPORT_DIRECTORIES:
-            support_root = skill_dir / directory_name
-            try:
-                root_info = support_root.lstat()
-            except FileNotFoundError:
-                continue
-            if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-                continue
-            for current_root, directory_names, file_names in os.walk(
-                support_root,
-                topdown=True,
-                followlinks=False,
-            ):
-                current = Path(current_root)
-                for directory_name_child in directory_names:
-                    child = current / directory_name_child
-                    child_info = child.lstat()
-                    if (
-                        stat.S_ISLNK(child_info.st_mode)
-                        or _SUPPORT_WRITE_ORPHAN_RE.fullmatch(directory_name_child)
-                    ):
-                        raise SkillStoreError(
-                            409,
-                            f"unsafe supporting directory: {child.relative_to(skill_dir)}",
-                            code="unsafe_skill_path",
-                        )
-                for file_name in file_names:
-                    if not _SUPPORT_WRITE_ORPHAN_RE.fullmatch(file_name):
-                        continue
-                    artifact = current / file_name
-                    self._require_contained_path(
-                        support_root,
-                        artifact,
-                        label="support write artifact",
-                    )
-                    _inspect_private_file_size(
-                        artifact,
-                        max_bytes=MAX_SUPPORT_FILE_BYTES,
-                        missing_status=500,
-                        label="support write artifact",
-                    )
-                    try:
-                        artifact.unlink()
-                    except OSError as exc:
-                        raise SkillStoreError(
-                            500,
-                            f"cannot clean support write artifact: {exc}",
-                            code="skill_write_failed",
-                        ) from exc
-                    _fsync_directory(current)
-
-    def _validate_orphan_tree(self, root: Path, scope_dir: Path) -> None:
-        self._require_direct_child(scope_dir, root, label="transaction artifact")
-        try:
-            root_info = root.lstat()
-        except OSError as exc:
-            raise SkillStoreError(
-                500,
-                f"cannot inspect transaction artifact: {exc}",
-                code="skill_read_failed",
-            ) from exc
-        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-            raise SkillStoreError(
-                409,
-                "Skill transaction directory is unsafe",
-                code="unsafe_skill_path",
-            )
-        for current_root, directory_names, file_names in os.walk(
-            root,
-            topdown=True,
-            followlinks=False,
-        ):
-            current = Path(current_root)
-            for child_name in directory_names:
-                child = current / child_name
-                info = child.lstat()
-                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    raise SkillStoreError(
-                        409,
-                        "Skill transaction artifact contains an unsafe directory",
-                        code="unsafe_skill_path",
-                    )
-                self._require_contained_path(
-                    root,
-                    child,
-                    label="transaction artifact",
-                )
-            for child_name in file_names:
-                child = current / child_name
-                _inspect_private_file_size(
-                    child,
-                    max_bytes=MAX_SUPPORT_TOTAL_BYTES + _MAX_SKILL_DOCUMENT_BYTES,
-                    missing_status=500,
-                    label="transaction artifact",
-                )
-                self._require_contained_path(
-                    root,
-                    child,
-                    label="transaction artifact",
-                )
-
-    @staticmethod
-    def _require_direct_child(parent: Path, child: Path, *, label: str) -> None:
-        try:
-            resolved_parent = parent.resolve(strict=True)
-            resolved_child = child.resolve(strict=True)
-        except OSError as exc:
-            raise SkillStoreError(
-                409,
-                f"cannot resolve {label} safely: {exc}",
-                code="unsafe_skill_path",
-            ) from exc
-        if resolved_child.parent != resolved_parent:
-            raise SkillStoreError(
-                409,
-                f"{label} escaped its parent",
-                code="unsafe_skill_path",
-            )
-
-    @staticmethod
-    def _require_contained_path(root: Path, path: Path, *, label: str) -> None:
-        try:
-            resolved_root = root.resolve(strict=True)
-            resolved_path = path.resolve(strict=True)
-            resolved_path.relative_to(resolved_root)
-        except (OSError, ValueError) as exc:
-            raise SkillStoreError(
-                409,
-                f"{label} escaped its root",
-                code="unsafe_skill_path",
-            ) from exc
-
     def _scope_directory(self, scope_key: str) -> Path:
         normalized = _validate_scope_key(scope_key)
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        candidate = self.root / digest
         try:
-            scope_dir = ensure_private_directory(candidate).resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
+            workspace = Path(self._workspace_for_scope(normalized)).expanduser()
+            workspace.relative_to(self.workspace_root)
+            workspace_fd = open_private_directory_fd(workspace, mode=None)
+            try:
+                for name in (".agent-platform", "skills"):
+                    try:
+                        os.mkdir(name, mode=0o700, dir_fd=workspace_fd)
+                    except FileExistsError:
+                        pass
+                    child_fd = open_private_child_directory_fd(
+                        workspace_fd, name, mode=None
+                    )
+                    os.fchmod(child_fd, 0o700)
+                    os.close(workspace_fd)
+                    workspace_fd = child_fd
+            finally:
+                os.close(workspace_fd)
+            internal = workspace / ".agent-platform"
+            scope_dir = internal / "skills"
+        except (OSError, RuntimeError, UnsafePrivatePathError) as exc:
             raise SkillStoreError(
                 409,
                 f"unsafe Skill scope directory: {exc}",
                 code="unsafe_skill_path",
             ) from exc
-        if scope_dir.parent != self.root:
+        except ValueError as exc:
+            raise SkillStoreError(
+                409,
+                "Skill workspace escaped its storage root",
+                code="unsafe_skill_path",
+            ) from exc
+        if internal.parent != workspace or scope_dir.parent != internal:
             raise SkillStoreError(
                 409,
                 "Skill scope escaped its storage root",
@@ -1152,43 +1105,57 @@ class SkillStore:
         return scope_dir
 
     def _iter_skill_dirs(self, scope_dir: Path) -> Iterator[Path]:
+        scope_fd = getattr(self._operation, "paths", {}).get(str(scope_dir))
+        if scope_fd is None:
+            raise RuntimeError("Skill scope is not pinned")
         try:
-            entries = sorted(scope_dir.iterdir(), key=lambda path: path.name)
+            entry_names: list[str] = []
+            with os.scandir(scope_fd) as entries:
+                for entry in entries:
+                    if entry.name.startswith("."):
+                        continue
+                    entry_names.append(entry.name)
+                    if len(entry_names) > MAX_SKILLS_PER_SCOPE:
+                        raise SkillStoreError(
+                            413,
+                            f"a scope may contain at most {MAX_SKILLS_PER_SCOPE} Skills",
+                            code="skill_quota_exceeded",
+                        )
         except OSError as exc:
             raise SkillStoreError(
                 500,
                 f"cannot list Skills: {exc}",
                 code="skill_read_failed",
             ) from exc
-        for entry in entries:
-            if entry.name.startswith("."):
-                continue
+        for name in sorted(entry_names):
             try:
-                info = entry.lstat()
+                info = os.stat(name, dir_fd=scope_fd, follow_symlinks=False)
             except OSError as exc:
                 raise SkillStoreError(
                     500,
-                    f"cannot inspect Skill package {entry.name}: {exc}",
+                    f"cannot inspect Skill package {name}: {exc}",
                     code="corrupt_skill",
                 ) from exc
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise SkillStoreError(
                     409,
-                    f"Skill package must be a non-symlink directory: {entry.name}",
+                    f"Skill package must be a non-symlink directory: {name}",
                     code="unsafe_skill_path",
                 )
-            if not _SKILL_ID_RE.fullmatch(entry.name):
+            if not _SKILL_ID_RE.fullmatch(name):
                 raise SkillStoreError(
                     500,
-                    f"invalid Skill package id on disk: {entry.name}",
+                    f"invalid Skill package id on disk: {name}",
                     code="corrupt_skill",
                 )
-            yield entry
+            yield self._pin_skill_directory(scope_dir, name)
 
     def _find_skill_dir(self, scope_dir: Path, skill_id: str) -> Path | None:
-        candidate = scope_dir / skill_id
+        scope_fd = getattr(self._operation, "paths", {}).get(str(scope_dir))
+        if scope_fd is None:
+            raise RuntimeError("Skill scope is not pinned")
         try:
-            info = candidate.lstat()
+            info = os.stat(skill_id, dir_fd=scope_fd, follow_symlinks=False)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -1203,22 +1170,7 @@ class SkillStore:
                 "Skill package must be a non-symlink directory",
                 code="unsafe_skill_path",
             )
-        try:
-            resolved = candidate.resolve(strict=True)
-            resolved_scope = scope_dir.resolve(strict=True)
-        except OSError as exc:
-            raise SkillStoreError(
-                409,
-                f"cannot resolve Skill package safely: {exc}",
-                code="unsafe_skill_path",
-            ) from exc
-        if resolved.parent != resolved_scope:
-            raise SkillStoreError(
-                409,
-                "Skill package escaped its scope",
-                code="unsafe_skill_path",
-            )
-        return candidate
+        return self._pin_skill_directory(scope_dir, skill_id)
 
     def _require_skill_dir(self, scope_dir: Path, skill_id: str) -> Path:
         normalized_id = _validate_skill_id(skill_id)
@@ -1261,11 +1213,11 @@ class SkillStore:
         *,
         include_instructions: bool,
     ) -> dict[str, Any]:
+        sidecar = self._read_or_materialize_sidecar(skill_dir)
         document = self._read_document(
             skill_dir,
             check_instruction_threats=include_instructions,
         )
-        sidecar = self._read_sidecar(skill_dir, expected_id=skill_dir.name)
         linked = self._scan_linked_files(skill_dir)
         record: dict[str, Any] = {
             "id": sidecar["id"],
@@ -1286,6 +1238,71 @@ class SkillStore:
             record["skill_dir"] = str(skill_dir.resolve(strict=True))
         return record
 
+    def _read_or_materialize_sidecar(self, skill_dir: Path) -> dict[str, Any]:
+        skill_id = self._skill_id_for_path(skill_dir)
+        sidecar_path = self._sidecar_path(skill_dir)
+        try:
+            sidecar_path.lstat()
+        except FileNotFoundError:
+            # Portable Skill packages installed by other clients commonly
+            # contain only SKILL.md. Validate the complete untrusted document
+            # before publishing Platform-owned lifecycle metadata.
+            self._read_document(skill_dir, check_instruction_threats=True)
+            self._scan_linked_files(skill_dir, check_sensitive_material=True)
+            scope_dir = skill_dir.parent
+            usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
+            timestamp = _utc_now()
+            sidecar = {
+                "schema_version": 1,
+                "id": skill_id,
+                "enabled": True,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "package_dev": int(
+                    os.fstat(self._operation.paths[str(skill_dir)]).st_dev
+                ),
+                "package_ino": int(
+                    os.fstat(self._operation.paths[str(skill_dir)]).st_ino
+                ),
+                "package_ctime_ns": int(
+                    os.fstat(self._operation.paths[str(skill_dir)]).st_ctime_ns
+                ),
+            }
+            try:
+                sidecar_path = self._sidecar_path(skill_dir, create_parent=True)
+                _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+                usage_state["skills"][skill_id] = _default_usage_record(
+                    created_by="user"
+                )
+                self._write_usage_state(scope_dir, usage_state)
+            except BaseException:
+                try:
+                    sidecar_path.unlink(missing_ok=True)
+                    _fsync_directory(skill_dir)
+                except OSError:
+                    pass
+                self._restore_usage_state(scope_dir, old_usage_bytes)
+                raise
+            return sidecar
+        except OSError as exc:
+            raise SkillStoreError(
+                500,
+                f"cannot inspect Skill sidecar: {exc}",
+                code="skill_read_failed",
+            ) from exc
+        try:
+            return self._read_sidecar(skill_dir, expected_id=skill_id)
+        except SkillStoreError as exc:
+            if exc.code != "stale_skill_state":
+                raise
+            # A deleted package may be recreated under the same id. Never let
+            # its old agent-owned authorization follow the new directory inode.
+            sidecar_path.unlink(missing_ok=True)
+            usage_state, _ = self._read_usage_state_snapshot(skill_dir.parent)
+            usage_state["skills"].pop(skill_id, None)
+            self._write_usage_state(skill_dir.parent, usage_state)
+            return self._read_or_materialize_sidecar(skill_dir)
+
     def _read_usage_state(self, scope_dir: Path) -> dict[str, Any]:
         state, _ = self._read_usage_state_snapshot(scope_dir)
         return state
@@ -1294,7 +1311,7 @@ class SkillStore:
         self,
         scope_dir: Path,
     ) -> tuple[dict[str, Any], bytes | None]:
-        path = scope_dir / _USAGE_STATE_FILE
+        path = self._state_directory() / _USAGE_STATE_FILE
         try:
             info = path.lstat()
         except FileNotFoundError:
@@ -1336,7 +1353,7 @@ class SkillStore:
             )
         try:
             _atomic_write_bytes(
-                scope_dir / _USAGE_STATE_FILE,
+                self._state_directory() / _USAGE_STATE_FILE,
                 rendered,
             )
         except OSError as exc:
@@ -1353,7 +1370,7 @@ class SkillStore:
     ) -> None:
         """Best-effort transaction rollback for a usage-state replacement."""
 
-        path = scope_dir / _USAGE_STATE_FILE
+        path = self._state_directory() / _USAGE_STATE_FILE
         try:
             if old_bytes is None:
                 path.unlink(missing_ok=True)
@@ -1469,7 +1486,7 @@ class SkillStore:
         reject_bundled_conflict: bool = False,
     ) -> None:
         document_path = skill_dir / "SKILL.md"
-        sidecar_path = skill_dir / ".skill.json"
+        sidecar_path = self._sidecar_path(skill_dir)
         old_document = _read_private_bytes(
             document_path,
             max_bytes=_MAX_SKILL_DOCUMENT_BYTES,
@@ -1522,7 +1539,10 @@ class SkillStore:
 
         try:
             _atomic_write_bytes(document_path, updated_bytes)
-            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+            _atomic_write_bytes(
+                sidecar_path,
+                _render_sidecar(self._bind_sidecar(sidecar, skill_dir)),
+            )
             self._write_usage_state(scope_dir, usage_state)
         except BaseException as exc:
             _restore_private_file(document_path, old_document)
@@ -1576,7 +1596,7 @@ class SkillStore:
                 code="support_size_exceeded",
             )
 
-        sidecar_path = skill_dir / ".skill.json"
+        sidecar_path = self._sidecar_path(skill_dir)
         sidecar = self._read_sidecar(skill_dir, expected_id=skill_id)
         old_sidecar = _read_private_bytes(
             sidecar_path,
@@ -1592,7 +1612,10 @@ class SkillStore:
 
         try:
             _atomic_write_bytes(target, updated_bytes)
-            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+            _atomic_write_bytes(
+                sidecar_path,
+                _render_sidecar(self._bind_sidecar(sidecar, skill_dir)),
+            )
             self._write_usage_state(scope_dir, usage_state)
         except BaseException as exc:
             _restore_private_file(target, old_target)
@@ -1665,6 +1688,7 @@ class SkillStore:
                     f"bundled Skill package is unsafe: {entry.name}",
                     code="bundled_skill_invalid",
                 )
+            self._bundled_skill_dirs[entry.name] = entry
             record = self._read_bundled_record(
                 entry,
                 include_instructions=False,
@@ -1678,7 +1702,6 @@ class SkillStore:
                 )
             names.add(folded_name)
             self._bundled_records[entry.name] = record
-            self._bundled_skill_dirs[entry.name] = entry
             if len(self._bundled_records) > MAX_SKILLS_PER_SCOPE:
                 raise SkillStoreError(
                     500,
@@ -1821,7 +1844,7 @@ class SkillStore:
         expected_id: str,
     ) -> dict[str, Any]:
         text, _ = _read_private_text(
-            skill_dir / ".skill.json",
+            self._sidecar_path(skill_dir),
             max_bytes=_MAX_SIDECAR_BYTES,
             missing_status=500,
             label=".skill.json",
@@ -1831,7 +1854,7 @@ class SkillStore:
         except json.JSONDecodeError as exc:
             raise SkillStoreError(
                 500,
-                f"invalid Skill sidecar in {skill_dir.name}",
+                f"invalid Skill sidecar in {expected_id}",
                 code="corrupt_skill",
             ) from exc
         required = {
@@ -1840,30 +1863,62 @@ class SkillStore:
             "enabled",
             "created_at",
             "updated_at",
+            "package_dev",
+            "package_ino",
+            "package_ctime_ns",
         }
         if not isinstance(value, dict) or set(value) != required:
             raise SkillStoreError(
                 500,
-                f"invalid Skill sidecar fields in {skill_dir.name}",
+                f"invalid Skill sidecar fields in {expected_id}",
                 code="corrupt_skill",
             )
         if value["schema_version"] != 1 or value["id"] != expected_id:
             raise SkillStoreError(
                 500,
-                f"Skill sidecar identity mismatch in {skill_dir.name}",
+                f"Skill sidecar identity mismatch in {expected_id}",
                 code="corrupt_skill",
+            )
+        if any(
+            isinstance(value[field], bool)
+            or not isinstance(value[field], int)
+            or value[field] < 0
+            for field in ("package_dev", "package_ino", "package_ctime_ns")
+        ):
+            raise SkillStoreError(
+                500,
+                f"invalid Skill package identity in {expected_id}",
+                code="corrupt_skill",
+            )
+        package_fd = getattr(self._operation, "paths", {}).get(str(skill_dir))
+        if package_fd is None:
+            raise RuntimeError("workspace Skill package is not pinned")
+        package_info = os.fstat(package_fd)
+        if (
+            value["package_dev"],
+            value["package_ino"],
+            value["package_ctime_ns"],
+        ) != (
+            package_info.st_dev,
+            package_info.st_ino,
+            package_info.st_ctime_ns,
+        ):
+            raise SkillStoreError(
+                409,
+                f"stale Skill state in {expected_id}",
+                code="stale_skill_state",
             )
         if not isinstance(value["enabled"], bool):
             raise SkillStoreError(
                 500,
-                f"invalid enabled state in {skill_dir.name}",
+                f"invalid enabled state in {expected_id}",
                 code="corrupt_skill",
             )
         for field in ("created_at", "updated_at"):
             if not isinstance(value[field], str) or not value[field]:
                 raise SkillStoreError(
                     500,
-                    f"invalid {field} in {skill_dir.name}",
+                    f"invalid {field} in {expected_id}",
                     code="corrupt_skill",
                 )
         return value
@@ -1874,34 +1929,54 @@ class SkillStore:
         *,
         allowed_root_entries: set[str] | None = None,
         ignore_generated_python_cache: bool = False,
+        check_sensitive_material: bool = False,
     ) -> list[tuple[str, int]]:
         linked: list[tuple[str, int]] = []
         total_bytes = 0
+        directory_count = 0
         allowed_entries = (
-            {"SKILL.md", ".skill.json", *SUPPORT_DIRECTORIES}
+            {"SKILL.md", *SUPPORT_DIRECTORIES}
             if allowed_root_entries is None
             else allowed_root_entries
         )
-        try:
+        root_fd = getattr(self._operation, "paths", {}).get(str(skill_dir))
+        if root_fd is None:
+            # Bundled Skills are repository-owned and never Agent-writable.
+            if skill_dir not in self._bundled_skill_dirs.values():
+                raise RuntimeError("workspace Skill package is not pinned")
             root_entries = list(skill_dir.iterdir())
+            for entry in root_entries:
+                if entry.name not in allowed_entries:
+                    raise SkillStoreError(
+                        500,
+                        f"unexpected file in Skill package: {entry.name}",
+                        code="corrupt_skill",
+                    )
+            return self._scan_bundled_linked_files(
+                skill_dir,
+                ignore_generated_python_cache=ignore_generated_python_cache,
+            )
+        try:
+            with os.scandir(root_fd) as entries:
+                for entry in entries:
+                    if entry.name not in allowed_entries:
+                        raise SkillStoreError(
+                            500,
+                            f"unexpected file in Skill package: {entry.name}",
+                            code="corrupt_skill",
+                        )
         except OSError as exc:
             raise SkillStoreError(
                 500,
                 f"cannot inspect Skill package: {exc}",
                 code="skill_read_failed",
             ) from exc
-        for entry in root_entries:
-            if entry.name not in allowed_entries:
-                raise SkillStoreError(
-                    500,
-                    f"unexpected file in Skill package: {entry.name}",
-                    code="corrupt_skill",
-                )
 
         for directory_name in sorted(SUPPORT_DIRECTORIES):
-            support_root = skill_dir / directory_name
             try:
-                root_info = support_root.lstat()
+                root_info = os.stat(
+                    directory_name, dir_fd=root_fd, follow_symlinks=False
+                )
             except FileNotFoundError:
                 continue
             except OSError as exc:
@@ -1916,73 +1991,147 @@ class SkillStore:
                     f"{directory_name} must be a non-symlink directory",
                     code="unsafe_skill_path",
                 )
+            directory_count += 1
+            if directory_count > MAX_SUPPORT_DIRECTORIES:
+                raise SkillStoreError(
+                    500,
+                    "Skill exceeds the supporting directory limit",
+                    code="corrupt_skill",
+                )
+            support_root = self._pin_child_directory(skill_dir, directory_name)
 
-            for current_root, directory_names, file_names in os.walk(
-                support_root,
-                topdown=True,
-                followlinks=False,
-            ):
-                current = Path(current_root)
-                directory_names.sort()
-                file_names.sort()
-                if ignore_generated_python_cache:
-                    for child_name in tuple(directory_names):
-                        if child_name != "__pycache__":
+            def scan(current: Path, relative_root: str) -> None:
+                nonlocal directory_count, total_bytes
+                current_fd = self._operation.paths[str(current)]
+                with os.scandir(current_fd) as entries:
+                    child_names = (entry.name for entry in entries)
+                    for child_name in child_names:
+                        info = os.stat(
+                            child_name, dir_fd=current_fd, follow_symlinks=False
+                        )
+                        relative = f"{relative_root}/{child_name}"
+                        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                            if ignore_generated_python_cache and child_name == "__pycache__":
+                                continue
+                            directory_count += 1
+                            if directory_count > MAX_SUPPORT_DIRECTORIES:
+                                raise SkillStoreError(
+                                    500,
+                                    "Skill exceeds the supporting directory limit",
+                                    code="corrupt_skill",
+                                )
+                            scan(self._pin_child_directory(current, child_name), relative)
                             continue
-                        cache_dir = current / child_name
-                        cache_info = cache_dir.lstat()
-                        if (
-                            stat.S_ISLNK(cache_info.st_mode)
-                            or not stat.S_ISDIR(cache_info.st_mode)
-                        ):
+                        if stat.S_ISLNK(info.st_mode):
                             raise SkillStoreError(
                                 409,
-                                (
-                                    "unsafe generated Python cache: "
-                                    f"{cache_dir.relative_to(skill_dir)}"
-                                ),
+                                f"unsafe supporting path: {relative}",
                                 code="unsafe_skill_path",
                             )
-                        directory_names.remove(child_name)
-                for child_name in directory_names:
-                    child = current / child_name
-                    info = child.lstat()
-                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                        raise SkillStoreError(
-                            409,
-                            f"unsafe supporting directory: {child.relative_to(skill_dir)}",
-                            code="unsafe_skill_path",
+                        if ignore_generated_python_cache and child_name.endswith((".pyc", ".pyo")):
+                            continue
+                        path = current / child_name
+                        size_bytes = _inspect_private_file_size(
+                            path,
+                            max_bytes=MAX_SUPPORT_FILE_BYTES,
+                            missing_status=500,
+                            label=f"supporting file {relative}",
                         )
-                for file_name in file_names:
-                    if (
-                        ignore_generated_python_cache
-                        and file_name.endswith((".pyc", ".pyo"))
-                    ):
+                        if check_sensitive_material:
+                            content = _read_private_bytes(
+                                path,
+                                max_bytes=MAX_SUPPORT_FILE_BYTES,
+                                missing_status=500,
+                                label=f"supporting file {relative}",
+                            )
+                            try:
+                                text = content.decode("utf-8")
+                            except UnicodeDecodeError:
+                                pass
+                            else:
+                                if _credential_material_reasons(text):
+                                    raise SkillStoreError(
+                                        400,
+                                        "supporting file contains apparent plaintext "
+                                        "credential material",
+                                        code="sensitive_skill_content",
+                                    )
+                        linked.append((relative, size_bytes))
+                        total_bytes += size_bytes
+                        if len(linked) > MAX_SUPPORT_FILES:
+                            raise SkillStoreError(
+                                500,
+                                "Skill exceeds the supporting file count limit",
+                                code="corrupt_skill",
+                            )
+                        if total_bytes > MAX_SUPPORT_TOTAL_BYTES:
+                            raise SkillStoreError(
+                                500,
+                                "Skill exceeds the supporting file size limit",
+                                code="corrupt_skill",
+                            )
+            scan(support_root, directory_name)
+        linked.sort(key=lambda item: item[0])
+        return linked
+
+    def _scan_bundled_linked_files(
+        self,
+        skill_dir: Path,
+        *,
+        ignore_generated_python_cache: bool,
+    ) -> list[tuple[str, int]]:
+        linked: list[tuple[str, int]] = []
+        total_bytes = 0
+        for directory_name in sorted(SUPPORT_DIRECTORIES):
+            support_root = skill_dir / directory_name
+            try:
+                root_info = support_root.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+                raise SkillStoreError(
+                    500,
+                    f"unsafe bundled supporting directory: {directory_name}",
+                    code="bundled_skill_invalid",
+                )
+            for current_root, directory_names, file_names in os.walk(
+                support_root, topdown=True, followlinks=False
+            ):
+                current = Path(current_root)
+                for child_name in directory_names:
+                    child_info = (current / child_name).lstat()
+                    if stat.S_ISLNK(child_info.st_mode):
+                        raise SkillStoreError(
+                            500,
+                            "bundled Skill contains a symlinked directory",
+                            code="bundled_skill_invalid",
+                        )
+                directory_names[:] = sorted(
+                    name for name in directory_names
+                    if not (ignore_generated_python_cache and name == "__pycache__")
+                )
+                for file_name in sorted(file_names):
+                    if ignore_generated_python_cache and file_name.endswith((".pyc", ".pyo")):
                         continue
                     path = current / file_name
-                    relative = path.relative_to(skill_dir).as_posix()
                     size_bytes = _inspect_private_file_size(
                         path,
                         max_bytes=MAX_SUPPORT_FILE_BYTES,
                         missing_status=500,
-                        label=f"supporting file {relative}",
+                        label="bundled supporting file",
                     )
-                    linked.append((relative, size_bytes))
+                    linked.append((path.relative_to(skill_dir).as_posix(), size_bytes))
                     total_bytes += size_bytes
-                    if len(linked) > MAX_SUPPORT_FILES:
+                    if (
+                        len(linked) > MAX_SUPPORT_FILES
+                        or total_bytes > MAX_SUPPORT_TOTAL_BYTES
+                    ):
                         raise SkillStoreError(
                             500,
-                            "Skill exceeds the supporting file count limit",
-                            code="corrupt_skill",
+                            "bundled Skill exceeds supporting file limits",
+                            code="bundled_skill_invalid",
                         )
-                    if total_bytes > MAX_SUPPORT_TOTAL_BYTES:
-                        raise SkillStoreError(
-                            500,
-                            "Skill exceeds the supporting file size limit",
-                            code="corrupt_skill",
-                        )
-        linked.sort(key=lambda item: item[0])
-        return linked
+        return sorted(linked)
 
     def _validate_package_tree(self, skill_dir: Path) -> None:
         # Reading package metadata verifies the document/sidecar UTF-8,
@@ -1999,7 +2148,7 @@ class SkillStore:
     ) -> None:
         desired = name.casefold()
         for skill_dir in skill_dirs:
-            if skill_dir.name == exclude_id:
+            if self._skill_id_for_path(skill_dir) == exclude_id:
                 continue
             existing = self._read_document(
                 skill_dir,
@@ -2050,7 +2199,7 @@ class SkillStore:
         sidecar: dict[str, Any],
     ) -> None:
         document_path = skill_dir / "SKILL.md"
-        sidecar_path = skill_dir / ".skill.json"
+        sidecar_path = self._sidecar_path(skill_dir)
         old_document = _read_private_bytes(
             document_path,
             max_bytes=_MAX_SKILL_DOCUMENT_BYTES,
@@ -2071,7 +2220,10 @@ class SkillStore:
                 _render_skill_document(document).encode("utf-8"),
             )
             document_replaced = True
-            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
+            _atomic_write_bytes(
+                sidecar_path,
+                _render_sidecar(self._bind_sidecar(sidecar, skill_dir)),
+            )
             sidecar_replaced = True
         except (OSError, SkillStoreError) as exc:
             try:
@@ -2096,13 +2248,26 @@ class SkillStore:
         *,
         must_exist: bool,
     ) -> Path:
-        target = skill_dir.joinpath(*relative.split("/"))
+        if str(skill_dir) not in getattr(self._operation, "paths", {}):
+            if skill_dir not in self._bundled_skill_dirs.values():
+                raise RuntimeError("workspace Skill package is not pinned")
+            target = skill_dir.joinpath(*relative.split("/"))
+            try:
+                target.resolve(strict=must_exist).relative_to(skill_dir.resolve(strict=True))
+            except (OSError, ValueError) as exc:
+                raise SkillStoreError(
+                    409,
+                    f"unsafe bundled supporting path: {relative}",
+                    code="unsafe_skill_path",
+                ) from exc
+            return target
         current = skill_dir
         parts = relative.split("/")
         for index, part in enumerate(parts):
-            current = current / part
+            parent = current
             try:
-                info = current.lstat()
+                parent_fd = self._operation.paths[str(parent)]
+                info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 if must_exist:
                     raise SkillStoreError(
@@ -2110,7 +2275,13 @@ class SkillStore:
                         f"supporting file not found: {relative}",
                         code="support_file_not_found",
                     )
-                break
+                if index != len(parts) - 1:
+                    raise SkillStoreError(
+                        409,
+                        f"supporting path parent disappeared: {relative}",
+                        code="unsafe_skill_path",
+                    )
+                return parent / part
             except OSError as exc:
                 raise SkillStoreError(
                     500,
@@ -2137,24 +2308,27 @@ class SkillStore:
                     f"supporting path parent is not a directory: {relative}",
                     code="unsafe_skill_path",
                 )
-        return target
+            if not is_last:
+                current = self._pin_child_directory(parent, part)
+        return current / parts[-1]
 
     def _ensure_support_parents(self, skill_dir: Path, relative: str) -> None:
         current = skill_dir
         for part in relative.split("/")[:-1]:
-            current = current / part
+            parent = current
+            parent_fd = self._operation.paths[str(parent)]
             try:
-                info = current.lstat()
+                info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
             except FileNotFoundError:
                 try:
-                    current.mkdir(mode=0o700)
-                    current.chmod(0o700)
+                    os.mkdir(part, mode=0o700, dir_fd=parent_fd)
                 except OSError as exc:
                     raise SkillStoreError(
                         500,
                         f"cannot create supporting directory: {exc}",
                         code="skill_write_failed",
                     ) from exc
+                current = self._pin_child_directory(parent, part)
                 continue
             if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
                 raise SkillStoreError(
@@ -2162,7 +2336,8 @@ class SkillStore:
                     f"unsafe supporting directory: {relative}",
                     code="unsafe_skill_path",
                 )
-            current.chmod(0o700)
+            current = self._pin_child_directory(parent, part)
+            os.fchmod(self._operation.paths[str(current)], 0o700)
 
     def _rollback_support_write(
         self,
@@ -2865,6 +3040,12 @@ def _read_private_bytes(
                 f"{label} must be a regular non-symlink file",
                 code="unsafe_skill_path",
             )
+        if info.st_nlink != 1:
+            raise SkillStoreError(
+                409,
+                f"{label} must not be hard-linked",
+                code="unsafe_skill_path",
+            )
         if require_single_link and info.st_nlink != 1:
             raise SkillStoreError(
                 409,
@@ -2936,6 +3117,12 @@ def _inspect_private_file_size(
                 f"{label} must be a regular non-symlink file",
                 code="unsafe_skill_path",
             )
+        if info.st_nlink != 1:
+            raise SkillStoreError(
+                409,
+                f"{label} must not be hard-linked",
+                code="unsafe_skill_path",
+            )
         if info.st_size > max_bytes:
             raise SkillStoreError(
                 413 if missing_status == 404 else 500,
@@ -2975,7 +3162,6 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        path.chmod(0o600)
         _fsync_directory(path.parent)
     except BaseException:
         try:
@@ -2992,16 +3178,60 @@ def _fsync_directory(path: Path) -> None:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return
+    fd = os.open(path, flags)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
+
+
+def _remove_pinned_directory_entry(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+) -> None:
+    """Erase one already-pinned private tree without resolving its pathname."""
+
+    remaining = [MAX_SUPPORT_DIRECTORIES + MAX_SUPPORT_FILES + 2]
+
+    def clear(current_fd: int) -> None:
+        names: list[str] = []
+        with os.scandir(current_fd) as entries:
+            for entry in entries:
+                remaining[0] -= 1
+                if remaining[0] < 0:
+                    raise UnsafePrivatePathError(
+                        "Skill deletion tree exceeds its limits"
+                    )
+                names.append(entry.name)
+        for child_name in names:
+            info = os.stat(child_name, dir_fd=current_fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                child_fd = open_private_child_directory_fd(
+                    current_fd,
+                    child_name,
+                    mode=None,
+                )
+                try:
+                    clear(child_fd)
+                    verify_private_child_directory_fd(
+                        current_fd,
+                        child_name,
+                        child_fd,
+                        mode=None,
+                    )
+                    os.rmdir(child_name, dir_fd=current_fd)
+                finally:
+                    os.close(child_fd)
+                continue
+            os.unlink(child_name, dir_fd=current_fd)
+        os.fsync(current_fd)
+
+    verify_private_child_directory_fd(parent_fd, name, directory_fd, mode=None)
+    clear(directory_fd)
+    verify_private_child_directory_fd(parent_fd, name, directory_fd, mode=None)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
 
 
 def _remove_tree_quietly(path: Path) -> None:

@@ -35,7 +35,6 @@ from .service import (
     ServiceError,
     UploadedFile,
     is_safe_inline_attachment_mime,
-    sanitize_attachment_filename,
 )
 from .secure_fs import ensure_private_directory
 
@@ -800,54 +799,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             token, user = service.impersonate_user(actor, int(m.group(1)))
             self._json({"user": user}, headers={"Set-Cookie": self._session_cookie(token)})
             return
-        m = re.fullmatch(
-            r"/api/admin/users/(\d+)/integrations/sylver-platform/verify",
-            path,
-        )
-        if m and method == "POST":
-            self._json(
-                service.verify_admin_sylver_platform_connection(
-                    actor,
-                    int(m.group(1)),
-                    self._body_json_closed_world(
-                        frozenset({"token"}),
-                        maximum_bytes=8 * 1024,
-                    ),
-                )
-            )
-            return
-        m = re.fullmatch(
-            r"/api/admin/users/(\d+)/integrations/sylver-platform",
-            path,
-        )
-        if m and method == "GET":
-            self._json(
-                service.get_admin_sylver_platform_connection(
-                    actor,
-                    int(m.group(1)),
-                )
-            )
-            return
-        if m and method == "PUT":
-            self._json(
-                service.put_admin_sylver_platform_connection(
-                    actor,
-                    int(m.group(1)),
-                    self._body_json_closed_world(
-                        frozenset({"token", "expected_remote_user_id"}),
-                        maximum_bytes=8 * 1024,
-                    ),
-                )
-            )
-            return
-        if m and method == "DELETE":
-            self._json(
-                service.delete_admin_sylver_platform_connection(
-                    actor,
-                    int(m.group(1)),
-                )
-            )
-            return
         m = re.fullmatch(r"/api/users/(\d+)", path)
         if m and method == "PUT":
             self._json({"user": service.update_user(actor, int(m.group(1)), self._body_json())})
@@ -1166,23 +1117,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/private-agent/telegram" and method == "DELETE":
             self._json(service.unlink_telegram_private_config(actor))
             return
-        if path == "/api/private-agent/integrations/sylver-platform" and method == "GET":
-            self._json(service.get_private_sylver_platform_connection(actor))
-            return
-        if path == "/api/private-agent/integrations/sylver-platform" and method == "PUT":
-            self._json(
-                service.put_private_sylver_platform_connection(
-                    actor,
-                    self._body_json_closed_world(
-                        frozenset({"token"}),
-                        maximum_bytes=8 * 1024,
-                    ),
-                )
-            )
-            return
-        if path == "/api/private-agent/integrations/sylver-platform" and method == "DELETE":
-            self._json(service.delete_private_sylver_platform_connection(actor))
-            return
         if path == "/api/private-agent/mail/accounts" and method == "GET":
             self._json(service.list_private_mail_accounts(actor))
             return
@@ -1295,34 +1229,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(service.token_usage_report(actor, days=int_arg(query, "days", 30), limit=int_arg(query, "limit", 200)))
             return
 
-        if path == "/api/knowledge/documents" and method == "GET":
-            self._json({"documents": service.list_knowledge_documents(actor)})
-            return
-        if path == "/api/knowledge/status" and method == "GET":
-            self._json(service.knowledge_status())
-            return
-        if path == "/api/knowledge/documents" and method == "POST":
-            self._json({"document": service.add_knowledge_document(actor, self._body_json())}, status=201)
-            return
-        if path == "/api/knowledge/documents/import" and method == "POST":
-            content_type = self.headers.get("Content-Type", "")
-            if not content_type.lower().startswith("multipart/form-data"):
-                raise ServiceError(415, "knowledge import requires multipart/form-data")
-            _content, uploads = self._body_multipart_message(content_type)
-            self._json(service.import_knowledge_documents(actor, uploads), status=201)
-            return
-        if path == "/api/knowledge/search" and method == "GET":
-            self._json({"results": service.user_search_knowledge(actor, first(query, "q", ""), int_arg(query, "limit", 5))})
-            return
-        m = re.fullmatch(r"/api/knowledge/documents/(\d+)/download", path)
-        if m and method == "GET":
-            self._serve_knowledge_download(actor, int(m.group(1)))
-            return
-        m = re.fullmatch(r"/api/knowledge/documents/(\d+)", path)
-        if m and method == "GET":
-            self._json({"document": service.user_knowledge_document(actor, int(m.group(1)))})
-            return
-
         if path == "/api/settings/secrets" and method == "GET":
             self._json({"secrets": service.list_secrets(actor)})
             return
@@ -1387,15 +1293,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 status=202,
             )
             return
-        if path == "/api/system/knowledge/config" and method == "GET":
-            self._json(service.knowledge_config(actor))
-            return
-        if path == "/api/system/knowledge/config" and method == "PUT":
-            self._json(service.update_knowledge_config(actor, self._body_json()))
-            return
-        if path == "/api/system/knowledge/reindex" and method == "POST":
-            self._json(service.reindex_knowledge(actor), status=202)
-            return
         if path == "/api/system/oauth/providers" and method == "GET":
             self._json(service.oauth_provider_status(actor))
             return
@@ -1424,13 +1321,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         token = bearer_token(self.headers.get("Authorization", ""))
         if not service.validate_agent_tool_token(token):
             raise ServiceError(401, "invalid agent tool token")
-        if path == "/api/agent/tools/knowledge/search" and method == "GET":
-            self._json({"results": service.search_knowledge(first(query, "q", ""), int_arg(query, "limit", 5))})
-            return
-        m = re.fullmatch(r"/api/agent/tools/knowledge/documents/(\d+)", path)
-        if m and method == "GET":
-            self._json({"document": service.get_knowledge_document(int(m.group(1)))})
-            return
         if path == "/api/agent/tools/memory/search" and method == "POST":
             self._json(service.agent_memory_search(self._body_json()))
             return
@@ -1456,7 +1346,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if method != "POST":
             raise ServiceError(405, "method not allowed")
         if re.fullmatch(
-            r"/internal/agent/tools/(?:web|browser|schedule|skill|mail|sylver_platform)",
+            r"/internal/agent/tools/(?:web|browser|schedule|skill|mail)",
             path,
         ):
             body = self._body_json()
@@ -1848,44 +1738,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self._stream_file_handle(fh)
 
-    def _serve_knowledge_download(
-        self,
-        actor: dict[str, Any],
-        document_id: int,
-    ) -> None:
-        download = self.server.service.user_knowledge_download(actor, document_id)
-        content = download.get("content")
-        if not isinstance(content, bytes):
-            raise ServiceError(500, "knowledge download is invalid")
-        size_bytes = int(download.get("size_bytes") or -1)
-        sha256 = str(download.get("sha256") or "").casefold()
-        if (
-            size_bytes != len(content)
-            or not re.fullmatch(r"[0-9a-f]{64}", sha256)
-            or not hmac.compare_digest(hashlib.sha256(content).hexdigest(), sha256)
-        ):
-            raise ServiceError(500, "knowledge download integrity check failed")
-        filename = sanitize_attachment_filename(str(download.get("filename") or "knowledge.md"))
-        ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .") or "knowledge"
-        media_type = str(download.get("media_type") or "application/octet-stream")
-        if re.search(r"[\r\n\x00]", media_type) or "/" not in media_type:
-            raise ServiceError(500, "knowledge download media type is invalid")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", media_type)
-        self.send_header("Content-Length", str(size_bytes))
-        self.send_header(
-            "Content-Disposition",
-            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}",
-        )
-        self.send_header("Cache-Control", "private, no-store")
-        self.send_header("ETag", f'"{sha256}"')
-        self._send_security_headers()
-        self._send_renewed_session_cookie()
-        self.end_headers()
-        try:
-            self.wfile.write(content)
-        except (BrokenPipeError, ConnectionError):
-            return
 
     def _stream_scope_events(self, actor: dict[str, Any], scope_type: str, scope_id: str) -> None:
         service = self.server.service

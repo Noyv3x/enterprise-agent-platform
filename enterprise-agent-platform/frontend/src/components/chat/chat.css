@@ -90,10 +90,6 @@
 
 .msg__pending { font-size: 11px; color: var(--muted); }
 
-.msg__suggest { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--line); }
-
-.chip__id { font-family: var(--font-mono); font-size: 10px; color: var(--on-accent); background: var(--accent-solid); padding: 1px 5px; border-radius: var(--r-pill); }
-
 .typing { display: flex; gap: 12px; align-items: center; }
 
 .typing__dots { display: inline-flex; gap: 5px; align-items: center; padding: 8px 0; }
@@ -603,22 +599,6 @@
 
 .msg-upload .eap-progress {
   margin: 0;
-}
-
-/* Attachments use one calm document-card language instead of introducing a
-   second bubble inside the conversation. */
-
-.msg__suggest .chip.chip {
-  margin: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 9px 3px 7px;
-  border-color: var(--accent-line);
-  border-radius: var(--r-pill);
-  background: var(--surface);
-  color: var(--accent-soft-ink);
-  line-height: 22px;
 }
 
 /* The composer is one floating input surface. Attachments and guidance belong

@@ -2017,12 +2017,10 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     if contract.get("schema_version") != 1:
         raise DocsSyncError(f"{label}.schema_version must be 1")
     sources = _expect_object(contract.get("sources"), f"{label}.sources")
-    required_sources = {"firecrawl", "sylver_platform_skill"}
-    missing_sources = sorted(required_sources - set(sources))
-    if missing_sources:
+    required_sources = {"firecrawl"}
+    if set(sources) != required_sources:
         raise DocsSyncError(
-            f"{label}.sources is missing required sources: "
-            + ", ".join(missing_sources)
+            f"{label}.sources must be exactly: firecrawl"
         )
     for name in sorted(sources):
         source_label = f"{label}.sources.{name}"
@@ -2033,12 +2031,9 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
             source,
             {
                 "repository_url",
-                "tracking_ref",
                 "revision",
                 "required_paths",
                 "compose_services",
-                "skill_sha256",
-                "adapter_sha256",
             },
             source_label,
         )
@@ -2095,54 +2090,6 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
         elif compose_services is not None:
             raise DocsSyncError(
                 f"{source_label}.compose_services is only valid for firecrawl"
-            )
-        skill_sha256 = source.get("skill_sha256")
-        if name == "sylver_platform_skill":
-            if repository_url != (
-                "https://github.com/Sylver-Lining/ubitech-platform-skill.git"
-            ):
-                raise DocsSyncError(
-                    f"{source_label}.repository_url must be the fixed official URL"
-                )
-            tracking_ref = source.get("tracking_ref")
-            if not isinstance(tracking_ref, str) or not re.fullmatch(
-                r"refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*", tracking_ref
-            ) or ".." in tracking_ref or tracking_ref.endswith(("/", ".lock")):
-                raise DocsSyncError(
-                    f"{source_label}.tracking_ref must be a safe full branch ref"
-                )
-            if "SKILL.md" not in required_paths:
-                raise DocsSyncError(
-                    f"{source_label}.required_paths must contain SKILL.md"
-                )
-            if "scripts/ubi.py" not in required_paths:
-                raise DocsSyncError(
-                    f"{source_label}.required_paths must contain scripts/ubi.py"
-                )
-            if not isinstance(skill_sha256, str) or not re.fullmatch(
-                r"[0-9a-f]{64}", skill_sha256
-            ):
-                raise DocsSyncError(
-                    f"{source_label}.skill_sha256 must be a lowercase SHA-256 digest"
-                )
-            adapter_sha256 = source.get("adapter_sha256")
-            if not isinstance(adapter_sha256, str) or not re.fullmatch(
-                r"[0-9a-f]{64}", adapter_sha256
-            ):
-                raise DocsSyncError(
-                    f"{source_label}.adapter_sha256 must be a lowercase SHA-256 digest"
-                )
-        elif skill_sha256 is not None:
-            raise DocsSyncError(
-                f"{source_label}.skill_sha256 is only valid for sylver_platform_skill"
-            )
-        elif source.get("adapter_sha256") is not None:
-            raise DocsSyncError(
-                f"{source_label}.adapter_sha256 is only valid for sylver_platform_skill"
-            )
-        elif source.get("tracking_ref") is not None:
-            raise DocsSyncError(
-                f"{source_label}.tracking_ref is only valid for sylver_platform_skill"
             )
     return contract
 

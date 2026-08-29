@@ -213,83 +213,6 @@ test("PlatformGateway forwards mail through the internal boundary with trusted t
   }
 });
 
-test("PlatformGateway routes only canonical sylver_platform actions and requires mutation identity", async () => {
-  const bodies: Record<string, unknown>[] = [];
-  const server = createServer(async (request, response) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of request) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    }
-    bodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>);
-    response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ data: { ok: true } }));
-  });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  try {
-    const address = server.address();
-    assert.ok(address && typeof address === "object");
-    const gateway = new PlatformGateway(`http://127.0.0.1:${address.port}`, "token");
-    const request: RunRequest = {
-      scope_key: "private:42",
-      lifecycle_id: "life",
-      session_id: "session",
-      workspace: "/workspace",
-      system_prompt: "system",
-      input: "input",
-      model: { provider: "openai-codex", id: "gpt-5" },
-      metadata: { actor: { id: 42 }, source_message_id: 9 },
-    };
-    await gateway.invoke(request, "run-read", "sylver_platform", "projects", {
-      include_archived: false,
-    });
-    await gateway.invoke(
-      request,
-      "run-write",
-      "sylver_platform",
-      "comment_approval",
-      { approval_id: 7, body: "Looks good" },
-      undefined,
-      "call-write",
-    );
-    assert.deepEqual(bodies[0], {
-      tool: "sylver_platform",
-      action: "projects",
-      arguments: { include_archived: false },
-      context: {
-        run_id: "run-read",
-        scope_key: "private:42",
-        lifecycle_id: "life",
-        session_id: "session",
-        workspace: "/workspace",
-        owner_user_id: 42,
-        source_message_id: 9,
-      },
-    });
-    assert.deepEqual((bodies[1]?.context as Record<string, unknown>)?.tool_call_id, "call-write");
-    await assert.rejects(
-      gateway.invoke(request, "run", "sylver_platform", "delete", {}),
-      /action is not supported/,
-    );
-    await assert.rejects(
-      gateway.invoke(request, "run", "sylver_platform", "start_task", { task_id: 1 }),
-      /requires a tool_call_id/,
-    );
-    await assert.rejects(
-      gateway.invoke(
-        { ...request, scope_key: "private:42/delegate/child" },
-        "run",
-        "sylver_platform",
-        "whoami",
-        {},
-      ),
-      /canonical private scope/,
-    );
-    assert.equal(bodies.length, 2, "rejected requests must not reach the Platform HTTP boundary");
-  } finally {
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  }
-});
-
 test("PlatformGateway preserves memory actions and recursively enforces trusted ownership", async () => {
   const bodies: Array<{ path: string; body: Record<string, unknown> }> = [];
   const server = createServer(async (request, response) => {
@@ -557,14 +480,6 @@ test("PlatformGateway rejects removed action and argument aliases before transpo
   await assert.rejects(
     gateway.invoke(request, "run", "session", "get", {}),
     /session action must be search, list, or read/,
-  );
-  await assert.rejects(
-    gateway.invoke(request, "run", "knowledge", "get", { id: 1 }),
-    /knowledge action must be search or read/,
-  );
-  await assert.rejects(
-    gateway.invoke(request, "run", "knowledge", "read", { document_id: "1" }),
-    /positive integer document_id/,
   );
   await assert.rejects(
     gateway.invoke(request, "run", "web", "query", { query: "test" }),

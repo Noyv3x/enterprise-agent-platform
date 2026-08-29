@@ -7,7 +7,6 @@ import {
   loadAutoUpdateConfig,
   loadBrandingConfig,
   loadAgentRuntimeConfig,
-  loadKnowledgeAdmin,
   loadMessageAudit,
   loadOAuthProviders,
   loadPermissionGroups,
@@ -45,8 +44,6 @@ export function loadAdminPage(store: AppStore, pageId: AdminPageId): Promise<voi
       return Promise.all([loadSecurityConfig(store), loadAutoUpdateConfig(store)]).then(() => undefined);
     case "runtime":
       return loadRuntime(store);
-    case "knowledge":
-      return loadKnowledgeAdmin(store);
     case "secrets":
       return loadSecrets(store);
   }
@@ -86,8 +83,6 @@ export function hasAdminPageData(state: AppState, pageId: AdminPageId): boolean 
       return state.securityConfig !== null;
     case "runtime":
       return state.runtimes !== null;
-    case "knowledge":
-      return state.knowledgeConfig !== null && state.knowledgeStatus !== null;
     case "secrets":
       return state.secrets.length > 0;
   }

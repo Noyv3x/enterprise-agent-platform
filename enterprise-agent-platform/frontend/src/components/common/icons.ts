@@ -164,10 +164,6 @@ export const ICONS: Record<IconName, readonly IconPrimitive[]> = {
     ["path", { d: "M10 11v6" }],
     ["path", { d: "M14 11v6" }],
   ],
-  link: [
-    ["path", { d: "M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1" }],
-    ["path", { d: "M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1" }],
-  ],
   users: [
     ["path", { d: "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" }],
     ["circle", { cx: 9, cy: 7, r: 4 }],

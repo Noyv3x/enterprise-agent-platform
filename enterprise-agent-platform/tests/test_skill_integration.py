@@ -182,6 +182,7 @@ class SkillIntegrationTests(unittest.TestCase):
                     context,
                 )
                 self.assertIn("Inspect the diff", loaded["skill"]["instructions"])
+                self.assertNotIn("skill_dir", loaded["skill"])
 
                 service._agent_skill_tool(
                     "write_file",

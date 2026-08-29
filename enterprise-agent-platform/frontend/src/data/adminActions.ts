@@ -14,8 +14,6 @@ import {
   loadBrandingConfig,
   loadChannelMessages,
   loadChannels,
-  loadKnowledgeAdmin,
-  loadKnowledgeStatus,
   loadMessageAudit,
   loadOAuthProviders,
   loadPrivateConversations,
@@ -45,7 +43,6 @@ import type {
   AgentRuntimeConfigUpdateRequest,
   Id,
   ImpersonateUserResponse,
-  KnowledgeConfigUpdateRequest,
   OAuthFlowResponse,
   OAuthImportResponse,
   SecurityConfigResponse,
@@ -469,36 +466,6 @@ export async function runManagerOperation(
     });
     await loadAutoUpdateConfig(store);
     toast(t("admin.toast.autoUpdateCheck"), { type: "ok", title: t("admin.toast.sent") });
-  });
-}
-
-/** Validate and save the external embeddings configuration, then refresh index state. */
-export async function saveKnowledgeConfig(
-  store: AppStore,
-  body: KnowledgeConfigUpdateRequest,
-): Promise<void> {
-  await runBusy(store, "admin:knowledge:save", async () => {
-    await api(endpoints.updateKnowledgeConfig.path(), {
-      method: "PUT",
-      body: JSON.stringify(body),
-    });
-    await loadKnowledgeAdmin(store);
-    toast(t("admin.toast.knowledgeSaved"), { type: "ok", title: t("admin.toast.complete") });
-  });
-}
-
-/** Rebuild a shadow knowledge generation from the authoritative documents. */
-export async function reindexKnowledge(store: AppStore): Promise<void> {
-  await runBusy(store, "admin:knowledge:reindex", async () => {
-    await api(endpoints.reindexKnowledge.path(), {
-      method: "POST",
-      body: EMPTY_BODY,
-    });
-    await loadKnowledgeStatus(store);
-    toast(t("admin.toast.knowledgeReindexQueued"), {
-      type: "ok",
-      title: t("admin.toast.sent"),
-    });
   });
 }
 

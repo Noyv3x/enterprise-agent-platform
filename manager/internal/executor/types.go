@@ -84,6 +84,10 @@ type terminalArguments struct {
 	CWD        string `json:"cwd,omitempty"`
 	TimeoutMS  int    `json:"timeout_ms,omitempty"`
 	Background bool   `json:"background,omitempty"`
+	// Runtime-owned presentation metadata is derived from the consumed audit
+	// record and never accepted from the executor protocol body.
+	DisplayCommand string `json:"-"`
+	PrivateOutput  bool   `json:"-"`
 }
 type processIDArguments struct {
 	ProcessID string `json:"process_id"`

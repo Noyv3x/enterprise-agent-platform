@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -23,7 +24,7 @@ class SkillStoreTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.data_dir = Path(self.temporary.name) / "data"
-        self.store = SkillStore(self.data_dir, bundled_skills_dir=None)
+        self.store = self.make_store(self.data_dir, bundled_skills_dir=None)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -81,12 +82,38 @@ class SkillStoreTests(unittest.TestCase):
         )
         return package
 
-    def scope_dir(self, scope: str) -> Path:
+    def workspace_dir(self, scope: str, root: Path | None = None) -> Path:
         digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
-        return self.data_dir / "agent-skills" / digest
+        return (self.data_dir if root is None else root) / digest
+
+    def scope_dir(self, scope: str) -> Path:
+        return self.workspace_dir(scope) / ".agent-platform" / "skills"
+
+    def make_store(
+        self,
+        root: Path,
+        *,
+        bundled_skills_dir: Path | None,
+    ) -> SkillStore:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        def workspace_for_scope(scope: str) -> Path:
+            workspace = self.workspace_dir(scope, root)
+            workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+            return workspace
+
+        return SkillStore(
+            root,
+            workspace_for_scope,
+            bundled_skills_dir=bundled_skills_dir,
+        )
 
     def usage_path(self, scope: str = "private:user-1") -> Path:
-        return self.scope_dir(scope) / ".skill-usage.json"
+        digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+        return self.store.state_root / digest / ".skill-usage.json"
+
+    def sidecar_path(self, skill_id: str, scope: str = "private:user-1") -> Path:
+        return self.usage_path(scope).parent / skill_id / ".skill.json"
 
     def read_usage(self, scope: str = "private:user-1") -> dict:
         return json.loads(self.usage_path(scope).read_text(encoding="utf-8"))
@@ -134,7 +161,137 @@ class SkillStoreTests(unittest.TestCase):
         self.assertIn('tags: [\"web\",\"sources\"]\n---\n\n# Workflow', document)
         self.assertEqual(package.stat().st_mode & 0o777, 0o700)
         self.assertEqual((package / "SKILL.md").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((package / ".skill.json").stat().st_mode & 0o777, 0o600)
+        self.assertFalse((package / ".skill.json").exists())
+        self.assertEqual(
+            self.sidecar_path(created["id"]).stat().st_mode & 0o777,
+            0o600,
+        )
+
+    def test_create_does_not_rechmod_agent_visible_staging_path(self):
+        real_chmod = Path.chmod
+
+        def reject_staging_chmod(path: Path, *args, **kwargs):
+            if path.name.startswith(".create-"):
+                raise AssertionError("create staging must not be chmodded by path")
+            return real_chmod(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path,
+            "chmod",
+            autospec=True,
+            side_effect=reject_staging_chmod,
+        ):
+            created = self.create_skill(name="No staging chmod")
+        self.assertEqual(created["name"], "No staging chmod")
+
+    def test_create_does_not_report_success_when_directory_fsync_fails(self):
+        scope = "private:fsync-failure"
+        with mock.patch.object(
+            skills_module,
+            "_fsync_directory",
+            side_effect=OSError("fsync failed"),
+        ):
+            with self.assertRaises(SkillStoreError) as raised:
+                self.create_skill(scope, name="Must be durable")
+        self.assertEqual(raised.exception.code, "skill_write_failed")
+        self.assertFalse(
+            any(not entry.name.startswith(".") for entry in self.scope_dir(scope).iterdir())
+        )
+
+    def test_portable_canonical_package_materializes_platform_state(self):
+        scope = "private:user-1"
+        self.store.list(scope)
+        package = self.scope_dir(scope) / "portable-workflow"
+        package.mkdir(mode=0o700)
+        document = skills_module._validated_document(
+            name="Portable Workflow",
+            description="A directly installed portable Skill.",
+            instructions="Follow the portable workflow.",
+            version="1.0.0",
+            category="general",
+            tags=[],
+        )
+        (package / "SKILL.md").write_text(
+            skills_module._render_skill_document(document),
+            encoding="utf-8",
+        )
+
+        loaded = self.store.load(scope, "portable-workflow")
+
+        self.assertEqual(loaded["source"], "user")
+        self.assertTrue(loaded["enabled"])
+        sidecar = json.loads(
+            self.sidecar_path("portable-workflow", scope).read_text(encoding="utf-8")
+        )
+        self.assertEqual(sidecar["id"], "portable-workflow")
+        usage = self.read_usage(scope)["skills"]["portable-workflow"]
+        self.assertEqual(usage["created_by"], "user")
+
+    def test_portable_package_rejects_plaintext_credential_in_support(self):
+        scope = "private:user-1"
+        self.store.list(scope)
+        package = self.scope_dir(scope) / "unsafe-portable"
+        references = package / "references"
+        references.mkdir(mode=0o700, parents=True)
+        document = skills_module._validated_document(
+            name="Unsafe Portable",
+            description="A portable Skill with unsafe support material.",
+            instructions="Read the supporting reference.",
+            version="1.0.0",
+            category="general",
+            tags=[],
+        )
+        (package / "SKILL.md").write_text(
+            skills_module._render_skill_document(document),
+            encoding="utf-8",
+        )
+        (references / "token.txt").write_text(
+            "sk-proj-abcdefghijklmnop1234567890",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.list(scope)
+
+        self.assertEqual(raised.exception.code, "sensitive_skill_content")
+        self.assertFalse((package / ".skill.json").exists())
+        self.assertFalse(self.usage_path(scope).exists())
+
+    def test_direct_install_quotas_bound_package_and_directory_descriptors(self):
+        crowded_scope = "private:crowded-packages"
+        self.store.list(crowded_scope)
+        for index in range(skills_module.MAX_SKILLS_PER_SCOPE + 1):
+            (self.scope_dir(crowded_scope) / f"skill-{index}").mkdir(mode=0o700)
+        with self.assertRaises(SkillStoreError) as crowded:
+            self.store.list(crowded_scope)
+        self.assertEqual(crowded.exception.code, "skill_quota_exceeded")
+
+        deep_scope = "private:deep-support"
+        healthy_scope = "private:healthy-after-quota"
+        healthy = self.create_skill(healthy_scope, name="Healthy")
+        self.store.list(deep_scope)
+        package = self.scope_dir(deep_scope) / "deep-support"
+        current = package / "references"
+        current.mkdir(mode=0o700, parents=True)
+        document = skills_module._validated_document(
+            name="Deep support",
+            description="A package with too many supporting directories.",
+            instructions="Stay bounded.",
+            version="1.0.0",
+            category="general",
+            tags=[],
+        )
+        (package / "SKILL.md").write_text(
+            skills_module._render_skill_document(document), encoding="utf-8"
+        )
+        for index in range(skills_module.MAX_SUPPORT_DIRECTORIES):
+            current /= f"level-{index}"
+            current.mkdir(mode=0o700)
+
+        with self.assertRaises(SkillStoreError) as deep:
+            self.store.list(deep_scope)
+        self.assertEqual(deep.exception.code, "corrupt_skill")
+        self.assertEqual(self.store.load(healthy_scope, healthy["id"])["name"], "Healthy")
 
     def test_usage_state_records_trusted_provenance_and_is_owner_only(self):
         user_skill = self.create_skill(name="User authored")
@@ -264,7 +421,7 @@ class SkillStoreTests(unittest.TestCase):
 
         package = Path(loaded["skill_dir"])
         before_document = (package / "SKILL.md").read_bytes()
-        before_sidecar = (package / ".skill.json").read_bytes()
+        before_sidecar = self.sidecar_path(skill["id"], scope).read_bytes()
         before_usage = self.usage_path(scope).read_bytes()
         with self.assertRaises(SkillStoreError) as raised:
             self.store.patch(
@@ -277,7 +434,7 @@ class SkillStoreTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 409)
         self.assertEqual(raised.exception.code, "skill_patch_mismatch")
         self.assertEqual((package / "SKILL.md").read_bytes(), before_document)
-        self.assertEqual((package / ".skill.json").read_bytes(), before_sidecar)
+        self.assertEqual(self.sidecar_path(skill["id"], scope).read_bytes(), before_sidecar)
         self.assertEqual(self.usage_path(scope).read_bytes(), before_usage)
 
     def test_patch_document_rejects_invalid_frontmatter_injection_and_quota(self):
@@ -313,7 +470,7 @@ class SkillStoreTests(unittest.TestCase):
         for old_string, new_string, instruction_limit, expected_code in cases:
             with self.subTest(code=expected_code):
                 before_document = (package / "SKILL.md").read_bytes()
-                before_sidecar = (package / ".skill.json").read_bytes()
+                before_sidecar = self.sidecar_path(skill["id"], scope).read_bytes()
                 before_usage = self.usage_path(scope).read_bytes()
                 limit_patch = (
                     mock.patch.object(
@@ -338,7 +495,7 @@ class SkillStoreTests(unittest.TestCase):
                         )
                 self.assertEqual(raised.exception.code, expected_code)
                 self.assertEqual((package / "SKILL.md").read_bytes(), before_document)
-                self.assertEqual((package / ".skill.json").read_bytes(), before_sidecar)
+                self.assertEqual(self.sidecar_path(skill["id"], scope).read_bytes(), before_sidecar)
                 self.assertEqual(self.usage_path(scope).read_bytes(), before_usage)
 
     def test_patch_support_requires_existing_safe_path_and_preserves_quotas(self):
@@ -535,6 +692,258 @@ class SkillStoreTests(unittest.TestCase):
             "Keep the user marker.",
         )
 
+    def test_workspace_state_forgery_cannot_grant_automatic_patch(self):
+        scope = "private:forged-state"
+        skill = self.create_skill(scope, name="User owned")
+        forged = {
+            "schema_version": 1,
+            "skills": {
+                skill["id"]: skills_module._default_usage_record(created_by="agent")
+            },
+        }
+        (self.scope_dir(scope) / ".skill-usage.json").write_text(
+            json.dumps(forged), encoding="utf-8"
+        )
+
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.patch_automatic(
+                scope,
+                skill["id"],
+                "Verify sources",
+                "Verify primary sources",
+            )
+
+        self.assertEqual(raised.exception.code, "automatic_skill_patch_forbidden")
+        self.assertEqual(
+            self.read_usage(scope)["skills"][skill["id"]]["created_by"],
+            "user",
+        )
+
+    def test_recreated_package_cannot_inherit_orphaned_agent_state(self):
+        scope = "private:orphaned-state"
+        skill = self.create_skill(scope, name="Learned", created_by="agent")
+        package = self.scope_dir(scope) / skill["id"]
+        displaced = package.with_name(package.name + "-old")
+        package.rename(displaced)
+        package.mkdir(mode=0o700)
+        document = skills_module._validated_document(
+            name="Replacement",
+            description="A direct user replacement.",
+            instructions="Never inherit unattended maintenance authority.",
+            version="1.0.0",
+            category="general",
+            tags=[],
+        )
+        (package / "SKILL.md").write_text(
+            skills_module._render_skill_document(document), encoding="utf-8"
+        )
+
+        self.assertEqual(self.store.load(scope, skill["id"])["name"], "Replacement")
+        self.assertEqual(
+            self.read_usage(scope)["skills"][skill["id"]]["created_by"],
+            "user",
+        )
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.patch_automatic(
+                scope,
+                skill["id"],
+                "Never inherit",
+                "Do not inherit",
+            )
+        self.assertEqual(raised.exception.code, "automatic_skill_patch_forbidden")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_package_swap_after_open_cannot_cross_scope_read(self):
+        scope = "private:swap-reader"
+        other_scope = "private:swap-victim"
+        skill = self.create_skill(scope, name="Pinned package", instructions="own data")
+        other = self.create_skill(
+            other_scope,
+            name="Other package",
+            instructions="other scope secret",
+        )
+        package = self.scope_dir(scope) / skill["id"]
+        other_package = self.scope_dir(other_scope) / other["id"]
+        displaced = package.with_name(package.name + "-pinned")
+        original_read = skills_module._read_private_bytes
+        swapped = False
+
+        def swap_then_read(path: Path, **kwargs):
+            nonlocal swapped
+            if path.name == "SKILL.md" and not swapped:
+                swapped = True
+                package.rename(displaced)
+                package.symlink_to(other_package, target_is_directory=True)
+            return original_read(path, **kwargs)
+
+        try:
+            with mock.patch.object(
+                skills_module, "_read_private_bytes", side_effect=swap_then_read
+            ):
+                loaded = self.store.load(scope, skill["id"])
+            self.assertEqual(loaded["instructions"], "own data")
+        finally:
+            if package.is_symlink():
+                package.unlink()
+            if displaced.exists():
+                displaced.rename(package)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_create_returns_the_pinned_package_after_path_swap(self):
+        scope = "private:create-swap"
+        other_scope = "private:create-swap-victim"
+        other = self.create_skill(
+            other_scope,
+            name="Other package",
+            instructions="other scope secret",
+        )
+        self.store.list(scope)
+        other_package = self.scope_dir(other_scope) / other["id"]
+        real_bind = self.store._bind_sidecar
+        swapped: dict[str, Path] = {}
+
+        def bind_then_swap(sidecar, skill_dir):
+            bound = real_bind(sidecar, skill_dir)
+            skill_id = self.store._skill_id_for_path(skill_dir)
+            package = self.scope_dir(scope) / skill_id
+            displaced = package.with_name(package.name + "-pinned")
+            package.rename(displaced)
+            package.symlink_to(other_package, target_is_directory=True)
+            swapped.update(package=package, displaced=displaced)
+            return bound
+
+        try:
+            with mock.patch.object(
+                self.store, "_bind_sidecar", side_effect=bind_then_swap
+            ):
+                created = self.create_skill(
+                    scope,
+                    name="Created package",
+                    instructions="own data",
+                )
+            self.assertEqual(created["name"], "Created package")
+            self.assertNotIn("other scope secret", json.dumps(created))
+        finally:
+            package = swapped.get("package")
+            displaced = swapped.get("displaced")
+            if package is not None and package.is_symlink():
+                package.unlink()
+            if displaced is not None and displaced.exists():
+                displaced.rename(package)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_create_staging_swap_cannot_write_another_scope(self):
+        scope = "private:create-staging-swap"
+        other_scope = "private:create-staging-victim"
+        other = self.create_skill(other_scope, name="Create staging victim")
+        victim = self.scope_dir(other_scope) / other["id"] / "SKILL.md"
+        victim_before = victim.read_bytes()
+        self.store.list(scope)
+        real_write = skills_module._atomic_write_bytes
+        swapped: dict[str, Path] = {}
+
+        def swap_then_write(path: Path, data: bytes):
+            if path.name == "SKILL.md" and not swapped:
+                staging = next(self.scope_dir(scope).glob(".create-*"))
+                displaced = staging.with_name(staging.name + "-pinned")
+                staging.rename(displaced)
+                staging.symlink_to(victim.parent, target_is_directory=True)
+                swapped.update(staging=staging, displaced=displaced)
+            return real_write(path, data)
+
+        try:
+            with mock.patch.object(
+                skills_module,
+                "_atomic_write_bytes",
+                side_effect=swap_then_write,
+            ):
+                with self.assertRaises(SkillStoreError) as raised:
+                    self.create_skill(scope, name="Pinned staging")
+            self.assertEqual(raised.exception.code, "unsafe_skill_path")
+            self.assertEqual(victim.read_bytes(), victim_before)
+            self.assertFalse(
+                any(
+                    not entry.name.startswith(".")
+                    for entry in self.scope_dir(scope).iterdir()
+                )
+            )
+        finally:
+            staging = swapped.get("staging")
+            displaced = swapped.get("displaced")
+            if staging is not None and staging.is_symlink():
+                staging.unlink()
+            if displaced is not None and displaced.exists():
+                shutil.rmtree(displaced)
+
+    def test_cross_scope_hard_linked_document_is_rejected(self):
+        scope = "private:hardlink-reader"
+        other_scope = "private:hardlink-victim"
+        skill = self.create_skill(scope, name="Hardlink target")
+        other = self.create_skill(other_scope, name="Hardlink source")
+        target = self.scope_dir(scope) / skill["id"] / "SKILL.md"
+        source = self.scope_dir(other_scope) / other["id"] / "SKILL.md"
+        target.unlink()
+        os.link(source, target)
+
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.load(scope, skill["id"])
+        self.assertEqual(raised.exception.code, "unsafe_skill_path")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_support_parent_swap_cannot_cross_scope_write(self):
+        scope = "private:swap-writer"
+        other_scope = "private:swap-write-victim"
+        skill = self.create_skill(scope, name="Pinned writer")
+        other = self.create_skill(other_scope, name="Other writer")
+        self.store.write_support(scope, skill["id"], "references/guide.md", "own")
+        self.store.write_support(
+            other_scope, other["id"], "references/guide.md", "victim"
+        )
+        references = self.scope_dir(scope) / skill["id"] / "references"
+        other_references = (
+            self.scope_dir(other_scope) / other["id"] / "references"
+        )
+        displaced = references.with_name("references-pinned")
+        original_write = skills_module._atomic_write_bytes
+        swapped = False
+
+        def swap_then_write(path: Path, data: bytes):
+            nonlocal swapped
+            if path.name == "guide.md" and data == b"updated own" and not swapped:
+                swapped = True
+                references.rename(displaced)
+                references.symlink_to(other_references, target_is_directory=True)
+            return original_write(path, data)
+
+        try:
+            with mock.patch.object(
+                skills_module, "_atomic_write_bytes", side_effect=swap_then_write
+            ):
+                with self.assertRaises(SkillStoreError) as raised:
+                    self.store.write_support(
+                        scope,
+                        skill["id"],
+                        "references/guide.md",
+                        "updated own",
+                    )
+            self.assertIn(
+                raised.exception.code,
+                {"unsafe_skill_path", "corrupt_skill"},
+            )
+            self.assertEqual(
+                (other_references / "guide.md").read_text(encoding="utf-8"),
+                "victim",
+            )
+            self.assertEqual(
+                (displaced / "guide.md").read_text(encoding="utf-8"),
+                "updated own",
+            )
+        finally:
+            if references.is_symlink():
+                references.unlink()
+            if displaced.exists():
+                displaced.rename(references)
+
     def test_automatic_patch_serializes_concurrent_delete_and_recreate(self):
         scope = "private:auto-patch-concurrent-recreate"
         original = self.create_skill(
@@ -686,7 +1095,7 @@ class SkillStoreTests(unittest.TestCase):
         package = self.scope_dir(scope) / skill["id"]
         paths = (
             package / "SKILL.md",
-            package / ".skill.json",
+            self.sidecar_path(skill["id"], scope),
             self.usage_path(scope),
         )
         before = {path: path.read_bytes() for path in paths}
@@ -1014,7 +1423,7 @@ class SkillStoreTests(unittest.TestCase):
             "Example license notice.",
             encoding="utf-8",
         )
-        store = SkillStore(
+        store = self.make_store(
             Path(self.temporary.name) / "bundled-data",
             bundled_skills_dir=bundled_root,
         )
@@ -1111,10 +1520,12 @@ class SkillStoreTests(unittest.TestCase):
             package_names = {
                 path.name
                 for path in (
-                    Path(self.temporary.name)
-                    / "bundled-data"
-                    / "agent-skills"
-                    / hashlib.sha256(scope.encode("utf-8")).hexdigest()
+                    self.workspace_dir(
+                        scope,
+                        Path(self.temporary.name) / "bundled-data",
+                    )
+                    / ".agent-platform"
+                    / "skills"
                 ).iterdir()
             }
             self.assertNotIn("source-verification", package_names)
@@ -1128,30 +1539,6 @@ class SkillStoreTests(unittest.TestCase):
                 instructions = document.read_text(encoding="utf-8")
                 self.assertNotIn(".ubitech/", instructions)
 
-    def test_sylver_skill_notice_matches_the_canonical_upstream_lock(self):
-        repository_root = Path(skills_module.__file__).resolve().parents[2]
-        contract = json.loads(
-            (repository_root / "docs/contracts/upstream-sources.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        source = contract["sources"]["sylver_platform_skill"]
-        notice = (
-            Path(skills_module.__file__).parent
-            / "bundled_skills/sylver-platform/references/NOTICE.md"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn(source["revision"], notice)
-        self.assertIn(source["skill_sha256"], notice)
-        self.assertIn(source["adapter_sha256"], notice)
-
-        instructions = (
-            Path(skills_module.__file__).parent
-            / "bundled_skills/sylver-platform/SKILL.md"
-        ).read_text(encoding="utf-8")
-        for bypass in ("`terminal`", "`web`", "`browser`", "raw HTTP"):
-            self.assertIn(bypass, instructions)
-        self.assertRegex(instructions, r"never\s+approve, reject")
 
     def test_repository_bundled_document_skills_send_real_workspace_files(self):
         bundled_root = Path(skills_module.__file__).parent / "bundled_skills"
@@ -1161,7 +1548,7 @@ class SkillStoreTests(unittest.TestCase):
             "presentations": ".pptx",
             "pdf-documents": ".pdf",
         }
-        store = SkillStore(
+        store = self.make_store(
             Path(self.temporary.name) / "document-skill-data",
             bundled_skills_dir=bundled_root,
         )
@@ -1213,7 +1600,7 @@ class SkillStoreTests(unittest.TestCase):
         )
         data_dir = Path(self.temporary.name) / "shadow-data"
         scope = "private:user-1"
-        first_store = SkillStore(data_dir, bundled_skills_dir=bundled_root)
+        first_store = self.make_store(data_dir, bundled_skills_dir=bundled_root)
         user_skill = first_store.create(
             scope,
             name="source verification",
@@ -1241,7 +1628,7 @@ class SkillStoreTests(unittest.TestCase):
             skills_module._render_skill_document(upgraded_document),
             encoding="utf-8",
         )
-        upgraded_store = SkillStore(data_dir, bundled_skills_dir=bundled_root)
+        upgraded_store = self.make_store(data_dir, bundled_skills_dir=bundled_root)
 
         self.assertEqual(
             upgraded_store.load(scope, user_skill["id"])["instructions"],
@@ -1278,7 +1665,7 @@ class SkillStoreTests(unittest.TestCase):
     def test_agent_created_skill_cannot_shadow_bundled_id_or_name(self):
         bundled_root = Path(self.temporary.name) / "agent-shadow-bundled"
         self.create_bundled_skill(bundled_root)
-        store = SkillStore(
+        store = self.make_store(
             Path(self.temporary.name) / "agent-shadow-data",
             bundled_skills_dir=bundled_root,
         )
@@ -1335,7 +1722,7 @@ class SkillStoreTests(unittest.TestCase):
     def test_automatic_patch_cannot_rename_or_maintain_bundled_shadow(self):
         bundled_root = Path(self.temporary.name) / "auto-patch-shadow-bundled"
         self.create_bundled_skill(bundled_root)
-        store = SkillStore(
+        store = self.make_store(
             Path(self.temporary.name) / "auto-patch-shadow-data",
             bundled_skills_dir=bundled_root,
         )
@@ -1393,7 +1780,7 @@ class SkillStoreTests(unittest.TestCase):
     def test_user_quota_and_bundled_catalog_are_listed_without_truncation(self):
         bundled_root = Path(self.temporary.name) / "bundled-capacity"
         self.create_bundled_skill(bundled_root)
-        store = SkillStore(
+        store = self.make_store(
             Path(self.temporary.name) / "capacity-data",
             bundled_skills_dir=bundled_root,
         )
@@ -1450,7 +1837,7 @@ class SkillStoreTests(unittest.TestCase):
                 case_root = Path(self.temporary.name) / f"bundled-case-{index}"
                 prepare(case_root)
                 with self.assertRaises(SkillStoreError) as raised:
-                    SkillStore(
+                    self.make_store(
                         Path(self.temporary.name) / f"case-data-{index}",
                         bundled_skills_dir=case_root,
                     )
@@ -1620,9 +2007,8 @@ class SkillStoreTests(unittest.TestCase):
     def test_different_scopes_do_not_share_a_process_thread_lock(self):
         first_scope = "private:slow"
         second_scope = "private:fast"
-        self.create_skill(first_scope, name="Slow")
+        slow = self.create_skill(first_scope, name="Slow")
         self.create_skill(second_scope, name="Fast")
-        first_scope_dir = self.scope_dir(first_scope)
         first_entered = threading.Event()
         release_first = threading.Event()
         second_finished = threading.Event()
@@ -1630,7 +2016,10 @@ class SkillStoreTests(unittest.TestCase):
         real_read_record = self.store._read_record
 
         def controlled_read(skill_dir: Path, *, include_instructions: bool):
-            if skill_dir.parent == first_scope_dir and not release_first.is_set():
+            if (
+                self.store._skill_id_for_path(skill_dir) == slow["id"]
+                and not release_first.is_set()
+            ):
                 first_entered.set()
                 release_first.wait(timeout=5)
             return real_read_record(
@@ -1813,7 +2202,7 @@ class SkillStoreTests(unittest.TestCase):
             )
         )
 
-    def test_owned_crash_artifacts_are_cleaned_without_touching_unknown_files(self):
+    def test_workspace_crash_artifacts_fail_closed_without_recursive_cleanup(self):
         scope = "private:crash"
         skill = self.create_skill(scope, name="Crash Recovery")
         self.store.write_support(
@@ -1857,8 +2246,9 @@ class SkillStoreTests(unittest.TestCase):
         (delete_tombstone / ".skill.json").write_text("private", encoding="utf-8")
         unknown_hidden.write_text("keep me", encoding="utf-8")
 
-        listed = self.store.list(scope)
-        self.assertEqual(listed[0]["linked_files"], ["references/guide.md"])
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.list(scope)
+        self.assertEqual(raised.exception.code, "corrupt_skill")
         for artifact in (
             root_document_temp,
             root_sidecar_temp,
@@ -1868,8 +2258,30 @@ class SkillStoreTests(unittest.TestCase):
             create_tombstone,
             delete_tombstone,
         ):
-            self.assertFalse(artifact.exists(), artifact)
+            self.assertTrue(artifact.exists(), artifact)
         self.assertEqual(unknown_hidden.read_text(encoding="utf-8"), "keep me")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_atomic_write_never_chmods_a_post_replace_symlink_target(self):
+        root = Path(self.temporary.name) / "atomic-write-race"
+        root.mkdir(mode=0o700)
+        target = root / "target.txt"
+        victim = root / "victim.txt"
+        target.write_text("old", encoding="utf-8")
+        victim.write_text("victim", encoding="utf-8")
+        victim.chmod(0o640)
+        real_replace = os.replace
+
+        def replace_then_swap(source, destination):
+            real_replace(source, destination)
+            if Path(destination) == target:
+                target.unlink()
+                target.symlink_to(victim)
+
+        with mock.patch.object(os, "replace", side_effect=replace_then_swap):
+            skills_module._atomic_write_bytes(target, b"new")
+
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs are not supported")
     def test_support_fifo_is_rejected_without_reading_it(self):
@@ -1968,12 +2380,52 @@ class SkillStoreTests(unittest.TestCase):
 
     def test_delete_is_scope_contained_and_returns_old_metadata(self):
         skill = self.create_skill()
+        self.store.write_support(
+            "private:user-1",
+            skill["id"],
+            "references/nested/guide.md",
+            "delete me",
+        )
         deleted = self.store.delete("private:user-1", skill["id"])
         self.assertEqual(deleted["id"], skill["id"])
         self.assertEqual(self.store.list("private:user-1"), [])
+        self.assertFalse(self.sidecar_path(skill["id"]).parent.exists())
+        self.assertFalse(
+            any(
+                entry.name.startswith(f".delete-{skill['id']}-")
+                for entry in self.scope_dir("private:user-1").iterdir()
+            )
+        )
         with self.assertRaises(SkillStoreError) as raised:
             self.store.get("private:user-1", skill["id"])
         self.assertEqual(raised.exception.status, 404)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
+    def test_delete_cleanup_unlinks_a_replaced_leaf_without_following_it(self):
+        scope = "private:delete-leaf-swap"
+        skill = self.create_skill(scope, name="Delete leaf swap")
+        victim = Path(self.temporary.name) / "delete-victim.txt"
+        victim.write_text("keep me", encoding="utf-8")
+        real_rename = os.rename
+
+        def rename_then_swap(source, destination, *args, **kwargs):
+            result = real_rename(source, destination, *args, **kwargs)
+            if source == skill["id"] and str(destination).startswith(".delete-"):
+                document = self.scope_dir(scope) / str(destination) / "SKILL.md"
+                document.unlink()
+                document.symlink_to(victim)
+            return result
+
+        with mock.patch.object(os, "rename", side_effect=rename_then_swap):
+            self.store.delete(scope, skill["id"])
+
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+        self.assertFalse(
+            any(
+                entry.name.startswith(f".delete-{skill['id']}-")
+                for entry in self.scope_dir(scope).iterdir()
+            )
+        )
 
 
 if __name__ == "__main__":

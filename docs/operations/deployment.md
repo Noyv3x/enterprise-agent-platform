@@ -95,7 +95,7 @@ release manifest 固定 source commit、数据库版本、Manager SHA-256、Comp
 
 Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_agent_platform/static/`；镜像只接受本次 frontend build stage 从受控源码生成的完整资产树，不能让本地旧 bundle 通过 Docker context 混入 wheel。
 
-Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG、Firecrawl 与知识 Embeddings provider 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。未配置 Embeddings API key 是明确的知识 disabled 状态，不是容器 readiness 失败。
+Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG 与 Firecrawl 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。用户工作区里的 MCP server 不属于部署 readiness。
 
 Platform、Agent Runtime 与 Camoufox 自有镜像的健康检查只在各自 Dockerfile 定义，固定 Compose 栈直接继承镜像 HEALTHCHECK；不得在 Compose 复制同一命令和时序形成第二真源。上游镜像仍由 Compose 显式声明平台所需的健康检查。
 
@@ -109,7 +109,7 @@ Codex 提示缓存优化同样不新增部署状态：`prompt_cache_key` 只在 
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```
 
-成功后才启动候选 writer。迁移和启动失败由同一 operation 使用更新前快照回滚。知识库基线切换只接受契约声明的直接前版本，保留权威文档并移除可重建的旧索引；新向量在 generation 提交后由持久 worker 重建。
+成功后才启动候选 writer。迁移和启动失败由同一 operation 使用更新前快照回滚。本次基线切换只接受契约声明的直接前版本；迁移删除已退役的知识库与原生 Sylver 数据，并在完整预检后把旧 `agent-skills/<scope-hash>/<skill-id>/` 的可移植包原子复制到各 Agent workspace，把 sidecar/usage 复制到 Platform-only `agent-skill-state/<scope-hash>/`。旧 `agent-skills` 不能移动、删除或改写，因为旧 Manager 快照不包含该目录，回滚前一数据库快照后仍由旧 Platform 使用它。Sandbox 容器可跨 fixed-stack 更新保留，因此迁移发布不能把维护态当作 workspace 路径排他锁；apply、原子发布和 staging 清理必须始终相对固定且复核过的目录 fd。预检不能把所有 scope 的文件正文同时留在内存；apply 按 scope 重读源树并与预检指纹比对。文件目标全部持久化后还要再对每个受保护的 portable/state 树做最终精确复核，通过后才能提交数据库事务；事务失败留下的精确目标供原样重试，不同内容、额外项和不安全路径一律失败关闭。需要保留退役知识或原生 Sylver 数据时必须在升级前从快照或旧版本导出。
 
 Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、启动或挂载 FoundationDB。SearXNG 的完整配置目录只读挂载到 `/etc/searxng`，不能依赖匿名 volume。
 
@@ -119,7 +119,7 @@ Firecrawl 使用 PostgreSQL、Redis、RabbitMQ 与 Playwright；不得声明、�
 
 Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、HOME 与环境位于 Manager 数据根；容器可以重建，持久目录不变。Platform 容器不挂载 Sandbox 的 `/workspace`，而是把 Agent 回复中的逻辑交付路径映射到当前 scope 的 Platform 可见工作区，并通过固定目录/文件描述符安全读取后保存附件；后台 Sandbox 进程并发替换路径时交付失败关闭。entrypoint 只为 UID/GID 映射短暂使用 root，随后降权；不能递归改写挂载树。
 
-Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：XLSX、DOCX、PPTX 和 PDF 生成不依赖任务期间临时联网安装。依赖属于不可变 Sandbox generation，并由镜像构建、导入和真实文件生成测试共同验收；不能把这些库装入用户持久 HOME 后再把偶然缓存当作平台能力。
+Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：XLSX、DOCX、PPTX 和 PDF 生成不依赖任务期间临时联网安装。它还预装平台的一次性 stdio MCP 客户端；客户端只实现 `tools/list|tools/call`，不包含第三方 server。依赖属于不可变 Sandbox generation，并由镜像构建、导入和真实文件生成/MCP 协议测试共同验收；不能把这些库装入用户持久 HOME 后再把偶然缓存当作平台能力。
 
 Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回确认前必须等待匹配进程退出及其控制器完成输出、进程登记与 Sandbox 活动计数落盘。更新、reset、测试目录回收和 Sandbox 停止都不能在该屏障返回后再次收到旧 wait/watch goroutine 的迟到写入。
 

@@ -182,7 +182,7 @@ test("todo tool has closed read/replace/merge schemas, returns the full list, an
     assert.match(todo.description, /routine inspection, one small change, and its focused verification are one linear task/);
     assert.match(todo.description, /keep only one item in_progress/);
     assert.match(todo.description, /completed immediately after it is actually finished and appropriately verified/);
-    assert.match(todo.description, /not a scheduled-task tool, process watcher, durable memory/);
+    assert.match(todo.description, /not a scheduled-task tool, process watcher, or durable memory store/);
     assert.match(todo.description, /process\.wait/);
 
     assert.doesNotThrow(() => validateToolArguments(todo, fauxToolCall("todo", { action: "read" })));

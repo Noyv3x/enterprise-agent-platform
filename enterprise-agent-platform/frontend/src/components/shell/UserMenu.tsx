@@ -4,7 +4,6 @@ import { navigateToView } from "../../data/chatActions";
 import { logout } from "../../data/sessionActions";
 import { useTheme } from "../../hooks/useTheme";
 import { SUPPORTED_LOCALES, useI18n, type Locale } from "../../i18n";
-import { permissionGroupLabel } from "../../i18n/labels";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { initials } from "../../utils/format";
 import { Icon } from "../common/Icon";
@@ -29,13 +28,7 @@ export function UserMenu() {
   if (!user) return null;
 
   const name = user.display_name || user.username || t("nav.userFallback");
-  const role =
-    user.position ||
-    permissionGroupLabel(
-      t,
-      user.permission_group || user.role || "member",
-      user.permission_group_label,
-    );
+  const position = user.position?.trim();
 
   return (
     <div className="user-menu">
@@ -51,7 +44,7 @@ export function UserMenu() {
           <div className="user-menu__popover" id={menuId} aria-label={name}>
             <div className="user-menu__identity">
               <strong>{name}</strong>
-              <span>{role}</span>
+              {position ? <span>{position}</span> : null}
             </div>
             <Menu
               className="user-menu__menu"
@@ -125,7 +118,7 @@ export function UserMenu() {
           <Avatar className="user-menu__avatar" size={32}>{initials(name)}</Avatar>
           <span className="user__meta">
             <span className="user__name">{name}</span>
-            <span className="user__role">{role}</span>
+            {position ? <span className="user__role">{position}</span> : null}
           </span>
           <Icon name="settings" cls="user-menu__trigger-icon" />
         </Button>

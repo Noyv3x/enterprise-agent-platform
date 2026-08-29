@@ -13,7 +13,7 @@ import type {
 } from "../../types";
 
 export const COMPUTER_FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
-export const COMPUTER_SEARCH_TOOLS = new Set(["web", "knowledge", "search_files"]);
+export const COMPUTER_SEARCH_TOOLS = new Set(["web", "search_files"]);
 export const COMPUTER_TERMINAL_TOOLS = new Set(["terminal", "process"]);
 export const COMPUTER_BROWSER_TOOLS = new Set(["browser"]);
 const HTML_SUFFIX = /\.(html|htm)$/i;

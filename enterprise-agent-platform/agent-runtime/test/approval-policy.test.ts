@@ -3,9 +3,11 @@ import { rm, symlink } from "node:fs/promises";
 import test from "node:test";
 import {
   APPROVAL_ARGUMENT_MAX_BYTES,
+  actionApprovalObject,
   hardBlockedCommand,
   normalizeCommandForApproval,
   redactCommandForApproval,
+  redactToolArgumentsForJournal,
 } from "../src/approval-policy.js";
 import { classifyToolCall } from "../src/tools.js";
 import { temporaryDirectory } from "./helpers.js";
@@ -301,6 +303,70 @@ test("terminal and process write reject high-risk invisible and bidi controls", 
     assert.match(processWrite.hardBlock || "", /forbidden control characters/, `U+${codePoint.toString(16)}`);
     assert.equal(redactCommandForApproval(`left${control}right`), "leftright");
   }
+});
+
+test("MCP call approval displays every ordinary argument while redacting sensitive fields", async () => {
+  const values = Array.from({ length: 60 }, (_unused, index) => `ordinary-${index}`);
+  values[59] = "final-material-value";
+  const nested = { level: { level: { level: { level: { value: "deep-material-value" } } } } };
+  const policy = await classifyToolCall("mcp", {
+    action: "call",
+    server: "local",
+    tool: "mutate",
+    arguments: {
+      values,
+      nested,
+      api_token: "secret-that-must-not-appear",
+    },
+  });
+  assert.equal(policy.hardBlock, undefined);
+  const display = JSON.stringify(policy.displayArguments);
+  assert.match(display, /final-material-value/);
+  assert.match(display, /deep-material-value/);
+  assert.match(display, /\[redacted\]/);
+  assert.doesNotMatch(display, /secret-that-must-not-appear/);
+  const displayedValues = (
+    policy.displayArguments?.arguments as { arguments?: { values?: unknown[] } } | undefined
+  )?.arguments?.values;
+  assert.equal(displayedValues?.length, values.length);
+  assert.deepEqual(redactToolArgumentsForJournal("mcp", {
+    action: "call",
+    server: "local",
+    tool: "mutate",
+    arguments: { values, api_token: "secret-that-must-not-appear" },
+  }), {
+    tool: "mcp",
+    action: "call",
+    arguments: { server: "local", tool: "mutate" },
+  });
+});
+
+test("MCP call approval hard-blocks dangerous controls before they can be hidden", async () => {
+  for (const arguments_ of [
+    { label: "safe\u202eevil" },
+    { ["safe\u2066evil"]: "value" },
+  ]) {
+    const policy = await classifyToolCall("mcp", {
+      action: "call",
+      server: "local",
+      tool: "mutate",
+      arguments: arguments_,
+    });
+    assert.match(policy.hardBlock || "", /forbidden control characters/);
+    assert.equal(policy.approvalKey, undefined);
+  }
+});
+
+test("MCP call approval rejects rather than truncates an oversized complete display", () => {
+  assert.throws(
+    () => actionApprovalObject("mcp", {
+      action: "call",
+      server: "local",
+      tool: "mutate",
+      arguments: { value: "x".repeat(APPROVAL_ARGUMENT_MAX_BYTES) },
+    }),
+    /complete display limit/,
+  );
 });
 
 test("browser approval keys bind every structured argument while hiding typed text", async () => {

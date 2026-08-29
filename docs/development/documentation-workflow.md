@@ -64,4 +64,4 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 `documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`。共享门禁脚本只能依赖对应 CI runner 明确提供的基础命令；可选的本地搜索工具不得成为流水线正确性前提。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。仓库级回归测试直接锁定这些 owner 关系，避免调整 manifest 时使迁移或发布验收失去规范文档。
 
-Firecrawl 与 Sylver Lining 私有 Skill 都不进入产品 Git tree。它们的 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域；该 validation-only contract 由相应发布/开发同步工具直接消费，不生成 Platform Python 模块。Sylver Lining 条目还分别锁定 `SKILL.md` 与 `scripts/ubi.py` 的 SHA-256；修改任一摘要都必须先审阅业务规则与 REST 适配差异，再同步集成文档、固定工具协议、bundled attribution 和测试。研究用第三方 checkout、GitHub 凭据和下载缓存不属于产品源码、运行数据或发布输入。
+Firecrawl 不进入产品 Git tree；其 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域。用户自行安装的 Skill/MCP 包只属于对应 Agent workspace，不进入该上游源码契约。研究用第三方 checkout、GitHub 凭据和下载缓存不属于产品源码、运行数据或发布输入。

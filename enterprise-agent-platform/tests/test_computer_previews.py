@@ -71,9 +71,41 @@ class WorkspacePathProjectionTests(unittest.TestCase):
             {"path": "…/shadow", "target": "host"},
         )
 
+    def test_mcp_parameters_keep_only_safe_identity_fields(self):
+        self.assertEqual(
+            agent_tool_parameters({
+                "tool": "mcp",
+                "arguments": {
+                    "action": "call",
+                    "arguments": {
+                        "server": "project.docs-v1",
+                        "tool": "search_documents",
+                        "arguments": {"token": "secret", "query": "private"},
+                        "env": {"API_KEY": "secret"},
+                    },
+                },
+                "result": {"content": "private result"},
+            }),
+            {
+                "action": "call",
+                "server": "project.docs-v1",
+                "tool": "search_documents",
+            },
+        )
+        self.assertEqual(
+            agent_tool_parameters({
+                "tool": "mcp",
+                "arguments": {
+                    "action": "list",
+                    "arguments": {"server": "../unsafe"},
+                },
+            }),
+            {"action": "list"},
+        )
+
 
 class ComputerSearchProjectionTests(unittest.TestCase):
-    def test_web_and_knowledge_hits_are_closed_world_and_bounded(self):
+    def test_web_hits_are_closed_world_and_bounded(self):
         hits = agent_search_hits({
             "tool_name": "web",
             "result": {
@@ -95,22 +127,6 @@ class ComputerSearchProjectionTests(unittest.TestCase):
                 "snippet": "Latest changes",
             }],
         )
-        knowledge = agent_search_hits({
-            "tool": "knowledge",
-            "result": {
-                "content": json.dumps({
-                    "hits": [{
-                        "title": "Runbook",
-                        "summary": "How to recover",
-                        "excerpt": "token=super-secret",
-                    }]
-                })
-            },
-        })
-        self.assertEqual(knowledge[0]["title"], "Runbook")
-        self.assertEqual(knowledge[0]["snippet"], "How to recover")
-        self.assertNotIn("super-secret", json.dumps(knowledge))
-
     def test_search_files_hits_use_workspace_paths_not_raw_journal(self):
         hits = agent_search_hits({
             "tool": "search_files",

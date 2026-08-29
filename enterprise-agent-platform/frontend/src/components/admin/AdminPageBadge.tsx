@@ -46,12 +46,6 @@ export function adminPageBadgeValue(state: AppState, pageId: AdminPageId): numbe
       return state.runtimes ? Object.keys(state.runtimes).length : 0;
     case "secrets":
       return state.secrets.filter((secret) => !isOAuthSecret(secret.key)).length;
-    case "knowledge":
-      return state.knowledgeStatus?.state === "ready"
-        ? "enabled"
-        : state.knowledgeStatus?.state === "indexing"
-          ? state.knowledgeStatus.pending_documents || 0
-          : 0;
   }
 }
 

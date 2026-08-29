@@ -98,13 +98,6 @@ export function topbarInfo(state: AppState, translate: Translator = defaultTrans
       sub: active || translate("nav.topbar.privateSubtitle"),
     };
   }
-  if (state.activeView === "knowledge") {
-    return {
-      title: translate("nav.knowledge"),
-      icon: "library",
-      sub: translate("nav.topbar.knowledgeDocuments", { count: state.documents.length }),
-    };
-  }
   if (state.activeView === "admin") {
     return { title: translate("nav.admin"), icon: "shield", sub: translate("nav.topbar.adminSubtitle") };
   }

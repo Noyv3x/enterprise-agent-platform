@@ -36,7 +36,7 @@ type ToolFamily = "file" | "terminal" | "search" | "browser" | "generic";
 
 const FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
 const TERMINAL_TOOLS = new Set(["terminal", "process"]);
-const SEARCH_TOOLS = new Set(["search_files", "web", "knowledge", "session", "session_search"]);
+const SEARCH_TOOLS = new Set(["search_files", "web", "session", "session_search"]);
 const SESSION_IDENTITY_TOOLS = new Set(["session", "session_search"]);
 
 const PARAMETER_LABELS: Partial<Record<string, MessageKey>> = {
@@ -60,6 +60,8 @@ const PARAMETER_LABELS: Partial<Record<string, MessageKey>> = {
   task_count: "chat.work.param.task_count",
   regex: "chat.work.param.regex",
   max_results: "chat.work.param.max_results",
+  server: "chat.work.param.server",
+  tool: "chat.work.param.tool",
 };
 
 const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
@@ -73,7 +75,7 @@ const TOOL_MESSAGE_KEYS: Partial<Record<string, MessageKey>> = {
   session_search: "chat.activity.toolName.session",
   memory: "chat.activity.toolName.memory",
   skill: "chat.activity.toolName.skill",
-  knowledge: "chat.activity.toolName.knowledge",
+  mcp: "chat.activity.toolName.mcp",
   web: "chat.activity.toolName.web",
   browser: "chat.activity.toolName.browser",
   delegate_task: "chat.activity.toolName.delegate_task",

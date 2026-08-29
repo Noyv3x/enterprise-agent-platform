@@ -13,7 +13,7 @@
     "check": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/server.js",
     "test": "npm run build && npm run test:compiled",
-    "test:compiled": "node --test --test-concurrency=1 dist/test/*.test.js"
+    "test:compiled": "node --test --test-concurrency=1 dist/test/*.test.js ../../containers/agent-sandbox-mcp-client.test.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.80.6",

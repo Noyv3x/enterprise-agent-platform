@@ -6,13 +6,11 @@ import type { Action, AppState } from "../types";
 import { adminInitial, adminReducer } from "./slices/admin";
 import { authInitial, authReducer } from "./slices/auth";
 import { chatInitial, chatReducer } from "./slices/chat";
-import { knowledgeInitial, knowledgeReducer } from "./slices/knowledge";
 import { uiInitial, uiReducer } from "./slices/ui";
 
 export const initialAppState: AppState = {
   ...authInitial,
   ...chatInitial,
-  ...knowledgeInitial,
   ...adminInitial,
   ...uiInitial,
 };
@@ -28,7 +26,6 @@ export function rootReducer(state: AppState, action: Action): AppState {
       drafts: {},
       draftFiles: {},
       expandedAgentRuns: {},
-      knowledgeSearch: { query: "", results: null },
       messageAudit: {
         auditChannelId: null,
         channelMessages: [],
@@ -46,7 +43,6 @@ export function rootReducer(state: AppState, action: Action): AppState {
   let next = state;
   next = authReducer(next, action);
   next = chatReducer(next, action);
-  next = knowledgeReducer(next, action);
   next = adminReducer(next, action);
   next = uiReducer(next, action);
   return next;

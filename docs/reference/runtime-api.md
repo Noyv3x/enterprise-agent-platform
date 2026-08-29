@@ -165,7 +165,7 @@ Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有
 
 审批 body 只接受 `approval_id` 和 `decision`。decision 是 `once`、`session`、`always` 或 `deny`。省略 `approval_id` 时处理该 Run 最新待决审批；未知字段或无效 decision 返回 400。
 
-审批用于 host terminal、普通前台 Skill 修改、计划修改和其它明确需要用户决定的业务动作。自动记忆不使用审批；经过完整校验的内部学习复盘可以免批执行受限的 memory 与 agent-owned Skill create/patch，其它 Skill 动作仍失败关闭。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
+审批用于 host terminal、普通前台 Skill 修改、MCP `call`、计划修改和其它明确需要用户决定的业务动作。MCP 调用只允许 `once|deny`，不形成 session/always 授权。自动记忆不使用审批；经过完整校验的内部学习复盘可以免批执行受限的 memory 与 agent-owned Skill create/patch，其它 Skill 动作仍失败关闭。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
 
 terminal、process 和文件工具必须带 `target=sandbox|host`，省略时为 sandbox。Sandbox 不使用人工审批；host terminal 在调用 Manager 之前逐次请求审批，choices 固定为 `once|deny`，不支持 session/always 复用，也不能成为 Run 默认。terminal 在 `background=true` 时可额外使用 `background_kind=task|service`，省略为 `task`；前台调用携带该字段、未知值或任何其它 schema 外字段都会在工具执行前拒绝。该字段只控制 Runtime 是否必须观察进程终态，不原样进入 Manager executor 的 audit/terminal 请求；task 会由 Runtime 派生 `completion_required` 和不可逆 session owner 摘要，二者都不是模型参数。批准后 Runtime 写入 `execution.audit`，数据包含 target、完整安全展示参数、canonical cwd/路径、前后台方式和有效 timeout。Manager 响应回显不可伪造的 executor id、实际 target 和审计 id，Runtime 才能发出 `tool.started`。
 
@@ -191,9 +191,9 @@ Manager 私有 task reconciliation/acknowledgement 路由只接受 Runtime beare
 
 ## Python 内部工具 Gateway
 
-Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，knowledge 使用 `/api/agent/tools/knowledge/**`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
+Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
 
-Python 必须从可信 context 推导 memory owner、schedule owner、browser identity、Sylver Lining 连接 owner 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：knowledge 为 `search|read`，web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill、mail 和 `sylver_platform`；memory、session 与 knowledge 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill 和 mail；memory 与 session 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
 
 scheduled Run 的 Gateway context 额外包含 Platform 签发的 `schedule_id`、`schedule_run_id` 与 `schedule_recurring`。`schedule.continue_current` 和 `schedule.complete_current` 的模型参数都必须是空对象；Python 只用可信 context 定位当前 occurrence。`continue_current` 原子复验当前 recurring occurrence、确认仍保留已经计算的下一次执行但不修改 schedule，`complete_current` 原子结束该计划。普通 Run、委派 Run、once occurrence、缺少任一身份、过期 occurrence、错误 recurring 标记或企图提供目标 id 都失败关闭。这两个窄 current-occurrence 动作是 unattended schedule 管理禁令的唯一例外；Runtime 只把 Gateway 成功的其中一个结果视为本轮机械决策，不能根据自然语言推断。
 
@@ -201,17 +201,13 @@ scheduled Run 的 Gateway context 额外包含 Platform 签发的 `schedule_id`�
 
 模型访问凭据请求只接受必填的 `provider`、`model`、`scope_key` 和可选的内部 `force_refresh`；`provider` 必须是规范 OAuth product id，`model` 必须是本次实际调用的非空模型 ID，`scope_key` 必须是当前 Run scope。Platform 在返回 Token 前确认 provider 是当前支持的 OAuth 类型，并确认 model 仍在同一凭据最近成功发现的账号目录与 Runtime 目录交集中。目录未配置、从未成功获取、已被新凭据替代或模型不在交集时失败关闭；Runtime 为视觉辅助模型请求 Token 时同样使用该模型自己的 ID，不能沿用主模型的授权判断。
 
-knowledge `search` 只返回 active 向量索引的稳定结果，每项包含可交给 `read` 的正整数 `document_id`、`chunk_id`、来源偏移、excerpt 和 score。未配置 Embeddings API key、尚无 active generation 或 provider 失败时返回可区分的错误代码，不以空列表伪装成“无命中”，也不改走本地关键词检索。
-
-知识库产品 API 以 `multipart/form-data` 向 `/api/knowledge/documents/import` 提交一至十个重复 `files` 字段；成功只返回按输入顺序排列的文档元数据和去重状态，不在批量响应中重复正文，任一文件失败时整批失败。`GET /api/knowledge/documents/{id}/download` 对有原件的条目返回原始字节，对手工条目返回 UTF-8 Markdown；两者都要求知识读取权限并只使用附件下载语义。Agent `knowledge` 工具仍只有 `search|read`，不获得文件上传或原件二进制读取能力。
-
 memory 额外支持原子 `reconcile`，其 `operations` 至多二十项且只含 `store|replace|forget`。skill 额外支持精确 `patch`：参数包含 id、可选 support `file_path`、`old_string`、`new_string` 与 `expected_replacements`。复盘 Gateway context 在 memory 的 `search|read|list` 与变更请求中都必须携带 `parent_run_id`、`delegation_depth`、`trigger`、`unattended`、`review_mode` 和 `review_job_id`，并结合已有 run/scope/lifecycle/owner/source message 构成完整主体。Python 在执行任何复盘记忆查询或写入前必须反查 running job、当前 lifecycle、激活账号与权限；过期或不完整主体返回 403，不读取记忆。复盘 Skill 不能 delete、enable/disable、完整 update 或 remove/write support，支持文件修改同样走精确 patch。
 
-Gateway 中网页、浏览器、邮件、知识、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
+Gateway 中网页、浏览器、邮件、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
 
 `mail` Gateway 只接受由 Run context 派生的私人账户所有权。读取动作为 `accounts/folders/search/read`，副作用动作为 `send/reply/move/mark/save_attachment`；unattended trigger 只能使用读取动作。SMTP mutation 携带 `run_id + tool_call_id` 幂等身份，结果不确定时返回 `needs_review` 语义而不是自动重发。
 
-`sylver_platform` Gateway 只接受 canonical private scope，并从当前 lifecycle、活动账号和个人 AI 权限推导连接 owner。Runtime schema 与 Python dispatcher 使用同一个闭世界 action 集：读取 `whoami|projects|project|project_context|tasks|task|task_activity|wiki_list|wiki_read|approvals|approval|approval_comments|notifications`；写入 `create_task|start_task|add_task_activity|propose_wiki|comment_approval`。`tasks.assigned_to_me` 和 `notifications.unread_only` 缺省均为 `true`，显式 `false` 才读取相应全集；`approvals.box` 缺省为 `inbox`。`create_task` 必须包含非空唯一 `tag_ids`、起止日期，以及必填的 `milestone_id`；后者为正整数时选择真实里程碑，为 `null` 时表示用户明确确认跳过，description 若存在则必须是首行摘要和后续 `- ` 要点。其 Python 复合动作根据项目 workflow 是否存在唯一 `proposed` category 决定省略 status 走提案闸，否则只允许唯一 `backlog` status；`proposal_approver_id` 只允许用于前一条提案路径。`start_task.note`、`propose_wiki.content_format` 和 `propose_wiki.order` 都是显式必填参数，避免审批内容与实际写请求出现隐藏默认值。模型参数不得包含 base URL、Token、HTTP method/path/header、owner 或 scope。全部写动作要求本次审批和 `tool_call_id`，unattended context 直接拒绝；原始完整参数在脱敏前超过 16 KiB 或含不可见控制字符时在调用前失败关闭，脱敏展示也不得超限。审批决定、跳过审查、强制完成、员工管理、通用 REST 和删除动作没有协议表示。
+`mcp` 不经过 Python Gateway。其 schema 固定为 `list|call`：`list` 可选 server id；`call` 必须包含 server id、tool name 和有界 JSON arguments。`call` 的 `approval.requested` 必须展示全部普通参数，只将敏感字段值替换为脱敏占位；不可见/双向控制字符或完整脱敏 JSON 超过审批上限时直接 hard-block，不得用截断或省略后的展示换取批准。Runtime 在批准 `call` 后以当前 execution context 和审计 receipt 请求 Manager 执行镜像内固定客户端命令；模型不能提供 executable、config path、cwd、env、transport 或 owner。Runtime 事件、Manager 审计/保留进程快照/终端预览和平台持久工作记录对 MCP 只携带 `action/server/tool` 安全投影；可逆命令载荷与原始 stdout/stderr 只能在该次 Manager→Runtime 执行响应中短暂存在。客户端每次读取 `/workspace/.agent-platform/mcp.json`，直接以 argv 启动清单中的 stdio server，完成 `initialize`、`notifications/initialized` 和一个 `tools/list|tools/call` 后退出。响应只接受与请求 id 匹配的 JSON-RPC result/error，server 发来的 request 以 method-not-supported 回应，通知忽略；stderr、行长、消息数、总输出与墙钟超限均失败关闭。工具描述和结果进入与 Gateway 结果相同的不可信 framing，环境值不进入审批或事件。
 
 浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API 申请当前 scope/tab 的短期租约并发送限幅输入；连续拖拽只接受有界、单调计时的 `down → move[] → up` 完整轨迹，Camoufox 在异常路径保证最终抬键。Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
 

@@ -31,10 +31,7 @@ import type {
   ChannelMessagesResponse,
   ChannelsResponse,
   ChatMode,
-  DocumentsResponse,
   Id,
-  KnowledgeConfigResponse,
-  KnowledgeStatusResponse,
   Message,
   OAuthProvidersResponse,
   PermissionGroupsResponse,
@@ -393,12 +390,6 @@ export async function loadPrivateTelegram(store: AppStore): Promise<void> {
   store.dispatch({ type: "SET_PRIVATE_TELEGRAM", payload: result });
 }
 
-export async function loadDocuments(store: AppStore): Promise<void> {
-  const result = await api<DocumentsResponse>(endpoints.knowledgeDocuments.path());
-  store.dispatch({ type: "SET_DOCUMENTS", payload: result.documents });
-  store.dispatch({ type: "SET_KNOWLEDGE_SEARCH", payload: { query: "", results: null } });
-}
-
 export async function loadUsers(store: AppStore): Promise<void> {
   const result = await api<UsersResponse>(endpoints.users.path());
   store.dispatch({ type: "SET_USERS", payload: result.users });
@@ -557,24 +548,6 @@ export async function loadBrandingConfig(store: AppStore): Promise<void> {
     type: "SET_BRANDING_CONFIG",
     payload: await api<BrandingSnapshot>(endpoints.brandingConfig.path()),
   });
-}
-
-export async function loadKnowledgeConfig(store: AppStore): Promise<void> {
-  store.dispatch({
-    type: "SET_KNOWLEDGE_CONFIG",
-    payload: await api<KnowledgeConfigResponse>(endpoints.knowledgeConfig.path()),
-  });
-}
-
-export async function loadKnowledgeStatus(store: AppStore): Promise<void> {
-  store.dispatch({
-    type: "SET_KNOWLEDGE_STATUS",
-    payload: await api<KnowledgeStatusResponse>(endpoints.knowledgeStatus.path()),
-  });
-}
-
-export async function loadKnowledgeAdmin(store: AppStore): Promise<void> {
-  await Promise.all([loadKnowledgeConfig(store), loadKnowledgeStatus(store)]);
 }
 
 export async function loadTokenUsage(store: AppStore): Promise<void> {

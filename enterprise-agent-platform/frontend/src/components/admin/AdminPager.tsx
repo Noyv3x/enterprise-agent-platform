@@ -19,7 +19,7 @@ export const ADMIN_PAGE_GROUPS: ReadonlyArray<{
   { id: "people", pages: ["accounts", "tokens", "messages"] },
   { id: "agents", pages: ["agent-runtime", "telegram"] },
   { id: "system", pages: ["branding", "updates", "security", "runtime"] },
-  { id: "advanced", pages: ["knowledge", "secrets"] },
+  { id: "advanced", pages: ["secrets"] },
 ];
 
 export function AdminPager({ activeId }: { activeId: AdminPageId }) {

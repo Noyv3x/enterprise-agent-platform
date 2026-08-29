@@ -36,7 +36,6 @@ export type IconName =
   | "message"
   | "barChart"
   | "trash"
-  | "link"
   | "users"
   | "browser"
   | "terminal"
@@ -48,7 +47,6 @@ export type IconName =
 export type ActiveView =
   | "channel"
   | "private"
-  | "knowledge"
   | "settings"
   | "admin";
 
@@ -304,15 +302,6 @@ export interface AgentStatuses {
   private: AgentStatus | null;
 }
 
-/** Knowledge chips rendered inline under an agent message. */
-export interface KnowledgeSuggestion {
-  id: Id;
-  title: string;
-  summary?: string;
-  source?: string;
-  score?: number;
-}
-
 /** Context occupied after the Agent's latest completed model turn. */
 export interface ContextUsage {
   used_tokens: number;
@@ -331,7 +320,6 @@ export interface MessageMetadata {
   processing_mode?: "started" | "joined" | "queued" | string;
   reply_to_message_ids?: Id[];
   durable_job_ids?: Id[];
-  knowledge_suggestions?: KnowledgeSuggestion[];
   context_usage?: ContextUsage;
   agent_work?: AgentWork;
   /** Marks the compact source message emitted by a scheduled task run. */
@@ -433,21 +421,6 @@ export interface MailAccount {
   updated_at: number;
 }
 
-/* ---------------------------------------------- private platform connector */
-
-export interface SylverPlatformConnection {
-  base_url: string;
-  remote_user_id: Id;
-  username: string;
-  full_name: string;
-  title: string;
-  email: string;
-  role: string;
-  credential_configured: boolean;
-  verified_at: number | string;
-  updated_at: number | string;
-}
-
 /* ---------------------------------------------------- scheduled Agent work */
 
 export type AgentScheduleRule =
@@ -528,44 +501,6 @@ export interface AgentSkill {
   updated_at: string | null;
   source?: "user" | "bundled";
   read_only?: boolean;
-}
-
-/* ------------------------------------------------------------- knowledge */
-
-export interface KnowledgeDocument {
-  id: number;
-  title: string;
-  summary: string;
-  source: string;
-  created_by: number | null;
-  created_at: number;
-  updated_at: number;
-  original_filename?: string | null;
-  original_media_type?: string | null;
-  original_size_bytes?: number | null;
-  original_sha256?: string | null;
-}
-
-export interface FullDocument extends KnowledgeDocument {
-  content: string;
-}
-
-export interface KnowledgeHit {
-  id: number;
-  title: string;
-  summary: string;
-  source: string;
-  score: number;
-  chunk_id?: string;
-  char_start?: number;
-  char_end?: number;
-  excerpt?: string;
-  title_path?: string;
-}
-
-export interface KnowledgeSearch {
-  query: string;
-  results: KnowledgeHit[] | null;
 }
 
 /* --------------------------------------------------------------- secrets */
@@ -746,7 +681,6 @@ export type AdminPageId =
   | "security"
   | "runtime"
   | "agent-runtime"
-  | "knowledge"
   | "secrets";
 
 export interface AdminPage {
@@ -891,34 +825,6 @@ export interface AutoUpdateStatus {
 export interface AutoUpdateConfigState {
   config: AutoUpdateConfigValues;
   status: AutoUpdateStatus;
-}
-
-/* knowledge embeddings configuration and derived-index status */
-export interface KnowledgeEmbeddingConfigValues {
-  base_url: string;
-  model: string;
-  dimensions: number | null;
-  batch_size: number;
-  credential_configured: boolean;
-  credential_masked?: string;
-}
-
-export interface KnowledgeConfigState {
-  config: KnowledgeEmbeddingConfigValues;
-}
-
-export type KnowledgeIndexState = "disabled" | "indexing" | "ready" | "degraded";
-
-export interface KnowledgeIndexStatus {
-  state: KnowledgeIndexState;
-  detail?: string;
-  last_error?: string;
-  active_generation_id?: number | null;
-  indexed_documents?: number;
-  total_documents?: number;
-  pending_documents?: number;
-  failed_documents?: number;
-  model?: string;
 }
 
 /* ----------------------------------------------------------- message audit */

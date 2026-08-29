@@ -23,12 +23,7 @@ from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
 )
-from test_platform import (
-    RecordingAgent,
-    RecordingEmbeddingClient,
-    configure_test_knowledge,
-    install_test_embedding_client,
-)
+from test_platform import RecordingAgent
 
 
 class _BlockingAgent(RecordingAgent):
@@ -494,11 +489,6 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             finally:
                 verification.close()
 
-
-
-
-
-
     def test_only_commit_release_advances_machine_schemas(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(
@@ -699,7 +689,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                         service._learning_active_jobs.pop(review_id, None)
                 service.close()
 
-    def test_finalize_reservation_defers_agent_and_background_workers(self):
+    def test_finalize_reservation_defers_agent_and_schedule_workers(self):
         with tempfile.TemporaryDirectory() as td:
             data_dir = Path(td)
             seed_agent = _BlockingAgent()
@@ -734,17 +724,6 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 scope_id=str(actor["id"]),
             )
             self.assertTrue(created)
-            embedding_client = RecordingEmbeddingClient()
-            configure_test_knowledge(seed, embedding_client)
-            document, created = seed.knowledge.add_document_with_status(
-                title="deferred index",
-                content="candidate must not index this before release",
-                source="test",
-                created_by=int(actor["id"]),
-            )
-            self.assertTrue(created)
-            ingest_job = seed.jobs.queued("knowledge_index", limit=None)[0]
-            self.assertEqual(ingest_job.scope_id, str(document["id"]))
             seed.close()
 
             operation_id = "operation-finalize-1"
@@ -761,31 +740,18 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 }
             )
             recovered_agent = _BlockingAgent()
-            ingest_started = threading.Event()
-
-            class SignalingEmbeddingClient(RecordingEmbeddingClient):
-                def embed(self, texts):
-                    ingest_started.set()
-                    return super().embed(texts)
 
             recovered = EnterpriseService(
                 _container_config(data_dir),
                 agent_client=recovered_agent,
                 manager_client=manager,
             )
-            install_test_embedding_client(
-                recovered,
-                SignalingEmbeddingClient(),
-            )
             try:
                 time.sleep(0.1)
                 self.assertTrue(recovered.platform_update_is_blocking())
                 self.assertEqual(recovered.jobs.get(agent_job.id).status, "queued")
-                self.assertEqual(recovered.jobs.get(ingest_job.id).status, "queued")
                 self.assertFalse(recovered_agent.started.is_set())
-                self.assertFalse(ingest_started.is_set())
                 self.assertEqual(recovered._agent_workers, {})
-                self.assertIsNone(recovered._ingest_thread)
                 self.assertIsNone(recovered._schedule_thread)
 
                 with self.assertRaisesRegex(
@@ -798,7 +764,6 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     {"released": True},
                 )
                 self.assertTrue(recovered_agent.started.wait(timeout=2))
-                self.assertTrue(ingest_started.wait(timeout=2))
                 self.assertIsNotNone(recovered._schedule_thread)
             finally:
                 recovered_agent.release.set()

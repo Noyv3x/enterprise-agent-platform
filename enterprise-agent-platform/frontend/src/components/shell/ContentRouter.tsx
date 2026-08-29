@@ -20,13 +20,9 @@ import { TelegramLinkPopover } from "../chat/TelegramLinkPopover";
 import { Spinner } from "../common/Spinner";
 import {
   loadAdminRoute,
-  loadKnowledgeRoute,
   loadSettingsRoute,
 } from "./routePreload";
 
-const KnowledgeView = lazy(() =>
-  loadKnowledgeRoute().then((module) => ({ default: module.KnowledgeView })),
-);
 const SettingsView = lazy(() =>
   loadSettingsRoute().then((module) => ({ default: module.SettingsView })),
 );
@@ -56,7 +52,6 @@ export function ContentRouter() {
 
   let body: React.ReactNode;
   if (effective === "private") body = <ChatView mode="private" />;
-  else if (effective === "knowledge") body = <KnowledgeView />;
   else if (effective === "settings") body = <SettingsView />;
   else if (effective === "admin") body = <AdminPanel />;
   else body = <ChatView mode="channel" />;

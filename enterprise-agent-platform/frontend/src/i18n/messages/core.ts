@@ -2,9 +2,9 @@ import { defineMessages } from "../types";
 
 export const coreMessages = defineMessages({
   "app.description": {
-    "zh-CN": "{product} - 公共频道、个人 AI、知识库与运行时管理。",
-    en: "{product} - public channels, Personal AI, knowledge, and runtime management.",
-    "zh-TW": "{product} - 公共頻道、個人 AI、知識庫與執行環境管理。",
+    "zh-CN": "{product} - 公共频道、个人 AI 与运行时管理。",
+    en: "{product} - public channels, Personal AI, and runtime management.",
+    "zh-TW": "{product} - 公共頻道、個人 AI 與執行環境管理。",
   },
   "language.label": { "zh-CN": "语言", en: "Language", "zh-TW": "語言" },
   "common.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
