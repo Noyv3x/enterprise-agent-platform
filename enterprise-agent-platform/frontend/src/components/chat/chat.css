@@ -330,8 +330,8 @@
 }
 
 .messages__inner { margin: 0 auto; display: flex; flex-direction: column;
-  width: min(820px, 100%);
-  gap: 24px;
+  width: min(800px, 100%);
+  gap: 28px;
 }
 
 .msg { display: flex; align-items: flex-start; min-width: 0;
@@ -616,7 +616,7 @@
 }
 
 .composer__wrap { margin: 0 auto;
-  width: min(860px, 100%);
+  width: min(820px, 100%);
   padding: 8px 10px 7px;
   border: 1px solid var(--line-strong);
   border-radius: var(--r-lg);
@@ -1245,33 +1245,34 @@
   white-space: normal;
   overflow-wrap: anywhere;
   color: var(--ink);
-  font-size: 14.5px;
-  line-height: 1.68;
-  letter-spacing: -0.003em;
+  font-size: 15px;
+  line-height: 1.6;
+  letter-spacing: -0.002em;
 }
 
 .msg__body > :first-child { margin-top: 0; }
 .msg__body > :last-child { margin-bottom: 0; }
-.msg__body :where(p, li, blockquote) { white-space: pre-wrap; }
-.msg__body p { margin: 0.7em 0; }
+.msg__body :where(p, li, blockquote) { white-space: normal; text-wrap: pretty; }
+.msg__body p { margin: 0.58em 0; }
 .msg__body :where(h1, h2, h3, h4, h5, h6) {
-  margin: 1.25em 0 0.5em;
+  margin: 1.15em 0 0.42em;
   color: var(--ink);
   font-family: var(--font-display);
   font-weight: 680;
   line-height: 1.25;
   letter-spacing: -0.018em;
+  text-wrap: balance;
 }
 .msg__body h1 { font-size: 1.4em; }
 .msg__body h2 { font-size: 1.24em; }
 .msg__body h3 { font-size: 1.1em; }
 .msg__body :where(h4, h5, h6) { font-size: 1em; }
-.msg__body :where(ul, ol) { margin: 0.72em 0; padding-left: 1.45em; }
-.msg__body li + li { margin-top: 0.24em; }
-.msg__body li > :where(p, ul, ol) { margin-top: 0.3em; margin-bottom: 0.3em; }
+.msg__body :where(ul, ol) { margin: 0.6em 0; padding-left: 1.45em; }
+.msg__body li + li { margin-top: 0.18em; }
+.msg__body li > :where(p, ul, ol) { margin-top: 0.24em; margin-bottom: 0.24em; }
 .msg__body blockquote {
-  margin: 0.8em 0;
-  padding: 0.2em 0 0.2em 0.9em;
+  margin: 0.7em 0;
+  padding: 0.15em 0 0.15em 0.9em;
   border-left: 2px solid var(--accent-line);
   color: var(--muted);
 }
@@ -1306,7 +1307,7 @@
 .msg__body .task-list-item input { width: 1em; height: 1em; margin: 0.35em 0 0; flex: 0 0 auto; }
 
 .md-code {
-  margin: 0.95em 0;
+  margin: 0.82em 0;
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -1346,7 +1347,7 @@
 
 .md-table-wrap {
   max-width: 100%;
-  margin: 0.95em 0;
+  margin: 0.82em 0;
   overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -1371,7 +1372,7 @@
 
 .msg__body .katex-display {
   max-width: 100%;
-  margin: 0.9em 0;
+  margin: 0.78em 0;
   overflow-x: auto;
   overflow-y: hidden;
   padding: 0.2em 0.15em 0.35em;
@@ -1501,8 +1502,8 @@
   }
 
   .msg__body {
-    font-size: 14px;
-    line-height: 1.64;
+    font-size: 14.5px;
+    line-height: 1.58;
   }
 
   .agent-work__summary,

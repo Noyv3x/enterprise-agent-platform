@@ -4,6 +4,7 @@
 import { Children, isValidElement, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import rehypeKatex from "rehype-katex";
 import ReactMarkdown, { type Components } from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { useI18n } from "../../i18n";
@@ -100,7 +101,7 @@ const markdownComponents: Components = {
 export function MarkdownContent({ content }: { content: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm, remarkMath]}
+      remarkPlugins={[remarkGfm, remarkMath, remarkBreaks]}
       rehypePlugins={[[rehypeKatex, KATEX_OPTIONS]]}
       skipHtml
       components={markdownComponents}

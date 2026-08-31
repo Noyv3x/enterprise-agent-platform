@@ -56,6 +56,18 @@ describe("MessageBody", () => {
     expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
   });
 
+  it("preserves intentional single line breaks without changing block structure", async () => {
+    const { container } = renderLocalized(
+      <MessageBody content={["第一行", "第二行", "", "- 第一点", "- 第二点"].join("\n")} />,
+    );
+
+    const paragraph = container.querySelector("p");
+    expect(paragraph).not.toBeNull();
+    expect(paragraph?.querySelectorAll("br")).toHaveLength(1);
+    expect(paragraph).toHaveTextContent("第一行 第二行");
+    expect(container.querySelectorAll("li")).toHaveLength(2);
+  });
+
   it("drops raw HTML and prevents unsafe link protocols", async () => {
     renderLocalized(
       <MessageBody content={'<img src="x" onerror="alert(1)">\n\n[unsafe](javascript:alert(1))'} />,
