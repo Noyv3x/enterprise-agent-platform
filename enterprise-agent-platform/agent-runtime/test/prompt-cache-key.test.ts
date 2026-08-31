@@ -53,7 +53,7 @@ const providerTools = [
   },
 ];
 
-test("Codex prompt cache key ignores volatile prompt state and canonicalizes provider tool schemas", () => {
+test("Codex prompt cache key ignores volatile state and canonicalizes tool object fields", () => {
   const scopeKey = "private:prompt-cache-scope";
   const first = buildSystemPromptParts(promptInput({
     platformSystemPrompt: "Platform context. Current UTC: first.",
@@ -65,18 +65,7 @@ test("Codex prompt cache key ignores volatile prompt state and canonicalizes pro
     recalledMemory: "Second recalled fact.",
     availableSkills: [{ id: "second", name: "Second skill" }],
   }));
-  const reorderedTools = [
-    {
-      name: "terminal",
-      strict: null,
-      description: "Run a command",
-      type: "function",
-      parameters: {
-        required: ["command"],
-        properties: { command: { type: "string" } },
-        type: "object",
-      },
-    },
+  const equivalentTools = [
     {
       name: "read_file",
       description: "Read a file",
@@ -91,16 +80,32 @@ test("Codex prompt cache key ignores volatile prompt state and canonicalizes pro
       type: "function",
       strict: null,
     },
+    {
+      name: "terminal",
+      strict: null,
+      description: "Run a command",
+      type: "function",
+      parameters: {
+        required: ["command"],
+        properties: { command: { type: "string" } },
+        type: "object",
+      },
+    },
   ];
 
   assert.equal(first.stable, second.stable);
   assert.notEqual(first.context, second.context);
   assert.notEqual(first.volatile, second.volatile);
   const firstKey = codexPromptCacheKey(first.stable, providerTools, scopeKey);
-  const secondKey = codexPromptCacheKey(second.stable, reorderedTools, scopeKey);
+  const secondKey = codexPromptCacheKey(second.stable, equivalentTools, scopeKey);
   assert.equal(firstKey, secondKey);
   assert.match(firstKey, /^pck_[0-9a-f]{24}$/);
   assert.doesNotMatch(firstKey, /private|prompt-cache-scope/);
+  assert.notEqual(
+    codexPromptCacheKey(first.stable, [...equivalentTools].reverse(), scopeKey),
+    firstKey,
+    "provider tool order changes the rendered cache prefix",
+  );
   assert.notEqual(
     codexPromptCacheKey(first.stable, providerTools, "private:other-scope"),
     firstKey,

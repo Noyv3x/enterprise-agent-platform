@@ -88,7 +88,7 @@ Runtime 使用 Node test runner。模型流必须使用 deterministic stream fak
 
 Runtime 不实现测试专用的本地进程或文件执行器。terminal、process 和文件工具测试必须在生产使用的 `ExecutionManager` 边界注入 deterministic fake，并断言规范请求与响应；不能让测试后备分支进入生产 bundle。
 
-提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明同一 scope 内只改变精确时间、回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀和内容寻址的 Codex 缓存 key 不变，稳定策略、规范工具 schema 或 scope 分片改变时 key 必须改变，空动态状态不生成占位块；捕获的 provider payload 还必须证明线上 key 不含原始 scope 且没有替代真实 session/header，普通单元测试不得把确定性 key 误报成供应商实际 cache hit。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
+提示词组装测试必须分别断言稳定 Runtime 策略、Platform-authored system context 与 Runtime 动态状态的顺序，并检查动态载荷的不可信 framing 和权威状态标识。测试还要证明同一 scope 内只改变精确时间、回忆记忆、活动 sidecar 或 Skill 索引时稳定前缀和内容寻址的 Codex 缓存 key 不变，稳定策略、provider 实际工具 schema、工具数组顺序或 scope 分片改变时 key 必须改变；工具对象字段顺序变化不得改变 key，空动态状态不生成占位块。捕获的 provider payload 还必须证明线上 key 不含原始 scope 且没有替代真实 session/header，普通单元测试不得把确定性 key 误报成供应商实际 cache hit。todo 回归要覆盖直接回答、单一读取、一两个简单动作、小改动的“读取 → 修改 → 聚焦验证”、至少三个独立步骤、用户同时要求多个任务以及执行中复杂度升级。deterministic fake 必须证明 Runtime 不自动创建 todo、空清单不进入系统提示、工具 schema 具有明确正反选择边界，并保留已有活动清单的恢复、不可信 framing 和有界完成守卫。执行恢复测试还要断言承诺式终稿和已有工具结果后的空终稿都最多追加一次 ephemeral continuation，恢复提示不进入 durable session，已执行工具不被重放。这些确定性测试只验证契约，不代替在发布前对代表性真实模型执行的小型行为 eval。
 
 后台 task 的反刷屏回归必须证明：只要当前 session 仍有活动责任，`schedule.create` 就在 Platform 调用和审批前被机械拒绝；取得匹配 target 的权威进程终态并解除全部责任后恢复允许；显式 service 不登记责任且不被误拦。
 

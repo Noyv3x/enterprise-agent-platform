@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 const CODEX_PROVIDER = "openai-codex";
 const CODEX_API = "openai-codex-responses";
-const PROMPT_CACHE_KEY_VERSION = "runtime-stable-prompt-tools-and-scope/v2";
+const PROMPT_CACHE_KEY_VERSION = "runtime-stable-prompt-ordered-tools-and-scope/v3";
 const SCOPE_PARTITION_VERSION = "runtime-prompt-cache-scope/v1";
 
 interface ProviderIdentity {
@@ -14,14 +14,14 @@ interface ProviderIdentity {
  * Build a provider cache-routing key without exposing raw Run identity or
  * volatile prompt data. The stable scope source is hashed locally to partition
  * traffic before the opaque wire key is derived. Tool schemas must come from
- * the provider payload so the digest tracks the exact normalized capabilities.
+ * the provider payload in wire order because order changes the rendered prefix.
  */
 export function codexPromptCacheKey(
   stableRuntimePrompt: string,
   providerToolSchemas: readonly unknown[],
   scopePartitionSource: string,
 ): string {
-  const tools = [...providerToolSchemas].sort(compareProviderTools);
+  const tools = [...providerToolSchemas];
   const material = canonicalJson({
     scope_partition: sha256(`${SCOPE_PARTITION_VERSION}\0${scopePartitionSource}`),
     stable_runtime_prompt: stableRuntimePrompt,
@@ -55,19 +55,6 @@ export function withCodexPromptCacheKey(
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function compareProviderTools(left: unknown, right: unknown): number {
-  const leftName = providerToolName(left);
-  const rightName = providerToolName(right);
-  const byName = ordinalCompare(leftName, rightName);
-  if (byName !== 0) return byName;
-  return ordinalCompare(canonicalJson(left), canonicalJson(right));
-}
-
-function providerToolName(value: unknown): string {
-  if (!isRecord(value)) return "";
-  return typeof value.name === "string" ? value.name : "";
 }
 
 function ordinalCompare(left: string, right: string): number {
