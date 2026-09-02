@@ -5,11 +5,13 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToastProvider } from "../../context/ToastContext";
+import { resetSession } from "../../data/sessionActions";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { BROWSER_CONTROL_RELINQUISH_EVENT } from "../../lib/browserControl";
 import { ApiError } from "../../lib/api";
 import { StoreProvider } from "../../store/StoreProvider";
 import { useStoreHandle } from "../../store/useStore";
+import type { AppStore } from "../../data/loaders";
 import type { ChatMode, FailedSend } from "../../types";
 import { Composer } from "./Composer";
 
@@ -31,23 +33,26 @@ function ComposerHarness({
   mode,
   scopeId,
   failedSend,
+  onStore,
 }: {
   mode: ChatMode;
   scopeId: string;
   failedSend?: FailedSend;
+  onStore?: (store: AppStore) => void;
 }) {
   const store = useStoreHandle();
   const draftKey = `${mode}:${scopeId}`;
   const [seeded, setSeeded] = useState(!failedSend);
 
   useLayoutEffect(() => {
+    onStore?.(store);
     if (!failedSend) return;
     store.dispatch({
       type: "ADD_FAILED_SEND",
       payload: { key: draftKey, send: failedSend },
     });
     setSeeded(true);
-  }, [draftKey, failedSend, store]);
+  }, [draftKey, failedSend, onStore, store]);
 
   if (!seeded) return null;
   return (
@@ -64,20 +69,30 @@ function ComposerHarness({
   );
 }
 
-function composerTree(mode: ChatMode, scopeId: string, failedSend?: FailedSend) {
+function composerTree(
+  mode: ChatMode,
+  scopeId: string,
+  failedSend?: FailedSend,
+  onStore?: (store: AppStore) => void,
+) {
   return (
     <I18nProvider>
       <ToastProvider>
         <StoreProvider>
-          <ComposerHarness mode={mode} scopeId={scopeId} failedSend={failedSend} />
+          <ComposerHarness mode={mode} scopeId={scopeId} failedSend={failedSend} onStore={onStore} />
         </StoreProvider>
       </ToastProvider>
     </I18nProvider>
   );
 }
 
-function renderComposer(mode: ChatMode, scopeId: string, failedSend?: FailedSend) {
-  return render(composerTree(mode, scopeId, failedSend));
+function renderComposer(
+  mode: ChatMode,
+  scopeId: string,
+  failedSend?: FailedSend,
+  onStore?: (store: AppStore) => void,
+) {
+  return render(composerTree(mode, scopeId, failedSend, onStore));
 }
 
 describe("Composer store subscriptions", () => {
@@ -121,6 +136,101 @@ describe("Composer store subscriptions", () => {
       expect(relinquished).toHaveBeenCalledTimes(1);
       finishRelinquish();
       await waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
+    } finally {
+      window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, relinquished);
+    }
+  });
+
+  it("drops an outgoing account payload when a deferred channel send crosses logout and login", async () => {
+    let finishRelinquish!: () => void;
+    const pendingRelinquish = new Promise<void>((resolve) => {
+      finishRelinquish = resolve;
+    });
+    const relinquished = (event: Event) => {
+      const detail = (event as CustomEvent<{ waitUntil: (operation: Promise<unknown>) => void }>).detail;
+      detail.waitUntil(pendingRelinquish);
+    };
+    let store!: AppStore;
+    const exposeStore = (nextStore: AppStore) => {
+      store = nextStore;
+    };
+    window.addEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, relinquished);
+    try {
+      renderComposer("channel", "12", undefined, exposeStore);
+      act(() => {
+        store.dispatch({ type: "SET_USER", payload: { id: 7, username: "alice" } });
+        store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
+        store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: 12 });
+      });
+
+      const input = screen.getByLabelText("Message input");
+      const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const attachment = new File(["handoff"], "handoff.txt", { type: "text/plain" });
+      fireEvent.change(input, { target: { value: "original account draft" } });
+      fireEvent.change(fileInput, { target: { files: [attachment] } });
+      fireEvent.submit(screen.getByRole("button", { name: "Send" }).closest("form")!);
+      expect(input).toHaveValue("");
+
+      act(() => {
+        resetSession(store);
+        store.dispatch({ type: "SET_USER", payload: { id: 8, username: "bob" } });
+        store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
+        store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: 12 });
+      });
+      fireEvent.change(input, { target: { value: "newer draft" } });
+
+      await act(async () => finishRelinquish());
+
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+      expect(input).toHaveValue("newer draft");
+      expect(screen.queryByRole("status")).not.toBeInTheDocument();
+      expect(screen.queryByText("original account draft")).not.toBeInTheDocument();
+      expect(screen.queryByText("handoff.txt")).not.toBeInTheDocument();
+    } finally {
+      window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, relinquished);
+    }
+  });
+
+  it("recovers a deferred payload only to its original scope after the Composer unmounts", async () => {
+    let finishRelinquish!: () => void;
+    const pendingRelinquish = new Promise<void>((resolve) => {
+      finishRelinquish = resolve;
+    });
+    const relinquished = (event: Event) => {
+      const detail = (event as CustomEvent<{ waitUntil: (operation: Promise<unknown>) => void }>).detail;
+      detail.waitUntil(pendingRelinquish);
+    };
+    let store!: AppStore;
+    const exposeStore = (nextStore: AppStore) => {
+      store = nextStore;
+    };
+    window.addEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, relinquished);
+    try {
+      const view = renderComposer("channel", "12", undefined, exposeStore);
+      act(() => {
+        store.dispatch({ type: "SET_USER", payload: { id: 7, username: "alice" } });
+        store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
+        store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: 12 });
+      });
+
+      const input = screen.getByLabelText("Message input");
+      const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+      const attachment = new File(["scope"], "original-scope.txt", { type: "text/plain" });
+      fireEvent.change(input, { target: { value: "return this to channel twelve" } });
+      fireEvent.change(fileInput, { target: { files: [attachment] } });
+      fireEvent.submit(screen.getByRole("button", { name: "Send" }).closest("form")!);
+
+      view.unmount();
+      act(() => {
+        store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: 13 });
+      });
+      await act(async () => finishRelinquish());
+
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+      expect(store.getState().drafts["channel:12"]).toBe("return this to channel twelve");
+      expect(store.getState().draftFiles["channel:12"]).toEqual([attachment]);
+      expect(store.getState().drafts["channel:13"]).toBeUndefined();
+      expect(store.getState().draftFiles["channel:13"]).toBeUndefined();
     } finally {
       window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, relinquished);
     }

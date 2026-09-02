@@ -22,7 +22,7 @@ import { useMention } from "../../hooks/useMention";
 import { useToast } from "../../hooks/useToast";
 import { useTypingNotifier } from "../../hooks/useTypingNotifier";
 import { compactAgentSession, sendMessage } from "../../data/chatActions";
-import { isApiError } from "../../lib/api";
+import { getApiSessionGeneration, isApiError } from "../../lib/api";
 import { preserveFailedSend, restoreNextFailedSend } from "../../data/failedSendRecovery";
 import { scopeTypeFor } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
@@ -72,6 +72,8 @@ export function Composer({
   const pendingCaretRef = useRef<number | null>(null);
   const isComposingRef = useRef(false);
   const activeDraftKeyRef = useRef(draftKey);
+  const activeScopeRef = useRef({ mode, scopeId });
+  const mountedRef = useRef(false);
   const commandRequestsRef = useRef(new Map<string, symbol>());
   const [commandScopesInFlight, setCommandScopesInFlight] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -85,7 +87,15 @@ export function Composer({
 
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
-  }, [draftKey]);
+    activeScopeRef.current = { mode, scopeId };
+  }, [draftKey, mode, scopeId]);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const notify = useTypingNotifier(mode, scopeId);
   useAutoGrow(textareaRef, draft);
@@ -240,6 +250,9 @@ export function Composer({
       }
       return;
     }
+    const accountGeneration = getApiSessionGeneration();
+    const submittingUserId = store.getState().user?.id ?? null;
+    const submittingScope = activeScopeRef.current;
     const browserHandoff = relinquishBrowserControlFor({ scope_type: mode, scope_id: scopeId });
     // Clear, focus + snap to bottom, and tell the server we stopped typing. These
     // sync dispatches batch with the optimistic insert inside sendMessage.
@@ -253,6 +266,16 @@ export function Composer({
     onBumpForceBottom();
     notify(false);
     await browserHandoff;
+    const latestState = store.getState();
+    const accountChanged = (
+      getApiSessionGeneration() !== accountGeneration
+      || (latestState.user?.id ?? null) !== submittingUserId
+    );
+    if (accountChanged) return;
+    if (!mountedRef.current || activeScopeRef.current !== submittingScope) {
+      preserveFailedSend(store, draftKey, content, files);
+      return;
+    }
     const sent = await sendMessage(store, mode, scopeId, content, files);
     if (sent === false) {
       preserveFailedSend(store, draftKey, content, files);

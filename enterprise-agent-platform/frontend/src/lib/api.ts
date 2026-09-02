@@ -81,6 +81,11 @@ export function _invokeSessionExpired(): void {
   sessionExpiredHandler?.();
 }
 
+/** Snapshot the account lifecycle generation before work that can defer request creation. */
+export function getApiSessionGeneration(): number {
+  return sessionGeneration;
+}
+
 /** Abort every request owned by the outgoing account and advance the response
  * generation. Even a fetch that wins the abort race is rejected before its
  * payload can be dispatched into the next account's store. */
