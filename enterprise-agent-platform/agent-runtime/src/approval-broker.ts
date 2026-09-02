@@ -43,6 +43,7 @@ export class ApprovalBroker {
   private readonly onRequest: (request: ApprovalRequest) => void;
   private readonly onResolved: (request: ApprovalRequest, resolution: ApprovalResolution) => void;
   private readonly persistence: ApprovalPersistence | undefined;
+  private sessionGrantMutation = Promise.resolve();
 
   constructor(
     timeoutMs: number,
@@ -63,16 +64,26 @@ export class ApprovalBroker {
         && (this.alwaysGrants.has(this.alwaysKey(context)) || this.persistence?.always.has(context.scopeKey, context.approvalKey))) {
       return { allowed: true, outcome: "approved" };
     }
-    if (context.allowSession !== false && this.sessionGrants.has(this.sessionKey(context))) {
-      return { allowed: true, outcome: "approved" };
-    }
-    if (context.allowSession !== false && this.persistence && context.lifecycleId && await this.persistence.sessions.hasSessionApproval({
-      scope_key: context.scopeKey,
-      lifecycle_id: context.lifecycleId,
-      session_id: context.sessionId,
-    }, context.approvalKey)) {
-      this.sessionGrants.add(this.sessionKey(context));
-      return { allowed: true, outcome: "approved" };
+    if (context.allowSession !== false) {
+      const sessionKey = this.sessionKey(context);
+      if (this.sessionGrants.has(sessionKey)) return { allowed: true, outcome: "approved" };
+      const persistence = this.persistence;
+      const lifecycleId = context.lifecycleId;
+      if (persistence && lifecycleId) {
+        const hasSessionGrant = await this.withSessionGrantMutation(async () => {
+          if (context.signal?.aborted) throw abortError();
+          if (this.sessionGrants.has(sessionKey)) return true;
+          const persisted = await persistence.sessions.hasSessionApproval({
+            scope_key: context.scopeKey,
+            lifecycle_id: lifecycleId,
+            session_id: context.sessionId,
+          }, context.approvalKey);
+          if (context.signal?.aborted) throw abortError();
+          if (persisted) this.sessionGrants.add(sessionKey);
+          return persisted;
+        });
+        if (hasSessionGrant) return { allowed: true, outcome: "approved" };
+      }
     }
     const request: ApprovalRequest = {
       id: id("approval"),
@@ -124,12 +135,17 @@ export class ApprovalBroker {
     clearTimeout(item.timer);
     if (item.signal && item.onAbort) item.signal.removeEventListener("abort", item.onAbort);
     try {
-      if (decision === "session" && this.persistence && item.request.lifecycle_id) {
-        await this.persistence.sessions.appendSessionApproval({
-          scope_key: item.request.scope_key,
-          lifecycle_id: item.request.lifecycle_id,
-          session_id: item.request.session_id,
-        }, item.request.approval_key, item.request.tool_name);
+      if (decision === "session") {
+        await this.withSessionGrantMutation(async () => {
+          if (this.persistence && item.request.lifecycle_id) {
+            await this.persistence.sessions.appendSessionApproval({
+              scope_key: item.request.scope_key,
+              lifecycle_id: item.request.lifecycle_id,
+              session_id: item.request.session_id,
+            }, item.request.approval_key, item.request.tool_name);
+          }
+          this.sessionGrants.add(this.sessionKeyFromRequest(item.request));
+        });
       }
       if (decision === "always") {
         this.persistence?.always.grant(
@@ -143,7 +159,6 @@ export class ApprovalBroker {
       item.resolve({ allowed: false, outcome: "notification_failed" });
       throw error;
     }
-    if (decision === "session") this.sessionGrants.add(this.sessionKeyFromRequest(item.request));
     if (decision === "always") this.alwaysGrants.add(this.alwaysKeyFromRequest(item.request));
     this.publishResolved(item.request, decision);
     item.resolve({
@@ -169,12 +184,6 @@ export class ApprovalBroker {
   }
 
   async clearScope(scopeKey: string, lifecycleId?: string): Promise<void> {
-    for (const grant of this.sessionGrants) {
-      const [grantScope = "", grantLifecycle = ""] = grant.split("\0", 3);
-      if (scopeOwns(scopeKey, grantScope) && (!lifecycleId || grantLifecycle === lifecycleId)) {
-        this.sessionGrants.delete(grant);
-      }
-    }
     for (const [approvalId, item] of this.pending) {
       if (
         !scopeOwns(scopeKey, item.request.scope_key)
@@ -182,7 +191,30 @@ export class ApprovalBroker {
       ) continue;
       this.settle(approvalId, "cancelled", { allowed: false, outcome: "cancelled" });
     }
-    await this.persistence?.sessions.clearSessionApprovals(scopeKey, lifecycleId);
+    await this.withSessionGrantMutation(async () => {
+      for (const grant of this.sessionGrants) {
+        const [grantScope = "", grantLifecycle = ""] = grant.split("\0", 3);
+        if (scopeOwns(scopeKey, grantScope) && (!lifecycleId || grantLifecycle === lifecycleId)) {
+          this.sessionGrants.delete(grant);
+        }
+      }
+      await this.persistence?.sessions.clearSessionApprovals(scopeKey, lifecycleId);
+    });
+  }
+
+  private async withSessionGrantMutation<T>(task: () => Promise<T>): Promise<T> {
+    const previous = this.sessionGrantMutation;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const current = previous.catch(() => undefined).then(async () => await gate);
+    this.sessionGrantMutation = current;
+    await previous.catch(() => undefined);
+    try {
+      return await task();
+    } finally {
+      release();
+      if (this.sessionGrantMutation === current) this.sessionGrantMutation = Promise.resolve();
+    }
   }
 
   private sessionKey(context: ApprovalContext): string {

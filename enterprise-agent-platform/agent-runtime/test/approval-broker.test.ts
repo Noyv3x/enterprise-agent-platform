@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { ApprovalBroker } from "../src/approval-broker.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
-import { SessionStore } from "../src/session-store.js";
+import { SessionStore, type SessionIdentity } from "../src/session-store.js";
 import type { ApprovalRequest } from "../src/types.js";
 import { temporaryDirectory } from "./helpers.js";
 
@@ -152,6 +152,171 @@ test("always and session approvals survive broker restart and cleanup clears ses
     await waitForRequest(afterCleanupRequests);
     afterCleanup.cancelRun("run-session-three");
     assert.deepEqual(await afterCleanupPending, { allowed: false, outcome: "cancelled" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("cleanup waits for an earlier session grant commit and prevents it from reappearing", async () => {
+  const home = await temporaryDirectory("agent-approval-cleanup-race-");
+  try {
+    let markAppendStarted!: () => void;
+    let releaseAppend!: () => void;
+    const appendStarted = new Promise<void>((resolve) => { markAppendStarted = resolve; });
+    const allowAppend = new Promise<void>((resolve) => { releaseAppend = resolve; });
+    class DelayedSessionStore extends SessionStore {
+      override async appendSessionApproval(
+        identity: SessionIdentity,
+        approvalKey: string,
+        toolName: string,
+      ): Promise<void> {
+        markAppendStarted();
+        await allowAppend;
+        await super.appendSessionApproval(identity, approvalKey, toolName);
+      }
+    }
+    const sessions = new DelayedSessionStore(home);
+    const requests: ApprovalRequest[] = [];
+    const broker = new ApprovalBroker(
+      1_000,
+      (request) => requests.push(request),
+      () => undefined,
+      { always: new AlwaysApprovalStore(home), sessions },
+    );
+    const context = {
+      runId: "run-racing-grant",
+      scopeKey: "scope",
+      lifecycleId: "life",
+      sessionId: "session",
+      toolName: "terminal",
+      approvalKey: "v2:terminal:racing-grant",
+      displayArguments: { command: "date" },
+      reason: "host command",
+    };
+    const identity = {
+      scope_key: context.scopeKey,
+      lifecycle_id: context.lifecycleId,
+      session_id: context.sessionId,
+    };
+    const pending = broker.request(context);
+    const response = broker.respond(context.runId, (await waitForRequest(requests)).id, "session");
+    await appendStarted;
+    const cleanup = broker.clearScope(context.scopeKey, context.lifecycleId);
+
+    releaseAppend();
+    await response;
+    assert.deepEqual(await pending, { allowed: true, outcome: "approved" });
+    await cleanup;
+    assert.equal(await sessions.hasSessionApproval(identity, context.approvalKey), false);
+
+    const afterCleanup = broker.request({ ...context, runId: "run-after-racing-grant" });
+    await waitForRequest(requests, 1);
+    broker.cancelRun("run-after-racing-grant");
+    assert.deepEqual(await afterCleanup, { allowed: false, outcome: "cancelled" });
+    const restarted = new SessionStore(home);
+    assert.equal(await restarted.hasSessionApproval(identity, context.approvalKey), false);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("cleanup waits for an earlier durable lookup and does not allow a stale grant to reappear", async () => {
+  const home = await temporaryDirectory("agent-approval-lookup-cleanup-race-");
+  try {
+    let markLookupStarted!: () => void;
+    let releaseLookup!: () => void;
+    const lookupStarted = new Promise<void>((resolve) => { markLookupStarted = resolve; });
+    const allowLookup = new Promise<void>((resolve) => { releaseLookup = resolve; });
+    class DelayedLookupSessionStore extends SessionStore {
+      private delayNextLookup = true;
+
+      override async hasSessionApproval(identity: SessionIdentity, approvalKey: string): Promise<boolean> {
+        const persisted = await super.hasSessionApproval(identity, approvalKey);
+        if (this.delayNextLookup) {
+          this.delayNextLookup = false;
+          markLookupStarted();
+          await allowLookup;
+        }
+        return persisted;
+      }
+    }
+    const sessions = new DelayedLookupSessionStore(home);
+    const identity = { scope_key: "scope", lifecycle_id: "life", session_id: "session" };
+    const approvalKey = "v2:terminal:durable-lookup-race";
+    await sessions.appendSessionApproval(identity, approvalKey, "terminal");
+    const requests: ApprovalRequest[] = [];
+    const broker = new ApprovalBroker(
+      1_000,
+      (request) => requests.push(request),
+      () => undefined,
+      { always: new AlwaysApprovalStore(home), sessions },
+    );
+    const context = {
+      runId: "run-durable-lookup",
+      scopeKey: identity.scope_key,
+      lifecycleId: identity.lifecycle_id,
+      sessionId: identity.session_id,
+      toolName: "terminal",
+      approvalKey,
+      displayArguments: { command: "date" },
+      reason: "host command",
+    };
+    const lookup = broker.request(context);
+    await lookupStarted;
+    const cleanup = broker.clearScope(identity.scope_key, identity.lifecycle_id);
+
+    releaseLookup();
+    assert.deepEqual(await lookup, { allowed: true, outcome: "approved" });
+    await cleanup;
+    assert.equal(await sessions.hasSessionApproval(identity, approvalKey), false);
+
+    const afterCleanup = broker.request({ ...context, runId: "run-after-durable-lookup-cleanup" });
+    await waitForRequest(requests);
+    broker.cancelRun("run-after-durable-lookup-cleanup");
+    assert.deepEqual(await afterCleanup, { allowed: false, outcome: "cancelled" });
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("session grant persistence failure denies and reports notification failure", async () => {
+  const home = await temporaryDirectory("agent-approval-persistence-failure-");
+  try {
+    class FailingSessionStore extends SessionStore {
+      override async appendSessionApproval(): Promise<void> {
+        throw new Error("approval journal unavailable");
+      }
+    }
+    const requests: ApprovalRequest[] = [];
+    const resolutions: string[] = [];
+    const broker = new ApprovalBroker(
+      1_000,
+      (request) => requests.push(request),
+      (_request, resolution) => resolutions.push(resolution),
+      { always: new AlwaysApprovalStore(home), sessions: new FailingSessionStore(home) },
+    );
+    const context = {
+      runId: "run-persistence-failure",
+      scopeKey: "scope",
+      lifecycleId: "life",
+      sessionId: "session",
+      toolName: "terminal",
+      approvalKey: "v2:terminal:persistence-failure",
+      displayArguments: { command: "date" },
+      reason: "host command",
+    };
+    const pending = broker.request(context);
+    await assert.rejects(
+      broker.respond(context.runId, (await waitForRequest(requests)).id, "session"),
+      /approval journal unavailable/,
+    );
+    assert.deepEqual(await pending, { allowed: false, outcome: "notification_failed" });
+    assert.deepEqual(resolutions, ["notification_failed"]);
+
+    const retry = broker.request({ ...context, runId: "run-after-persistence-failure" });
+    await waitForRequest(requests, 1);
+    broker.cancelRun("run-after-persistence-failure");
+    assert.deepEqual(await retry, { allowed: false, outcome: "cancelled" });
   } finally {
     await rm(home, { recursive: true, force: true });
   }

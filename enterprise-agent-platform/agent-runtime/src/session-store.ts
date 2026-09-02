@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { redactCommandForApproval } from "./approval-policy.js";
@@ -52,6 +52,7 @@ export class SessionStore {
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
   private readonly archiveQueues = new Map<string, Promise<void>>();
+  private readonly approvalQueues = new Map<string, Promise<void>>();
   private readonly todos: TodoStore;
   private readonly backgroundTasks: BackgroundTaskStore;
 
@@ -139,9 +140,11 @@ export class SessionStore {
           lifecycle_id: identity.lifecycle_id,
           session_id: identity.session_id,
         });
+        await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
         await this.appendRaw(file, header);
         const tracked: TrackedSessionMessage[] = [];
         for (const message of history) {
+          await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
           const entry = this.entry(identity, "message", durableSessionMessage(message));
           await this.appendRaw(file, entry);
           tracked.push({ entry_id: entry.id, message });
@@ -477,47 +480,53 @@ export class SessionStore {
   }
 
   async hasSessionApproval(identity: SessionIdentity, approvalKey: string): Promise<boolean> {
-    const entries = await this.readApprovalEntries(identity);
-    const grants = new Set<string>();
-    for (const entry of entries) {
-      if (entry.type === "clear") grants.clear();
-      // Unscoped entries contain only tool_name and are intentionally ignored:
-      // those grants are too broad to map safely to a concrete current object.
-      else if (entry.session_id && entry.approval_key?.startsWith("v2:")) {
-        grants.add(`${entry.session_id}\0${entry.approval_key}`);
+    return await this.withQueue(this.approvalQueues, "session-approvals", async () => {
+      const entries = await this.readApprovalEntries(identity);
+      const grants = new Set<string>();
+      for (const entry of entries) {
+        if (entry.type === "clear") grants.clear();
+        // Unscoped entries contain only tool_name and are intentionally ignored:
+        // those grants are too broad to map safely to a concrete current object.
+        else if (entry.session_id && entry.approval_key?.startsWith("v2:")) {
+          grants.add(`${entry.session_id}\0${entry.approval_key}`);
+        }
       }
-    }
-    return grants.has(`${identity.session_id}\0${approvalKey}`);
+      return grants.has(`${identity.session_id}\0${approvalKey}`);
+    });
   }
 
   async appendSessionApproval(identity: SessionIdentity, approvalKey: string, toolName: string): Promise<void> {
-    const file = this.approvalPath(identity);
-    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    await this.appendRaw(file, {
-      id: id("approval_grant"),
-      type: "grant",
-      timestamp: nowIso(),
-      session_id: identity.session_id,
-      tool_name: toolName,
-      approval_key: approvalKey,
-    } satisfies SessionApprovalEntry);
+    await this.withQueue(this.approvalQueues, "session-approvals", async () => {
+      const file = this.approvalPath(identity);
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      await this.appendRaw(file, {
+        id: id("approval_grant"),
+        type: "grant",
+        timestamp: nowIso(),
+        session_id: identity.session_id,
+        tool_name: toolName,
+        approval_key: approvalKey,
+      } satisfies SessionApprovalEntry);
+    });
   }
 
   async clearSessionApprovals(scopeKey: string, lifecycleId?: string): Promise<void> {
-    const scopeDir = join(this.sessionsRoot, stableHash(scopeKey));
-    const lifecycleDirectories = lifecycleId
-      ? [join(scopeDir, stableHash(lifecycleId))]
-      : await readdir(scopeDir, { withFileTypes: true }).then(
-        (entries) => entries.filter((entry) => entry.isDirectory()).map((entry) => join(scopeDir, entry.name)),
-        (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
-      );
-    for (const directory of lifecycleDirectories) {
-      const file = join(directory, "approvals.jsonl");
-      await mkdir(directory, { recursive: true, mode: 0o700 });
-      await this.replaceRaw(file, [
-        { id: id("approval_clear"), type: "clear", timestamp: nowIso() } satisfies SessionApprovalEntry,
-      ]);
-    }
+    await this.withQueue(this.approvalQueues, "session-approvals", async () => {
+      const scopeDir = join(this.sessionsRoot, stableHash(scopeKey));
+      const lifecycleDirectories = lifecycleId
+        ? [join(scopeDir, stableHash(lifecycleId))]
+        : await readdir(scopeDir, { withFileTypes: true }).then(
+          (entries) => entries.filter((entry) => entry.isDirectory()).map((entry) => join(scopeDir, entry.name)),
+          (error: NodeJS.ErrnoException) => error.code === "ENOENT" ? [] : Promise.reject(error),
+        );
+      for (const directory of lifecycleDirectories) {
+        const file = join(directory, "approvals.jsonl");
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        await this.replaceRaw(file, [
+          { id: id("approval_clear"), type: "clear", timestamp: nowIso() } satisfies SessionApprovalEntry,
+        ]);
+      }
+    });
   }
 
   async writeManifest(identity: SessionIdentity): Promise<void> {
@@ -536,6 +545,7 @@ export class SessionStore {
     return await this.withQueue(this.mutationQueues, file, async () => {
       await mkdir(dirname(file), { recursive: true, mode: 0o700 });
       const entry = this.entry(identity, type, payload, modelContentSecurityVersion);
+      await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
       await this.appendRaw(file, entry);
       await this.writeManifest(identity);
       return entry;
@@ -596,39 +606,78 @@ export class SessionStore {
   }
 
   private async repairJsonlTail(file: string, label: string, maximumBytes: number): Promise<void> {
-    let bytes: Buffer;
+    let handle: FileHandle;
     try {
-      const info = await stat(file);
-      if (!info.isFile()) throw new Error(`${label} is not a regular file`);
-      if (info.size > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`);
-      if (info.size === 0) return;
-      bytes = await readFile(file);
+      handle = await open(file, "r+");
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
       throw error;
     }
-    if (bytes[bytes.length - 1] === 0x0a) return;
-    const previousLineEnd = bytes.lastIndexOf(0x0a);
-    const tailStart = previousLineEnd + 1;
-    const tail = bytes.subarray(tailStart).toString("utf8").trim();
-    let preserveTail = false;
-    if (tail) {
-      try {
-        const candidate = JSON.parse(tail) as { id?: unknown; type?: unknown };
-        preserveTail = Boolean(
-          candidate
-          && typeof candidate === "object"
-          && typeof candidate.id === "string"
-          && typeof candidate.type === "string",
-        );
-      } catch {
-        preserveTail = false;
-      }
-    }
-    const handle = await open(file, "r+");
     try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error(`${label} is not a regular file`);
+      if (info.size > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`);
+      if (info.size === 0) return;
+
+      const finalByte = Buffer.allocUnsafe(1);
+      const { bytesRead: finalBytesRead } = await handle.read(finalByte, 0, 1, info.size - 1);
+      if (finalBytesRead !== 1) throw new Error(`Could not read ${label.toLowerCase()} tail`);
+      if (finalByte[0] === 0x0a) return;
+
+      const scanBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, info.size));
+      let tailStart = 0;
+      let cursor = info.size;
+      while (cursor > 0) {
+        const scanLength = Math.min(scanBuffer.length, cursor);
+        const scanStart = cursor - scanLength;
+        let scanOffset = 0;
+        while (scanOffset < scanLength) {
+          const { bytesRead } = await handle.read(
+            scanBuffer,
+            scanOffset,
+            scanLength - scanOffset,
+            scanStart + scanOffset,
+          );
+          if (bytesRead === 0) throw new Error(`Could not read ${label.toLowerCase()} tail`);
+          scanOffset += bytesRead;
+        }
+        const previousLineEnd = scanBuffer.subarray(0, scanLength).lastIndexOf(0x0a);
+        if (previousLineEnd >= 0) {
+          tailStart = scanStart + previousLineEnd + 1;
+          break;
+        }
+        cursor = scanStart;
+      }
+
+      const tailBytes = Buffer.allocUnsafe(info.size - tailStart);
+      let tailOffset = 0;
+      while (tailOffset < tailBytes.length) {
+        const { bytesRead } = await handle.read(
+          tailBytes,
+          tailOffset,
+          tailBytes.length - tailOffset,
+          tailStart + tailOffset,
+        );
+        if (bytesRead === 0) throw new Error(`Could not read ${label.toLowerCase()} tail`);
+        tailOffset += bytesRead;
+      }
+      const tail = tailBytes.toString("utf8").trim();
+      let preserveTail = false;
+      if (tail) {
+        try {
+          const candidate = JSON.parse(tail) as { id?: unknown; type?: unknown };
+          preserveTail = Boolean(
+            candidate
+            && typeof candidate === "object"
+            && typeof candidate.id === "string"
+            && typeof candidate.type === "string",
+          );
+        } catch {
+          preserveTail = false;
+        }
+      }
       if (preserveTail) {
-        await handle.write("\n", bytes.length, "utf8");
+        await handle.write("\n", info.size, "utf8");
       } else {
         await handle.truncate(tailStart);
       }

@@ -150,7 +150,7 @@ OAuth token 不得写入 Runtime session、Run metadata、工具事件或错误�
 
 ## 不可信内容与提示词注入
 
-用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、MCP 描述/结果、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只允许读取和汇报，不得把邮件内容当成发送、移动、删除或宿主执行授权。
+用户显示名、职位、频道名、网页、浏览器、电脑呈现页 HTML、邮件正文与头部、MCP 描述/结果、记忆、历史 session、计划结果和 Skill 附件都作为不可信数据。Runtime 使用防伪、闭合的结构化边界包装工具结果，中和载荷伪造的边界 token；短文本、错误文本和历史数据不能豁免。邮件唤醒是 unattended Run，只能暴露读取邮件账户、目录、搜索和正文所需的只读 mail 动作并汇报结果；terminal、process、文件、网页、浏览器、Skill、计划、委派、MCP、邮件修改与附件保存等其它工具必须在调用前机械拒绝，不得把邮件内容当成发送、移动、删除、网络访问、工作区操作或宿主执行授权。
 
 Runtime 系统提示按稳定策略、Platform-authored system context 和动态状态分层时，分层仅决定顺序、缓存稳定性和数据 framing，不创建新授权；Platform 是系统上下文作者，其中嵌入的用户、频道和品牌载荷仍是闭合不可信数据。供应商 `prompt_cache_key` 只能是版本化稳定策略、工具 schema 和稳定 scope 分片的单向内容摘要，线上 key 不得包含原始账号、scope、session、路径、提示正文或凭据；本地参与摘要的 scope 只用于稳定分流，不得写入日志或供应商 payload。该 key 只是缓存路由提示，不是身份、隔离、授权或完整性边界，真实 session/header 与 Runtime 权威状态仍独立校验。权限、scope、lifecycle、执行 target 与审批仍只来自闭世界结构化请求和 Runtime/Platform 权威状态，不从任何提示文本推断。`todo` 只是 session 内执行组织；工具说明、清单正文和状态都不能绕过审批、授予工具能力或建立外部副作用。todo 正文是不可信任务数据；模型不得主动把凭据复制进去，todo 也不是 secret store。只有 Runtime-owned id 和状态可作为机械完成守卫的权威依据。
 

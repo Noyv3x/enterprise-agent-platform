@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import test from "node:test";
 import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
@@ -71,6 +71,79 @@ test("SessionStore ignores an incomplete final JSONL record", async () => {
     await store.initialize(identity, [message]);
     await appendFile(store.path(identity), "{\"incomplete\":");
     assert.deepEqual(await store.load(identity), [message]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore preserves a complete active record without a newline before later appends", async () => {
+  const home = await temporaryDirectory("agent-session-active-complete-tail-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const beforeCrash: UserMessage = { role: "user", content: "complete-before-crash", timestamp: 1 };
+    const afterCrashOne: UserMessage = { role: "user", content: "after-crash-one", timestamp: 2 };
+    const afterCrashTwo: UserMessage = { role: "user", content: "after-crash-two", timestamp: 3 };
+    await store.initialize(identity, [beforeCrash]);
+    const journalPath = store.path(identity);
+    await writeFile(journalPath, (await readFile(journalPath, "utf8")).trimEnd(), { mode: 0o600 });
+
+    await store.appendMessage(identity, afterCrashOne);
+    await store.appendMessage(identity, afterCrashTwo);
+
+    const journal = await readFile(journalPath, "utf8");
+    assert.equal(journal.endsWith("\n"), true);
+    assert.doesNotThrow(() => journal.trimEnd().split("\n").map((line) => JSON.parse(line)));
+    assert.equal((journal.match(/complete-before-crash/g) ?? []).length, 1);
+    assert.deepEqual(await new SessionStore(home).load(identity), [beforeCrash, afterCrashOne, afterCrashTwo]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore truncates a partial active record before two later appends and reload", async () => {
+  const home = await temporaryDirectory("agent-session-active-partial-tail-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const beforeCrash: UserMessage = { role: "user", content: "valid-before-partial", timestamp: 1 };
+    const afterCrashOne: UserMessage = { role: "user", content: "after-partial-one", timestamp: 2 };
+    const afterCrashTwo: UserMessage = { role: "user", content: "after-partial-two", timestamp: 3 };
+    await store.initialize(identity, [beforeCrash]);
+    const journalPath = store.path(identity);
+    await appendFile(journalPath, "{\"id\":\"partial");
+
+    await store.appendMessage(identity, afterCrashOne);
+    await store.appendMessage(identity, afterCrashTwo);
+
+    const journal = await readFile(journalPath, "utf8");
+    assert.doesNotMatch(journal, /\"id\":\"partial/);
+    assert.doesNotThrow(() => journal.trimEnd().split("\n").map((line) => JSON.parse(line)));
+    assert.deepEqual(await new SessionStore(home).load(identity), [beforeCrash, afterCrashOne, afterCrashTwo]);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore checks only the final byte of a healthy large journal before append", async (context) => {
+  const home = await temporaryDirectory("agent-session-active-tail-fast-path-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const large: UserMessage = { role: "user", content: "x".repeat(2 * 1024 * 1024), timestamp: 1 };
+    await store.initialize(identity, [large]);
+    const journalPath = store.path(identity);
+    const journalSize = (await stat(journalPath)).size;
+    const probe = await open(journalPath, "r");
+    const fileHandlePrototype = Object.getPrototypeOf(probe) as typeof probe;
+    await probe.close();
+    const read = context.mock.method(fileHandlePrototype, "read");
+
+    await store.appendMessage(identity, { role: "user", content: "later", timestamp: 2 });
+
+    const requestedLengths = read.mock.calls.map((call) => (call.arguments as unknown[])[2]);
+    assert.deepEqual(requestedLengths, [1]);
+    assert.ok(requestedLengths.every((length) => typeof length === "number" && length < journalSize));
   } finally {
     await rm(home, { recursive: true, force: true });
   }

@@ -542,97 +542,112 @@ const mailBodyFields = {
   text_body: Type.Optional(Type.String({ maxLength: 200_000 })),
   html_body: Type.Optional(Type.String({ maxLength: 800_000 })),
 };
+const mailAccountsSchema = Type.Object({
+  action: Type.Literal("accounts"),
+  arguments: Type.Optional(Type.Object({}, { additionalProperties: false })),
+}, { additionalProperties: false });
+const mailFoldersSchema = Type.Object({
+  action: Type.Literal("folders"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailSearchSchema = Type.Object({
+  action: Type.Literal("search"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    criteria: Type.Optional(Type.Object({
+      unread: Type.Optional(Type.Boolean()),
+      from: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      to: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      subject: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+      since: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
+      before: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
+    }, { additionalProperties: false })),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailReadMessageSchema = Type.Object({
+  action: Type.Literal("read"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    uid: mailUidSchema,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailReadSchema = Type.Union([
+  mailAccountsSchema,
+  mailFoldersSchema,
+  mailSearchSchema,
+  mailReadMessageSchema,
+]);
+const mailSendSchema = Type.Object({
+  action: Type.Literal("send"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    to: mailAddressListSchema,
+    cc: optionalMailRecipientsSchema,
+    bcc: optionalMailRecipientsSchema,
+    subject: Type.String({ maxLength: 998 }),
+    ...mailBodyFields,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailReplySchema = Type.Object({
+  action: Type.Literal("reply"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    uid: mailUidSchema,
+    cc: optionalMailRecipientsSchema,
+    bcc: optionalMailRecipientsSchema,
+    subject: Type.Optional(Type.String({ maxLength: 998 })),
+    ...mailBodyFields,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailMoveSchema = Type.Object({
+  action: Type.Literal("move"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    uid: mailUidSchema,
+    destination: mailFolderSchema,
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailMarkSchema = Type.Object({
+  action: Type.Literal("mark"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    uid: mailUidSchema,
+    state: Type.Union([
+      Type.Literal("seen"),
+      Type.Literal("unseen"),
+      Type.Literal("flagged"),
+      Type.Literal("unflagged"),
+    ]),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
+const mailSaveAttachmentSchema = Type.Object({
+  action: Type.Literal("save_attachment"),
+  arguments: Type.Object({
+    account_id: mailAccountIdSchema,
+    folder: Type.Optional(mailFolderSchema),
+    uid: mailUidSchema,
+    attachment_index: Type.Integer({ minimum: 0, maximum: 10_000 }),
+    path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  }, { additionalProperties: false }),
+}, { additionalProperties: false });
 const mailSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("accounts"),
-    arguments: Type.Optional(Type.Object({}, { additionalProperties: false })),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("folders"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("search"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      criteria: Type.Optional(Type.Object({
-        unread: Type.Optional(Type.Boolean()),
-        from: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-        to: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-        subject: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-        since: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
-        before: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
-      }, { additionalProperties: false })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("read"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      uid: mailUidSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("send"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      to: mailAddressListSchema,
-      cc: optionalMailRecipientsSchema,
-      bcc: optionalMailRecipientsSchema,
-      subject: Type.String({ maxLength: 998 }),
-      ...mailBodyFields,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("reply"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      uid: mailUidSchema,
-      cc: optionalMailRecipientsSchema,
-      bcc: optionalMailRecipientsSchema,
-      subject: Type.Optional(Type.String({ maxLength: 998 })),
-      ...mailBodyFields,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("move"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      uid: mailUidSchema,
-      destination: mailFolderSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("mark"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      uid: mailUidSchema,
-      state: Type.Union([
-        Type.Literal("seen"),
-        Type.Literal("unseen"),
-        Type.Literal("flagged"),
-        Type.Literal("unflagged"),
-      ]),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("save_attachment"),
-    arguments: Type.Object({
-      account_id: mailAccountIdSchema,
-      folder: Type.Optional(mailFolderSchema),
-      uid: mailUidSchema,
-      attachment_index: Type.Integer({ minimum: 0, maximum: 10_000 }),
-      path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
+  mailAccountsSchema,
+  mailFoldersSchema,
+  mailSearchSchema,
+  mailReadMessageSchema,
+  mailSendSchema,
+  mailReplySchema,
+  mailMoveSchema,
+  mailMarkSchema,
+  mailSaveAttachmentSchema,
 ]);
 
 const memoryTargetSchema = Type.Union([
@@ -1058,6 +1073,10 @@ function canDelegateTasks(context: ToolFactoryContext): boolean {
 
 export function createTools(context: ToolFactoryContext): AgentTool[] {
   const learningReview = isLearningReviewRun(context.request);
+  const unattendedEmail = (
+    context.request.metadata?.trigger === "email"
+    && context.request.metadata.unattended === true
+  );
   const codexFileTargetRequired = context.request.model?.provider === "openai-codex";
   const todoState = context.todoState;
   const loadedSkillIds = new Set<string>();
@@ -1465,11 +1484,11 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     },
   };
 
-  const mailTool: AgentTool<typeof mailSchema, JsonValue> = {
+  const mailTool: AgentTool<typeof mailSchema | typeof mailReadSchema, JsonValue> = {
     name: "mail",
     label: "Mail",
     description: gatewayDescription("mail"),
-    parameters: mailSchema,
+    parameters: unattendedEmail ? mailReadSchema : mailSchema,
     executionMode: "sequential",
     async execute(toolCallId, params, signal) {
       if (isMailMutation(params.action) && context.request.metadata?.unattended === true) {
@@ -1608,6 +1627,9 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
   };
 
   if (learningReview) return [memoryTool, skillTool];
+  if (unattendedEmail) {
+    return isCanonicalPrivateScope(context.request.scope_key) ? [mailTool] : [];
+  }
 
   return [
     terminal,

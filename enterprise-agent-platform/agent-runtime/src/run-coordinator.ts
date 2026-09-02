@@ -132,6 +132,17 @@ interface RunActivityState {
   pausedReason?: string;
 }
 
+interface ApprovedToolCallBinding {
+  toolName: string;
+  canonicalArguments: string;
+  approvedCwd?: string;
+  approvedPath?: string;
+  executionTarget?: ExecutionTarget;
+  journalArguments: JsonObject;
+}
+
+const UNATTENDED_EMAIL_TOOL_BLOCK = "Unattended email runs can only use read-only mail account, folder, search, and read actions";
+
 // Background learning mutates durable memory and Agent-owned Skills without a
 // user approval round trip. Keep that autonomous loop independently bounded,
 // even when operators raise the ordinary long-task turn budget.
@@ -996,11 +1007,7 @@ export class RunCoordinator {
       let automaticCompactionView: AgentMessage[] | undefined;
       const executionReview = createExecutionReviewState(activeBackgroundTasksAtStart);
       const ephemeralMessages = new WeakSet<AgentMessage>();
-      const approvedToolCalls = new Set<string>();
-      const journalToolArguments = new Map<string, JsonObject>();
-      const approvedTerminalCwds = new Map<string, string>();
-      const approvedFilePaths = new Map<string, string>();
-      const executionTargets = new Map<string, ExecutionTarget>();
+      const approvedToolCalls = new Map<string, ApprovedToolCallBinding>();
       const executionReceipts = new Map<string, ExecutionAuditReceipt>();
       const startedToolCalls = new Set<string>();
       const codexOAuthProvider = (
@@ -1048,21 +1055,30 @@ export class RunCoordinator {
       const tools = rawTools.map((tool): AgentTool => ({
         ...tool,
         execute: async (toolCallId, params, signal, onUpdate) => {
-          if (!approvedToolCalls.has(toolCallId)) {
+          const approval = approvedToolCalls.get(toolCallId);
+          if (!approval) {
             throw new Error("Tool execution did not pass the platform policy preflight");
           }
+          // Consume the exact preflight result before doing anything observable.
+          // A provider id can therefore authorize at most one execution, even if
+          // a caller attempts to invoke a prepared tool more than once.
+          approvedToolCalls.delete(toolCallId);
+          if (approval.toolName !== tool.name) {
+            throw new Error("Tool execution does not match its platform policy preflight");
+          }
           if (record.controller.signal.aborted || signal?.aborted) throw abortError();
-          const approvedCwd = tool.name === "terminal" ? approvedTerminalCwds.get(toolCallId) : undefined;
-          const approvedPath = approvedFilePaths.get(toolCallId);
-          const executionParams = approvedCwd
-            ? { ...recordValue(params), cwd: approvedCwd }
-            : approvedPath
-              ? { ...recordValue(params), path: approvedPath }
+          const executionParams = approval.approvedCwd
+            ? { ...recordValue(params), cwd: approval.approvedCwd }
+            : approval.approvedPath
+              ? { ...recordValue(params), path: approval.approvedPath }
               : params;
+          if (canonicalJson(executionParams) !== approval.canonicalArguments) {
+            throw new Error("Tool arguments do not match their platform policy preflight");
+          }
           let receipt: ExecutionAuditReceipt | undefined;
           let executionDetails: JsonObject | undefined;
           if (isExecutionTool(tool.name)) {
-            const target = executionTargets.get(toolCallId) ?? EXECUTION_TARGETS[0];
+            const target = approval.executionTarget ?? EXECUTION_TARGETS[0];
             const auditId = id("audit");
             const binding = managedExecutionBinding(
               tool.name,
@@ -1070,13 +1086,7 @@ export class RunCoordinator {
               record.request.workspace,
               this.config.terminalTimeoutMs,
             );
-            const details = binding.auditDetails
-              ?? journalToolArguments.get(toolCallId)
-              ?? redactToolArgumentsForJournal(
-                tool.name,
-                recordValue(executionParams),
-                record.request.workspace,
-              );
+            const details = binding.auditDetails ?? approval.journalArguments;
             executionDetails = details;
             journal.publish("execution.audit", {
               audit_id: auditId,
@@ -1106,9 +1116,7 @@ export class RunCoordinator {
           journal.publish("tool.started", {
             tool_call_id: toolCallId,
             tool_name: tool.name,
-            arguments: executionDetails
-              ?? journalToolArguments.get(toolCallId)
-              ?? redactToolArgumentsForJournal(tool.name, recordValue(params), record.request.workspace),
+            arguments: executionDetails ?? approval.journalArguments,
             execution_started: true,
             ...(receipt ? {
               audit_id: receipt.audit_id,
@@ -1163,7 +1171,7 @@ export class RunCoordinator {
                 tool.name,
                 recordValue(executionParams),
                 result.details,
-                executionTargets.get(toolCallId) ?? EXECUTION_TARGETS[0],
+                approval.executionTarget ?? EXECUTION_TARGETS[0],
               );
             } catch {
               this.forcedReviewReasons.set(record.id, BACKGROUND_TASK_STATE_REVIEW_ERROR);
@@ -1424,30 +1432,51 @@ export class RunCoordinator {
           if (record.controller.signal.aborted) {
             return { block: true, reason: "Agent run is no longer active" };
           }
+          const metadata = record.request.metadata;
+          const unattended = metadata?.unattended === true;
+          const unattendedScheduled = metadata?.trigger === "scheduled" && unattended;
+          const unattendedEmail = metadata?.trigger === "email" && unattended;
+          if (assistantMessageHasDuplicateToolCallIds(toolContext.assistantMessage)) {
+            return {
+              block: true,
+              reason: "Assistant tool-call batches must use a unique id for every tool call",
+            };
+          }
+          const unattendedEmailBlock = unattendedEmailToolBlockReason(
+            record.request,
+            toolContext.toolCall.name,
+            toolContext.args,
+          );
+          if (unattendedEmailBlock) {
+            this.rememberUnattendedAuthorizationBlock(
+              record.id,
+              toolContext.toolCall.id,
+              unattendedEmailBlock,
+            );
+            return { block: true, reason: unattendedEmailBlock };
+          }
           const rememberApprovedTool = (): boolean => {
             if (record.controller.signal.aborted || signal?.aborted) return false;
-            approvedToolCalls.add(toolContext.toolCall.id);
-            if (toolContext.toolCall.name === "terminal" && policy.approvedCwd) {
-              approvedTerminalCwds.set(toolContext.toolCall.id, policy.approvedCwd);
-            }
-            if (policy.approvedPath) approvedFilePaths.set(toolContext.toolCall.id, policy.approvedPath);
-            if (policy.executionTarget) {
-              executionTargets.set(toolContext.toolCall.id, policy.executionTarget);
-            }
-            journalToolArguments.set(
-              toolContext.toolCall.id,
-              policy.displayArguments
+            const approvedArguments = policy.approvedCwd
+              ? { ...recordValue(toolContext.args), cwd: policy.approvedCwd }
+              : policy.approvedPath
+                ? { ...recordValue(toolContext.args), path: policy.approvedPath }
+                : toolContext.args;
+            approvedToolCalls.set(toolContext.toolCall.id, {
+              toolName: toolContext.toolCall.name,
+              canonicalArguments: canonicalJson(approvedArguments),
+              ...(policy.approvedCwd ? { approvedCwd: policy.approvedCwd } : {}),
+              ...(policy.approvedPath ? { approvedPath: policy.approvedPath } : {}),
+              ...(policy.executionTarget ? { executionTarget: policy.executionTarget } : {}),
+              journalArguments: policy.displayArguments
                 ?? redactToolArgumentsForJournal(
                   toolContext.toolCall.name,
                   recordValue(toolContext.args),
                   record.request.workspace,
                 ),
-            );
+            });
             return true;
           };
-          const metadata = record.request.metadata;
-          const unattended = metadata?.unattended === true;
-          const unattendedScheduled = metadata?.trigger === "scheduled" && metadata.unattended === true;
           if (
             isDelegatedRun(metadata)
             && toolContext.toolCall.name === "terminal"
@@ -1487,10 +1516,11 @@ export class RunCoordinator {
           }
           if (
             unattended
+            && !unattendedEmail
             && toolContext.toolCall.name === "mail"
             && isMailMutation(recordValue(toolContext.args).action)
           ) {
-            const reason = "Unattended email runs cannot mutate mail or save attachments";
+            const reason = "Unattended runs cannot mutate mail or save attachments";
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
@@ -1603,9 +1633,6 @@ export class RunCoordinator {
         executionReview,
         ephemeralMessages,
         approvedToolCalls,
-        journalToolArguments,
-        approvedTerminalCwds,
-        approvedFilePaths,
         startedToolCalls,
         fileDraftProjector,
       ));
@@ -1825,10 +1852,7 @@ export class RunCoordinator {
     sessionEntryIds: WeakMap<AgentMessage, string>,
     executionReview: ExecutionReviewState,
     ephemeralMessages: WeakSet<AgentMessage>,
-    approvedToolCalls: Set<string>,
-    journalToolArguments: Map<string, JsonObject>,
-    approvedTerminalCwds: Map<string, string>,
-    approvedFilePaths: Map<string, string>,
+    approvedToolCalls: Map<string, ApprovedToolCallBinding>,
     startedToolCalls: Set<string>,
     fileDraftProjector: CodexFileDraftProjector,
   ): Promise<void> {
@@ -1915,6 +1939,19 @@ export class RunCoordinator {
           ...this.turnIdentity(record.id),
         });
       }
+      if (event.message.role === "assistant") {
+        for (const block of event.message.content) {
+          if (block.type !== "toolCall") continue;
+          const unattendedEmailBlock = unattendedEmailToolBlockReason(
+            record.request,
+            block.name,
+            block.arguments,
+          );
+          if (unattendedEmailBlock) {
+            this.rememberUnattendedAuthorizationBlock(record.id, block.id, unattendedEmailBlock);
+          }
+        }
+      }
       return;
     }
     if (event.type === "tool_execution_start") {
@@ -1931,9 +1968,6 @@ export class RunCoordinator {
       });
     } else if (event.type === "tool_execution_end") {
       approvedToolCalls.delete(event.toolCallId);
-      journalToolArguments.delete(event.toolCallId);
-      approvedTerminalCwds.delete(event.toolCallId);
-      approvedFilePaths.delete(event.toolCallId);
       const executionStarted = startedToolCalls.delete(event.toolCallId);
       const unattendedAuthorizationReason = this.takeUnattendedAuthorizationBlock(record.id, event.toolCallId);
       journal.publish(event.isError ? "tool.failed" : "tool.completed", {
@@ -2803,6 +2837,31 @@ function resolvedAttachmentPaths(
     paths.add(resolveWorkspacePath(workspace, attachment.path));
   }
   return paths;
+}
+
+function unattendedEmailToolBlockReason(
+  request: RunRequest,
+  toolName: string,
+  arguments_: unknown,
+): string | undefined {
+  if (
+    request.metadata?.trigger !== "email"
+    || request.metadata.unattended !== true
+    || (toolName === "mail" && !isMailMutation(recordValue(arguments_).action))
+  ) {
+    return undefined;
+  }
+  return UNATTENDED_EMAIL_TOOL_BLOCK;
+}
+
+function assistantMessageHasDuplicateToolCallIds(message: AssistantMessage): boolean {
+  const seen = new Set<string>();
+  for (const block of message.content) {
+    if (block.type !== "toolCall") continue;
+    if (seen.has(block.id)) return true;
+    seen.add(block.id);
+  }
+  return false;
 }
 
 function canonicalJson(value: unknown): string {

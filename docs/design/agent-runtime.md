@@ -89,6 +89,8 @@ Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化�
 
 Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和规范化逻辑路径；Manager 是宿主映射的最终可信边界。Manager 必须把 `/workspace`、`/home/agent`、`/opt/agent-env` 或绝对宿主路径解析为不可变的根与相对路径，从根目录 fd 逐段以不跟随符号链接的方式打开。文件 read/write/patch/search 与 terminal cwd 都不能在检查后重新按字符串解析；patch 在同一个已固定父目录中完成读取与原子替换，terminal 子进程从已固定目录 fd 切换 cwd。审批后路径被替换为符号链接、非目录或受保护路径时，本次调用失败且批准不可复用。
 
+同一条 assistant 消息中的 provider tool call id 必须唯一；Runtime 在任一预检、审批或并行执行前整批拒绝重复 id。批准记录不能只以 provider id 绑定，必须同时绑定工具名、规范参数、执行 target 与 canonical 路径，并在精确一次执行时消费。session grant 的 durable 查询、持久化提交、内存缓存与 scope/lifecycle cleanup 撤销必须在同一身份边界线性化；cleanup 返回后，任何更早开始的查询或 grant 追加都不得重新建立内存或 durable 授权。
+
 来自网页、浏览器、MCP、记忆、session 和 Skill 附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
 
 `mcp` 是固定的通用工具，不把每个外部 server 的动态 schema 注册为新的顶层 Runtime 工具。`list` 返回当前清单中的 server 和其 `tools/list` 有界结果；`call` 接受清单内 server id、tool name 与有界 JSON arguments，并逐次请求用户批准。Runtime 通过 Manager 在当前 Sandbox 内调用镜像自带的一次性 stdio 客户端；客户端以 argv 而非 shell 启动清单中的命令，完成 `initialize → notifications/initialized → tools/list|tools/call` 后退出。清单、命令、环境、工作目录、协议消息和返回体都有大小、数量、路径与超时上限；server stderr 和不匹配的 JSON-RPC 消息不能越过工具结果边界。模型不能为一次调用改写 command、env、cwd、URL、owner、scope 或 transport。首版不实现 Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接或后台 server；需要这些能力时由用户安装一个本地 stdio 适配器。
@@ -113,7 +115,7 @@ Runtime 不从最终回复中的“继续”“完成”文字猜测决策。rec
 
 这里的 session 是 Runtime JSONL 模型上下文，不是浏览器登录 Cookie。登录态寿命由 Platform 认证策略决定，不因 Runtime 压缩、修复或删除模型 session 而改变。
 
-每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。上下文超过策略阈值时，Runtime 先按合法 user/assistant/tool 边界保护最近 tail，并用当前已授权模型把待省略历史更新成一个结构化 handoff。首轮自动压缩后，Runtime 可以复用“handoff + tail”的模型投影，但每次新增消息后都必须重新计算该投影的上下文用量；同一 Run 的长工具循环再次越过阈值时必须再次自动压缩，不能因为已有 handoff 永久绕过阈值判断。后续压缩把上一轮 handoff 作为不可信历史迭代更新，只保留一个现役 handoff，旧 handoff 不写入 archive。摘要模型输入在总字符预算内必须为最早目标/验收条件和待省略段中最新用户请求分别预留首尾有界锚点，再把其余预算按时间倒序分给最近工具证据；大量工具输出不能把原始目标完全挤出摘要输入。摘要必须保留最新未完成用户请求、验收条件、已完成动作及证据、决策与约束、文件和关键工具结果、blocker、下一步，以及 Runtime-owned 活动 todo/process 状态；旧摘要采用迭代更新而不是作为普通历史重复堆叠。历史正文和既有摘要都属于不可信数据，不能授予工具、审批或身份。Runtime 使用同一集中敏感文本清洗器同时处理发送给摘要模型的历史和模型返回的摘要，覆盖常见供应商 Token、认证头、JWT、私钥、带密码连接串、敏感配置字段与 URL 参数；原始 journal/archive 仍按会话访问边界保存真实历史，不能把清洗后的摘要反向当作原文替换。摘要输出有独立大小上限；摘要请求失败、被取消、为空或不合法时，本次压缩不改活动 journal，也不丢任何上下文，已经安全提交的上一轮压缩保持有效。
+每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。活动 journal 在每次追加前必须在同一 session mutation queue 内修复崩溃留下的尾部：完整但缺少换行的 JSON 对象只补终止换行，不完整或非法尾部截断到最后一个已验证边界；不得把新记录拼接到残片后。上下文超过策略阈值时，Runtime 先按合法 user/assistant/tool 边界保护最近 tail，并用当前已授权模型把待省略历史更新成一个结构化 handoff。首轮自动压缩后，Runtime 可以复用“handoff + tail”的模型投影，但每次新增消息后都必须重新计算该投影的上下文用量；同一 Run 的长工具循环再次越过阈值时必须再次自动压缩，不能因为已有 handoff 永久绕过阈值判断。后续压缩把上一轮 handoff 作为不可信历史迭代更新，只保留一个现役 handoff，旧 handoff 不写入 archive。摘要模型输入在总字符预算内必须为最早目标/验收条件和待省略段中最新用户请求分别预留首尾有界锚点，再把其余预算按时间倒序分给最近工具证据；大量工具输出不能把原始目标完全挤出摘要输入。摘要必须保留最新未完成用户请求、验收条件、已完成动作及证据、决策与约束、文件和关键工具结果、blocker、下一步，以及 Runtime-owned 活动 todo/process 状态；旧摘要采用迭代更新而不是作为普通历史重复堆叠。历史正文和既有摘要都属于不可信数据，不能授予工具、审批或身份。Runtime 使用同一集中敏感文本清洗器同时处理发送给摘要模型的历史和模型返回的摘要，覆盖常见供应商 Token、认证头、JWT、私钥、带密码连接串、敏感配置字段与 URL 参数；原始 journal/archive 仍按会话访问边界保存真实历史，不能把清洗后的摘要反向当作原文替换。摘要输出有独立大小上限；摘要请求失败、被取消、为空或不合法时，本次压缩不改活动 journal，也不丢任何上下文，已经安全提交的上一轮压缩保持有效。
 
 摘要成功后，被省略的已持久消息先 fsync 到去重 archive，再原子替换活动 journal。archive 追加前必须按写入后的 UTF-8 总字节执行上限检查，不能先写过界再让后续读取永久失败；没有稳定 entry id 的消息不得被压缩。Runtime-owned todo sidecar 不依赖模型摘要，活动项以独立可信段重新注入；完成和取消项保留在 sidecar 审计中但不占后续模型上下文。
 
