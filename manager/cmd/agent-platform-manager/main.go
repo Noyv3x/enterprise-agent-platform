@@ -43,6 +43,11 @@ var version = "development"
 
 const managerDisplayName = "Agent Platform Manager"
 
+type pendingAutoUpdate struct {
+	targetID    string
+	operationID string
+}
+
 type application struct {
 	config                     config.Config
 	configs                    *config.Manager
@@ -60,6 +65,8 @@ type application struct {
 	maintenanceWake            chan struct{}
 	maintenanceJobs            maintenanceCleanup
 	maintenanceActiveProcesses func() int
+	autoUpdateMu               sync.Mutex
+	pendingAutoUpdate          pendingAutoUpdate
 }
 
 type maintenanceCleanup interface {
@@ -1337,11 +1344,19 @@ func autoUpdateDue(last, now time.Time, interval time.Duration) bool {
 	}
 	return !now.Before(last.Add(interval))
 }
+func autoUpdateIdempotencyKey(url, target string, now time.Time) string {
+	return "auto-" + stableKey(url, target, now.UTC().Format("2006010215"))
+}
+
 func (a *application) autoUpdate(ctx context.Context) {
 	cfg := a.configs.Config()
 	if !cfg.UpdateEnabled || cfg.ReleaseURL == "" {
 		return
 	}
+
+	a.autoUpdateMu.Lock()
+	defer a.autoUpdateMu.Unlock()
+
 	state := a.state.State()
 	if state.ActiveOperationID != "" || state.Current == nil {
 		return
@@ -1349,11 +1364,68 @@ func (a *application) autoUpdate(ctx context.Context) {
 	checkCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	manifest, modified, err := a.operations.CheckIfChanged(checkCtx, cfg.ReleaseURL)
 	cancel()
-	if err != nil || !modified || manifest.ID() == state.Current.ID {
+	if err != nil {
 		return
 	}
+	state = a.state.State()
+	if modified && manifest.ID() != a.pendingAutoUpdate.targetID {
+		a.pendingAutoUpdate = pendingAutoUpdate{targetID: manifest.ID()}
+	}
+	a.reconcilePendingAutoUpdate(state)
+	if a.pendingAutoUpdate.targetID == "" || a.pendingAutoUpdate.operationID != "" {
+		return
+	}
+
 	fresh := a.state.State()
-	_, _, _ = a.operations.Start(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "auto-" + manifest.ID() + "-" + time.Now().UTC().Format("2006010215"), ExpectedGeneration: fresh.Generation, ManifestURL: cfg.ReleaseURL})
+	if fresh.ActiveOperationID != "" || fresh.FinalizePendingOperationID != "" || fresh.Current == nil {
+		return
+	}
+	if fresh.Current.ID == a.pendingAutoUpdate.targetID {
+		a.pendingAutoUpdate = pendingAutoUpdate{}
+		return
+	}
+	op, _, startErr := a.operations.Start(model.OperationRequest{
+		Kind:               model.OperationUpdate,
+		IdempotencyKey:     autoUpdateIdempotencyKey(cfg.ReleaseURL, a.pendingAutoUpdate.targetID, time.Now()),
+		ExpectedGeneration: fresh.Generation,
+		ManifestURL:        cfg.ReleaseURL,
+	})
+	if startErr == nil {
+		a.pendingAutoUpdate.operationID = op.ID
+	}
+}
+
+func (a *application) reconcilePendingAutoUpdate(state model.ManagerState) {
+	pending := a.pendingAutoUpdate
+	if pending.targetID == "" {
+		return
+	}
+	if state.ActiveOperationID == "" && state.FinalizePendingOperationID == "" &&
+		state.Current != nil && state.Current.ID == pending.targetID {
+		a.pendingAutoUpdate = pendingAutoUpdate{}
+		return
+	}
+	if pending.operationID == "" {
+		return
+	}
+	op, err := a.state.Operation(pending.operationID)
+	if err != nil || !op.Finalized {
+		return
+	}
+	switch op.Status {
+	case model.OperationFailed:
+		if op.Retryable {
+			a.pendingAutoUpdate.operationID = ""
+		} else {
+			a.pendingAutoUpdate = pendingAutoUpdate{}
+		}
+	case model.OperationSucceeded:
+		// A committed operation normally matched Current above. If it did not,
+		// retain the accepted target but do not duplicate a successful attempt;
+		// a later manifest response can supersede it.
+	default:
+		return
+	}
 }
 
 type gatewayController struct {

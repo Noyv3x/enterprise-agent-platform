@@ -29,7 +29,7 @@ manifest 必须最后公开，部署机不能看到半套资产。品牌配置�
 
 ## 检测与预拉取
 
-Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响应的 `ETag` 与 `Last-Modified`，后续请求使用条件头；上游返回 `304 Not Modified` 时不重复解码、落盘或创建 operation。校验器只在相同 manifest URL、通道和技术 profile 下复用，配置变化、无验证器响应或临时网络失败不会把未知内容当作未变化。
+Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响应的 `ETag` 与 `Last-Modified`，后续请求使用条件头；上游返回 `304 Not Modified` 时不重复解码或落盘，但若最近已接受的目标仍不同于 Current 且上一次 operation 未成功提交，必须继续以同一目标建立有界、幂等的重试，不能把 `modified=false` 当作“无需更新”。只有 Current 已等于目标、目标被明确判定为不可重试失败，或出现更新的合法 manifest 时才能清除这份待收敛目标。校验器只在相同 manifest URL、通道和技术 profile 下复用，配置变化、无验证器响应或临时网络失败不会把未知内容当作未变化。
 
 管理面板的“上次更新成功时间”读取 Manager 当前 generation 持久化的 `activated_at`，Platform 只做只读投影，不另建更新历史或以浏览器时间猜测。回滚后该值仍是被恢复 generation 原本成功启用的时间。
 
