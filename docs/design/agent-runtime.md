@@ -89,7 +89,7 @@ Sandbox/host 两个目标都执行不可绕过的 hard-block、路径规范化�
 
 Runtime 的批准对象绑定原始调用参数、主 Agent Sandbox identity 和规范化逻辑路径；Manager 是宿主映射的最终可信边界。Manager 必须把 `/workspace`、`/home/agent`、`/opt/agent-env` 或绝对宿主路径解析为不可变的根与相对路径，从根目录 fd 逐段以不跟随符号链接的方式打开。文件 read/write/patch/search 与 terminal cwd 都不能在检查后重新按字符串解析；patch 在同一个已固定父目录中完成读取与原子替换，terminal 子进程从已固定目录 fd 切换 cwd。审批后路径被替换为符号链接、非目录或受保护路径时，本次调用失败且批准不可复用。
 
-同一条 assistant 消息中的 provider tool call id 必须唯一；Runtime 在任一预检、审批或并行执行前整批拒绝重复 id。批准记录不能只以 provider id 绑定，必须同时绑定工具名、规范参数、执行 target 与 canonical 路径，并在精确一次执行时消费。session grant 的 durable 查询、持久化提交、内存缓存与 scope/lifecycle cleanup 撤销必须在同一身份边界线性化；cleanup 返回后，任何更早开始的查询或 grant 追加都不得重新建立内存或 durable 授权。
+同一条 assistant 消息中的 provider tool call id 必须唯一；Runtime 在任一预检、审批或并行执行前整批拒绝重复 id。批准记录不能只以 provider id 绑定，必须同时绑定工具名、规范参数、执行 target 与 canonical 路径，并在精确一次执行时消费。即使 provider 违反唯一性，同一 id 下每个被阻断的 occurrence 仍必须各自保留并消费一条 authorization 拒绝标记，不能因按 id 覆盖或首次读取删除而把后续拒绝事件伪装成普通工具错误。session grant 的 durable 查询、持久化提交、内存缓存与 scope/lifecycle cleanup 撤销必须在同一身份边界线性化；cleanup 返回后，任何更早开始的查询或 grant 追加都不得重新建立内存或 durable 授权。
 
 来自网页、浏览器、MCP、记忆、session 和 Skill 附件的模型可见文本由 Runtime 统一包装为防伪的不可信工具结果。包装函数必须重建文本块、中和攻击者提供的边界 token，并保留图片块；各工具不能自行拼一个可被内容提前闭合的提示前缀。这个边界同时适用于成功返回和上游失败文本。
 

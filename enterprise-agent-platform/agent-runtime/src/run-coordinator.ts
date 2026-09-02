@@ -141,6 +141,11 @@ interface ApprovedToolCallBinding {
   journalArguments: JsonObject;
 }
 
+interface UnattendedAuthorizationBlockQueue {
+  reasons: string[];
+  next: number;
+}
+
 const UNATTENDED_EMAIL_TOOL_BLOCK = "Unattended email runs can only use read-only mail account, folder, search, and read actions";
 
 // Background learning mutates durable memory and Agent-owned Skills without a
@@ -208,7 +213,7 @@ export class RunCoordinator {
   private readonly scopeCleanupFences = new Set<ScopeCleanupFence>();
   private readonly sessionCompactionFences = new Set<string>();
   private readonly forcedReviewReasons = new Map<string, string>();
-  private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, string>>();
+  private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, UnattendedAuthorizationBlockQueue>>();
   private readonly runActivities = new Map<string, RunActivityState>();
   private readonly scopeExecutionContexts = new Map<string, ExecutionContext>();
 
@@ -2039,16 +2044,21 @@ export class RunCoordinator {
   }
 
   private rememberUnattendedAuthorizationBlock(runId: string, toolCallId: string, reason: string): void {
-    const blocked = this.unattendedAuthorizationBlocks.get(runId) ?? new Map<string, string>();
-    blocked.set(toolCallId, reason);
+    const blocked = this.unattendedAuthorizationBlocks.get(runId)
+      ?? new Map<string, UnattendedAuthorizationBlockQueue>();
+    const queue = blocked.get(toolCallId) ?? { reasons: [], next: 0 };
+    queue.reasons.push(reason);
+    blocked.set(toolCallId, queue);
     this.unattendedAuthorizationBlocks.set(runId, blocked);
   }
 
   private takeUnattendedAuthorizationBlock(runId: string, toolCallId: string): string | undefined {
     const blocked = this.unattendedAuthorizationBlocks.get(runId);
-    if (!blocked) return undefined;
-    const reason = blocked.get(toolCallId);
-    blocked.delete(toolCallId);
+    const queue = blocked?.get(toolCallId);
+    if (!blocked || !queue) return undefined;
+    const reason = queue.reasons[queue.next];
+    queue.next += 1;
+    if (queue.next >= queue.reasons.length) blocked.delete(toolCallId);
     if (blocked.size === 0) this.unattendedAuthorizationBlocks.delete(runId);
     return reason;
   }

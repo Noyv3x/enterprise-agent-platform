@@ -193,6 +193,53 @@ test("duplicate provider tool-call ids fail the whole parallel batch before exec
   }
 });
 
+test("duplicate blocked email calls each retain their unattended authorization marker", async () => {
+  const home = await temporaryDirectory("agent-duplicate-email-block-home-");
+  const workspace = await temporaryDirectory("agent-duplicate-email-block-workspace-");
+  const faux = fauxProvider();
+  const sendArguments = {
+    action: "send",
+    arguments: {
+      account_id: 1,
+      to: ["recipient@example.com"],
+      subject: "forbidden",
+      text_body: "forbidden",
+    },
+  };
+  faux.setResponses([
+    fauxAssistantMessage([
+      fauxToolCall("mail", sendArguments, { id: "duplicate-mail-send" }),
+      fauxToolCall("mail", sendArguments, { id: "duplicate-mail-send" }),
+    ], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Duplicate mail sends rejected."),
+  ]);
+  let gatewayCalls = 0;
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: faux.provider.streamSimple,
+  });
+  coordinator.gateway.invoke = async () => {
+    gatewayCalls += 1;
+    return assert.fail("blocked duplicate mail sends must not reach the platform gateway");
+  };
+  try {
+    const run = coordinator.createRun(emailRequest(workspace, "duplicate-blockers"));
+    assert.equal((await coordinator.wait(run.id)).status, "completed");
+    const failures = (coordinator.getJournal(run.id)?.list() ?? [])
+      .filter((event) => event.type === "tool.failed");
+    assert.equal(gatewayCalls, 0);
+    assert.equal(failures.length, 2);
+    assert.equal(failures.every((event) => (
+      event.data.unattended_authorization_required === true
+      && /only use read-only mail/.test(String(event.data.reason))
+    )), true);
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
 function emailRequest(workspace: string, suffix: string): RunRequest {
   return {
     scope_key: "private:1",
