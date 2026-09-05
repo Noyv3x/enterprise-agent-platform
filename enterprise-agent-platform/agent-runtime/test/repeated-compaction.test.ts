@@ -191,3 +191,137 @@ test("cancelling a repeated automatic summary preserves the last committed hando
     await rm(workspace, { recursive: true, force: true });
   }
 });
+
+const incompleteSummaries = [
+  {
+    name: "output-token limit",
+    response: () => fauxAssistantMessage("REJECTED_PARTIAL_HANDOFF: unfinished objective", { stopReason: "length" }),
+  },
+  {
+    name: "normally stopped body exceeding 24000 cleaned characters",
+    response: () => fauxAssistantMessage(`REJECTED_PARTIAL_HANDOFF\n${"bounded evidence\n".repeat(1_501)}`),
+  },
+  {
+    name: "toolUse despite a nonempty body",
+    response: () => fauxAssistantMessage("REJECTED_PARTIAL_HANDOFF: still requesting evidence", {
+      stopReason: "toolUse",
+    }),
+  },
+  {
+    name: "tool call despite a normal stop and nonempty body",
+    response: () => fauxAssistantMessage([
+      { type: "text", text: "REJECTED_PARTIAL_HANDOFF: still requesting evidence" },
+      fauxToolCall("todo", { action: "read" }, { id: "invalid-summary-tool-call" }),
+    ], { stopReason: "stop" }),
+  },
+];
+
+for (const scenario of incompleteSummaries) {
+  test(`manual compaction rejects ${scenario.name} without changing durable state or holding the fence`, async () => {
+    const home = await temporaryDirectory("agent-incomplete-manual-summary-");
+    // Faux preserves explicit stopReason through cloneMessage and streamWithDeltas;
+    // supplying length here must not become an ordinary successful stop.
+    const summaries = fauxProvider({ tokenSize: { min: 1024, max: 1024 } });
+    summaries.setResponses([
+      fauxAssistantMessage("PREVIOUS_COMPLETE_HANDOFF: preserve the original objective."),
+      scenario.response(),
+      fauxAssistantMessage("RECOVERED_COMPLETE_HANDOFF: continue the newly retained objective."),
+    ]);
+    const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: summaries.provider.streamSimple });
+    const identity = { scope_key: "private:incomplete-summary", lifecycle_id: "life", session_id: "manual" };
+    const compact = () => coordinator.compactSession(
+      identity.scope_key,
+      identity.lifecycle_id,
+      identity.session_id,
+      { provider: "openai-codex", id: "gpt-5.5" },
+    );
+
+    try {
+      await coordinator.sessions.initializeTracked(identity, Array.from({ length: 10 }, (_, index) => ({
+        role: "user" as const,
+        content: `Original durable objective ${index}`,
+        timestamp: index + 1,
+      })));
+      assert.equal((await compact()).compacted, true);
+      for (let index = 0; index < 8; index += 1) {
+        await coordinator.sessions.appendMessage(identity, {
+          role: "user",
+          content: `New durable evidence ${index}`,
+          timestamp: index + 20,
+        });
+      }
+      const beforeJournal = await readFile(coordinator.sessions.path(identity));
+      const beforeArchive = await readFile(coordinator.sessions.archivePath(identity));
+
+      await assert.rejects(compact());
+
+      assert.deepEqual(await readFile(coordinator.sessions.path(identity)), beforeJournal);
+      assert.deepEqual(await readFile(coordinator.sessions.archivePath(identity)), beforeArchive);
+      assert.equal((await compact()).compacted, true, "a failed summary must release the session fence");
+      const recovered = await coordinator.sessions.loadTracked(identity);
+      assert.equal(recovered.filter((entry) => entry.synthetic_kind === "context_compaction_notice").length, 1);
+      assert.match(JSON.stringify(recovered), /RECOVERED_COMPLETE_HANDOFF/);
+      assert.doesNotMatch(JSON.stringify(recovered), /REJECTED_PARTIAL_HANDOFF/);
+      assert.doesNotMatch(await readFile(coordinator.sessions.archivePath(identity), "utf8"), /REJECTED_PARTIAL_HANDOFF/);
+    } finally {
+      coordinator.shutdown();
+      await rm(home, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+
+  test(`automatic compaction rejects ${scenario.name} without committing a partial handoff`, async () => {
+    const home = await temporaryDirectory("agent-incomplete-auto-summary-");
+    const workspace = await temporaryDirectory("agent-incomplete-auto-summary-workspace-");
+    const summaries = fauxProvider({ tokenSize: { min: 1024, max: 1024 } });
+    const main = fauxProvider();
+    summaries.setResponses([scenario.response()]);
+    main.setResponses([fauxAssistantMessage("Must not continue from an incomplete handoff.")]);
+    let summaryCalls = 0;
+    const streamFn: StreamFn = (model, context, options) => {
+      if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+        summaryCalls += 1;
+        return summaries.provider.streamSimple(model, context, options);
+      }
+      return main.provider.streamSimple(model, context, options);
+    };
+    const coordinator = new RunCoordinator({
+      config: testConfig(home, { compactionThreshold: 0.00001 }),
+      streamFn,
+    });
+    const identity = { scope_key: "private:incomplete-summary", lifecycle_id: "life", session_id: "automatic" };
+    try {
+      await coordinator.sessions.initializeTracked(identity, Array.from({ length: 9 }, (_, index) => ({
+        role: "user" as const,
+        content: `Original durable objective ${index}: ${"evidence ".repeat(80)}`,
+        timestamp: index + 1,
+      })));
+      const original = await coordinator.sessions.loadTracked(identity);
+      const run = coordinator.createRun({
+        ...identity,
+        workspace,
+        system_prompt: "You are an Agent.",
+        input: "Continue the original objective.",
+        model: { provider: "openai-codex", id: "gpt-5.5" },
+      });
+      const failed = await coordinator.wait(run.id);
+
+      assert.equal(summaryCalls, 1, "the incomplete response must reach the automatic summary boundary");
+      assert.equal(failed.status, "failed");
+      assert.equal(
+        coordinator.getJournal(run.id)?.list().filter((event) => event.type === "context.compacted").length,
+        0,
+      );
+      const retained = await coordinator.sessions.loadTracked(identity);
+      assert.deepEqual(retained.slice(0, original.length), original, "all original durable entries must survive");
+      assert.ok(retained.some((entry) => entry.message.role === "user"
+        && entry.message.content === "Continue the original objective."));
+      assert.equal(retained.filter((entry) => entry.synthetic_kind === "context_compaction_notice").length, 0);
+      assert.doesNotMatch(await readFile(coordinator.sessions.path(identity), "utf8"), /REJECTED_PARTIAL_HANDOFF/);
+      await assert.rejects(readFile(coordinator.sessions.archivePath(identity)), { code: "ENOENT" });
+    } finally {
+      coordinator.shutdown();
+      await rm(home, { recursive: true, force: true, maxRetries: 3 });
+      await rm(workspace, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+}

@@ -157,6 +157,8 @@ Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有
 
 终态为 `run.completed`、`run.failed`、`run.cancelled` 或 `run.needs_review`。完成数据包含 output/content、session、model、usage、context usage 和输入消费信息。Runtime 可以在 Agent 主循环的单次模型 stream 尚未发布任何非空正文、思考或工具调用时，对明确的瞬时供应商错误做有界可取消重试；重试过程不产生额外 Run、工具工作记录或 session 消息。一旦 stream 已发布内容便不重试，上下文/输出大小、额度、账单、认证、内容策略错误也不重试；预算耗尽后继续使用原终态和 `sideEffectsStarted` 安全分类，Platform 不根据错误字符串重新提交整个 Run。该重试边界不包含 browser 工具结果的视觉辅助模型请求。若 Runtime 在一个含规范 `MEDIA: /workspace/<relative-path>` 的 assistant 回复后自动插入内部文件复验，只有相关变更已被成功复验清除时，`run.completed` 的 output/content 才把该交付标记去重保留下来，即使被持久化的最终 assistant 文本只报告复验结果；复验失败或仍有未确认变更时不恢复标记。Platform 仍是解析并授权附件的唯一边界。
 
+`context_usage` 描述现役模型上下文而非整个 Run 的累计账单用量。`used_tokens` 优先使用与当前请求前缀匹配的本 Run 供应商测量，另加该测量之后新增消息的估算；无有效测量时回退为消息、系统提示和工具 schema 的合计估算。只要采用回退或包含估算的新增内容，`estimated=true`。压缩后旧历史中的 usage 不得污染新投影，恢复或切换模型的首轮也不能复用上个 Run 的测量；`max_tokens` 仍来自当前可信模型目录，`percent` 只在展示层范围内夹取，不截断真实 `used_tokens`。
+
 由 Runtime 机械完成守卫产生的 `run.needs_review` 可以在同一个终态 data 中携带有界 `output`/`content`、session、model、usage 和 context usage。该正文只能取自最后一段真实 assistant 阶段性说明，表示尚未成功的进度或 blocker 诊断；`error` 必须继续给出独立的机械失败原因，状态仍是 `needs_review`。Python client 将正文暴露为 `AgentRuntimeRunError.partial_content`，但不得把它转成成功结果。幂等重放必须保持同一非成功状态与诊断。任何非成功终态中的 `MEDIA:` 都只是普通诊断文本，Platform 不解析、不复制也不发布附件。
 
 `delegate_task` 的实时工具结果由 Runtime 添加结构化 child 证据：单任务包含 `child_run_id`、`status`、`content`、`side_effects_started`、`changed_files` 和 `unknown_change`；批量任务在有序 `results[]` 中逐项携带同一成功证据或失败摘要。这些字段不是模型参数，也不能从 child 文本解析。任一成功 child 的 `side_effects_started=true` 会在父 Run 建立待复验状态；只有随后成功的非委派聚焦验证工具才能清除，纯只读 child 不建立该状态。

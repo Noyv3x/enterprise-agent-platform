@@ -6,7 +6,6 @@ import {
   type AgentMessage,
   type AgentTool,
   type StreamFn,
-  estimateContextTokens,
 } from "@earendil-works/pi-agent-core";
 import type {
   Api,
@@ -29,6 +28,7 @@ import { CONTAINER_PATHS, EXECUTION_TARGETS, type ExecutionTarget } from "./cont
 import { EventJournal } from "./event-journal.js";
 import { CodexFileDraftProjector } from "./file-draft-projector.js";
 import { MODEL_STREAM_MAX_RETRIES, withModelStreamRetry } from "./model-stream-retry.js";
+import { RequestContextUsage } from "./context-usage.js";
 import { redactToolArgumentsForModelHistory } from "./model-history.js";
 import {
   createExecutionManager,
@@ -748,10 +748,14 @@ export class RunCoordinator {
     if (response.stopReason === "error" || response.stopReason === "aborted") {
       throw new Error(response.errorMessage || "Context handoff summary did not complete");
     }
-    const summary = redactSensitiveText(
-      truncate(assistantText(response).trim(), CONTEXT_COMPACTION_SUMMARY_MAX_CHARS),
-    ).trim();
+    if (response.stopReason !== "stop" || response.content.some((block) => block.type === "toolCall")) {
+      throw new Error("Context handoff summary did not complete");
+    }
+    const summary = redactSensitiveText(assistantText(response).trim()).trim();
     if (!summary) throw new Error("Context handoff summary was empty");
+    if (summary.length > CONTEXT_COMPACTION_SUMMARY_MAX_CHARS) {
+      throw new Error("Context handoff summary exceeded the output limit");
+    }
     const framedSummary = frameUntrustedText(
       "context_compaction_summary",
       summary.replace(/runtime_context_handoff/gi, "runtime-context-handoff"),
@@ -1219,6 +1223,15 @@ export class RunCoordinator {
         interactiveInputs: acceptsInteractiveInputs(record),
       });
       const systemPrompt = assembleSystemPrompt(systemPromptParts);
+      const contextMeter = new RequestContextUsage(systemPrompt, tools);
+      const projectContext = (messages: AgentMessage[]): AgentMessage[] => (
+        automaticCompactionSource
+        && automaticCompactionView
+        && messages.length >= automaticCompactionSource.length
+        && automaticCompactionSource.every((message, index) => messages[index] === message)
+          ? [...automaticCompactionView, ...messages.slice(automaticCompactionSource.length)]
+          : messages
+      );
       const agentOptions: ConstructorParameters<typeof Agent>[0] = {
         initialState: {
           systemPrompt,
@@ -1293,18 +1306,7 @@ export class RunCoordinator {
           // messages. A long tool loop can therefore compact repeatedly instead
           // of either re-summarizing the original history on every turn or
           // permanently bypassing the threshold after its first handoff.
-          let projectionSourceMessages = messages;
-          if (
-            automaticCompactionSource
-            && automaticCompactionView
-            && messages.length >= automaticCompactionSource.length
-            && automaticCompactionSource.every((message, index) => messages[index] === message)
-          ) {
-            projectionSourceMessages = [
-              ...automaticCompactionView,
-              ...messages.slice(automaticCompactionSource.length),
-            ];
-          }
+          const projectionSourceMessages = projectContext(messages);
           const compatibleMessages = adaptImageContentForModel(
             projectionSourceMessages,
             modelSupportsImages(resolved.model),
@@ -1322,8 +1324,14 @@ export class RunCoordinator {
             if (compactionNotices.has(source)) compactionNotices.add(compatible);
             if (ephemeralMessages.has(source)) ephemeralMessages.add(compatible);
           }
-          if (record.controller.signal.aborted || isTerminal(record.status)) return compatibleMessages;
-          if (estimateContextTokens(compatibleMessages).tokens < resolved.model.contextWindow * this.config.compactionThreshold) {
+          const usage = contextMeter.measure(projectionSourceMessages, compatibleMessages, resolved.model.contextWindow);
+          if (
+            record.controller.signal.aborted
+            || isTerminal(record.status)
+            || !usage
+            || usage.used_tokens < resolved.model.contextWindow * this.config.compactionThreshold
+          ) {
+            contextMeter.beginRequest(projectionSourceMessages);
             return compatibleMessages;
           }
           const compaction = compactContextPlan(
@@ -1430,6 +1438,9 @@ export class RunCoordinator {
             }
             this.touchRunActivity(record.id, "session context compacted");
           }
+          // A rewritten prefix cannot inherit usage from the retained historical tail.
+          const requestSource = omitted > 0 ? compactedMessages : projectionSourceMessages;
+          contextMeter.beginRequest(requestSource);
           return compactedMessages;
         },
         beforeToolCall: async (toolContext, signal) => {
@@ -1631,16 +1642,22 @@ export class RunCoordinator {
       this.flushReadyInputs(record);
       const onAbort = (): void => agent.abort();
       record.controller.signal.addEventListener("abort", onAbort, { once: true });
-      agent.subscribe(async (event) => await this.handleAgentEvent(
-        record,
-        event,
-        sessionEntryIds,
-        executionReview,
-        ephemeralMessages,
-        approvedToolCalls,
-        startedToolCalls,
-        fileDraftProjector,
-      ));
+      agent.subscribe(async (event) => {
+        // Pi emits the final response object here (start/update events are clones).
+        if (event.type === "message_end" && event.message.role === "assistant") {
+          contextMeter.completeResponse(event.message);
+        }
+        await this.handleAgentEvent(
+          record,
+          event,
+          sessionEntryIds,
+          executionReview,
+          ephemeralMessages,
+          approvedToolCalls,
+          startedToolCalls,
+          fileDraftProjector,
+        );
+      });
       this.touchRunActivity(record.id, "building model prompt");
       const prompt = await buildPrompt(record.request, record.controller.signal);
       this.touchRunActivity(record.id, "starting model turn");
@@ -1689,13 +1706,19 @@ export class RunCoordinator {
           this.forcedReviewReasons.set(record.id, ACTIVE_TODO_REVIEW_ERROR);
         }
       }
+      const finalProjection = projectContext(agent.state.messages);
+      const contextUsage = contextMeter.measure(
+        finalProjection,
+        adaptImageContentForModel(finalProjection, modelSupportsImages(resolved.model)),
+        resolved.model.contextWindow,
+      );
       const forcedReviewReason = this.forcedReviewReasons.get(record.id);
       if (forcedReviewReason) {
         const diagnostic = reviewDiagnosticFromMessages(
           agent.state.messages,
           resolved.model.provider,
           resolved.model.id,
-          resolved.model.contextWindow,
+          contextUsage,
           history.length,
           ephemeralMessages,
         );
@@ -1707,7 +1730,7 @@ export class RunCoordinator {
         agent.state.messages,
         resolved.model.provider,
         resolved.model.id,
-        resolved.model.contextWindow,
+        contextUsage,
         history.length,
         ephemeralMessages,
         record.request.workspace,
@@ -3919,7 +3942,7 @@ function resultFromMessages(
   messages: AgentMessage[],
   provider: string,
   model: string,
-  contextWindow: number,
+  contextUsage: ContextUsage | undefined,
   runMessageStart = 0,
   ephemeralMessages?: WeakSet<AgentMessage>,
   workspace?: string,
@@ -3952,7 +3975,6 @@ function resultFromMessages(
       usage.cacheWrite1h = Number(usage.cacheWrite1h || 0) + message.usage.cacheWrite1h;
     }
   }
-  const contextUsage = contextUsageForCompletedTurn(messages, contextWindow);
   return {
     content: appendPreservedMediaMarkers(
       assistantText(assistant),
@@ -3978,7 +4000,7 @@ function reviewDiagnosticFromMessages(
   messages: AgentMessage[],
   provider: string,
   model: string,
-  contextWindow: number,
+  contextUsage: ContextUsage | undefined,
   runMessageStart: number,
   ephemeralMessages: WeakSet<AgentMessage>,
 ): RunResult | undefined {
@@ -3995,7 +4017,7 @@ function reviewDiagnosticFromMessages(
     currentMessages,
     provider,
     model,
-    contextWindow,
+    contextUsage,
     0,
     ephemeralMessages,
   );
@@ -4004,22 +4026,6 @@ function reviewDiagnosticFromMessages(
   diagnostic.content = assistantText(assistant);
   diagnostic.content = truncate(diagnostic.content.trim(), REVIEW_DIAGNOSTIC_MAX_CHARS);
   return diagnostic.content ? diagnostic : undefined;
-}
-
-export function contextUsageForCompletedTurn(
-  messages: AgentMessage[],
-  contextWindow: number,
-): ContextUsage | undefined {
-  const maximum = Number.isFinite(contextWindow) ? Math.max(0, Math.round(contextWindow)) : 0;
-  if (maximum <= 0) return undefined;
-  const estimate = estimateContextTokens(messages);
-  const used = Math.max(0, Math.round(estimate.tokens));
-  return {
-    used_tokens: used,
-    max_tokens: maximum,
-    percent: Math.max(0, Math.min(100, Math.round((used / maximum) * 100))),
-    estimated: estimate.usageTokens === 0 || estimate.trailingTokens > 0,
-  };
 }
 
 function inputText(input: RunRequest["input"]): string {

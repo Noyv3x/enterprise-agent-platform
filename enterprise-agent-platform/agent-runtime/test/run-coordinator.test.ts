@@ -12,7 +12,6 @@ import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-response
 import { productModelCatalogs } from "../src/model-resolver.js";
 import {
   adaptImageContentForModel,
-  contextUsageForCompletedTurn,
   durableRunResultMessages,
   prepareSessionHistoryForModel,
   RunInputConflictError,
@@ -336,42 +335,6 @@ test("available skill policy validates, escapes, and bounds metadata without inj
   assert.match(prompt, /Only the main instructions returned by skill\.load may guide the current task/);
   assert.match(prompt, /skill\.list can discover other skills/);
   assert.doesNotMatch(appendSkillPolicy("base", undefined), /<available_skills>\n\[/);
-});
-
-test("completed-turn context usage prefers provider measurements and reports capacity", () => {
-  const answer = fauxAssistantMessage("done");
-  answer.usage.input = 24_000;
-  answer.usage.output = 8_000;
-  answer.usage.totalTokens = 32_000;
-  assert.deepEqual(contextUsageForCompletedTurn([answer], 128_000), {
-    used_tokens: 32_000,
-    max_tokens: 128_000,
-    percent: 25,
-    estimated: false,
-  });
-});
-
-test("completed-turn context fallback estimates image cost without counting base64 bytes", () => {
-  const answer = fauxAssistantMessage("done");
-  answer.usage.input = 0;
-  answer.usage.output = 0;
-  answer.usage.cacheRead = 0;
-  answer.usage.cacheWrite = 0;
-  answer.usage.totalTokens = 0;
-  const messages: AgentMessage[] = [
-    {
-      role: "user",
-      content: [{ type: "image", data: "A".repeat(1_000_000), mimeType: "image/png" }],
-      timestamp: Date.now(),
-    },
-    answer,
-  ];
-
-  const usage = contextUsageForCompletedTurn(messages, 128_000);
-
-  assert.equal(usage?.estimated, true);
-  assert.ok(Number(usage?.used_tokens) > 0);
-  assert.ok(Number(usage?.used_tokens) < 10_000);
 });
 
 test("RunCoordinator places fixed untrusted guidance before direct user image blocks", async () => {
