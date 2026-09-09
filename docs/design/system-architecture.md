@@ -63,6 +63,8 @@ SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务�
 
 文件发布和预览沿用同一“固定对象后操作”原则：普通文件发布重放重新完成耐久屏障，复制失败释放全部目录/文件描述符；PPTX 通过包内 presentation relationship 解释声明页序而不是 ZIP 文件名；current 数据布局缺少受管 sidecar 时失败，只有创建数据库前已经证明的 fresh 安装可以显式延迟初始化。
 
+`migrate` 与直接启动共用这一身份边界：仅在创建数据库前已确认 fresh 的调用中完成 Camoufox sidecar 初始化，再允许后续 `serve` 按既有部署启动；旧数据库迁移必须保留原有 sidecar，不能借迁移补建缺失身份文件。具体持久布局见[数据目录](../reference/data-layout.md)。
+
 ## Agent Runtime
 
 Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、结构化 todo、受限并行委派、语义上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具，并通过 Manager 在当前 Agent Sandbox 调用固定的一次性 stdio MCP 客户端。MCP 清单、Skill 与本地 server 包只存在于该主 Agent 的工作区，不进入中央 Runtime 文件系统。

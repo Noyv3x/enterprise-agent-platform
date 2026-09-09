@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from .camofox_state import ensure_camofox_runtime_sidecar
 from .container_contract_generated import DATABASE_SCHEMA_VERSION
 from .secure_fs import (
     UnsafePrivatePathError,
@@ -2836,6 +2837,17 @@ def migrate_database(
     has stopped the current writer and created its rollback snapshot.
     """
 
+    # Preserve fresh evidence before Database creates the file. Existing
+    # migrations retain their managed sidecar; they must never invent one.
+    fresh_initialization = not os.path.lexists(Path(path).expanduser())
+    if fresh_initialization:
+        ensure_camofox_runtime_sidecar(
+            data_dir,
+            fresh_initialization=True,
+            commit_schema_upgrade=False,
+            technical_profile_value=technical_profile_value,
+        )
+
     database = Database(
         path,
         technical_profile_value,
@@ -2843,6 +2855,12 @@ def migrate_database(
         migration_data_dir=data_dir,
     )
     try:
+        if fresh_initialization:
+            ensure_camofox_runtime_sidecar(
+                data_dir,
+                fresh_initialization=True,
+                technical_profile_value=technical_profile_value,
+            )
         return int(
             database.scalar(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"

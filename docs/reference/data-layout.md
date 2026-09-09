@@ -71,6 +71,8 @@ Agent Runtime 的 session、approval 与 idempotency 位于 `runtimes/agent`。�
 
 Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。上传暂存位于受控 `upload-staging/` 并在请求完成或服务启动时清理。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
 
+Platform 管理的 `runtimes/camofox/.agent-platform-runtime.json` 是既有部署的必需身份文件，直接前版本迁移保留它，不负责补建。普通启动与 Candidate 对缺失或不匹配的 sidecar 失败关闭。仅在创建数据库前明确确认数据库不存在的 fresh 初始化中，`serve` 或 `migrate` 才能校验并创建该文件；fresh `migrate` 成功后必须能作为既有部署启动。迁移冒烟夹具必须同时包含旧 schema、旧 Skill 布局与既有受管 sidecar，不能用启动时隐式补建掩盖不完整部署。
+
 ## Manager 状态、快照与清理
 
 Manager 保存 Current/Previous/Candidate、operation journal、不可变 release、Manager version、control capability 和活动 generation。`active-generation` 明确指出停止、日志与恢复命令使用的 generation，不能按目录时间猜测。

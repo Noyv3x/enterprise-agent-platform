@@ -12,6 +12,10 @@ from unittest import mock
 
 from enterprise_agent_platform import db as db_module
 from enterprise_agent_platform.agent_scopes import AgentScopeManager
+from enterprise_agent_platform.camofox_state import (
+    CAMOFOX_SIDECAR_NAME,
+    expected_camofox_sidecar,
+)
 from enterprise_agent_platform.config import PlatformConfig
 from enterprise_agent_platform.db import Database, migrate_database
 from enterprise_agent_platform.skills import (
@@ -180,6 +184,16 @@ def create_source_database(
     finally:
         database.close()
 
+    # The source is an existing deployment, not only an old schema. Keep its
+    # managed runtime identity present just as the migration snapshot does.
+    runtime = data_dir / "runtimes" / "camofox"
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (data_dir / "runtimes").chmod(0o700)
+    write_private(
+        runtime / CAMOFOX_SIDECAR_NAME,
+        (json.dumps(expected_camofox_sidecar(), sort_keys=True) + "\n").encode("utf-8"),
+    )
+
     digest = hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
     legacy_scope = data_dir / "agent-skills" / digest
     legacy_scope.mkdir(mode=0o700, parents=True)
@@ -246,6 +260,79 @@ def marker(database_path: Path) -> int:
 
 
 class DatabaseMigrationTests(unittest.TestCase):
+    def test_migrated_deployment_starts_with_preserved_runtime_identity(self):
+        from enterprise_agent_platform.service import EnterpriseService
+        from test_platform import RecordingAgent, make_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            runtime = data_dir / "runtimes" / "camofox"
+            runtime.mkdir(mode=0o700, parents=True)
+            database_path, workspace, _legacy = create_source_database(data_dir)
+            sidecar = runtime / CAMOFOX_SIDECAR_NAME
+            original = sidecar.read_bytes()
+            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
+
+            self.assertEqual(
+                migrate_database(database_path, data_dir=data_dir),
+                TARGET_SCHEMA_VERSION,
+            )
+            service = EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
+            try:
+                self.assertIn(
+                    SKILL_ID,
+                    {skill["id"] for skill in service.skills.list(SCOPE_KEY)},
+                )
+                self.assertEqual(
+                    (workspace / ".agent-platform" / "skills" / SKILL_ID / "references" / "guide.txt").read_bytes(),
+                    b"portable support\n",
+                )
+                self.assertEqual(sidecar.read_bytes(), original)
+            finally:
+                service.close()
+
+    def test_migrated_existing_deployment_missing_sidecar_still_rejects_startup(self):
+        from enterprise_agent_platform.service import EnterpriseService
+        from test_platform import RecordingAgent, make_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "data"
+            database_path, _workspace, _legacy = create_source_database(data_dir)
+            sidecar = data_dir / "runtimes" / "camofox" / CAMOFOX_SIDECAR_NAME
+            sidecar.unlink()
+            migrate_database(database_path, data_dir=data_dir)
+            with self.assertRaises(sqlite3.DatabaseError):
+                EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
+            self.assertFalse(sidecar.exists())
+            self.assertEqual(marker(database_path), TARGET_SCHEMA_VERSION)
+
+    def test_fresh_migrate_initializes_runtime_before_existing_service_startup(self):
+        from enterprise_agent_platform.service import EnterpriseService
+        from test_platform import RecordingAgent, make_config
+
+        for prepared_runtime in (False, True):
+            with self.subTest(prepared_runtime=prepared_runtime), tempfile.TemporaryDirectory() as directory:
+                data_dir = Path(directory) / "data"
+                runtime = data_dir / "runtimes" / "camofox"
+                if prepared_runtime:
+                    runtime.mkdir(mode=0o700, parents=True)
+                    (data_dir / "runtimes").chmod(0o700)
+                    data_dir.chmod(0o700)
+                self.assertEqual(
+                    migrate_database(data_dir / "platform.db", data_dir=data_dir),
+                    TARGET_SCHEMA_VERSION,
+                )
+                service = EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
+                try:
+                    self.assertEqual(
+                        json.loads((runtime / CAMOFOX_SIDECAR_NAME).read_text()),
+                        expected_camofox_sidecar(),
+                    )
+                    _, admin = service.authenticate("admin", "admin")
+                    self.assertEqual(admin["role"], "admin")
+                finally:
+                    service.close()
+
     def test_legacy_mount_compatibility_prepares_skill_destination(self):
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory) / "data"
