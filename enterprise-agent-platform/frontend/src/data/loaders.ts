@@ -59,6 +59,42 @@ interface RuntimeRefreshRetry {
 }
 const runtimeRefreshRetries = new WeakMap<AppStore, RuntimeRefreshRetry>();
 
+/* Message-audit lists are fenced by selection identity and a per-selection read
+   version: a response commits only while its conversation is still the selected
+   one and no newer read for that conversation has been issued. Switching the
+   selection isolates the previous list synchronously, so a slow earlier
+   conversation can never appear under a later title or delete target. */
+const auditReadVersions = new WeakMap<AppStore, Map<string, number>>();
+
+function issueAuditRead(store: AppStore, key: string): number {
+  let versions = auditReadVersions.get(store);
+  if (!versions) {
+    versions = new Map();
+    auditReadVersions.set(store, versions);
+  }
+  const version = (versions.get(key) || 0) + 1;
+  versions.set(key, version);
+  return version;
+}
+
+/** Select the audited channel, dropping the previous channel's rows at once. */
+export function selectAuditChannelId(store: AppStore, channelId: string | null): void {
+  if (store.getState().messageAudit.auditChannelId === channelId) return;
+  store.dispatch({
+    type: "PATCH_MESSAGE_AUDIT",
+    payload: { auditChannelId: channelId, channelMessages: [], channelTotal: 0 },
+  });
+}
+
+/** Select the audited private conversation, dropping the previous user's rows at once. */
+export function selectAuditPrivateUserId(store: AppStore, userId: string | null): void {
+  if (store.getState().messageAudit.auditPrivateUserId === userId) return;
+  store.dispatch({
+    type: "PATCH_MESSAGE_AUDIT",
+    payload: { auditPrivateUserId: userId, privateMessages: [], privateTotal: 0 },
+  });
+}
+
 /* ----------------------------------------------------------- local helpers */
 
 /** Merge server messages with the still-pending optimistic items for a scope. */
@@ -400,6 +436,9 @@ export async function loadPermissionGroups(store: AppStore): Promise<void> {
   store.dispatch({ type: "SET_PERMISSION_GROUPS", payload: result.permission_groups });
 }
 
+/** Read the selected channel's audit rows. The caller selects first; a read for
+ *  a channel that is no longer selected is skipped rather than re-selecting it,
+ *  and a late response for a superseded selection or read is discarded. */
 export async function loadAuditChannelMessages(
   store: AppStore,
   channelId: Id | null = store.getState().messageAudit.auditChannelId,
@@ -408,10 +447,17 @@ export async function loadAuditChannelMessages(
     store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { channelMessages: [], channelTotal: 0 } });
     return;
   }
-  store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditChannelId: String(channelId) } });
+  const selected = String(channelId);
+  if (store.getState().messageAudit.auditChannelId !== selected) return;
+  const fenceKey = `channel:${selected}`;
+  const version = issueAuditRead(store, fenceKey);
   const result = await api<AuditChannelMessagesResponse>(
-    endpoints.auditChannelMessages.path(channelId),
+    endpoints.auditChannelMessages.path(selected),
   );
+  if (
+    auditReadVersions.get(store)?.get(fenceKey) !== version ||
+    store.getState().messageAudit.auditChannelId !== selected
+  ) return;
   store.dispatch({
     type: "PATCH_MESSAGE_AUDIT",
     payload: { channelMessages: result.messages || [], channelTotal: result.total || 0 },
@@ -421,23 +467,23 @@ export async function loadAuditChannelMessages(
 export async function loadPrivateConversations(store: AppStore): Promise<void> {
   const result = await api<PrivateConversationsResponse>(endpoints.privateConversations.path());
   const conversations = result.conversations || [];
-  const audit = store.getState().messageAudit;
-  const selected = String(audit.auditPrivateUserId || "");
-  let auditPrivateUserId = audit.auditPrivateUserId;
+  const selected = String(store.getState().messageAudit.auditPrivateUserId || "");
+  store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { privateConversations: conversations } });
   // Reselect when the current selection is no longer present: prefer the first
   // conversation with messages, else the first conversation.
   if (!conversations.some((item) => String(item.user_id) === selected)) {
     const firstWithMessages = conversations.find((item) => (item.message_count || 0) > 0);
-    auditPrivateUserId = firstWithMessages
-      ? String(firstWithMessages.user_id)
-      : String(conversations[0]?.user_id || "");
+    selectAuditPrivateUserId(
+      store,
+      firstWithMessages
+        ? String(firstWithMessages.user_id)
+        : String(conversations[0]?.user_id || ""),
+    );
   }
-  store.dispatch({
-    type: "PATCH_MESSAGE_AUDIT",
-    payload: { privateConversations: conversations, auditPrivateUserId },
-  });
 }
 
+/** Read the selected private conversation's audit rows under the same
+ *  selection/version fence as the channel list. */
 export async function loadAuditPrivateMessages(
   store: AppStore,
   userId: Id | null = store.getState().messageAudit.auditPrivateUserId,
@@ -446,10 +492,17 @@ export async function loadAuditPrivateMessages(
     store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { privateMessages: [], privateTotal: 0 } });
     return;
   }
-  store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditPrivateUserId: String(userId) } });
+  const selected = String(userId);
+  if (store.getState().messageAudit.auditPrivateUserId !== selected) return;
+  const fenceKey = `private:${selected}`;
+  const version = issueAuditRead(store, fenceKey);
   const result = await api<AuditPrivateMessagesResponse>(
-    endpoints.auditPrivateMessages.path(userId),
+    endpoints.auditPrivateMessages.path(selected),
   );
+  if (
+    auditReadVersions.get(store)?.get(fenceKey) !== version ||
+    store.getState().messageAudit.auditPrivateUserId !== selected
+  ) return;
   store.dispatch({
     type: "PATCH_MESSAGE_AUDIT",
     payload: { privateMessages: result.messages || [], privateTotal: result.total || 0 },
@@ -567,10 +620,7 @@ export async function loadMessageAudit(store: AppStore): Promise<void> {
   const state = store.getState();
   const defaultChannel = state.activeChannelId || state.channels[0]?.id;
   if (!state.messageAudit.auditChannelId && defaultChannel) {
-    store.dispatch({
-      type: "PATCH_MESSAGE_AUDIT",
-      payload: { auditChannelId: String(defaultChannel) },
-    });
+    selectAuditChannelId(store, String(defaultChannel));
   }
   // Conversations must resolve before private messages: the auto-select of
   // auditPrivateUserId happens inside loadPrivateConversations.

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import imaplib
 import json
+import re
+import socket
 import sqlite3
 import tempfile
 import threading
 import unittest
+from email.message import EmailMessage
 from pathlib import Path
 from unittest import mock
 
@@ -103,6 +107,129 @@ class FakeMailTransport:
         return {"message_id": "<sent@example.com>", "recipients": 1}
 
 
+class _SearchIMAPPeer:
+    """A socket-pair IMAP peer: real imaplib serialization, no network service."""
+
+    def __init__(self, subject, *, from_uids=b"7"):
+        self.subject = subject
+        self.from_uids = from_uids
+        self.client_socket, self.server_socket = socket.socketpair()
+        self.client_socket.settimeout(5)
+        self.server_socket.settimeout(5)
+        self.errors = []
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        fixture = self
+
+        class Client(imaplib.IMAP4):
+            def _create_socket(self, timeout):
+                return fixture.client_socket
+
+        try:
+            self.client = Client(timeout=5)
+            self.client.login("synthetic-user", APPLICATION_PASSWORD)
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _unquote(value):
+        if not value.startswith(b'"'):
+            raise ValueError("expected IMAP quoted string")
+        decoded = bytearray()
+        index = 1
+        while index < len(value):
+            char = value[index]
+            if char == 34:
+                if value[index + 1:].strip():
+                    raise ValueError("trailing search data")
+                return bytes(decoded).decode("utf-8")
+            if char == 92:
+                index += 1
+                if index == len(value) or value[index] not in (34, 92):
+                    raise ValueError("invalid quoted escape")
+                char = value[index]
+            decoded.append(char)
+            index += 1
+        raise ValueError("unterminated quoted string")
+
+    def _serve(self):
+        try:
+            with self.server_socket.makefile("rb") as stream:
+                self.server_socket.sendall(b"* OK synthetic IMAP ready\r\n")
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        return
+                    tag, command = line.rstrip(b"\r\n").split(b" ", 1)
+                    upper = command.upper()
+                    response = b""
+                    if upper == b"CAPABILITY":
+                        response = b"* CAPABILITY IMAP4rev1\r\n"
+                    elif upper.startswith(b"LOGIN "):
+                        pass
+                    elif upper.startswith((b"EXAMINE ", b"SELECT ")):
+                        response = (
+                            b"* 1 EXISTS\r\n* OK [UIDVALIDITY 23] validity\r\n"
+                            b"* OK [UIDNEXT 8] next\r\n"
+                        )
+                    elif upper.startswith(b"UID SEARCH "):
+                        try:
+                            token = b"SUBJECT " if b"SUBJECT " in command else b"FROM "
+                            encoded = command.split(token, 1)[1]
+                            literal = re.fullmatch(rb"\{([0-9]+)(\+)?\}", encoded)
+                            if literal:
+                                if not literal.group(2):
+                                    self.server_socket.sendall(b"+ literal accepted\r\n")
+                                value = stream.read(int(literal.group(1))).decode("utf-8")
+                                if stream.readline() != b"\r\n":
+                                    raise ValueError("trailing literal data")
+                            else:
+                                if not encoded.isascii():
+                                    raise ValueError("non-ASCII quoted string")
+                                value = self._unquote(encoded)
+                        except (ValueError, IndexError):
+                            self.server_socket.sendall(tag + b" BAD malformed search\r\n")
+                            continue
+                        if not value.isascii() and not upper.startswith(b"UID SEARCH CHARSET UTF-8 "):
+                            self.server_socket.sendall(tag + b" BAD missing UTF-8 charset\r\n")
+                            continue
+                        matched = (
+                            b"7" if token == b"SUBJECT " and value == self.subject
+                            else self.from_uids if token == b"FROM " and value == "发件人"
+                            else b""
+                        )
+                        response = b"* SEARCH " + matched + b"\r\n"
+                    elif upper.startswith(b"UID FETCH "):
+                        message = EmailMessage()
+                        message["Subject"] = self.subject
+                        message["From"] = "sender@example.com"
+                        message["Message-ID"] = "<synthetic@example.com>"
+                        raw = message.as_bytes()
+                        response = (
+                            b"* 1 FETCH (UID 7 FLAGS () BODY[HEADER.FIELDS (SUBJECT)] {"
+                            + str(len(raw)).encode("ascii") + b"}\r\n" + raw + b")\r\n"
+                        )
+                    elif upper == b"LOGOUT":
+                        self.server_socket.sendall(b"* BYE done\r\n" + tag + b" OK logout\r\n")
+                        return
+                    else:
+                        self.server_socket.sendall(tag + b" BAD unsupported command\r\n")
+                        continue
+                    self.server_socket.sendall(response + tag + b" OK completed\r\n")
+        except (OSError, ValueError) as exc:
+            self.errors.append(exc)
+
+    def close(self):
+        for sock in (self.client_socket, self.server_socket):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        self.thread.join(6)
+
+
 class MailTransportCheckpointTests(unittest.TestCase):
     @staticmethod
     def client(*, validity: bytes = b"11", uid_next: bytes = b"81"):
@@ -114,6 +241,32 @@ class MailTransportCheckpointTests(unittest.TestCase):
         )
         client.uid.return_value = ("OK", [b""])
         return client
+
+    def test_changed_uidvalidity_rebaselines_without_replaying_history(self):
+        transport = MailTransport()
+        client = self.client(validity=b"24", uid_next=b"101")
+        with mock.patch.object(transport, "_imap", return_value=client):
+            checkpoint = transport.checkpoint(
+                {}, APPLICATION_PASSWORD, folder="INBOX",
+                after_uid=80, expected_uid_validity=23,
+            )
+        self.assertEqual(checkpoint, MailboxCheckpoint(uid_validity=24, highest_uid=100, uids=()))
+        client.uid.assert_not_called()
+
+    def test_first_arrival_after_initialized_empty_mailbox_is_returned(self):
+        transport = MailTransport()
+        empty = MailTransportCheckpointTests.client(validity=b"23", uid_next=b"1")
+        arrived = MailTransportCheckpointTests.client(validity=b"23", uid_next=b"2")
+        arrived.uid.return_value = ("OK", [b"1"])
+        with mock.patch.object(transport, "_imap", side_effect=[empty, arrived]):
+            initial = transport.checkpoint({}, APPLICATION_PASSWORD, folder="INBOX")
+            self.assertEqual((initial.uid_validity, initial.highest_uid, initial.uids), (23, 0, ()))
+            incremental = transport.checkpoint(
+                {}, APPLICATION_PASSWORD, folder="INBOX",
+                after_uid=initial.highest_uid,
+                expected_uid_validity=initial.uid_validity,
+            )
+        self.assertEqual(incremental.uids, (1,))
 
     def test_baseline_uses_uidnext_without_searching_all(self):
         transport = MailTransport()
@@ -194,6 +347,53 @@ class MailServiceTests(unittest.TestCase):
         assert self.actor is not None
         self.transport = FakeMailTransport()
         self.service.mail_transport = self.transport
+
+    def test_two_creates_at_nineteen_accounts_cannot_exceed_twenty(self):
+        owner = int(self.actor["id"])
+        store = self.service.mail_accounts
+        for index in range(19):
+            store.create(owner, account_body(email_address=f"seed-{index}@example.com"))
+        db = self.service.db
+        real_scalar = db.scalar
+        read_barrier = threading.Barrier(2, timeout=10)
+        start_barrier = threading.Barrier(2, timeout=10)
+        results = []
+        errors = []
+        lock = threading.Lock()
+
+        def scalar(sql, params=()):
+            value = real_scalar(sql, params)
+            # Hold both real autocommit snapshots at 19 before either INSERT.
+            # If the limit check moves inside BEGIN IMMEDIATE, do not block the
+            # lock owner waiting for a second writer that SQLite serializes.
+            if "count(*) FROM mail_accounts WHERE owner_user_id" in sql and not db._conn.in_transaction:
+                read_barrier.wait()
+            return value
+
+        def create(index):
+            try:
+                start_barrier.wait()
+                result = self.service.create_private_mail_account(
+                    self.actor, account_body(email_address=f"concurrent-{index}@example.com")
+                )
+                with lock:
+                    results.append(result)
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
+
+        workers = [threading.Thread(target=create, args=(index,), daemon=True) for index in range(2)]
+        with mock.patch.object(db, "scalar", side_effect=scalar):
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(15)
+        self.assertFalse(any(worker.is_alive() for worker in workers), "account creation did not finish")
+        unexpected = [exc for exc in errors if not isinstance(exc, ServiceError) or exc.status != 400]
+        self.assertEqual(unexpected, [])
+        self.assertLessEqual(len(store.list(owner)), 20)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
 
     def create_account(self, **overrides):
         return self.service.create_private_mail_account(
@@ -888,6 +1088,41 @@ class MailServiceTests(unittest.TestCase):
 
 
 class MailTransportTests(unittest.TestCase):
+    def _search_round_trip(self, subject):
+        fixture = _SearchIMAPPeer(subject)
+        self.addCleanup(fixture.close)
+        transport = MailTransport()
+        with mock.patch.object(transport, "_imap", return_value=fixture.client):
+            results = transport.search(
+                {}, APPLICATION_PASSWORD, folder="INBOX",
+                criteria={"subject": subject}, limit=5,
+            )
+        self.assertEqual([(item["uid"], item["subject"]) for item in results], [(7, subject)])
+        self.assertEqual(fixture.errors, [])
+
+    def test_search_preserves_trailing_backslash(self):
+        self._search_round_trip("report\\")
+
+    def test_search_preserves_double_quotes(self):
+        self._search_round_trip('report "approved"')
+
+    def test_search_chinese_passes_real_imaplib_encoding(self):
+        self._search_round_trip("中文报告")
+
+    def test_multiple_utf8_filters_intersect_results(self):
+        for from_uids, expected in ((b"6", []), (b"6 7", [7])):
+            with self.subTest(from_uids=from_uids):
+                fixture = _SearchIMAPPeer("中文报告", from_uids=from_uids)
+                self.addCleanup(fixture.close)
+                transport = MailTransport()
+                with mock.patch.object(transport, "_imap", return_value=fixture.client):
+                    results = transport.search(
+                        {}, APPLICATION_PASSWORD, folder="INBOX",
+                        criteria={"from": "发件人", "subject": "中文报告"}, limit=5,
+                    )
+                self.assertEqual([item["uid"] for item in results], expected)
+                self.assertEqual(fixture.errors, [])
+
     def test_read_checks_declared_size_before_fetching_the_body(self):
         transport = MailTransport()
         client = mock.MagicMock()

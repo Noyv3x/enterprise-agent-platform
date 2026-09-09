@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestResolveTargetConfigurationUsesOneOwnerControlledSnapshot(t *testing.T) {
@@ -45,6 +48,30 @@ func TestResolveTargetConfigurationRejectsRelativeAndSymlinkPaths(t *testing.T) 
 	}
 	if _, err := resolveTargetConfiguration(link); err == nil {
 		t.Fatal("symbolic-link config path was accepted")
+	}
+}
+
+func TestResolveTargetConfigurationRejectsFIFOWithoutWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manager.toml")
+	if err := unix.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := resolveTargetConfiguration(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO config was accepted")
+		}
+	case <-time.After(2 * time.Second):
+		// Release a regressed blocking open before failing the test.
+		if fd, err := unix.Open(path, unix.O_RDWR|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); err == nil {
+			_ = unix.Close(fd)
+		}
+		t.Fatal("config reader waited for a FIFO writer")
 	}
 }
 

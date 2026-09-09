@@ -12,11 +12,17 @@
 
 密码使用 PBKDF2-SHA256 和随机盐。登录失败按客户端与账号限流，并使用固定 dummy hash 降低用户名时序泄漏。用户停用、改密、权限变化或显式吊销会推进 token version，使旧会话失效。
 
+所有密码写入口与登录采用同一字符边界：密码最多 1024 个 Unicode 字符，超过上限必须在写入前拒绝并保留旧密码及 token version。登录闭世界 JSON 正文上限为 16 KiB，以容纳合法上限密码的 UTF-8 和 JSON Unicode 转义形式；解析后仍先执行字符上限，再进入密码哈希验证。
+
+本人改密的密码校验可以在写事务外计算，但提交必须同时匹配已验证的旧 hash、token version 和活动状态，并只用本次提交取得的版本签发会话。管理员重置、撤权或另一改密先提交时，旧请求失败，不能覆盖新状态或借读取较新版本签发有效 token。
+
 浏览器会话由 HMAC 签名 token 承载。Cookie 使用 `HttpOnly`、`SameSite=Lax`，以及与当前会话 TTL 相同的 `Max-Age`，因此关闭浏览器后仍保持登录，直到 token 到期、被吊销或用户退出。开启 Manager 可信代理边界时，`Secure` 必须以 Manager 清洗并重建的当前请求 scheme 为准：HTTPS 请求增加 `Secure`，明文 LAN HTTP 请求不增加，不能因全局公网 URL 为 HTTPS 而使 LAN 会话无法登录。未开启可信代理时必须忽略客户端伪造的 `Forwarded`/`X-Forwarded-*`，并以公共 URL scheme 作为本地直连的安全回退。携带 Cookie 的写请求必须提供允许的 Origin 或 Referer。
 
 出厂会话 TTL 为 7 天（604800 秒），管理员可在 60 秒到 30 天（2592000 秒）之间调整；该值同时约束 token `exp` 与 Cookie `Max-Age`。token 自签发起计算绝对到期时间。当浏览器以 Cookie 出示仍有效的会话，且剩余寿命已不足当前 TTL 的一半时，Platform 用同一 token version 签发新 token，并在本次响应写入 `Set-Cookie`，使日常使用自动续期。Authorization bearer、已过期 token、停用账号或 token version 变化不得续期。
 
 权限必须在 Python 服务端检查。前端路由、隐藏按钮和角色标签不是授权边界。Platform、Runtime 与 Manager 的内部接口分别使用独立 bearer 或 owner-only Unix socket；浏览器 session 不能替代内部身份。
+
+管理员写操作必须重新验证当前活动账号和权限，不能信任正文读取前取得的旧 actor 快照。账号创建、角色/权限更新及凭据变更的授权与提交必须有明确的串行或事务边界；在该边界之前已经完成的降权、停用或会话吊销必须拒绝旧请求。长网络等待不得占用全局 conversation gate。
 
 频道消息撤回是登录用户的受限写操作。Platform 必须在同一频道消息锁内重新读取当前活动账号和权限，并同时验证频道可读、仍有聊天权限、消息仍可见、消息类型为用户以及 `user_id` 与当前账号精确相等；管理员身份不绕过本人所有权，代删继续使用独立的管理审计接口。客户端提供的消息作者、scope 或可见按钮都不能替代这些检查。
 
@@ -37,6 +43,8 @@ Sandbox 镜像只允许 PID 1 entrypoint 在启动映射阶段短暂以 root 运
 Runtime 和 Platform 的所有内部 HTTP 接口，包括健康检查，都需要 token。管理器容器控制 socket 位于独立的 owner-only `control/` 目录；Runtime/Platform 只读挂载该目录而不是单个 socket inode 或整个 Manager 状态根，使 Manager 原子重建 socket 后容器能看到新 inode，同时不能读取 journal、release 和其它 secret。管理器在单一 Unix socket 上同时校验同 UID peer credential 与严格的 `Authorization: Bearer <token>`，并按 capability 分离身份：`manager-token` 只允许 Platform、宿主 CLI 与 Manager 回调访问状态、配置、日志、迁移和变更 operation；独立的 `manager-executor-token` 只允许 Runtime 访问 `/v1/executor/*`。两枚 token 不得互相授权，Platform 不挂载 executor token，Runtime 不挂载 control token；知道 socket 路径、容器名称、网络地址或 scope key 均不能替代 capability 与主 Agent sandbox identity。
 
 Manager 启动必须重新验证 `control/`、`secrets/` 及两枚 token 的真实宿主对象。目录必须由部署 UID 拥有、是非符号链接目录并收紧为 `0700`；token 必须由部署 UID 拥有、是非符号链接普通文件并收紧为 `0600`。任何 owner、类型或符号链接异常都必须拒绝启动，不能通过 `ReadFile` 或 `MkdirAll` 跟随既有路径继续运行。只读 bind mount 与 `SO_PEERCRED` 是外层纵深防护，不能代替按路由的 token capability。
+
+凡要求普通文件的配置、token、进程输出和 MCP 清单/命令读取，都必须先以不跟随符号链接且非阻塞的方式打开，再从同一 fd 检查类型和身份。FIFO 等特殊文件不能在类型拒绝之前无限等待；取得 fd 后的每个初始化失败路径也必须释放已持有的描述符。
 
 搜索结果和 Firecrawl 提取 URL 只允许公开 HTTP(S)，拒绝内嵌凭据、回环、私网、链路本地地址、云元数据及敏感查询参数；搜索结果轻量过滤不能替代提取前的 DNS 感知 SSRF 校验。
 
@@ -69,6 +77,10 @@ Agent 回复中的 `MEDIA: /workspace/<relative-path>` 只是一条待校验的�
 命令中的 token、Cookie、Authorization、URL userinfo、常见 secret 变量和值必须在离开执行器前脱敏。统一脱敏器覆盖常见客户端的紧凑、等号和分离参数形式；无法安全解析嵌套 shell 求值中的 secret 时直接拒绝。原始 secret 只留在当前执行闭包，不能进入事件 journal、session、预览或错误文本。聊天工作记录的展开详情只能持久化闭世界、再次脱敏的 `parameters` 和有界 `result`；write/patch 正文、邮件正文、记忆与跨会话搜索结果以及未脱敏凭据不得进入 `agent_work`。
 
 终端预览和 `process.list/read/stop` 快照复用同一脱敏器后再裁剪。取消和 scope cleanup 尽力终止前台进程；一旦 Manager 报告终止已确认，就必须同时证明对应进程控制器的输出快照、持久登记和 Sandbox 活动计数已经收敛，不能让旧 goroutine 在授权边界返回后继续写 scope 状态。Sandbox 后台进程可跨 Run 保留，但必须有登记、输出上限和管理员可见状态。Sandbox 停止会终止其容器进程，持久挂载数据保留。
+
+普通 terminal 的保留命令来自已经消费并绑定本次调用的安全审计投影；stdout/stderr 在进入保留缓冲、进程 JSON 或预览前脱敏，再执行输出裁剪。不得只保护 audit.jsonl 而让其它保留层保存原始凭据，也不能用隐藏全部普通输出代替脱敏。
+
+保留输出的 Go 脱敏器和生成的 Python 脱敏器共享同一组引入规则与必要条件预筛选：只有当前窗口不含某条规则必需的字符，或空白数不足该规则的最低要求时，才跳过该条正则扫描；必要条件只排除不可能匹配的规则，不改变原始正则、最早起点及同点规则顺序。普通无标点或带空格文本同样走该流程，不能以整段输出直通替代脱敏。筛选始终针对完整待定窗口，保持 512 字节尾窗、跨 chunk 拼接、已有秘密/URL/PEM/引号模式、EOF 和非消费式 Preview 语义；两端不得各自维护不同的筛选白名单。
 
 ## 管理器与更新
 
@@ -116,7 +128,13 @@ Unix control socket 路径不是可抢占锁。绑定方必须先在同一已验
 
 数据根、workspace、Runtime 根和 Agent env 必须由部署用户拥有、不是符号链接，并收紧权限。workspace 路径的每个组成部分都要重新检查符号链接。数据库只保存相对 workspace 标识，不能写入宿主绝对路径。
 
+文件 patch 必须在分配替换结果前，以防整数溢出的长度计算验证结果上限；小输入和有界请求正文不能成为先分配超大结果、再事后拒绝的理由。
+
 跨 staging 与 workspace 父目录发布私有目录时，首次 rename 和 exact-final 崩溃重放必须使用同一耐久屏障：依次 `fsync` 已固定 child fd、staging/source parent 和 destination parent，即使 staging 名已消失或 exact 空 residue 已清理也不能省略。任一步失败只能在 final 仍是预期 inode，且本次 missing→rename 或已建立的空目录恢复身份仍为空时分类为 committed-but-not-durable；重试必须再走完整屏障。若在 rename 后的检查或 `fsync` 窗口出现内容、类型、权限或 inode 漂移，不得宣称已提交，不得删除证据或继续提交数据库状态。
+
+私有普通文件的显式发布与 exact-final 重放同样必须重新固定和验证目标，完成文件及父目录的必要 `fsync` 后才可宣告耐久成功。上层 marker/sidecar 的初始化重试不得仅凭相同可见字节跳过曾失败的屏障；纯只读身份验证不等于一次耐久提交。
+
+Camoufox sidecar 的缺失只能在明确的 fresh 初始化上下文中等待创建。启动前已存在 current 数据库的普通/候选启动必须拒绝缺失 sidecar 或受管父目录；fresh 资格在创建数据库之前确定并显式传递，不能在第二次检查时从 sidecar 缺失推断，也不能误拒绝同次 fresh 启动刚创建的数据库。
 
 上传文件有数量、单文件、总量、账号配额和全局配额；名称和 MIME 在服务端规范化。上传没有固定墙钟超时，但连续没有收到字节达到上传 socket 空闲上限、断线、取消、更新切换或大小越界仍会终止传输；持续前进的慢速上传不会因普通总耗时被中断，界面只展示浏览器已实际发送的字节进度。Multipart 读取期间只写 owner-only staging，不占用可无限延长的更新写准入；只有完整读取后的附件验证、权威复制、消息和 durable job 提交占用短准入。若更新先预约，旧请求可以中断并清除 staging，不能通过慢滴流永久阻止版本收敛。Platform 为上传使用独立的有界并发预算，超过预算时明确拒绝新上传，不能让大文件占满普通请求工作线程。
 

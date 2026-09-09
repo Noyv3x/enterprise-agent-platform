@@ -52,6 +52,7 @@ func (c Client) Do(ctx context.Context, method, path string, body, out any) erro
 		dialer := net.Dialer{Timeout: timeout}
 		return dialer.DialContext(ctx, "unix", c.SocketPath)
 	}}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: timeout}
 	response, err := client.Do(request)
 	if err != nil {

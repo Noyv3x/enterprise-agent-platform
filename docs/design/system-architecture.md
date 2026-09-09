@@ -59,6 +59,10 @@ Python Platform 容器拥有产品业务状态：
 
 SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务及 Telegram 投递通过持久任务账本记录；进程重启后，安全可重试的任务可重新排队，已开始副作用的任务进入人工复核。Platform 只接受当前数据库 marker 与精确结构，任何其它非空数据库都在修改前拒绝。直接前一 baseline 的迁移必须显式识别该版本自身生成的控制文件：安全校验后只作为源一致性证据，不复制、不改写，也不把未知输入放宽为兼容项。当前 `2026080801` 到 `2026082901` 的直接迁移还允许候选镜像的闭世界 entrypoint 先以部署身份和 isolated Python 只读确认精确旧 marker，再回到 root 非递归接管旧 Docker 自动创建的精确空 mountpoint，随后立即降为部署 UID/GID；fresh/current/未知 marker、普通启动、其它路径和后续 baseline 没有该权限。由权威业务表可重建的派生索引在启动时单独验证自身契约；只有这类派生对象可以从权威数据原地修复，具体边界见[数据、记忆与会话](data-memory-sessions.md)。Platform 不安装依赖、拉取上游源码、调用 Compose 或拥有服务生命周期。
 
+本轮业务状态边界进一步统一：所有 SQLite 写入口在失败后回滚再复用线程连接；管理员写在短准入/事务边界重新验证非序列化的认证版本，密码修改以旧 hash、活动状态和 token version 做 CAS；同一 OAuth 凭据组原子提交，并用单调凭据世代把返回 token 与账号模型目录绑定。邮件 checkpoint、Telegram update 前缀、计划 occurrence、Agent worker 建账和 Camoufox sidecar 都必须保留各自明确的持久所有权，不能从缺失值或旧内存快照猜测成功。
+
+文件发布和预览沿用同一“固定对象后操作”原则：普通文件发布重放重新完成耐久屏障，复制失败释放全部目录/文件描述符；PPTX 通过包内 presentation relationship 解释声明页序而不是 ZIP 文件名；current 数据布局缺少受管 sidecar 时失败，只有创建数据库前已经证明的 fresh 安装可以显式延迟初始化。
+
 ## Agent Runtime
 
 Node.js Runtime 容器直接使用锁定版本的 Pi Core 与 Pi AI。它拥有一次 Run 内的模型和工具循环、SSE 事件、工具策略、结构化 todo、受限并行委派、语义上下文压缩、JSONL 会话和幂等结果。Python 通过私有容器网络创建 Run 并消费可恢复事件；Runtime 通过独立 token 回调 Python 业务工具，并通过 Manager 在当前 Agent Sandbox 调用固定的一次性 stdio MCP 客户端。MCP 清单、Skill 与本地 server 包只存在于该主 Agent 的工作区，不进入中央 Runtime 文件系统。

@@ -300,6 +300,15 @@ func (c Client) FetchForProfileConditional(ctx context.Context, url, channel str
 	return ManifestResponse{Manifest: manifest, Data: data, Validators: next, Modified: true}, nil
 }
 
+// ReadManifest bounds local input before applying the shared strict decoder.
+func ReadManifest(reader io.Reader, channel, goos, goarch string) (Manifest, error) {
+	data, err := io.ReadAll(io.LimitReader(reader, maxManifestBytes+1))
+	if err != nil {
+		return Manifest{}, err
+	}
+	return DecodeManifest(data, channel, goos, goarch)
+}
+
 // DecodeManifest applies the same closed-world parser and cross-field
 // validation as Client.Fetch to retained immutable bytes.
 func DecodeManifest(data []byte, channel, goos, goarch string) (Manifest, error) {

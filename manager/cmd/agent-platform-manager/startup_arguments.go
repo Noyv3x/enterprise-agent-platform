@@ -22,11 +22,14 @@ type startupArgumentSpec struct {
 }
 
 type startupArguments struct {
-	ConfigPath string
-	PlanPath   string
+	ConfigPath   string
+	PlanPath     string
+	ManifestPath string
+	Architecture string
 }
 
 var startupCommandArguments = map[string]startupArgumentSpec{
+	"inspect-release":      {options: startupOptions("manifest", startupArgumentValue, "architecture", startupArgumentValue), required: []string{"manifest", "architecture"}},
 	"serve":                {options: startupOptions("config", startupArgumentValue)},
 	"preflight":            {options: startupOptions("config", startupArgumentValue, "probe-user-systemd-transient", startupArgumentBool)},
 	"install":              {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
@@ -101,7 +104,7 @@ func parseStartupArguments(command string, arguments []string) (startupArguments
 			return startupArguments{}, errors.New("invalid startup argument contract")
 		}
 	}
-	result := startupArguments{ConfigPath: values["config"], PlanPath: values["plan"]}
+	result := startupArguments{ConfigPath: values["config"], PlanPath: values["plan"], ManifestPath: values["manifest"], Architecture: values["architecture"]}
 	if spec.requireConfig && result.ConfigPath == "" {
 		return startupArguments{}, fmt.Errorf("%s requires an explicit --config path", command)
 	}
@@ -113,7 +116,7 @@ func parseStartupArguments(command string, arguments []string) (startupArguments
 			return startupArguments{}, fmt.Errorf("%s requires --%s=true", command, name)
 		}
 	}
-	for label, path := range map[string]string{"config": result.ConfigPath, "plan": result.PlanPath} {
+	for label, path := range map[string]string{"config": result.ConfigPath, "plan": result.PlanPath, "manifest": result.ManifestPath} {
 		if path != "" && (!filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0)) {
 			return startupArguments{}, fmt.Errorf("%s path must be canonical and absolute", label)
 		}

@@ -222,11 +222,16 @@ func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
 	if !ok {
 		return errors.New("sandbox is not registered")
 	}
+	original := record
 	record.ActiveCalls++
 	record.LastActivityAt = now.UTC()
 	record.StoppedAt = nil
 	m.registry.Records[sandboxID] = record
-	return m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		m.registry.Records[sandboxID] = original
+		return err
+	}
+	return nil
 }
 func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Time) error {
 	unlockMaintenance := m.lockMaintenance()

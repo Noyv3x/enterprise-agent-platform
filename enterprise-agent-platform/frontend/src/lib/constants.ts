@@ -5,6 +5,9 @@ import type { AdminPage, ThinkingDepthOption } from "../types";
 export const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 export const SSE_RECONNECT_MS = 3000;
+/** Ceiling for the doubling backoff used while the post-CLOSED auth probe keeps
+ * failing for transient network/server reasons. */
+export const SSE_RECOVERY_MAX_MS = 30_000;
 
 export const THINKING_DEPTH_OPTIONS: ThinkingDepthOption[] = [
   ["none", "none"],

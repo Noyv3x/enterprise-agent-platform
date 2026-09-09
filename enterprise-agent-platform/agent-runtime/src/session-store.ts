@@ -390,7 +390,7 @@ export class SessionStore {
   async deleteScope(scopeKey: string, lifecycleId?: string): Promise<void> {
     const scopeDir = join(this.sessionsRoot, stableHash(scopeKey));
     const target = lifecycleId ? join(scopeDir, stableHash(lifecycleId)) : scopeDir;
-    await rm(target, { recursive: true, force: true });
+    await this.deleteDirectory(target);
   }
 
   /** Delete exactly one transient session while preserving lifecycle approvals and siblings. */
@@ -427,14 +427,27 @@ export class SessionStore {
         const manifest = JSON.parse(await readFile(join(directory, "scope.json"), "utf8")) as { scope_key?: string };
         const candidate = String(manifest.scope_key || "");
         if (!scopeOwns(scopeKey, candidate)) continue;
-        await rm(lifecycleId ? join(directory, stableHash(lifecycleId)) : directory, {
-          recursive: true,
-          force: true,
-        });
+        await this.deleteDirectory(lifecycleId ? join(directory, stableHash(lifecycleId)) : directory);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
     }
+  }
+
+  private async deleteDirectory(directory: string): Promise<void> {
+    // Scope admission is fenced by the coordinator. Join any already admitted
+    // writes in their own queue, never acquiring a session lock from inside a
+    // mutation lock (compaction takes those in the opposite order).
+    const files = [...this.mutationQueues.keys()].filter((file) => file.startsWith(`${directory}/`)).sort();
+    const remove = async (index: number): Promise<void> => {
+      const file = files[index];
+      if (file === undefined) {
+        await rm(directory, { recursive: true, force: true });
+        return;
+      }
+      await this.withQueue(this.mutationQueues, file, async () => await remove(index + 1));
+    };
+    await remove(0);
   }
 
   /** Clear only finite background-task responsibilities in an exact scope family. */

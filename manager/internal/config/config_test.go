@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -64,10 +65,22 @@ func TestDefaultsUseCanonicalTargetIdentity(t *testing.T) {
 	}
 }
 
-func TestDefaultsRejectsMissingRuntimeDirectory(t *testing.T) {
+func TestDefaultsResolveRuntimeDirectoryWithoutEnvironment(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	if _, err := Defaults(testActiveProfile); err == nil {
-		t.Fatal("target profile started without XDG_RUNTIME_DIR")
+	want := filepath.Join("/run/user", strconv.Itoa(os.Getuid()), "agent-platform-manager", "manager.sock")
+	cfg, err := Defaults(testActiveProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SocketPath != want {
+		t.Fatalf("socket = %q, want %q", cfg.SocketPath, want)
+	}
+	loaded, err := LoadSnapshot(testActiveProfile, filepath.Join(t.TempDir(), "manager.toml"), []byte("data_root = \""+t.TempDir()+"\"\n"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SocketPath != want {
+		t.Fatalf("configured data root changed runtime socket: %q", loaded.SocketPath)
 	}
 }
 

@@ -15,6 +15,7 @@ const STDERR_MAX_BYTES = 64 * 1024;
 const LINE_MAX_BYTES = 256 * 1024;
 const MESSAGE_MAX_COUNT = 256;
 const SERVER_MAX_COUNT = 32;
+const PROTOCOL_VERSION = "2025-06-18";
 const SERVER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
@@ -48,7 +49,7 @@ export async function executeMcpRequest(request, options = {}) {
 async function loadServers(workspaceRoot, configPath, missingIsEmpty) {
   let descriptor;
   try {
-    descriptor = await open(configPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    descriptor = await open(configPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     const configRealPath = await realpath(`/proc/self/fd/${descriptor.fd}`);
     if (!within(workspaceRoot, configRealPath)) throw new Error("MCP config must remain inside the workspace");
   } catch (error) {
@@ -61,7 +62,15 @@ async function loadServers(workspaceRoot, configPath, missingIsEmpty) {
     if (!metadata.isFile() || metadata.size > CONFIG_MAX_BYTES) {
       throw new Error(`MCP config exceeds ${CONFIG_MAX_BYTES} bytes or is not a regular file`);
     }
-    const bytes = await descriptor.readFile();
+    const buffer = Buffer.allocUnsafe(CONFIG_MAX_BYTES + 1);
+    let size = 0;
+    while (size < buffer.length) {
+      const { bytesRead } = await descriptor.read(buffer, size, buffer.length - size, size);
+      if (bytesRead === 0) break;
+      size += bytesRead;
+    }
+    if (size > CONFIG_MAX_BYTES) throw new Error(`MCP config exceeds ${CONFIG_MAX_BYTES} bytes`);
+    const bytes = buffer.subarray(0, size);
     let parsed;
     try {
       parsed = JSON.parse(textDecoder.decode(bytes));
@@ -232,12 +241,8 @@ async function exchange(server, method, params, deadline) {
       assertJsonBounds(message.result);
       if (stage === 1) {
         requireObject(message.result, "MCP initialize result");
-        if (
-          typeof message.result.protocolVersion !== "string"
-          || utf8Bytes(message.result.protocolVersion) < 1
-          || utf8Bytes(message.result.protocolVersion) > 32
-        ) {
-          throw new Error("MCP initialize result has an invalid protocol version");
+        if (message.result.protocolVersion !== PROTOCOL_VERSION) {
+          throw new Error("MCP initialize result has an unsupported protocol version");
         }
         stage = 2;
         send({ jsonrpc: "2.0", method: "notifications/initialized", params: {} });
@@ -291,7 +296,7 @@ async function exchange(server, method, params, deadline) {
         id: 1,
         method: "initialize",
         params: {
-          protocolVersion: "2025-06-18",
+          protocolVersion: PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: "agent-platform-mcp-client", version: "1" },
         },
@@ -387,7 +392,7 @@ async function pinWorkspaceCommand(workspaceRoot, candidate) {
 }
 
 async function pinWorkspacePath(workspaceRoot, candidate, directory) {
-  const flags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (directory ? fsConstants.O_DIRECTORY : 0);
+  const flags = fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | (directory ? fsConstants.O_DIRECTORY : fsConstants.O_NONBLOCK);
   const descriptor = await open(candidate, flags);
   try {
     const path = await realpath(`/proc/self/fd/${descriptor.fd}`);

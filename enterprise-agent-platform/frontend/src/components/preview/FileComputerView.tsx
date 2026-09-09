@@ -12,6 +12,8 @@ import { useComputerFilePreview } from "./useComputerFilePreview";
 
 interface FileComputerViewProps {
   scope: AgentPreviewScope;
+  /** The Run the surface belongs to; drafts never carry across Runs. */
+  runId: string;
   file: ComputerFileClue | null;
   compact?: boolean;
 }
@@ -253,14 +255,15 @@ function FileSnapshot({
   );
 }
 
-export function FileComputerView({ scope, file, compact = false }: FileComputerViewProps) {
+export function FileComputerView({ scope, runId, file, compact = false }: FileComputerViewProps) {
   const { t } = useI18n();
-  const { state, refresh, hostTarget, workspacePath, running } = useComputerFilePreview(scope, file);
+  const { state, refresh, hostTarget, workspacePath, running } = useComputerFilePreview(scope, runId, file);
   const draftStreaming = state.loaded && running && state.source === "draft";
   const progressivePhase: ProgressiveFilePhase = draftStreaming
     ? "draft"
     : completedFile(file) ? "settle" : "immediate";
   const streamIdentity = [
+    runId,
     scope.scope_type,
     scope.scope_id,
     workspacePath,

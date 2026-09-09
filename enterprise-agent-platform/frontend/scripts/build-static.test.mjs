@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+  brotliCompressSync,
   brotliDecompress as brotliDecompressCallback,
+  brotliDecompressSync,
   gunzip as gunzipCallback,
+  gunzipSync,
+  gzipSync,
 } from "node:zlib";
 import {
   atomicPublish,
@@ -150,7 +154,7 @@ describe("atomic static publication", () => {
     expect(await readFile(join(live, "index.html"), "utf8")).toContain("app-AbCd1234.js");
   });
 
-  it("removes every file that is not part of the current staged release", async () => {
+  it("removes files outside the current release only after the entry commit", async () => {
     const root = await temporaryRoot();
     const stage = join(root, "stage");
     const live = join(root, "live");
@@ -161,7 +165,7 @@ describe("atomic static publication", () => {
       writeFile(join(live, "app-obsolete123.js"), "old bundle"),
       writeFile(join(live, "untracked-static.txt"), "unknown residue"),
     ]);
-    let staleClearedBeforeCommit = false;
+    let staleRetainedUntilCommit = false;
 
     await atomicPublish(
       stage,
@@ -170,14 +174,14 @@ describe("atomic static publication", () => {
       {
         beforeCommit: async () => {
           const names = await readdir(live);
-          staleClearedBeforeCommit =
-            !names.includes("app-obsolete123.js") &&
-            !names.includes("untracked-static.txt");
+          staleRetainedUntilCommit =
+            names.includes("app-obsolete123.js") &&
+            names.includes("untracked-static.txt");
         },
       },
     );
 
-    expect(staleClearedBeforeCommit).toBe(true);
+    expect(staleRetainedUntilCommit).toBe(true);
     expect((await readdir(live)).sort()).toEqual([
       ".static-release.json",
       "app-AbCd1234.js",
@@ -191,6 +195,75 @@ describe("atomic static publication", () => {
       current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"],
     });
   });
+
+  it("keeps every readable live entry resolvable to its bundle throughout publication", async () => {
+    const root = await temporaryRoot();
+    const stage = join(root, "stage");
+    const live = join(root, "live");
+    await mkdir(live, { recursive: true });
+    for (const [directory, generation] of [[live, "Old12345"], [stage, "New12345"]]) {
+      await mkdir(directory, { recursive: true });
+      const html = `<script type="module" src="/app-${generation}.js"></script>`;
+      await Promise.all([
+        writeFile(join(directory, `app-${generation}.js`), `globalThis.generation = "${generation}";`),
+        writeFile(join(directory, "index.html"), html),
+        writeFile(join(directory, "index.html.br"), brotliCompressSync(html)),
+        writeFile(join(directory, "index.html.gz"), gzipSync(html)),
+      ]);
+    }
+    const missing = [];
+    const observe = async (phase) => {
+      for (const [entry, decode] of [
+        ["index.html", (bytes) => bytes],
+        ["index.html.br", brotliDecompressSync],
+        ["index.html.gz", gunzipSync],
+      ]) {
+        const html = decode(await readFile(join(live, entry))).toString();
+        const asset = /src="\/([^"]+)"/.exec(html)[1];
+        try {
+          await readFile(join(live, asset));
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          missing.push({ phase, entry, asset });
+        }
+      }
+    };
+
+    await atomicPublish(stage, live, { version: 2, current_assets: ["app-New12345.js"] }, {
+      beforeCommit: () => observe("before-commit"),
+      afterInstall: (name) => observe(`installed:${name}`),
+    });
+
+    expect(missing).toEqual([]);
+    await expect(readFile(join(live, "app-Old12345.js"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(live, "index.html"), "utf8")).toContain("app-New12345.js");
+  });
+
+  it.skipIf(process.getuid?.() === 0)(
+    "reports leftover stale files after a committed release instead of rolling back",
+    async () => {
+      const root = await temporaryRoot();
+      const stage = join(root, "stage");
+      const live = join(root, "live");
+      await writeFixture(stage);
+      await mkdir(join(live, "locked"), { recursive: true });
+      await writeFile(join(live, "index.html"), "old index");
+      await writeFile(join(live, "locked", "app-obsolete123.js"), "old bundle");
+      await chmod(join(live, "locked"), 0o555);
+
+      try {
+        await expect(
+          atomicPublish(stage, live, { version: 2, current_assets: ["app-AbCd1234.js", "styles-ZyXw9876.css"] }),
+        ).rejects.toThrow(/release committed .* stale static files could not be removed: locked\/app-obsolete123\.js/);
+
+        expect(await readFile(join(live, "index.html"), "utf8")).toContain("app-AbCd1234.js");
+        expect(await readFile(join(live, "app-AbCd1234.js"), "utf8")).toContain("application-ready");
+        expect(await readFile(join(live, "locked", "app-obsolete123.js"), "utf8")).toBe("old bundle");
+      } finally {
+        await chmod(join(live, "locked"), 0o755);
+      }
+    },
+  );
 
   it("publishes encoded indexes after ordinary assets and identity index last", async () => {
     const root = await temporaryRoot();

@@ -174,21 +174,9 @@ export async function atomicPublish(
   const rollbackDir = join(stageDir, ".rollback");
   const installed = [];
   let committed = false;
-  let staleFilesRemoved = false;
 
   try {
     for (const relativePath of ordered) {
-      if (entrySet.has(relativePath) && !staleFilesRemoved) {
-        for (const stalePath of staleFiles) {
-          const destination = assertInside(liveDir, stalePath);
-          const backup = join(rollbackDir, stalePath);
-          await mkdir(dirname(backup), { recursive: true });
-          await copyFile(destination, backup);
-          await rm(destination, { force: true });
-          installed.push({ relativePath: stalePath, destination, backup });
-        }
-        staleFilesRemoved = true;
-      }
       if (relativePath === "index.html") await beforeCommit?.();
       const source = assertInside(stageDir, relativePath);
       const destination = assertInside(liveDir, relativePath);
@@ -207,8 +195,9 @@ export async function atomicPublish(
       }
       await atomicCopy(source, destination, releaseId);
       installed.push({ relativePath, destination, backup });
-      await afterInstall?.(relativePath);
+      // The identity index rename is the commit: from here on nothing rolls back.
       if (relativePath === "index.html") committed = true;
+      await afterInstall?.(relativePath);
     }
   } catch (error) {
     if (!committed) {
@@ -226,6 +215,25 @@ export async function atomicPublish(
       }
     }
     throw error;
+  }
+
+  // Until the last entry was committed, a still-readable previous entry could
+  // reference the previous generation's hashed bundles, so those files had to
+  // stay in place. Every entry now belongs to this release; remove everything
+  // the manifest does not declare. The release is already live, so a removal
+  // failure is reported as leftover cleanup work rather than rolled back.
+  const cleanupErrors = [];
+  for (const stalePath of staleFiles) {
+    try {
+      await rm(assertInside(liveDir, stalePath), { force: true });
+    } catch (cleanupError) {
+      cleanupErrors.push(`${stalePath}: ${cleanupError?.message || cleanupError}`);
+    }
+  }
+  if (cleanupErrors.length) {
+    throw new Error(
+      `release committed to ${liveDir}, but stale static files could not be removed: ${cleanupErrors.join("; ")}`,
+    );
   }
 }
 

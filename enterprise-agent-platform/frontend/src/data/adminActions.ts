@@ -23,6 +23,8 @@ import {
   loadTelegramConfig,
   loadTokenUsage,
   loadUsers,
+  selectAuditChannelId,
+  selectAuditPrivateUserId,
   type AppStore,
 } from "./loaders";
 import { resetSession, runBusy } from "./sessionActions";
@@ -128,21 +130,35 @@ export async function selectAdminPage(store: AppStore, pageId: AdminPageId): Pro
 
 /* ========================================================== audit: select */
 
-/** Select the channel used by message audit. */
-export async function selectAuditChannel(store: AppStore, channelId: string): Promise<void> {
-  store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditChannelId: channelId } });
-  await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
+let auditReadSequence = 0;
+
+/** Every selection or refresh read owns a distinct busy key. runBusy de-duplicates
+ *  by key, which is right for mutations but would let an older, still-pending read
+ *  of the same conversation swallow the read issued when the admin returns to it,
+ *  leaving the list empty. Ordering between reads of one conversation belongs to
+ *  the loaders' newest-wins fence, not to the busy registry. */
+function auditReadKey(kind: "channel" | "private", id: Id): string {
+  auditReadSequence += 1;
+  return `admin:audit:${kind}:${id}:${auditReadSequence}`;
 }
 
-/** Select a private conversation for audit. */
+/** Select the channel used by message audit. The selection and the isolation of
+ *  the previous channel's rows happen synchronously; the read that follows only
+ *  commits while this channel remains selected. */
+export async function selectAuditChannel(store: AppStore, channelId: string): Promise<void> {
+  selectAuditChannelId(store, channelId);
+  await runBusy(store, auditReadKey("channel", channelId), () => loadAuditChannelMessages(store, channelId));
+}
+
+/** Select a private conversation for audit with the same synchronous isolation. */
 export async function selectAuditConversation(store: AppStore, userId: Id): Promise<void> {
-  store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { auditPrivateUserId: String(userId) } });
-  await runBusy(store, `admin:audit:private:${userId}`, () => loadAuditPrivateMessages(store, userId));
+  selectAuditPrivateUserId(store, String(userId));
+  await runBusy(store, auditReadKey("private", userId), () => loadAuditPrivateMessages(store, userId));
 }
 
 /** Refresh one audited channel. */
 export async function refreshAuditChannel(store: AppStore, channelId: string): Promise<void> {
-  await runBusy(store, `admin:audit:channel:${channelId}`, () => loadAuditChannelMessages(store, channelId));
+  await runBusy(store, auditReadKey("channel", channelId), () => loadAuditChannelMessages(store, channelId));
 }
 
 /** Refresh private-message audit data. */
@@ -152,7 +168,9 @@ export async function refreshMessageAudit(store: AppStore): Promise<void> {
 
 /* ===================================================== audit: cascade reloads */
 
-/** Refresh the channel list, audit list and active channel after an audit change. */
+/** Refresh the channel list, the audited rows and the active channel after an
+ *  audit change. The audited rows reload only while the changed channel is still
+ *  the selection: a refresh never re-selects a conversation the admin has left. */
 async function reloadAfterChannelAuditChange(store: AppStore, channelId: Id): Promise<void> {
   await Promise.all([loadChannels(store), loadAuditChannelMessages(store, channelId)]);
   if (String(store.getState().activeChannelId || "") === String(channelId)) {
@@ -160,9 +178,12 @@ async function reloadAfterChannelAuditChange(store: AppStore, channelId: Id): Pr
   }
 }
 
-/** Refresh conversations, the audit list and the user's own private thread. */
+/** Refresh conversations, the currently selected audited thread and the user's
+ *  own private thread. Conversations resolve first because they may move the
+ *  selection when the changed conversation disappeared. */
 async function reloadAfterPrivateAuditChange(store: AppStore, userId: Id): Promise<void> {
-  await Promise.all([loadPrivateConversations(store), loadAuditPrivateMessages(store, userId)]);
+  await loadPrivateConversations(store);
+  await loadAuditPrivateMessages(store);
   if (String(store.getState().user?.id || "") === String(userId)) {
     await loadPrivateMessages(store);
   }

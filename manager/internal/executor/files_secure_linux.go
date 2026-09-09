@@ -26,10 +26,12 @@ import (
 // fd with O_NOFOLLOW, so a process cannot redirect a later Manager file call
 // through a parent symlink.
 type managedFilePath struct {
-	root     string
-	relative string
-	readOnly bool
-	host     *sandbox.HostPath
+	root           string
+	relative       string
+	readOnly       bool
+	host           *sandbox.HostPath
+	attachmentRoot string
+	attachmentPath string
 }
 
 func (s FileService) sandboxPath(call Call, value string) (managedFilePath, error) {
@@ -71,7 +73,14 @@ func (s FileService) sandboxPath(call Call, value string) (managedFilePath, erro
 		if !ok {
 			continue
 		}
-		return managedFilePath{root: candidate.host, relative: relative, readOnly: candidate.readOnly}, nil
+		path := managedFilePath{root: candidate.host, relative: relative, readOnly: candidate.readOnly}
+		if candidate.logical == contract.ContainerWorkspace && spec.Attachments != "" {
+			if overlay, ancestor := relativeBelow(logical, attachmentRoot); ancestor {
+				path.attachmentRoot = spec.Attachments
+				path.attachmentPath = overlay
+			}
+		}
+		return path, nil
 	}
 	return managedFilePath{}, errors.New("sandbox file tools can access only persistent mounted paths")
 }
@@ -327,13 +336,24 @@ func createTemporaryAt(parent *os.File, temporaryPrefix string) (string, *os.Fil
 }
 
 func searchManaged(ctx context.Context, path managedFilePath, matcher *regexp.Regexp, max int) ([]string, error) {
+	var attachments *os.File
+	if path.attachmentRoot != "" {
+		var err error
+		attachments, err = openManagedDirectory(managedFilePath{root: path.attachmentRoot, relative: "."})
+		if err != nil {
+			return nil, err
+		}
+		defer attachments.Close()
+	}
 	root, err := openManagedNode(path)
-	if err != nil {
+	if err != nil && !(attachments != nil && errors.Is(err, syscall.ENOENT)) {
 		return nil, err
 	}
-	defer root.Close()
+	if root != nil {
+		defer root.Close()
+	}
 	results := make([]string, 0, max)
-	if err := searchManagedNode(ctx, path, root, ".", matcher, max, &results); err != nil {
+	if err := searchManagedNode(ctx, path, root, attachments, ".", matcher, max, &results); err != nil {
 		return nil, err
 	}
 	return results, nil
@@ -369,7 +389,7 @@ func openManagedNode(path managedFilePath) (*os.File, error) {
 	return file, nil
 }
 
-func searchManagedNode(ctx context.Context, path managedFilePath, node *os.File, relative string, matcher *regexp.Regexp, max int, results *[]string) error {
+func searchManagedNode(ctx context.Context, path managedFilePath, node, attachments *os.File, relative string, matcher *regexp.Regexp, max int, results *[]string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -384,25 +404,45 @@ func searchManagedNode(ctx context.Context, path managedFilePath, node *os.File,
 			return nil
 		}
 	}
-	info, err := node.Stat()
-	if err != nil {
-		return err
-	}
-	if info.Mode().IsRegular() {
-		if info.Size() > 2<<20 {
+	var names []string
+	if node != nil {
+		info, err := node.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			if info.Size() > 2<<20 {
+				return nil
+			}
+			return scanManagedFile(node, relative, matcher, max, results)
+		}
+		if !info.IsDir() {
 			return nil
 		}
-		return scanManagedFile(node, relative, matcher, max, results)
+		// Enumerate from the pinned fd, not from the display-only node.Name().
+		names, err = node.Readdirnames(-1)
+		if err != nil {
+			return err
+		}
 	}
-	if !info.IsDir() {
-		return nil
+	// The mount is visible even when its workspace mountpoint is absent.
+	// Inject only the next component on the route to the exact overlay.
+	overlayBelow := path.attachmentPath
+	if relative != "." {
+		overlayBelow, _ = relativeBelow(relative, path.attachmentPath)
 	}
-	// Readdir asks older Go releases to lstat each entry through node.Name().
-	// These Files intentionally carry only logical display names, so enumerate
-	// names from the pinned directory fd and inspect each entry with openat.
-	names, err := node.Readdirnames(-1)
-	if err != nil {
-		return err
+	if attachments != nil && overlayBelow != "" && overlayBelow != "." {
+		name, _, _ := strings.Cut(overlayBelow, string(filepath.Separator))
+		found := false
+		for _, existing := range names {
+			if existing == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	for _, name := range names {
@@ -419,7 +459,27 @@ func searchManagedNode(ctx context.Context, path managedFilePath, node *os.File,
 		if !path.allowsSearchDescendant(childRelative) {
 			continue
 		}
+		if attachments != nil && childRelative == path.attachmentPath {
+			if err := searchManagedNode(ctx, path, attachments, nil, childRelative, matcher, max, results); err != nil {
+				return err
+			}
+			continue
+		}
+		if node == nil {
+			if err := searchManagedNode(ctx, path, nil, attachments, childRelative, matcher, max, results); err != nil {
+				return err
+			}
+			continue
+		}
 		fd, openErr := syscall.Openat(int(node.Fd()), name, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if attachments != nil && errors.Is(openErr, syscall.ENOENT) {
+			if _, ancestor := relativeBelow(childRelative, path.attachmentPath); ancestor {
+				if err := searchManagedNode(ctx, path, nil, attachments, childRelative, matcher, max, results); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		if errors.Is(openErr, syscall.ELOOP) || errors.Is(openErr, syscall.ENOENT) {
 			// Match symlink names for parity with filepath.WalkDir, but never
 			// follow their content or a concurrently replaced entry.
@@ -436,7 +496,7 @@ func searchManagedNode(ctx context.Context, path managedFilePath, node *os.File,
 			_ = syscall.Close(fd)
 			return errors.New("open managed search entry failed")
 		}
-		err = searchManagedNode(ctx, path, child, childRelative, matcher, max, results)
+		err := searchManagedNode(ctx, path, child, attachments, childRelative, matcher, max, results)
 		_ = child.Close()
 		if err != nil {
 			return err

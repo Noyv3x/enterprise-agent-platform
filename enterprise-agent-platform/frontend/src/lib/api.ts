@@ -246,6 +246,14 @@ export function apiUpload<T = unknown>(
     const cancel = () => finish(() => reject(new ApiRequestCancelledError()));
     const abortFromCaller = () => xhr.abort();
 
+    if (callerSignal?.aborted) {
+      // A request that was never sent dispatches no `abort` event, so a signal
+      // that is already cancelled must settle here through the same owner as
+      // every other exit. Nothing is opened or sent.
+      cancel();
+      return;
+    }
+
     xhr.open(method, path, true);
     xhr.withCredentials = true;
     // 0 is the XMLHttpRequest contract for no fixed timeout.
@@ -292,8 +300,7 @@ export function apiUpload<T = unknown>(
     callerSignal?.addEventListener("abort", abortFromCaller, { once: true });
     activeUploads.add(xhr);
     try {
-      if (callerSignal?.aborted) xhr.abort();
-      else xhr.send(body);
+      xhr.send(body);
     } catch (error) {
       // XMLHttpRequest.send() may throw synchronously (for example when the
       // browser rejects the body or request state). Route that exit through the

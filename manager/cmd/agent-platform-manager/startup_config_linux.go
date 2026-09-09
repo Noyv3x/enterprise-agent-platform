@@ -115,7 +115,7 @@ func openStartupConfigNoFollow(path string) (*os.File, int, string, unix.Stat_t,
 		parentFD = next
 	}
 	leaf := components[len(components)-1]
-	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(parentFD, leaf, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		_ = unix.Close(parentFD)
 		return nil, -1, "", unix.Stat_t{}, err

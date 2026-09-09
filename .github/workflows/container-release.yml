@@ -39,6 +39,8 @@ jobs:
       image_matrix: ${{ steps.release.outputs.image_matrix }}
       image_namespace: ${{ steps.release.outputs.image_namespace }}
       firecrawl_revision: ${{ steps.release.outputs.firecrawl_revision }}
+      quality_run_id: ${{ steps.quality.outputs.run_id }}
+      quality_run_attempt: ${{ steps.quality.outputs.run_attempt }}
     steps:
       - name: Check out qualified source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -85,6 +87,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Revalidate the exact successful Quality run
+        id: quality
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -93,6 +96,7 @@ jobs:
           UPSTREAM_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
         run: |
           set -euo pipefail
+          run_json="$RUNNER_TEMP/quality-run.json"
           if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
             [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
             [[ "$UPSTREAM_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
@@ -102,7 +106,7 @@ jobs:
               --argjson run "$UPSTREAM_RUN_ID" --argjson attempt "$UPSTREAM_RUN_ATTEMPT" '
               .id == $run and .run_attempt == $attempt and
               .path == ".github/workflows/quality.yml" and
-              .event == "push" and .conclusion == "success" and
+              .event == "push" and .status == "completed" and .conclusion == "success" and
               .head_branch == "main" and .head_sha == $source and
               .head_repository.full_name == $repo
             ' "$run_json" >/dev/null
@@ -113,14 +117,18 @@ jobs:
                 [.[].workflow_runs[] | select(
                   .path == ".github/workflows/quality.yml" and
                   (.event == "push" or .event == "workflow_dispatch") and
-                  .conclusion == "success" and
+                  .status == "completed" and .conclusion == "success" and
                   .head_branch == "main" and .head_sha == $source and
                   .head_repository.full_name == $repo and
                   (.id | type == "number" and . > 0) and
                   (.run_attempt | type == "number" and . > 0)
-                )] | length >= 1
-              ' >/dev/null
+                )] | sort_by(.id, .run_attempt) | last // error("no successful Quality run")
+              ' > "$run_json"
           fi
+          {
+            echo "run_id=$(jq -er '.id' "$run_json")"
+            echo "run_attempt=$(jq -er '.run_attempt' "$run_json")"
+          } >> "$GITHUB_OUTPUT"
 
   upstream-contracts:
     name: Validate managed upstream sources
@@ -140,12 +148,17 @@ jobs:
           set -euo pipefail
           root="$(mktemp -d)"
           trap 'rm -rf "$root"' EXIT
+          repository_url="$(jq -er '.sources.firecrawl.repository_url' docs/contracts/upstream-sources.json)"
+          revision="$(jq -er '.sources.firecrawl.revision' docs/contracts/upstream-sources.json)"
           git -C "$root" init firecrawl
-          git -C "$root/firecrawl" remote add origin https://github.com/firecrawl/firecrawl.git
-          git -C "$root/firecrawl" fetch --depth=1 origin '${{ needs.prepare.outputs.firecrawl_revision }}'
+          git -C "$root/firecrawl" remote add origin "$repository_url"
+          git -C "$root/firecrawl" fetch --depth=1 origin "$revision"
           git -C "$root/firecrawl" checkout --detach FETCH_HEAD
-          test "$(git -C "$root/firecrawl" rev-parse HEAD)" = '${{ needs.prepare.outputs.firecrawl_revision }}'
-          test -f "$root/firecrawl/docker-compose.yaml"
+          test "$(git -C "$root/firecrawl" rev-parse HEAD)" = "$revision"
+          jq -er '.sources.firecrawl.required_paths[]' docs/contracts/upstream-sources.json |
+            while IFS= read -r required_path; do
+              test -e "$root/firecrawl/$required_path"
+            done
           docker compose -f "$root/firecrawl/docker-compose.yaml" config --services | sort > "$root/actual-services"
           jq -r '.sources.firecrawl.compose_services[]' docs/contracts/upstream-sources.json |
             while IFS= read -r service; do
@@ -262,6 +275,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
     steps:
       - name: Check out release capacity contract
@@ -273,6 +287,9 @@ jobs:
       - name: Download immutable image identities
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           pattern: image-*
           path: image-metadata
           merge-multiple: true
@@ -330,6 +347,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
+      actions: read
       contents: read
       packages: read
     steps:
@@ -342,6 +360,9 @@ jobs:
       - name: Download managed image catalog
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           name: managed-images
           path: artifacts
 
@@ -652,6 +673,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
+      actions: read
       contents: read
       packages: read
     steps:
@@ -664,6 +686,9 @@ jobs:
       - name: Download managed image catalog
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           name: managed-images
           path: artifacts
 
@@ -1239,12 +1264,18 @@ jobs:
       - name: Download managed image catalog
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           name: managed-images
           path: artifacts
 
       - name: Download Manager binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
           pattern: manager-*
           path: artifacts
           merge-multiple: true
@@ -1338,8 +1369,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
-          UPSTREAM_RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
-          UPSTREAM_RUN_ATTEMPT: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.run_attempt || '' }}
+          UPSTREAM_RUN_ID: ${{ needs.prepare.outputs.quality_run_id }}
+          UPSTREAM_RUN_ATTEMPT: ${{ needs.prepare.outputs.quality_run_attempt }}
         run: |
           set -euo pipefail
           stage="$RUNNER_TEMP/release"
@@ -1358,33 +1389,35 @@ jobs:
 
           revalidate_quality() {
             local result="$RUNNER_TEMP/quality-run.json"
-            if [[ "$GITHUB_EVENT_NAME" == workflow_run ]]; then
-              [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
-              [[ "$UPSTREAM_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
-              gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}" > "$result"
+            [[ "$UPSTREAM_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$UPSTREAM_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${UPSTREAM_RUN_ID}" > "$result"
+            jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
+              --arg event "$GITHUB_EVENT_NAME" \
+              --argjson run "$UPSTREAM_RUN_ID" --argjson attempt "$UPSTREAM_RUN_ATTEMPT" '
+              .id == $run and .run_attempt == $attempt and
+              .path == ".github/workflows/quality.yml" and
+              (.event == "push" or ($event == "workflow_dispatch" and .event == "workflow_dispatch")) and
+              .status == "completed" and .conclusion == "success" and
+              .head_branch == "main" and .head_sha == $source and
+              .head_repository.full_name == $repo
+            ' "$result" >/dev/null
+          }
+
+          revalidate_container_run() {
+            [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" |
               jq -e --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" \
-                --argjson run "$UPSTREAM_RUN_ID" --argjson attempt "$UPSTREAM_RUN_ATTEMPT" '
+                --arg sha "$GITHUB_SHA" --arg event "$GITHUB_EVENT_NAME" \
+                --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" '
                 .id == $run and .run_attempt == $attempt and
-                .path == ".github/workflows/quality.yml" and
-                .event == "push" and .conclusion == "success" and
-                .head_branch == "main" and .head_sha == $source and
-                .head_repository.full_name == $repo
-              ' "$result" >/dev/null
-            else
-              gh api --paginate \
-                "/repos/${GITHUB_REPOSITORY}/actions/workflows/quality.yml/runs?head_sha=${SOURCE_COMMIT}&status=completed&per_page=100" |
-                jq -se --arg repo "$GITHUB_REPOSITORY" --arg source "$SOURCE_COMMIT" '
-                  [.[].workflow_runs[] | select(
-                    .path == ".github/workflows/quality.yml" and
-                    (.event == "push" or .event == "workflow_dispatch") and
-                    .conclusion == "success" and
-                    .head_branch == "main" and .head_sha == $source and
-                    .head_repository.full_name == $repo and
-                    (.id | type == "number" and . > 0) and
-                    (.run_attempt | type == "number" and . > 0)
-                  )] | length >= 1
-                ' >/dev/null
-            fi
+                .path == ".github/workflows/container-release.yml" and
+                .event == $event and .head_branch == "main" and .head_sha == $sha and
+                ($event == "workflow_run" or ($event == "workflow_dispatch" and .head_sha == $source)) and
+                .head_repository.full_name == $repo and
+                .status == "in_progress" and .conclusion == null
+              ' >/dev/null
           }
 
           current_latest() {
@@ -1503,6 +1536,7 @@ jobs:
           }
 
           revalidate_quality
+          revalidate_container_run
           current="$(current_latest)"
           verify_forward "$current"
           scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"
@@ -1547,6 +1581,15 @@ jobs:
           current="$(current_latest)"
           verify_forward "$current"
           verify_tag
+          inspect_release
+          verify_asset_set "$release_api" 1
+          jq -cS '{
+            id, tag_name, target_commitish, prerelease,
+            assets: ([.assets[] | {id, name, digest, size, state}] | sort_by(.name))
+          }' "$release_api" > "$RUNNER_TEMP/release-identity-prepublish.json"
+          cmp "$RUNNER_TEMP/release-identity-before.json" "$RUNNER_TEMP/release-identity-prepublish.json"
+          revalidate_quality
+          revalidate_container_run
           gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
           inspect_release

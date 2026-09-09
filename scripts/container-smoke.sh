@@ -27,35 +27,6 @@ for path in \
 done
 
 bash -n install.sh
-for expected in \
-  'Install the Agent Platform from the current container release channel.' \
-  'Description=Agent Platform Manager' \
-  'This installer supports fresh container installations only.' \
-  'docker compose version' \
-  'read -r answer </dev/tty' \
-  'asset="agent-platform-manager-linux-${architecture}"' \
-  'mapfile -t account_records < <(getent passwd "$account_uid")' \
-  'bin_dir="$account_home/.local/bin"' \
-  'config_path="$account_home/.config/agent-platform/manager.toml"' \
-  'unit_dir="$account_home/.config/systemd/user"' \
-  'data_root="$account_home/.local/share/agent-platform"' \
-  'stable_manager="$bin_dir/agent-platform-manager"' \
-  'unit_name="agent-platform-manager.service"' \
-  'socket_path="$runtime_root/agent-platform-manager/manager.sock"' \
-  'systemctl --user enable --now "$unit_name"' \
-  '"$stable_manager" preflight --config "$config_path"' \
-  'if ((status != 0 && manager_activated == 0 && installation_owned == 1)); then' \
-  'install_lock="$runtime_root/agent-platform-install.lock"' \
-  'flock -n "$install_lock_fd"' \
-  'rm -rf --one-file-system -- "$data_root/manager"' \
-  '"$stable_manager" install --config "$config_path" --release-manifest-url "$manifest_url"'; do
-  grep -Fq "$expected" install.sh || fail "fresh container installer contract is missing: $expected"
-done
-for ambient_install_root in HOME XDG_BIN_HOME XDG_CONFIG_HOME XDG_DATA_HOME; do
-  if grep -Eq "(^|[^A-Z0-9_])${ambient_install_root}([^A-Z0-9_]|$)" install.sh; then
-    fail "fresh installer derives a persistent path from ambient $ambient_install_root"
-  fi
-done
 grep -Fq 'bash -s -- --yes' README.md \
   || fail "README fresh-install command does not pass explicit non-interactive consent"
 grep -Fq -- '--title "Agent Platform ${SOURCE_COMMIT:0:12}"' .github/workflows/container-release.yml \
@@ -156,6 +127,42 @@ PY
 installer_test="$(mktemp -d)"
 installer_stubs="$installer_test/bin"
 mkdir -p "$installer_stubs"
+for account_case in schema1 extra extra-image wrong-basename other-arch \
+  corrupt-bootstrap corrupt-target unsafe-runtime happy concurrent failure activated; do
+  mkdir -m 0700 "$installer_test/${account_case}-account-home"
+done
+installer_previous_tmpdir="${TMPDIR-}"
+installer_had_tmpdir="${TMPDIR+x}"
+export TMPDIR="$installer_test/noexec-tmp"
+mkdir -m 0700 "$TMPDIR"
+# Only the side-effecting target is fake. Manifest inspection executes the
+# actual Manager downloaded from the fixed bootstrap source by the curl stub.
+go -C manager build -o "$installer_test/bootstrap-manager" ./cmd/agent-platform-manager
+for command in bash sha256sum install uname awk stat realpath id mktemp find grep rm rmdir flock mv mkdir dirname cat cp sleep; do
+  ln -s "$(command -v "$command")" "$installer_stubs/$command"
+done
+# Model execve EACCES without mounting anything or requiring root: executable
+# mode cannot stick on files in the simulated noexec temporary filesystem.
+ln -s "$(command -v chmod)" "$installer_test/real-chmod"
+cat > "$installer_stubs/chmod" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+"${FAKE_MANAGER%/*}/real-chmod" "$@"
+for path in "$@"; do
+  if [[ "$path" == "$TMPDIR/"* && -f "$path" ]]; then
+    "${FAKE_MANAGER%/*}/real-chmod" a-x "$path"
+  fi
+done
+EOF
+chmod 0755 "$installer_stubs/chmod"
+cp "$installer_test/bootstrap-manager" "$TMPDIR/exec-probe"
+FAKE_MANAGER="$installer_test/fake-manager" "$installer_stubs/chmod" 0700 "$TMPDIR/exec-probe"
+set +e
+"$TMPDIR/exec-probe" version >"$installer_test/noexec-probe.log" 2>&1
+noexec_probe_status=$?
+set -e
+[[ "$noexec_probe_status" -eq 126 ]] || fail "simulated noexec filesystem allowed execution"
+rm "$TMPDIR/exec-probe"
 cat > "$installer_test/fake-manager" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -253,6 +260,13 @@ for arch in ("amd64", "arm64"):
 (manifest_path.parent / "wrong-basename-release.json").write_text(
     json.dumps(wrong_basename) + "\n", encoding="utf-8"
 )
+
+other_arch = "arm64" if __import__("os").uname().machine in ("x86_64", "amd64") else "amd64"
+bad_other = json.loads(json.dumps(manifest))
+bad_other["manager"]["artifacts"][other_arch]["sha256"] = "invalid"
+(manifest_path.parent / "other-arch-release.json").write_text(
+    json.dumps(bad_other) + "\n", encoding="utf-8"
+)
 PY
 cat > "$installer_stubs/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -274,8 +288,20 @@ done
 [[ -n "$output" && -n "$url" ]]
 if [[ "$url" == */release.json ]]; then
   cp "$FAKE_MANIFEST" "$output"
+elif [[ "$url" == https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/agent-platform-manager-linux-*.sha256 ]]; then
+  digest="$(sha256sum "${FAKE_MANAGER%/*}/bootstrap-manager")"
+  asset="${url##*/}"
+  printf '%s  %s\n' "${digest%% *}" "${asset%.sha256}" > "$output"
+elif [[ "$url" == https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/agent-platform-manager-linux-* ]]; then
+  cp "${FAKE_MANAGER%/*}/bootstrap-manager" "$output"
+  if [[ "${FAKE_CORRUPT:-}" == bootstrap ]]; then
+    printf '\ncorrupt\n' >> "$output"
+  fi
 else
   cp "$FAKE_MANAGER" "$output"
+  if [[ "${FAKE_CORRUPT:-}" == target ]]; then
+    printf '\ncorrupt\n' >> "$output"
+  fi
 fi
 EOF
 cat > "$installer_stubs/docker" <<'EOF'
@@ -305,13 +331,14 @@ chmod 0755 \
   "$installer_stubs/getent"
 
 assert_manifest_rejected_before_paths() {
-  local case_name="$1" manifest="$2" expected_message="${3:-}"
+  local case_name="$1" manifest="$2"
   local output="$installer_test/${case_name}-install.log" status path
   set +e
   cat install.sh | env \
     PATH="$installer_stubs:$PATH" \
     FAKE_MANAGER="$installer_test/fake-manager" \
     FAKE_MANIFEST="$manifest" \
+    FAKE_CORRUPT="${3:-}" \
     FAKE_ACCOUNT_HOME="$installer_test/${case_name}-account-home" \
     HOME="$installer_test/${case_name}-ambient-home" \
     XDG_DATA_HOME="$installer_test/${case_name}-data" \
@@ -322,23 +349,28 @@ assert_manifest_rejected_before_paths() {
     >"$output" 2>&1
   status=$?
   set -e
-  [[ "$status" -ne 0 ]] || fail "$case_name manifest unexpectedly allowed fresh install"
-  if [[ -n "$expected_message" ]]; then
-    grep -Fq "$expected_message" "$output" \
-      || fail "$case_name rejection did not report the expected boundary"
-  fi
-  for path in account-home ambient-home data config bin runtime; do
+  local expected_status=1
+  [[ -z "${3:-}" ]] || expected_status=65
+  [[ "$status" -eq "$expected_status" ]] || fail "$case_name validation did not reject the release: $status"
+  [[ -z "$(find "$installer_test/${case_name}-account-home" -mindepth 1 -print -quit)" ]] \
+    || fail "$case_name rejection left temporary or formal installation files in account home"
+  for path in ambient-home data config bin runtime; do
     [[ ! -e "$installer_test/${case_name}-${path}" ]] \
       || fail "$case_name rejection created target installation path: $path"
   done
 }
 
-assert_manifest_rejected_before_paths \
-  schema1 "$installer_test/schema1-release.json" \
-  'fresh installation requires manifest schema/protocol 2'
+assert_manifest_rejected_before_paths schema1 "$installer_test/schema1-release.json"
 assert_manifest_rejected_before_paths extra "$installer_test/extra-release.json"
 assert_manifest_rejected_before_paths extra-image "$installer_test/extra-image-release.json"
 assert_manifest_rejected_before_paths wrong-basename "$installer_test/wrong-basename-release.json"
+assert_manifest_rejected_before_paths other-arch "$installer_test/other-arch-release.json"
+assert_manifest_rejected_before_paths corrupt-bootstrap "$installer_test/release.json" bootstrap
+assert_manifest_rejected_before_paths corrupt-target "$installer_test/release.json" target
+grep -Fq 'bootstrap Manager checksum mismatch' "$installer_test/corrupt-bootstrap-install.log" \
+  || fail "corrupt bootstrap was not rejected at the checksum boundary"
+grep -Fq 'Manager checksum mismatch' "$installer_test/corrupt-target-install.log" \
+  || fail "corrupt target was not rejected at the checksum boundary"
 
 unsafe_runtime="$installer_test/unsafe-runtime"
 unsafe_runtime_home="$installer_test/unsafe-runtime-account-home"
@@ -364,8 +396,8 @@ set -e
   || fail "fresh installer did not reject a non-private runtime directory"
 grep -Fq 'refusing a non-private runtime directory' "$unsafe_runtime_output" \
   || fail "unsafe runtime rejection did not report the private-directory boundary"
-[[ ! -e "$unsafe_runtime_home" ]] \
-  || fail "unsafe runtime rejection created the authoritative account installation root"
+[[ -z "$(find "$unsafe_runtime_home" -mindepth 1 -print -quit)" ]] \
+  || fail "unsafe runtime rejection retained temporary or formal installation files"
 for ignored_root in \
   "$installer_test/unsafe-runtime-ambient-home" \
   "$installer_test/unsafe-runtime-data" \
@@ -378,7 +410,7 @@ done
 happy_home="$installer_test/happy-account-home"
 happy_data="$happy_home/.local/share/agent-platform"
 cat install.sh | env \
-  PATH="$installer_stubs:$PATH" \
+  PATH="$installer_stubs" \
   FAKE_MANAGER="$installer_test/fake-manager" \
   FAKE_MANIFEST="$installer_test/release.json" \
   FAKE_DATA_ROOT="$happy_data" \
@@ -389,7 +421,7 @@ cat install.sh | env \
   XDG_CONFIG_HOME="$installer_test/happy-config" \
   XDG_BIN_HOME="$installer_test/happy-bin" \
   XDG_RUNTIME_DIR="$installer_test/happy-runtime" \
-  bash -s -- --yes --manifest-url https://example.invalid/release.json
+  bash -s -- --yes
 [[ -x "$happy_home/.local/bin/agent-platform-manager" ]] \
   || fail "schema-2 fresh install did not activate the target Manager path"
 [[ -f "$happy_home/.config/agent-platform/manager.toml" ]] \
@@ -563,6 +595,17 @@ grep -Fq 'install --config' "$activated_output" \
   || fail "post-activation failure deleted Manager config"
 [[ -f "$activated_home/.config/systemd/user/agent-platform-manager.service" ]] \
   || fail "post-activation failure deleted Manager unit"
+[[ -z "$(find "$TMPDIR" -mindepth 1 -print -quit)" ]] \
+  || fail "installer retained files in the default temporary filesystem"
+for account_home in "$installer_test/"*-account-home; do
+  [[ -z "$(find "$account_home" -name '.agent-platform-install.*' -print -quit)" ]] \
+    || fail "installer retained private bootstrap staging after success or failure"
+done
+if [[ -n "$installer_had_tmpdir" ]]; then
+  export TMPDIR="$installer_previous_tmpdir"
+else
+  unset TMPDIR
+fi
 rm -rf --one-file-system -- "$installer_test"
 
 for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do

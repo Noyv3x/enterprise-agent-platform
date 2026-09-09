@@ -62,6 +62,6 @@ CI 在生成 release 前验证当前文档树与代码共改关系。部署机�
 
 容器定义的静态门禁还必须验证：只随发布 generation 变化的 revision/version 参数只在最后一个文件系统构建指令之后被 label 消费；Camoufox 不得把锁定浏览器、依赖和小型运行源文件作为一个整体跨阶段复制。该检查不改变最终镜像的发布标签、路径、所有权或运行入口。
 
-`documentation-governance` 域必须始终同时覆盖 `scripts/**`、本流程文档和 `test_docs_sync.py`。共享门禁脚本只能依赖对应 CI runner 明确提供的基础命令；可选的本地搜索工具不得成为流水线正确性前提。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。仓库级回归测试直接锁定这些 owner 关系，避免调整 manifest 时使迁移或发布验收失去规范文档。
+`scripts/**` 同时属于 `documentation-governance` 与 `repository-development`；其中发布、容器验收和 release 资产脚本还属于 `deployment`，容器发布 workflow 也同时归入部署域。根 `install.sh` 纳入生产覆盖并归属 `deployment`，不能因位于仓库根绕过同步门。共享门禁脚本只能依赖对应 CI runner 明确提供的基础命令；可选的本地搜索工具不得成为流水线正确性前提。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。回归应通过真实 `check-change` 对代码独改的拒绝来证明多域同步，不以锁死旧 owner 列表或文档措辞代替行为证据。
 
 Firecrawl 不进入产品 Git tree；其 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域。用户自行安装的 Skill/MCP 包只属于对应 Agent workspace，不进入该上游源码契约。研究用第三方 checkout、GitHub 凭据和下载缓存不属于产品源码、运行数据或发布输入。

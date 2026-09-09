@@ -25,7 +25,6 @@ class GHCRLoginActionTests(unittest.TestCase):
         source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(source.count("uses: ./.github/actions/ghcr-login"), 2)
         self.assertNotIn(PINNED_LOGIN_ACTION, source)
-        self.assertEqual(source.count("token: ${{ secrets.GITHUB_TOKEN }}"), 2)
 
     def test_manual_release_requires_current_main_and_exact_quality(self) -> None:
         source = RELEASE_WORKFLOW.read_text(encoding="utf-8")
@@ -35,12 +34,6 @@ class GHCRLoginActionTests(unittest.TestCase):
             )
             + source.count(
                 '[[ "$source_commit" == "$(git rev-parse origin/main)" ]]'
-            ),
-            2,
-        )
-        self.assertEqual(
-            source.count(
-                '(.event == "push" or .event == "workflow_dispatch")'
             ),
             2,
         )

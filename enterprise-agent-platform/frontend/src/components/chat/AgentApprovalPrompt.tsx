@@ -43,7 +43,7 @@ export function AgentApprovalPrompt({
     if (submitting) return;
     setSubmitting(choice);
     try {
-      await respondAgentApproval(store, mode, scopeId, choice);
+      await respondAgentApproval(store, mode, scopeId, approval, choice);
     } finally {
       setSubmitting(null);
     }

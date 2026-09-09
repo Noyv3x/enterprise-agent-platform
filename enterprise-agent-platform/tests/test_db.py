@@ -9,6 +9,37 @@ from enterprise_agent_platform.db import Database
 
 
 class DatabaseMemoryFtsContractTests(unittest.TestCase):
+    def test_failed_insert_commit_cannot_escape_into_the_next_write(self):
+        class FailFirstCommit:
+            def __init__(self, connection):
+                self.connection = connection
+                self.failed = False
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            def commit(self):
+                if not self.failed:
+                    self.failed = True
+                    raise sqlite3.OperationalError("commit failed")
+                return self.connection.commit()
+
+        with tempfile.TemporaryDirectory() as td:
+            db = Database(Path(td) / "platform.db")
+            try:
+                db._local.holder.conn = FailFirstCommit(db._local.holder.conn)
+                with self.assertRaises(sqlite3.OperationalError):
+                    db.insert(
+                        "INSERT INTO settings(key,value,updated_at) VALUES('failed','one',1)"
+                    )
+                db.execute(
+                    "INSERT INTO settings(key,value,updated_at) VALUES('next','two',1)"
+                )
+                self.assertIsNone(db.query_one("SELECT * FROM settings WHERE key='failed'"))
+                self.assertEqual(db.scalar("SELECT value FROM settings WHERE key='next'"), "two")
+            finally:
+                db.close()
+
     def test_startup_repairs_legacy_tags_projection_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.db"

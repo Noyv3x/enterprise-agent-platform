@@ -1782,7 +1782,7 @@ func ensureSecret(path string) (string, error) {
 // filesystem object. Callers must not follow a token symlink or accept a token
 // owned by another host user merely because the containing path is private.
 func ReadOwnerSecret(path string) (string, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return "", fmt.Errorf("open private secret %s without following links: %w", path, err)
 	}

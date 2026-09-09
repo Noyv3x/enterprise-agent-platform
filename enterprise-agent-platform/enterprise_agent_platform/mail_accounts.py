@@ -155,18 +155,16 @@ class MailAccountStore:
         return row, password
 
     def create(self, owner_user_id: int, body: dict[str, Any]) -> dict[str, Any]:
-        if int(
-            self.db.scalar(
-                "SELECT count(*) FROM mail_accounts WHERE owner_user_id = ?",
-                (int(owner_user_id),),
-            )
-            or 0
-        ) >= MAX_MAIL_ACCOUNTS_PER_USER:
-            raise MailAccountError("mail account limit reached")
         values = self._validated_create(body)
         password = self._password(body.get("password"), required=True)
         ts = now_ts()
         with self.db.transaction(immediate=True) as conn:
+            count = conn.execute(
+                "SELECT count(*) FROM mail_accounts WHERE owner_user_id = ?",
+                (int(owner_user_id),),
+            ).fetchone()[0]
+            if count >= MAX_MAIL_ACCOUNTS_PER_USER:
+                raise MailAccountError("mail account limit reached")
             cursor = conn.execute(
                 """
                 INSERT INTO mail_accounts(

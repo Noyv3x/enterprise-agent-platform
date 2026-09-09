@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -22,6 +23,35 @@ from test_platform import make_config
 
 
 class AgentScopeSessionTests(unittest.TestCase):
+    def test_marker_initialization_retry_does_not_skip_failed_parent_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            db = Database(config.db_path)
+            try:
+                manager = AgentScopeManager(config, db)
+                real_sync = os.fsync
+                workspace = config.workspace_dir / "user-1"
+
+                def fail_marker_parent(fd):
+                    if workspace.exists():
+                        expected = workspace.stat()
+                        actual = os.fstat(fd)
+                        if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
+                            raise OSError(errno.EIO, "directory sync failed")
+                    real_sync(fd)
+
+                with mock.patch.object(secure_fs.os, "fsync", side_effect=fail_marker_parent):
+                    for _ in range(2):
+                        with self.assertRaises(secure_fs.PrivatePublicationCommittedError):
+                            manager.ensure_private_scope(1)
+                scope = manager.ensure_private_scope(1)
+                self.assertEqual(scope.scope_key, "private:1")
+                with mock.patch.object(secure_fs.os, "fsync", side_effect=AssertionError("ordinary read writes")):
+                    self.assertEqual(manager.ensure_private_scope(1), scope)
+                    AgentScopeManager(config, db, commit_schema_upgrade=False)
+            finally:
+                db.close()
+
     def test_target_database_and_workspace_use_only_target_markers(self):
         with tempfile.TemporaryDirectory() as td:
             config = replace(

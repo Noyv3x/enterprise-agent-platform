@@ -131,7 +131,7 @@ export function ComputerPip() {
     );
   } else if (surface.mode === "file") {
     content = surface.file?.path || surface.file?.workspace_path ? (
-      <FileComputerView scope={preview.scope} file={surface.file} compact />
+      <FileComputerView scope={preview.scope} runId={surface.runId} file={surface.file} compact />
     ) : (
       <Skeleton className="computer-pip__skeleton" width="100%" height="100%" label={t("computer.loading")} />
     );

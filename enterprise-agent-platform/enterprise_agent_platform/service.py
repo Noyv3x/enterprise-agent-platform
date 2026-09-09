@@ -248,10 +248,12 @@ def _ensure_profile_camofox_runtime_sidecar(
     config: PlatformConfig,
     *,
     commit_schema_upgrade: bool,
+    fresh_initialization: bool,
 ) -> Path:
     return ensure_camofox_runtime_sidecar(
         config.data_dir,
         commit_schema_upgrade=commit_schema_upgrade,
+        fresh_initialization=fresh_initialization,
         technical_profile_value=config.technical_profile,
     )
 
@@ -806,6 +808,17 @@ PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
 }
 
 
+class _UserSnapshot(dict[str, Any]):
+    """Public user fields with a server-only authenticated credential revision."""
+
+    def __init__(self, fields: dict[str, Any], *, token_version: int) -> None:
+        super().__init__(fields)
+        self._token_version = token_version
+
+    def copy(self) -> _UserSnapshot:
+        return _UserSnapshot(self, token_version=self._token_version)
+
+
 class EnterpriseService:
     def __init__(
         self,
@@ -853,9 +866,11 @@ class EnterpriseService:
             self.config.technical_profile,
         )
         assert_existing_workspace_profile(self.config)
+        self._fresh_initialization = not os.path.lexists(self.config.db_path)
         _ensure_profile_camofox_runtime_sidecar(
             self.config,
             commit_schema_upgrade=False,
+            fresh_initialization=self._fresh_initialization,
         )
         ensure_private_directory(self.config.data_dir)
         self._instance_lock_fd: int | None = None
@@ -866,6 +881,7 @@ class EnterpriseService:
         self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
             self.config,
             commit_schema_upgrade=startup_schema_writes_committed,
+            fresh_initialization=self._fresh_initialization,
         )
         self.jobs = DurableJobStore(self.db)
         self.learning_reviews = LearningReviewStore(self.db)
@@ -1444,7 +1460,9 @@ class EnterpriseService:
         for row in self.db.query("SELECT scope_key FROM agent_scopes ORDER BY scope_key"):
             self._cleanup_agent_scope(str(row["scope_key"]))
 
-    def _task_scope_is_current(self, task: dict[str, Any]) -> bool:
+    def _task_scope_is_current(
+        self, task: dict[str, Any], *, allow_queued: bool = False
+    ) -> bool:
         key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
         with self._conversation_lock:
             lifecycle_current = (
@@ -1457,7 +1475,9 @@ class EnterpriseService:
             if not job_id:
                 return True
             job = self.jobs.get(job_id)
-            return job is not None and job.status == "running"
+            return job is not None and (
+                job.status == "running" or (allow_queued and job.status == "queued")
+            )
 
     def _runtime_submission_barrier(
         self,
@@ -1698,13 +1718,23 @@ class EnterpriseService:
             pass
 
     def _ensure_agent_task_can_run(self, task: dict[str, Any]) -> None:
-        if not self._task_scope_is_current(task):
+        self._ensure_agent_task_can_publish(task)
+
+    def _ensure_agent_task_can_publish(
+        self, task: dict[str, Any], *, before_submission: bool = False
+    ) -> None:
+        # A failed FIFO claim still owns a queued request's error feedback, but
+        # only actual running jobs may cross the Runtime execution boundary.
+        if not self._task_scope_is_current(task, allow_queued=before_submission):
             with self._conversation_lock:
                 shutting_down = self._closed
             raise _AgentTaskCancelled(
                 "service is shutting down" if shutting_down else "Agent conversation was reset",
                 needs_review=shutting_down,
             )
+        # Accepted jobs carry durable owner identity, not a browser session.
+        # Revalidate account/scope permissions independently of the request's
+        # private credential revision, which is deliberately never serialized.
         actor = task.get("actor") or {}
         user_id = actor.get("id")
         current = self.get_user(int(user_id)) if user_id is not None else None
@@ -2553,6 +2583,7 @@ class EnterpriseService:
         )
         primary_color = normalize_brand_color(body.get("primary_color"))
         with self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             current = self._branding_record_from_connection(conn)
             if int(current["revision"]) != expected_revision:
                 raise ServiceError(409, "branding configuration revision conflict")
@@ -2589,6 +2620,7 @@ class EnterpriseService:
         )
         encoded_logo = base64.b64encode(logo_bytes).decode("ascii")
         with self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             current = self._branding_record_from_connection(conn)
             if int(current["revision"]) != expected_revision:
                 raise ServiceError(409, "branding configuration revision conflict")
@@ -2634,6 +2666,7 @@ class EnterpriseService:
             body.get("expected_revision")
         )
         with self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             current = self._branding_record_from_connection(conn)
             if int(current["revision"]) != expected_revision:
                 raise ServiceError(409, "branding configuration revision conflict")
@@ -2724,30 +2757,29 @@ class EnterpriseService:
 
     def update_platform_security_config(self, actor: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        restart_required = False
-        session_secret_restart_required = False
+        updates: dict[str, str] = {}
         if "public_base_url" in body:
-            public_base_url = self._validate_public_base_url(str(body.get("public_base_url") or ""))
-            self.set_setting(PLATFORM_SETTING_PUBLIC_BASE_URL, public_base_url)
+            updates[PLATFORM_SETTING_PUBLIC_BASE_URL] = self._validate_public_base_url(str(body.get("public_base_url") or ""))
         if "trusted_proxy" in body:
-            self.set_setting(PLATFORM_SETTING_TRUSTED_PROXY, "1" if parse_bool(body.get("trusted_proxy")) else "0")
+            updates[PLATFORM_SETTING_TRUSTED_PROXY] = "1" if parse_bool(body.get("trusted_proxy")) else "0"
         if "host" in body or "port" in body:
             raise ServiceError(400, "listen host and port are not Platform settings")
-        if "session_ttl_seconds" in body:
-            ttl = self._validate_session_ttl(body.get("session_ttl_seconds"))
-            self.set_setting(PLATFORM_SETTING_SESSION_TTL, str(ttl))
-            self.tokens = TokenSigner(self._session_secret, ttl)
+        ttl = self._validate_session_ttl(body["session_ttl_seconds"]) if "session_ttl_seconds" in body else None
+        if ttl is not None:
+            updates[PLATFORM_SETTING_SESSION_TTL] = str(ttl)
         session_secret = str(body.get("session_secret") or "").strip()
         if session_secret:
             if len(session_secret) < 32:
                 raise ServiceError(400, "session secret must be at least 32 characters")
-            self.set_setting(
-                SESSION_SECRET_SETTING,
-                session_secret,
-                secret=True,
-            )
-            session_secret_restart_required = True
-            restart_required = True
+            updates[SESSION_SECRET_SETTING] = session_secret
+        with self._auth_lock:
+            with self.db.transaction(immediate=True) as conn:
+                require_admin(self._fresh_active_actor(actor))
+                for key, value in updates.items():
+                    self._write_setting(conn, key, value, secret=key == SESSION_SECRET_SETTING)
+            if ttl is not None:
+                self.tokens = TokenSigner(self._session_secret, ttl)
+        session_secret_restart_required = restart_required = bool(session_secret)
         result = self.platform_security_config(actor)
         result["restart_required"] = restart_required
         result["session_secret_restart_required"] = session_secret_restart_required
@@ -2806,36 +2838,32 @@ class EnterpriseService:
         role = role_for_permission_group(group)
         if not password or (len(password) < MIN_PASSWORD_LENGTH and not _allow_weak_password):
             raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+        if len(password) > MAX_LOGIN_PASSWORD_CHARACTERS:
+            raise ServiceError(400, "password exceeds 1024 characters")
         display = display_name.strip() or username
         position = normalize_position(position)
         model_name = self._validate_account_model_name(model_name)
         thinking_depth = normalize_thinking_depth(thinking_depth)
         timezone_name = self._normalize_user_timezone(timezone_name)
         ts = now_ts()
-        try:
-            user_id = self.db.insert(
-                """
-                INSERT INTO users(
-                    username, display_name, password_hash, role, position,
-                    permission_group, model_name, thinking_depth, timezone, created_at
+        password_hash = hash_password(password)
+        with self.db.transaction(immediate=True) as conn:
+            if actor is not None:
+                require_admin(self._fresh_active_actor(actor))
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO users(
+                        username, display_name, password_hash, role, position,
+                        permission_group, model_name, thinking_depth, timezone, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (username, display, password_hash, role, position, group,
+                     model_name, thinking_depth, timezone_name, ts),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    username,
-                    display,
-                    hash_password(password),
-                    role,
-                    position,
-                    group,
-                    model_name,
-                    thinking_depth,
-                    timezone_name,
-                    ts,
-                ),
-            )
-        except Exception as exc:
-            raise ServiceError(409, f"user already exists: {username}") from exc
+                user_id = int(cursor.lastrowid)
+            except sqlite3.IntegrityError as exc:
+                raise ServiceError(409, f"user already exists: {username}") from exc
         return self.get_user(user_id) or {}
 
     def authenticate(self, username: str, password: str, *, client_id: str = "") -> tuple[str, dict[str, Any]]:
@@ -3261,18 +3289,24 @@ class EnterpriseService:
         new_password = str(body.get("new_password", body.get("password", "")) or "")
         if not current_password:
             raise ServiceError(400, "current password is required")
+        if max(len(current_password), len(new_password)) > MAX_LOGIN_PASSWORD_CHARACTERS:
+            raise ServiceError(400, "password exceeds 1024 characters")
         if not verify_password(current_password, str(current["password_hash"])):
             raise ServiceError(400, "current password is incorrect")
         if len(new_password) < MIN_PASSWORD_LENGTH:
             raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
 
-        self.db.execute(
-            "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
-            (hash_password(new_password), user_id),
-        )
-        updated = self.db.query_one("SELECT * FROM users WHERE id = ?", (user_id,))
-        if not updated:
-            raise ServiceError(404, "user not found")
+        password_hash = hash_password(new_password)
+        with self.db.transaction(immediate=True) as conn:
+            self._fresh_active_actor(actor)
+            changed = conn.execute(
+                "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
+                "WHERE id = ? AND password_hash = ? AND token_version = ? AND active = 1",
+                (password_hash, user_id, current["password_hash"], current["token_version"]),
+            )
+            if changed.rowcount != 1:
+                raise ServiceError(409, "credentials changed while updating password")
+            updated = dict(conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone())
         user = self.public_user(updated)
         token = self.tokens.issue(user_id, int(updated.get("token_version") or 1))
         return token, user
@@ -3290,12 +3324,15 @@ class EnterpriseService:
         exactly as if that user had just logged in.
         """
         require_admin(actor)
-        target = self.db.query_one("SELECT * FROM users WHERE id = ? AND active = 1", (int(user_id),))
-        if not target:
-            raise ServiceError(404, "user not found")
-        self.db.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), target["id"]))
-        user = self.public_user(target)
-        token = self.tokens.issue(int(target["id"]), int(target.get("token_version") or 1))
+        with self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
+            target = conn.execute("SELECT * FROM users WHERE id = ? AND active = 1", (int(user_id),)).fetchone()
+            if target is None:
+                raise ServiceError(404, "user not found")
+            conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_ts(), target["id"]))
+            target = dict(target)
+            user = self.public_user(target)
+            token = self.tokens.issue(int(target["id"]), int(target.get("token_version") or 1))
         return token, user
 
     def mention_targets(self, actor: dict[str, Any]) -> list[dict[str, Any]]:
@@ -3363,11 +3400,15 @@ class EnterpriseService:
         if password:
             if len(password) < MIN_PASSWORD_LENGTH:
                 raise ServiceError(400, f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+            if len(password) > MAX_LOGIN_PASSWORD_CHARACTERS:
+                raise ServiceError(400, "password exceeds 1024 characters")
             updates["password_hash"] = hash_password(password)
 
         updates = _changed_user_updates(current, updates)
         if not updates:
-            return self.get_user(user_id) or {}
+            with self.db.transaction(immediate=True):
+                require_admin(self._fresh_active_actor(actor))
+                return self.get_user(user_id) or {}
         # Invalidate existing sessions when credentials or privileges change, or
         # when the account is deactivated, so a captured token cannot outlive a
         # password reset or a permission downgrade.
@@ -3409,6 +3450,8 @@ class EnterpriseService:
                     # lifecycle lock also orders stale authenticated writes after
                     # this privilege/account change.
                     conn.execute("BEGIN IMMEDIATE")
+                    actor = self._fresh_active_actor(actor)
+                    require_admin(actor)
                     locked = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
                     if locked is None:
                         raise ServiceError(404, "user not found")
@@ -3460,7 +3503,7 @@ class EnterpriseService:
         thinking_depth = str(row.get("thinking_depth") or DEFAULT_THINKING_DEPTH).strip().lower()
         if thinking_depth not in THINKING_DEPTHS:
             thinking_depth = DEFAULT_THINKING_DEPTH
-        return {
+        return _UserSnapshot({
             "id": int(row["id"]),
             "username": row["username"],
             "display_name": row["display_name"],
@@ -3475,7 +3518,7 @@ class EnterpriseService:
             "active": bool(row["active"]),
             "created_at": row["created_at"],
             "last_login_at": row.get("last_login_at"),
-        }
+        }, token_version=int(row.get("token_version") or 1))
 
     def _guard_admin_update(
         self,
@@ -4721,31 +4764,30 @@ class EnterpriseService:
             if webhook_secret and not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", webhook_secret):
                 raise ServiceError(400, "Telegram webhook secret must be 8-128 URL-safe characters")
 
-        # Validation happens first; then revoke the old token-bound transport
-        # before changing any live setting. This closes the rotation window in
-        # which the old Bot API client could otherwise consume queued outbox
-        # rows after a new token had already been persisted.
-        self.unregister_telegram_delivery_handler()
-        if "enabled" in body:
-            self.set_setting(TELEGRAM_SETTING_ENABLED, "1" if enabled else "0")
-        if "polling" in body:
-            self.set_setting(TELEGRAM_SETTING_POLLING, "1" if polling else "0")
-        if "bot_username" in body:
-            self.set_setting(TELEGRAM_SETTING_BOT_USERNAME, username or "")
-        if token is not None:
-            if token:
-                self.set_setting(
-                    TELEGRAM_SECRET_BOT_TOKEN,
-                    token,
-                    secret=True,
-                )
-        if webhook_secret is not None:
-            if webhook_secret:
-                self.set_setting(
-                    TELEGRAM_SECRET_WEBHOOK_SECRET,
-                    webhook_secret,
-                    secret=True,
-                )
+        updates: dict[str, str] = {}
+        if enabled is not None:
+            updates[TELEGRAM_SETTING_ENABLED] = "1" if enabled else "0"
+        if polling is not None:
+            updates[TELEGRAM_SETTING_POLLING] = "1" if polling else "0"
+        if username is not None:
+            updates[TELEGRAM_SETTING_BOT_USERNAME] = username
+        if token:
+            updates[TELEGRAM_SECRET_BOT_TOKEN] = token
+        if webhook_secret:
+            updates[TELEGRAM_SECRET_WEBHOOK_SECRET] = webhook_secret
+        # Match sender admission's delivery-lock -> DB order. Transport waits
+        # remain outside both locks; no old handler can reserve after commit.
+        with self._telegram_delivery_lock:
+            with self.db.transaction(immediate=True) as conn:
+                require_admin(self._fresh_active_actor(actor))
+                for key, value in updates.items():
+                    self._write_setting(
+                        conn, key, value,
+                        secret=key in {TELEGRAM_SECRET_BOT_TOKEN, TELEGRAM_SECRET_WEBHOOK_SECRET},
+                    )
+            self._telegram_delivery_handler = None
+            self._telegram_delivery_generation += 1
+        self._telegram_delivery_wakeup.set()
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
 
@@ -4827,6 +4869,7 @@ class EnterpriseService:
             self._camofox_sidecar = _ensure_profile_camofox_runtime_sidecar(
                 self.config,
                 commit_schema_upgrade=True,
+                fresh_initialization=self._fresh_initialization,
             )
             self._auto_update_last_committed_id = clean_operation_id
             released = self.release_auto_update_reservation(
@@ -5323,36 +5366,36 @@ class EnterpriseService:
                     except Exception:
                         pass
 
-        generate_kwargs: dict[str, Any] = dict(
-            system_prompt=self._private_system_prompt(actor, scope),
-            user_message=review_input,
-            history=history,
-            session_id=session_id,
-            session_key=scope_key,
-            metadata={
-                "idempotency_key": f"agent-learning-review:{job.id}",
-                "source_message_id": source_message_id,
-                "review_job_id": job.id,
-                "review_mode": "memory_skill",
-                "trigger": "learning_review",
-                "unattended": True,
-                "actor": self._agent_actor_metadata(actor),
-                "available_skills": self._available_skill_index(scope_key),
-                "execution": execution,
-                "workspace": {
-                    "path": self._agent_runtime_workspace(scope),
-                    "scope": "private",
-                    "user_id": owner_user_id,
-                },
-            },
-            attachments=[],
-            model=generation["model"],
-            thinking_depth=generation["thinking_depth"],
-            reasoning_config=generation["reasoning_config"],
-        )
-        if supports_callback:
-            generate_kwargs["run_started_callback"] = run_started
         try:
+            generate_kwargs: dict[str, Any] = dict(
+                system_prompt=self._private_system_prompt(actor, scope),
+                user_message=review_input,
+                history=history,
+                session_id=session_id,
+                session_key=scope_key,
+                metadata={
+                    "idempotency_key": f"agent-learning-review:{job.id}",
+                    "source_message_id": source_message_id,
+                    "review_job_id": job.id,
+                    "review_mode": "memory_skill",
+                    "trigger": "learning_review",
+                    "unattended": True,
+                    "actor": self._agent_actor_metadata(actor),
+                    "available_skills": self._available_skill_index(scope_key),
+                    "execution": execution,
+                    "workspace": {
+                        "path": self._agent_runtime_workspace(scope),
+                        "scope": "private",
+                        "user_id": owner_user_id,
+                    },
+                },
+                attachments=[],
+                model=generation["model"],
+                thinking_depth=generation["thinking_depth"],
+                reasoning_config=generation["reasoning_config"],
+            )
+            if supports_callback:
+                generate_kwargs["run_started_callback"] = run_started
             # Adapters without the acceptance callback remain behind the gate
             # for the whole call; this is conservative and preserves ordering.
             self.agent_client.generate(**generate_kwargs)
@@ -5543,6 +5586,10 @@ class EnterpriseService:
                     raise ServiceError(400, f"{field} contains an invalid entry")
                 values.append(value)
             updates[field] = values
+        # Accept this remote operation under the account write boundary; the
+        # Manager response wait belongs to the already accepted operation.
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             self.manager_client.update_config(updates)
         except ManagerClientError as exc:
@@ -5553,6 +5600,8 @@ class EnterpriseService:
         require_admin(actor)
         if self.manager_client is None:
             raise ServiceError(503, "container manager is not active")
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             result = self.manager_client.check(
                 idempotency_key=f"ui-check-{int(time.time()) // 5}"
@@ -5586,6 +5635,8 @@ class EnterpriseService:
         key = str(body.get("idempotency_key") or "").strip()
         if not key:
             key = f"ui-{clean_operation}-{int(time.time())}-{secrets.token_hex(6)}"
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             return self.manager_client.operation(
                 clean_operation,
@@ -5688,7 +5739,8 @@ class EnterpriseService:
     def delete_channel_message(self, actor: dict[str, Any], channel_id: int, message_id: int) -> dict[str, Any]:
         require_admin(actor)
         self.get_channel(actor, channel_id)
-        with self._conversation_lock:
+        with self._conversation_lock, self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             row = self.db.query_one(
                 """
                 SELECT * FROM messages
@@ -5699,7 +5751,7 @@ class EnterpriseService:
             if not row:
                 raise ServiceError(404, "channel message not found")
             message = self._message_from_row(row)
-            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]))
+            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]), conn=conn)
             result = {"deleted": 1, "message": message}
         return result
 
@@ -5713,7 +5765,8 @@ class EnterpriseService:
         if before_ts <= 0:
             raise ServiceError(400, "before_created_at must be a unix timestamp")
         scope_id = str(channel_id)
-        with self._conversation_lock:
+        with self._conversation_lock, self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             rows = self.db.query(
                 """
                 SELECT id FROM messages
@@ -5723,24 +5776,25 @@ class EnterpriseService:
                 (scope_id, before_ts),
             )
             message_ids = [int(row["id"]) for row in rows]
-            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]))
+            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]), conn=conn)
             result = {"deleted": deleted, "before_created_at": before_ts}
         return result
 
     def clear_channel_messages(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
         require_admin(actor)
         self.get_channel(actor, channel_id)
-        return self._clear_agent_conversation("channel", str(channel_id), actor_id=int(actor["id"]))
+        return self._clear_agent_conversation("channel", str(channel_id), actor=actor)
 
     def _clear_agent_conversation(
         self,
         scope_type: str,
         scope_id: str,
         *,
-        actor_id: int,
+        actor: dict[str, Any],
     ) -> dict[str, Any]:
         """Hide current history without changing durable Agent/runtime state."""
-        with self._conversation_lock:
+        with self._conversation_lock, self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             rows = self.db.query(
                 "SELECT id FROM messages "
                 "WHERE scope_type = ? AND scope_id = ? AND hidden_at IS NULL",
@@ -5748,7 +5802,7 @@ class EnterpriseService:
             )
             hidden = self._hide_message_ids(
                 [int(row["id"]) for row in rows],
-                actor_id=int(actor_id),
+                actor_id=int(actor["id"]), conn=conn,
             )
         return {"deleted": hidden}
 
@@ -5829,7 +5883,8 @@ class EnterpriseService:
     def delete_private_message(self, actor: dict[str, Any], user_id: int, message_id: int) -> dict[str, Any]:
         require_admin(actor)
         subject = self._private_audit_subject(user_id)
-        with self._conversation_lock:
+        with self._conversation_lock, self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             row = self.db.query_one(
                 """
                 SELECT * FROM messages
@@ -5840,7 +5895,7 @@ class EnterpriseService:
             if not row:
                 raise ServiceError(404, "private message not found")
             message = self._message_from_row(row)
-            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]))
+            self._hide_message_ids([int(message_id)], actor_id=int(actor["id"]), conn=conn)
             result = {"deleted": 1, "message": message}
         return result
 
@@ -5854,7 +5909,8 @@ class EnterpriseService:
         if before_ts <= 0:
             raise ServiceError(400, "before_created_at must be a unix timestamp")
         scope_id = str(int(subject["id"]))
-        with self._conversation_lock:
+        with self._conversation_lock, self.db.transaction(immediate=True) as conn:
+            require_admin(self._fresh_active_actor(actor))
             rows = self.db.query(
                 """
                 SELECT id FROM messages
@@ -5864,7 +5920,7 @@ class EnterpriseService:
                 (scope_id, before_ts),
             )
             message_ids = [int(row["id"]) for row in rows]
-            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]))
+            deleted = self._hide_message_ids(message_ids, actor_id=int(actor["id"]), conn=conn)
             result = {"deleted": deleted, "before_created_at": before_ts}
         return result
 
@@ -5872,7 +5928,7 @@ class EnterpriseService:
         require_admin(actor)
         subject = self._private_audit_subject(user_id)
         scope_id = str(int(subject["id"]))
-        return self._clear_agent_conversation("private", scope_id, actor_id=int(actor["id"]))
+        return self._clear_agent_conversation("private", scope_id, actor=actor)
 
     def _private_audit_subject(self, user_id: int) -> dict[str, Any]:
         subject = self.db.query_one("SELECT * FROM users WHERE id = ?", (int(user_id),))
@@ -6292,7 +6348,7 @@ class EnterpriseService:
                 "scope_type": "channel",
                 "scope_id": scope_id,
                 "channel": channel,
-                "actor": dict(actor),
+                "actor": actor.copy(),
                 "content": agent_content,
                 "attachments": agent_attachments,
                 "generation": generation,
@@ -6580,7 +6636,7 @@ class EnterpriseService:
             task = {
                 "scope_type": "private",
                 "scope_id": scope_id,
-                "actor": dict(actor),
+                "actor": actor.copy(),
                 "content": task_content,
                 "attachments": agent_attachments,
                 "generation": generation,
@@ -6610,6 +6666,8 @@ class EnterpriseService:
         current = self.get_user(user_id)
         if current is None or not current.get("active"):
             raise ServiceError(401, "account is inactive")
+        if not isinstance(actor, _UserSnapshot) or actor._token_version != getattr(current, "_token_version", None):
+            raise ServiceError(401, "session has been revoked")
         return current
 
     def _private_user_message_for_telegram_update(
@@ -7917,6 +7975,7 @@ class EnterpriseService:
                         locked_schedule,
                         scheduled_for=int(scheduled_for),
                         reason="previous occurrence is still queued or running",
+                        preserve_current=True,
                     )
 
                 cursor = conn.execute(
@@ -8012,7 +8071,7 @@ class EnterpriseService:
                 task = {
                     "scope_type": "private",
                     "scope_id": str(actor["id"]),
-                    "actor": dict(actor),
+                    "actor": actor.copy(),
                     "content": str(source["content"]),
                     "attachments": [],
                     "generation": generation,
@@ -8221,6 +8280,7 @@ class EnterpriseService:
         *,
         scheduled_for: int,
         reason: str,
+        preserve_current: bool = False,
     ) -> dict[str, Any]:
         revision = int(schedule.get("revision") or 1)
         timestamp = now_ts()
@@ -8279,9 +8339,9 @@ class EnterpriseService:
                 state,
                 enabled,
                 following,
-                int(run["id"]),
+                schedule.get("last_run_id") if preserve_current else int(run["id"]),
                 str(reason)[:2000],
-                revision + 1,
+                revision if preserve_current else revision + 1,
                 timestamp,
                 int(schedule["id"]),
             ),
@@ -8994,6 +9054,7 @@ class EnterpriseService:
                 timestamp = now_ts()
                 with self.db.transaction() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    require_admin(self._fresh_active_actor(actor))
                     for key, value in updates.items():
                         connection.execute(
                             """
@@ -9006,6 +9067,9 @@ class EnterpriseService:
                             """,
                             (key, value, timestamp),
                         )
+            else:
+                with self.db.transaction(immediate=True):
+                    require_admin(self._fresh_active_actor(actor))
             if AGENT_SETTING_MAX_CONCURRENCY in updates:
                 self._agent_run_gate.resize(
                     int(updates[AGENT_SETTING_MAX_CONCURRENCY])
@@ -9101,11 +9165,19 @@ class EnterpriseService:
         if not scope_key:
             raise ServiceError(400, "OAuth credential resolution requires a scope_key")
         force_refresh = parse_bool(body.get("force_refresh"))
-        access_token, expires_at = self._resolve_oauth_access_token(
-            provider,
-            force_refresh=force_refresh,
-        )
-        catalog = self._oauth_model_catalog(provider)
+        while True:
+            with self._auth_lock:
+                access_token, expires_at = self._resolve_oauth_access_token(
+                    provider, force_refresh=force_refresh,
+                )
+                revision = self._oauth_credential_revision(provider)
+            force_refresh = False
+            # Discovery single-flight needs the auth lock itself. Never wait
+            # for it while holding that lock; instead reject superseded snapshots.
+            catalog = self._oauth_model_catalog(provider)
+            with self._auth_lock:
+                if revision == self._oauth_credential_revision(provider):
+                    break
         models = catalog["models"]
         if not models:
             label = oauth_provider_info(provider)["label"]
@@ -9168,21 +9240,20 @@ class EnterpriseService:
             )
             if should_refresh:
                 response = self._refresh_oauth_access_token(provider, refresh_token)
-                access_token = str(response.get("access_token") or "").strip()
-                if not access_token:
+                access_token = response.get("access_token")
+                if not isinstance(access_token, str) or not access_token.strip():
                     raise ServiceError(502, "OAuth refresh response did not contain an access token")
-                rotated_refresh = str(response.get("refresh_token") or refresh_token).strip()
-                self.set_setting(access_key, access_token, secret=True)
-                self.set_setting(refresh_key, rotated_refresh, secret=True)
+                rotated_refresh = response.get("refresh_token", refresh_token)
+                values = {access_key: access_token, refresh_key: rotated_refresh}
                 try:
                     expires_in = max(60, int(response.get("expires_in") or 3600))
-                except (TypeError, ValueError):
-                    expires_in = 3600
+                except (TypeError, ValueError) as exc:
+                    raise ServiceError(502, "OAuth refresh expiry is invalid") from exc
                 expires_at = now_ts() + expires_in
-                self.set_setting(expires_key, str(expires_at))
-                id_token = str(response.get("id_token") or "").strip()
-                if provider == "xai-oauth" and id_token:
-                    self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
+                values[expires_key] = str(expires_at)
+                if provider == "xai-oauth":
+                    values["GROK_OAUTH_ID_TOKEN"] = response.get("id_token") or ""
+                self._commit_oauth_credentials(provider, values)
             if not access_token:
                 raise ServiceError(409, f"{oauth_provider_info(provider)['label']} is not connected")
         return access_token, expires_at
@@ -9240,19 +9311,19 @@ class EnterpriseService:
             if any(key in secrets_by_key for key in required) and not all(key in secrets_by_key for key in required):
                 label = oauth_provider_info(provider)["label"]
                 raise ServiceError(400, f"{label} import requires both access and refresh tokens")
-            with self._auth_lock:
-                imported_providers.append(provider)
-                for key, value in secrets_by_key.items():
-                    self.set_setting(key, value, secret=True)
-                    imported_keys.append(key)
-                self.model_catalogs.invalidate_oauth(provider)
+        for provider, secrets_by_key in by_provider.items():
+            if not secrets_by_key:
+                continue
+            self._commit_oauth_credentials(provider, secrets_by_key, actor=actor)
+            imported_providers.append(provider)
+            imported_keys.extend(secrets_by_key)
         if not imported_keys:
             raise ServiceError(400, "no supported OAuth credentials found in import file")
 
         active_raw = payload.get("active_provider")
         active_provider = normalize_oauth_provider(str(active_raw)) if active_raw else ""
         if active_provider in SUPPORTED_OAUTH_PROVIDERS and self._oauth_tokens_configured(active_provider):
-            self._select_oauth_provider(active_provider)
+            self._select_oauth_provider(active_provider, actor=actor)
         return {
             "imported": {
                 "providers": imported_providers,
@@ -9272,6 +9343,8 @@ class EnterpriseService:
         # provider only becomes active in _store_oauth_flow_result once tokens are
         # stored. Surface the in-progress target for the UI without mutating
         # runtime config.
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             flow = self.oauth_flows.start(provider)
         except OAuthFlowError as exc:
@@ -9286,11 +9359,13 @@ class EnterpriseService:
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         flow_id = str(body.get("flow_id", "")).strip()
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             flow = self.oauth_flows.poll(provider, flow_id)
         except OAuthFlowError as exc:
             raise ServiceError(exc.status, exc.message) from exc
-        self._store_oauth_flow_result(provider, flow)
+        self._store_oauth_flow_result(provider, flow, actor=actor)
         return {"flow": flow, **self.oauth_provider_status(actor)}
 
     def complete_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -9300,11 +9375,13 @@ class EnterpriseService:
             raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
         flow_id = str(body.get("flow_id", "")).strip()
         callback_url = str(body.get("callback_url", "")).strip()
+        with self.db.transaction(immediate=True):
+            require_admin(self._fresh_active_actor(actor))
         try:
             flow = self.oauth_flows.complete(provider, flow_id, callback_url)
         except OAuthFlowError as exc:
             raise ServiceError(exc.status, exc.message) from exc
-        self._store_oauth_flow_result(provider, flow)
+        self._store_oauth_flow_result(provider, flow, actor=actor)
         return {"flow": flow, **self.oauth_provider_status(actor)}
 
 
@@ -14360,15 +14437,37 @@ class EnterpriseService:
         row = self.db.query_one("SELECT value FROM settings WHERE key = ?", (key,))
         return row["value"] if row else None
 
-    def set_setting(self, key: str, value: str, *, secret: bool = False) -> None:
-        self.db.execute(
-            """
-            INSERT INTO settings(key, value, secret, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=excluded.secret, updated_at=excluded.updated_at
-            """,
-            (key, value, 1 if secret else 0, now_ts()),
+    @staticmethod
+    def _write_setting(
+        conn: sqlite3.Connection, key: str, value: str, *, secret: bool = False,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=excluded.secret, updated_at=excluded.updated_at",
+            (key, value, int(secret), now_ts()),
         )
+
+    @staticmethod
+    def _advance_oauth_credential_revision(conn: sqlite3.Connection, provider: str) -> None:
+        conn.execute(
+            "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, '1', 0, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER) + 1, updated_at=excluded.updated_at",
+            (f"AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:{provider}", now_ts()),
+        )
+
+    def set_setting(self, key: str, value: str, *, secret: bool = False) -> None:
+        provider = next((
+            provider for provider, keys in OAUTH_PROVIDER_SECRET_KEYS.items()
+            if key in keys or key == ("CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT")
+        ), None)
+        if provider is None:
+            with self.db.transaction() as conn:
+                self._write_setting(conn, key, value, secret=secret)
+            return
+        with self._auth_lock:
+            with self.db.transaction(immediate=True) as conn:
+                self._write_setting(conn, key, value, secret=secret)
+                self._advance_oauth_credential_revision(conn, provider)
 
     def get_secret(self, key: str) -> str:
         row = self.db.query_one("SELECT value FROM settings WHERE key = ? AND secret = 1", (key,))
@@ -14423,7 +14522,13 @@ class EnterpriseService:
         if raw_key == "agent_tool_token":
             if not value:
                 raise ServiceError(400, "secret value is required")
-            self.set_setting(raw_key, value, secret=True)
+            with self.db.transaction(immediate=True) as conn:
+                require_admin(self._fresh_active_actor(actor))
+                conn.execute(
+                    "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, ?, 1, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=1, updated_at=excluded.updated_at",
+                    (raw_key, value, now_ts()),
+                )
             # Managed runs carry the current tool token in every request. The
             # sidecar keeps the internal target URL fixed but accepts this
             # request-level credential, so rotation takes effect for new runs
@@ -14440,7 +14545,17 @@ class EnterpriseService:
         if not value:
             raise ServiceError(400, "secret value is required")
         with self._auth_lock:
-            self.set_setting(clean, value, secret=True)
+            with self.db.transaction(immediate=True) as conn:
+                require_admin(self._fresh_active_actor(actor))
+                conn.execute(
+                    "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, ?, 1, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=1, updated_at=excluded.updated_at",
+                    (clean, value, now_ts()),
+                )
+                for provider, keys in OAUTH_PROVIDER_SECRET_KEYS.items():
+                    if clean in keys:
+                        self._advance_oauth_credential_revision(conn, provider)
+                        break
             for provider, keys in OAUTH_PROVIDER_SECRET_KEYS.items():
                 if clean in keys:
                     self.model_catalogs.invalidate_oauth(provider)
@@ -14497,15 +14612,18 @@ class EnterpriseService:
         provider: str,
         source: dict[str, Any],
     ) -> None:
-        for key in OAUTH_PROVIDER_SECRET_KEYS[provider]:
+        expires_key = "CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT"
+        for key in (*OAUTH_PROVIDER_SECRET_KEYS[provider], expires_key):
             value = source.get(key)
             if value is None:
                 continue
-            clean = str(value).strip()
+            if not isinstance(value, str):
+                raise ServiceError(400, "OAuth credentials must be strings")
+            clean = value.strip()
             if clean:
                 by_provider[provider][key] = clean
 
-    def _select_oauth_provider(self, provider: str) -> None:
+    def _select_oauth_provider(self, provider: str, *, actor: dict[str, Any]) -> None:
         with self._agent_runtime_config_lock:
             previous_provider = self._active_oauth_provider()
             updates = {AGENT_SETTING_PROVIDER: provider}
@@ -14518,6 +14636,7 @@ class EnterpriseService:
             timestamp = now_ts()
             with self.db.transaction() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                require_admin(self._fresh_active_actor(actor))
                 for key, value in updates.items():
                     connection.execute(
                         """
@@ -14550,18 +14669,13 @@ class EnterpriseService:
             return self.agent_client.model_catalog()
 
     def _oauth_credential_revision(self, provider: str) -> int:
-        keys = OAUTH_PROVIDER_SECRET_KEYS.get(provider, ())
-        if not keys:
+        if provider not in OAUTH_PROVIDER_SECRET_KEYS:
             return 0
-        # A content fingerprint avoids timestamp collisions when credentials
-        # rotate more than once in the same second. It is stable across process
-        # restarts and never leaves this process or contains a recoverable token.
+        # A durable write generation distinguishes A -> B -> A even when all
+        # credential bytes return to their original value. It shares the token
+        # transaction and survives restarts without adding a schema migration.
         with self._auth_lock:
-            material = "\0".join(
-                f"{key}\0{self.get_secret(key)}"
-                for key in keys
-            ).encode("utf-8")
-        return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
+            return int(self.get_setting(f"AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:{provider}") or "0")
 
     def _default_oauth_model(self, provider: str) -> str:
         catalog = self._oauth_model_catalog(provider)
@@ -14635,31 +14749,58 @@ class EnterpriseService:
         detail = f": {catalog['error']}" if catalog.get("error") else ""
         raise ServiceError(503, f"Agent model catalog for {label} has no recommended model{detail}")
 
-    def _store_oauth_flow_result(self, provider: str, flow: dict[str, Any]) -> None:
+    def _commit_oauth_credentials(
+        self, provider: str, values: dict[str, str], *, actor: dict[str, Any] | None = None,
+    ) -> None:
+        keys = OAUTH_PROVIDER_SECRET_KEYS[provider]
+        expires_key = "CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT"
+        if any(key not in (*keys, expires_key) or not isinstance(value, str) for key, value in values.items()):
+            raise ServiceError(400, "OAuth credential group is invalid")
+        if any(not isinstance(values.get(key), str) or not values[key].strip() for key in keys[:2]):
+            raise ServiceError(400, "OAuth credentials require access and refresh tokens")
+        try:
+            expiry = int(values.get(expires_key, "0"))
+            if expiry < 0:
+                raise ValueError("negative expiry")
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(400, "OAuth credential expiry is invalid") from exc
+        group = dict(values)
+        group[expires_key] = str(expiry)
+        if provider == "xai-oauth":
+            group.setdefault("GROK_OAUTH_ID_TOKEN", "")
+        with self._auth_lock:
+            with self.db.transaction(immediate=True) as conn:
+                if actor is not None:
+                    require_admin(self._fresh_active_actor(actor))
+                for key, value in group.items():
+                    conn.execute(
+                        "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, secret=excluded.secret, updated_at=excluded.updated_at",
+                        (key, value, int(key != expires_key), now_ts()),
+                    )
+                self._advance_oauth_credential_revision(conn, provider)
+            self.model_catalogs.invalidate_oauth(provider)
+
+    def _store_oauth_flow_result(
+        self, provider: str, flow: dict[str, Any], *, actor: dict[str, Any],
+    ) -> None:
         tokens = flow.pop("tokens", None)
         if not tokens:
             return
         try:
             expires_in = max(60, int(tokens.get("expires_in") or 3600))
-        except (TypeError, ValueError):
-            expires_in = 3600
-        with self._auth_lock:
-            if provider == "openai-codex":
-                self.set_setting("CODEX_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
-                self.set_setting("CODEX_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
-                expires_key = "CODEX_OAUTH_EXPIRES_AT"
-            elif provider == "xai-oauth":
-                self.set_setting("GROK_OAUTH_ACCESS_TOKEN", str(tokens.get("access_token", "")), secret=True)
-                self.set_setting("GROK_OAUTH_REFRESH_TOKEN", str(tokens.get("refresh_token", "")), secret=True)
-                expires_key = "GROK_OAUTH_EXPIRES_AT"
-                id_token = str(tokens.get("id_token", "") or "").strip()
-                if id_token:
-                    self.set_setting("GROK_OAUTH_ID_TOKEN", id_token, secret=True)
-            else:
-                return
-            self.set_setting(expires_key, str(now_ts() + expires_in))
-            self.model_catalogs.invalidate_oauth(provider)
-        self._select_oauth_provider(provider)
+        except (TypeError, ValueError) as exc:
+            raise ServiceError(502, "OAuth flow expiry is invalid") from exc
+        prefix = "CODEX" if provider == "openai-codex" else "GROK"
+        values = {
+            f"{prefix}_OAUTH_ACCESS_TOKEN": tokens.get("access_token", ""),
+            f"{prefix}_OAUTH_REFRESH_TOKEN": tokens.get("refresh_token", ""),
+            f"{prefix}_OAUTH_EXPIRES_AT": str(now_ts() + expires_in),
+        }
+        if provider == "xai-oauth":
+            values["GROK_OAUTH_ID_TOKEN"] = tokens.get("id_token") or ""
+        self._commit_oauth_credentials(provider, values, actor=actor)
+        self._select_oauth_provider(provider, actor=actor)
 
     def _oauth_tokens_configured(self, provider: str) -> bool:
         with self._auth_lock:
@@ -14758,8 +14899,7 @@ class EnterpriseService:
                 # this lock is held, same-conversation ingress remains blocked.
                 with self._conversation_lock:
                     start_lock.acquire()
-                try:
-                    with self._conversation_lock:
+                    try:
                         if self._closed:
                             raise ServiceError(503, "service is shutting down")
                         actor = self._fresh_active_actor(actor)
@@ -14772,7 +14912,6 @@ class EnterpriseService:
                             raise ServiceError(409, "conversation identity changed")
                         if scope_type == "channel":
                             require_permission(actor, PERMISSION_CHAT)
-                        generation = self.account_generation_config(actor)
                         busy = bool(
                             self._agent_active_tasks.get(conversation_key)
                             or self._agent_queues.get(conversation_key)
@@ -14781,6 +14920,11 @@ class EnterpriseService:
                                 and self._agent_workers[conversation_key].is_alive()
                             )
                         )
+                    except BaseException:
+                        start_lock.release()
+                        raise
+                try:
+                    generation = self.account_generation_config(actor)
                     job_counts = self.jobs.counts(
                         kind="agent",
                         scope_type=scope_type,
@@ -14826,6 +14970,9 @@ class EnterpriseService:
         scope_type: str,
         scope_id: str,
         choice: str,
+        *,
+        run_id: str,
+        approval_id: str,
     ) -> dict[str, Any]:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         if scope_type == "channel":
@@ -14833,23 +14980,27 @@ class EnterpriseService:
         normalized_choice = str(choice or "").strip().lower()
         if normalized_choice not in {"once", "session", "always", "deny"}:
             raise ServiceError(400, "invalid approval choice")
+        if not isinstance(run_id, str) or not run_id or not isinstance(approval_id, str) or not approval_id:
+            raise ServiceError(400, "run_id and approval_id are required")
         key = self._conversation_key(scope_type, scope_id)
         with self._conversation_lock:
             status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
             approval = dict(status.get("approval") or {})
-        run_id = str(approval.get("run_id") or "").strip()
-        if not run_id:
-            raise ServiceError(409, "no pending approval for this conversation")
-        approval_id = str(approval.get("approval_id") or "").strip()
+            if approval.get("run_id") != run_id or approval.get("approval_id") != approval_id:
+                raise ServiceError(409, "approval is no longer pending for this conversation")
         responder = self._actor_display_name(actor)
         try:
             approval_result = self.agent_client.respond_approval(
                 run_id=run_id,
                 choice=normalized_choice,
-                approval_id=approval_id or None,
+                approval_id=approval_id,
             )
         except ValueError as exc:
             raise ServiceError(400, str(exc)) from exc
+        except AgentRuntimeHTTPError as exc:
+            if exc.status_code in {404, 409}:
+                raise ServiceError(409, "approval is no longer pending for this conversation") from exc
+            raise ServiceError(502, str(exc)) from exc
         except Exception as exc:
             raise ServiceError(502, str(exc)) from exc
         updated = self._mark_agent_approval_responded(
@@ -14857,7 +15008,11 @@ class EnterpriseService:
             scope_id,
             normalized_choice,
             responder=responder,
-            approval_result=approval_result if isinstance(approval_result, dict) else {},
+            approval_result={
+                **(approval_result if isinstance(approval_result, dict) else {}),
+                "run_id": run_id,
+                "approval_id": approval_id,
+            },
         )
         return {"ok": True, "approval": approval_result, "agent_status": updated}
 
@@ -15639,65 +15794,73 @@ class EnterpriseService:
                         return
                     task = queue.popleft()
                     job_id = int(task.get("_job_id") or 0)
-                    if job_id and self.jobs.mark_running(job_id, lease_seconds=AGENT_JOB_LEASE_SECONDS) is None:
-                        # Another worker (or a terminal transition) already owns
-                        # this ledger entry. Never execute a side-effectful Agent
-                        # run unless this worker atomically claimed it.
-                        self._release_pending_root_inputs_locked(task, queue)
-                        continue
-                    if (
-                        str(task.get("scope_type")) == "private"
-                        and not task.get("schedule_run_id")
-                        and job_id
-                    ):
-                        input_group_id = str(task.get("_input_group_id") or f"agent:{job_id}")
-                        task["_input_group_id"] = input_group_id
-                        task["_processing_mode"] = str(task.get("_processing_mode") or "started")
-                        task["_accepting_inputs"] = True
-                        task["_admission_pending_claim"] = False
-                        task.setdefault("_joined_input_tasks", [])
-                        task.setdefault("_runtime_run_id", "")
-                        task.setdefault("_input_submit_lock", threading.Lock())
-                        self.agent_inputs.start_root(
-                            message_id=int(task["user_message"]["id"]),
-                            job_id=job_id,
-                            input_group_id=input_group_id,
-                        )
-                        claimed_children: list[dict[str, Any]] = []
-                        unclaimed_children: list[dict[str, Any]] = []
-                        for child in list(task.get("_joined_input_tasks") or []):
-                            if not child.get("_pending_input_claim"):
-                                claimed_children.append(child)
-                                continue
-                            try:
-                                association = self.agent_inputs.reserve_and_claim(
-                                    message_id=int(child["user_message"]["id"]),
-                                    job_id=int(child["_job_id"]),
-                                    parent_job_id=job_id,
-                                    input_group_id=input_group_id,
-                                    lease_seconds=AGENT_JOB_LEASE_SECONDS,
-                                )
-                            except Exception:
-                                association = None
-                            if association is None:
-                                unclaimed_children.append(child)
-                                continue
-                            claimed = dict(child)
-                            claimed.pop("_pending_input_claim", None)
-                            claimed_children.append(claimed)
-                        task["_joined_input_tasks"] = claimed_children
-                        for child in unclaimed_children:
-                            fallback = dict(child)
-                            fallback.pop("_pending_input_claim", None)
-                            fallback["_input_group_id"] = (
-                                f"agent:{int(fallback['_job_id'])}"
+                    preparation_error: Exception | None = None
+                    try:
+                        if job_id and self.jobs.mark_running(job_id, lease_seconds=AGENT_JOB_LEASE_SECONDS) is None:
+                            # Another worker (or a terminal transition) already owns
+                            # this ledger entry. Never execute a side-effectful Agent
+                            # run unless this worker atomically claimed it.
+                            self._release_pending_root_inputs_locked(task, queue)
+                            continue
+                        if (
+                            str(task.get("scope_type")) == "private"
+                            and not task.get("schedule_run_id")
+                            and job_id
+                        ):
+                            input_group_id = str(task.get("_input_group_id") or f"agent:{job_id}")
+                            task["_input_group_id"] = input_group_id
+                            task["_processing_mode"] = str(task.get("_processing_mode") or "started")
+                            task["_accepting_inputs"] = True
+                            task["_admission_pending_claim"] = False
+                            task.setdefault("_joined_input_tasks", [])
+                            task.setdefault("_runtime_run_id", "")
+                            task.setdefault("_input_submit_lock", threading.Lock())
+                            self.agent_inputs.start_root(
+                                message_id=int(task["user_message"]["id"]),
+                                job_id=job_id,
+                                input_group_id=input_group_id,
                             )
-                            fallback["_processing_mode"] = "queued"
-                            fallback["_accepting_inputs"] = False
-                            self._insert_agent_queue_by_job_id_locked(queue, fallback)
-                    else:
+                            claimed_children: list[dict[str, Any]] = []
+                            unclaimed_children: list[dict[str, Any]] = []
+                            for child in list(task.get("_joined_input_tasks") or []):
+                                if not child.get("_pending_input_claim"):
+                                    claimed_children.append(child)
+                                    continue
+                                try:
+                                    association = self.agent_inputs.reserve_and_claim(
+                                        message_id=int(child["user_message"]["id"]),
+                                        job_id=int(child["_job_id"]),
+                                        parent_job_id=job_id,
+                                        input_group_id=input_group_id,
+                                        lease_seconds=AGENT_JOB_LEASE_SECONDS,
+                                    )
+                                except Exception:
+                                    association = None
+                                if association is None:
+                                    unclaimed_children.append(child)
+                                    continue
+                                claimed = dict(child)
+                                claimed.pop("_pending_input_claim", None)
+                                claimed_children.append(claimed)
+                            task["_joined_input_tasks"] = claimed_children
+                            for child in unclaimed_children:
+                                fallback = dict(child)
+                                fallback.pop("_pending_input_claim", None)
+                                fallback["_input_group_id"] = (
+                                    f"agent:{int(fallback['_job_id'])}"
+                                )
+                                fallback["_processing_mode"] = "queued"
+                                fallback["_accepting_inputs"] = False
+                                self._insert_agent_queue_by_job_id_locked(queue, fallback)
+                        else:
+                            task["_accepting_inputs"] = False
+                        self._update_schedule_run_for_task(task, "running")
+                    except Exception as exc:
+                        # No Runtime submission occurred: settle through the normal
+                        # failure path, retaining independent queued input owners.
+                        preparation_error = exc
                         task["_accepting_inputs"] = False
-                    self._update_schedule_run_for_task(task, "running")
+                        self._release_pending_root_inputs_locked(task, queue)
                     self._agent_active_tasks[key] = task
                     self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
 
@@ -15705,6 +15868,8 @@ class EnterpriseService:
                 error_persisted = True
                 response_message: dict[str, Any] | None = None
                 try:
+                    if preparation_error is not None:
+                        raise preparation_error
                     # Only N replies hit the Agent runtime (and hold a thread /
                     # socket) at once; each conversation still drains its own
                     # queue in FIFO order while queued runs wait on the semaphore.
@@ -15844,6 +16009,7 @@ class EnterpriseService:
                                 task,
                                 error,
                                 require_current=True,
+                                before_submission=preparation_error is not None,
                                 partial_content=(
                                     exc.partial_content
                                     if runtime_needs_review
@@ -15996,6 +16162,7 @@ class EnterpriseService:
         require_current: bool = False,
         partial_content: str = "",
         needs_review: bool = False,
+        before_submission: bool = False,
     ) -> None:
         username = "Main Agent" if task["scope_type"] == "channel" else "Private Agent"
         metadata = {
@@ -16036,7 +16203,9 @@ class EnterpriseService:
         }
         if require_current:
             with self._conversation_lock:
-                self._ensure_agent_task_can_run(task)
+                self._ensure_agent_task_can_publish(
+                    task, before_submission=before_submission
+                )
                 self._record_agent_activity(
                     str(task["scope_type"]),
                     str(task["scope_id"]),
@@ -16825,6 +16994,10 @@ class EnterpriseService:
         }.get(choice, choice or "已处理")
         with self._conversation_lock:
             status = dict(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            response_run_id = str(approval_result.get("run_id") or "")
+            current_run_id = str((status.get("approval") or {}).get("run_id") or "")
+            if response_run_id and current_run_id and response_run_id != current_run_id:
+                return self._copy_status(status)
             activity = [dict(item) for item in status.get("activity") or []]
             current_approval = dict(status.get("approval") or {})
             approval_id = str(
@@ -17275,14 +17448,16 @@ class EnterpriseService:
         )
         return [self._attachment_from_row(row, include_local_path=include_local_path) for row in rows]
 
-    def _hide_message_ids(self, message_ids: list[int], *, actor_id: int) -> int:
+    def _hide_message_ids(
+        self, message_ids: list[int], *, actor_id: int, conn: sqlite3.Connection | None = None,
+    ) -> int:
         """Hide messages from UI reads while preserving all durable execution state."""
 
         ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
         if not ids:
             return 0
         placeholders = ",".join("?" for _ in ids)
-        cursor = self.db.execute(
+        cursor = (conn.execute if conn is not None else self.db.execute)(
             f"""
             UPDATE messages
             SET hidden_at = ?, hidden_by_user_id = ?

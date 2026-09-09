@@ -230,6 +230,36 @@ class LearningReviewStoreTests(unittest.TestCase):
 
 
 class LearningReviewIntegrationTests(unittest.TestCase):
+    def test_prompt_assembly_failure_releases_submission_gate(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                review, scope, _ = self._running_review_context(service, actor, dedupe_key="prompt-storage-failure")
+                foreground_calls = list(agent.calls)
+                with mock.patch.object(service, "_private_system_prompt", side_effect=OSError("prompt storage unavailable")):
+                    with self.assertRaises(OSError):
+                        service._execute_learning_review(review)
+                self.assertEqual(agent.calls, foreground_calls)
+                # A second execution can cross the same gate without any repair.
+                gate = service._agent_run_start_lock(scope.scope_key)
+                available = gate.acquire(blocking=False)
+                if available:
+                    gate.release()
+                else:
+                    # Release a leaked test-owned primitive before service.close.
+                    gate.release()
+                self.assertTrue(available)
+                service._execute_learning_review(review)
+                review_calls = [
+                    call for call in agent.calls
+                    if call.get("metadata", {}).get("review_job_id") == review.id
+                ]
+                self.assertEqual(len(review_calls), 1)
+            finally:
+                service.close()
+
     @staticmethod
     def _running_review_context(
         service: EnterpriseService,

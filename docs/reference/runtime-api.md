@@ -27,6 +27,8 @@ JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON �
 
 未知路径和不支持的方法返回 404。模型目录、预览、Run、Input、Cleanup 与控制 endpoint 严格拒绝未知 query/body 字段。调用方不得依赖未记录字段；新增字段必须先更新本文、类型和双方测试。
 
+事件游标必须是非负、安全整数的完整十进制表示；带尾随字符、负数、溢出或重复 `after` query 一律在建立订阅前拒绝。取消请求不接受业务字段，未知正文必须在取消 Run 前拒绝。
+
 ## 模型目录
 
 `GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。OAuth provider 的 `default_model` 始终为空；推荐值必须由账号级供应商目录决定，调用方不得擅自替换为 Runtime 列表第一项。
@@ -124,6 +126,8 @@ Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有
 
 客户端可以使用 `Last-Event-ID` 或 `?after=` 恢复；Runtime 以两者中较大的合法 sequence 为起点。事件 journal 先记录再广播，慢或断开的客户端可在保留窗口内补读。
 
+每条 SSE 连接还必须独立处理网络背压；有界 journal 不能替代有界的 socket 待发送队列。可写后继续按 sequence 排出完整事件，积压超出保留预算时断开该连接，由客户端在保留窗口内恢复，不阻塞 Agent 或其它读取者；heartbeat 与终态同样遵守该队列及关闭边界。
+
 稳定事件族包括：
 
 - `run.queued`、`run.started`、`run.reused` 及 Run 终态；
@@ -166,6 +170,8 @@ Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有
 ## 审批与执行审计
 
 审批 body 只接受 `approval_id` 和 `decision`。decision 是 `once`、`session`、`always` 或 `deny`。省略 `approval_id` 时处理该 Run 最新待决审批；未知字段或无效 decision 返回 400。
+
+Platform 面向浏览器的审批入口不使用“最新待决项”的省略语义：客户端必须提交展示时的 `run_id`、`approval_id` 与 `choice`，Platform 复验当前 scope 的精确待决身份后，把该 `approval_id` 和转换后的 `decision` 转发到指定 Run；迟到身份返回 `409`，不得换成当前项。
 
 审批用于 host terminal、普通前台 Skill 修改、MCP `call`、计划修改和其它明确需要用户决定的业务动作。MCP 调用只允许 `once|deny`，不形成 session/always 授权。自动记忆不使用审批；经过完整校验的内部学习复盘可以免批执行受限的 memory 与 agent-owned Skill create/patch，其它 Skill 动作仍失败关闭。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
 

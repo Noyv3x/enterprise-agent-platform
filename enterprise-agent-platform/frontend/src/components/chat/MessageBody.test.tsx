@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom/vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -45,6 +45,11 @@ describe("MessageBody", () => {
         ].join("\n")}
       />,
     );
+
+    // Wait for the real lazy parser and flush Suspense before starting DOM query deadlines.
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
 
     expect(await screen.findByRole("heading", { name: "Result" })).toBeTruthy();
     expect(screen.getByRole("checkbox")).toBeDisabled();

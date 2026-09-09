@@ -369,11 +369,8 @@ class MailTransport:
             highest_mailbox_uid = _selected_number(client, "UIDNEXT") - 1
             clean_after_uid = max(0, int(after_uid))
             if (
-                clean_after_uid <= 0
-                or (
-                    expected_uid_validity is not None
-                    and int(expected_uid_validity) != uid_validity
-                )
+                expected_uid_validity is None
+                or int(expected_uid_validity) != uid_validity
             ):
                 return MailboxCheckpoint(
                     uid_validity=uid_validity,
@@ -537,12 +534,16 @@ class MailTransport:
                 return []
             first_uid = max(1, highest_uid - MAX_MAIL_UID_SCAN_SPAN + 1)
             tokens: list[str] = ["UID", f"{first_uid}:{highest_uid}"]
+            utf8_filters: list[tuple[str, bytes]] = []
             if bool(criteria.get("unread")):
                 tokens.append("UNSEEN")
             for key, token in (("from", "FROM"), ("to", "TO"), ("subject", "SUBJECT")):
                 value = _safe_header(criteria.get(key), field=key, maximum=512)
                 if value:
-                    tokens.extend((token, '"' + value.replace('"', "") + '"'))
+                    if value.isascii():
+                        tokens.extend((token, _quoted_mailbox(value)))
+                    else:
+                        utf8_filters.append((token, value.encode("utf-8")))
             for key, token in (("since", "SINCE"), ("before", "BEFORE")):
                 raw = str(criteria.get(key) or "").strip()
                 if raw:
@@ -551,7 +552,26 @@ class MailTransport:
                     except ValueError as exc:
                         raise MailGatewayError(f"{key} must use YYYY-MM-DD") from exc
                     tokens.extend((token, parsed.strftime("%d-%b-%Y")))
-            status, data = client.uid("search", None, *tokens)
+            if utf8_filters:
+                # IMAP4rev1 quoted strings are 7-bit. imaplib supports one
+                # synchronizing literal per command, so intersect bounded
+                # searches when more than one header needs a UTF-8 literal.
+                matching_uids: set[bytes] | None = None
+                for token, literal in utf8_filters:
+                    client.literal = literal
+                    status, data = client.uid("search", "CHARSET", "UTF-8", *tokens, token)
+                    _imap_ok(status, operation="mail search")
+                    found = {
+                        uid
+                        for item in (data or []) if isinstance(item, bytes)
+                        for uid in item.split() if uid.isdigit() and int(uid) > 0
+                    }
+                    matching_uids = found if matching_uids is None else matching_uids & found
+                    if not matching_uids:
+                        return []
+                data = [b" ".join(sorted(matching_uids or (), key=int))]
+            else:
+                status, data = client.uid("search", None, *tokens)
             _imap_ok(status, operation="mail search")
             uid_bytes = b" ".join(item for item in (data or []) if isinstance(item, bytes))
             all_uids = [int(item) for item in uid_bytes.split() if item.isdigit() and int(item) > 0]

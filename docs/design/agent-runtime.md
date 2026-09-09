@@ -41,6 +41,10 @@ Runtime 的进程与文件工具始终通过 Manager executor 接口执行，源
 
 创建请求的 `idempotency_key` 在 `scope_key` 内唯一。终态结果原子保存；重复创建返回既有 Run。重启时发现已经开始但没有终态的幂等 Run，必须返回 `needs_review`，不能自动重做。
 
+保留期只用于终态记录：`queued/running` 的幂等证据不能因执行时间超过保留期而消失，终态保留期从该终态提交时起算。持久授权和幂等变更必须先成功提交存储，再发布对应内存状态；未完成创建的请求不得留下可被重放观察到、却永远不会执行的幽灵 Run。
+
+原子替换之后的耐久错误属于不确定提交：旧内存快照不得随后覆盖可能已提交的新结果或输入证据。该存储实例必须失败关闭，重启后重新读取权威文件；Run waiter 和调度槽仍须明确收敛，不能因存储异常永久悬挂。
+
 Agent 主循环中的模型供应商过载、限流、可重试服务端错误和瞬时网络故障，在单次模型请求边界进行有界指数退避与抖动重试。只有失败 attempt 尚未向 Agent loop 提交任何非空正文、思考或工具调用时才可丢弃并重发相同请求；一旦已有可见增量，或错误属于上下文/输出大小、额度、账单、认证、内容策略等非瞬时类别，就不得自动重试。这个机制可以重试工具完成后的下一次模型请求，但不能重新开始整个 Run、重放 session 中已完成的模型轮次或再次执行工具。退避等待可被 Run 取消并持续刷新活动；预算耗尽后仍按现有 `failed` / `needs_review` 与副作用事实终结。这个主循环策略不扩展到 browser 结果的视觉辅助分析；该辅助请求仍使用自身有界 timeout 与文本 fallback，不得因重试阻塞工具结果回到主循环。
 
 私人交互 Run 可以接收追加输入。输入按 message id 持久化并返回 accepted、injected 或 unconsumed；只有模型循环确认注入后，Platform 才能把该输入视为已消费。
@@ -107,6 +111,10 @@ scope cleanup 是对整个 scope family 的显式取消边界，不是允许 tas
 
 后台进程立即返回并由对应 Sandbox 登记。Manager 是生产进程清单的唯一权威：同一主 scope 与其 `/delegate/` 子 scope 组成一个进程 family，共享同时运行上限，root cleanup 必须停止整个 family；单进程读写、等待和终止仍要求精确 scope，不允许越权访问子 Agent 句柄。cleanup 或显式终止报告已确认前，不仅要观察到进程终态，还必须等待对应控制器完成输出快照、持久状态、Sandbox 活动计数和终态裁剪；返回后不得再由该进程的 wait/watch goroutine 写入 scope 数据。进程输出、历史记录和同时运行数量有界；终态记录按时间和数量双重裁剪，但不得裁剪 `running` 或 `orphaned`。预览优先返回活动进程，其不透明 revision 在状态或输出变化时必须变化，Manager 重启后旧 revision 必须失效。Run 空闲、模型轮次、terminal 默认超时和单次 process wait 上限的精确跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；Sandbox 空闲值见 [`container-platform.json`](../contracts/container-platform.json)。
 
+一个进程的 Sandbox 计数只能结算一次；恢复 watcher 与显式停止共享同一结算所有者。controller 的完成信号必须晚于前台 `EndCall`、后台退出计数与持久状态提交，尚未完成结算的终态记录不得裁剪。Sandbox 调用准入落盘失败时不保留虚假的内存活动计数。只返回数量的查询只读取身份、状态和前后台元数据，不复制输出；预览先筛选当前 scope 和展示集合，再读取被选中进程的有界输出。
+
+进程 PID 尚未就绪的所有分支，包括空文件，都必须经过同一 deadline 与等待间隔；所有已经成功启动的 controller 均有唯一 `Wait` 回收路径。宿主前台请求取消或 deadline 与显式停止一样终止本次自有进程组并等待结算，不能只杀 shell leader 后留下后代继续执行或持有输出管道。`process.write` 的 stdin 写入必须串行且能被请求取消；取消只终止本次输入等待，不因此杀死原本应独立存续的后台服务。
+
 计划任务只用于真正基于时间的提醒、周期报告或与当前 Run 无关的未来检查，不能充当本地进程 watcher。Platform 对计划唤醒的 Run 签发可信 `schedule_id`、`schedule_run_id` 与布尔 `schedule_recurring`；后者只在当前权威定义为 interval/cron 时为 `true`，once 固定为 `false`，模型和调用方不能自行选择。当前顶层 recurring occurrence 结束前必须成功调用且只能以空参数调用 `schedule.continue_current` 或 `schedule.complete_current`：前者只原子复验并确认本轮保留下一次执行，不修改计划；后者原子结束本次所属计划，清除 `enabled/next_run_at`，使并发排队的旧 occurrence 失效。两者都不能选择目标 id 或取得其它计划权限，重复调用和竞态按当前 occurrence 身份幂等或失败关闭。
 
 Runtime 不从最终回复中的“继续”“完成”文字猜测决策。recurring Run 准备结束却没有成功的 current-occurrence 决策时，它有界追加明确 follow-up；预算耗尽仍无决策则进入 `needs_review`，不能完成。once occurrence 不要求这项决策并继续在 dispatch 后自动结束。Platform 将 scheduled occurrence 的 `needs_review` 或授权 `blocked` 与“暂停所属当前 revision、关闭 enabled、清空 next_run_at”放在同一事务；重复恢复和迟到写入不得重开计划。这样一次模型遗漏至多产生一条需要关注的结果，不会继续按间隔刷屏。
@@ -124,6 +132,8 @@ Runtime 不从最终回复中的“继续”“完成”文字猜测决策。rec
 摘要成功后，被省略的已持久消息先 fsync 到去重 archive，再原子替换活动 journal。archive 追加前必须按写入后的 UTF-8 总字节执行上限检查，不能先写过界再让后续读取永久失败；没有稳定 entry id 的消息不得被压缩。Runtime-owned todo sidecar 不依赖模型摘要，活动项以独立可信段重新注入；完成和取消项保留在 sidecar 审计中但不占后续模型上下文。
 
 `/compact` 是 Platform 调用的会话控制操作，不是模型输入。Runtime 只接受严格的 scope、lifecycle、session、模型和内部 Gateway 身份；当前身份存在 queued/running Run 时拒绝，在会话锁内复用自动压缩的同一摘要、边界计算、archive 去重与 journal 原子替换。活动消息不足以安全省略时返回成功但 `compacted=false`，不创建伪消息；内部摘要必须用 journal entry 的 Runtime-owned 结构化标记识别，不能从用户可伪造的正文推断。连续调用不得把上一轮内部摘要当作用户历史再次归档，也不得无新历史时增长 journal 或 archive。被省略的历史仍可由 `session` 搜索。命令执行期间的新 Run 必须由同一身份门闩隔离，不能与摘要调用或 journal 替换竞态。该同步控制请求使用独立的长模型调用 deadline；客户端断开或 deadline 在模型摘要及提交准备阶段会取消本次操作并释放门闩，不改 archive/journal。一旦越过最终提交点，Runtime 忽略迟到断线并完成有界的 archive-first 原子替换后再释放门闩，不能停在活动 journal 已替换但 archive 缺失的状态。
+
+手动压缩与 scope/session 删除必须共用写入串行边界。cleanup 完成删除后，先前已经开始的摘要或已读取旧提交快照的压缩不能重新创建 journal/archive；等待已有压缩收敛时不能持有阻止它结束的锁，新压缩也不能越过当前 cleanup fence。
 
 中断留下的孤立 tool call 会在恢复时修复并发出 `session.repaired`。`session` 工具搜索当前 session 的活动 journal 和 archive；跨产品会话的 `session_search` 由 Python 提供。二者返回的历史都必须标记为不可信数据，而不是指令。
 

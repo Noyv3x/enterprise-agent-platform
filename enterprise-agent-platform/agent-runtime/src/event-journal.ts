@@ -17,7 +17,7 @@ export class EventJournal {
   private readonly events: RuntimeEvent[] = [];
   private readonly listeners = new Set<EventListener>();
   private readonly maxEvents: number;
-  private readonly maxBytes: number;
+  readonly maxBytes: number;
   private retainedBytes = 0;
   private nextSequence = 1;
   private terminal = false;

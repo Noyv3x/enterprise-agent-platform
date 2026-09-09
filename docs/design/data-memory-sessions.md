@@ -17,6 +17,8 @@ Python 平台的 SQLite 是账号、权限、频道、产品消息、附件元�
 
 数据库启用 WAL、外键和按线程连接。事务正文或 `commit` 失败时必须在复用该线程连接前尝试 `rollback`，磁盘满等提交错误不能把不确定事务遗留给后续请求。文件写入与对应数据库记录必须形成可恢复的逻辑事务；启动时清理未完成附件和孤立文件。
 
+这一失败恢复边界覆盖所有独立写入口，包括返回新行 id 的 `insert`；调用者已经收到失败的写入，不得由同线程后续请求顺带提交。
+
 短期登录失败窗口属于 Platform 安全状态，使用 session secret 派生的不可逆主体标识保存在 secret 设置行，并随当前 SQLite 一起备份、更新和恢复。它只保留当前窗口内的有界时间戳，不保存明文用户名、客户端地址或密码；成功登录、窗口过期和容量回收按认证策略清理相应桶。浏览器登录 Cookie 是 HMAC 签名的瞬时认证状态，不写入用户表或 Runtime JSONL；其 TTL、`Max-Age` 与活动续期见[安全与信任边界](security-and-trust.md)。Platform 重启只要沿用已持久化的 session secret，就不会使未到期且未被吊销的登录失效。listen host/port 不是 Platform 设置行；产品 secret 读取也不把进程环境当作第二份库。
 
 Agent session 映射只由 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 承载。当前容器 schema marker 与最终表结构是唯一 baseline：空数据库直接创建该结构；普通启动只接受精确匹配当前 marker 和声明结构的非空数据库。全部业务表属于同一个原子 baseline，不允许各业务 store 在服务启动后补建表。发布中的专用 `migrate` 进程可仅从契约声明的直接前一 baseline 在 Manager 已停止 writer 并创建快照后原子迁移；其它 marker、未知业务表、额外列、缺失结构或退役表在任何写入前拒绝。
@@ -69,6 +71,8 @@ todo 工具结果写入 JSONL 供模型和审计查看，但权威状态以 todo
 
 Agent 回复在消息写入后进入 `durable_jobs`。每个会话由一个 FIFO worker 消费，全局并发门只限制实际进入 Runtime 的任务。
 
+FIFO worker 领取任务和建立 root 输入账本也属于受控执行边界。Runtime 尚未接受任务时的存储异常必须保留可恢复的排队所有权，或将任务明确结算并反馈失败；不能弹出唯一唤醒后退出，留下没有 worker 或队列所有者的 `queued/running` job。已经提交而结果不明的 Run 不得自动重做。
+
 用户消息任务可以把完整任务快照持久化在 job payload 中；邮件唤醒例外地使用引用载荷，只保存任务类型与权威 `source_message_id`。所有队列唤醒、重启恢复、中断复核和失败消息补偿路径都先校验 job scope 与源消息归属，再从消息和其可信 metadata 重建任务。源消息丢失、归属不一致或 metadata 不完整时失败关闭，不能从去重键或文本猜测身份。
 
 Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构建本次恢复使用的 `durable_job_id` 与完成状态索引；随后对失败、待复核和分组任务只做集合查询。不得为每条历史 job 重复读取并解析整张消息表，使启动成本退化为任务数与消息数的乘积。该索引只是一轮启动内的派生数据，不替代 SQLite 中的消息和 job 权威记录。
@@ -76,6 +80,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 当前数据库基线必须携带合法的 durable-job 消息高水位：空库从 `0` 开始，正常启动只读取并验证该值；缺失或损坏时拒绝恢复，不得把当前消息最大值静默写回后跳过潜在任务。
 
 计划任务 occurrence 与当前计划身份由 Platform SQLite 权威保存。Platform 从当前定义派生并随 scheduled Run 透传可信 `schedule_id/schedule_run_id/schedule_recurring`。recurring occurrence 只能以无 id 的空参数 `continue_current` 或 `complete_current` 提交机械决策：前者在单一事务中复验 owner、revision、当前 run/job/source identity 后不修改 schedule，后者在同一边界设置 completed、关闭 enabled 并清空 next run；已经过期或重复的 dispatcher 观察无法取得其它计划能力。若本轮以 `needs_review` 或 `blocked` 结束，Platform 在更新 occurrence 终态的同一事务中仅对仍匹配 `last_run_id` 和 revision 的计划设置 paused、关闭 enabled 并清空 next run，重复恢复幂等且不会暂停较新 revision。计划任务不能用于观察当前 Run 启动的本地进程；这类等待属于 Runtime/Manager process 生命周期。
+
+因前一 occurrence 仍在排队或执行而跳过重叠唤醒时，只追加 skipped 历史并推进下一到期时间，不替换活动 occurrence 的 `last_run_id` 或决策 revision。活动 Run 继续具有原来的 current-occurrence 决策与终态暂停资格；用户显式修改计划仍推进 revision 并使旧执行身份失效。
 
 个人 AI 活动期间的新消息仍拥有独立 job，并在 `agent_run_inputs` 中经历 reserved、submitting、accepted、injected、unconsumed 或终态。首次领取 joined child 时，durable job 的 FIFO claim 与 `agent_run_inputs` reservation 必须在同一事务完成；不能先用独立入口留下未取得任务所有权的 reservation。服务重启时：
 
@@ -103,6 +109,8 @@ Platform 启动恢复必须至多顺序扫描一次 Agent 消息 metadata，构�
 复盘对 Skill 采用 Hermes 的主动信号与分层策略：用户对风格、格式、流程或工具使用的纠正，非平凡的可复用技巧，以及本轮已使用 Skill 暴露的缺漏都应触发维护；优先精确 patch 已检查且允许自动维护的现有 agent-owned Skill，没有合适目标时才创建可覆盖一类任务的 umbrella Skill。不得把一次性任务叙述、已经恢复的瞬时故障、环境暂缺或“某工具永远不可用”固化为 Skill；没有真实持久信号时允许不写入。
 
 `memory.reconcile` 在一个 Platform 事务内执行至多二十个 `store`、`replace` 或 `forget` 动作，用于复盘时原子整理相关事实；不提供批量 `clear`。所有动作继续由 Platform 从可信 review job 派生 owner、scope、Run 和 source message，模型不能覆盖来源。复盘的 `search|read|list` 与写入使用同一完整主体契约；Python 必须持有 lifecycle start barrier，并在同一个 SQLite 事务快照中先重验当前 scope lifecycle、账号激活与权限、来源消息和 running job，再执行记忆查询，不能让 reset、撤权或 job 终止前已发出但延迟到达的查询越过授权边界。复盘写入还必须在覆盖复验、预算扣减、全部记忆变更和返回快照的同一个 `BEGIN IMMEDIATE` 事务内完成。撤权/reset 先提交时复盘读写失败关闭；复盘事务先线性化时完成该次快照或原子变更，后续撤权/reset 再生效。
+
+学习复盘取得 lifecycle start barrier 后，参数与提示组装、Runtime 提交和失败路径必须全部由同一个释放边界覆盖。Platform 统一按 conversation gate → scope start barrier 的顺序取得锁；持有 start barrier 时不得重新等待 conversation gate，立即压缩和 scope cleanup 也遵循此顺序。
 
 每个 `agent_learning_review` durable job 具有持久、跨重启和重试共享的二十单位变更预算；模型 turn 上限不能替代该预算。每个 memory `store|replace|forget` 消耗一单位，`reconcile` 按内部动作数逐项计费；每个 Skill `create|patch` 消耗一单位，读操作不计费。记忆预算与实际变更同事务扣减，变更失败整体回滚。Skill 横跨 SQLite 与文件系统，Platform 在持有同一 lifecycle barrier 时先用独立 `BEGIN IMMEDIATE` 事务持久预扣一单位，再重新复验授权并执行文件提交；因此失败的 Skill 写入也可能消耗预算，这是防止“文件已提交但预算回滚”的 fail-closed 语义。预算耗尽后 Gateway 拒绝后续变更，任务重领、进程重启或 Runtime 重试不得重置计数。
 

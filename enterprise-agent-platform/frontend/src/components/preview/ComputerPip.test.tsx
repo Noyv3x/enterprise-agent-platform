@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
@@ -9,6 +9,7 @@ import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerPip, formatComputerElapsed } from "./ComputerPip";
 import type { ComputerSurface } from "./computer";
+import type { AgentPreviewFileResponse } from "../../types";
 
 const mocks = vi.hoisted(() => ({
   browserPreviewHook: vi.fn(),
@@ -247,6 +248,68 @@ describe("ComputerPip", () => {
     expect(document.querySelector(".computer-pip__player")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show the AI computer" }))
       .toHaveAccessibleDescription("File · Read only");
+  });
+
+  it("never shows the previous Run's late draft after the pip switches to a new Run", async () => {
+    const pending: Array<{ resolve: (value: AgentPreviewFileResponse) => void }> = [];
+    vi.mocked(fetchPreviewFile).mockImplementation(() => new Promise((resolve) => {
+      pending.push({ resolve });
+    }));
+    const pipFor = (runId: string, draftRevision: number) => (
+      <I18nProvider>
+        <ChatPreviewContext.Provider value={{
+          scope: { scope_type: "private", scope_id: "7" },
+          browserDrawerOpen: false,
+          computerDrawerOpen: false,
+          computerMode: "file",
+          computerSurface: {
+            ...surface,
+            runId,
+            file: {
+              tool: "write_file",
+              path: "draft.txt",
+              workspace_path: "draft.txt",
+              target: "sandbox",
+              status: "running",
+              tool_call_id: "call",
+              revision: `draft:call:${draftRevision}`,
+            },
+          },
+          openComputer: vi.fn(),
+          openBrowserAssist: vi.fn(),
+        }}
+        >
+          <ComputerPip />
+        </ChatPreviewContext.Provider>
+      </I18nProvider>
+    );
+    const draft = (content: string, draftRevision: number): AgentPreviewFileResponse => ({
+      workspace_path: "draft.txt",
+      content,
+      truncated: false,
+      encoding: "utf-8",
+      source: "draft",
+      draft_kind: "file",
+      revision: `draft:call:${draftRevision}`,
+    });
+
+    const rendered = render(pipFor("run-A", 9));
+    await waitFor(() => expect(pending).toHaveLength(1));
+
+    rendered.rerender(pipFor("run-B", 1));
+    await act(async () => {
+      pending[0].resolve(draft("A_STALE_DRAFT", 9));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
+
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => {
+      pending[1].resolve(draft("B_CURRENT_DRAFT", 1));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("B_CURRENT_DRAFT")).toBeVisible();
+    expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
   });
 
   it("shows bounded search hits instead of a generic computer icon", () => {

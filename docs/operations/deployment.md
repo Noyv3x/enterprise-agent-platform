@@ -56,6 +56,10 @@ curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/d
 
 不兼容或畸形的清单必须在创建安装路径前失败；竞争安装也必须在进入任何目标清理逻辑前失败，不能留下半安装状态。
 
+清单解码复用 Manager 的唯一闭世界校验器，不在安装脚本维护第二份 JSON/schema 实现。安装器先验证操作系统账户 home 已存在、无符号链接组件、归当前 UID 所有且不可被组或其他用户写入，再在其中创建随机命名的 owner-only 临时目录，从自身固定的受信发布源取得当前架构 Manager 及其 SHA-256 sidecar。严格核对 sidecar 文件名与摘要后，调用无配置、无持久副作用的 `inspect-release --manifest <path> --architecture <arch>`。该命令验证整份清单（包括非当前架构工件），仅输出已验证的目标 Manager URL 和 SHA-256；不打开 control socket、不创建正式安装路径、不启动服务。临时目录在成功和失败退出时均清理；home 必须允许执行，但默认 `/tmp` 或 `TMPDIR` 可以挂载为 `noexec`，未经校验的字节不得写入正式 Manager 路径。
+
+自定义 manifest URL 仍决定目标 release 和工件地址，不改变 bootstrap 校验器的受信来源。目标 Manager 与已验证 bootstrap 字节一致时直接复用；不同则按已验证清单下载并校验目标工件。校验失败只回收本次私有临时文件，不进入 fresh root 变更；不增加公开资产、常驻 helper 或第二套发布协议。
+
 安装器写入 stable 的 Manager 已经与 manifest Manager 完全相同时，这是初始 Current，不创建同摘要 Candidate、Activation 或 watchdog。只有现役 Current 与候选摘要不同时才进入 Manager 自更新协议。
 
 Manager 激活前失败只删除本次安装进程创建且身份仍匹配的对象，使同一命令可安全重试。Manager 激活后，容器 operation 由持久 journal 接管；不得重跑安装器或手工删除数据根。
@@ -124,6 +128,8 @@ Sandbox 挂载 `/workspace`、`/home/agent` 和 `/opt/agent-env`。工作区、H
 Sandbox 镜像预装平台文档产出 Skill 所需的固定版本 Python 库：XLSX、DOCX、PPTX 和 PDF 生成不依赖任务期间临时联网安装。它还预装平台的一次性 stdio MCP 客户端；客户端只实现 `tools/list|tools/call`，不包含第三方 server。依赖属于不可变 Sandbox generation，并由镜像构建、导入和真实文件生成/MCP 协议测试共同验收；不能把这些库装入用户持久 HOME 后再把偶然缓存当作平台能力。
 
 Manager 对 scope family 的进程 cleanup 是部署生命周期屏障：返回确认前必须等待匹配进程退出及其控制器完成输出、进程登记与 Sandbox 活动计数落盘。更新、reset、测试目录回收和 Sandbox 停止都不能在该屏障返回后再次收到旧 wait/watch goroutine 的迟到写入。
+
+CLI 的每次 control 请求结束后必须释放其不再复用的 HTTP transport 闲置连接；操作轮询不能为每次请求遗留一条等待服务端空闲超时回收的连接。
 
 Manager executor 还是后台进程终态的唯一权威。`process.wait` 只在完整 execution context、精确 scope、lifecycle、target 与 process id 全部匹配时等待，并使用 Runtime 策略契约规定的默认值和上下限；等待超时或调用方取消只结束本次观察，不向进程发送终止信号，也不把 `running` 或 `orphaned` 降级成完成。自然终态与重复读取必须返回同一份有界快照，供 Runtime 解除当前 session 的有限后台任务责任。
 

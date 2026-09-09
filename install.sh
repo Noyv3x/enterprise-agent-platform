@@ -33,7 +33,7 @@ while (($#)); do
   esac
 done
 
-for command in curl sha256sum install systemctl uname awk stat realpath id getent mktemp docker find grep rm rmdir python3 flock; do
+for command in curl sha256sum install systemctl uname awk stat realpath id getent mktemp docker find grep rm rmdir flock chmod mv; do
   command -v "$command" >/dev/null 2>&1 || {
     printf 'required command is missing: %s\n' "$command" >&2
     exit 69
@@ -149,7 +149,7 @@ ensure_owner_directory() {
   fi
 }
 
-temporary="$(mktemp -d)"
+temporary=""
 manager_activated=0
 manager_root_created=0
 stable_installed=0
@@ -189,10 +189,20 @@ cleanup() {
   [[ -z "$config_incoming" ]] || rm -f "$config_incoming"
   [[ -z "$manager_incoming" ]] || rm -f "$manager_incoming"
   [[ -z "$unit_incoming" ]] || rm -f "$unit_incoming"
-  rm -rf --one-file-system -- "$temporary"
+  [[ -z "$temporary" ]] || rm -rf --one-file-system -- "$temporary"
   exit "$status"
 }
 trap cleanup EXIT
+
+# Bootstrap must execute on the account's installation filesystem, not an
+# ambient temporary filesystem that may be mounted noexec. Never create a
+# missing account home or publish bootstrap bytes at the stable Manager path.
+if [[ ! -d "$account_home" ]]; then
+  printf 'operating-system account home does not exist: %s\n' "$account_home" >&2
+  exit 73
+fi
+ensure_owner_directory "$account_home"
+temporary="$(mktemp -d "$account_home/.agent-platform-install.XXXXXXXXXX")"
 
 download() {
   local output="$1" url="$2"
@@ -201,107 +211,46 @@ download() {
     --output "$output" "$url"
 }
 
+# The validator is always bootstrapped from the installer's trusted release
+# source, never from a caller-supplied manifest or artifact URL.
+bootstrap_url="${default_manifest_url%/*}/$asset"
+download "$temporary/$asset" "$bootstrap_url"
+download "$temporary/$asset.sha256" "$bootstrap_url.sha256"
+mapfile -t bootstrap_checksums < "$temporary/$asset.sha256"
+if [[ "${#bootstrap_checksums[@]}" -ne 1 \
+  || ! "${bootstrap_checksums[0]}" =~ ^([0-9a-f]{64})\ \ (.*)$ \
+  || "${BASH_REMATCH[2]}" != "$asset" ]]; then
+  printf '%s\n' 'bootstrap Manager checksum must contain one complete hash and the fixed asset filename' >&2
+  exit 65
+fi
+bootstrap_sha="${BASH_REMATCH[1]}"
+actual="$(sha256sum "$temporary/$asset")"
+if [[ "${actual%% *}" != "$bootstrap_sha" ]]; then
+  printf '%s\n' 'bootstrap Manager checksum mismatch' >&2
+  exit 65
+fi
+chmod 0700 "$temporary/$asset"
 download "$temporary/release.json" "$manifest_url"
-mapfile -t manifest_artifact < <(python3 - "$temporary/release.json" "$architecture" <<'PY'
-import json
-import pathlib
-import re
-import sys
-import urllib.parse
-from datetime import datetime
-
-def closed(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate manifest key: {key}")
-        value[key] = item
-    return value
-
-try:
-    raw = pathlib.Path(sys.argv[1]).read_bytes()
-    if not raw or len(raw) > 1024 * 1024:
-        raise ValueError("release manifest has an invalid size")
-    manifest = json.loads(
-        raw.decode("utf-8"),
-        object_pairs_hook=closed,
-    )
-except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
-    raise SystemExit(f"release manifest is invalid: {exc}")
-if not isinstance(manifest, dict):
-    raise SystemExit("release manifest must be an object")
-expected_top = {
-    "schema_version", "channel", "source_commit", "generated_at",
-    "protocol_version", "database_schema_version", "manager", "compose", "images",
-}
-if set(manifest) != expected_top:
-    raise SystemExit("fresh install requires the closed target-only release manifest")
-if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != 2 or type(manifest.get("protocol_version")) is not int or manifest["protocol_version"] != 2:
-    raise SystemExit("fresh installation requires manifest schema/protocol 2")
-if type(manifest.get("channel")) is not str or manifest["channel"] != "main":
-    raise SystemExit("fresh install manifest channel must be main")
-if not isinstance(manifest.get("source_commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
-    raise SystemExit("fresh install manifest source_commit is invalid")
-if not isinstance(manifest.get("generated_at"), str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", manifest["generated_at"]):
-    raise SystemExit("fresh install manifest generated_at is invalid")
-try:
-    datetime.fromisoformat(manifest["generated_at"].removesuffix("Z") + "+00:00")
-except ValueError as exc:
-    raise SystemExit("fresh install manifest generated_at is invalid") from exc
-if type(manifest.get("database_schema_version")) is not int or manifest["database_schema_version"] < 1:
-    raise SystemExit("fresh install manifest database schema is invalid")
-
-manager = manifest.get("manager")
-if not isinstance(manager, dict) or set(manager) != {"version", "artifacts"} or manager.get("version") != manifest["source_commit"]:
-    raise SystemExit("fresh install Manager release is invalid")
-artifacts = manager.get("artifacts")
-if not isinstance(artifacts, dict) or set(artifacts) != {"amd64", "arm64"}:
-    raise SystemExit("fresh install Manager artifacts must contain exactly amd64 and arm64")
-
-def artifact(value, label, basename):
-    if not isinstance(value, dict) or set(value) != {"url", "sha256"}:
-        raise SystemExit(f"{label} artifact is not a closed object")
-    url = value.get("url")
-    sha = value.get("sha256")
-    if not isinstance(url, str) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
-        raise SystemExit(f"{label} artifact identity is invalid")
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
-        raise SystemExit(f"{label} artifact URL must be a credential-free HTTPS URL")
-    if pathlib.PurePosixPath(parsed.path).name != basename:
-        raise SystemExit(f"{label} artifact basename must be {basename}")
-    return url, sha
-
-architecture = sys.argv[2]
-manager_url, manager_sha = artifact(
-    artifacts.get(architecture),
-    f"Manager {architecture}",
-    f"agent-platform-manager-linux-{architecture}",
-)
-artifact(manifest.get("compose"), "Compose", "agent-platform-compose.yaml")
-
-expected_images = {
-    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq",
-}
-images = manifest.get("images")
-if not isinstance(images, dict) or set(images) != expected_images:
-    raise SystemExit("fresh install manifest does not contain the exact schema 2 image set")
-for name, reference in images.items():
-    if not isinstance(reference, str) or not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", reference):
-        raise SystemExit(f"fresh install image {name} is not immutable")
-
-print(manager_url)
-print(manager_sha)
-PY
-)
+# A direct command preserves failure status; process substitution would hide it.
+"$temporary/$asset" inspect-release --manifest "$temporary/release.json" \
+  --architecture "$architecture" > "$temporary/manifest-artifact"
+mapfile -t manifest_artifact < "$temporary/manifest-artifact"
 if [[ "${#manifest_artifact[@]}" -ne 2 ]]; then
   printf '%s\n' 'release manifest did not produce one bound Manager artifact' >&2
   exit 65
 fi
 manager_url="${manifest_artifact[0]}"
 expected="${manifest_artifact[1]}"
+if [[ "$expected" != "$bootstrap_sha" ]]; then
+  download "$temporary/target-manager" "$manager_url"
+  actual="$(sha256sum "$temporary/target-manager")"
+  if [[ "${actual%% *}" != "$expected" ]]; then
+    printf 'Manager checksum mismatch: expected %s, found %s\n' "$expected" "${actual%% *}" >&2
+    exit 65
+  fi
+  mv "$temporary/target-manager" "$temporary/$asset"
+  chmod 0700 "$temporary/$asset"
+fi
 
 # Serialize the entire fresh-install ownership decision. The lock is acquired
 # only after the manifest has passed its closed-world validation, so an
@@ -380,13 +329,6 @@ ensure_owner_directory "$data_root"
 manager_root_created=1
 ensure_owner_directory "$data_root/manager"
 
-download "$temporary/$asset" "$manager_url"
-actual="$(sha256sum "$temporary/$asset" | awk '{ print $1 }')"
-[[ "$actual" == "$expected" ]] || {
-  printf 'Manager checksum mismatch: expected %s, found %s\n' "$expected" "$actual" >&2
-  exit 65
-}
-chmod 0700 "$temporary/$asset"
 
 config_incoming="$(mktemp "$(dirname "$config_path")/.manager.toml.XXXXXX")"
 cat > "$config_incoming" <<EOF

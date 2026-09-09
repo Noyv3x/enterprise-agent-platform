@@ -678,7 +678,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/login" and method == "POST":
             body = self._body_json_closed_world(
                 frozenset({"username", "password"}),
-                maximum_bytes=4 * 1024,
+                maximum_bytes=16 * 1024,
             )
             token, user = service.authenticate(
                 str(body.get("username", "")),
@@ -928,6 +928,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "channel",
                     m.group(1),
                     str(body.get("choice", "")),
+                    run_id=body.get("run_id"),
+                    approval_id=body.get("approval_id"),
                 )
             )
             return
@@ -1099,6 +1101,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     "private",
                     str(actor["id"]),
                     str(body.get("choice", "")),
+                    run_id=body.get("run_id"),
+                    approval_id=body.get("approval_id"),
                 )
             )
             return
@@ -1854,6 +1858,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     stream.get("content"),
                     len(status.get("stream_messages") or []),
                     approval.get("run_id"),
+                    approval.get("approval_id"),
                     approval.get("command"),
                     approval.get("description"),
                     tuple(

@@ -23,7 +23,11 @@
 
 平台提供 Codex OAuth 和 Grok OAuth。Codex 使用设备码流程；Grok 使用浏览器授权后粘贴 callback URL 的流程。Python 完成 OAuth 会话、state/PKCE 校验、token 交换、刷新、导入导出和持久化。这些供应商 refresh token 的寿命独立于浏览器登录 Cookie；浏览器会话续期不能刷新 OAuth、Telegram 或邮箱凭据，这些凭据失效也不能单独使浏览器登录过期。OAuth 与 Firecrawl 等产品 secret 只从 Platform secret 行读取，不以进程环境双读。
 
+同一 OAuth provider 的 access token、refresh token、expiry 和可选身份 token 必须先完整验证，再在同一 SQLite 事务中提交；refresh、导入和交互流程完成都使用同一原子边界。失败保留原凭据组，不能持久留下新旧混合状态；外部供应商已消费的一次性授权码不因此获得盲目重试资格。
+
 Runtime 的锁定 Pi 元数据是可执行模型的唯一能力目录，OAuth 成功后供应商返回的账号目录是可用性的唯一来源。两个集合必须求交：供应商结果不能创造 Runtime 不认识的模型，Runtime 清单也不能补入账号目录没有返回的模型。当前凭据从未成功发现目录时返回不可用；同一凭据最近一次成功目录可以带 stale 标志继续使用。文档和产品代码不得硬编码动态模型 ID、退役名单或默认版本。
+
+实际返回给 Runtime 的 access token 与放行模型的账号目录必须来自同一凭据 revision。等待目录期间发生换号或刷新时重新取得并验证一致快照，不能拼接旧 token 与新目录；不得持有 auth lock 等待需要该锁的目录 single-flight。
 
 Codex 账号目录先按供应商 priority 排序；Grok 目录保留供应商响应及其 alias 的顺序。交集后的第一项是该账号当前的推荐默认候选，Runtime 静态目录不得覆盖该顺序。用户已经明确保存且仍在交集中的模型选择继续保留，模型新品发布、同 provider 重验和目录刷新都不能静默改写它；未显式选择的账号在每次执行时采用当前推荐候选，但不把候选反写成显式设置。切换 provider 且没有同时明确选择模型时清空旧 provider 的模型值。OAuth 管理卡必须把“推荐模型”和“可用模型数量”明确标注，不能把一个无说明的默认值表现成完整目录。
 
@@ -53,6 +57,8 @@ Camoufox 镜像的构建层把锁定浏览器目录、已打补丁的 Node 依�
 
 浏览器身份由 scope key 哈希派生，模型不能指定 user id、profile 路径或 session key。每次操作都带派生身份，URL 在操作前后重新校验。浏览器按可信成员模型允许普通内网和回环页面，但拒绝云元数据、链路本地、多播、保留、不可路由目标及 URL 内嵌凭据。
 
+connection-pinning proxy 对字面地址和 DNS 结果采用同一分类，IPv4-mapped IPv6 先还原 IPv4 再检查；未指定、多播、保留及不可路由目标不能借表示形式或子资源请求绕过。普通回环、私网与 IPv6 ULA 的可信成员访问语义保持不变。客户端已经读到响应后取消，也必须终止对应上游 HTTP 流并释放 socket，不能只观察请求正文的 aborted 事件。
+
 支持 tab、导航、snapshot、截图/vision、链接、图片、下载列表、结构化提取和常见交互；console 不执行任意 JavaScript。用户界面里的「AI 的电脑」复用这一预览作为浏览器屏幕，不另接 Camoufox 通道，也不因电脑画面统一入口而在打开预览时启动浏览器。预览只读取已有 tab 的 viewport 帧，打开预览不能启动浏览器、创建 tab、导航或改变当前 tab。只读观察保持两秒级低频 JPEG；用户取得人工接管后，同一鉴权 HTTP 边界临时切换为有界的高频 JPEG 轮询，使用 ETag、CSS 像素截图和较低质量压缩避免重复正文与坐标漂移。接管结束、页面隐藏或失焦后立即恢复低频观察，不维持后台高带宽流。
 
 用户可以对当前已授权 tab 取得短期人工接管租约，用限幅坐标鼠标、连续拖拽、滚动、文本与按键协助处理验证码或卡住的页面。连续指针采用有界轨迹协议：前端使用 Pointer Events 与 pointer capture 记录 `down → move[] → up`，本地合并高频 move 后以单个单调 sequence 提交整条轨迹；提交前的取消、失焦或页面隐藏只丢弃本地轨迹并释放租约。Platform 完整校验动作后才消费 sequence；Camoufox 在同一 tab lock 内按有界相对时间执行 Playwright `mouse.down/move/up`，并在异常路径的 `finally` 中保证最终抬键。整条轨迹一旦执行便不提供伪中断协议，客户端也不能逐个堆积 DOM `pointermove` HTTP 请求。
@@ -81,6 +87,10 @@ Sandbox 镜像提供一个无额外依赖的一次性 stdio MCP 客户端。Runt
 
 客户端对 config、cwd 与工作区内 command 先打开后从 fd 重新验证边界，并通过该 fd 启动，不让 Sandbox 后台进程在检查与使用之间替换父目录或目标。
 
+普通文件要求必须在非阻塞打开后由同一 fd 验证，清单大小限制覆盖实际读取而不只依赖读取前的 stat；配置或命令为 FIFO 时应及时拒绝，不能在协议 deadline 建立之前挂住。
+
+stdio 初始化只接受客户端明确支持并声明的协议版本 `2025-06-18`；server 返回其它非空版本也必须在发送 initialized 或工具调用之前拒绝，不能把“版本字符串存在”当作协商成功。
+
 首版只支持 stdio 的 `tools/list` 与 `tools/call`。Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接和动态顶层工具注册不进入当前边界；远程服务需要由用户安装本地 stdio 适配器。Sylver Lining 是否提供何种 Skill/MCP 包由其自身维护，平台不锁定其仓库、API、origin、Token 形状或业务动作。
 
 ## Telegram
@@ -89,15 +99,23 @@ Telegram Gateway 只处理私聊，忽略群组、超级群组和频道。用户
 
 update id 是入站去重边界；未确认 update 可在重启后重新领取。出站回复使用持久 delivery job；已开始发送但结果未知的任务进入 `needs_review`，不能盲目重复。停用或轮换 bot 时先吊销旧 sender generation，再停止 transport。
 
+轮询 offset 只能确认连续成功处理的 update 前缀。批内一项处理失败后停止消费该批，保留失败项供下一次领取；后续较大 update 的成功不能越过失败项，向 Telegram 确认一个本地没有可恢复原载荷的输入。
+
 ## 邮箱
 
 个人 AI 可以配置标准 IMAP/SMTP 邮箱账户与应用专用密码。Platform 使用系统 CA 验证 IMAPS、SMTPS 或 STARTTLS，不增加邮件容器，也不把密码交给 Runtime、Sandbox、日志或工具结果。界面只管理账户、测试连接、立即检查和收信唤醒开关，不实现第二个完整邮件客户端。
 
+每用户最多二十个邮箱账户；数量检查与新增记录必须在同一个 SQLite 写事务内，不能让并发创建各自通过事务外的配额检查。
+
 `mail` 工具支持列账户、文件夹、搜索、读取、发送、回复、移动、标记与把附件安全保存到当前工作区。所有权由可信私人 scope 派生；频道、委派或其他用户不能访问账户。交互式搜索也必须先用 `UIDNEXT` 限定最近的有界 UID 窗口，不能让 `SEARCH ALL` 为大邮箱生成无界响应；读取完整正文前先读取 `RFC822.SIZE` 并拒绝超限或缺失大小的响应。邮件正文、头部和附件名始终作为不可信工具结果，也不得写入用户可见工作记录的 `result`。发送使用持久幂等投递记录：明确成功才完成，明确失败可由新请求重试，结果未知进入 `needs_review`，不得盲目重发；“删除”只移动到 Trash，不执行不可恢复 expunge。
+
+IMAP 搜索必须保留用户查询的实际字符，正确转义 quoted-string 的反斜线与双引号，并在需要时使用明确的 UTF-8 SEARCH 编码；不能删除引号或把非 ASCII 字符直接交给默认 ASCII 命令编码器。
 
 保存邮件附件时，Platform 必须从可信 scope 的工作区根目录 fd 开始，逐段以 `O_DIRECTORY | O_NOFOLLOW` 打开或以 `mkdirat` 创建目标父目录，并验证每一段都是部署用户拥有的真实目录。最终文件只能相对已固定的父目录 fd 使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建，再验证其类型与 owner；不得先按路径检查、随后重新按字符串路径打开。父目录在保存过程中被替换、重命名或改成符号链接时，写入也不能越过当前 scope 的工作区边界。
 
 启用收信唤醒后，一个有界轮询器按 `UIDVALIDITY + UID` 做 checkpoint 和去重。首次启用或 `UIDVALIDITY` 变化时必须用服务器 `UIDNEXT` 建立当前高水位，不能执行 `SEARCH ALL`、把整个邮箱 UID 列表载入内存或把历史邮箱当成新邮件；服务器未返回有效 `UIDVALIDITY/UIDNEXT` 时 fail closed。增量检查只搜索从 checkpoint 开始的有界 UID 数值窗口，每批新邮件数量另有更小上限；有剩余窗口时把账户标记为立即到期，由公平的后台轮询循环继续追赶，而不是等待用户配置的常规周期。公平顺序按持久化的下次到期时间排列；追赶一个窗口后，该账户仍立即到期，但必须移到其他已到期账户之后。这个顺序必须跨轮询循环和进程重启保留，不能让前一批持续积压的账户固定占满批次。只有成功处理完整窗口才持久化已扫描边界；批内超过上限时只能推进到最后一个已选择 UID，读取或落库失败不得越过失败 UID。这样既不让大邮箱一次占满 worker，也不会让稀疏 UID 或持续流量积压数小时。
+
+已初始化空邮箱的 `last_uid=0` 是合法高水位，不表示尚未初始化。同一 `UIDVALIDITY` 下随后到达的第一封邮件必须进入增量窗口；只有明确的未初始化状态或 validity 改变才建立新的历史基线。
 
 唤醒背压是 IMAP 读取的前置门。每个邮箱账户最多同时保留 `4` 个、每个私人 scope 最多同时保留 `8` 个处于 `queued/running` 的邮件唤醒 Agent job；任一上限到达时，本轮不建立 IMAP 读取、不获取正文、不推进 `UIDVALIDITY/last_uid` checkpoint，只按账户的正常轮询周期退避。同一私人 scope 的后台轮询与手工“立即检查”共用同一串行门，并在落库事务内再次检查两级容量；因此释放容量后必须从原 checkpoint 的同一 UID 精确续跑，不能丢信或产生重复模型调用。
 

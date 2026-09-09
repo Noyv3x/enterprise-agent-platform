@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { t } from "../i18n";
 import { resetApiSession } from "../lib/api";
 import { createStore } from "../lib/store";
 import { initialAppState, rootReducer } from "../store/reducer";
-import type { Message, PostMessageResponse, User } from "../types";
-import { refreshActiveChat, sendMessage, withdrawChannelMessage } from "./chatActions";
+import type { AgentStatus, Message, PostMessageResponse, User } from "../types";
+import {
+  refreshActiveChat,
+  respondAgentApproval,
+  sendMessage,
+  withdrawChannelMessage,
+} from "./chatActions";
 
 class FakeUploadRequest {
   static instances: FakeUploadRequest[] = [];
@@ -170,6 +176,67 @@ describe("channel message withdrawal", () => {
 
     expect(store.getState().messages).toEqual([message]);
     expect(store.getState().error).toContain("only the message author");
+  });
+});
+
+describe("agent approval responses", () => {
+  const displayed = { run_id: "run-A", approval_id: "approval-A", command: "printf harmless" };
+
+  it.each(["private", "channel"] as const)(
+    "%s: submits the displayed run and approval identity with the choice",
+    async (mode) => {
+      const posts: Array<{ path: string; body: unknown }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (path: string, init?: RequestInit) => {
+          if (init?.method === "POST") posts.push({ path, body: JSON.parse(String(init.body)) });
+          return response(200, { messages: [], agent_status: { state: "idle" }, typing: [] });
+        }),
+      );
+      const store = mode === "private" ? privateStore() : channelStore([]);
+
+      await expect(
+        respondAgentApproval(store, mode, mode === "private" ? "7" : "3", displayed, "once"),
+      ).resolves.toBe(true);
+
+      expect(posts).toEqual([{
+        path: mode === "private" ? "/api/private-agent/agent-approval" : "/api/channels/3/agent-approval",
+        body: { choice: "once", run_id: "run-A", approval_id: "approval-A" },
+      }]);
+    },
+  );
+
+  it("drops a late gesture on 409 and resynchronizes to the current pending approval", async () => {
+    const stale: AgentStatus = {
+      state: "approval",
+      run_id: "run-A",
+      updated_at: 100,
+      approval: { ...displayed, choices: ["once"] },
+    };
+    const current: AgentStatus = {
+      ...stale,
+      approval: { ...displayed, approval_id: "approval-B", command: "printf replaced" },
+    };
+    const fetchMock = vi.fn(async (_path: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        return response(409, { error: "approval is no longer pending for this conversation" });
+      }
+      return response(200, { messages: [], agent_status: current });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const store = privateStore();
+    store.dispatch({
+      type: "SET_AGENT_STATUS",
+      payload: { mode: "private", scopeId: "7", status: stale },
+    });
+
+    await expect(
+      respondAgentApproval(store, "private", "7", displayed, "once"),
+    ).resolves.toBe(false);
+
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(store.getState().agentStatuses.private?.approval?.approval_id).toBe("approval-B");
+    expect(store.getState().error).toBe(t("chat.approvalOutdated"));
   });
 });
 

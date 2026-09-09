@@ -351,6 +351,11 @@ export const chatMessages = defineMessages({
   },
   "chat.approvalProcessed": { "zh-CN": "已处理", en: "Processed", "zh-TW": "已處理" },
   "chat.approvalFailed": { "zh-CN": "审批失败", en: "Approval failed", "zh-TW": "核准失敗" },
+  "chat.approvalOutdated": {
+    "zh-CN": "该审批请求已被处理或替换，未应用你的选择；状态已刷新",
+    en: "This approval request was already resolved or replaced; your choice was not applied and the status has been refreshed",
+    "zh-TW": "該核准請求已被處理或取代，未套用你的選擇；狀態已重新整理",
+  },
   "chat.composer.sendTitle": { "zh-CN": "发送 (Enter)", en: "Send (Enter)", "zh-TW": "傳送 (Enter)" },
   "chat.composer.newLine": { "zh-CN": "换行", en: "New line", "zh-TW": "換行" },
   "chat.mentions.label": {

@@ -147,11 +147,17 @@ func (o *Orchestrator) acceptManifest(ctx context.Context, manifest release.Mani
 		return err
 	}
 	defer unlockMaintenance()
+	if err := validateDatabaseVersion(o.Store.State().Current, manifest); err != nil {
+		return err
+	}
 	path, err := o.saveManifest(ctx, manifest, data)
 	if err != nil {
 		return err
 	}
 	_, err = o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
+		if err := validateDatabaseVersion(state.Current, manifest); err != nil {
+			return err
+		}
 		if state.Current != nil && state.Current.ID == manifest.ID() {
 			state.Candidate = nil
 		} else {
@@ -162,6 +168,14 @@ func (o *Orchestrator) acceptManifest(ctx context.Context, manifest release.Mani
 	})
 	return err
 }
+
+func validateDatabaseVersion(current *model.Generation, manifest release.Manifest) error {
+	if current != nil && manifest.DatabaseSchemaVersion < current.DatabaseVersion {
+		return fmt.Errorf("candidate database schema %d is below current schema %d", manifest.DatabaseSchemaVersion, current.DatabaseVersion)
+	}
+	return nil
+}
+
 func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, bool, error) {
 	unlockMaintenance, err := o.lockMaintenanceAdmission(context.Background())
 	if err != nil {
@@ -170,7 +184,8 @@ func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, b
 	defer unlockMaintenance()
 	o.mu.Lock()
 	op, reused, err := o.Store.Begin(request, o.now())
-	if err != nil || reused {
+	_, running := o.running[op.ID]
+	if err != nil || reused && (running || op.Status != model.OperationPending || op.Phase != model.PhaseValidating || o.Store.State().ActiveOperationID != op.ID) {
 		o.mu.Unlock()
 		return op, reused, err
 	}
@@ -184,7 +199,7 @@ func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, b
 		defer func() { o.mu.Lock(); delete(o.running, op.ID); o.mu.Unlock(); cancel() }()
 		o.run(ctx, op)
 	}()
-	return op, false, nil
+	return op, reused, nil
 }
 func (o *Orchestrator) Await(ctx context.Context, id string) (model.Operation, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -456,6 +471,10 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			o.failBeforeMaintenance(op, err)
 			return
 		}
+	}
+	if err := validateDatabaseVersion(o.Store.State().Current, manifest); err != nil {
+		o.failBeforeMaintenance(op, err)
+		return
 	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
 		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreDownload, manifest); err != nil {

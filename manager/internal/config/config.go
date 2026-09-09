@@ -72,7 +72,7 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 	dataHome := filepath.Join(home, ".local", "share")
 	dataRoot := profile.DefaultDataRoot(dataHome)
 	stateDir := profile.ManagerStateRoot(dataRoot)
-	socketPath, err := profile.ControlSocketPath(os.Getenv("XDG_RUNTIME_DIR"))
+	socketPath, err := profile.ControlSocketPath(runtimeDirectory())
 	if err != nil {
 		return Config{}, fmt.Errorf("resolve Manager control socket: %w", err)
 	}
@@ -103,6 +103,13 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		CommandMaxBytes:     1 << 20,
 		activeProfile:       active,
 	}, nil
+}
+
+func runtimeDirectory() string {
+	if directory := os.Getenv("XDG_RUNTIME_DIR"); directory != "" {
+		return directory
+	}
+	return filepath.Join("/run/user", strconv.Itoa(os.Getuid()))
 }
 
 // accountHome resolves the deployment owner's home from the operating-system
@@ -175,7 +182,7 @@ func set(c *Config, key, value string) error {
 		if err != nil {
 			return fmt.Errorf("active technical profile: %w", err)
 		}
-		socketPath, err := profile.ControlSocketPath(os.Getenv("XDG_RUNTIME_DIR"))
+		socketPath, err := profile.ControlSocketPath(runtimeDirectory())
 		if err != nil {
 			return err
 		}

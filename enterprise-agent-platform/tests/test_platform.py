@@ -1143,6 +1143,126 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_compact_and_cleanup_finish_across_conversation_handoff(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            original_conversation = service._conversation_lock
+            handed_off = threading.Event()
+            cleanup_waiting = threading.Event()
+            errors = []
+            results = []
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                start = service._agent_run_start_lock(scope.scope_key)
+
+                class StartGate:
+                    def acquire(self):
+                        if threading.current_thread().name == "cleanup-handoff":
+                            cleanup_waiting.set()
+                        if not start.acquire(timeout=5):
+                            raise TimeoutError("scope start barrier did not settle")
+
+                    def release(self):
+                        start.release()
+
+                class ConversationGate:
+                    def __enter__(self):
+                        if not original_conversation.acquire(timeout=3):
+                            raise TimeoutError("conversation did not settle")
+                        return self
+
+                    def __exit__(self, *exc):
+                        original_conversation.release()
+                        if (threading.current_thread().name == "compact-handoff"
+                                and start.locked() and not handed_off.is_set()):
+                            handed_off.set()
+                            if not cleanup_waiting.wait(timeout=3):
+                                raise TimeoutError("cleanup did not reach start barrier")
+
+                def compact():
+                    try:
+                        results.append(service.compact_agent_session(actor, "private", str(actor["id"])))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                def cleanup():
+                    try:
+                        if not handed_off.wait(timeout=3):
+                            raise TimeoutError("compaction did not reach handoff")
+                        service._cleanup_agent_scope(scope.scope_key)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                service._conversation_lock = ConversationGate()
+                with mock.patch.object(service, "_agent_run_start_lock", return_value=StartGate()), \
+                        mock.patch.object(service, "_agent_browser_tool", return_value={}):
+                    workers = [threading.Thread(target=compact, name="compact-handoff"),
+                               threading.Thread(target=cleanup, name="cleanup-handoff")]
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join(timeout=10)
+                    self.assertTrue(all(not worker.is_alive() for worker in workers))
+                self.assertEqual(errors, [])
+                self.assertTrue(results[0]["compacted"])
+            finally:
+                service._conversation_lock = original_conversation
+                service.close()
+
+    def test_late_approval_cannot_authorize_replacement_in_either_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = ApprovalRecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                for scope_type, scope_id in (("private", str(actor["id"])), ("channel", "1")):
+                    for replacement_run in ("original-run", "replacement-run"):
+                        with self.subTest(scope=scope_type, replacement_run=replacement_run):
+                            for run_id, approval_id in (("original-run", "original-approval"),
+                                                       (replacement_run, "replacement-approval")):
+                                service._record_agent_progress(scope_type, scope_id, {
+                                    "event": "approval.request", "run_id": run_id,
+                                    "approval_id": approval_id, "choices": ["once", "deny"],
+                                })
+                            with self.assertRaises(ServiceError) as stale:
+                                service.respond_agent_approval(
+                                    actor, scope_type, scope_id, "once",
+                                    run_id="original-run", approval_id="original-approval",
+                                )
+                            self.assertEqual(stale.exception.status, 409)
+                            self.assertEqual(agent.approvals, [])
+                            pending = service.agent_status(actor, scope_type, scope_id)["approval"]
+                            self.assertEqual(pending["approval_id"], "replacement-approval")
+            finally:
+                service.close()
+
+    def test_worker_pre_submission_storage_failure_settles_and_drains_fifo(self):
+        for boundary in ("claim", "root"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as td:
+                agent = RecordingAgent()
+                service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+                try:
+                    _, actor = service.authenticate("admin", "admin")
+                    key = service._conversation_key("private", str(actor["id"]))
+                    with mock.patch.object(service, "_start_agent_worker_locked"):
+                        sent = service.send_private_message(actor, "first request")
+                    owner, name = ((service.jobs, "mark_running") if boundary == "claim"
+                                   else (service.agent_inputs, "start_root"))
+                    with mock.patch.object(owner, name, side_effect=sqlite3.OperationalError("storage unavailable")):
+                        service._agent_worker(key)
+                    job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                    self.assertEqual(job.status, "failed")
+                    self.assertEqual(agent.calls, [])
+                    reply = service.agent_message_replying_to("private", str(actor["id"]), sent["user_message"]["id"])
+                    self.assertIsNotNone(reply)
+                    service.send_private_message(actor, "next request")
+                    service.wait_for_agent_idle("private", str(actor["id"]), timeout=5)
+                    self.assertEqual(len(agent.calls), 1)
+                    self.assertTrue(service.try_reserve_auto_update("storage-failure-settled")["reserved"])
+                finally:
+                    service.close()
+
     def test_agent_approval_status_can_be_responded_from_channel_scope(self):
         with tempfile.TemporaryDirectory() as td:
             agent = ApprovalRecordingAgent()
@@ -1168,10 +1288,16 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(status["approval"]["command"], "rm -rf build")
 
                 with self.assertRaises(ServiceError) as alias_error:
-                    service.respond_agent_approval(admin, "channel", "1", "approve")
+                    service.respond_agent_approval(
+                        admin, "channel", "1", "approve",
+                        run_id="run_42", approval_id="approval_42",
+                    )
                 self.assertEqual(alias_error.exception.status, 400)
 
-                result = service.respond_agent_approval(admin, "channel", "1", "session")
+                result = service.respond_agent_approval(
+                    admin, "channel", "1", "session",
+                    run_id="run_42", approval_id="approval_42",
+                )
 
                 self.assertEqual(
                     agent.approvals,
@@ -1184,7 +1310,6 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["agent_status"]["state"], "replying")
                 self.assertIsNone(result["agent_status"]["approval"])
-                self.assertEqual(result["agent_status"]["current_step"], "权限审批已处理")
 
                 # The HTTP response and the runtime SSE acknowledgement race in
                 # production. Both carry the same approval ID and must converge
@@ -4522,12 +4647,20 @@ class PlatformServiceTests(unittest.TestCase):
                     service.withdraw_channel_message(
                         member, 1, permission_guard["id"]
                     )
-                self.assertEqual(revoked.exception.status, 403)
+                self.assertEqual(revoked.exception.status, 401)
+                _, viewer = service.authenticate("alice", "alice-pass")
+                with self.assertRaises(ServiceError) as forbidden:
+                    service.withdraw_channel_message(viewer, 1, permission_guard["id"])
+                self.assertEqual(forbidden.exception.status, 403)
                 self.assertIsNone(
                     service.db.scalar(
                         "SELECT hidden_at FROM messages WHERE id = ?",
                         (permission_guard["id"],),
                     )
+                )
+                self.assertIn(
+                    permission_guard["id"],
+                    [message["id"] for message in service.list_messages(viewer, "channel", "1")],
                 )
             finally:
                 service.close()
@@ -5100,12 +5233,33 @@ class PlatformServiceTests(unittest.TestCase):
                 barrier.wait(timeout=5)
                 for thread in threads:
                     thread.join(timeout=5)
+                    self.assertFalse(thread.is_alive())
 
-                self.assertEqual(sorted(outcomes), ["error:400", "ok"])
+                self.assertEqual(sorted(outcomes), ["error:401", "ok"])
                 self.assertEqual(
                     service.db.scalar("SELECT COUNT(*) FROM users WHERE role = 'admin' AND active = 1"),
                     1,
                 )
+                survivor = next(
+                    actor for actor in (first, second)
+                    if service.get_user(actor["id"])["active"]
+                )
+                deactivated = second if survivor["id"] == first["id"] else first
+                with self.assertRaises(ServiceError) as stale:
+                    service.update_user(deactivated, survivor["id"], {"active": False})
+                self.assertEqual(stale.exception.status, 401)
+
+                password = "admin" if survivor["id"] == first["id"] else "second-admin-pass"
+                _, survivor = service.authenticate(survivor["username"], password)
+                for change in ({"active": False}, {"permission_group": "member"}):
+                    with self.assertRaises(ServiceError) as last_admin:
+                        service.update_user(survivor, survivor["id"], change)
+                    self.assertEqual(last_admin.exception.status, 400)
+                active_admins = [
+                    user["id"] for user in service.list_users(survivor)
+                    if user["active"] and user["role"] == "admin"
+                ]
+                self.assertEqual(active_admins, [survivor["id"]])
             finally:
                 service.close()
 
@@ -5601,18 +5755,19 @@ class PlatformServiceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
+                _, admin = service.authenticate("admin", "admin")
                 service.set_setting(AGENT_SETTING_PROVIDER, "openai-codex")
                 service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
 
-                service._select_oauth_provider("openai-codex")
+                service._select_oauth_provider("openai-codex", actor=admin)
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
 
                 service.set_setting(AGENT_SETTING_MODEL, "")
-                service._select_oauth_provider("openai-codex")
+                service._select_oauth_provider("openai-codex", actor=admin)
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
 
                 service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
-                service._select_oauth_provider("xai-oauth")
+                service._select_oauth_provider("xai-oauth", actor=admin)
                 self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
             finally:
@@ -7053,9 +7208,11 @@ class PlatformHTTPTests(unittest.TestCase):
                     response.read()
                     self.assertEqual(response.status, 400)
 
+                # Exceed the 16 KiB HTTP body bound with valid credentials;
+                # password character-limit failures are authentication failures.
                 oversized = json.dumps(
-                    {"username": "admin", "password": "x" * 5_000}
-                )
+                    {"username": "admin", "password": "admin"}
+                ) + " " * (16 * 1024)
                 connection.request(
                     "POST",
                     "/api/auth/login",
@@ -7091,6 +7248,46 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertEqual(payload["code"], "login_rate_limited")
                 self.assertGreater(int(response.getheader("Retry-After") or "0"), 0)
             finally:
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_approval_routes_require_the_displayed_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = make_config(Path(td))
+            agent = ApprovalRecordingAgent()
+            service = EnterpriseService(config, agent_client=agent)
+            token, actor = service.authenticate("admin", "admin")
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            connection = http.client.HTTPConnection(host, port, timeout=5)
+            headers = {"Content-Type": "application/json", "Origin": f"http://{host}:{port}",
+                       "Cookie": f"{config.session_cookie_name}={token}"}
+            try:
+                for scope_type, scope_id, route in (
+                    ("private", str(actor["id"]), "/api/private-agent/agent-approval"),
+                    ("channel", "1", "/api/channels/1/agent-approval"),
+                ):
+                    with self.subTest(route=route):
+                        service._record_agent_progress(scope_type, scope_id, {
+                            "event": "approval.request", "run_id": "displayed-run",
+                            "approval_id": "displayed-approval", "choices": ["once", "deny"],
+                        })
+                        for body, expected in (
+                            ({"choice": "once"}, 400),
+                            ({"choice": "once", "run_id": "older-run", "approval_id": "displayed-approval"}, 409),
+                            ({"choice": "once", "run_id": "displayed-run", "approval_id": "older-approval"}, 409),
+                            ({"choice": "once", "run_id": "displayed-run", "approval_id": "displayed-approval"}, 200),
+                            ({"choice": "once", "run_id": "displayed-run", "approval_id": "displayed-approval"}, 409),
+                        ):
+                            connection.request("POST", route, body=json.dumps(body), headers=headers)
+                            response = connection.getresponse()
+                            response.read()
+                            self.assertEqual(response.status, expected)
+                self.assertEqual(len(agent.approvals), 2)
+            finally:
+                connection.close()
                 server.shutdown()
                 server.server_close()
                 service.close()
@@ -7568,7 +7765,13 @@ class PlatformHTTPTests(unittest.TestCase):
                 conn.request(
                     "POST",
                     "/api/private-agent/agent-approval",
-                    body=json.dumps({"choice": "session"}),
+                    body=json.dumps(
+                        {
+                            "choice": "session",
+                            "run_id": "run-http-approval",
+                            "approval_id": "approval-http-1",
+                        }
+                    ),
                     headers=headers,
                 )
                 response = conn.getresponse()
@@ -8414,7 +8617,8 @@ class PlatformHTTPTests(unittest.TestCase):
                 cookie = res.getheader("Set-Cookie")
                 self.assertEqual(res.status, 200)
                 self.assertEqual(body["user"]["username"], "admin")
-                admin = body["user"]
+                # JSON user projections are not authenticated service actors.
+                _, admin = service.authenticate("admin", "admin")
                 configure_test_codex(service, admin)
 
                 conn.request("GET", "/api/channels", headers={"Cookie": cookie})

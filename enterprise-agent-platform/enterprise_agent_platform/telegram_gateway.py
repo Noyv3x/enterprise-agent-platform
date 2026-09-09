@@ -553,8 +553,10 @@ class TelegramGateway:
                             self._offset = update_id + 1
                     except ServiceError as exc:
                         print(f"Telegram gateway rejected update: {exc.message}", file=sys.stderr)
+                        raise
                     except Exception as exc:
                         print(f"Telegram gateway failed to process update: {exc}", file=sys.stderr)
+                        raise
             except Exception as exc:
                 if not self._stop.is_set():
                     print(f"Telegram gateway polling failed: {exc}", file=sys.stderr)

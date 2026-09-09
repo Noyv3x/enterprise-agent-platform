@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -64,6 +66,72 @@ func TestSandboxFileActionsSupportNestedRegularFiles(t *testing.T) {
 	}
 	if !strings.Contains(result, "file.txt:1:beta") || details["count"] != 1 {
 		t.Fatalf("unexpected search result %q (%#v)", result, details)
+	}
+}
+
+func TestPatchRejectsExpansionBeforeAllocatingResult(t *testing.T) {
+	service, _ := newTestService(t)
+	path := "/workspace/expansion.txt"
+	original := strings.Repeat("x", 10*1024)
+	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: path, Content: original}); err != nil {
+		t.Fatal(err)
+	}
+	arguments := filePatchArguments{Path: path, OldText: "x", NewText: strings.Repeat("y", 2000), ExpectedReplacements: len(original)}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, _, err := executeSandboxFile(t, service, "patch", arguments)
+	runtime.ReadMemStats(&after)
+	if err == nil || !strings.Contains(err.Error(), "patched file exceeds manager limit") {
+		t.Fatalf("expanding patch error = %v", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("rejected 10 KiB patch allocated %d bytes", allocated)
+	}
+	content, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: path})
+	if err != nil || content != original {
+		t.Fatalf("rejected patch changed original: content %q, error %v", content, err)
+	}
+}
+
+func TestPatchSizeBoundaryAndReplacementCount(t *testing.T) {
+	for _, item := range []struct {
+		name     string
+		oldText  string
+		newText  string
+		expected int
+		want     string
+		wantErr  string
+	}{
+		{name: "exact limit", oldText: "aa", newText: "bbbb", expected: 2, want: "bbbbbbbb"},
+		{name: "shrinking", oldText: "aa", newText: "b", expected: 2, want: "bb"},
+		{name: "count precedes size", oldText: "aa", newText: "bbbbbbbb", expected: 1, want: "aaaa", wantErr: "expected 1 replacements, found 2"},
+		{name: "default count", oldText: "aaaa", newText: "b", want: "b"},
+	} {
+		t.Run(item.name, func(t *testing.T) {
+			service, _ := newTestService(t)
+			service.Files.MaxBytes = 8
+			path := "/workspace/boundary.txt"
+			if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: path, Content: "aaaa"}); err != nil {
+				t.Fatal(err)
+			}
+			_, details, err := executeSandboxFile(t, service, "patch", filePatchArguments{Path: path, OldText: item.oldText, NewText: item.newText, ExpectedReplacements: item.expected})
+			if item.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), item.wantErr) {
+					t.Fatalf("patch error = %v, want %q", err, item.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if details["replacements"] != strings.Count("aaaa", item.oldText) {
+					t.Fatalf("replacement count = %#v", details)
+				}
+			}
+			content, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: path})
+			if err != nil || content != item.want {
+				t.Fatalf("patch result = %q, %v; want %q", content, err, item.want)
+			}
+		})
 	}
 }
 
@@ -311,5 +379,116 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	}
 	if result != "No matches" {
 		t.Fatalf("attachment search escaped through a symbolic link: %q", result)
+	}
+}
+
+func TestSandboxAncestorSearchUsesAttachmentOverlay(t *testing.T) {
+	for _, mountpoint := range []string{"directory", "absent", "symlink", "missing-parent"} {
+		t.Run(mountpoint, func(t *testing.T) {
+			service, root := newTestService(t)
+			if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
+				t.Fatal(err)
+			}
+			actual := filepath.Join(root, "data", "attachments", "private", "1")
+			shadow := filepath.Join(root, "data", "workspaces", "user-1", ".agent-platform", "attachments")
+			if err := os.WriteFile(filepath.Join(actual, "note.txt"), []byte("overlay-actual"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(shadow, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(shadow, "note.txt"), []byte("overlay-shadow"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			outside := filepath.Join(root, "outside")
+			if err := os.Mkdir(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("overlay-outside"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, filepath.Join(actual, "escape")); err != nil {
+				t.Fatal(err)
+			}
+			switch mountpoint {
+			case "absent", "symlink":
+				if err := os.Rename(shadow, filepath.Join(root, "hidden-attachments")); err != nil {
+					t.Fatal(err)
+				}
+			case "missing-parent":
+				if err := os.Rename(filepath.Dir(shadow), filepath.Join(root, "hidden-internal")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mountpoint == "symlink" {
+				if err := os.Symlink(outside, shadow); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, path := range []string{"/workspace/.agent-platform/attachments", "/workspace/.agent-platform", "/workspace"} {
+				var result string
+				var err error
+				if mountpoint == "directory" {
+					result, _, err = executeSandboxFile(t, service, "search", fileSearchArguments{Path: path, Query: "overlay-"})
+				} else {
+					// Exercise traversal after a mountpoint disappears or is
+					// replaced, without Ensure recreating or rejecting it first.
+					var mapped managedFilePath
+					mapped, err = service.Files.sandboxPath(Call{Identity: identity(), Target: "sandbox"}, path)
+					if err == nil {
+						var matches []string
+						matches, err = searchManaged(context.Background(), mapped, regexp.MustCompile("overlay-"), 10)
+						result = strings.Join(matches, "\n")
+					}
+				}
+				if err != nil {
+					t.Fatalf("search %s: %v", path, err)
+				}
+				prefix := strings.TrimPrefix("/workspace/.agent-platform/attachments/note.txt", path+"/")
+				if result != prefix+":1:overlay-actual" {
+					t.Fatalf("search %s violated attachment overlay: %q", path, result)
+				}
+			}
+		})
+	}
+}
+
+func TestAncestorSearchKeepsAttachmentRootPinned(t *testing.T) {
+	service, root := newTestService(t)
+	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
+		t.Fatal(err)
+	}
+	path, err := service.Files.sandboxPath(Call{Identity: identity(), Target: "sandbox"}, "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachments, err := openManagedDirectory(managedFilePath{root: path.attachmentRoot, relative: "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attachments.Close()
+	if err := os.WriteFile(filepath.Join(path.attachmentRoot, "note.txt"), []byte("overlay-original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path.attachmentRoot, filepath.Join(root, "pinned-attachments")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path.attachmentRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path.attachmentRoot, "note.txt"), []byte("overlay-replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := openManagedNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workspace.Close()
+	var results []string
+	if err := searchManagedNode(context.Background(), path, workspace, attachments, ".", regexp.MustCompile("overlay-"), 10, &results); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0] != ".agent-platform/attachments/note.txt:1:overlay-original" {
+		t.Fatalf("search reopened attachment pathname instead of using pinned fd: %v", results)
 	}
 }

@@ -28,17 +28,30 @@ class FakeEventSource extends EventTarget {
     this.dispatchEvent(new Event("open"));
   }
 
+  /** The browser gave up: CLOSED plus a final error event. */
+  fail() {
+    this.readyState = 2;
+    this.dispatchEvent(new Event("error"));
+  }
+
   update(payload: unknown) {
     this.dispatchEvent(new MessageEvent("update", { data: JSON.stringify(payload) }));
   }
 }
 
-function response(body: unknown) {
+function response(body: unknown, status = 200) {
   return {
-    ok: true,
-    status: 200,
+    ok: status >= 200 && status < 300,
+    status,
     text: async () => JSON.stringify(body),
   };
+}
+
+/** Let the auth probe's fetch/text/throw chain settle without advancing timers. */
+async function settle() {
+  await act(async () => {
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+  });
 }
 
 describe("useRealtime compact updates", () => {
@@ -51,6 +64,7 @@ describe("useRealtime compact updates", () => {
   afterEach(() => {
     cleanup();
     resetApiSession();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -120,5 +134,41 @@ describe("useRealtime compact updates", () => {
 
     expect(stream.readyState).toBe(1);
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it("keeps recovering with bounded backoff when the post-close auth probe fails transiently", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
+    const store = createStore(rootReducer, { ...initialAppState, user, activeView: "private" });
+    const fetchMock = vi.fn(async (_path: string) =>
+      response({ user }, fetchMock.mock.calls.length === 1 ? 502 : 200),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
+    );
+
+    const { unmount } = renderHook(() => useRealtime(), { wrapper });
+    act(() => {
+      FakeEventSource.instances[0].open();
+      FakeEventSource.instances[0].fail();
+    });
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    // The failed probe is retried after the base delay; the successful probe then
+    // schedules the ordinary reconnect, so a new stream appears without any
+    // visibility or pageshow event.
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(FakeEventSource.instances).toHaveLength(2);
+
+    // Teardown cancels a pending recovery instead of leaking a later reconnect.
+    act(() => FakeEventSource.instances[1].fail());
+    await settle();
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(FakeEventSource.instances).toHaveLength(2);
   });
 });

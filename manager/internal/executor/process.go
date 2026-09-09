@@ -66,6 +66,7 @@ type managedProcess struct {
 	snapshot               ProcessSnapshot
 	command                *exec.Cmd
 	stdin                  io.WriteCloser
+	stdinGate              chan struct{}
 	cancel                 context.CancelFunc
 	context                context.Context
 	sandboxID              string
@@ -85,6 +86,11 @@ type managedProcess struct {
 	stopRequested          bool
 	done                   chan struct{}
 	stopMu                 sync.Mutex
+	settleMu               sync.Mutex
+	settlementErr          error
+	backgroundSettled      bool
+	backgroundAdmitted     bool
+	settling               bool
 	stdout, stderr         *boundedBuffer
 }
 
@@ -108,30 +114,44 @@ type boundedBuffer struct {
 	value     bytes.Buffer
 	limit     int64
 	truncated bool
+	private   bool
+	redactor  outputRedactor
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	n := len(p)
-	remaining := b.limit - int64(b.value.Len())
-	if remaining > 0 {
-		if int64(n) > remaining {
-			_, _ = b.value.Write(p[:remaining])
-			b.truncated = true
-		} else {
-			_, _ = b.value.Write(p)
-		}
+	if b.private {
+		b.writeSanitizedLocked(p)
 	} else {
+		b.redactor.Write(p, b.writeSanitizedLocked)
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) writeSanitizedLocked(p []byte) {
+	remaining := max(0, b.limit-int64(b.value.Len()))
+	if int64(len(p)) > remaining {
+		p = p[:remaining]
 		b.truncated = true
 	}
-	return n, nil
+	_, _ = b.value.Write(p)
 }
 func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	result := b.value.String()
-	if b.truncated {
+	pending := ""
+	if !b.private {
+		pending = b.redactor.Preview()
+	}
+	remaining := max(0, b.limit-int64(len(result)))
+	truncated := b.truncated || int64(len(pending)) > remaining
+	if int64(len(pending)) > remaining {
+		pending = pending[:remaining]
+	}
+	result += pending
+	if truncated {
 		result += "\n[output truncated by platform manager]\n"
 	}
 	return result
@@ -140,6 +160,9 @@ func (b *boundedBuffer) String() string {
 func (b *boundedBuffer) TakeString() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !b.private {
+		b.redactor.Flush(b.writeSanitizedLocked)
+	}
 	result := b.value.String()
 	if b.truncated {
 		result += "\n[output truncated by platform manager]\n"
@@ -147,6 +170,13 @@ func (b *boundedBuffer) TakeString() string {
 	b.value.Reset()
 	b.truncated = false
 	return result
+}
+func (b *boundedBuffer) Flush() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.private {
+		b.redactor.Flush(b.writeSanitizedLocked)
+	}
 }
 
 func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64) (*ProcessManager, error) {
@@ -295,7 +325,7 @@ func (m *ProcessManager) releaseProcessSlotLocked(scope, lifecycle string) {
 	m.pendingStartChanged = make(chan struct{})
 }
 
-const sandboxProcessWrapper = `
+var sandboxProcessWrapper = sandboxOutputRedactorPython() + `
 import os, selectors, sys
 pid_file, stdout_file, stderr_file, exit_file, limit, private_output, command = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "private", sys.argv[7]
 out_r, out_w = os.pipe()
@@ -312,21 +342,30 @@ if child:
     out_fd = 1 if private_output else os.open(stdout_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     err_fd = 2 if private_output else os.open(stderr_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     selector = selectors.DefaultSelector()
-    selector.register(out_r, selectors.EVENT_READ, (out_fd, None if private_output else stdout_file))
-    selector.register(err_r, selectors.EVENT_READ, (err_fd, None if private_output else stderr_file))
+    selector.register(out_r, selectors.EVENT_READ, [out_fd, None if private_output else stdout_file, None if private_output else OutputRedactor(), 0])
+    selector.register(err_r, selectors.EVENT_READ, [err_fd, None if private_output else stderr_file, None if private_output else OutputRedactor(), 0])
     while selector.get_map():
         for key, _ in selector.select(timeout=1):
             chunk = os.read(key.fd, 65536)
+            target_fd, target_path, redactor, committed = key.data
+            if private_output:
+                os.write(target_fd, chunk)
+            else:
+                # Replace only the safe speculative suffix; never commit it to
+                # the streaming redactor or let it become input to clipping.
+                os.ftruncate(target_fd, committed)
+                os.lseek(target_fd, committed, os.SEEK_SET)
+                os.write(target_fd, redactor.feed(chunk, final=not chunk))
+                size = os.lseek(target_fd, 0, os.SEEK_END)
+                if size > limit * 2:
+                    read_fd = os.open(target_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    tail = os.pread(read_fd, limit, size - limit)
+                    os.close(read_fd)
+                    os.ftruncate(target_fd, 0); os.lseek(target_fd, 0, os.SEEK_SET); os.write(target_fd, tail)
+                key.data[3] = os.lseek(target_fd, 0, os.SEEK_END)
+                os.write(target_fd, redactor.preview()[:limit] if chunk else b'')
             if not chunk:
-                selector.unregister(key.fd); os.close(key.fd); continue
-            target_fd, target_path = key.data
-            os.write(target_fd, chunk)
-            size = os.lseek(target_fd, 0, os.SEEK_END) if target_path else 0
-            if target_path and size > limit * 2:
-                read_fd = os.open(target_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                tail = os.pread(read_fd, limit, size - limit)
-                os.close(read_fd)
-                os.ftruncate(target_fd, 0); os.lseek(target_fd, 0, os.SEEK_SET); os.write(target_fd, tail)
+                selector.unregister(key.fd); os.close(key.fd)
     if not private_output:
         os.fsync(out_fd); os.fsync(err_fd); os.close(out_fd); os.close(err_fd)
     _, status = os.waitpid(child, 0)
@@ -514,11 +553,14 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	}
 	command := exec.CommandContext(executionContext, name, commandArgs...)
 	if call.Target == "host" {
+		// Keep Start's context check, but disable the competing exec watcher:
+		// the non-reaping host group waiter exclusively owns cancellation.
+		command.Cancel = nil
 		command.Dir = string(filepath.Separator)
 		command.ExtraFiles = []*os.File{hostWorkingDirectory}
 		command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
 	}
-	stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
+	stdout, stderr := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput}, &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput}
 	command.Stdout, command.Stderr = stdout, stderr
 	stdin, err := command.StdinPipe()
 	if err != nil {
@@ -532,7 +574,7 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	} else if call.CompletionOwnerID != "" {
 		stateFile = filepath.Join(filepath.Dir(m.Sandboxes.StatePath), "processes", "host", id+".json")
 	}
-	displayCommand := args.Command
+	displayCommand := redactRetainedText(args.Command)
 	if args.DisplayCommand != "" {
 		displayCommand = args.DisplayCommand
 	}
@@ -555,8 +597,9 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 			process.snapshot.FinishedAt = &now
 			process.starting = false
 			process.mu.Unlock()
-			_ = m.persistProcess(process)
-			close(process.done)
+			callOpen = false
+			settleErr := m.Sandboxes.EndCall(process.sandboxID, false, time.Now())
+			m.finishProcess(process, errors.Join(settleErr, m.persistProcess(process)))
 			return m.snapshot(process), err
 		}
 		return ProcessSnapshot{}, err
@@ -569,14 +612,15 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	process.snapshot.PID = command.Process.Pid
 	process.mu.Unlock()
 	if call.Target == "sandbox" {
-		if containerPID, waitErr := waitForPIDFile(hostPIDFile, 2*time.Second); waitErr != nil {
+		if containerPID, waitErr := waitForPIDFileContext(executionContext, hostPIDFile, 2*time.Second); waitErr != nil {
 			cancel()
 			_, _ = m.stopSandboxProcess(process)
 			process.mu.Lock()
 			process.starting = false
 			process.mu.Unlock()
+			callOpen = false
+			m.wait(process)
 			if process.completionOwnerID != "" {
-				m.wait(process)
 				return m.snapshot(process), waitErr
 			}
 			return ProcessSnapshot{}, waitErr
@@ -596,19 +640,22 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 	reserved = false
 	_ = m.persistProcess(process)
 	if args.Background {
-		_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, true, time.Now())
+		settleErr := m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, true, time.Now())
+		process.mu.Lock()
+		process.settlementErr = settleErr
+		process.backgroundAdmitted = true
+		process.mu.Unlock()
 		callOpen = false
 		go m.wait(process)
 		return m.snapshot(process), nil
 	}
+	callOpen = false
 	m.wait(process)
 	snapshot := m.snapshot(process)
 	if args.PrivateOutput {
 		snapshot.Stdout = process.stdout.TakeString()
 		snapshot.Stderr = process.stderr.TakeString()
 	}
-	_ = m.Sandboxes.EndCall(call.ExecutionContext.SandboxID, snapshot.Status == "orphaned", time.Now())
-	callOpen = false
 	if snapshot.Status == "cancelled" {
 		return snapshot, context.Canceled
 	}
@@ -616,13 +663,32 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 }
 
 func (m *ProcessManager) wait(process *managedProcess) {
-	defer close(process.done)
+	process.settleMu.Lock()
+	defer process.settleMu.Unlock()
+	process.mu.Lock()
+	wasBackground := process.backgroundAdmitted
+	process.mu.Unlock()
+	confirmed := true
+	var groupErr error
+	if process.snapshot.Target == "host" {
+		// Keep the leader waitable until all group signaling has finished.
+		// Cmd.Wait is the sole reaper and runs only after this lifetime fence.
+		groupErr = waitHostProcessGroup(process.context, process.command.Process.Pid, syscall.Kill)
+		confirmed = groupErr == nil
+	}
 	err := process.command.Wait()
+	if groupErr != nil {
+		err = errors.Join(err, groupErr)
+	}
+	process.stdout.Flush()
+	process.stderr.Flush()
 	contextErr := process.context.Err()
 	process.mu.Lock()
 	stopRequested := process.stopRequested
 	process.mu.Unlock()
-	confirmed := true
+	if process.snapshot.Target == "host" && err == nil && (contextErr != nil || stopRequested) {
+		err = context.Canceled
+	}
 	if process.snapshot.Target == "sandbox" && err != nil {
 		if contextErr != nil || stopRequested {
 			confirmed, _ = m.stopSandboxProcess(process)
@@ -665,41 +731,53 @@ func (m *ProcessManager) wait(process *managedProcess) {
 			process.snapshot.Status = "cancelled"
 		}
 	}
-	background := process.snapshot.Background
+	background := wasBackground
 	orphaned := process.snapshot.Status == "orphaned"
 	process.command = nil
 	process.mu.Unlock()
 	if process.hostPIDFile != "" && !orphaned {
 		_ = os.Remove(process.hostPIDFile)
 	}
-	_ = m.persistProcess(process)
-	if background && !orphaned {
-		_ = m.Sandboxes.ProcessExited(process.sandboxID, time.Now())
+	var settleErr error
+	if !background {
+		settleErr = m.Sandboxes.EndCall(process.sandboxID, orphaned, time.Now())
+		process.backgroundSettled = !orphaned
+	} else if !orphaned {
+		settleErr = m.settleBackground(process)
 	}
-	m.pruneCompleted(time.Now())
+	m.finishProcess(process, errors.Join(settleErr, m.persistProcess(process)))
 }
 
 func waitForPIDFile(path string, timeout time.Duration) (int, error) {
-	deadline := time.Now().Add(timeout)
+	return waitForPIDFileContext(context.Background(), path, timeout)
+}
+
+func waitForPIDFileContext(ctx context.Context, path string, timeout time.Duration) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	for {
-		data, err := os.ReadFile(path)
+		if err := ctx.Err(); err != nil {
+			return 0, fmt.Errorf("sandbox process did not publish its managed PID: %w", err)
+		}
+		data, err := readTailFile(path, 4096)
 		if err == nil {
-			fields := bytes.Fields(data)
-			if len(fields) == 0 {
-				continue
-			}
-			pid, parseErr := strconv.Atoi(string(fields[0]))
-			if parseErr == nil && pid > 1 {
-				return pid, nil
+			fields := strings.Fields(data)
+			if len(fields) > 0 {
+				pid, parseErr := strconv.Atoi(fields[0])
+				if parseErr == nil && pid > 1 {
+					return pid, nil
+				}
 			}
 		}
 		if err != nil && !os.IsNotExist(err) {
 			return 0, err
 		}
-		if time.Now().After(deadline) {
-			return 0, errors.New("sandbox process did not publish its managed PID")
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-timer.C:
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -716,24 +794,58 @@ func (m *ProcessManager) persistProcess(process *managedProcess) error {
 	return atomicfile.WriteJSON(process.stateFile, value, 0o600)
 }
 
+// settleMu belongs to the live waiter or recovery watcher until done closes.
+// Only a later explicit stop of an orphan may take over that ownership.
+func (m *ProcessManager) settleBackground(process *managedProcess) error {
+	if process.backgroundSettled {
+		return nil
+	}
+	process.backgroundSettled = true
+	return m.Sandboxes.ProcessExited(process.sandboxID, time.Now())
+}
+
+func (m *ProcessManager) finishProcess(process *managedProcess, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	process.mu.Lock()
+	process.settlementErr = errors.Join(process.settlementErr, err)
+	process.mu.Unlock()
+	m.pruneCompletedLocked(time.Now(), process)
+	close(process.done)
+}
+
 func (m *ProcessManager) pruneCompleted(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneCompletedLocked(now, nil)
+}
+
+func (m *ProcessManager) pruneCompletedLocked(now time.Time, finalizing *managedProcess) {
 	type completedProcess struct {
 		id       string
 		finished time.Time
 		process  *managedProcess
 	}
 	candidates := make([]completedProcess, 0)
-	m.mu.Lock()
 	for id, process := range m.processes {
 		process.mu.Lock()
 		active := activeProcessStatus(process.snapshot.Status)
 		completionPinned := process.completionOwnerID != "" && !process.completionAcknowledged
+		settled := process == finalizing || process.done == nil
+		if !settled {
+			select {
+			case <-process.done:
+				settled = true
+			default:
+			}
+		}
+		settled = settled && !process.settling && process.settlementErr == nil
 		finished := process.snapshot.StartedAt
 		if process.snapshot.FinishedAt != nil {
 			finished = *process.snapshot.FinishedAt
 		}
 		process.mu.Unlock()
-		if !active && !completionPinned {
+		if !active && !completionPinned && settled {
 			candidates = append(candidates, completedProcess{id: id, finished: finished, process: process})
 		}
 	}
@@ -751,7 +863,6 @@ func (m *ProcessManager) pruneCompleted(now time.Time) {
 			removed = append(removed, candidate.process)
 		}
 	}
-	m.mu.Unlock()
 	for _, process := range removed {
 		m.removeCompletedProcessFiles(process)
 	}
@@ -788,6 +899,7 @@ func (m *ProcessManager) removeCompletedProcessFiles(process *managedProcess) {
 
 func (m *ProcessManager) recoverSandboxProcesses() {
 	counts := map[string]int{}
+	var watchers []*managedProcess
 	for _, record := range m.Sandboxes.Records() {
 		spec, err := m.Sandboxes.Spec(record.SandboxID)
 		if err != nil {
@@ -810,7 +922,7 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 						process.snapshot.StopConfirmed = boolPointer(false)
 						process.snapshot.Background = true
 						counts[state.SandboxID]++
-						_ = m.persistProcess(process)
+						process.settlementErr = m.persistProcess(process)
 						close(process.done)
 						m.processes[process.snapshot.ID] = process
 						continue
@@ -828,10 +940,10 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 				if running {
 					process.snapshot.Background = true
 					counts[state.SandboxID]++
-					go m.watchRecoveredProcess(process)
+					watchers = append(watchers, process)
 				} else {
 					m.restoreRecoveredTerminalState(process, time.Now().UTC())
-					_ = m.persistProcess(process)
+					process.settlementErr = m.persistProcess(process)
 					close(process.done)
 				}
 			} else {
@@ -841,7 +953,14 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 		}
 	}
 	m.recoverHostCompletionTasks()
-	_ = m.Sandboxes.ReconcileProcesses(counts, time.Now())
+	if err := m.Sandboxes.ReconcileProcesses(counts, time.Now()); err != nil {
+		for _, process := range m.processes {
+			process.settlementErr = errors.Join(process.settlementErr, err)
+		}
+	}
+	for _, process := range watchers {
+		go m.watchRecoveredProcess(process)
+	}
 }
 
 func (m *ProcessManager) recoverHostCompletionTasks() {
@@ -870,7 +989,7 @@ func (m *ProcessManager) recoverHostCompletionTasks() {
 			process.snapshot.ExitCode = nil
 			process.snapshot.FinishedAt = &now
 			process.snapshot.StopConfirmed = nil
-			_ = m.persistProcess(process)
+			process.settlementErr = m.persistProcess(process)
 		}
 		close(process.done)
 		m.processes[process.snapshot.ID] = process
@@ -878,7 +997,8 @@ func (m *ProcessManager) recoverHostCompletionTasks() {
 }
 
 func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
-	defer close(process.done)
+	process.settleMu.Lock()
+	defer process.settleMu.Unlock()
 	for {
 		time.Sleep(time.Second)
 		running, err := m.sandboxProcessRunning(process)
@@ -887,7 +1007,12 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		}
 		now := time.Now().UTC()
 		process.mu.Lock()
-		if activeProcessStatus(process.snapshot.Status) {
+		if process.stopRequested {
+			process.snapshot.Status = "cancelled"
+			process.snapshot.FinishedAt = &now
+			process.snapshot.StopConfirmed = boolPointer(true)
+			process.mu.Unlock()
+		} else if activeProcessStatus(process.snapshot.Status) {
 			process.mu.Unlock()
 			m.restoreRecoveredTerminalState(process, now)
 		} else {
@@ -896,9 +1021,8 @@ func (m *ProcessManager) watchRecoveredProcess(process *managedProcess) {
 		if process.hostPIDFile != "" {
 			_ = os.Remove(process.hostPIDFile)
 		}
-		_ = m.persistProcess(process)
-		_ = m.Sandboxes.ProcessExited(process.sandboxID, now)
-		m.pruneCompleted(now)
+		settleErr := m.settleBackground(process)
+		m.finishProcess(process, errors.Join(settleErr, m.persistProcess(process)))
 		return
 	}
 }
@@ -996,32 +1120,6 @@ func (m *ProcessManager) stopSandboxProcess(process *managedProcess) (bool, erro
 	return true, nil
 }
 
-func (m *ProcessManager) stopHostProcess(process *managedProcess) bool {
-	process.mu.Lock()
-	pid := process.snapshot.PID
-	process.mu.Unlock()
-	if pid <= 1 {
-		return false
-	}
-	_ = syscall.Kill(-pid, syscall.SIGTERM)
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	_ = syscall.Kill(-pid, syscall.SIGKILL)
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return false
-}
-
 func (m *ProcessManager) stopProcess(process *managedProcess) bool {
 	process.mu.Lock()
 	target := process.snapshot.Target
@@ -1039,22 +1137,50 @@ func (m *ProcessManager) stopProcess(process *managedProcess) bool {
 	if target == "sandbox" {
 		confirmed, _ = m.stopSandboxProcess(process)
 	} else {
-		confirmed = m.stopHostProcess(process)
+		if process.cancel != nil {
+			process.cancel()
+		}
+		select {
+		case <-process.done:
+			process.mu.Lock()
+			confirmed = !activeProcessStatus(process.snapshot.Status) && process.settlementErr == nil
+			process.mu.Unlock()
+		case <-time.After(10 * time.Second):
+			return false
+		}
 	}
 	if process.cancel != nil {
 		process.cancel()
 	}
 	process.mu.Lock()
+	controllerDone := false
+	select {
+	case <-process.done:
+		controllerDone = true
+	default:
+	}
 	process.snapshot.StopConfirmed = boolPointer(confirmed)
-	if confirmed && process.command == nil {
+	process.mu.Unlock()
+	if confirmed && controllerDone {
+		process.settleMu.Lock()
+		process.mu.Lock()
+		if !activeProcessStatus(process.snapshot.Status) {
+			process.mu.Unlock()
+			process.settleMu.Unlock()
+			return confirmed
+		}
 		now := time.Now().UTC()
+		process.settling = true
 		process.snapshot.Status = "cancelled"
 		process.snapshot.FinishedAt = &now
-	}
-	process.mu.Unlock()
-	if confirmed && process.command == nil {
-		_ = m.persistProcess(process)
-		_ = m.Sandboxes.ProcessExited(process.sandboxID, time.Now())
+		process.mu.Unlock()
+		settleErr := m.settleBackground(process)
+		persistErr := m.persistProcess(process)
+		process.mu.Lock()
+		process.settlementErr = errors.Join(process.settlementErr, settleErr, persistErr)
+		process.settling = false
+		process.mu.Unlock()
+		process.settleMu.Unlock()
 	}
 	return confirmed
 }
@@ -1081,7 +1207,7 @@ func (m *ProcessManager) snapshot(process *managedProcess) ProcessSnapshot {
 }
 
 func readTailFile(path string, limit int64) (string, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", err
 	}
@@ -1133,19 +1259,23 @@ func (m *ProcessManager) List(scope, lifecycle string, target ...string) []Proce
 func (m *ProcessManager) listScopeFamily(scope, lifecycle string) []ProcessSnapshot {
 	m.pruneCompleted(time.Now())
 	m.mu.Lock()
-	values := make([]*managedProcess, 0, len(m.processes))
-	for _, process := range m.processes {
-		values = append(values, process)
-	}
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 	result := make([]ProcessSnapshot, 0)
-	for _, process := range values {
-		snapshot := m.snapshot(process)
+	for _, process := range m.processes {
+		process.mu.Lock()
+		snapshot := process.snapshot
+		process.mu.Unlock()
 		if scopeFamilyOwns(scope, snapshot.ScopeKey) && (lifecycle == "" || snapshot.LifecycleID == lifecycle) {
 			result = append(result, snapshot)
 		}
 	}
 	sortProcessSnapshots(result)
+	if len(result) > 16 {
+		result = result[:16]
+	}
+	for index := range result {
+		result[index] = m.snapshot(m.processes[result[index].ID])
+	}
 	return result
 }
 
@@ -1278,7 +1408,7 @@ func (m *ProcessManager) Wait(
 		return ProcessWaitResult{ProcessSnapshot: snapshot, WaitTimedOut: true}, nil
 	}
 }
-func (m *ProcessManager) Write(scope, lifecycle, target, id, input string) error {
+func (m *ProcessManager) Write(ctx context.Context, scope, lifecycle, target, id, input string) error {
 	m.mu.Lock()
 	p, ok := m.processes[id]
 	m.mu.Unlock()
@@ -1289,10 +1419,41 @@ func (m *ProcessManager) Write(scope, lifecycle, target, id, input string) error
 	if s.ScopeKey != scope || s.Target != target || (lifecycle != "" && s.LifecycleID != lifecycle) || !activeProcessStatus(s.Status) {
 		return errors.New("process is not running")
 	}
-	if p.stdin == nil {
+	p.mu.Lock()
+	if p.stdinGate == nil {
+		p.stdinGate = make(chan struct{}, 1)
+	}
+	gate := p.stdinGate
+	stdin, ok := p.stdin.(*os.File)
+	p.mu.Unlock()
+	if !ok {
 		return errors.New("input is unavailable for a process recovered after Manager restart")
 	}
-	_, err := io.WriteString(p.stdin, input)
+	select {
+	case gate <- struct{}{}:
+		defer func() { <-gate }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Go's pipe poller interrupts the blocked write without closing stdin or
+	// terminating a detached service. Join the callback before clearing its
+	// deadline so cancellation cannot affect the next serialized writer.
+	cancelled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = stdin.SetWriteDeadline(time.Now())
+		close(cancelled)
+	})
+	_, err := io.WriteString(stdin, input)
+	if !stop() {
+		<-cancelled
+	}
+	_ = stdin.SetWriteDeadline(time.Time{})
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return err
 }
 func (m *ProcessManager) Kill(scope, lifecycle, target, id string) (ProcessSnapshot, error) {
@@ -1538,10 +1699,11 @@ func confirmStopped(processes []*managedProcess, timeout time.Duration) bool {
 		all := true
 		for _, process := range processes {
 			process.mu.Lock()
-			running := activeProcessStatus(process.snapshot.Status)
+			running := activeProcessStatus(process.snapshot.Status) || process.settling
 			done := process.done
+			settlementErr := process.settlementErr
 			process.mu.Unlock()
-			if running {
+			if running || settlementErr != nil {
 				all = false
 				break
 			}
@@ -1618,11 +1780,16 @@ func (m *ProcessManager) Preview(scope, lifecycle, since string) map[string]any 
 	return map[string]any{"processes": previews, "revision": revision}
 }
 func (m *ProcessManager) RunningCount(scope, lifecycle string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	count := 0
-	for _, p := range m.listScopeFamily(scope, lifecycle) {
-		if activeProcessStatus(p.Status) {
+	for _, p := range m.processes {
+		p.mu.Lock()
+		s := p.snapshot
+		if scopeFamilyOwns(scope, s.ScopeKey) && (lifecycle == "" || s.LifecycleID == lifecycle) && activeProcessStatus(s.Status) {
 			count++
 		}
+		p.mu.Unlock()
 	}
 	return count
 }
@@ -1632,17 +1799,14 @@ func (m *ProcessManager) RunningCount(scope, lifecycle string) int {
 // such process delays an update; the Manager never terminates one for cutover.
 func (m *ProcessManager) ActiveBackgroundCount() int {
 	m.mu.Lock()
-	values := make([]*managedProcess, 0, len(m.processes))
-	for _, p := range m.processes {
-		values = append(values, p)
-	}
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 	count := 0
-	for _, p := range values {
-		s := m.snapshot(p)
-		if s.Background && activeProcessStatus(s.Status) {
+	for _, p := range m.processes {
+		p.mu.Lock()
+		if p.snapshot.Background && activeProcessStatus(p.snapshot.Status) {
 			count++
 		}
+		p.mu.Unlock()
 	}
 	return count
 }

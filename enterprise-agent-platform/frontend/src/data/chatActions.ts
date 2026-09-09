@@ -16,6 +16,7 @@ import {
   api,
   apiUpload,
   ApiRequestCancelledError,
+  isApiError,
   isApiRequestCancelled,
   type ApiOptions,
   type ApiUploadProgress,
@@ -55,6 +56,8 @@ import {
 import type {
   ActiveView,
   AgentApprovalChoice,
+  AgentApprovalRequest,
+  AgentApprovalSubmitRequest,
   AgentApprovalSubmitResponse,
   AgentStatus,
   AgentSessionCompactResponse,
@@ -728,30 +731,41 @@ export async function withdrawChannelMessage(
   }
 }
 
+/** Answer the approval the user is looking at. The request carries that exact
+ *  `run_id`/`approval_id`; a 409 means the Platform no longer holds this item as
+ *  the scope's pending approval, so the gesture is dropped and the scope is
+ *  resynchronized instead of being applied to whatever is pending now. */
 export async function respondAgentApproval(
   store: AppStore,
   mode: ChatMode,
   scopeId: string,
+  approval: AgentApprovalRequest,
   choice: AgentApprovalChoice,
 ): Promise<boolean> {
+  const body: AgentApprovalSubmitRequest = {
+    choice,
+    run_id: String(approval.run_id || ""),
+    approval_id: String(approval.approval_id || ""),
+  };
   try {
     await runStatusMutation(store, mode, scopeId, () =>
-      mode === "private"
-        ? api<AgentApprovalSubmitResponse>(endpoints.privateAgentApproval.path(), {
-            method: "POST",
-            body: JSON.stringify({ choice }),
-          })
-        : api<AgentApprovalSubmitResponse>(endpoints.channelAgentApproval.path(scopeId), {
-            method: "POST",
-            body: JSON.stringify({ choice }),
-          }),
+      api<AgentApprovalSubmitResponse>(
+        mode === "private"
+          ? endpoints.privateAgentApproval.path()
+          : endpoints.channelAgentApproval.path(scopeId),
+        { method: "POST", body: JSON.stringify(body) },
+      ),
     );
     await refreshActiveChat(store);
     toast(t("chat.approvalSubmitted"), { type: "ok", title: t("chat.approvalProcessed") });
     return true;
   } catch (error) {
     if (isApiRequestCancelled(error)) return false;
-    const text = error instanceof Error ? error.message || String(error) : String(error);
+    const outdated = isApiError(error, 409);
+    if (outdated) await refreshActiveChat(store);
+    const text = outdated
+      ? t("chat.approvalOutdated")
+      : error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });
     toast(text, { type: "error", title: t("chat.approvalFailed") });
     return false;

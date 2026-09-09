@@ -243,13 +243,6 @@ def _element_text(element: ElementTree.Element) -> str:
     ).strip()
 
 
-def _natural_key(value: str) -> tuple[object, ...]:
-    return tuple(
-        int(part) if part.isdigit() else part
-        for part in re.split(r"(\d+)", value)
-    )
-
-
 def _xlsx_sheet_parts(
     archive: zipfile.ZipFile,
     names: set[str],
@@ -378,14 +371,61 @@ def _extract_pptx_preview(
     archive: zipfile.ZipFile,
     names: set[str],
 ) -> dict[str, object]:
-    slides = sorted(
-        (
-            name
-            for name in names
-            if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
-        ),
-        key=_natural_key,
+    required = {"ppt/presentation.xml", "ppt/_rels/presentation.xml.rels"}
+    if not required.issubset(names):
+        raise AttachmentPreviewError("PPTX presentation metadata is missing")
+    relationships: dict[str, ElementTree.Element] = {}
+    for relationship in _root(
+        archive,
+        "ppt/_rels/presentation.xml.rels",
+        maximum=MAX_XLSX_PREVIEW_XML_BYTES,
+    ).iter():
+        if _local_name(relationship.tag) != "Relationship":
+            continue
+        relationship_id = str(relationship.attrib.get("Id") or "")
+        if not relationship_id or relationship_id in relationships:
+            raise AttachmentPreviewError("PPTX slide relationship is invalid")
+        relationships[relationship_id] = relationship
+
+    presentation = _root(
+        archive, "ppt/presentation.xml", maximum=MAX_XLSX_PREVIEW_XML_BYTES
     )
+    namespace_pairs = {
+        "http://schemas.openxmlformats.org/presentationml/2006/main":
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "http://purl.oclc.org/ooxml/presentationml/main":
+            "http://purl.oclc.org/ooxml/officeDocument/relationships",
+    }
+    presentation_namespace = presentation.tag.removesuffix("}presentation").removeprefix("{")
+    relationship_namespace = namespace_pairs.get(presentation_namespace)
+    if relationship_namespace is None:
+        raise AttachmentPreviewError("PPTX presentation metadata is invalid")
+    slides: list[str] = []
+    for slide in presentation.findall(
+        f"{{{presentation_namespace}}}sldIdLst/{{{presentation_namespace}}}sldId"
+    ):
+        relationship_id = slide.attrib.get(f"{{{relationship_namespace}}}id", "")
+        relationship = relationships.get(relationship_id)
+        if relationship is None:
+            raise AttachmentPreviewError("PPTX slide relationship is missing")
+        if relationship.attrib.get("Type") != f"{relationship_namespace}/slide":
+            raise AttachmentPreviewError("PPTX slide relationship type is invalid")
+        target = str(relationship.attrib.get("Target") or "")
+        if (
+            relationship.attrib.get("TargetMode", "Internal") != "Internal"
+            or not target
+            or any(character in target for character in "\\\\:%?#")
+            or target.startswith("//")
+        ):
+            raise AttachmentPreviewError("PPTX slide relationship is unsafe")
+        normalized = posixpath.normpath(
+            target.lstrip("/") if target.startswith("/") else f"ppt/{target}"
+        )
+        if not normalized.startswith("ppt/"):
+            raise AttachmentPreviewError("PPTX slide relationship is unsafe")
+        if normalized not in names:
+            raise AttachmentPreviewError("PPTX slide relationship is invalid")
+        slides.append(normalized)
     if not slides:
         raise AttachmentPreviewError("PPTX document contains no slides")
     truncated = len(slides) > MAX_PPTX_PREVIEW_SLIDES

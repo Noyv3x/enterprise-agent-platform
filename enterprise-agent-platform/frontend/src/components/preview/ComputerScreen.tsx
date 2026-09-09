@@ -44,7 +44,9 @@ export function ComputerScreen({
         </InlineAlert>
       ) : null}
       <div className={`computer-screen__viewport is-${surface.mode || "empty"}`}>
-        {surface.mode === "file" ? <FileComputerView scope={scope} file={surface.file} /> : null}
+        {surface.mode === "file" ? (
+          <FileComputerView scope={scope} runId={surface.runId} file={surface.file} />
+        ) : null}
         {surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} /> : null}
         {surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} /> : null}
         {surface.mode === "browser" ? (

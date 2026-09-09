@@ -25,6 +25,8 @@ manifest 必须最后公开，部署机不能看到半套资产。品牌配置�
 
 发布中的 draft 通过认证的 release identity 和数字 ID 读取、上传及复验；公开的按 tag REST 查询只用于已经可见的 release，不能作为发现 draft 的前提。这样发布任务在上传前、上传后和最终公开后始终校验同一个 release 对象。
 
+耗时的匿名拉取、下载和逐字节验证完成后，最终公开操作紧前必须再次核对同一 release 的资产身份/摘要、精确 source commit、Quality run/attempt 的成功状态，以及本次 Container run/attempt 的来源绑定。可观察到任何漂移都应在 draft 公开前拒绝；公开后的复验不能替代这一提交前边界。
+
 创建候选 lightweight tag 后，GitHub 控制面可能短暂返回 ref 不存在。发布器只对该次写后读取执行秒级、有界退避；可见后仍须验证 tag 精确指向候选 commit，超过预算、读到其它对象或其它 commit 都失败关闭，不能跳过验证或无限等待。
 
 ## 检测与预拉取
@@ -41,6 +43,8 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 - Manager version 等于 source commit，工件 basename、SHA-256 与只读 `version` 输出一致；
 - Compose 和所有镜像都由完整 digest 固定。
 
+候选数据库 schema 不得低于 Current 的已提交版本。该比较既在无副作用的接受边界执行，也在实际更新进入预拉取、Manager 准备或维护之前复验；显式 rollback 继续使用它自己的已验证快照恢复语义。相同 schema 的 Git 先后关系仍由既有发布通道证明，不按 commit 字符串或构建时间猜测。
+
 核心镜像在进入维护前预拉取。Manager 先检查本地 RepoDigest，本地已有精确 digest 时不访问 registry。拉取使用“无进展超时 + 较大的绝对上限”；有持续字节进展不会被固定四分钟墙钟中断。原始 registry 输出只用于有界、脱敏诊断，不递归写入长期错误。
 
 预拉取前与切换前分别检查磁盘空间和 inode。空间不足是可重试失败，不进入维护；后续空间恢复后自动重试。
@@ -48,6 +52,8 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 ## 排队与维护
 
 发现更新后先建立持久 operation。存在运行中或排队的 Agent job、审批、文件提交、浏览器接管、后台学习或其它已准入副作用时，状态为 `waiting_for_tasks`；Manager 不停止服务，也不领取新的更新所有权。
+
+operation-first 的准入发布必须可恢复：若 operation 已耐久保存、state 所有权尚未提交时进程退出，重新打开 journal 只能在完整请求、精确 expected/next generation、唯一 pending 且尚未进入副作用阶段的证据闭合时补完同一 operation 的所有权。未知或冲突的孤立记录失败关闭，不能永久返回无人执行的 pending，也不能任意删除证据或自动重做已开始的操作。
 
 达到自然空闲点后，Manager 用同一 operation id 取得 Platform reservation，并按顺序完成：
 
@@ -100,6 +106,8 @@ Manager 自更新失败时，previous Manager 恢复并由原 Platform operation
 - 已停止且超过保留期的无用受管容器与空网络资源。
 
 删除前重新校验 owner、类型、link count、路径、inode、label、digest 和保护 epoch；状态变化即保留。清理按小批次执行并记录有界错误，一类失败不阻止其它独立类别。禁止 `docker system prune`、全局 image/volume/network prune、通配删除或触碰无法证明由本部署拥有的对象。
+
+递归目录清理必须保留发现时的目录/条目身份，在取得 removal guard 后用固定父目录和候选 fd 复验同一对象，并只相对这些 fd 删除已经验证的条目。不能在 guard 之后重新按可替换路径执行 `RemoveAll`；新对象、未知条目和身份漂移必须保留。
 
 Docker 空间达到预警阈值时，Manager 优先运行安全清理，再决定是否预拉取新版本；仍不足则保持 current 服务并报告可重试空间错误。日志按大小和数量轮转。
 

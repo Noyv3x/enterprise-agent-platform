@@ -683,7 +683,17 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 		if _, staging := snapshotStagingOperationID(entry.Name()); staging {
 			path := filepath.Join(s.BackupDir, entry.Name())
 			info, infoErr := entry.Info()
-			if infoErr != nil || now.Sub(info.ModTime()) <= stagingRetention || validateSnapshotStaging(path) != nil {
+			if infoErr != nil || now.Sub(info.ModTime()) <= stagingRetention {
+				continue
+			}
+			plan, planErr := atomicfile.PlanDirectoryRemoval(path, func() error {
+				current, err := os.Lstat(path)
+				if err != nil || !os.SameFile(info, current) || now.Sub(current.ModTime()) <= stagingRetention {
+					return errors.New("snapshot staging identity or age changed")
+				}
+				return validateSnapshotStaging(path)
+			})
+			if planErr != nil {
 				continue
 			}
 			releaseGuard := func() {}
@@ -694,7 +704,10 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 					continue
 				}
 			}
-			err := removeSnapshotStaging(path)
+			err := ctx.Err()
+			if err == nil {
+				err = plan.Remove()
+			}
 			releaseGuard()
 			if err != nil {
 				return removed, err
@@ -713,22 +726,20 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 		if _, keep := canonicalProtected[filepath.Clean(absolute)]; keep {
 			continue
 		}
-		clean, _, validateErr := s.validateSnapshot(ctx, path)
-		if validateErr != nil {
-			continue
-		}
+		var clean string
 		var manifest Manifest
-		if readErr := atomicfile.ReadJSON(filepath.Join(clean, "manifest.json"), &manifest); readErr != nil {
+		plan, planErr := atomicfile.PlanDirectoryRemoval(path, func() error {
+			var validateErr error
+			clean, _, validateErr = s.validateSnapshot(ctx, path)
+			if validateErr != nil {
+				return validateErr
+			}
+			return atomicfile.ReadJSON(filepath.Join(clean, "manifest.json"), &manifest)
+		})
+		if planErr != nil {
 			continue
 		}
 		if manifest.CreatedAt.IsZero() || now.Sub(manifest.CreatedAt) <= retention {
-			continue
-		}
-		// Revalidate at the deletion boundary. A failed or interrupted snapshot
-		// writer may have left new evidence after the first verification; such a
-		// directory must be retained rather than recursively removed.
-		rechecked, _, recheckErr := s.validateSnapshot(ctx, clean)
-		if recheckErr != nil || rechecked != clean {
 			continue
 		}
 		releaseGuard := func() {}
@@ -739,7 +750,10 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 				continue
 			}
 		}
-		err := os.RemoveAll(rechecked)
+		err := ctx.Err()
+		if err == nil {
+			err = plan.Remove()
+		}
 		releaseGuard()
 		if err != nil {
 			return removed, err

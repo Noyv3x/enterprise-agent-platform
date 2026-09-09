@@ -211,7 +211,11 @@ export class RunCoordinator {
   private readonly activeTopLevelRuns = new Set<string>();
   private readonly childRuns = new Set<string>();
   private readonly scopeCleanupFences = new Set<ScopeCleanupFence>();
-  private readonly sessionCompactionFences = new Set<string>();
+  private readonly sessionCompactionFences = new Map<string, {
+    scopeKey: string;
+    lifecycleId: string;
+    settled: Promise<void>;
+  }>();
   private readonly forcedReviewReasons = new Map<string, string>();
   private readonly unattendedAuthorizationBlocks = new Map<string, Map<string, UnattendedAuthorizationBlockQueue>>();
   private readonly runActivities = new Map<string, RunActivityState>();
@@ -294,7 +298,6 @@ export class RunCoordinator {
       ) {
         throw new RunValidationError("execution_context conflicts with the established scope identity");
       }
-      this.scopeExecutionContexts.set(contextKey, structuredClone(request.execution_context));
     }
     const idempotencyKey = runIdempotencyKey(request);
     if (idempotencyKey) {
@@ -321,6 +324,16 @@ export class RunCoordinator {
     };
     const journal = new EventJournal(runId);
     const completion = deferred(record);
+    const attachmentPaths = resolvedAttachmentPaths(record.request.workspace, record.request.attachments);
+    if (idempotencyKey) {
+      this.idempotency.create(request.scope_key, idempotencyValue(request)!, runId, request.session_id, this.config.runRetentionMs);
+    }
+    if (request.execution_context) {
+      this.scopeExecutionContexts.set(
+        scopeExecutionContextKey(request.scope_key, request.lifecycle_id),
+        structuredClone(request.execution_context),
+      );
+    }
     this.runs.set(runId, record);
     this.runActivities.set(runId, {
       lastActivityAt: now,
@@ -330,15 +343,11 @@ export class RunCoordinator {
     this.journals.set(runId, journal);
     this.completions.set(runId, completion);
     this.runInputs.set(runId, new Map());
-    this.runAttachmentPaths.set(
-      runId,
-      resolvedAttachmentPaths(record.request.workspace, record.request.attachments),
-    );
+    this.runAttachmentPaths.set(runId, attachmentPaths);
     if (acceptsInteractiveInputs(record)) this.acceptingInputs.add(runId);
     if (childRun) this.childRuns.add(runId);
     if (idempotencyKey) {
       this.idempotencyIndex.set(idempotencyKey, runId);
-      this.idempotency.create(request.scope_key, idempotencyValue(request)!, runId, request.session_id, this.config.runRetentionMs);
     }
     journal.publish("run.queued", { status: "queued" });
     if (childRun) queueMicrotask(() => void this.execute(record));
@@ -539,6 +548,13 @@ export class RunCoordinator {
       if (matching.some((record) => !isTerminal(record.status))) {
         throw new Error("Agent run cancellation could not be confirmed");
       }
+      // Do not hold session or mutation locks while waiting: compaction needs
+      // both to finish its archive-first commit. The admission fence above
+      // prevents a new compaction from replacing the snapshot we await.
+      await Promise.all([...this.sessionCompactionFences.values()]
+        .filter((compaction) => scopeOwns(scopeKey, compaction.scopeKey)
+          && (!lifecycleId || lifecycleId === compaction.lifecycleId))
+        .map((compaction) => compaction.settled));
       await this.approvals.clearScope(scopeKey, lifecycleId);
       const cleaned = await this.executor.cleanupScope({
         scope_id: scopeKey,
@@ -611,11 +627,14 @@ export class RunCoordinator {
     if (this.sessionCompactionFences.has(fenceKey) || this.hasActiveSessionRun(identity)) {
       throw new SessionBusyError("Agent session is busy");
     }
+    this.assertScopeAvailable(summaryRequest);
 
     // The fence is installed before the first await. createRun() is synchronous
     // through its registration boundary, so no matching Run can slip between
     // the busy check and the journal lock.
-    this.sessionCompactionFences.add(fenceKey);
+    let releaseCompaction!: () => void;
+    const settled = new Promise<void>((resolve) => { releaseCompaction = resolve; });
+    this.sessionCompactionFences.set(fenceKey, { scopeKey, lifecycleId, settled });
     try {
       return await this.sessions.withSessionLock(identity, async () => {
         if (signal?.aborted) throw abortError();
@@ -696,6 +715,7 @@ export class RunCoordinator {
       });
     } finally {
       this.sessionCompactionFences.delete(fenceKey);
+      releaseCompaction();
     }
   }
 
@@ -880,17 +900,25 @@ export class RunCoordinator {
   }
 
   private async execute(record: RunRecord): Promise<void> {
-    await this.sessions.withSessionLock(
-      sessionIdentity(record.request),
-      async () => await this.executeInSession(record),
-    );
+    try {
+      await this.sessions.withSessionLock(
+        sessionIdentity(record.request),
+        async () => await this.executeInSession(record),
+      );
+    } catch (error) {
+      record.controller.abort();
+      this.agents.get(record.id)?.abort();
+      this.approvals.cancelRun(record.id);
+      void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
+      this.finish(record, record.sideEffectsStarted ? "needs_review" : "failed", errorMessage(error));
+    }
   }
 
   private async executeInSession(record: RunRecord): Promise<void> {
     if (record.controller.signal.aborted || isTerminal(record.status)) return;
-    record.status = "running";
-    record.updatedAt = Date.now();
-    this.persistRunStatus(record);
+    const started = { ...record, status: "running" as const, updatedAt: Date.now() };
+    this.persistRunStatus(started);
+    Object.assign(record, started);
     const journal = this.journals.get(record.id)!;
     const learningReview = isLearningReviewRun(record.request);
     journal.publish("run.started", { status: "running" });
@@ -2063,7 +2091,6 @@ export class RunCoordinator {
       });
     }
     this.agents.get(record.id)?.clearSteeringQueue();
-    this.persistRunStatus(record);
   }
 
   private rememberUnattendedAuthorizationBlock(runId: string, toolCallId: string, reason: string): void {
@@ -2352,10 +2379,24 @@ export class RunCoordinator {
   private finish(record: RunRecord, status: RunRecord["status"], error?: string, data: JsonObject = {}): void {
     if (isTerminal(record.status) && record.status !== "running") return;
     this.closeInputs(record, error || `Run ${status}`);
-    record.status = status;
-    record.updatedAt = Date.now();
-    if (error) record.error = error;
-    this.persistRunStatus(record);
+    const candidate = { ...record, status, updatedAt: Date.now(), ...(error ? { error } : {}) };
+    let persisted = false;
+    try {
+      this.persistRunStatus(candidate);
+      persisted = true;
+    } catch (commitError) {
+      // Keep the last durable evidence and the live result. An uncertain
+      // terminal commit must never be rewritten as success or later deleted.
+      status = "needs_review";
+      error = `${error ? `${error}; ` : ""}Run state could not be persisted: ${errorMessage(commitError)}`;
+      candidate.status = status;
+      candidate.error = error;
+      record.controller.abort();
+      this.agents.get(record.id)?.abort();
+      this.approvals.cancelRun(record.id);
+      void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
+    }
+    Object.assign(record, candidate);
     const eventType = status === "needs_review" ? "run.needs_review" : `run.${status}`;
     this.journals.get(record.id)?.publish(eventType, {
       status,
@@ -2366,11 +2407,21 @@ export class RunCoordinator {
     this.runActivities.delete(record.id);
     this.runAttachmentPaths.delete(record.id);
     this.completions.get(record.id)?.resolve(record);
-    this.scheduleRetention(record, Date.now() + this.config.runRetentionMs);
+    if (persisted) this.scheduleRetention(record, Date.now() + this.config.runRetentionMs);
   }
 
   private scheduleRetention(record: RunRecord, expiresAt: number): void {
     const timer = setTimeout(() => {
+      const idempotencyKey = runIdempotencyKey(record.request);
+      if (idempotencyKey && this.idempotencyIndex.get(idempotencyKey) === record.id) {
+        try {
+          this.idempotency.delete(record.request.scope_key, idempotencyValue(record.request)!, record.id);
+        } catch {
+          // Retain the replay and all evidence when durable deletion failed.
+          return;
+        }
+        this.idempotencyIndex.delete(idempotencyKey);
+      }
       this.runs.delete(record.id);
       this.journals.delete(record.id);
       this.completions.delete(record.id);
@@ -2383,11 +2434,6 @@ export class RunCoordinator {
       this.acceptingInputs.delete(record.id);
       this.turnIndexes.delete(record.id);
       this.runActivities.delete(record.id);
-      const idempotencyKey = runIdempotencyKey(record.request);
-      if (idempotencyKey && this.idempotencyIndex.get(idempotencyKey) === record.id) {
-        this.idempotencyIndex.delete(idempotencyKey);
-        this.idempotency.delete(record.request.scope_key, idempotencyValue(record.request)!, record.id);
-      }
     }, Math.max(1, expiresAt - Date.now()));
     timer.unref();
   }
@@ -2448,9 +2494,6 @@ export class RunCoordinator {
     };
     const journal = new EventJournal(record.id);
     const converted = status !== persisted.status || error !== persisted.error;
-    this.runs.set(record.id, record);
-    this.journals.set(record.id, journal);
-    this.completions.set(record.id, deferred(record));
     const restoredInputs = new Map<string, AcceptedRunInput>();
     for (const [messageId, input] of Object.entries(persisted.inputs ?? {})) {
       if (
@@ -2475,6 +2518,28 @@ export class RunCoordinator {
         queued: restoredState === "injected",
       });
     }
+    if (converted) {
+      this.idempotency.update(request.scope_key, idempotencyValue(request)!, {
+        status,
+        retentionMs: this.config.runRetentionMs,
+        ...(result ? { result } : {}),
+        ...(error ? { error } : {}),
+        inputs: Object.fromEntries([...restoredInputs].map(([messageId, input]) => [
+          messageId, { fingerprint: input.fingerprint, state: input.state as RunInputState },
+        ])),
+      });
+    }
+    // The request identity was validated before recovery. Publish it only after
+    // any durable interrupted-run conversion succeeds, just like new admission.
+    if (request.execution_context) {
+      this.scopeExecutionContexts.set(
+        scopeExecutionContextKey(request.scope_key, request.lifecycle_id),
+        structuredClone(request.execution_context),
+      );
+    }
+    this.runs.set(record.id, record);
+    this.journals.set(record.id, journal);
+    this.completions.set(record.id, deferred(record));
     this.runInputs.set(record.id, restoredInputs);
     this.idempotencyIndex.set(mapKey, record.id);
     journal.publish("run.reused", { status, persisted: true });
@@ -2495,7 +2560,6 @@ export class RunCoordinator {
       ...this.inputSummary(record.id),
       ...(error ? { error } : {}),
     });
-    if (converted) this.persistRunStatus(record);
     this.scheduleRetention(record, converted ? Date.now() + this.config.runRetentionMs : persisted.expires_at);
     return record;
   }

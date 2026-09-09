@@ -143,6 +143,7 @@ export function agentStatusFingerprint(status: AgentStatus | null | undefined): 
     approval: status.approval
       ? {
           run_id: status.approval.run_id || "",
+          approval_id: status.approval.approval_id || "",
           command: status.approval.command || "",
           description: status.approval.description || "",
           choices: status.approval.choices || [],

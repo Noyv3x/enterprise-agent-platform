@@ -14,7 +14,13 @@
   },
   "overrides": {
     "@askjo/camofox-browser": {
-      "camoufox-js": "0.10.2",
+      "camoufox-js": {
+        ".": "0.10.2",
+        "adm-zip": "0.6.0"
+      },
+      "express": {
+        "qs": "6.16.0"
+      },
       "playwright-core": "1.59.1"
     }
   }

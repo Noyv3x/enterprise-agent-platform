@@ -76,6 +76,12 @@ func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, erro
 		}
 		args.DisplayCommand = presentation.Command
 		args.PrivateOutput = true
+	} else {
+		command, ok := record.Details["command"].(string)
+		if !ok || command == "" {
+			return nil, errors.New("terminal audit requires a safe command projection")
+		}
+		args.DisplayCommand = redactRetainedText(command)
 	}
 	if err := s.Audits.Started(call, map[string]any{"operation": record.Operation, "arguments": record.Details}); err != nil {
 		return nil, err
@@ -223,7 +229,7 @@ func (s *Service) Process(ctx context.Context, call Call) (map[string]any, error
 	case "read":
 		result, err = s.Processes.Get(call.ScopeID, call.LifecycleID, call.Target, processID)
 	case "write":
-		err = s.Processes.Write(call.ScopeID, call.LifecycleID, call.Target, processID, input)
+		err = s.Processes.Write(ctx, call.ScopeID, call.LifecycleID, call.Target, processID, input)
 		result = map[string]any{"message": "Input sent"}
 	case "kill":
 		result, err = s.Processes.Kill(call.ScopeID, call.LifecycleID, call.Target, processID)

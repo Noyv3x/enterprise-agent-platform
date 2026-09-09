@@ -253,7 +253,7 @@ class AgentScopeManager:
             raise sqlite3.DatabaseError(
                 "Agent Runtime current alias is missing from the current baseline"
             )
-        self._assert_scope_markers()
+        self._assert_scope_markers(publish=self._schema_writes_enabled)
 
     @staticmethod
     def private_scope_key(user_id: int) -> str:
@@ -332,7 +332,7 @@ class AgentScopeManager:
                     + str(row["scope_key"])
                 )
 
-    def _assert_scope_markers(self) -> None:
+    def _assert_scope_markers(self, *, publish: bool = False) -> None:
         rows = self.db.query(_SCOPE_SELECT + " ORDER BY scopes.scope_key")
         expected_count = int(self.db.scalar("SELECT COUNT(*) FROM agent_scopes") or 0)
         if len(rows) != expected_count:
@@ -346,6 +346,8 @@ class AgentScopeManager:
                 scope.scope_id,
             )
             self._require_scope_marker(scope)
+            if publish:
+                self._write_scope_marker(scope)
 
     def _missing_current_runtime_aliases(self) -> list[tuple[str, str, str, int]]:
         rows = self.db.query(
@@ -380,7 +382,7 @@ class AgentScopeManager:
             raise sqlite3.DatabaseError(
                 "Agent Runtime current alias is missing from the current baseline"
             )
-        self._assert_scope_markers()
+        self._assert_scope_markers(publish=True)
         self._schema_writes_enabled = True
 
     def release_schema_write_gate_after_abort(self) -> None:
@@ -494,6 +496,7 @@ class AgentScopeManager:
             self._require_scope_marker(
                 existing,
             )
+            self._write_scope_marker(existing)
             with self._scope_cache_lock:
                 self._scope_cache[scope_key] = existing
             return existing
@@ -804,6 +807,9 @@ class AgentScopeManager:
                 if self._scope_marker_payload_matches(
                     actual, self._scope_marker_payload(scope)
                 ):
+                    publish_private_file_at(
+                        directory_fd, marker.name, raw, replace_identity=None,
+                    )
                     self._cleanup_scope_marker_residue(
                         scope,
                         final_raw=raw,

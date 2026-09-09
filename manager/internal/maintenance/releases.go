@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -52,6 +51,7 @@ type verifiedRelease struct {
 	path     string
 	manifest release.Manifest
 	images   []string
+	removal  *atomicfile.DirectoryRemoval
 }
 
 // PruneReleases removes only expired immutable release directories whose
@@ -75,7 +75,7 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 		return 0, err
 	}
 	candidates := make([]verifiedRelease, 0)
-	staging := make([]string, 0)
+	staging := make(map[string]*atomicfile.DirectoryRemoval)
 	allImages := map[string]struct{}{}
 	protectedImages := cloneStringSet(policy.ProtectedImages)
 	var pruneErr error
@@ -88,8 +88,17 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 		if validReleaseStagingName(entry.Name()) && entry.Type()&os.ModeSymlink == 0 && entry.IsDir() {
 			info, infoErr := entry.Info()
 			path := filepath.Join(policy.Root, entry.Name())
-			if infoErr == nil && now.Sub(info.ModTime()) > retention && validateReleaseStaging(path) == nil {
-				staging = append(staging, path)
+			if infoErr == nil && now.Sub(info.ModTime()) > retention {
+				plan, planErr := atomicfile.PlanDirectoryRemoval(path, func() error {
+					current, err := os.Lstat(path)
+					if err != nil || !os.SameFile(info, current) || now.Sub(current.ModTime()) <= retention {
+						return errors.New("release staging identity or age changed")
+					}
+					return validateReleaseStaging(path)
+				})
+				if planErr == nil {
+					staging[path] = plan
+				}
 			}
 			continue
 		}
@@ -124,11 +133,17 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 				continue
 			}
 		}
-		item, verifyErr := verifyRelease(path, entry.Name(), policy.Channel, active)
+		var item verifiedRelease
+		plan, verifyErr := atomicfile.PlanDirectoryRemoval(path, func() error {
+			var err error
+			item, err = verifyRelease(path, entry.Name(), policy.Channel, active)
+			return err
+		})
 		if verifyErr != nil {
 			protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
 			continue
 		}
+		item.removal = plan
 		if item.manifest.GeneratedAt.IsZero() || now.Sub(item.manifest.GeneratedAt) <= retention {
 			protectImages(item.images, protectedImages)
 			continue
@@ -150,14 +165,11 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 		candidates = append(candidates, item)
 	}
 	removed := 0
-	for _, path := range staging {
+	for path, plan := range staging {
 		select {
 		case <-ctx.Done():
 			return removed, errors.Join(ctx.Err(), pruneErr)
 		default:
-		}
-		if err := validateReleaseStaging(path); err != nil {
-			continue
 		}
 		releaseGuard := func() {}
 		if policy.RemovalGuard != nil {
@@ -167,7 +179,10 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 				continue
 			}
 		}
-		err := os.RemoveAll(path)
+		err := ctx.Err()
+		if err == nil {
+			err = plan.Remove()
+		}
 		releaseGuard()
 		if err != nil {
 			pruneErr = errors.Join(pruneErr, fmt.Errorf("remove abandoned release staging %s: %w", filepath.Base(path), err))
@@ -194,10 +209,6 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 			if !safe {
 				continue
 			}
-			rechecked, verifyErr := verifyRelease(item.path, item.manifest.ID(), policy.Channel, active)
-			if verifyErr != nil || !sameStrings(rechecked.images, item.images) || rechecked.manifest.Compose.SHA256 != item.manifest.Compose.SHA256 {
-				continue
-			}
 			releaseGuard := func() {}
 			if policy.RemovalGuard != nil {
 				var ok bool
@@ -206,7 +217,10 @@ func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (in
 					continue
 				}
 			}
-			err := os.RemoveAll(rechecked.path)
+			err := ctx.Err()
+			if err == nil {
+				err = item.removal.Remove()
+			}
 			releaseGuard()
 			if err != nil {
 				pruneErr = errors.Join(pruneErr, fmt.Errorf("remove obsolete release %s: %w", item.manifest.ID(), err))
@@ -425,10 +439,6 @@ func protectReleaseCoreImages(path, expectedID, channel string, active identity.
 	if err == nil {
 		protectImages(item.images, protected)
 	}
-}
-
-func sameStrings(left, right []string) bool {
-	return slices.Equal(left, right)
 }
 
 func readRegularFile(path string, limit int64) ([]byte, error) {

@@ -172,4 +172,18 @@ describe("agentStatusFingerprint", () => {
     });
     expect(after).not.toEqual(before);
   });
+
+  it("observes an approval whose only change is its identity", () => {
+    const status: AgentStatus = {
+      state: "approval",
+      run_id: "run-A",
+      approval: { run_id: "run-A", approval_id: "approval-A", command: "printf harmless", choices: ["once"] },
+    };
+    const before = agentStatusFingerprint(status);
+    const after = agentStatusFingerprint({
+      ...status,
+      approval: { ...status.approval, approval_id: "approval-B" },
+    });
+    expect(after).not.toEqual(before);
+  });
 });

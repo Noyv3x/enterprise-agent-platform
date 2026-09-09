@@ -165,7 +165,7 @@ func TestTerminalStartAdmissionPrecedesAuditReceiptConsumption(t *testing.T) {
 	arguments, _ := json.Marshal(terminalArguments{Command: "true"})
 	request := AuditRequest{
 		Identity: identity(), AuditID: "audit-cleanup-fence", Target: "host",
-		Operation: "terminal", Action: "run", Arguments: arguments, Details: map[string]any{},
+		Operation: "terminal", Action: "run", Arguments: arguments, Details: map[string]any{"command": "true"},
 	}
 	receipt, err := service.Audit(request)
 	if err != nil {

@@ -867,6 +867,55 @@ class ScheduleServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_overlap_retains_current_decision_and_needs_review_pause(self):
+        class HeldReviewAgent(BlockingAgent):
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("run_started_callback"):
+                    kwargs["run_started_callback"]("held-scheduled-run")
+                self.started.set()
+                if not self.release.wait(timeout=10):
+                    raise AssertionError("scheduled execution was not released")
+                raise AgentRuntimeRunError(
+                    "held-scheduled-run", "needs_review", "occurrence requires review",
+                    session_id=kwargs["session_id"], raw={"terminal_event": "run.needs_review"},
+                )
+
+        with tempfile.TemporaryDirectory() as td:
+            agent = HeldReviewAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                schedule = self._create(service, actor)
+                initial = service.schedules.get(actor["id"], schedule["id"])
+                accepted = service._materialize_schedule_occurrence(
+                    schedule["id"], scheduled_for=int(initial["next_run_at"]),
+                    trigger="scheduled", expected_revision=int(initial["revision"]),
+                )
+                run_id = int(accepted["run"]["id"])
+                self.assertTrue(agent.started.wait(timeout=3))
+                current = service.schedules.get(actor["id"], schedule["id"])
+                skipped = service._materialize_schedule_occurrence(
+                    schedule["id"], scheduled_for=int(current["next_run_at"]),
+                    trigger="scheduled", expected_revision=int(current["revision"]),
+                )
+                self.assertEqual(skipped["run"]["status"], "skipped")
+                context = self._complete_current_context(service, actor, schedule["id"], run_id)
+                decision = service.invoke_agent_runtime_tool({
+                    "tool": "schedule", "action": "continue_current", "arguments": {}, "context": context,
+                })["data"]
+                self.assertTrue(decision["continued"])
+                agent.release.set()
+                service.wait_for_agent_idle("private", str(actor["id"]), timeout=5)
+                self.assertEqual(service.schedules.get_run(run_id)["status"], "needs_review")
+                paused = service.schedules.get(actor["id"], schedule["id"])
+                self.assertEqual(paused["state"], "paused")
+                self.assertEqual(paused["enabled"], 0)
+                self.assertIsNone(paused["next_run_at"])
+            finally:
+                agent.release.set()
+                service.close()
+
     def test_overlap_is_skipped_and_manual_overlap_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()

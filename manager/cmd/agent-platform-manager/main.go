@@ -155,6 +155,8 @@ func run(arguments []string) int {
 	}
 	var err error
 	switch command {
+	case "inspect-release":
+		err = inspectReleaseCommand(arguments[1:], os.Stdout)
 	case "serve":
 		err = serveCommand(arguments[1:])
 	case "preflight":
@@ -186,7 +188,7 @@ func run(arguments []string) int {
 func usage() {
 	profile := identity.TargetProfile()
 	fmt.Fprintln(os.Stderr, managerDisplayName)
-	fmt.Fprintf(os.Stderr, "usage: %s <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|logs|version> [options]\n", profile.ManagerBinary)
+	fmt.Fprintf(os.Stderr, "usage: %s <serve|preflight|install|status|check|update|restart|rollback|repair|recover-current|logs|inspect-release|version> [options]\n", profile.ManagerBinary)
 }
 
 func commonFlags(name string) (*flag.FlagSet, *string) {

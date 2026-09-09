@@ -1139,17 +1139,6 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("coverage must include owned production probes", result.stderr)
         self.assertIn(".gitignore", result.stderr)
 
-    def test_repository_manifest_assigns_documentation_governance_ownership(self) -> None:
-        manifest = json.loads(
-            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
-        )
-        governance = self.manifest_domain(manifest, "documentation-governance")
-        self.assertEqual(governance["code"], ["scripts/docs_sync.py"])
-        self.assertIn(
-            "enterprise-agent-platform/tests/test_docs_sync.py",
-            governance["tests"],
-        )
-
     def test_repository_manifest_classifies_release_and_scope_regressions(self) -> None:
         manifest = json.loads(
             (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")

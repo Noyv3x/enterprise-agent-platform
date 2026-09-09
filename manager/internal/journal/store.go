@@ -88,6 +88,7 @@ type Store struct {
 	operations         string
 	mu                 sync.Mutex
 	state              model.ManagerState
+	stateUncertain     bool
 	beforePersistState func(model.ManagerState) error
 }
 
@@ -106,9 +107,19 @@ func Open(dir string, now time.Time) (*Store, error) {
 		return nil, fmt.Errorf("unsupported manager state schema %d", store.state.SchemaVersion)
 	}
 	if _, err := os.Stat(store.statePath); os.IsNotExist(err) {
+		entries, readErr := os.ReadDir(store.operations)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if len(entries) != 0 {
+			return nil, errors.New("operation journal exists without manager state")
+		}
 		if err := store.persistStateLocked(); err != nil {
 			return nil, err
 		}
+	}
+	if err := store.reconcileAdmissionLocked(); err != nil {
+		return nil, err
 	}
 	return store, nil
 }
@@ -154,6 +165,9 @@ func (s *Store) StateWithReferencedOperation() (model.ManagerState, *model.Opera
 func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (model.ManagerState, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return model.ManagerState{}, err
+	}
 	next := cloneState(s.state)
 	if err := fn(&next); err != nil {
 		return model.ManagerState{}, err
@@ -173,6 +187,9 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	defer s.mu.Unlock()
 	if req.IdempotencyKey == "" {
 		return model.Operation{}, false, errors.New("idempotency_key is required")
+	}
+	if err := s.reconcileAdmissionLocked(); err != nil {
+		return model.Operation{}, false, err
 	}
 	attempt := 1
 	if existing, ok, err := s.findByIdempotencyLocked(req.IdempotencyKey); err != nil {
@@ -214,6 +231,9 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 		Status: model.OperationPending, Phase: model.PhaseValidating,
 		History: []model.PhaseEvent{{Phase: model.PhaseValidating, At: now.UTC()}}, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
+	// Either publication can have committed before returning an error.
+	// Until both succeed, every state writer must reconcile before cloning.
+	s.stateUncertain = true
 	if err := s.persistOperationLocked(&op); err != nil {
 		return model.Operation{}, false, err
 	}
@@ -223,7 +243,8 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	next.Phase = op.Phase
 	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
 	if err := s.persistStateValueLocked(&next); err != nil {
-		_ = os.Remove(s.operationPath(op.ID))
+		// A rename may have committed state before directory sync failed.
+		// Keep the operation evidence; the next admission reconciles disk state.
 		return model.Operation{}, false, err
 	}
 	s.state = next
@@ -252,6 +273,14 @@ func (s *Store) Operation(id string) (model.Operation, error) {
 func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	operations, err := s.unfinishedOperationsLocked()
+	for index := range operations {
+		operations[index] = BoundOperation(operations[index])
+	}
+	return operations, err
+}
+
+func (s *Store) unfinishedOperationsLocked() ([]model.Operation, error) {
 	if err := s.cleanupOperationAtomicResiduesLocked(); err != nil {
 		return nil, err
 	}
@@ -277,10 +306,10 @@ func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 		}
 		switch op.Status {
 		case model.OperationPending, model.OperationRunning:
-			unfinished = append(unfinished, BoundOperation(op))
+			unfinished = append(unfinished, op)
 		case model.OperationSucceeded, model.OperationFailed:
 			if !op.Finalized {
-				unfinished = append(unfinished, BoundOperation(op))
+				unfinished = append(unfinished, op)
 			}
 		default:
 			return nil, fmt.Errorf("operation journal %s has unknown status %q", entry.Name(), op.Status)
@@ -295,6 +324,9 @@ func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.PublicState, maintenance bool, note string, now time.Time) (model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return model.Operation{}, err
+	}
 	op, err := s.readOperationLocked(id)
 	if err != nil {
 		return model.Operation{}, err
@@ -339,6 +371,9 @@ func (s *Store) UpdateOperation(id string, fn func(*model.Operation) error) (mod
 func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerState), message string, now time.Time) (model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return model.Operation{}, err
+	}
 	op, err := s.readOperationLocked(id)
 	if err != nil {
 		return model.Operation{}, err
@@ -379,6 +414,9 @@ func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerSta
 func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return model.Operation{}, err
+	}
 	op, err := s.readOperationLocked(id)
 	if err != nil {
 		return model.Operation{}, err
@@ -446,13 +484,18 @@ func (s *Store) operationPath(id string) string {
 
 func (s *Store) persistStateLocked() error { return s.persistStateValueLocked(&s.state) }
 func (s *Store) persistStateValueLocked(value *model.ManagerState) error {
+	s.stateUncertain = true
 	value.LastError = BoundDiagnostic(value.LastError)
 	if s.beforePersistState != nil {
 		if err := s.beforePersistState(cloneState(*value)); err != nil {
 			return err
 		}
 	}
-	return atomicfile.WriteJSON(s.statePath, *value, 0o600)
+	if err := atomicfile.WriteJSON(s.statePath, *value, 0o600); err != nil {
+		return err
+	}
+	s.stateUncertain = false
+	return nil
 }
 func (s *Store) persistOperationLocked(op *model.Operation) error {
 	*op = BoundOperation(*op)

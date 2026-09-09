@@ -3,6 +3,7 @@
   "coverage": {
     "code_include": [
       ".gitignore",
+      "install.sh",
       ".github/**/*.yml",
       ".github/**/*.yaml",
       "manager/go.mod",
@@ -61,7 +62,7 @@
         "docs/domains.json"
       ],
       "code": [
-        "scripts/docs_sync.py"
+        "scripts/**"
       ],
       "tests": [
         "enterprise-agent-platform/tests/test_docs_sync.py"
@@ -76,8 +77,7 @@
       "code": [
         ".gitignore",
         ".github/**",
-        "scripts/python_test_shard.py",
-        "scripts/test.sh"
+        "scripts/**"
       ],
       "tests": []
     },
@@ -88,6 +88,8 @@
         "docs/operations/auto-update.md"
       ],
       "code": [
+        "install.sh",
+        ".github/workflows/container-release.yml",
         "manager/**",
         "containers/**",
         "scripts/assemble_release_manifest.py",

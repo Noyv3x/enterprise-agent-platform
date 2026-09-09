@@ -37,6 +37,7 @@ describe("AgentApprovalPrompt", () => {
             mode="private"
             scopeId="7"
             approval={{
+              run_id: "run-1",
               approval_id: "approval-1",
               description: "Run the requested command",
               command: "git status --short",
@@ -53,7 +54,13 @@ describe("AgentApprovalPrompt", () => {
 
     await user.click(screen.getByRole("button", { name: "Allow once" }));
 
-    expect(respondAgentApproval).toHaveBeenCalledWith(expect.anything(), "private", "7", "once");
+    expect(respondAgentApproval).toHaveBeenCalledWith(
+      expect.anything(),
+      "private",
+      "7",
+      expect.objectContaining({ run_id: "run-1", approval_id: "approval-1" }),
+      "once",
+    );
     expect(screen.getByRole("button", { name: /Submitting/ })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeDisabled();
 

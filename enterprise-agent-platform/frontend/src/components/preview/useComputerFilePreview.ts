@@ -41,6 +41,8 @@ const EMPTY_STATE: ComputerFilePreviewState = {
 interface PreviewRequestTarget {
   key: string;
   running: boolean;
+  /** Identity of the running draft this read belongs to; see draftLineage(). */
+  lineage: string;
 }
 
 interface PreviewRequestQueue {
@@ -74,8 +76,47 @@ function lifecycleKey(file: ComputerFileClue | null): string {
   );
 }
 
+/** Everything but the draft revision: Run, scope, path, tool, tool call, target
+ *  and the running/terminal phase. Two request keys with the same lineage differ
+ *  only by the monotonic draft revision the SSE announced. The Run is part of
+ *  the identity because a later Run may reuse a tool call id and restart the
+ *  draft numbering for the same path. */
+function draftLineage(
+  runId: string,
+  pathKey: string,
+  file: ComputerFileClue | null,
+  running: boolean,
+  refreshToken: number,
+): string {
+  return [
+    runId,
+    pathKey,
+    file?.tool || "",
+    file?.tool_call_id || "",
+    String(file?.target || "sandbox").toLowerCase(),
+    running ? "running" : "terminal",
+    refreshToken,
+  ].join("\u0000");
+}
+
+/** Platform draft revisions are `draft:<tool_call_id>:<n>` with `n` increasing
+ *  per tool call. A candidate is newer when it belongs to the same tool call
+ *  and carries a larger `n`, or when nothing comparable is displayed yet. */
+function newerDraftRevision(candidate: string, displayed: string): boolean {
+  const candidateSplit = candidate.lastIndexOf(":");
+  const candidateOrder = Number(candidate.slice(candidateSplit + 1));
+  if (candidateSplit < 0 || !Number.isInteger(candidateOrder)) return false;
+  const displayedSplit = displayed.lastIndexOf(":");
+  if (displayedSplit < 0) return true;
+  const displayedOrder = Number(displayed.slice(displayedSplit + 1));
+  return displayed.slice(0, displayedSplit) !== candidate.slice(0, candidateSplit)
+    || !Number.isInteger(displayedOrder)
+    || candidateOrder > displayedOrder;
+}
+
 export function useComputerFilePreview(
   scope: AgentPreviewScope,
+  runId: string,
   file: ComputerFileClue | null,
 ) {
   const workspacePath = String(file?.workspace_path || "");
@@ -84,12 +125,16 @@ export function useComputerFilePreview(
   const revision = lifecycleKey(file);
   const pathKey = `${scope.scope_type}\u0000${String(scope.scope_id)}\u0000${workspacePath}`;
   const [refreshToken, setRefreshToken] = useState(0);
-  const requestKey = `${pathKey}\u0000${revision}\u0000${running ? "running" : "terminal"}\u0000${refreshToken}`;
+  const lineage = draftLineage(runId, pathKey, file, running, refreshToken);
+  const requestKey = `${lineage}\u0000${revision}`;
   const desiredRequestKeyRef = useRef(requestKey);
   desiredRequestKeyRef.current = requestKey;
+  const desiredLineageRef = useRef(lineage);
+  desiredLineageRef.current = lineage;
   const requestQueueRef = useRef<PreviewRequestQueue | null>(null);
-  const [stored, setStored] = useState<{ pathKey: string; value: ComputerFilePreviewState }>({
+  const [stored, setStored] = useState<{ pathKey: string; lineage: string; value: ComputerFilePreviewState }>({
     pathKey,
+    lineage: "",
     value: {
       ...EMPTY_STATE,
       loading: !hostTarget && Boolean(workspacePath),
@@ -99,7 +144,7 @@ export function useComputerFilePreview(
   useEffect(() => {
     if (hostTarget || !workspacePath) {
       requestQueueRef.current = null;
-      setStored({ pathKey, value: EMPTY_STATE });
+      setStored({ pathKey, lineage: "", value: EMPTY_STATE });
       return;
     }
 
@@ -119,6 +164,7 @@ export function useComputerFilePreview(
       const samePath = current.pathKey === pathKey;
       return {
         pathKey,
+        lineage: samePath ? current.lineage : "",
         value: samePath ? {
           ...current.value,
           loading: true,
@@ -134,6 +180,7 @@ export function useComputerFilePreview(
     const markLoading = () => {
       setStored((current) => current.pathKey === pathKey ? {
         pathKey,
+        lineage: current.lineage,
         value: {
           ...current.value,
           loading: true,
@@ -167,24 +214,38 @@ export function useComputerFilePreview(
       try {
         const result = await fetchPreviewFile(requestScope, workspacePath, requestController.signal);
         if (stopped || requestController.signal.aborted) return;
-        // A newer lifecycle revision arrived while this read was in flight. The
-        // endpoint response cannot prove which revision it represents, so skip
-        // it and immediately chase only the newest queued request.
-        if (pending === null && desiredRequestKeyRef.current === target.key) {
+        const desired = pending === null && desiredRequestKeyRef.current === target.key;
+        const draftRevision = result.source === "draft" ? result.revision : "";
+        // A newer lifecycle revision arrived while this read was in flight. For a
+        // running draft the endpoint returns its own monotonic draft revision, so
+        // a response that still belongs to the same draft lineage is real,
+        // provable progress: reveal it now and keep chasing the newest queued
+        // revision instead of discarding every answer while the stream is fast.
+        // Any other supersession (scope, path, tool call, target, terminal
+        // transition, manual refresh) cannot prove what it represents: skip it.
+        const progress = !desired
+          && draftRevision !== ""
+          && desiredLineageRef.current === target.lineage;
+        if (desired || progress) {
           setStored((current) => {
             if (current.pathKey !== pathKey) return current;
+            if (progress && current.lineage === target.lineage
+              && !newerDraftRevision(draftRevision, current.value.revision)) {
+              return current;
+            }
             const changed = !current.value.loaded || current.value.content !== result.content;
             return {
               pathKey,
+              lineage: target.lineage,
               value: {
                 ...current.value,
                 content: result.content,
                 previousContent: current.value.loaded ? current.value.content : null,
                 source: result.source,
                 draftKind: result.source === "draft" ? result.draft_kind : null,
-                revision: result.source === "draft" ? result.revision : "",
+                revision: draftRevision,
                 truncated: result.truncated,
-                loading: false,
+                loading: !desired,
                 pending: false,
                 loaded: true,
                 error: "",
@@ -204,6 +265,7 @@ export function useComputerFilePreview(
         if (waitingForAtomicWrite && attempt < PENDING_RETRY_LIMIT) {
           setStored((current) => current.pathKey === pathKey ? {
             pathKey,
+            lineage: current.lineage,
             value: {
               ...current.value,
               loading: true,
@@ -230,6 +292,7 @@ export function useComputerFilePreview(
           const discardTerminalDraft = !target.running && current.value.source === "draft";
           return {
             pathKey,
+            lineage: current.lineage,
             value: {
               ...current.value,
               ...(discardTerminalDraft ? {
@@ -296,8 +359,9 @@ export function useComputerFilePreview(
     queue.enqueue({
       key: requestKey,
       running,
+      lineage,
     });
-  }, [hostTarget, pathKey, requestKey, running, workspacePath]);
+  }, [hostTarget, lineage, pathKey, requestKey, running, workspacePath]);
 
   const refresh = useCallback(() => setRefreshToken((value) => value + 1), []);
   const state = stored.pathKey === pathKey

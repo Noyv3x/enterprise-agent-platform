@@ -57,6 +57,22 @@ class ThrowingSendXMLHttpRequest extends FakeXMLHttpRequest {
   }
 }
 
+/** Mirrors the XMLHttpRequest state machine: abort() only dispatches `abort`
+ * once send() has set the send flag; an OPENED-unsent request stays silent. */
+class UnsentSilentAbortXMLHttpRequest extends FakeXMLHttpRequest {
+  sent = false;
+
+  send(body: FormData) {
+    this.sent = true;
+    super.send(body);
+  }
+
+  abort() {
+    this.abortCalls += 1;
+    if (this.sent) this.onabort?.();
+  }
+}
+
 function response(status: number, body: unknown) {
   return {
     ok: status >= 200 && status < 300,
@@ -130,6 +146,19 @@ describe("api request lifecycle", () => {
     resetApiSession();
 
     expect(xhr.abortCalls).toBe(0);
+  });
+
+  it("settles an upload whose signal was already cancelled without sending", async () => {
+    vi.stubGlobal("XMLHttpRequest", UnsentSilentAbortXMLHttpRequest);
+    const controller = new AbortController();
+    controller.abort();
+
+    const request = apiUpload("/api/upload", new FormData(), { signal: controller.signal });
+    const xhr = FakeXMLHttpRequest.instances[0] as UnsentSilentAbortXMLHttpRequest;
+
+    await expect(request).rejects.toBeInstanceOf(ApiRequestCancelledError);
+    expect(xhr.sent).toBe(false);
+    expect(xhr.body).toBeNull();
   });
 
   it("rejects a response from an outgoing session even when fetch ignores abort", async () => {

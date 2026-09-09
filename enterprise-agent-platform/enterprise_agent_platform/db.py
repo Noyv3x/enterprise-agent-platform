@@ -2819,9 +2819,7 @@ class Database:
         return row[0] if row else None
 
     def insert(self, sql: str, params: Iterable[Any] = ()) -> int:
-        conn = self._conn
-        cur = conn.execute(sql, tuple(params))
-        conn.commit()
+        cur = self.execute(sql, params)
         return int(cur.lastrowid)
 
 

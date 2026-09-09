@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.js";
+import type { EventJournal } from "./event-journal.js";
 import { productModelCatalogs } from "./model-resolver.js";
 import { RunCoordinator } from "./run-coordinator.js";
 import type { ApprovalDecision, RunInputRequest, RunRequest, RuntimeConfig, RuntimeEvent } from "./types.js";
@@ -62,6 +63,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
   authorize(config, request);
   if (request.method === "GET" && url.pathname === "/health") {
+    assertQuery(url);
     json(response, 200, {
       status: "ok",
       service: "agent-platform-runtime",
@@ -85,6 +87,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   }
 
   if (request.method === "POST" && url.pathname === "/v1/runs") {
+    assertQuery(url);
     const body = await readJson<RunRequest>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);
     const run = coordinator.createRun(body);
     json(response, 202, { run_id: run.id, status: run.status, events_url: `/v1/runs/${run.id}/events` });
@@ -95,6 +98,10 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   if (runMatch) {
     const runId = decodeURIComponent(runMatch[1]!);
     const action = runMatch[2];
+    const supported = request.method === "GET" ? !action || action === "events"
+      : request.method === "POST" && ["input", "approval", "cancel"].includes(action ?? "");
+    if (!supported) throw httpError(404, "Not found");
+    assertQuery(url, action === "events" ? ["after"] : []);
     const run = coordinator.getRun(runId);
     if (!run) throw httpError(404, "Run not found");
     if (request.method === "GET" && !action) {
@@ -102,9 +109,9 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       return;
     }
     if (request.method === "GET" && action === "events") {
-      const headerSequence = Number.parseInt(String(request.headers["last-event-id"] || "0"), 10);
-      const querySequence = Number.parseInt(url.searchParams.get("after") || "0", 10);
-      streamEvents(response, coordinator.getJournal(runId)!, Math.max(Number.isFinite(headerSequence) ? headerSequence : 0, Number.isFinite(querySequence) ? querySequence : 0));
+      const headerSequence = eventCursor(request.headers["last-event-id"]);
+      const querySequence = eventCursor(url.searchParams.get("after") ?? undefined);
+      streamEvents(response, coordinator.getJournal(runId)!, Math.max(headerSequence, querySequence));
       return;
     }
     if (request.method === "POST" && action === "input") {
@@ -139,20 +146,26 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       return;
     }
     if (request.method === "POST" && action === "cancel") {
+      const body = await readJson<Record<string, unknown>>(request, config.maxBodyBytes, config.requestBodyTimeoutMs, true);
+      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
+        throw httpError(400, "Cancel request accepts only an empty object");
+      }
       const cancelled = coordinator.cancel(runId);
       json(response, 202, { run_id: runId, status: cancelled.status });
       return;
     }
-    throw httpError(405, "Method not allowed");
+    throw httpError(404, "Not found");
   }
 
   if (request.method === "POST" && url.pathname === "/v1/scopes/cleanup") {
+    assertQuery(url);
     const body = await readJson<{ scope_key?: string; lifecycle_id?: string; delete_sessions?: boolean }>(
       request,
       config.maxBodyBytes,
       config.requestBodyTimeoutMs,
     );
     const allowed = new Set(["scope_key", "lifecycle_id", "delete_sessions"]);
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "Invalid scope cleanup request");
     if (Object.keys(body).some((key) => !allowed.has(key))) {
       throw httpError(400, "Scope cleanup accepts only scope_key, lifecycle_id, and delete_sessions");
     }
@@ -266,7 +279,23 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
   throw httpError(404, "Not found");
 }
 
-function streamEvents(response: ServerResponse, journal: NonNullable<ReturnType<RunCoordinator["getJournal"]>>, after: number): void {
+function assertQuery(url: URL, allowed: readonly string[] = []): void {
+  for (const key of url.searchParams.keys()) {
+    if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) {
+      throw httpError(400, "Unknown or repeated query parameter");
+    }
+  }
+}
+
+function eventCursor(value: string | string[] | undefined): number {
+  if (value === undefined) return 0;
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    throw httpError(400, "Event cursor must be a non-negative safe integer");
+  }
+  return Number(value);
+}
+
+function streamEvents(response: ServerResponse, journal: EventJournal, after: number): void {
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -274,28 +303,83 @@ function streamEvents(response: ServerResponse, journal: NonNullable<ReturnType<
     "x-accel-buffering": "no",
   });
   response.flushHeaders();
-  response.write(": connected\n\n");
+  const queue: Buffer[] = [];
+  // SSE repeats the JSON sequence/type in its framing. That extra encoding is
+  // smaller than the envelope itself, so twice the JSON retention budget holds
+  // every valid retained replay, including many small frames, without treating
+  // synchronous replay as a slow reader. Live backlog remains strictly bounded.
+  const queueByteBudget = 2 * journal.maxBytes;
+  let queuedBytes = 0;
+  let blocked = false;
+  let closed = false;
+  let terminal = false;
   let unsubscribe = (): void => undefined;
-  const heartbeat = setInterval(() => {
-    if (!response.writableEnded) response.write(": heartbeat\n\n");
-  }, 15_000);
-  heartbeat.unref();
-  const send = (event: RuntimeEvent): void => {
-    if (response.writableEnded) return;
-    response.write(`id: ${event.sequence}\n`);
-    response.write(`event: ${event.type}\n`);
-    response.write(`data: ${JSON.stringify(event)}\n\n`);
-    if (TERMINAL_EVENTS.has(event.type)) {
-      clearInterval(heartbeat);
-      unsubscribe();
+  let heartbeat: NodeJS.Timeout | undefined;
+  const cleanup = (): void => {
+    closed = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+    queue.length = 0;
+    queuedBytes = 0;
+    response.off("drain", drain);
+  };
+  const finish = (): void => {
+    if (terminal && !blocked && queue.length === 0 && !closed) {
+      cleanup();
       response.end();
     }
   };
+  const enqueue = (frame: Buffer): void => {
+    if (closed || response.destroyed || response.writableEnded) return;
+    if (!blocked) {
+      // One complete frame may exceed the writable high-water mark. Keep it
+      // in flight until drain, rather than making large events unreplayable.
+      blocked = !response.write(frame);
+    } else {
+      if (queuedBytes + frame.length > queueByteBudget) {
+        cleanup();
+        response.destroy();
+        return;
+      }
+      queue.push(frame);
+      queuedBytes += frame.length;
+    }
+  };
+  function drain(): void {
+    if (closed) return;
+    blocked = false;
+    while (queue.length > 0 && !blocked) {
+      const frame = queue.shift()!;
+      queuedBytes -= frame.length;
+      blocked = !response.write(frame);
+    }
+    finish();
+  }
+  response.on("drain", drain);
+  response.once("close", cleanup);
+  enqueue(Buffer.from(": connected\n\n"));
+  heartbeat = setInterval(() => {
+    if (!closed && !terminal) enqueue(Buffer.from(": heartbeat\n\n"));
+  }, 15_000);
+  heartbeat.unref();
+  const send = (event: RuntimeEvent): void => {
+    if (closed || terminal) return;
+    enqueue(Buffer.from(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+    if (TERMINAL_EVENTS.has(event.type)) {
+      terminal = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+      finish();
+    }
+  };
   unsubscribe = journal.subscribe(after, send);
-  response.on("close", () => {
+  // subscribe replays synchronously, possibly closing before it returns.
+  if (closed || terminal) unsubscribe();
+  if (journal.isTerminal) {
+    terminal = true;
     clearInterval(heartbeat);
-    unsubscribe();
-  });
+    finish();
+  }
 }
 
 function authorize(config: RuntimeConfig, request: IncomingMessage): void {
@@ -304,9 +388,10 @@ function authorize(config: RuntimeConfig, request: IncomingMessage): void {
   if (!supplied || !safeEqual(supplied, config.bearerToken)) throw httpError(401, "Unauthorized");
 }
 
-async function readJson<T>(request: IncomingMessage, maxBytes: number, timeoutMs: number): Promise<T> {
+async function readJson<T>(request: IncomingMessage, maxBytes: number, timeoutMs: number, allowEmpty = false): Promise<T> {
   const contentType = request.headers["content-type"] || "";
-  if (!contentType.toLowerCase().startsWith("application/json")) throw httpError(415, "Content-Type must be application/json");
+  const isJson = contentType.toLowerCase().startsWith("application/json");
+  if (!allowEmpty && !isJson) throw httpError(415, "Content-Type must be application/json");
   return await new Promise<T>((resolvePromise, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
@@ -342,8 +427,12 @@ async function readJson<T>(request: IncomingMessage, maxBytes: number, timeoutMs
     };
     const onEnd = (): void => {
       if (settled) return;
+      if (size > 0 && !isJson) {
+        fail(httpError(415, "Content-Type must be application/json"));
+        return;
+      }
       try {
-        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as T;
+        const parsed = (allowEmpty && size === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString("utf8"))) as T;
         settled = true;
         cleanup();
         resolvePromise(parsed);

@@ -384,12 +384,14 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             def observe_sidecar(
                 data_dir,
                 *,
+                fresh_initialization,
                 commit_schema_upgrade=False,
                 technical_profile_value=None,
             ):
                 calls.append(bool(commit_schema_upgrade))
                 return ensure_camofox_runtime_sidecar(
                     data_dir,
+                    fresh_initialization=fresh_initialization,
                     commit_schema_upgrade=commit_schema_upgrade,
                     technical_profile_value=technical_profile_value,
                 )
@@ -505,6 +507,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             def commit_camofox_schema(
                 _data_dir,
                 *,
+                fresh_initialization,
                 commit_schema_upgrade=False,
                 technical_profile_value=None,
             ):

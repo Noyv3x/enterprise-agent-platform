@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { ApiError } from "../../lib/api";
-import type { ComputerFileClue } from "../../types";
+import type { AgentPreviewFileResponse, ComputerFileClue } from "../../types";
 import { FileComputerView } from "./FileComputerView";
 
 vi.mock("../../data/previewActions", () => ({
@@ -20,7 +20,7 @@ const defaultMatchMedia = window.matchMedia;
 function view(file: ComputerFileClue) {
   return (
     <I18nProvider>
-      <FileComputerView scope={scope} file={file} />
+      <FileComputerView scope={scope} runId="run-1" file={file} />
     </I18nProvider>
   );
 }
@@ -305,6 +305,55 @@ describe("FileComputerView", () => {
     expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
     expect(rendered.container.querySelector(".computer-file"))
       .toHaveAttribute("data-source", "workspace");
+  });
+
+  it("reveals each monotonic draft revision while the stream keeps outrunning the read", async () => {
+    const reads: Array<{ announced: number; resolve: (value: AgentPreviewFileResponse) => void }> = [];
+    let announced = 1;
+    vi.mocked(fetchPreviewFile).mockImplementation(() => new Promise((resolve) => {
+      reads.push({ announced, resolve });
+    }));
+    const streaming = (revision: number): ComputerFileClue => ({
+      tool: "write_file",
+      path: "draft.txt",
+      workspace_path: "draft.txt",
+      target: "sandbox",
+      status: "running",
+      tool_call_id: "write-stream",
+      revision: `draft:write-stream:${revision}`,
+    });
+    const rendered = render(view(streaming(announced)));
+    await waitFor(() => expect(reads).toHaveLength(1));
+
+    for (let step = 0; step < 3; step += 1) {
+      // Three newer revisions are announced before the in-flight read answers.
+      for (let burst = 0; burst < 3; burst += 1) {
+        announced += 1;
+        rendered.rerender(view(streaming(announced)));
+      }
+      const read = reads[reads.length - 1];
+      expect(reads).toHaveLength(step + 1);
+      await act(async () => {
+        read.resolve({
+          workspace_path: "draft.txt",
+          content: `DRAFT_${read.announced}`,
+          truncated: false,
+          encoding: "utf-8",
+          source: "draft",
+          draft_kind: "file",
+          revision: `draft:write-stream:${read.announced}`,
+        });
+        await Promise.resolve();
+      });
+      // The older-but-monotonic answer is shown at once while a single new read
+      // chases the newest announced revision.
+      expect(await screen.findByText(`DRAFT_${read.announced}`)).toBeVisible();
+      expect(screen.getByText("Uncommitted file draft")).toBeVisible();
+      await waitFor(() => expect(reads).toHaveLength(step + 2));
+    }
+
+    expect(reads.map((read) => read.announced)).toEqual([1, 4, 7, 10]);
+    rendered.unmount();
   });
 
   it("aborts reads when the scope path changes or the consumer unmounts", async () => {

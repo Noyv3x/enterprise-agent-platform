@@ -49,6 +49,49 @@ func TestClientSendsControlBearer(t *testing.T) {
 	}
 }
 
+func TestClientReleasesConnectionsAfterSuccessfulRequests(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "manager.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const requests = 100
+	closed := make(chan struct{}, requests)
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			_, _ = response.Write([]byte(`{"ok":true}`))
+		}),
+		ConnState: func(_ net.Conn, state http.ConnState) {
+			if state == http.StateClosed {
+				closed <- struct{}{}
+			}
+		},
+	}
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(func() { _ = server.Close() })
+	client := Client{SocketPath: socketPath, Token: "control-token-0123456789abcdef", Timeout: time.Second}
+	for range requests {
+		var result struct {
+			OK bool `json:"ok"`
+		}
+		if err := client.Do(context.Background(), http.MethodGet, "/v1/status", nil, &result); err != nil {
+			t.Fatal(err)
+		}
+		if !result.OK {
+			t.Fatal("successful response was not decoded")
+		}
+	}
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for count := range requests {
+		select {
+		case <-closed:
+		case <-timeout.C:
+			t.Fatalf("only %d of %d request connections closed", count, requests)
+		}
+	}
+}
+
 func TestClientRejectsMissingOrMalformedControlToken(t *testing.T) {
 	t.Parallel()
 	for _, token := range []string{"", "bad token", "bad\ntoken"} {

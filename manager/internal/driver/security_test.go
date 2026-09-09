@@ -3,7 +3,9 @@ package driver
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestEnsureHostLayoutRestrictsCapabilityFiles(t *testing.T) {
@@ -44,9 +46,37 @@ func TestEnsureHostLayoutRestrictsCapabilityFiles(t *testing.T) {
 		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s is not a 0600 regular file: %v", path, info.Mode())
 		}
-		if _, err := ReadOwnerSecret(path); err != nil {
+		value, err := ReadOwnerSecret(path)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if name == "manager-token" && value != "0123456789abcdef0123456789abcdef" {
+			t.Fatalf("existing capability changed: %q", value)
+		}
+	}
+}
+
+func TestReadOwnerSecretRejectsFIFOWithoutWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "manager-token")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadOwnerSecret(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO secret was accepted")
+		}
+	case <-time.After(2 * time.Second):
+		// Release a regressed blocking open before failing the test.
+		if fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0); err == nil {
+			_ = syscall.Close(fd)
+		}
+		t.Fatal("secret reader waited for a FIFO writer")
 	}
 }
 

@@ -169,8 +169,13 @@ export interface WithdrawChannelMessageResponse {
   message_id: Id;
 }
 
+/** The browser always submits the approval identity it displayed. The Platform
+ * accepts only the scope's exact pending item and answers 409 for a late or
+ * replaced identity instead of applying the gesture to the current one. */
 export interface AgentApprovalSubmitRequest {
   choice: AgentApprovalChoice;
+  run_id: string;
+  approval_id: string;
 }
 
 export interface AgentApprovalSubmitResponse {

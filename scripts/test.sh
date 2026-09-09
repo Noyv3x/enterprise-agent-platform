@@ -201,12 +201,8 @@ for component in "${selected_names[@]}"; do
   names+=("$component")
   (
     component_started=$SECONDS
-    set +e
+    trap 'component_status=$?; printf "%s\n" "$(( SECONDS - component_started ))" >"$work/$component.elapsed"; exit "$component_status"' EXIT
     "run_$component"
-    component_status=$?
-    set -e
-    printf '%s\n' "$(( SECONDS - component_started ))" >"$work/$component.elapsed"
-    exit "$component_status"
   ) >"$work/$component.log" 2>&1 &
   pids+=("$!")
 done

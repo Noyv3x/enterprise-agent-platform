@@ -17,6 +17,8 @@
 
 温热工作区的目标是 `affected` 在 3 分钟内给出反馈、`full` 在 10 分钟内完成；Quality CI 继续以独立 job 全量并行。顶层脚本必须输出选中组件和每组耗时；普通变更连续超出目标时，先定位回归或拆分过宽测试域，不把增大全局超时当作默认解法。
 
+组件在启用严格错误处理的独立子 shell 中运行，任意安装、检查、测试或构建中间步骤失败都立即终止该组件；EXIT trap 记录失败耗时但不覆盖退出码。依赖摘要仅在 `npm ci` 成功后写入，失败不能继续下游命令或报告 PASS。
+
 每个可发布提交的 Manager 全量测试只在对应的成功 Quality run 中以 `go test -count=1 ./...` 真实执行一次。Container release 必须绑定该精确提交的成功 Quality 证据；自动入口只接受同仓库 `main` push，人工恢复入口可接受对当前 `origin/main` 精确 HEAD 显式触发的 Quality，但在发布开始和最终推进通道前都必须重新确认候选仍等于远端 HEAD。其两个 Manager 工件 job 只分别交叉编译 `linux/amd64` 与 `linux/arm64`、生成校验和并上传，不得再次运行全量测试。发布工作流在镜像构建前证明当前公开 generation 是候选提交的 Git 祖先，防止分叉或降级通道。Go 模块与构建缓存以 `manager/go.sum` 为精确依赖入口，仅用于加速且不替代测试、编译或工件校验。真实 user-systemd 集成测试仍是独立发布门禁，必须使用 `-count=1` 执行，不能由全量单元测试或缓存命中代替。
 
 CI 中的 Python 仓库工具必须显式通过 `python3` 调用，不能依赖 Git 可执行位或 runner 的隐式命令解析；静态发布验收需要锁定这一调用形式。
@@ -163,6 +165,8 @@ npm run build
 四个镜像构建完成后必须先把原始 `image-*` identity 收敛为闭世界的单一 `managed-images` 目录。双架构匿名拉取/容量验证、Compose 冒烟与最终 manifest 只能消费这同一目录，不能各自维护镜像默认值；原子 publish 必须直接依赖目录生成、两个架构验证与 Compose 三类成功结果，不能在验证完成前运行。发布组装不得重新拼接原始 `image-*` 输出，也不得使用 `*` 下载当前 run 的全部 artifact。Buildx 自动生成的 `.dockerbuild` 记录属于诊断产物，不进入发布目录，也不能成为 release 下载、解压或文件冲突的额外故障面；缺少任一必需 family 时必须失败。
 
 镜像身份与 Manager 二进制上传允许同一 workflow run 的全量重跑覆盖同名中间 artifact。最终 `publish` job 必须使用完整 source commit 作为跨 run 全局锁，并在同一发布步骤中直接复验成功 Quality run、构建 source、workflow run/attempt、release ID、tag commit 和精确资产名称/SHA-256/size；不再生成第二套 promotion 或 provenance 文件。GitHub 在创建 lightweight tag 后可能短暂读不到同一 ref，发布器必须只对这次写后读取做有界重试并最终重证 tag 的精确 commit，不能跳过验证或无限等待。相同 generation 的重放只接受逐字节一致资产；错误 tag、未知/重名资产、无关 Quality run、镜像不可匿名拉取或 digest 漂移都必须在推进 latest 前失败。
+
+耗时的下载/匿名镜像验证之后、公开 draft 或推进 latest 之前，必须再次比较 release ID 与完整资产身份，并重新验证同一个成功 Quality run/attempt 和当前 Container run/attempt 的来源。当前发布 run 合法状态为 `in_progress` 且无 conclusion，不能要求它先完成；`workflow_run` 入口自身 head 是触发默认分支工作流的提交，候选来源由精确上游 Quality 身份及 prepare 输出绑定，手动入口自身 head 必须与候选一致。中间 artifact 下载显式绑定当前 repository/run；同一次重跑覆盖工件不构成跨 run 来源授权。Firecrawl checkout 必须直接读取 canonical URL、revision 与全部 required_paths，缺少任一路径即失败。
 
 main 通道测试必须覆盖至少三个线性后代：较旧 workflow 后完成不能降级 latest，连续 push 最终自动推进到最新通过 Quality 的 main head，分叉 candidate 在构建前或发布前拒绝。发布链没有阶段选择器、固定迁移前任、部署 challenge 或人工 promotion 分支。
 

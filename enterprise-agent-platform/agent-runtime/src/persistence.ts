@@ -28,7 +28,8 @@ interface AlwaysGrantFile {
 
 export class AlwaysApprovalStore {
   private readonly file: string;
-  private readonly grants = new Map<string, AlwaysGrant>();
+  private grants = new Map<string, AlwaysGrant>();
+  private commitError?: Error;
 
   constructor(home: string) {
     this.file = join(home, "approvals", "always.json");
@@ -45,23 +46,33 @@ export class AlwaysApprovalStore {
   }
 
   has(scopeKey: string, approvalKey: string): boolean {
+    if (this.commitError) throw this.commitError;
     return this.grants.has(this.key(scopeKey, approvalKey));
   }
 
   grant(scopeKey: string, approvalKey: string, toolName: string): void {
     const key = this.key(scopeKey, approvalKey);
+    if (this.commitError) throw this.commitError;
     if (this.grants.has(key)) return;
-    this.grants.set(key, {
+    const candidate = new Map(this.grants);
+    candidate.set(key, {
       scope_key: scopeKey,
       approval_key: approvalKey,
       tool_name: toolName,
       created_at: nowIso(),
     });
-    this.flush();
+    this.flush(candidate);
   }
 
-  private flush(): void {
-    writeJsonAtomic(this.file, { version: 2, grants: [...this.grants.values()] } satisfies AlwaysGrantFile);
+  private flush(candidate = this.grants): void {
+    if (this.commitError) throw this.commitError;
+    try {
+      writeJsonAtomic(this.file, { version: 2, grants: [...candidate.values()] } satisfies AlwaysGrantFile);
+    } catch (error) {
+      if (error instanceof UncertainCommitError) this.commitError = error;
+      throw error;
+    }
+    this.grants = candidate;
   }
 
   private key(scopeKey: string, approvalKey: string): string {
@@ -107,31 +118,37 @@ interface IdempotencyFile {
 
 export class IdempotencyStore {
   private readonly file: string;
-  private readonly records = new Map<string, PersistentIdempotencyRecord>();
+  private records = new Map<string, PersistentIdempotencyRecord>();
+  private commitError?: Error;
 
   constructor(home: string) {
     this.file = join(home, "idempotency", "index.json");
     const stored = readJsonFile<IdempotencyFile>(this.file, { version: 1, records: [] });
     const now = Date.now();
+    const candidate = new Map<string, PersistentIdempotencyRecord>();
     for (const record of stored.records) {
-      if (record.lookup_hash && record.run_id && record.expires_at > now) this.records.set(record.lookup_hash, record);
+      if (record.lookup_hash && record.run_id && !recordExpired(record, now)) candidate.set(record.lookup_hash, record);
     }
-    if (this.records.size !== stored.records.length) this.flush();
+    if (candidate.size !== stored.records.length) this.flush(candidate);
+    else this.records = candidate;
   }
 
   find(scopeKey: string, idempotencyKey: string): PersistentIdempotencyRecord | undefined {
+    if (this.commitError) throw this.commitError;
     const hash = this.hash(scopeKey, idempotencyKey);
     const record = this.records.get(hash);
     if (!record) return undefined;
-    if (record.expires_at <= Date.now()) {
-      this.records.delete(hash);
-      this.flush();
+    if (recordExpired(record, Date.now())) {
+      const candidate = new Map(this.records);
+      candidate.delete(hash);
+      this.flush(candidate);
       return undefined;
     }
     return structuredClone(record);
   }
 
   create(scopeKey: string, idempotencyKey: string, runId: string, sessionId: string, retentionMs: number): PersistentIdempotencyRecord {
+    if (this.commitError) throw this.commitError;
     const timestamp = Date.now();
     const record: PersistentIdempotencyRecord = {
       lookup_hash: this.hash(scopeKey, idempotencyKey),
@@ -142,8 +159,9 @@ export class IdempotencyStore {
       updated_at: timestamp,
       expires_at: timestamp + retentionMs,
     };
-    this.records.set(record.lookup_hash, record);
-    this.flush();
+    const candidate = new Map(this.records);
+    candidate.set(record.lookup_hash, record);
+    this.flush(candidate);
     return structuredClone(record);
   }
 
@@ -158,6 +176,7 @@ export class IdempotencyStore {
       error?: string;
     },
   ): void {
+    if (this.commitError) throw this.commitError;
     const hash = this.hash(scopeKey, idempotencyKey);
     const current = this.records.get(hash);
     if (!current) return;
@@ -169,7 +188,7 @@ export class IdempotencyStore {
       expires_at: timestamp + patch.retentionMs,
     };
     if (patch.result) {
-      next.result = {
+      next.result = structuredClone({
         content: patch.result.content,
         model: patch.result.model,
         ...(patch.result.usage ? { usage: patch.result.usage } : {}),
@@ -180,29 +199,48 @@ export class IdempotencyStore {
         ...(patch.result.unconsumed_input_message_ids
           ? { unconsumed_input_message_ids: patch.result.unconsumed_input_message_ids }
           : {}),
-      };
+      });
     }
     if (patch.inputs) next.inputs = structuredClone(patch.inputs);
     if (patch.error) next.error = patch.error;
-    this.records.set(hash, next);
-    this.flush();
+    const candidate = new Map(this.records);
+    candidate.set(hash, next);
+    this.flush(candidate);
   }
 
   delete(scopeKey: string, idempotencyKey: string, runId: string): void {
+    if (this.commitError) throw this.commitError;
     const hash = this.hash(scopeKey, idempotencyKey);
     if (this.records.get(hash)?.run_id !== runId) return;
-    this.records.delete(hash);
-    this.flush();
+    const candidate = new Map(this.records);
+    candidate.delete(hash);
+    this.flush(candidate);
   }
 
   private hash(scopeKey: string, idempotencyKey: string): string {
     return stableHash(`${scopeKey}\0${idempotencyKey}`);
   }
 
-  private flush(): void {
-    writeJsonAtomic(this.file, { version: 1, records: [...this.records.values()] } satisfies IdempotencyFile);
+  private flush(candidate: Map<string, PersistentIdempotencyRecord>): void {
+    if (this.commitError) throw this.commitError;
+    try {
+      writeJsonAtomic(this.file, { version: 1, records: [...candidate.values()] } satisfies IdempotencyFile);
+    } catch (error) {
+      if (error instanceof UncertainCommitError) this.commitError = error;
+      throw error;
+    }
+    this.records = candidate;
   }
 }
+
+function recordExpired(record: PersistentIdempotencyRecord, now: number): boolean {
+  return record.status !== "queued" && record.status !== "running" && record.expires_at <= now;
+}
+
+// After rename the disk may contain the candidate despite a failed directory
+// sync. Fence the store until restart rather than overwrite evidence from a
+// stale in-memory snapshot or authorize an unconfirmed grant.
+class UncertainCommitError extends Error {}
 
 function readJsonFile<T>(file: string, fallback: T): T {
   try {
@@ -219,6 +257,7 @@ function writeJsonAtomic(file: string, value: JsonObject | AlwaysGrantFile | Ide
   chmodSync(directory, 0o700);
   const temporary = join(directory, `.${id("state")}.tmp`);
   let descriptor: number | undefined;
+  let renamed = false;
   try {
     descriptor = openSync(temporary, "wx", 0o600);
     writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
@@ -226,13 +265,16 @@ function writeJsonAtomic(file: string, value: JsonObject | AlwaysGrantFile | Ide
     closeSync(descriptor);
     descriptor = undefined;
     renameSync(temporary, file);
-    chmodSync(file, 0o600);
+    renamed = true;
     const directoryDescriptor = openSync(directory, "r");
     try {
       fsyncSync(directoryDescriptor);
     } finally {
       closeSync(directoryDescriptor);
     }
+  } catch (error) {
+    if (renamed) throw new UncertainCommitError(`Persistent runtime state commit is uncertain: ${(error as Error).message}`, { cause: error });
+    throw error;
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
     if (existsSync(temporary)) unlinkSync(temporary);

@@ -593,22 +593,53 @@ def publish_private_file_at(
         final_raw = None
         final_info = None
     if final_raw == data:
-        if staging_fd is not None and staging_name is not None:
-            try:
-                staged_raw, _ = read_private_file_at(
-                    staging_fd,
-                    staging_name,
-                    maximum_bytes=max(len(replace_data or b""), 1),
+        if final_info is None:
+            raise UnsafePrivatePathError(
+                f"private destination identity is unavailable: {name}"
+            )
+        published_identity = (final_info.st_dev, final_info.st_ino)
+        file_fd = open_private_file_fd_at(parent_fd, name, writable=False)
+        try:
+            verify_private_file_fd_at(parent_fd, name, file_fd)
+            pinned = os.fstat(file_fd)
+            if (pinned.st_dev, pinned.st_ino) != published_identity:
+                raise UnsafePrivatePathError(
+                    f"private destination changed before replay: {name}"
                 )
-            except FileNotFoundError:
-                pass
-            else:
-                if replace_data is None or staged_raw != replace_data:
-                    raise UnsafePrivatePathError(
-                        f"private replacement residue conflicts: {staging_name}"
+            _reprove_committed_private_file(
+                parent_fd, name, data, published_identity,
+                staging_fd=staging_fd, staging_name=staging_name,
+                previous_data=replace_data, previous_identity=replace_identity,
+            )
+            try:
+                os.fsync(file_fd)
+                os.fsync(parent_fd)
+                if staging_fd is not None and staging_name is not None:
+                    try:
+                        os.unlink(staging_name, dir_fd=staging_fd)
+                    except FileNotFoundError:
+                        pass
+                    os.fsync(staging_fd)
+            except OSError as exc:
+                try:
+                    verify_private_file_fd_at(parent_fd, name, file_fd)
+                    _reprove_committed_private_file(
+                        parent_fd, name, data, published_identity,
+                        staging_fd=staging_fd, staging_name=staging_name,
+                        previous_data=replace_data, previous_identity=replace_identity,
                     )
-                os.unlink(staging_name, dir_fd=staging_fd)
-                os.fsync(staging_fd)
+                except (OSError, UnsafePrivatePathError) as proof_exc:
+                    raise UnsafePrivatePathError(
+                        f"private destination could not be reconciled after replay: {name}"
+                    ) from proof_exc
+                raise PrivatePublicationCommittedError(
+                    f"private file replay cleanup or durability failed: {name}",
+                    published_identity,
+                ) from exc
+            verify_private_file_fd_at(parent_fd, name, file_fd)
+            _reprove_committed_private_file(parent_fd, name, data, published_identity)
+        finally:
+            os.close(file_fd)
         return
     if replace_identity is None:
         if final_info is not None:
@@ -1000,8 +1031,9 @@ def copy_private_file_exclusive(
             raise RuntimeError(f"private source file size changed: {source}")
 
         parent_fd = open_private_directory_fd(destination.parent)
-        destination_fd = _open_anonymous_private_file(parent_fd)
+        destination_fd = -1
         try:
+            destination_fd = _open_anonymous_private_file(parent_fd)
             digest = hashlib.sha256()
             total = 0
             with os.fdopen(source_fd, "rb") as source_handle:

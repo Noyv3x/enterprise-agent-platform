@@ -21,6 +21,110 @@ from enterprise_agent_platform.secure_fs import (
 
 
 class SecureFilesystemTests(unittest.TestCase):
+    def test_replacement_replay_retries_sync_after_old_residue_is_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            staging = root / "staging"
+            staging.mkdir(mode=0o700)
+            final = root / "final"
+            final.write_bytes(b"old")
+            final.chmod(0o600)
+            previous = final.stat()
+            parent_fd = open_private_directory_fd(root)
+            staging_fd = open_private_directory_fd(staging)
+            real_sync = os.fsync
+
+            def fail_cleanup_sync(fd):
+                if fd == staging_fd and final.read_bytes() == b"new":
+                    raise OSError(errno.EIO, "cleanup sync failed")
+                real_sync(fd)
+
+            def publish():
+                publish_private_file_at(
+                    parent_fd, "final", b"new",
+                    replace_identity=(previous.st_dev, previous.st_ino),
+                    replace_data=b"old", staging_fd=staging_fd, staging_name="replace.stage",
+                )
+
+            try:
+                with mock.patch.object(secure_fs.os, "fsync", side_effect=fail_cleanup_sync):
+                    for _ in range(2):
+                        with self.assertRaises(secure_fs.PrivatePublicationCommittedError):
+                            publish()
+                        self.assertFalse((staging / "replace.stage").exists())
+                publish()
+                self.assertEqual(final.read_bytes(), b"new")
+                self.assertEqual(list(staging.iterdir()), [])
+            finally:
+                os.close(staging_fd)
+                os.close(parent_fd)
+
+    def test_failed_anonymous_copy_closes_parent_descriptors(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source"
+            source.write_bytes(b"payload")
+            source.chmod(0o600)
+            descriptors = []
+            real_open = secure_fs.open_private_directory_fd
+
+            def capture_parent(path):
+                fd = real_open(path)
+                descriptors.append(fd)
+                return fd
+
+            with mock.patch.object(secure_fs, "open_private_directory_fd", side_effect=capture_parent):
+                with mock.patch.object(
+                    secure_fs, "_open_anonymous_private_file",
+                    side_effect=OSError(errno.ENOSPC, "full"),
+                ):
+                    for index in range(32):
+                        with self.assertRaises(OSError):
+                            secure_fs.copy_private_file_exclusive(source, root / str(index))
+            for fd in set(descriptors):
+                with self.assertRaises(OSError) as raised:
+                    os.fstat(fd)
+                self.assertEqual(raised.exception.errno, errno.EBADF)
+            self.assertEqual(list(root.iterdir()), [source])
+
+    def test_exact_file_replay_retries_durability_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            parent_fd = open_private_directory_fd(root)
+            real_sync = os.fsync
+
+            def fail_parent(fd):
+                if fd == parent_fd:
+                    raise OSError(errno.EIO, "directory sync failed")
+                real_sync(fd)
+
+            try:
+                with mock.patch.object(secure_fs.os, "fsync", side_effect=fail_parent):
+                    for _ in range(2):
+                        with self.assertRaises(secure_fs.PrivatePublicationCommittedError):
+                            publish_private_file_at(parent_fd, "final", b"value", replace_identity=None)
+                with mock.patch.object(
+                    secure_fs.os, "fsync", side_effect=OSError(errno.EIO, "file sync failed"),
+                ):
+                    with self.assertRaises(secure_fs.PrivatePublicationCommittedError):
+                        publish_private_file_at(parent_fd, "final", b"value", replace_identity=None)
+                publish_private_file_at(parent_fd, "final", b"value", replace_identity=None)
+                self.assertEqual((root / "final").read_bytes(), b"value")
+
+                def drift_parent(fd):
+                    if fd == parent_fd:
+                        (root / "final").write_bytes(b"drift")
+                        raise OSError(errno.EIO, "directory sync failed")
+                    real_sync(fd)
+
+                with mock.patch.object(secure_fs.os, "fsync", side_effect=drift_parent):
+                    with self.assertRaises(UnsafePrivatePathError) as raised:
+                        publish_private_file_at(parent_fd, "final", b"value", replace_identity=None)
+                self.assertNotIsInstance(raised.exception, secure_fs.PrivatePublicationCommittedError)
+                self.assertEqual((root / "final").read_bytes(), b"drift")
+            finally:
+                os.close(parent_fd)
+
     def test_atomic_support_check_never_exchanges_existing_probe_names(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

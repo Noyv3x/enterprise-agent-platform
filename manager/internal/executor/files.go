@@ -156,10 +156,14 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 		if count != expected {
 			return "", nil, fmt.Errorf("expected %d replacements, found %d", expected, count)
 		}
-		updated := bytes.ReplaceAll(data, []byte(args.OldText), []byte(args.NewText))
-		if int64(len(updated)) > s.MaxBytes {
+		// Count first, then bound growth by division so neither multiplication
+		// nor ReplaceAll can overflow or allocate beyond the output budget.
+		maxResultBytes := min(s.MaxBytes, int64(int(^uint(0)>>1)))
+		growth := int64(len(args.NewText)) - int64(len(args.OldText))
+		if growth > 0 && int64(count) > (maxResultBytes-int64(len(data)))/growth {
 			return "", nil, errors.New("patched file exceeds manager limit")
 		}
+		updated := bytes.ReplaceAll(data, []byte(args.OldText), []byte(args.NewText))
 		if err := writeManagedFileAt(parent, leaf, updated, 0o600, s.profile.InternalWorkspaceDirectory); err != nil {
 			return "", nil, err
 		}

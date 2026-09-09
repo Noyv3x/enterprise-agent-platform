@@ -59,6 +59,7 @@ def is_expected_camofox_sidecar(
 def ensure_camofox_runtime_sidecar(
     data_dir: Path,
     *,
+    fresh_initialization: bool,
     commit_schema_upgrade: bool = True,
     technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
 ) -> Path:
@@ -67,6 +68,8 @@ def ensure_camofox_runtime_sidecar(
     Browser profile contents remain owned by the pinned Camoufox dependency.
     In particular, this function never enumerates or rewrites Cookie, IndexedDB,
     storage-state, meta.json, or webpage storage files.
+    Only an explicitly fresh startup may tolerate or create missing metadata;
+    callers must retain that decision across database creation and commit.
     """
 
     profile = technical_profile(technical_profile_value)
@@ -74,24 +77,36 @@ def ensure_camofox_runtime_sidecar(
     runtime_root = data_root / "runtimes" / "camofox"
     sidecar = runtime_root / profile.camofox_sidecar_name
     expected = expected_camofox_sidecar(profile)
-    if not commit_schema_upgrade:
+    if not fresh_initialization or not commit_schema_upgrade:
         try:
-            # Candidate startup is a pure read: pin existing directories
-            # without mutating permissions while enforcing owner and type.
+            # Existing installations and candidates must pin directories
+            # without creating them or mutating their permissions.
             data_fd = open_private_directory_fd(data_root, mode=None)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            if not fresh_initialization:
+                raise sqlite3.DatabaseError(
+                    "Platform Camoufox managed data directory is missing"
+                ) from exc
             return sidecar
         try:
             try:
                 runtimes_fd = open_private_child_directory_fd(data_fd, "runtimes")
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
+                if not fresh_initialization:
+                    raise sqlite3.DatabaseError(
+                        "Platform Camoufox managed runtimes directory is missing"
+                    ) from exc
                 return sidecar
             try:
                 try:
                     directory_fd = open_private_child_directory_fd(
                         runtimes_fd, "camofox"
                     )
-                except FileNotFoundError:
+                except FileNotFoundError as exc:
+                    if not fresh_initialization:
+                        raise sqlite3.DatabaseError(
+                            "Platform Camoufox managed runtime directory is missing"
+                        ) from exc
                     return sidecar
             finally:
                 os.close(runtimes_fd)
@@ -105,7 +120,11 @@ def ensure_camofox_runtime_sidecar(
     try:
         try:
             actual = _read_sidecar_at(directory_fd, profile.camofox_sidecar_name)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            if not fresh_initialization:
+                raise sqlite3.DatabaseError(
+                    "Platform Camoufox sidecar is missing"
+                ) from exc
             if not commit_schema_upgrade:
                 return sidecar
             encoded = (
@@ -128,6 +147,24 @@ def ensure_camofox_runtime_sidecar(
             raise sqlite3.DatabaseError(
                 "Platform Camoufox sidecar does not match the current technical profile"
             )
+        if commit_schema_upgrade:
+            raw, _ = read_private_file_at(
+                directory_fd, profile.camofox_sidecar_name,
+                maximum_bytes=_MAX_SIDECAR_BYTES,
+            )
+            if not is_expected_camofox_sidecar(_decode_sidecar(raw), profile):
+                raise sqlite3.DatabaseError(
+                    "Platform Camoufox sidecar changed before publication"
+                )
+            try:
+                publish_private_file_at(
+                    directory_fd, profile.camofox_sidecar_name, raw,
+                    replace_identity=None,
+                )
+            except UnsafePrivatePathError as exc:
+                raise sqlite3.DatabaseError(
+                    "Platform Camoufox sidecar could not be published safely"
+                ) from exc
         return sidecar
     finally:
         os.close(directory_fd)
@@ -156,6 +193,10 @@ def _read_sidecar_at(directory_fd: int, name: str) -> dict[str, Any]:
         raise sqlite3.DatabaseError(
             "Platform Camoufox sidecar has unsafe file metadata"
         ) from exc
+    return _decode_sidecar(raw)
+
+
+def _decode_sidecar(raw: bytes) -> dict[str, Any]:
 
     def closed_object(pairs):
         result: dict[str, Any] = {}

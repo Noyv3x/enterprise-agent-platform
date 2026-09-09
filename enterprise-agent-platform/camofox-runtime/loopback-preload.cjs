@@ -97,32 +97,35 @@ const blockedMetadataIpv6Numbers = new Set([
   parseIpv6("fd00:ec2::254"),
 ]);
 
+function isBlockedIpv4Number(numeric) {
+  return (numeric >>> 24) === 0 // "This network" is not a destination.
+    || (numeric >>> 28) >= 14 // Multicast and reserved (including broadcast).
+    || ((numeric & 0xffff0000) >>> 0) === 0xa9fe0000
+    || blockedMetadataIpv4Numbers.has(numeric);
+}
+
 function isBlockedNetworkAddress(rawAddress) {
   const address = normalizeHostname(rawAddress);
   if (blockedMetadataAddresses.has(address)) return true;
   const family = net.isIP(address);
-  if (family === 4) {
-    const numeric = parseIpv4(address);
-    // RFC 3927 link-local range, including every common 169.254.x metadata IP.
-    return numeric !== null && (
-      ((numeric & 0xffff0000) >>> 0) === 0xa9fe0000
-      || blockedMetadataIpv4Numbers.has(numeric)
-    );
-  }
+  if (family === 4) return isBlockedIpv4Number(parseIpv4(address));
   if (family === 6) {
     const numeric = parseIpv6(address);
-    if (numeric === null) return false;
-    // RFC 4291 fe80::/10 link-local unicast.
-    if ((numeric >> 118n) === 0x3fan) return true;
-    // IPv4-mapped IPv6 addresses must receive the same link-local checks.
+    if (numeric === null) return true;
+    // Classify mapped addresses as IPv4 before applying IPv6 reservations.
     if ((numeric >> 32n) === 0xffffn) {
-      const mapped = Number(numeric & 0xffffffffn);
-      return (
-        ((mapped & 0xffff0000) >>> 0) === 0xa9fe0000
-        || blockedMetadataIpv4Numbers.has(mapped)
-      );
+      return isBlockedIpv4Number(Number(numeric & 0xffffffffn));
     }
-    return blockedMetadataIpv6Numbers.has(numeric);
+    if (blockedMetadataIpv6Numbers.has(numeric)) return true;
+    if (numeric === 1n) return false; // Ordinary loopback remains reachable.
+    // Allocated unicast space, ULA and legacy site-local are not a public-only
+    // allowlist: private destinations retain the trusted-member semantics.
+    // Everything else is unspecified, reserved, link-local or multicast.
+    return !(
+      (numeric >> 125n) === 1n // 2000::/3
+      || (numeric >> 121n) === 0x7en // fc00::/7
+      || (numeric >> 118n) === 0x3fbn // fec0::/10
+    );
   }
   return false;
 }
@@ -385,10 +388,32 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
   let proxyUrl = "";
 
   const server = http.createServer((request, response) => {
+    let upstream = null;
+    let upstreamResponse = null;
+    const cleanup = () => {
+      request.off("aborted", cancel);
+      response.off("close", onClose);
+      response.off("finish", cleanup);
+    };
+    const cancel = () => {
+      request.unpipe(upstream);
+      upstreamResponse?.unpipe(response);
+      upstreamResponse?.destroy();
+      upstream?.destroy();
+      cleanup();
+    };
+    const onClose = () => {
+      if (!response.writableFinished) cancel();
+      else cleanup();
+    };
+    request.once("aborted", cancel);
+    response.once("close", onClose);
+    response.once("finish", cleanup);
     void (async () => {
       const target = parseAbsoluteProxyTarget(request.url, new Set(["http:"]));
       const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup);
-      const upstream = http.request(
+      if (request.aborted || response.destroyed) return;
+      upstream = http.request(
         {
           host: pinned.address,
           family: pinned.family,
@@ -398,7 +423,12 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
           headers: sanitizedProxyHeaders(request.headers),
           agent: false,
         },
-        (upstreamResponse) => {
+        (incoming) => {
+          upstreamResponse = incoming;
+          if (response.destroyed) {
+            cancel();
+            return;
+          }
           response.writeHead(
             upstreamResponse.statusCode || 502,
             upstreamResponse.statusMessage,
@@ -420,7 +450,6 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
           response.destroy(error);
         }
       });
-      request.once("aborted", () => upstream.destroy(new Error("proxy client aborted")));
       request.pipe(upstream);
     })().catch((error) => {
       auditProxyFailure("proxy-request", error);
