@@ -1,18 +1,13 @@
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { useI18n } from "../../i18n";
+import { useBranding } from "../../context/BrandingContext";
 import { endpoints } from "../../lib/endpoints";
 import { registerPlatformUpdatingHandler } from "../../lib/api";
 import { PUBLIC_UPDATE_STATES } from "../../container-contract.generated";
 import type { PlatformUpdateState, PlatformUpdateStatus } from "../../types";
-import { Brand } from "../common/Brand";
-import { LanguageSelect } from "../common/LanguageSelect";
-import { Spinner } from "../common/Spinner";
+import { LoadingState, RecoveryPage } from "../ui/fieldwork";
+import { PublicUtilities } from "../ui/PublicUtilities";
 
 const DEFAULT_POLL_MS = 5_000;
 const MIN_POLL_MS = 750;
@@ -83,53 +78,22 @@ interface UpdateStatusScreenProps {
 
 function UpdateStatusScreen({ state }: UpdateStatusScreenProps) {
   const { t } = useI18n();
+  const { branding } = useBranding();
   const failed = state === "failed";
   const probing = state === "probing";
+  const title = t(probing ? "maintenance.probingTitle" : failed ? "maintenance.failedTitle" : "maintenance.title");
+  const description = t(probing ? "maintenance.probingDetail" : failed ? "maintenance.failedDetail" : "maintenance.detail");
+  const hint = t(failed ? "maintenance.failedHint" : "maintenance.hint");
 
   return (
-    <main
-      className={`update-screen${failed ? " update-screen--failed" : ""}`}
-      role={failed ? "alert" : "status"}
-      aria-live="polite"
-      aria-busy={!failed}
-    >
-      <div className="update-screen__locale"><LanguageSelect /></div>
-      <section className="update-screen__card">
-        <Brand />
-        <div className="update-screen__indicator" aria-hidden="true">
-          {failed ? <span>!</span> : <Spinner size={26} />}
-        </div>
-        <div className="update-screen__copy">
-          <p className="eyebrow">{t("maintenance.eyebrow")}</p>
-          <h1>
-            {t(
-              probing
-                ? "maintenance.probingTitle"
-                : failed
-                  ? "maintenance.failedTitle"
-                  : "maintenance.title",
-            )}
-          </h1>
-          <p>
-            {t(
-              probing
-                ? "maintenance.probingDetail"
-                : failed
-                  ? "maintenance.failedDetail"
-                  : "maintenance.detail",
-            )}
-          </p>
-        </div>
-        {!probing && !failed ? (
-          <div className="update-screen__progress" aria-hidden="true">
-            <span />
-          </div>
-        ) : null}
-        <p className="update-screen__hint">
-          {t(failed ? "maintenance.failedHint" : "maintenance.hint")}
-        </p>
-      </section>
-    </main>
+    <RecoveryPage
+      brand={{ productName: branding.product_name, logoUrl: branding.logo_url }}
+      title={title}
+      description={<div role={failed ? "alert" : "status"} aria-live="polite">{description}</div>}
+      status={!failed ? <LoadingState label={hint} /> : undefined}
+      detail={failed ? hint : undefined}
+      utilities={<PublicUtilities />}
+    />
   );
 }
 

@@ -1,24 +1,18 @@
-/* Contextual topbar actions only. Persistent language/theme controls live in the
-   user menu to keep this header focused on the active workspace. */
-
 import { useStore } from "../../store/useStore";
 import { ContextDetailsDialog } from "../chat/ContextDetailsDialog";
 import { PrivateTelegramTrigger } from "./PrivateTelegramTrigger";
+import { useChatPreviewContext } from "../preview/ChatPreviewContext";
 
 export function TopbarActions() {
-  const activeView = useStore((state) => state.activeView);
-  const activeChannelId = useStore((state) => state.activeChannelId);
-  const activeMessages = useStore((state) => (
-    state.activeView === "private" ? state.privateMessages : state.messages
-  ));
-  const isPrivate = activeView === "private";
-  const isChat = isPrivate || (activeView === "channel" && activeChannelId != null);
-  return (
-    <div className="topbar__actions">
-      {isChat ? (
-        <ContextDetailsDialog messages={activeMessages} />
-      ) : null}
-      {isPrivate ? <PrivateTelegramTrigger /> : null}
-    </div>
-  );
+  const preview = useChatPreviewContext();
+  const view = useStore(state => state.activeView);
+  const channelId = useStore(state => state.activeChannelId);
+  const messages = useStore(state => state.activeView === "private" ? state.privateMessages : state.messages);
+  const privateScope = view === "private";
+  const chat = privateScope || (view === "channel" && channelId != null);
+  return <>
+    {preview?.capabilityActions}
+    {chat ? <ContextDetailsDialog messages={messages} /> : null}
+    {privateScope ? <PrivateTelegramTrigger /> : null}
+  </>;
 }

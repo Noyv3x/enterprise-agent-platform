@@ -3,7 +3,6 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Brand } from "../components/common/Brand";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../i18n";
 import type { BrandingSnapshot } from "../types";
 import {
@@ -16,6 +15,7 @@ import {
   parseBrandingCache,
   useBranding,
 } from "./BrandingContext";
+import { BrandMark } from "../components/ui/fieldwork";
 
 function snapshot(overrides: Partial<BrandingSnapshot> = {}): BrandingSnapshot {
   const revision = overrides.revision ?? 7;
@@ -34,6 +34,7 @@ function BrandingProbe({ apply }: { apply?: BrandingSnapshot }) {
   const { branding, applyBranding } = useBranding();
   return (
     <div>
+      <BrandMark productName={branding.product_name} logoUrl={branding.logo_url} />
       <output data-testid="branding-state">{branding.revision}:{branding.product_name}</output>
       {apply ? <button onClick={() => applyBranding(apply)}>Apply branding</button> : null}
     </div>
@@ -105,7 +106,7 @@ describe("deployment branding", () => {
 
     render(
       <I18nProvider>
-        <BrandingProvider><Brand /></BrandingProvider>
+        <BrandingProvider><BrandingProbe /></BrandingProvider>
       </I18nProvider>,
     );
 
@@ -124,7 +125,8 @@ describe("deployment branding", () => {
       headers: { "Content-Type": "application/json", ETag: '"branding-7"' },
     }));
 
-    expect(await screen.findByRole("img", { name: "Northstar" })).toHaveAttribute(
+    expect(await screen.findByText("Northstar")).toBeVisible();
+    expect(screen.getByAltText("")).toHaveAttribute(
       "src",
       "/api/platform/branding/logo?v=7",
     );

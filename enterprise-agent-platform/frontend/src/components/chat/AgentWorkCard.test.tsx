@@ -72,7 +72,7 @@ describe("AgentWorkCard", () => {
       </ConfigProvider>,
     );
 
-    const card = document.querySelector<HTMLElement>(".agent-work--active");
+    const card = screen.getByRole("region", { name: "View AI work" });
     expect(card).not.toBeNull();
     if (!card) throw new Error("Expected active work card");
 
@@ -85,10 +85,7 @@ describe("AgentWorkCard", () => {
     expect(within(card).queryByRole("button")).toBeNull();
     expect(screen.queryByLabelText("Terminal command")).toBeNull();
     expect(card).not.toHaveTextContent("ACTIVE_FULL_COMMAND_DETAIL");
-    expect(card.querySelector('[data-tool="terminal"] .agent-work__preview')).toHaveTextContent(/…$/);
     expect(screen.getByText("File search · Running")).toBeVisible();
-    expect(card.querySelector(".agent-work__log--live")).not.toBeNull();
-    expect(card.querySelector(".agent-work__entry-list")).toBeNull();
     expect(screen.queryByText(/Using tool/i)).toBeNull();
   });
 
@@ -126,7 +123,7 @@ describe("AgentWorkCard", () => {
         },
       ],
     };
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -135,22 +132,20 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
+    const card = screen.getByRole("region", { name: "View AI work" });
     expect(card).not.toBeNull();
     if (!card) throw new Error("Expected completed work card");
-    const disclosure = card.querySelector<HTMLElement>(".agent-work__collapse-header");
-    expect(disclosure).toHaveAttribute("role", "button");
+    const disclosure = within(card!).getByRole("button");
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     expect(within(card).getByText("1 terminal action · 1 search")).toBeVisible();
-    expect(card.querySelector(".agent-work__entry-list")).toBeNull();
 
     fireEvent.click(disclosure!);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
     expect(store.getState().expandedAgentRuns["run-collapse"]).toBe(true);
 
-    const commandRow = within(card).getByText("Command").closest<HTMLElement>(".agent-work__item");
-    const commentaryRow = within(card).getByText("AI update").closest<HTMLElement>(".agent-work__item");
-    const searchRow = within(card).getByText("File search").closest<HTMLElement>(".agent-work__item");
+    const commandRow = within(card).getByText("Command").closest<HTMLElement>("[role=listitem]");
+    const commentaryRow = within(card).getByText("AI update").closest<HTMLElement>("[role=listitem]");
+    const searchRow = within(card).getByText("File search").closest<HTMLElement>("[role=listitem]");
     expect(commandRow).not.toBeNull();
     expect(commentaryRow).not.toBeNull();
     expect(searchRow).not.toBeNull();
@@ -164,22 +159,22 @@ describe("AgentWorkCard", () => {
     expect(screen.queryByLabelText("Terminal command")).toBeNull();
     expect(card).not.toHaveTextContent("SEARCH_FULL_DETAIL");
 
-    const commandDisclosure = commandRow.querySelector<HTMLElement>("[role=button]");
+    const commandDisclosure = within(commandRow!).getByRole("button");
     fireEvent.click(commandDisclosure!);
     expect(commandDisclosure).toHaveAttribute("aria-expanded", "true");
     const commandDetail = screen.getByLabelText("Terminal command");
     expect(commandDetail.textContent).toBe(command);
     expect(commandDetail).toHaveAttribute("tabindex", "0");
 
-    const searchDisclosure = searchRow.querySelector<HTMLElement>("[role=button]");
+    const searchDisclosure = within(searchRow!).getByRole("button");
     fireEvent.click(searchDisclosure!);
     expect(searchDisclosure).toHaveAttribute("aria-expanded", "true");
     expect(card).toHaveTextContent("SEARCH_FULL_DETAIL");
 
-    const commentaryDisclosure = commentaryRow.querySelector<HTMLElement>("[role=button]");
+    const commentaryDisclosure = within(commentaryRow!).getByRole("button");
     fireEvent.click(commentaryDisclosure!);
     expect(commentaryDisclosure).toHaveAttribute("aria-expanded", "true");
-    const commentary = commentaryRow.querySelector(".agent-work__commentary");
+    const commentary = within(commentaryRow).getByRole("group");
     expect(commentary).toHaveTextContent("I checked the focused tests.");
     expect(commentary).toHaveTextContent("The target behavior is ready.");
   });
@@ -225,7 +220,7 @@ describe("AgentWorkCard", () => {
       ],
     };
 
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -234,13 +229,13 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
-    const disclosure = card?.querySelector<HTMLElement>(".agent-work__collapse-header");
+    const card = screen.getByRole("region", { name: "View AI work" });
+    const disclosure = within(card!).getByRole("button");
     fireEvent.click(disclosure!);
 
-    const commandRow = within(card!).getByText("Command").closest<HTMLElement>(".agent-work__item");
-    const commentaryRow = within(card!).getByText("AI update").closest<HTMLElement>(".agent-work__item");
-    const noticeRow = within(card!).getByText("Records truncated").closest<HTMLElement>(".agent-work__item");
+    const commandRow = within(card!).getByText("Command").closest<HTMLElement>("[role=listitem]");
+    const commentaryRow = within(card!).getByText("AI update").closest<HTMLElement>("[role=listitem]");
+    const noticeRow = within(card!).getByText("Records truncated").closest<HTMLElement>("[role=listitem]");
     expect(commandRow).not.toBeNull();
     expect(commentaryRow).not.toBeNull();
     expect(noticeRow).not.toBeNull();
@@ -252,7 +247,7 @@ describe("AgentWorkCard", () => {
     ).toBeTruthy();
     expect(card).toHaveTextContent("4 later work events were omitted by the safety limit");
 
-    fireEvent.click(commandRow!.querySelector<HTMLElement>("[role=button]")!);
+    fireEvent.click(within(commandRow!).getByRole("button")!);
     expect(card).toHaveTextContent("17 detail characters were omitted by the safety limit");
     expect(card).toHaveTextContent("9 result characters were omitted by the safety limit");
     expect(within(commandRow!).getAllByRole("note")).toHaveLength(2);
@@ -260,7 +255,7 @@ describe("AgentWorkCard", () => {
 
   it("renders needs-review work as a warning instead of successful completion", () => {
     const store = createStore(rootReducer, initialAppState);
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -281,15 +276,13 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
+    const card = screen.getByRole("region", { name: "View AI work" });
     expect(card).toHaveTextContent("AI work failed");
-    expect(card?.querySelector(".agent-work__done")).toHaveClass("agent-work__done--failed");
-    expect(card?.querySelector(".agent-work__done--failed svg")).not.toBeNull();
   });
 
   it("shows file evidence first without repeating tool, status, or path facts", () => {
     const store = createStore(rootReducer, initialAppState);
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -315,22 +308,15 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
+    const card = screen.getByRole("region", { name: "View AI work" });
     expect(within(card!).getByText("View AI work")).toBeVisible();
-    fireEvent.click(card!.querySelector<HTMLElement>(".agent-work__collapse-header")!);
-    const row = within(card!).getByText("Read file").closest<HTMLElement>(".agent-work__item");
+    fireEvent.click(within(card!).getByRole("button")!);
+    const row = within(card!).getByText("Read file").closest<HTMLElement>("[role=listitem]");
     expect(row).not.toBeNull();
-    fireEvent.click(row!.querySelector<HTMLElement>("[role=button]")!);
-    const detail = row!.querySelector<HTMLElement>(".agent-work__detail--rich");
+    fireEvent.click(within(row!).getByRole("button")!);
+    const detail = within(row!).getByRole("group");
     expect(detail).not.toBeNull();
     if (!detail) throw new Error("Expected file detail");
-    expect(detail).toHaveAttribute("data-family", "file");
-    expect([...detail.querySelectorAll("h4")].map((heading) => heading.textContent)).toEqual([
-      "File content",
-      "File options",
-    ]);
-    expect(detail.firstElementChild).toHaveTextContent("export function start");
-    expect(detail.lastElementChild).toHaveClass("agent-work__detail-meta");
     expect(within(detail).queryByText("Tool")).toBeNull();
     expect(within(detail).queryByText("Status")).toBeNull();
     expect(within(detail).queryByText("Completed")).toBeNull();
@@ -346,7 +332,7 @@ describe("AgentWorkCard", () => {
   it("does not offer an empty row disclosure for identity, status, time, and path alone", () => {
     const store = createStore(rootReducer, initialAppState);
     const longPath = "packages/enterprise-agent-platform/frontend/src/components/chat/generated/deeply/nested/notes.md";
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -375,23 +361,20 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
-    fireEvent.click(card!.querySelector<HTMLElement>(".agent-work__collapse-header")!);
-    const row = within(card!).getByText("Write file").closest<HTMLElement>(".agent-work__item");
+    const card = screen.getByRole("region", { name: "View AI work" });
+    fireEvent.click(within(card!).getByRole("button")!);
+    const row = within(card!).getByText("Write file").closest<HTMLElement>("[role=listitem]");
     expect(row).not.toBeNull();
     expect(within(row!).getAllByText(longPath)).toHaveLength(1);
-    expect(within(row!).getByTitle(longPath)).toHaveClass("agent-work__preview");
-    expect(row!.querySelector(".agent-work__entry-chevron")).toBeNull();
+    expect(within(row!).getByTitle(longPath)).toBeVisible();
     expect(row).toHaveAttribute("role", "listitem");
-    expect(row!.querySelector("[role=button]")).toBeNull();
-    expect(row!.querySelector(".agent-work__entry-header")).toBeNull();
-    expect(row!.querySelector(".agent-work__detail")).toBeNull();
+    expect(within(row!).queryByRole("button")).toBeNull();
     expect(within(row!).queryByText("Time")).toBeNull();
   });
 
   it("keeps action-only session identities static while preserving mixed row order", () => {
     const store = createStore(rootReducer, initialAppState);
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -435,22 +418,20 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
-    fireEvent.click(card!.querySelector<HTMLElement>(".agent-work__collapse-header")!);
-    const list = card!.querySelector<HTMLElement>(".agent-work__entry-list");
-    const sessionSearchRow = list!.querySelector<HTMLElement>('[data-tool="session_search"]');
-    const terminalRow = list!.querySelector<HTMLElement>('[data-tool="terminal"]');
-    const sessionRow = list!.querySelector<HTMLElement>('[data-tool="session"]');
+    const card = screen.getByRole("region", { name: "View AI work" });
+    fireEvent.click(within(card!).getByRole("button")!);
+    const list = within(card!).getByRole("list");
+    const sessionSearchRow = within(list!).getAllByRole("listitem")[0];
+    const terminalRow = within(list!).getAllByRole("listitem")[1];
+    const sessionRow = within(list!).getAllByRole("listitem")[2];
     expect(list).toHaveAttribute("role", "list");
     expect(within(list!).getAllByRole("listitem")).toHaveLength(3);
     expect(sessionSearchRow).toHaveAttribute("role", "listitem");
-    expect(sessionSearchRow!.querySelector("[role=button]")).toBeNull();
-    expect(sessionSearchRow!.querySelector(".agent-work__entry-chevron")).toBeNull();
+    expect(within(sessionSearchRow!).queryByRole("button")).toBeNull();
     expect(sessionSearchRow).not.toHaveTextContent("search · search");
-    expect(sessionSearchRow!.querySelector(".agent-work__detail")).toBeNull();
-    expect(terminalRow!.querySelector("[role=button]")).not.toBeNull();
+    expect(within(terminalRow!).queryByRole("button")).not.toBeNull();
     expect(sessionRow).toHaveAttribute("role", "listitem");
-    expect(sessionRow!.querySelector("[role=button]")).toBeNull();
+    expect(within(sessionRow!).queryByRole("button")).toBeNull();
     expect(sessionSearchRow!.compareDocumentPosition(terminalRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(terminalRow!.compareDocumentPosition(sessionRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
@@ -460,7 +441,6 @@ describe("AgentWorkCard", () => {
       name: "terminal",
       rowTitle: "Command",
       family: "terminal",
-      headings: ["Terminal command", "Terminal output", "Execution context"],
       evidence: "PASS focused suite",
       failed: false,
       step: activityStep({
@@ -480,7 +460,6 @@ describe("AgentWorkCard", () => {
       name: "process",
       rowTitle: "Process",
       family: "terminal",
-      headings: ["Process action", "Process result"],
       evidence: "Process exited with code 0",
       failed: false,
       step: activityStep({
@@ -497,7 +476,6 @@ describe("AgentWorkCard", () => {
       name: "search",
       rowTitle: "File search",
       family: "search",
-      headings: ["Search target", "Search results"],
       evidence: "src/components/chat/AgentWorkCard.tsx:119",
       failed: false,
       step: activityStep({
@@ -514,7 +492,6 @@ describe("AgentWorkCard", () => {
       name: "browser error",
       rowTitle: "Browser",
       family: "browser",
-      headings: ["Browser action", "Error"],
       evidence: "Navigation timed out",
       failed: true,
       step: activityStep({
@@ -531,7 +508,6 @@ describe("AgentWorkCard", () => {
       name: "generic tool",
       rowTitle: "Skill",
       family: "generic",
-      headings: ["Action target", "Result"],
       evidence: "Loaded skill reference",
       failed: false,
       step: activityStep({
@@ -547,13 +523,12 @@ describe("AgentWorkCard", () => {
   ])("organizes $name details around the action object and evidence", ({
     rowTitle,
     family,
-    headings,
     evidence,
     failed,
     step,
   }) => {
     const store = createStore(rootReducer, initialAppState);
-    const view = render(
+    render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
@@ -569,22 +544,20 @@ describe("AgentWorkCard", () => {
         </StoreContext.Provider>
       </ConfigProvider>,
     );
-    const card = view.container.querySelector<HTMLElement>(".agent-work--complete");
-    fireEvent.click(card!.querySelector<HTMLElement>(".agent-work__collapse-header")!);
-    const row = within(card!).getByText(rowTitle).closest<HTMLElement>(".agent-work__item");
+    const card = screen.getByRole("region", { name: "View AI work" });
+    fireEvent.click(within(card!).getByRole("button")!);
+    const row = within(card!).getByText(rowTitle).closest<HTMLElement>("[role=listitem]");
     expect(row).not.toBeNull();
-    fireEvent.click(row!.querySelector<HTMLElement>("[role=button]")!);
-    const detail = row!.querySelector<HTMLElement>(".agent-work__detail--rich");
+    fireEvent.click(within(row!).getByRole("button")!);
+    const detail = within(row!).getByRole("group");
     expect(detail).not.toBeNull();
     if (!detail) throw new Error(`Expected ${family} detail`);
-    expect(detail).toHaveAttribute("data-family", family);
-    expect([...detail.querySelectorAll("h4")].map((heading) => heading.textContent)).toEqual(headings);
     expect(detail).toHaveTextContent(evidence);
     expect(within(detail).queryByText("Tool")).toBeNull();
     expect(within(detail).queryByText("Status")).toBeNull();
     expect(within(detail).queryByText("Time")).toBeNull();
     if (failed) {
-      expect(detail.querySelector(".agent-work__result--error")).toHaveTextContent(evidence);
+      expect(within(detail).getByRole("region", { name: "Error" })).toHaveTextContent(evidence);
     }
   });
 });

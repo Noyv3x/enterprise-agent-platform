@@ -3,7 +3,8 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { api } from "../../lib/api";
 import type { PlatformUpdateStatus } from "../../types";
 import { UpdateGate } from "./UpdateGate";
@@ -22,11 +23,11 @@ function renderGate(
   return {
     reload,
     ...render(
-      <I18nProvider>
+      <TestUiProviders>
         <UpdateGate loadStatus={loadStatus} reload={reload}>
           <div>Application content</div>
         </UpdateGate>
-      </I18nProvider>,
+      </TestUiProviders>,
     ),
   };
 }

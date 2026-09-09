@@ -58,6 +58,7 @@ function renderMessageList(status: AgentStatus, messages: Message[]) {
       <StoreContext.Provider value={store}>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "channel", scope_id: "1" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: null,
@@ -90,7 +91,6 @@ describe("MessageList computer thumbnails", () => {
     );
 
     expect(screen.getByText("Browser answer")).toBeVisible();
-    expect(screen.queryByTestId("browser-work-preview")).not.toBeInTheDocument();
-    expect(document.querySelector(".agent-work-preview-row")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
   });
 });

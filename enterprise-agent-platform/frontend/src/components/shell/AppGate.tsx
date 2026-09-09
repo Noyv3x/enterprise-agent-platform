@@ -1,62 +1,29 @@
-/* <AppGate> — the boot gate. Runs boot() exactly once (a useRef guard makes it
-   StrictMode-double-mount safe), registers the api 401 hook → handleSessionExpired,
-   switches between <LoginView/> and <AppShell/> based on the store user.
-
-   The SSE/poll visibility + pagehide lifecycle is NOT here: it lives in the
-   useRealtime / usePolling hooks mounted by <AppShell/> only while a user is
-   present. */
-
 import { Button } from "antd";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { registerSessionExpiredHandler } from "../../lib/api";
 import { boot, handleSessionExpired } from "../../data/sessionActions";
+import type { BootResult } from "../../data/sessionActions";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
+import { useBranding } from "../../context/BrandingContext";
 import { LoginView } from "../auth/LoginView";
-import { Brand } from "../common/Brand";
-import { LanguageSelect } from "../common/LanguageSelect";
-import { Spinner } from "../common/Spinner";
+import { LoadingState, RecoveryPage } from "../ui/fieldwork";
+import { PublicUtilities } from "../ui/PublicUtilities";
 
 const AppShell = lazy(() => import("./AppShell").then((module) => ({ default: module.AppShell })));
 
-function BootScreen({
-  status = "loading",
-  onRetry,
-}: {
-  status?: "loading" | "error";
-  onRetry?: () => void;
-}) {
+function BootScreen({ status = "loading", onRetry }: { status?: "loading" | "error"; onRetry?: () => void }) {
   const { t } = useI18n();
+  const { branding } = useBranding();
   return (
-    <main className="auth auth--login">
-      <aside className="auth__aside">
-        <Brand className="auth__logo" />
-      </aside>
-      <div className="auth__main">
-        <section
-          className="auth__card boot-status"
-          role={status === "error" ? "alert" : "status"}
-          aria-live="polite"
-        >
-          <div className="auth__locale"><LanguageSelect /></div>
-          <Brand />
-          <h1>{status === "error" ? t("boot.failed") : t("boot.connecting")}</h1>
-          {status === "error" ? (
-            <>
-              <p className="muted">{t("boot.failedDetail")}</p>
-              <Button type="primary" size="large" onClick={onRetry}>
-                {t("common.retry")}
-              </Button>
-            </>
-          ) : (
-            <div className="boot-status__loading">
-              <Spinner size={20} />
-              <span>{t("boot.restoringSession")}</span>
-            </div>
-          )}
-        </section>
-      </div>
-    </main>
+    <RecoveryPage
+      brand={{ productName: branding.product_name, logoUrl: branding.logo_url }}
+      title={t(status === "error" ? "boot.failed" : "boot.connecting")}
+      description={status === "error" ? <div role="alert">{t("boot.failedDetail")}</div> : undefined}
+      status={status === "loading" ? <LoadingState label={t("boot.restoringSession")} /> : undefined}
+      actions={status === "error" ? <Button type="primary" onClick={onRetry}>{t("common.retry")}</Button> : undefined}
+      utilities={<PublicUtilities />}
+    />
   );
 }
 
@@ -66,12 +33,10 @@ export function AppGate() {
   const [attempt, setAttempt] = useState(0);
   const [bootStatus, setBootStatus] = useState<"loading" | "ready" | "error">("loading");
   const bootAttempt = useRef(-1);
-  const bootPromise = useRef<ReturnType<typeof boot> | null>(null);
-
+  const bootPromise = useRef<Promise<BootResult> | null>(null);
   useEffect(() => {
     const unregister = registerSessionExpiredHandler(() => handleSessionExpired(store));
-    // Reuse the in-flight promise across StrictMode's development-only effect
-    // replay, while a deliberate retry gets a fresh request.
+    // StrictMode effect replay shares the request; an explicit retry starts a new one.
     if (bootAttempt.current !== attempt) {
       bootAttempt.current = attempt;
       bootPromise.current = boot(store);
@@ -88,20 +53,10 @@ export function AppGate() {
   }, [attempt, store]);
 
   if (bootStatus !== "ready") {
-    return (
-      <BootScreen
-        status={bootStatus}
-        onRetry={() => {
-          setBootStatus("loading");
-          setAttempt((value) => value + 1);
-        }}
-      />
-    );
+    return <BootScreen status={bootStatus} onRetry={() => {
+      setBootStatus("loading");
+      setAttempt((value) => value + 1);
+    }} />;
   }
-
-  return user ? (
-    <Suspense fallback={<BootScreen />}>
-      <AppShell />
-    </Suspense>
-  ) : <LoginView />;
+  return user ? <Suspense fallback={<BootScreen />}><AppShell /></Suspense> : <LoginView />;
 }

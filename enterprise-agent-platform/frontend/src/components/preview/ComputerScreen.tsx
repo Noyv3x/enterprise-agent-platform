@@ -1,66 +1,37 @@
 import { Button } from "antd";
+import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
-import type { AgentPreviewScope, ActivityStep } from "../../types";
-import { InlineAlert } from "../common/InlineAlert";
+import type { ActivityStep, AgentPreviewScope } from "../../types";
+import { ComputerPanel, LoadingState, Notice } from "../ui/fieldwork";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 import type { ComputerSurface } from "./computer";
 import { FileComputerView } from "./FileComputerView";
 import { PresentComputerView } from "./PresentComputerView";
 import { SearchComputerView } from "./SearchComputerView";
 import { TerminalPreviewView } from "./TerminalPreviewView";
+import { formatComputerElapsed } from "./ComputerPip";
 
-interface ComputerScreenProps {
-  scope: AgentPreviewScope;
-  surface: ComputerSurface;
-  availabilityError: string;
-  onRetryAvailability: () => void;
-  latestTerminalStep?: ActivityStep | null;
-  browserControlRequestId?: number;
-}
-
-export function ComputerScreen({
-  scope,
-  surface,
-  availabilityError,
-  onRetryAvailability,
-  latestTerminalStep,
-  browserControlRequestId,
-}: ComputerScreenProps) {
-  const { t } = useI18n();
-
-  return (
-    <div className="computer-screen">
-      {availabilityError ? (
-        <InlineAlert
-          className="computer-screen__alert"
-          variant="warning"
-          action={(
-            <Button size="small" type="link" onClick={onRetryAvailability}>
-              {t("computer.retry")}
-            </Button>
-          )}
-        >
-          {availabilityError}
-        </InlineAlert>
-      ) : null}
-      <div className={`computer-screen__viewport is-${surface.mode || "empty"}`}>
-        {surface.mode === "file" ? (
-          <FileComputerView scope={scope} runId={surface.runId} file={surface.file} />
-        ) : null}
-        {surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} /> : null}
-        {surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} /> : null}
-        {surface.mode === "browser" ? (
-          <BrowserPreviewView
-            scope={scope}
-            controlRequestId={browserControlRequestId}
-          />
-        ) : null}
-        {surface.mode === "terminal" ? (
-          <div className="computer-terminal">
-            <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
-          </div>
-        ) : null}
-      </div>
+export function ComputerScreen({scope,surface,availabilityError,onRetryAvailability,latestTerminalStep,browserControlRequestId}: {scope:AgentPreviewScope;surface:ComputerSurface;availabilityError:string;onRetryAvailability:()=>void;latestTerminalStep?:ActivityStep|null;browserControlRequestId?:number}) {
+  const {t}=useI18n();
+  const [now, setNow] = useState(Date.now);
+  const timing = surface.live && Boolean(surface.runId) && surface.startedAt != null && surface.startedAt > 0;
+  useEffect(() => {
+    if (!timing) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [timing, surface.runId, surface.startedAt]);
+  return <div className="wf-computer-screen">
+    {availabilityError ? <Notice tone="warning" title={availabilityError} action={<Button onClick={onRetryAvailability}>{t("computer.retry")}</Button>} /> : null}
+    <ComputerPanel expanded title={surface.mode ? t(`computer.mode.${surface.mode}`) : t("computer.title")} modeLabel={t(surface.live ? "computer.pip.live" : "preview.readOnly")} elapsed={timing ? t("computer.pip.elapsed", {time:formatComputerElapsed((now-Number(surface.startedAt)*1000)/1000)}) : undefined}>
+    <div className="wf-computer-viewport" data-mode={surface.mode || undefined}>
+      {surface.mode === "file" ? <FileComputerView scope={scope} runId={surface.runId} file={surface.file} />
+        : surface.mode === "browser" ? <BrowserPreviewView scope={scope} controlRequestId={browserControlRequestId} />
+        : surface.mode === "terminal" ? <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
+        : surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} />
+        : surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} />
+        : <LoadingState label={t("computer.loading")} />}
     </div>
-  );
+    </ComputerPanel>
+  </div>;
 }

@@ -680,7 +680,11 @@ class ScheduleServiceTests(unittest.TestCase):
                 service.close()
 
     def test_needs_review_atomically_pauses_recurring_schedule_and_clears_next_run(self):
-        with tempfile.TemporaryDirectory() as td:
+        # Keep automatic claiming disabled while the real dispatcher drives this run.
+        with (
+            tempfile.TemporaryDirectory() as td,
+            mock.patch.object(EnterpriseService, "_start_schedule_worker", return_value=None),
+        ):
             service = EnterpriseService(make_config(Path(td)), agent_client=NeedsReviewAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
@@ -947,7 +951,11 @@ class ScheduleServiceTests(unittest.TestCase):
                 service.close()
 
     def test_two_completed_run_now_occurrences_in_same_second_are_distinct(self):
-        with tempfile.TemporaryDirectory() as td:
+        # The fixed clock belongs to these manual runs, not the automatic scheduler.
+        with (
+            tempfile.TemporaryDirectory() as td,
+            mock.patch.object(EnterpriseService, "_start_schedule_worker", return_value=None),
+        ):
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:

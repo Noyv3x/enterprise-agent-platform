@@ -119,60 +119,49 @@ describe("ScheduledTasksPanel", () => {
     expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
   });
 
-  it("does not let an older list refresh overwrite a newer pause response", async () => {
+  it("keeps cached list actions disabled until refresh establishes authoritative data", async () => {
     const user = userEvent.setup();
-    const staleRefresh = deferred<{ schedules: AgentSchedule[] }>();
+    const refresh = deferred<{ schedules: AgentSchedule[] }>();
     renderPanel();
     await screen.findByRole("heading", { name: "Morning brief" });
-    mocks.loadAgentSchedules.mockReturnValueOnce(staleRefresh.promise);
-
+    mocks.loadAgentSchedules.mockReturnValueOnce(refresh.promise);
     await user.click(screen.getByRole("button", { name: "Refresh tasks" }));
-    const staleCalls = mocks.loadAgentSchedules.mock.calls;
-    const staleSignal = staleCalls[staleCalls.length - 1]?.[0] as AbortSignal;
-    await user.click(screen.getByRole("button", { name: "Pause" }));
-
-    expect(await screen.findByText("Paused")).toBeVisible();
-    expect(staleSignal.aborted).toBe(true);
-    await act(async () => staleRefresh.resolve({ schedules: [schedule] }));
+    expect(screen.getByRole("button", { name: "Pause" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete" })).toBeDisabled();
+    expect(mocks.pauseAgentSchedule).not.toHaveBeenCalled();
+    await act(async () => refresh.resolve({ schedules: [{ ...schedule, state: "paused" }] }));
     expect(screen.getByText("Paused")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Refresh tasks" })).toBeEnabled();
   });
 
-  it("does not let an older detail refresh overwrite a newer pause response", async () => {
+  it("keeps detail actions disabled while its authoritative refresh is pending", async () => {
     const user = userEvent.setup();
-    const staleDetail = deferred<{ schedule: AgentSchedule }>();
+    const refresh = deferred<{ schedule: AgentSchedule }>();
     renderPanel();
     await screen.findByRole("heading", { name: "Morning brief" });
     await user.click(screen.getByRole("button", { name: "Run history" }));
     await screen.findByText("Run history for “Morning brief”");
-    mocks.loadAgentSchedule.mockReturnValueOnce(staleDetail.promise);
-
+    mocks.loadAgentSchedule.mockReturnValueOnce(refresh.promise);
     await user.click(screen.getByRole("button", { name: "Refresh run history" }));
-    const detailCalls = mocks.loadAgentSchedule.mock.calls;
-    const staleSignal = detailCalls[detailCalls.length - 1]?.[1] as AbortSignal;
-    await user.click(screen.getByRole("button", { name: "Pause" }));
-
-    expect(await screen.findByText("Paused")).toBeVisible();
-    expect(staleSignal.aborted).toBe(true);
-    await act(async () => staleDetail.resolve({ schedule }));
-    await waitFor(() => expect(screen.getByText("Paused")).toBeVisible());
+    expect(screen.getByRole("button", { name: "Pause" })).toBeDisabled();
+    await act(async () => refresh.resolve({ schedule: { ...schedule, state: "paused" } }));
+    expect(screen.getByText("Paused")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Resume" })).toBeEnabled();
   });
 
-  it("does not let an older list refresh restore a deleted task", async () => {
+  it("does not expose deletion of a cached task removed by refresh", async () => {
     const user = userEvent.setup();
-    const staleRefresh = deferred<{ schedules: AgentSchedule[] }>();
+    const refresh = deferred<{ schedules: AgentSchedule[] }>();
     renderPanel();
     await screen.findByRole("heading", { name: "Morning brief" });
-    mocks.loadAgentSchedules.mockReturnValueOnce(staleRefresh.promise);
-
+    mocks.loadAgentSchedules.mockReturnValueOnce(refresh.promise);
     await user.click(screen.getByRole("button", { name: "Refresh tasks" }));
-    await user.click(screen.getByRole("button", { name: "Delete" }));
-    const dialog = screen.getByRole("dialog", { name: "Delete scheduled task?" });
-    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+    expect(screen.getByRole("button", { name: "Delete" })).toBeDisabled();
+    await act(async () => refresh.resolve({ schedules: [] }));
     expect(screen.queryByRole("heading", { name: "Morning brief" })).not.toBeInTheDocument();
-
-    await act(async () => staleRefresh.resolve({ schedules: [schedule] }));
-    expect(screen.queryByRole("heading", { name: "Morning brief" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
+    expect(mocks.deleteAgentSchedule).not.toHaveBeenCalled();
   });
 
   it("confirms run-now and delete operations before calling their endpoints", async () => {
@@ -247,7 +236,7 @@ describe("ScheduledTasksPanel", () => {
 
     renderPanel();
     const morningHeading = await screen.findByRole("heading", { name: "Morning brief" });
-    await user.click(within(morningHeading.closest("article")!).getByRole("button", { name: "Run history" }));
+    await user.click(within(morningHeading.closest("li")!).getByRole("button", { name: "Run history" }));
     await screen.findByText("Run history for “Morning brief”");
     await user.click(screen.getByRole("button", { name: "Load more" }));
     const delayedCall = mocks.loadAgentScheduleRuns.mock.calls.find(
@@ -257,7 +246,7 @@ describe("ScheduledTasksPanel", () => {
 
     await user.click(screen.getByRole("button", { name: "Back to tasks" }));
     const eveningHeading = await screen.findByRole("heading", { name: "Evening review" });
-    await user.click(within(eveningHeading.closest("article")!).getByRole("button", { name: "Run history" }));
+    await user.click(within(eveningHeading.closest("li")!).getByRole("button", { name: "Run history" }));
     expect(await screen.findByText("Run history for “Evening review”")).toBeVisible();
     expect(screen.getByText("Evening record")).toBeVisible();
     expect(delayedSignal.aborted).toBe(true);

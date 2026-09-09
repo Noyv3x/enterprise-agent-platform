@@ -1,9 +1,11 @@
 import { createContext, useContext } from "react";
+import type { ReactNode } from "react";
 import type { AgentPreviewScope, ComputerMode } from "../../types";
 import type { ComputerSurface } from "./computer";
 
 export interface ChatPreviewContextValue {
   scope: AgentPreviewScope | null;
+  capabilityActions: ReactNode;
   browserDrawerOpen: boolean;
   computerDrawerOpen: boolean;
   computerMode: ComputerMode | null;

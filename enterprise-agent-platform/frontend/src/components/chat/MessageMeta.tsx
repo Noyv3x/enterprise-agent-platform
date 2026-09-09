@@ -1,10 +1,7 @@
-/* <MessageMeta/> — author name, optional pending/streaming badges and formatted time. */
-
+import type { ReactNode } from "react";
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
-import type { ReactNode } from "react";
-import { Tag } from "antd";
-
+import { StatusMark } from "../ui/fieldwork";
 function formatMessageTime(value: number | null | undefined, locale: string): string {
   if (!value) return "";
   const date = new Date(value * 1000);
@@ -22,29 +19,16 @@ function authorName(message: Message, isUser: boolean, translate: Translator): s
   return message.username || translate("chat.agent");
 }
 
-export function MessageMeta({
-  message,
-  isUser,
-  pending,
-  streaming,
-  hideAuthorName = false,
-  action,
-}: {
-  message: Message;
-  isUser: boolean;
-  pending: boolean;
-  streaming: boolean;
-  hideAuthorName?: boolean;
-  action?: ReactNode;
+export function MessageMeta({message,isUser,pending,streaming,hideAuthorName=false,action}: {
+ message:Message; isUser:boolean; pending:boolean; streaming:boolean; hideAuthorName?:boolean; action?:ReactNode;
 }) {
-  const { locale, t } = useI18n();
-  return (
-    <div className="msg__meta">
-      {hideAuthorName ? null : <span className="msg__name">{authorName(message, isUser, t)}</span>}
-      {pending ? <Tag className="msg__pending">{t("chat.message.sending")}</Tag> : null}
-      {streaming ? <Tag className="msg__pending" color="processing">{t("chat.message.generating")}</Tag> : null}
-      <span className="msg__time">{formatMessageTime(message.created_at, locale)}</span>
-      {action}
-    </div>
-  );
+ const {t,locale}=useI18n();
+ return <div className="wf-message-metadata">
+   {!hideAuthorName && <strong>{authorName(message,isUser,t)}</strong>}
+   <time dateTime={message.created_at ? new Date(message.created_at * 1000).toISOString() : undefined}>{formatMessageTime(message.created_at,locale)}</time>
+   {message.metadata?.needs_review && <StatusMark tone="warning">{t("chat.message.needsReview")}</StatusMark>}
+   {pending && <StatusMark tone="info">{t("chat.message.sending")}</StatusMark>}
+   {streaming && <StatusMark tone="info">{t("chat.message.generating")}</StatusMark>}
+   {action}
+ </div>;
 }

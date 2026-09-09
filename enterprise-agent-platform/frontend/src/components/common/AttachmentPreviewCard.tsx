@@ -1,302 +1,123 @@
-import { Button, Spin, Tabs } from "antd";
-import { useEffect, useMemo, useState } from "react";
-import { useI18n, type MessageKey, type Translator } from "../../i18n";
+import { Button, Modal, Table, Tabs } from "antd";
+import { useEffect, useState } from "react";
+import { useI18n, type MessageKey } from "../../i18n";
 import { api, isApiRequestCancelled, safeUrl } from "../../lib/api";
-import type {
-  Attachment,
-  AttachmentPreview,
-  AttachmentPreviewKind,
-  AttachmentPreviewSection,
-  XlsxPreviewSheet,
-} from "../../types";
+import type { Attachment, AttachmentPreview, AttachmentPreviewKind, AttachmentPreviewSection, XlsxPreviewSheet } from "../../types";
 import { formatFileSize } from "../../utils/format";
-import { Dialog } from "./Dialog";
+import { AttachmentSlot, LoadingState, Notice, useFieldworkContainer } from "../ui/fieldwork";
 import { Icon } from "./Icon";
-
-const INLINE_ROWS = 8;
-const INLINE_COLUMNS = 8;
-const INLINE_BLOCKS = 8;
+import "../preview/preview.css";
 
 const KIND_LABELS: Record<AttachmentPreviewKind, MessageKey> = {
-  xlsx: "chat.preview.kind.xlsx",
-  docx: "chat.preview.kind.docx",
-  pptx: "chat.preview.kind.pptx",
-  pdf: "chat.preview.kind.pdf",
+  xlsx: "chat.preview.kind.xlsx", docx: "chat.preview.kind.docx",
+  pptx: "chat.preview.kind.pptx", pdf: "chat.preview.kind.pdf",
 };
 
-function previewKind(filename: string | undefined, kind?: string): AttachmentPreviewKind | "" {
-  if (kind === "xlsx" || kind === "docx" || kind === "pptx" || kind === "pdf") return kind;
-  const suffix = String(filename || "").toLowerCase();
-  if (suffix.endsWith(".xlsx")) return "xlsx";
-  if (suffix.endsWith(".docx")) return "docx";
-  if (suffix.endsWith(".pptx")) return "pptx";
-  if (suffix.endsWith(".pdf")) return "pdf";
-  return "";
-}
-
-function spreadsheetColumn(index: number): string {
-  let value = index + 1;
-  let label = "";
-  while (value > 0) {
-    value -= 1;
-    label = String.fromCharCode(65 + (value % 26)) + label;
-    value = Math.floor(value / 26);
+function columnName(index: number): string {
+  let name = "";
+  for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26)) {
+    name = String.fromCharCode(65 + (value - 1) % 26) + name;
   }
-  return label;
+  return name;
 }
 
-function SheetTable({
-  sheet,
-  compact,
-}: {
-  sheet: XlsxPreviewSheet;
-  compact: boolean;
-}) {
+function Sheet({ sheet, compact }: { sheet: XlsxPreviewSheet; compact: boolean }) {
   const { t } = useI18n();
-  const rows = compact ? sheet.rows.slice(0, INLINE_ROWS) : sheet.rows;
-  const availableColumns = Math.max(
-    Number(sheet.columns) || 0,
-    ...rows.map((row) => row.length),
-  );
-  const columnCount = compact
-    ? Math.min(availableColumns, INLINE_COLUMNS)
-    : availableColumns;
-  const clipped = sheet.truncated
-    || rows.length < sheet.rows.length
-    || columnCount < availableColumns;
-
-  if (!rows.length || columnCount === 0) {
-    return <div className="xlsx-preview__empty">{t("chat.xlsx.empty")}</div>;
-  }
-
-  return (
-    <>
-      <div className="xlsx-preview__scroll">
-        <table aria-label={t("chat.xlsx.sheet", { name: sheet.name })}>
-          <thead>
-            <tr>
-              <th className="xlsx-preview__corner" aria-hidden="true" />
-              {Array.from({ length: columnCount }, (_, index) => (
-                <th key={index} scope="col">{spreadsheetColumn(index)}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, rowIndex) => (
-              <tr key={rowIndex}>
-                <th scope="row">{rowIndex + 1}</th>
-                {Array.from({ length: columnCount }, (_, columnIndex) => (
-                  <td key={columnIndex}>{row[columnIndex] || ""}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {clipped ? (
-        <div className="xlsx-preview__limited">{t("chat.xlsx.limited")}</div>
-      ) : null}
-    </>
-  );
+  const rows = compact ? sheet.rows.slice(0, 8) : sheet.rows;
+  const count = Math.max(sheet.columns, ...rows.map((row) => row.length));
+  const visibleColumns = compact ? Math.min(8, count) : count;
+  const limited = sheet.truncated || rows.length < sheet.rows.length || visibleColumns < count;
+  return <div className="wf-document-sheet">
+    {rows.length && visibleColumns ? <Table<string[]>
+      aria-label={t("chat.xlsx.sheet", { name: sheet.name })}
+      dataSource={rows}
+      columns={Array.from({ length: visibleColumns }, (_, index) => ({
+        title: columnName(index), key: String(index), render: (_: unknown, row: string[]) => row[index] || "",
+      }))}
+      rowKey={(_, index) => String(index)}
+      pagination={false}
+      scroll={{ x: "max-content" }}
+      size="small"
+    /> : <Notice title={t("chat.xlsx.empty")} />}
+    {limited ? <Notice title={t("chat.xlsx.limited")} /> : null}
+  </div>;
 }
 
-function sectionTitle(
-  section: AttachmentPreviewSection,
-  kind: AttachmentPreviewKind,
-  translate: Translator,
-): string {
-  if (section.title) return section.title;
-  const number = Number(section.index || 0);
-  if (kind === "pptx" && number) return translate("chat.preview.slide", { number });
-  if (kind === "pdf" && number) return translate("chat.preview.page", { number });
-  return "";
-}
-
-function DocumentSections({
-  sections,
-  kind,
-  compact,
-  truncated,
-}: {
-  sections: AttachmentPreviewSection[];
-  kind: AttachmentPreviewKind;
-  compact: boolean;
-  truncated: boolean;
-}) {
+function TextSection({ section, compact }: { section?: AttachmentPreviewSection; compact: boolean }) {
   const { t } = useI18n();
-  const visible = compact ? sections.slice(0, 1) : sections;
-  const first = visible[0];
-  const blocks = compact ? (first?.blocks || []).slice(0, INLINE_BLOCKS) : [];
-  const clipped = truncated
-    || sections.some((section) => section.truncated)
-    || (compact && (
-      sections.length > 1
-      || (first?.blocks.length || 0) > INLINE_BLOCKS
-    ));
-
-  if (!sections.some((section) => section.blocks.length)) {
-    return <div className="document-preview__empty">{t("chat.preview.empty")}</div>;
-  }
-
-  if (compact) {
-    return (
-      <>
-        {first && sectionTitle(first, kind, t) ? (
-          <div className="document-preview__section-name">{sectionTitle(first, kind, t)}</div>
-        ) : null}
-        <div className="document-preview__text">
-          {blocks.map((block, index) => <p key={index}>{block}</p>)}
-        </div>
-        {clipped ? <div className="document-preview__limited">{t("chat.preview.limited")}</div> : null}
-      </>
-    );
-  }
-
-  if (visible.length > 1) {
-    return null;
-  }
-  return (
-    <>
-      <div className="document-preview__text">
-        {(first?.blocks || []).map((block, index) => <p key={index}>{block}</p>)}
-      </div>
-      {clipped ? <div className="document-preview__limited">{t("chat.preview.limited")}</div> : null}
-    </>
-  );
+  const blocks = section?.blocks || [];
+  const visible = compact ? blocks.slice(0, 8) : blocks;
+  return <div className="wf-document-text">
+    {visible.length ? visible.map((text, index) => <p key={index}>{text}</p>) : <Notice title={t("chat.preview.empty")} />}
+    {section?.truncated || visible.length < blocks.length ? <Notice title={t("chat.preview.limited")} /> : null}
+  </div>;
 }
 
 export function AttachmentPreviewCard({ attachment }: { attachment: Attachment }) {
   const { t } = useI18n();
-  const [preview, setPreview] = useState<AttachmentPreview | null>(null);
-  const [error, setError] = useState("");
-  const [expanded, setExpanded] = useState(false);
-  const [activeKey, setActiveKey] = useState("0");
-  const previewUrl = safeUrl(attachment.preview_url);
-  const downloadUrl = safeUrl(attachment.download_url || attachment.url);
-  const name = attachment.filename || t("chat.attachment");
-  const size = formatFileSize(attachment.size_bytes || 0);
-  const kind = previewKind(attachment.filename, preview?.kind);
-  const kindLabel = kind ? t(KIND_LABELS[kind]) : t("chat.file");
-
+  const getContainer = useFieldworkContainer();
+  const rawUrl = safeUrl(attachment.preview_url);
+  let previewUrl = "";
+  try {
+    const url = new URL(rawUrl, window.location.origin);
+    if (rawUrl && url.origin === window.location.origin && !url.username && !url.password
+      && url.pathname === `/api/attachments/${encodeURIComponent(String(attachment.id))}/preview`) previewUrl = url.pathname + url.search;
+  } catch { /* Invalid attachment URLs cannot initiate a preview request. */ }
+  const identity = `${attachment.id}:${previewUrl}`;
+  const [result, setResult] = useState<{ identity: string; preview?: AttachmentPreview; failed?: boolean } | null>(null);
+  const [openIdentity, setOpenIdentity] = useState<string | null>(null);
+  const [selection, setSelection] = useState({ identity, key: "0" });
   useEffect(() => {
-    if (!previewUrl) {
-      setError(t("chat.preview.unavailable"));
-      return;
-    }
     const controller = new AbortController();
-    setError("");
-    api<AttachmentPreview>(previewUrl, { signal: controller.signal })
-      .then((value) => setPreview(value))
-      .catch((reason) => {
-        if (!isApiRequestCancelled(reason)) setError(t("chat.preview.unavailable"));
+    let current = true;
+    setResult(null);
+    setOpenIdentity(null);
+    setSelection({ identity, key: "0" });
+    if (previewUrl) {
+      api<AttachmentPreview>(previewUrl, { signal: controller.signal }).then((preview) => {
+        if (current) setResult({ identity, preview });
+      }).catch((reason) => {
+        if (current && !isApiRequestCancelled(reason)) setResult({ identity, failed: true });
       });
-    return () => controller.abort();
-  }, [previewUrl, t]);
-
-  const spreadsheet = kind === "xlsx" || Boolean(preview?.sheets?.length);
+    }
+    return () => { current = false; controller.abort(); };
+  }, [identity, previewUrl]);
+  const preview = result?.identity === identity ? result.preview : undefined;
+  const failed = !previewUrl || (result?.identity === identity && result.failed);
+  const suffix = attachment.filename?.split(".").pop()?.toLowerCase();
+  const kind = preview?.kind || (suffix && suffix in KIND_LABELS ? suffix as AttachmentPreviewKind : undefined);
   const sheets = preview?.sheets || [];
   const sections = preview?.sections || [];
-  const firstSheet = sheets[0];
-  const canExpand = spreadsheet
-    ? Boolean(firstSheet)
-    : sections.some((section) => section.blocks.length);
-
-  const tabs = useMemo(() => {
-    if (spreadsheet) {
-      return sheets.map((sheet, index) => ({
-        key: String(index),
-        label: sheet.name,
-        children: <SheetTable sheet={sheet} compact={false} />,
-      }));
-    }
-    if (sections.length <= 1) return [];
-    return sections.map((section, index) => ({
-      key: String(index),
-      label: sectionTitle(section, kind || "docx", t) || String(index + 1),
-      children: (
-        <div className="document-preview__text">
-          {section.blocks.map((block, blockIndex) => <p key={blockIndex}>{block}</p>)}
-          {section.truncated ? (
-            <div className="document-preview__limited">{t("chat.preview.limited")}</div>
-          ) : null}
-        </div>
-      ),
-    }));
-  }, [kind, sections, sheets, spreadsheet, t]);
-
-  return (
-    <section className={`msg-attachment msg-attachment--preview msg-attachment--${kind || "file"}`} aria-label={name}>
-      <header className="xlsx-preview__header">
-        <span className="msg-attachment__fileicon">
-          <Icon name="doc" size={18} />
-        </span>
-        <span className="msg-attachment__meta">
-          <strong title={name}>{name}</strong>
-          <span>{`${kindLabel} · ${size}`}</span>
-        </span>
-        <span className="xlsx-preview__actions">
-          <Button
-            type="text"
-            size="small"
-            icon={<Icon name="external" size={16} />}
-            aria-label={spreadsheet ? t("chat.xlsx.expand") : t("chat.preview.expand")}
-            title={spreadsheet ? t("chat.xlsx.expand") : t("chat.preview.expand")}
-            disabled={!canExpand}
-            onClick={() => setExpanded(true)}
-          />
-          <Button
-            type="text"
-            size="small"
-            icon={<Icon name="download" size={16} />}
-            aria-label={spreadsheet ? t("chat.xlsx.download") : t("chat.preview.download")}
-            title={spreadsheet ? t("chat.xlsx.download") : t("chat.preview.download")}
-            href={downloadUrl || undefined}
-            target="_blank"
-            rel="noreferrer"
-            disabled={!downloadUrl}
-          />
-        </span>
-      </header>
-      <div className="xlsx-preview__body" aria-live="polite">
-        {!preview && !error ? (
-          <div className="xlsx-preview__loading"><Spin size="small" /> {t("chat.preview.loading")}</div>
-        ) : error ? (
-          <div className="xlsx-preview__error">{error}</div>
-        ) : spreadsheet && firstSheet ? (
-          <>
-            <div className="xlsx-preview__sheet-name">{firstSheet.name}</div>
-            <SheetTable sheet={firstSheet} compact />
-          </>
-        ) : spreadsheet ? (
-          <div className="xlsx-preview__empty">{t("chat.xlsx.empty")}</div>
-        ) : (
-          <DocumentSections
-            compact
-            kind={kind || "docx"}
-            sections={sections}
-            truncated={Boolean(preview?.truncated)}
-          />
-        )}
+  const spreadsheet = kind === "xlsx";
+  const name = attachment.filename || t("chat.attachment");
+  const download = safeUrl(attachment.download_url || attachment.url);
+  const expandLabel = t(spreadsheet ? "chat.xlsx.expand" : "chat.preview.expand");
+  const downloadLabel = t(spreadsheet ? "chat.xlsx.download" : "chat.preview.download");
+  const sectionLabel = (section: AttachmentPreviewSection, index: number) => section.title || (
+    kind === "pdf" ? t("chat.preview.page", { number: section.index || index + 1 }) :
+    kind === "pptx" ? t("chat.preview.slide", { number: section.index || index + 1 }) : String(index + 1));
+  const canExpand = Boolean(preview && (spreadsheet ? sheets.length : sections.some((section) => section.blocks.length)));
+  const downloadAction = <Button type="text" icon={<Icon name="download" size={18} />} aria-label={downloadLabel} title={downloadLabel} href={download || undefined} disabled={!download} target="_blank" rel="noreferrer" />;
+  const compact = failed ? <Notice tone="warning" title={t("chat.preview.unavailable")} /> : !preview ? <LoadingState label={t("chat.preview.loading")} /> : <>
+    {spreadsheet ? sheets[0] ? <><strong>{sheets[0].name}</strong><Sheet sheet={sheets[0]} compact /></> : <Notice title={t("chat.xlsx.empty")} /> : <>
+      {sections[0] && (sections[0].title || kind === "pdf" || kind === "pptx") ? <strong>{sectionLabel(sections[0], 0)}</strong> : null}
+      <TextSection section={sections[0]} compact />
+    </>}
+    {preview.truncated || (spreadsheet ? sheets.length > 1 : sections.length > 1) ? <Notice title={t(spreadsheet ? "chat.xlsx.limited" : "chat.preview.limited")} /> : null}
+  </>;
+  return <>
+    <AttachmentSlot name={name} meta={`${kind ? t(KIND_LABELS[kind]) : attachment.mime_type || t("chat.file")} · ${formatFileSize(attachment.size_bytes || 0)}`}
+      actions={<><Button type="text" icon={<Icon name="external" size={18} />} aria-label={expandLabel} title={expandLabel} disabled={!canExpand} onClick={() => setOpenIdentity(identity)} />{downloadAction}</>}
+      preview={<div className="wf-document-compact" aria-live="polite">{compact}</div>}
+    />
+    <Modal open={openIdentity === identity} onCancel={() => setOpenIdentity(null)} title={name} footer={downloadAction} width="min(1080px, calc(100vw - 32px))" destroyOnHidden getContainer={getContainer}>
+      <div className="wf-document-expanded">
+        {preview ? <>
+          <Tabs activeKey={selection.identity === identity ? selection.key : "0"} onChange={(key) => setSelection({ identity, key })}
+            items={spreadsheet ? sheets.map((sheet, index) => ({ key: String(index), label: sheet.name, children: <Sheet sheet={sheet} compact={false} /> })) : sections.map((section, index) => ({ key: String(index), label: sectionLabel(section, index), children: <TextSection section={section} compact={false} /> }))} />
+          {preview.truncated ? <Notice title={t(spreadsheet ? "chat.xlsx.limited" : "chat.preview.limited")} /> : null}
+        </> : null}
       </div>
-      <Dialog
-        open={expanded}
-        onClose={() => setExpanded(false)}
-        title={name}
-        className={spreadsheet ? "xlsx-preview-dialog" : "document-preview-dialog"}
-      >
-        {tabs.length > 1 ? (
-          <Tabs items={tabs} activeKey={activeKey} onChange={setActiveKey} />
-        ) : spreadsheet && firstSheet ? (
-          <SheetTable sheet={firstSheet} compact={false} />
-        ) : (
-          <DocumentSections
-            compact={false}
-            kind={kind || "docx"}
-            sections={sections}
-            truncated={Boolean(preview?.truncated)}
-          />
-        )}
-      </Dialog>
-    </section>
-  );
+    </Modal>
+  </>;
 }

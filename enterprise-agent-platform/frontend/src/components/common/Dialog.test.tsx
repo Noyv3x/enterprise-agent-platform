@@ -2,7 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { ConfigProvider } from "antd";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, it } from "vitest";
@@ -75,6 +75,7 @@ describe("Dialog", () => {
   it("only lets the top modal handle keyboard input", async () => {
     const user = userEvent.setup();
     mount(<NestedHarness />);
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Account" })).toContainElement(document.activeElement as HTMLElement));
     await user.click(screen.getByRole("button", { name: "Discard" }));
 
     expect(screen.getAllByRole("dialog")).toHaveLength(2);

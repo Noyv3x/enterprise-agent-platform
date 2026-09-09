@@ -42,12 +42,30 @@ describe("RuntimeSettings", () => {
     );
 
     expect(screen.getByText("SearXNG search")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Health of the Agent runtime, Camofox, SearXNG search, and Firecrawl web extraction.",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByText("Managed search is ready")).toBeInTheDocument();
+    expect(screen.getByText("Ready")).toBeInTheDocument();
 
     expect(screen.queryByRole("button", { name: "Restart" })).not.toBeInTheDocument();
+  });
+
+  it("does not treat an unknown service state as ready", () => {
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({
+      type: "SET_RUNTIMES",
+      payload: {
+        searxng: {
+          name: "searxng",
+          available: true,
+          state: undefined as never,
+          detail: "",
+          error: "",
+          status_stale: true,
+          status_checked_at: null,
+        },
+      },
+    });
+    render(<StoreContext.Provider value={store}><I18nProvider><RuntimeSettings /></I18nProvider></StoreContext.Provider>);
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("Ready")).not.toBeInTheDocument();
   });
 });

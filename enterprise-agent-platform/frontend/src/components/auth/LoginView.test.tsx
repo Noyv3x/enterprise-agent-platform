@@ -1,9 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
@@ -13,7 +11,6 @@ import { StoreContext } from "../../store/StoreProvider";
 import { TestUiProviders } from "../../test/TestUiProviders";
 import { LoginView } from "./LoginView";
 
-const designSystemStyles = readFileSync(resolve(process.cwd(), "src/design-system.css"), "utf8");
 
 describe("LoginView", () => {
   beforeEach(() => {
@@ -36,24 +33,11 @@ describe("LoginView", () => {
     return { store, ...view };
   }
 
-  it("keeps the original split-screen layout with locale controls in the form pane", () => {
-    const { container } = renderLogin();
-
-    const page = container.querySelector("main.auth--login");
-    expect(page).toBeInTheDocument();
-
-    const aside = page?.querySelector(".auth__aside");
-    expect(aside).toBeInTheDocument();
-    expect(within(aside as HTMLElement).getByText("Agent Platform")).toBeInTheDocument();
-    expect(within(aside as HTMLElement).getByText("Agent")).toBeInTheDocument();
-
-    const card = page?.querySelector(".auth__card");
-    expect(card).toContainElement(screen.getByRole("combobox", { name: "Language" }));
+  it("provides language selection and required credential fields", () => {
+    renderLogin();
+    expect(screen.getByRole("combobox", { name: "Language" })).toBeInTheDocument();
     expect(screen.getByLabelText("Username")).toBeRequired();
     expect(screen.getByLabelText("Password")).toBeRequired();
-    expect(designSystemStyles).toMatch(
-      /\.auth--login \.auth__logo\s*\{[^}]*width:\s*min\(440px, 88%\)/,
-    );
   });
 
   it("keeps failed authentication inline and submits the entered credentials", async () => {

@@ -20,6 +20,7 @@ import {
   t,
   translate,
 } from ".";
+import { workroomMessages } from "./messages/workroom";
 
 afterEach(() => setCurrentLocale("zh-CN"));
 
@@ -118,6 +119,7 @@ describe("translation catalogs", () => {
       memoryMessages,
       skillMessages,
       mailMessages,
+      workroomMessages,
     ]) {
       for (const key of Object.keys(domain)) {
         if (seen.has(key)) duplicates.push(key);

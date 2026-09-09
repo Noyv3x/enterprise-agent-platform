@@ -1,19 +1,20 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeContext } from "../../context/ThemeContext";
 import { ToastProvider } from "../../context/ToastContext";
 import { resourceKeys } from "../../data/resourceState";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { I18nProvider, LOCALE_STORAGE_KEY, translate } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AppState, Message, User } from "../../types";
 import { AntDesignProvider } from "../ui/AntDesignProvider";
 import { AppShell } from "./AppShell";
+import { PersonalAiGuideDialog } from "./PersonalAiGuideDialog";
 
 vi.mock("../../hooks/useRealtime", () => ({ useRealtime: () => true }));
 vi.mock("../../hooks/usePolling", () => ({ usePolling: () => undefined }));
@@ -62,7 +63,7 @@ const readyHistory = {
   prependVersion: 0,
 };
 
-function renderShell(overrides: Partial<AppState> = {}) {
+function renderShell(overrides: Partial<AppState> = {}, ui: React.ReactNode = <AppShell />) {
   const store = createStore(rootReducer, {
     ...initialAppState,
     user: currentUser,
@@ -78,7 +79,7 @@ function renderShell(overrides: Partial<AppState> = {}) {
       <I18nProvider>
         <ThemeContext.Provider value={{ theme: "light", toggleTheme: vi.fn() }}>
           <AntDesignProvider>
-            <ToastProvider><AppShell /></ToastProvider>
+            <ToastProvider>{ui}</ToastProvider>
           </AntDesignProvider>
         </ThemeContext.Provider>
       </I18nProvider>
@@ -88,7 +89,7 @@ function renderShell(overrides: Partial<AppState> = {}) {
 }
 
 async function visibleGuide() {
-  const dialog = await screen.findByRole("dialog", { name: "Meet your Personal AI" });
+  const dialog = await screen.findByRole("dialog", { name: translate("en", "personalAi.guide.title") });
   expect(dialog).toBeVisible();
   return dialog;
 }
@@ -99,7 +100,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
       value: vi.fn((query: string) => ({
-        matches: false,
+        matches: query === "(prefers-reduced-motion: reduce)",
         media: query,
         onchange: null,
         addListener: vi.fn(),
@@ -119,21 +120,20 @@ describe("Personal AI onboarding and public-channel cues", () => {
   });
 
   it("opens once for an authoritative empty Personal AI conversation", async () => {
-    const { store } = renderShell();
+    const { store } = renderShell({}, <PersonalAiGuideDialog onDraftFilled={vi.fn()} />);
 
     await visibleGuide();
-    expect(screen.getByText("This guide stays in the sidebar, so you can reopen it at any time.")).toBeVisible();
     expect(screen.getAllByRole("button", { name: /^Try:/ })).toHaveLength(3);
     expect(store.getState().personalAiGuideShownThisSession).toBe(true);
 
     await userEvent.click(screen.getByRole("button", { name: "Got it" }));
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Meet your Personal AI" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: translate("en", "personalAi.guide.title") })).not.toBeInTheDocument());
 
-    store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
-    store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "private" });
-    expect(screen.queryByRole("dialog", { name: "Meet your Personal AI" })).not.toBeInTheDocument();
+    act(() => { store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" }); });
+    act(() => { store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "private" }); });
+    expect(screen.queryByRole("dialog", { name: translate("en", "personalAi.guide.title") })).not.toBeInTheDocument();
 
-    store.dispatch({ type: "RESET_SESSION" });
+    act(() => { store.dispatch({ type: "RESET_SESSION" }); });
     expect(store.getState().personalAiGuideOpen).toBe(false);
     expect(store.getState().personalAiGuideShownThisSession).toBe(false);
   });
@@ -148,7 +148,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
     await user.click(screen.getByRole("button", { name: "Try: Create and deliver files" }));
 
     expect(store.getState().drafts["private:7"]).toContain("Excel task plan");
-    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Meet your Personal AI" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: translate("en", "personalAi.guide.title") })).not.toBeInTheDocument());
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Message input" })).toHaveFocus());
     expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "POST")).toBe(false);
   });
@@ -162,7 +162,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
 
     expect(store.getState().drafts["private:7"]).toBe("keep my draft");
     expect(screen.getByText(/composer already has text or attachments/)).toBeVisible();
-    expect(screen.getByRole("dialog", { name: "Meet your Personal AI" })).toBeVisible();
+    expect(screen.getByRole("dialog", { name: translate("en", "personalAi.guide.title") })).toBeVisible();
   });
 
   it("preserves attached files when the text draft is empty", async () => {
@@ -176,7 +176,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
     expect(store.getState().drafts["private:7"] || "").toBe("");
     expect(store.getState().draftFiles["private:7"]).toEqual([attachment]);
     expect(screen.getByText(/composer already has text or attachments/)).toBeVisible();
-    expect(screen.getByRole("dialog", { name: "Meet your Personal AI" })).toBeVisible();
+    expect(screen.getByRole("dialog", { name: translate("en", "personalAi.guide.title") })).toBeVisible();
   });
 
   it.each([
@@ -204,7 +204,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
   ])("does not auto-open while %s", async (_label, overrides) => {
     renderShell(overrides as Partial<AppState>);
     await waitFor(() => {
-      expect(screen.queryByRole("dialog", { name: "Meet your Personal AI" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: translate("en", "personalAi.guide.title") })).not.toBeInTheDocument();
     });
   });
 
@@ -220,16 +220,18 @@ describe("Personal AI onboarding and public-channel cues", () => {
     const { store } = renderShell({
       activeView: "channel",
       activeChannelId: 3,
-      channels: [{ id: 3, name: "general" }],
+      channels: [{ id: 3, name: "general", description: "Team planning notes" }],
       privateMessages: [{ id: 2, author_type: "agent", content: "existing" }],
       personalAiGuideShownThisSession: true,
     });
 
-    expect(screen.getByText("Public channels")).toBeVisible();
-    expect(screen.getByText("Channel messages are visible to all members with workspace access")).toBeVisible();
-    expect(screen.getByText("Public")).toBeVisible();
+    const navigation = screen.getByRole("navigation", { name: "Main navigation" });
+    expect(within(navigation).getByText("Public channels")).toBeVisible();
+    expect(within(navigation).getByText("Visible to workspace members")).toBeVisible();
+    expect(within(navigation).getByText("Team planning notes")).toBeVisible();
+    expect(within(screen.getByRole("main")).getByText("Public")).toBeVisible();
 
-    await user.click(screen.getByRole("menuitem", { name: "Personal AI guide" }));
+    await user.click(within(navigation).getByRole("button", { name: "Personal AI guide" }));
     expect(store.getState().activeView).toBe("private");
     await visibleGuide();
   });

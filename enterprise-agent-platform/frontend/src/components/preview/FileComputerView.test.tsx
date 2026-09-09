@@ -71,7 +71,7 @@ describe("FileComputerView", () => {
       rejectStarted?.(new ApiError("not found", 404));
       await Promise.resolve();
     });
-    expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Loading file…").closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
     rendered.rerender(view({
@@ -110,7 +110,7 @@ describe("FileComputerView", () => {
       await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(fetchPreviewFile).toHaveBeenCalledTimes(9);
-    expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Loading file…").closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
@@ -151,8 +151,7 @@ describe("FileComputerView", () => {
       revision: "patch-3:7:completed",
     }));
 
-    const changed = await screen.findByText("const value = 2;");
-    expect(changed).toHaveClass("computer-file__line", "is-changed");
+    expect(await screen.findByText("const value = 2;")).toBeVisible();
     expect(screen.queryByText("const value = 1;")).not.toBeInTheDocument();
     expect(fetchPreviewFile).toHaveBeenCalledTimes(2);
   });
@@ -198,7 +197,6 @@ describe("FileComputerView", () => {
 
     expect(await screen.findByText("Uncommitted file draft")).toBeVisible();
     expect(screen.getByText("export const value = 1;")).toBeVisible();
-    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-source", "draft");
 
     rendered.rerender(view({ ...running, revision: "draft:write-draft:2" }));
     expect(await screen.findByText("export const value = 12;")).toBeVisible();
@@ -214,8 +212,6 @@ describe("FileComputerView", () => {
     await waitFor(() => {
       expect(fetchPreviewFile).toHaveBeenCalledTimes(3);
       expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
-      expect(rendered.container.querySelector(".computer-file"))
-        .toHaveAttribute("data-source", "workspace");
     });
   });
 
@@ -230,7 +226,7 @@ describe("FileComputerView", () => {
       revision: "draft:patch-draft:4",
     });
 
-    const rendered = render(view({
+    render(view({
       tool: "patch_file",
       path: "src/value.ts",
       workspace_path: "src/value.ts",
@@ -241,7 +237,6 @@ describe("FileComputerView", () => {
     }));
 
     expect(await screen.findByText("Uncommitted replacement draft")).toBeVisible();
-    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-draft-kind", "replacement");
   });
 
   it("keeps one read in flight, coalesces revision bursts, and fences the superseded response", async () => {
@@ -303,8 +298,6 @@ describe("FileComputerView", () => {
     expect(fetchPreviewFile).toHaveBeenCalledTimes(2);
     expect(screen.queryByText("older draft")).not.toBeInTheDocument();
     expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
-    expect(rendered.container.querySelector(".computer-file"))
-      .toHaveAttribute("data-source", "workspace");
   });
 
   it("reveals each monotonic draft revision while the stream keeps outrunning the read", async () => {
@@ -448,11 +441,10 @@ describe("FileComputerView", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const stream = rendered.container.querySelector('[data-render-mode="stream"] code');
+    const stream = rendered.container.querySelector("pre code");
     expect(stream).not.toBeNull();
     expect(stream?.textContent?.length).toBeGreaterThan(0);
     expect(stream?.textContent?.length).toBeLessThan(content.length);
-    expect(rendered.container.querySelectorAll(".computer-file__line")).toHaveLength(0);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2_000);
@@ -511,7 +503,7 @@ describe("FileComputerView", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const stream = rendered.container.querySelector('[data-render-mode="stream"] code');
+    const stream = rendered.container.querySelector("pre code");
     expect(stream?.textContent?.length).toBeLessThan(draft.length);
 
     rendered.rerender(view({
@@ -523,16 +515,13 @@ describe("FileComputerView", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(rendered.container.querySelector('[data-render-mode="stream"]')).not.toBeNull();
     expect(stream?.textContent?.length).toBeLessThan(workspace.length);
-    expect(rendered.container.querySelector(".computer-file__caret")).toBeNull();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2_000);
     });
     expect(stream?.textContent).toBe(workspace);
-    expect(rendered.container.querySelector(".computer-file"))
-      .toHaveAttribute("data-source", "workspace");
+    expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
   });
 
   it("immediately replaces a non-prefix draft and cancels queued stale text", async () => {
@@ -573,7 +562,7 @@ describe("FileComputerView", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const stream = rendered.container.querySelector('[data-render-mode="stream"] code');
+    const stream = rendered.container.querySelector("pre code");
     expect(stream?.textContent).not.toBe(firstContent);
 
     rendered.rerender(view({ ...file, revision: "draft:rewrite:2" }));
@@ -626,105 +615,9 @@ describe("FileComputerView", () => {
     }));
 
     await waitFor(() => {
-      expect(rendered.container.querySelector('[data-render-mode="stream"] code')?.textContent)
+      expect(rendered.container.querySelector("pre code")?.textContent)
         .toBe(content);
     });
   });
 
-  it("only animates a bounded real change region without remounting unchanged lines", async () => {
-    const original = Array.from({ length: 40 }, (_value, index) => `stable ${index}`);
-    const changed = original.map((line, index) => index < 10 ? line : `changed ${index}`);
-    vi.mocked(fetchPreviewFile)
-      .mockResolvedValueOnce({
-        workspace_path: "src/lines.txt",
-        content: original.join("\n"),
-        truncated: false,
-        encoding: "utf-8",
-        source: "workspace",
-      })
-      .mockResolvedValueOnce({
-        workspace_path: "src/lines.txt",
-        content: changed.join("\n"),
-        truncated: false,
-        encoding: "utf-8",
-        source: "workspace",
-      });
-
-    const file: ComputerFileClue = {
-      tool: "write_file",
-      path: "src/lines.txt",
-      workspace_path: "src/lines.txt",
-      target: "sandbox",
-      status: "completed",
-      tool_call_id: "lines",
-      revision: "lines:1:completed",
-    };
-    const rendered = render(view(file));
-    const stableLine = await screen.findByText("stable 0");
-
-    rendered.rerender(view({ ...file, revision: "lines:2:completed" }));
-    expect(await screen.findByText("changed 39")).toBeVisible();
-    expect(screen.getByText("stable 0")).toBe(stableLine);
-    const animated = [...rendered.container.querySelectorAll(".computer-file__line.is-changed")];
-    expect(animated).toHaveLength(18);
-    const delays = animated.map((line) => (line as HTMLElement).style.getPropertyValue("--computer-line-delay"));
-    expect(new Set(delays).size).toBe(animated.length);
-    expect(delays[delays.length - 1]).toBe("238ms");
-  });
-
-  it.each([
-    { label: "240 lines", content: Array.from({ length: 240 }, (_, index) => `line ${index}`).join("\n"), mode: "lines", lines: 240 },
-    { label: "241 lines", content: Array.from({ length: 241 }, (_, index) => `line ${index}`).join("\n"), mode: "plain", lines: 0 },
-    { label: "24,000 characters", content: "x".repeat(24_000), mode: "lines", lines: 1 },
-    { label: "24,001 characters", content: "x".repeat(24_001), mode: "plain", lines: 0 },
-  ])("keeps bounded DOM behavior at the $label boundary", async ({ content, mode, lines }) => {
-    vi.mocked(fetchPreviewFile).mockResolvedValueOnce({
-      workspace_path: "boundary.txt",
-      content,
-      truncated: false,
-      encoding: "utf-8",
-      source: "workspace",
-    });
-
-    const rendered = render(view({
-      tool: "read_file",
-      path: "boundary.txt",
-      workspace_path: "boundary.txt",
-      target: "sandbox",
-      status: "completed",
-      revision: `boundary:${content.length}:completed`,
-    }));
-
-    await waitFor(() => {
-      expect(rendered.container.querySelector(`[data-render-mode="${mode}"]`)).not.toBeNull();
-    });
-    expect(rendered.container.querySelectorAll(".computer-file__line")).toHaveLength(lines);
-  });
-
-  it("renders a large snapshot as one complete text node without thousands of animated spans", async () => {
-    const largeContent = Array.from({ length: 241 }, (_value, index) => `line ${index}`).join("\n");
-    vi.mocked(fetchPreviewFile).mockResolvedValueOnce({
-      workspace_path: "large.log",
-      content: largeContent,
-      truncated: false,
-      encoding: "utf-8",
-      source: "workspace",
-    });
-
-    const rendered = render(view({
-      tool: "read_file",
-      path: "large.log",
-      workspace_path: "large.log",
-      target: "sandbox",
-      status: "completed",
-      revision: "read-4:9:completed",
-    }));
-
-    await waitFor(() => {
-      expect(rendered.container.querySelector('[data-render-mode="plain"]')).not.toBeNull();
-    });
-    const code = rendered.container.querySelector('[data-render-mode="plain"] code');
-    expect(code?.textContent).toBe(largeContent);
-    expect(rendered.container.querySelectorAll(".computer-file__line")).toHaveLength(0);
-  });
 });

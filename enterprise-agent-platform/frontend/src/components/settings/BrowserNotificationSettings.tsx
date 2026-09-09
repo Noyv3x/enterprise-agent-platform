@@ -1,69 +1,54 @@
-import { Alert, Card, Space, Switch, Typography } from "antd";
-import { useEffect, useState } from "react";
+import { Switch } from "antd";
+import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
-import {
-  browserNotificationsEnabled,
-  browserNotificationsSupported,
-  setBrowserNotificationsEnabled,
-} from "../../lib/browserNotifications";
+import { browserNotificationsEnabled, browserNotificationsSupported, setBrowserNotificationsEnabled } from "../../lib/browserNotifications";
 import type { Id } from "../../types";
-import { Icon } from "../common/Icon";
+import { FormFooter, Notice, Section } from "../ui/fieldwork";
 
 export function BrowserNotificationSettings({ userId }: { userId: Id }) {
   const { t } = useI18n();
   const supported = browserNotificationsSupported();
-  const [permission, setPermission] = useState<NotificationPermission>(
-    typeof Notification === "undefined" ? "denied" : Notification.permission,
-  );
+  const [permission, setPermission] = useState<NotificationPermission>(() => typeof Notification === "undefined" ? "denied" : Notification.permission);
   const [enabled, setEnabled] = useState(() => browserNotificationsEnabled(userId));
-
+  const [pending, setPending] = useState(false);
+  const owner = useRef(userId);
+  const request = useRef(0);
+  const busy = useRef(false);
+  owner.current = userId;
   useEffect(() => {
     setEnabled(browserNotificationsEnabled(userId));
     setPermission(typeof Notification === "undefined" ? "denied" : Notification.permission);
+    setPending(false); busy.current = false;
+    return () => { request.current += 1; };
   }, [userId]);
-
   const toggle = async (checked: boolean) => {
-    if (!checked) {
-      setBrowserNotificationsEnabled(userId, false);
-      setEnabled(false);
-      return;
-    }
+    if (busy.current) return;
+    if (!checked) { setBrowserNotificationsEnabled(userId, false); setEnabled(false); return; }
     if (!supported) return;
-    let nextPermission = Notification.permission;
-    if (nextPermission === "default") {
-      nextPermission = await Notification.requestPermission();
+    const capturedUser = userId;
+    const version = ++request.current;
+    busy.current = true; setPending(true);
+    try {
+      let next = Notification.permission;
+      if (next === "default") next = await Notification.requestPermission();
+      if (version !== request.current || String(owner.current) !== String(capturedUser)) return;
+      setPermission(next);
+      setBrowserNotificationsEnabled(capturedUser, next === "granted");
+      setEnabled(next === "granted");
+    } catch {
+      if (version === request.current) {
+        setPermission(Notification.permission);
+        setBrowserNotificationsEnabled(capturedUser, false); setEnabled(false);
+      }
+    } finally {
+      if (version === request.current) { busy.current = false; setPending(false); }
     }
-    setPermission(nextPermission);
-    const nextEnabled = nextPermission === "granted";
-    setBrowserNotificationsEnabled(userId, nextEnabled);
-    setEnabled(nextEnabled);
   };
-
-  return (
-    <Card
-      className="settings-card"
-      classNames={{ body: "settings-card__body" }}
-      title={<Space><Icon name="message" />{t("notifications.settings.title")}</Space>}
-    >
-      <div className="notification-setting">
-        <div>
-          <Typography.Text strong>{t("notifications.settings.replyComplete")}</Typography.Text>
-          <Typography.Paragraph type="secondary">
-            {t("notifications.settings.description")}
-          </Typography.Paragraph>
-        </div>
-        <Switch
-          checked={supported && permission === "granted" && enabled}
-          disabled={!supported || permission === "denied"}
-          aria-label={t("notifications.settings.replyComplete")}
-          onChange={(checked) => void toggle(checked)}
-        />
-      </div>
-      {!supported ? (
-        <Alert role="status" type="warning" showIcon title={t("notifications.settings.unsupported")} />
-      ) : permission === "denied" ? (
-        <Alert role="status" type="warning" showIcon title={t("notifications.settings.denied")} />
-      ) : null}
-    </Card>
-  );
+  const state = !supported ? "notifications.settings.unsupported" : permission === "denied" ? "notifications.settings.denied" : permission === "default" ? "notifications.settings.permissionDefault" : enabled ? "notifications.settings.enabled" : "notifications.settings.disabled";
+  return <Section title={t("notifications.settings.title")} description={t("notifications.settings.description")}>
+    <FormFooter note={t("notifications.settings.replyComplete")}>
+      <Switch aria-label={t("notifications.settings.replyComplete")} checked={supported && permission === "granted" && enabled} disabled={!supported || permission === "denied"} loading={pending} onChange={(checked) => void toggle(checked)} />
+    </FormFooter>
+    <Notice tone={!supported || permission === "denied" ? "warning" : "info"} title={t(state)} />
+  </Section>;
 }

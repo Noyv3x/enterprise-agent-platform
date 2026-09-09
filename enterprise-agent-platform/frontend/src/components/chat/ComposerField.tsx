@@ -1,51 +1,36 @@
-/* <ComposerField/> — the `.composer__field` row (focus-within ring) holding the
-   hidden file input + attach button, the controlled textarea, the in-field mention
-   popover and the send button. Layout only;
-   all behavior is threaded down from <Composer>. */
-
-import { type ChangeEvent, type RefObject } from "react";
+import type { ChangeEvent, ReactNode, RefObject } from "react";
+import { useI18n } from "../../i18n";
+import { ComposerFrame } from "../ui/fieldwork";
 import { AttachButton } from "./AttachButton";
 import { ComposerTextarea, type ComposerTextareaProps } from "./ComposerTextarea";
 import { MentionMenu } from "./MentionMenu";
 import { SendButton } from "./SendButton";
 import { SlashCommandMenu } from "./SlashCommandMenu";
 
-export function ComposerField({
-  disabled,
-  busy,
-  fileInputRef,
-  onFileChange,
-  textarea,
-  slashCommand,
-}: {
+export function ComposerField({ disabled, busy, fileInputRef, onFileChange, textarea, slashCommand, attachments, hint, recovery }: {
   disabled: boolean;
   busy: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
   onFileChange: (event: ChangeEvent<HTMLInputElement>) => void;
   textarea: ComposerTextareaProps;
-  slashCommand: {
-    visible: boolean;
-    onChoose: () => void;
-    menuId: string;
-    optionId: string;
-  };
+  slashCommand: { visible: boolean; onChoose: () => void; menuId: string; optionId: string };
+  attachments?: ReactNode;
+  hint?: ReactNode;
+  recovery?: ReactNode;
 }) {
-  return (
-    <div className="composer__field">
-      <input
-        ref={fileInputRef}
-        className="composer__file-input"
-        type="file"
-        disabled={disabled}
-        multiple
-        tabIndex={-1}
-        onChange={onFileChange}
-      />
+  const { t } = useI18n();
+  return <ComposerFrame
+    label={t("chat.composer.label")}
+    disabled={disabled}
+    input={<ComposerTextarea {...textarea} />}
+    suggestions={<><MentionMenu mention={textarea.mention} /><SlashCommandMenu {...slashCommand} /></>}
+    startActions={<>
+      <input hidden type="file" multiple disabled={disabled} ref={fileInputRef} onChange={onFileChange} tabIndex={-1} />
       <AttachButton disabled={disabled} onClick={() => fileInputRef.current?.click()} />
-      <ComposerTextarea {...textarea} />
-      <MentionMenu mention={textarea.mention} />
-      <SlashCommandMenu {...slashCommand} />
-      <SendButton disabled={disabled} loading={busy} />
-    </div>
-  );
+    </>}
+    submitAction={<SendButton disabled={disabled || (!textarea.value.trim() && !attachments)} loading={busy} />}
+    attachments={attachments}
+    recovery={recovery}
+    hint={hint}
+  />;
 }

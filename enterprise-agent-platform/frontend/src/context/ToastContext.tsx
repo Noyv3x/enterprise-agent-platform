@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import { useI18n } from "../i18n";
+import { useFieldworkContainer } from "../components/ui/fieldwork";
 
 export type ToastType = "ok" | "error";
 
@@ -35,8 +36,10 @@ export function toast(message: string, options?: ToastOptions): void {
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const { t } = useI18n();
+  const getContainer = useFieldworkContainer();
   const [api, contextHolder] = notification.useNotification({
-    placement: "topRight",
+    placement: "bottomRight",
+    getContainer,
     stack: { threshold: 4 },
   });
   const sequence = useRef(0);
@@ -53,7 +56,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       duration: type === "ok" ? 3.2 : 6.5,
       pauseOnHover: true,
       role: type === "error" ? "alert" : "status",
-      className: `platform-notification platform-notification--${type}`,
+      className: "wf-notification",
       closable: { "aria-label": t("toast.close") },
     });
   }, [api, t]);

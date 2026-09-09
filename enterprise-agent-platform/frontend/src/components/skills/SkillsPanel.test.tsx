@@ -98,14 +98,11 @@ describe("SkillsPanel", () => {
     localStorage.clear();
   });
 
-  it("explains progressive loading and searches the exact Agent scope", async () => {
+  it("searches the exact Agent scope", async () => {
     const user = userEvent.setup();
     renderPanel();
 
-    expect(screen.getByText("Skills load on demand")).toBeVisible();
-    expect(screen.getByText(/separate from chat history and memory/)).toBeVisible();
     expect(await screen.findByText(reviewSkill.description)).toBeVisible();
-    expect(screen.getByText(/^Updated /)).toBeVisible();
     expect(mocks.loadAgentSkills).toHaveBeenCalledWith(privateScope, "", expect.any(AbortSignal));
 
     const search = screen.getByRole("searchbox", { name: "Search this Agent's Skills" });
@@ -172,12 +169,16 @@ describe("SkillsPanel", () => {
     );
 
     const name = await screen.findByRole("textbox", { name: "Name" });
-    const editor = screen.getByRole("heading", { name: "Edit Skill" }).closest("form");
-    expect(editor).not.toBeNull();
-    expect(within(editor!).getByText("2 linked files")).toBeVisible();
-    expect(within(editor!).getByText(/reads and maintains linked files on demand/)).toBeVisible();
+    const editor = screen.getByRole("dialog", { name: "Edit Skill" });
+    expect(within(editor).getByText("2 linked files")).toBeVisible();
+    expect(within(editor).getByText(/reads and maintains linked files on demand/)).toBeVisible();
+    await waitFor(() => {
+      expect(editor).toBeVisible();
+      expect(editor).toContainElement(document.activeElement as HTMLElement);
+    });
     await user.clear(name);
     await user.type(name, "review-changes");
+    expect(name).toHaveValue("review-changes");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     expect(mocks.updateAgentSkill).toHaveBeenCalledWith(
@@ -212,18 +213,17 @@ describe("SkillsPanel", () => {
     );
     const heading = await screen.findByRole("heading", { name: "View Skill" });
     expect(heading).toBeVisible();
-    expect(heading).toHaveFocus();
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "View Skill" })).toContainElement(document.activeElement as HTMLElement));
     expect(screen.getByText(/read-only Skill ships with the platform/)).toBeVisible();
     expect(screen.getByText(/reads preset files on demand/)).toBeVisible();
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "Name" })).toHaveAttribute("readonly");
 
-    const editor = heading.closest("form");
-    expect(editor).not.toBeNull();
-    const closeButtons = within(editor!).getAllByRole("button", { name: "Close" });
+    const editor = screen.getByRole("dialog", { name: "View Skill" });
+    const closeButtons = within(editor).getAllByRole("button", { name: "Close" });
     await user.click(closeButtons[closeButtons.length - 1]);
-    expect(screen.queryByRole("heading", { name: "View Skill" })).not.toBeInTheDocument();
-    expect(viewButton).toHaveFocus();
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "View Skill" })).not.toBeInTheDocument());
+    await waitFor(() => expect(viewButton).toHaveFocus());
   });
 
   it("uses detail ownership when a preset is replaced while details load", async () => {
@@ -285,7 +285,8 @@ describe("SkillsPanel", () => {
 
     await user.click(await screen.findByRole("button", { name: `View ${presetSkill.name}` }));
 
-    expect(await screen.findByRole("heading", { name: "View Skill" })).toHaveFocus();
+    const dialog = await screen.findByRole("dialog", { name: "View Skill" });
+    await waitFor(() => expect(dialog).toContainElement(document.activeElement as HTMLElement));
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "New Skill" })).not.toBeInTheDocument();
   });

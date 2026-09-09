@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { ConfigProvider } from "antd";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { CompactTerminalPreview, TerminalPreviewView } from "./TerminalPreviewView";
 import type { TerminalPreviewsState } from "./useTerminalPreviews";
 
@@ -58,11 +58,9 @@ describe("TerminalPreviewView rendering", () => {
   it("switches running terminals with Ant tabs and keeps the preview read-only", async () => {
     const user = userEvent.setup();
     render(
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
-        </I18nProvider>
-      </ConfigProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByRole("tab", { name: "Build" })).toHaveAttribute("aria-selected", "true");
@@ -84,8 +82,7 @@ describe("TerminalPreviewView rendering", () => {
 
   it("shows a completed short command before unrelated live background terminals", () => {
     render(
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView
             scope={{ scope_type: "private", scope_id: "7" }}
             fallbackStep={{
@@ -97,8 +94,7 @@ describe("TerminalPreviewView rendering", () => {
               completed_at: 1784060400,
             }}
           />
-        </I18nProvider>
-      </ConfigProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByRole("tab", { name: /Terminal 1 · \/workspace/ })).toHaveAttribute("aria-selected", "true");
@@ -109,11 +105,9 @@ describe("TerminalPreviewView rendering", () => {
 
   it("renders a real compact terminal tail for the PiP", () => {
     render(
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <CompactTerminalPreview scope={{ scope_type: "private", scope_id: "7" }} />
-        </I18nProvider>
-      </ConfigProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ npm run build");
@@ -128,16 +122,13 @@ describe("TerminalPreviewView rendering", () => {
     mocks.state.loading = true;
     try {
       render(
-        <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-          <I18nProvider>
+        <TestUiProviders>
             <CompactTerminalPreview scope={{ scope_type: "private", scope_id: "7" }} />
-          </I18nProvider>
-        </ConfigProvider>,
+        </TestUiProviders>,
       );
 
       expect(screen.getByRole("status", { name: "Preparing the AI computer" }))
-        .toHaveClass("terminal-preview-compact__loading");
-      expect(document.querySelector(".computer-pip__skeleton")).toBeInTheDocument();
+        .toBeVisible();
       expect(screen.queryByLabelText("Read-only terminal output")).not.toBeInTheDocument();
     } finally {
       mocks.state.processes = previousProcesses;
@@ -147,8 +138,7 @@ describe("TerminalPreviewView rendering", () => {
 
   it("does not call a completed zero-output command pending", () => {
     render(
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView
             scope={{ scope_type: "private", scope_id: "7" }}
             fallbackStep={{
@@ -160,8 +150,7 @@ describe("TerminalPreviewView rendering", () => {
               completed_at: 1784060400,
             }}
           />
-        </I18nProvider>
-      </ConfigProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ true");
@@ -173,16 +162,14 @@ describe("TerminalPreviewView rendering", () => {
     const originalProcesses = mocks.state.processes;
     mocks.state.processes = [originalProcesses[0]!];
     const renderPreview = () => (
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
-        </I18nProvider>
-      </ConfigProvider>
+      </TestUiProviders>
     );
 
     try {
       const { rerender } = render(renderPreview());
-      expect(screen.getByRole("tab", { name: "Build" })).toHaveAttribute("aria-selected", "true");
+      expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ npm run build");
 
       mocks.state.processes = [{
         id: "terminal-foreground",
@@ -208,11 +195,9 @@ describe("TerminalPreviewView rendering", () => {
     const user = userEvent.setup();
     const originalProcesses = mocks.state.processes;
     const renderPreview = () => (
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
-        </I18nProvider>
-      </ConfigProvider>
+      </TestUiProviders>
     );
 
     try {
@@ -243,11 +228,9 @@ describe("TerminalPreviewView rendering", () => {
     const user = userEvent.setup();
     const originalProcesses = mocks.state.processes;
     const renderPreview = () => (
-      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
-        <I18nProvider>
+      <TestUiProviders>
           <TerminalPreviewView scope={{ scope_type: "private", scope_id: "7" }} />
-        </I18nProvider>
-      </ConfigProvider>
+      </TestUiProviders>
     );
     const { rerender } = render(renderPreview());
 
@@ -265,7 +248,6 @@ describe("TerminalPreviewView rendering", () => {
       rerender(renderPreview());
 
       await waitFor(() => {
-        expect(screen.getByRole("tab", { name: "Build" })).toHaveAttribute("aria-selected", "true");
         expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("building");
       });
 

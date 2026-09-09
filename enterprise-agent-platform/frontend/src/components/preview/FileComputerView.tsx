@@ -1,33 +1,11 @@
 import { Button } from "antd";
 import { useLayoutEffect, useRef, useState } from "react";
-import type { CSSProperties } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useI18n } from "../../i18n";
-import { cx } from "../../lib/cx";
 import type { AgentPreviewScope, ComputerFileClue } from "../../types";
-import { EmptyState } from "../common/EmptyState";
-import { InlineAlert } from "../common/InlineAlert";
-import { Skeleton } from "../common/Skeleton";
+import { ComputerOutput, EmptyState, LoadingState, Notice } from "../ui/fieldwork";
 import { useComputerFilePreview } from "./useComputerFilePreview";
 
-interface FileComputerViewProps {
-  scope: AgentPreviewScope;
-  /** The Run the surface belongs to; drafts never carry across Runs. */
-  runId: string;
-  file: ComputerFileClue | null;
-  compact?: boolean;
-}
-
-interface LineStyle extends CSSProperties {
-  "--computer-line-delay": string;
-}
-
-const MAX_ANIMATED_FILE_LINES = 240;
-const MAX_ANIMATED_FILE_CHARS = 24_000;
-const EXPANDED_ANIMATED_CHANGE_LIMIT = 18;
-const COMPACT_ANIMATED_CHANGE_LIMIT = 10;
-const EXPANDED_LINE_DELAY_MS = 14;
-const COMPACT_LINE_DELAY_MS = 12;
 const STREAM_FRAME_MS = 32;
 const STREAM_MIN_CHUNK_CHARS = 24;
 const STREAM_TARGET_FRAMES = 18;
@@ -143,195 +121,31 @@ function completedFile(file: ComputerFileClue | null): boolean {
   return ["completed", "complete", "done"].includes(status);
 }
 
-function unchangedLineBounds(previous: string[], current: string[]): {
-  prefix: number;
-  suffix: number;
-} {
-  let prefix = 0;
-  while (
-    prefix < previous.length
-    && prefix < current.length
-    && previous[prefix] === current[prefix]
-  ) {
-    prefix += 1;
-  }
-
-  let suffix = 0;
-  while (
-    suffix < previous.length - prefix
-    && suffix < current.length - prefix
-    && previous[previous.length - 1 - suffix] === current[current.length - 1 - suffix]
-  ) {
-    suffix += 1;
-  }
-  return { prefix, suffix };
+function FileText({content, previous, streaming, running}: {content:string; previous:string|null; streaming:boolean; running:boolean}) {
+  const lines = !streaming && content.length <= 24_000 ? content.replace(/\r\n?/g, "\n").split("\n") : [];
+  const previousLines = previous?.replace(/\r\n?/g, "\n").split("\n") || [];
+  const bounded = lines.length > 0 && lines.length <= 240;
+  return <pre className="wf-file-text" aria-label="" data-render-mode={streaming ? "stream" : bounded ? "lines" : "plain"}><code>
+    {bounded ? lines.map((line,index) => <span className="wf-file-line" key={index} data-changed={previous !== null && previousLines[index] !== line || undefined}>{line || "\u00a0"}</span>) : content}
+    {running ? <span className="wf-file-caret" aria-hidden="true" /> : null}
+  </code></pre>;
 }
 
-function stableLineKeys(lines: string[]): string[] {
-  const occurrences = new Map<string, number>();
-  return lines.map((line) => {
-    const occurrence = occurrences.get(line) || 0;
-    occurrences.set(line, occurrence + 1);
-    return `${line}\u0000${occurrence}`;
-  });
-}
-
-function FileSnapshot({
-  content,
-  previousContent,
-  snapshot,
-  running,
-  streaming,
-  compact,
-}: {
-  content: string;
-  previousContent: string | null;
-  snapshot: number;
-  running: boolean;
-  streaming: boolean;
-  compact: boolean;
-}) {
-  if (streaming) {
-    return (
-      <pre
-        className={cx("computer-file__content", compact && "computer-file__content--compact")}
-        data-snapshot={snapshot}
-        data-render-mode="stream"
-      >
-        <code className="computer-file__plain">
-          {content}
-          {running ? <span className="computer-file__caret" aria-hidden="true" /> : null}
-        </code>
-      </pre>
-    );
-  }
-
-  const normalizedContent = content.replace(/\r\n?/g, "\n");
-  const withinAnimatedSize = normalizedContent.length <= MAX_ANIMATED_FILE_CHARS;
-  const lines = withinAnimatedSize ? normalizedContent.split("\n") : [];
-  const animateLines = withinAnimatedSize && lines.length <= MAX_ANIMATED_FILE_LINES;
-  const normalizedPrevious = previousContent?.replace(/\r\n?/g, "\n") || "";
-  const previousLines = animateLines && normalizedPrevious.length <= MAX_ANIMATED_FILE_CHARS
-    ? (previousContent === null ? [] : normalizedPrevious.split("\n"))
-    : [];
-  const { prefix, suffix } = previousContent === null
-    ? { prefix: 0, suffix: 0 }
-    : unchangedLineBounds(previousLines, lines);
-  const keys = animateLines ? stableLineKeys(lines) : [];
-  const animationLimit = compact
-    ? COMPACT_ANIMATED_CHANGE_LIMIT
-    : EXPANDED_ANIMATED_CHANGE_LIMIT;
-  const lineDelay = compact ? COMPACT_LINE_DELAY_MS : EXPANDED_LINE_DELAY_MS;
-  let changedOrder = 0;
-  return (
-    <pre
-      className={cx("computer-file__content", compact && "computer-file__content--compact")}
-      data-snapshot={snapshot}
-      data-render-mode={animateLines ? "lines" : "plain"}
-    >
-      <code className={animateLines ? undefined : "computer-file__plain"}>
-        {animateLines ? lines.map((line, index) => {
-          const changed = previousContent === null
-            || (index >= prefix && index < lines.length - suffix);
-          const order = changed ? changedOrder++ : -1;
-          const animated = changed && order < animationLimit;
-          const className = animated
-            ? previousContent === null
-              ? "computer-file__line is-new"
-              : "computer-file__line is-changed"
-            : "computer-file__line";
-          const style: LineStyle | undefined = animated ? {
-            "--computer-line-delay": `${order * lineDelay}ms`,
-          } : undefined;
-          return (
-            <span className={className} key={keys[index]} style={style}>
-              {line || "\u00a0"}
-            </span>
-          );
-        }) : content}
-        {running ? <span className="computer-file__caret" aria-hidden="true" /> : null}
-      </code>
-    </pre>
-  );
-}
-
-export function FileComputerView({ scope, runId, file, compact = false }: FileComputerViewProps) {
-  const { t } = useI18n();
-  const { state, refresh, hostTarget, workspacePath, running } = useComputerFilePreview(scope, runId, file);
-  const draftStreaming = state.loaded && running && state.source === "draft";
-  const progressivePhase: ProgressiveFilePhase = draftStreaming
-    ? "draft"
-    : completedFile(file) ? "settle" : "immediate";
-  const streamIdentity = [
-    runId,
-    scope.scope_type,
-    scope.scope_id,
-    workspacePath,
-    file?.tool_call_id || "",
-    file?.tool || "",
-  ].join("\u0000");
-  const progressive = useProgressiveDraftContent(state.content, progressivePhase, streamIdentity);
-
-  const path = file?.path || workspacePath;
-  const draftLabel = state.source === "draft"
-    ? t(state.draftKind === "replacement"
-      ? "computer.file.replacementDraft"
-      : "computer.file.uncommittedDraft")
-    : "";
-  return (
-    <section
-      className={cx("computer-file", compact && "computer-file--compact")}
-      aria-busy={state.loading || state.pending}
-      data-source={state.loaded ? state.source : undefined}
-      data-draft-kind={state.source === "draft" ? state.draftKind || undefined : undefined}
-      data-revision={state.revision || undefined}
-    >
-      {path ? (
-        <header className="computer-file__meta">
-          {!compact ? <span>{t("computer.file.path")}</span> : null}
-          <span className="computer-file__identity">
-            <strong>{path}</strong>
-            {draftLabel ? <span className="computer-file__draft-label">{draftLabel}</span> : null}
-          </span>
-        </header>
-      ) : null}
-      {hostTarget ? (
-        <EmptyState
-          icon="doc"
-          title={t("computer.mode.file")}
-          text={t("computer.file.host")}
-        />
-      ) : state.loaded ? (
-        <>
-          <FileSnapshot
-            content={progressive.content}
-            previousContent={state.previousContent}
-            snapshot={state.snapshot}
-            running={running}
-            streaming={progressive.streaming}
-            compact={compact}
-          />
-          {state.truncated && !compact ? (
-            <p className="computer-file__truncated">{t("computer.file.truncated")}</p>
-          ) : null}
-        </>
-      ) : state.loading || state.pending ? (
-        <div className="computer-file__loading" role="status" aria-busy="true">
-          <Skeleton width="100%" height={compact ? "100%" : 180} label={t("computer.file.loading")} />
-        </div>
-      ) : state.error ? (
-        <InlineAlert
-          className="computer-file__error"
-          variant="error"
-          action={compact ? undefined : (
-            <Button size="small" type="link" onClick={refresh}>{t("computer.retry")}</Button>
-          )}
-        >
-          {state.error || t("computer.file.failed")}
-        </InlineAlert>
-      ) : (
-        <EmptyState icon="doc" title={t("computer.mode.file")} text={t("computer.file.empty")} />
-      )}
-    </section>
-  );
+export function FileComputerView({scope,runId,file,compact=false}: {scope:AgentPreviewScope;runId:string;file:ComputerFileClue|null;compact?:boolean}) {
+  const {t}=useI18n();
+  const {state,refresh,hostTarget,workspacePath,running}=useComputerFilePreview(scope,runId,file);
+  const phase: ProgressiveFilePhase = state.loaded && running && state.source === "draft" ? "draft" : completedFile(file) ? "settle" : "immediate";
+  const identity=[runId,scope.scope_type,scope.scope_id,workspacePath,file?.tool_call_id || "",file?.tool || ""].join("\u0000");
+  const progressive=useProgressiveDraftContent(state.content,phase,identity);
+  const draftLabel=state.source === "draft" ? t(state.draftKind === "replacement" ? "computer.file.replacementDraft" : "computer.file.uncommittedDraft") : "";
+  return <section className="wf-file-view" data-compact={compact || undefined} aria-busy={state.loading || state.pending} data-source={state.loaded ? state.source : undefined} data-draft-kind={state.source === "draft" ? state.draftKind || undefined : undefined} data-revision={state.revision || undefined}>
+    <ComputerOutput kind="file" title={file?.path || workspacePath || t("computer.mode.file")} meta={draftLabel || t("preview.readOnly")} truncated={state.truncated ? t("computer.file.truncated") : undefined}>
+      {hostTarget ? <EmptyState compact title={t("computer.mode.file")} description={t("computer.file.host")} />
+        : state.loaded ? <FileText content={progressive.content} previous={state.previousContent} streaming={progressive.streaming} running={running} />
+        : state.loading || state.pending ? <div aria-busy="true"><LoadingState label={t("computer.file.loading")} /></div>
+        : state.error ? <Notice tone="danger" title={state.error} action={!compact ? <Button onClick={refresh}>{t("computer.retry")}</Button> : undefined} />
+        : <EmptyState compact title={t("computer.mode.file")} description={t("computer.file.empty")} />}
+    </ComputerOutput>
+    {state.loaded && state.error ? <Notice tone="warning" title={state.error} action={!compact ? <Button onClick={refresh}>{t("computer.retry")}</Button> : undefined} /> : null}
+  </section>;
 }

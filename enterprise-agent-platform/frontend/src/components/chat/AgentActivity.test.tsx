@@ -35,7 +35,7 @@ describe("AgentActivity", () => {
     localStorage.clear();
   });
 
-  it("does not attach a work-record thumbnail beside the live work card", () => {
+  it("shows the actual browser work without interactive controls", () => {
     render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
@@ -47,7 +47,6 @@ describe("AgentActivity", () => {
     );
 
     expect(screen.getByText("Browser")).toBeVisible();
-    expect(screen.queryByTestId("browser-work-preview")).not.toBeInTheDocument();
-    expect(document.querySelector(".agent-activity__content")).not.toHaveClass("has-browser-preview");
+    expect(screen.queryByRole("button")).toBeNull();
   });
 });

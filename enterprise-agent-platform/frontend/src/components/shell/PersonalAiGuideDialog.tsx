@@ -1,39 +1,30 @@
-import { Alert, Button } from "antd";
+import { Button } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { resourceKeys } from "../../data/resourceState";
 import { useI18n, type MessageKey } from "../../i18n";
 import { hasPermission, isAgentActive } from "../../store/selectors";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import type { IconName } from "../../types";
 import { Dialog } from "../common/Dialog";
-import { Icon } from "../common/Icon";
+import { GuideSheet, Notice } from "../ui/fieldwork";
 
 const GUIDE_ITEMS: ReadonlyArray<{
   id: string;
-  icon: IconName;
   titleKey: MessageKey;
-  descriptionKey: MessageKey;
   promptKey: MessageKey;
 }> = [
   {
     id: "computer",
-    icon: "terminal",
     titleKey: "personalAi.guide.computer.title",
-    descriptionKey: "personalAi.guide.computer.description",
     promptKey: "personalAi.guide.computer.prompt",
   },
   {
     id: "files",
-    icon: "doc",
     titleKey: "personalAi.guide.files.title",
-    descriptionKey: "personalAi.guide.files.description",
     promptKey: "personalAi.guide.files.prompt",
   },
   {
     id: "web",
-    icon: "browser",
     titleKey: "personalAi.guide.web.title",
-    descriptionKey: "personalAi.guide.web.description",
     promptKey: "personalAi.guide.web.prompt",
   },
 ];
@@ -130,53 +121,20 @@ export function PersonalAiGuideDialog({ onDraftFilled }: { onDraftFilled: () => 
     close();
   };
 
-  return (
-    <Dialog
-      open={open}
-      onClose={close}
-      title={t("personalAi.guide.title")}
-      description={t("personalAi.guide.description")}
-      className="personal-ai-guide"
-      afterOpenChange={(nextOpen) => {
-        if (nextOpen || !pendingFocusRef.current) return;
-        pendingFocusRef.current = false;
-        onDraftFilled();
-      }}
-      footer={<Button onClick={close}>{t("personalAi.guide.close")}</Button>}
-    >
-      <p className="personal-ai-guide__reopen-note">
-        <Icon name="sparkles" size={17} />
-        <span>{t("personalAi.guide.reopen")}</span>
-      </p>
-      <div className="personal-ai-guide__list">
-        {GUIDE_ITEMS.map((item) => {
-          const title = t(item.titleKey);
-          return (
-            <div className="personal-ai-guide__item" key={item.id}>
-              <span className="personal-ai-guide__icon"><Icon name={item.icon} size={20} /></span>
-              <span className="personal-ai-guide__copy">
-                <strong>{title}</strong>
-                <span>{t(item.descriptionKey)}</span>
-              </span>
-              <Button
-                type="default"
-                onClick={() => tryPrompt(item.promptKey)}
-                aria-label={t("personalAi.guide.tryNamed", { capability: title })}
-              >
-                {t("personalAi.guide.try")}
-              </Button>
-            </div>
-          );
-        })}
-      </div>
-      {draftBlocked ? (
-        <Alert
-          className="personal-ai-guide__draft-alert"
-          type="warning"
-          showIcon
-          title={t("personalAi.guide.draftPreserved")}
-        />
-      ) : null}
-    </Dialog>
-  );
+  return <Dialog open={open} onClose={close} title={t("personalAi.guide.title")}
+    afterOpenChange={nextOpen => {
+      if (nextOpen || !pendingFocusRef.current) return;
+      pendingFocusRef.current = false;
+      onDraftFilled();
+    }} footer={<Button onClick={close}>{t("personalAi.guide.close")}</Button>}>
+    <GuideSheet title={t("personalAi.guide.computer.title")} intro={t("personalAi.guide.description")}
+      sections={[
+        { key: "files", title: t("personalAi.guide.files.title"), body: t("personalAi.guide.files.description") },
+        { key: "web", title: t("personalAi.guide.web.title"), body: t("personalAi.guide.web.description") },
+        { key: "skills", title: t("workroom.guideSkillsTitle"), body: t("workroom.guideSkillsBody") },
+      ]}
+      examples={GUIDE_ITEMS.map(item => ({ key: item.id, label: t("personalAi.guide.tryNamed", { capability: t(item.titleKey) }), onSelect: () => tryPrompt(item.promptKey) }))}
+      notice={draftBlocked ? <Notice tone="warning" title={t("personalAi.guide.draftPreserved")} /> : undefined}
+      action={<p className="wf-muted">{t("personalAi.guide.reopen")}</p>} />
+  </Dialog>;
 }

@@ -1,11 +1,5 @@
-/* <TelegramLinkPopover/> — one-time Telegram ownership challenge for the private
-   Agent. The browser never accepts a Telegram numeric ID: it asks the platform
-   for a short-lived command, which the user sends in a private chat with the
-   managed bot. The secret command is retained locally because later GETs expose
-   only pending status/expiry; a focused poll discovers the completed link. */
-
 import { useEffect, useState } from "react";
-import { Alert, Button } from "antd";
+import { Button } from "antd";
 import { loadPrivateTelegram } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
 import { useI18n } from "../../i18n";
@@ -18,7 +12,8 @@ import {
   telegramChallengeTiming,
   telegramLinkView,
 } from "../../utils/telegramLink";
-import { Dialog } from "../common/Dialog";
+import { OverlayPanel, Notice, Section, FactGrid, StatusMark } from "../ui/fieldwork";
+import {copyText} from "../../utils/clipboard";
 
 const LINK_POLL_INTERVAL_MS = 3_000;
 
@@ -28,32 +23,6 @@ function formatExpiryTimestamp(value: number | null | undefined, locale: string)
   return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }).format(
     new Date(seconds * 1000),
   );
-}
-
-async function copyText(value: string): Promise<boolean> {
-  try {
-    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(value);
-      return true;
-    }
-  } catch {
-    // Fall through to the selection-based clipboard capability fallback.
-  }
-  let textarea: HTMLTextAreaElement | null = null;
-  try {
-    textarea = document.createElement("textarea");
-    textarea.value = value;
-    textarea.readOnly = true;
-    textarea.className = "clipboard-proxy";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    return copied;
-  } catch {
-    return false;
-  } finally {
-    textarea?.remove();
-  }
 }
 
 export function TelegramLinkPopover() {
@@ -198,84 +167,18 @@ export function TelegramLinkPopover() {
     });
   };
 
-  return (
-    <Dialog
-      id="private-telegram-popover"
-      open
-      onClose={() => dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: false })}
-      title={t("chat.telegram.title")}
-      description={status}
-      className="telegram-link-dialog"
-    >
-      <div className="telegram-link__body">
-        {view === "linked" ? (
-          <div className="telegram-link__account">
-            <div>
-              <strong>{link.telegram_username ? `@${link.telegram_username}` : t("chat.telegram.accountFallback")}</strong>
-              <span>{`ID ${link.telegram_user_id}`}</span>
-            </div>
-            <Button danger size="small" disabled={busy} loading={unlinkBusy} onClick={onUnbind}>
-              {t("chat.telegram.unbind")}
-            </Button>
-          </div>
-        ) : view === "disabled" ? (
-          <Alert className="telegram-link__notice" type="warning" showIcon title={t("chat.telegram.disabledNotice")} />
-        ) : (
-          <>
-            <p className="telegram-link__instructions">
-              {t("chat.telegram.instructions", { bot: botName })}
-            </p>
-            {challengeVisible ? (
-              <div className="telegram-challenge">
-                <div className="telegram-challenge__code">
-                  <span>{t("chat.telegram.code")}</span>
-                  <strong>{code}</strong>
-                </div>
-                <div className="telegram-challenge__command">
-                  <code>{command}</code>
-                  <Button size="small" onClick={onCopy}>
-                    {copied ? t("chat.telegram.copied") : t("chat.telegram.copyCommand")}
-                  </Button>
-                </div>
-                <div className="telegram-challenge__expiry">
-                  <span>{relativeExpiry}</span>
-                  {timing.valid ? (
-                    <span>{t("chat.telegram.expiresAt", { time: formatExpiryTimestamp(pending?.expires_at, locale) })}</span>
-                  ) : null}
-                </div>
-                <span className="telegram-challenge__hint">
-                  {t("chat.telegram.commandHint")}
-                </span>
-              </div>
-            ) : pendingActive ? (
-              <Alert
-                className="telegram-link__notice"
-                type="warning"
-                showIcon
-                title={t("chat.telegram.pendingHidden")}
-              />
-            ) : timing.expired ? (
-              <Alert
-                className="telegram-link__notice"
-                type="warning"
-                showIcon
-                title={t("chat.telegram.expiredNotice")}
-              />
-            ) : null}
-            <div className="telegram-link__actions">
-              <Button
-                type="primary"
-                size="small"
-                disabled={busy}
-                loading={linkBusy}
-                onClick={() => void onGenerate()}
-              >
-                {pending ? t("chat.telegram.regenerate") : t("chat.telegram.generate")}
-              </Button>
-            </div>
-          </>
-        )}
-      </div>
-    </Dialog>
-  );
+  return <OverlayPanel open onClose={()=>dispatch({type:"SET_PRIVATE_TELEGRAM_EXPANDED",payload:false})} title={t("chat.telegram.title")} description={status} closeLabel={t("common.close")}
+ footer={<Button disabled={busy} loading={pendingOperations.includes("telegram:refresh")} onClick={()=>void runBusy(store,"telegram:refresh",()=>loadPrivateTelegram(store))}>{t("chat.telegram.refresh")}</Button>}>
+ <StatusMark tone={linked?"success":gateway.enabled?"info":"warning"}>{status}</StatusMark>
+ {view==="disabled"?<Notice tone="warning" title={t("chat.telegram.disabledNotice")}/>:view==="linked"?<Section actions={<Button danger disabled={busy} loading={unlinkBusy} onClick={()=>void onUnbind()}>{t("chat.telegram.unbind")}</Button>}>
+ <FactGrid items={[{key:"account",label:t("chat.telegram.accountFallback"),value:link.telegram_username?`@${link.telegram_username}`:t("chat.telegram.accountFallback")},{key:"id",label:"ID",value:String(link.telegram_user_id)}]}/>
+ </Section>:<Section description={t("chat.telegram.instructions",{bot:botName})}>
+ {challengeVisible?<Section tone="inset" title={t("chat.telegram.code")} actions={<Button onClick={()=>void onCopy()}>{copied?t("chat.telegram.copied"):t("chat.telegram.copyCommand")}</Button>}>
+ <strong>{code}</strong><pre className="wf-telegram-command">{command}</pre>
+ <p role="status">{relativeExpiry}</p>{timing.valid&&<p>{t("chat.telegram.expiresAt",{time:formatExpiryTimestamp(pending?.expires_at,locale)})}</p>}
+ <p>{t("chat.telegram.commandHint")}</p>
+ </Section>:pendingActive?<Notice tone="warning" title={t("chat.telegram.pendingHidden")}/>:timing.expired?<Notice tone="warning" title={t("chat.telegram.expiredNotice")}/>:null}
+ <Button type="primary" disabled={busy} loading={linkBusy} onClick={()=>void onGenerate()}>{pending?t("chat.telegram.regenerate"):t("chat.telegram.generate")}</Button>
+ </Section>}
+ </OverlayPanel>;
 }

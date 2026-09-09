@@ -1,20 +1,9 @@
-/* <AgentTyping/> — the lightweight "Agent 正在处理" line shown while a run is
-   active but has no tool-call steps yet. */
-
 import { useI18n } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import type { AgentStatus } from "../../types";
+import { StatusMark } from "../ui/fieldwork";
 
 export function AgentTyping({ status }: { status: AgentStatus }) {
   const { t } = useI18n();
-  return (
-    <div className="typing-line typing-line--agent">
-      <span>{agentStatusText(status, t) || t("chat.status.processing")}</span>
-      <div className="typing__dots">
-        <i />
-        <i />
-        <i />
-      </div>
-    </div>
-  );
+  return <div role="status" aria-live="polite"><StatusMark tone={status.state === "approval" ? "warning" : "info"}>{agentStatusText(status, t) || t("chat.status.processing")}</StatusMark></div>;
 }

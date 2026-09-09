@@ -51,8 +51,8 @@ describe("SettingsView dirty forms", () => {
 
     const displayName = screen.getByRole("textbox", { name: "Display name" });
     const save = screen.getByRole("button", { name: "Save profile" });
-    expect(screen.getByText("Engineer")).toBeVisible();
-    expect(screen.queryByText("Member")).not.toBeInTheDocument();
+    expect(screen.getByText(/Alice.*@alice.*Engineer/)).toBeVisible();
+    expect(screen.queryByText(/Member/)).not.toBeInTheDocument();
     expect(save).toBeDisabled();
 
     await userEventApi.clear(displayName);
@@ -89,6 +89,30 @@ describe("SettingsView dirty forms", () => {
 
     expect(screen.getByText("The new passwords do not match")).toBeVisible();
     expect(accountActions.changePassword).not.toHaveBeenCalled();
+  });
+
+  it("submits a valid astral current password without truncating it", async () => {
+    const userEventApi = userEvent.setup();
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({ type: "SET_USER", payload: user });
+    const currentPassword = "\u{10400}".repeat(600);
+    render(
+      <StoreContext.Provider value={store}>
+        <I18nProvider><SettingsView /></I18nProvider>
+      </StoreContext.Provider>,
+    );
+
+    await userEventApi.click(screen.getByLabelText("Current password"));
+    await userEventApi.paste(currentPassword);
+    await userEventApi.type(screen.getByLabelText("New password"), "new-password");
+    await userEventApi.type(screen.getByLabelText("Confirm new password"), "new-password");
+    await userEventApi.click(screen.getByRole("button", { name: "Update password" }));
+
+    expect(accountActions.changePassword).toHaveBeenCalledWith(
+      store,
+      { current_password: currentPassword, new_password: "new-password" },
+      expect.any(Function),
+    );
   });
 
   it("saves an editable IANA time zone with the current profile", async () => {

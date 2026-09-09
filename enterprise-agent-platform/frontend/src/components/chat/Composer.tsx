@@ -1,18 +1,3 @@
-/* <Composer/> — the `<form class="composer">` host. Owns refs and per-scope draft
-   plumbing; the textarea below it is never remounted.
-
-   State ownership:
-   - draft text + pending files live in the store keyed by draftKey (survive scope
-     switches), read through controlled selectors;
-   - the textarea ref, pending-caret ref, and isComposing ref are component refs;
-   - useTypingNotifier owns the typing throttle; useAutoGrow resizes on the value;
-   - useMention drives the @mention popover.
-
-   Focus/scroll are owned by <ChatView> via tokens: onBumpFocus re-focuses the
-   textarea, onBumpForceBottom snaps the list to the bottom. The send pipeline lives
-   in data/chatActions.sendMessage; on failure we restore the draft + files and
-   re-focus. */
-
 import { useCallback, useLayoutEffect, useRef, useState, type ChangeEvent } from "react";
 import { useI18n } from "../../i18n";
 import { MAX_ATTACHMENTS_PER_MESSAGE, MAX_ATTACHMENT_BYTES } from "../../lib/constants";
@@ -31,6 +16,7 @@ import { ComposerField } from "./ComposerField";
 import { ComposerFiles } from "./ComposerFiles";
 import { FailedSendRecovery } from "./FailedSendRecovery";
 import { ComposerHint } from "./ComposerHint";
+import "./composer.css";
 import type { ComposerTextareaProps } from "./ComposerTextarea";
 
 const EMPTY_FILES: File[] = [];
@@ -335,41 +321,22 @@ export function Composer({
   };
 
   return (
-    <form
-      className="composer"
-      aria-busy={commandInFlight}
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit();
-      }}
-    >
-      <div className="composer__wrap">
-        {failedSends.length ? (
-          <FailedSendRecovery
-            sends={failedSends}
-            blocked={!!draft || !!selectedFiles.length}
-            onRestore={() => {
-              restoreNextFailedSend(store, draftKey);
-              onBumpFocus();
-            }}
-          />
-        ) : null}
-        <ComposerField
-          disabled={composerDisabled}
-          busy={commandInFlight}
-          fileInputRef={fileInputRef}
-          onFileChange={onFileChange}
-          textarea={textareaProps}
-          slashCommand={{
-            visible: slashCommandVisible,
-            onChoose: chooseSlashCommand,
-            menuId: slashMenuId,
-            optionId: slashOptionId,
-          }}
-        />
-        {selectedFiles.length ? <ComposerFiles files={selectedFiles} onRemove={removeFile} /> : null}
-        <ComposerHint />
-      </div>
+    <form className="wf-chat-compose" aria-busy={commandInFlight} onSubmit={(event) => {
+      event.preventDefault();
+      void submit();
+    }}>
+      <ComposerField disabled={composerDisabled} busy={commandInFlight}
+        fileInputRef={fileInputRef} onFileChange={onFileChange} textarea={textareaProps}
+        slashCommand={{ visible: slashCommandVisible, onChoose: chooseSlashCommand, menuId: slashMenuId, optionId: slashOptionId }}
+        recovery={failedSends.length > 0 ? (
+          <FailedSendRecovery sends={failedSends} blocked={Boolean(draft || selectedFiles.length)} onRestore={() => {
+            restoreNextFailedSend(store, draftKey);
+            onBumpFocus();
+          }} />
+        ) : undefined}
+        attachments={selectedFiles.length > 0 ? <ComposerFiles files={selectedFiles} onRemove={removeFile} /> : undefined}
+        hint={<ComposerHint />}
+      />
     </form>
   );
 }

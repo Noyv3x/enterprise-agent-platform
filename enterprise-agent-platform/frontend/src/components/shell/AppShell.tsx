@@ -1,100 +1,45 @@
-/* <AppShell/> — the authenticated two-column layout: the product-owned desktop
-   sidebar and main column remain custom structure, while Ant Design Drawer owns
-   the mobile overlay, focus, Escape, and mask-dismiss behavior.
-
-   The SSE stream and safety poll are shell-owned, so useRealtime and usePolling
-   mount here and track the active scope.
-
-*/
-
-import { Drawer } from "antd";
 import { useCallback, useEffect, useState } from "react";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { ensureCurrentUserTimezone } from "../../data/accountActions";
+import { useBranding } from "../../context/BrandingContext";
 import { usePolling } from "../../hooks/usePolling";
 import { useRealtime } from "../../hooks/useRealtime";
 import { useReplyNotifications } from "../../hooks/useReplyNotifications";
-import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
+import { useStore, useStoreHandle } from "../../store/useStore";
+import { topbarInfo } from "../../store/selectors";
+import { AppFrame } from "../ui/fieldwork";
+import { PublicUtilities } from "../ui/PublicUtilities";
 import { ContentRouter } from "./ContentRouter";
-import { Sidebar } from "./Sidebar";
-import { Topbar } from "./Topbar";
-import { ensureCurrentUserTimezone } from "../../data/accountActions";
-import { Brand } from "../common/Brand";
-import { Icon } from "../common/Icon";
 import { PersonalAiComposerFocusContext } from "./PersonalAiGuideContext";
 import { PersonalAiGuideDialog } from "./PersonalAiGuideDialog";
+import { WorkspaceNav } from "./WorkspaceNav";
+import { UserMenu } from "./UserMenu";
 
 export function AppShell() {
   const store = useStoreHandle();
   const { t } = useI18n();
-  const sidebarOpen = useStore((state) => state.sidebarOpen);
-  const userId = useStore((state) => state.user?.id);
-  const userTimezone = useStore((state) => state.user?.timezone);
-  const isMobile = useMediaQuery("(max-width: 800px)");
-  const [personalAiComposerFocusToken, setPersonalAiComposerFocusToken] = useState(0);
-  const requestPersonalAiComposerFocus = useCallback(
-    () => setPersonalAiComposerFocusToken((token) => token + 1),
-    [],
-  );
-
-  // A connected stream uses cheap revision events for normal delivery. Keep a
-  // low-frequency watchdog as well: if the one GET triggered by an SSE event
-  // crosses a transient tunnel failure, the unchanged stream has no reason to
-  // emit that same event again.
-  const realtimeConnected = useRealtime();
-  usePolling(realtimeConnected ? 30_000 : 4_000);
+  const { branding } = useBranding();
+  const userId = useStore(state => state.user?.id);
+  const userTimezone = useStore(state => state.user?.timezone);
+  const navigationOpen = useStore(state => state.sidebarOpen);
+  const setNavigationOpen = useCallback((open: boolean) => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: open }), [store]);
+  const destination = useStore(state => topbarInfo(state, t).title);
+  const [focusToken, setFocusToken] = useState(0);
+  const requestFocus = useCallback(() => setFocusToken(token => token + 1), []);
+  const connected = useRealtime();
+  usePolling(connected ? 30_000 : 4_000);
   useReplyNotifications();
-
   useEffect(() => {
-    if (userId == null) return;
-    void ensureCurrentUserTimezone(store, userId, userTimezone).catch(() => undefined);
+    if (userId != null) void ensureCurrentUserTimezone(store, userId, userTimezone).catch(() => undefined);
   }, [store, userId, userTimezone]);
-
-  useEffect(() => {
-    if (!isMobile && sidebarOpen) {
-      store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
-    }
-  }, [isMobile, sidebarOpen, store]);
-
-  const closeSidebar = () => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: false });
-
-  return (
-    <PersonalAiComposerFocusContext.Provider value={personalAiComposerFocusToken}>
-      <a className="skip-link" href="#main-content">{t("shell.skipToContent")}</a>
-      <div className="shell">
-        {isMobile ? (
-          <Drawer
-            rootClassName="shell-drawer"
-            placement="left"
-            size="min(86vw, 300px)"
-            open={sidebarOpen}
-            onClose={closeSidebar}
-            title={<Brand />}
-            closeIcon={<Icon name="close" />}
-            destroyOnHidden
-            mask={{ closable: true }}
-            classNames={{
-              header: "shell-drawer__header",
-              section: "shell-drawer__section",
-              body: "shell-drawer__body",
-              close: "shell-drawer__close",
-            }}
-          >
-            <Sidebar showBrand={false} />
-          </Drawer>
-        ) : (
-          <Sidebar />
-        )}
-        <main
-          className="main"
-          id="main-content"
-          tabIndex={-1}
-        >
-          <Topbar />
-          <ContentRouter />
-        </main>
-      </div>
-      <PersonalAiGuideDialog onDraftFilled={requestPersonalAiComposerFocus} />
-    </PersonalAiComposerFocusContext.Provider>
-  );
+  return <PersonalAiComposerFocusContext.Provider value={focusToken}>
+    <AppFrame brand={{ productName: branding.product_name, logoUrl: branding.logo_url }}
+      navigationOpen={navigationOpen} onNavigationOpenChange={setNavigationOpen}
+      navigation={<WorkspaceNav />} account={<UserMenu />} utilities={<PublicUtilities />}
+      navigationLabel={t("shell.navigation")} openNavigationLabel={t("nav.menu.open")}
+      closeNavigationLabel={t("common.close")} skipLabel={t("shell.skipToContent")} mobileTitle={destination}>
+      <ContentRouter />
+    </AppFrame>
+    <PersonalAiGuideDialog onDraftFilled={requestFocus} />
+  </PersonalAiComposerFocusContext.Provider>;
 }

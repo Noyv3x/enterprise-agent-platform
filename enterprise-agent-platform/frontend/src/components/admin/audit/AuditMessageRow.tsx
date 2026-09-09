@@ -1,14 +1,9 @@
-/* <AuditMessageRow/> — one message in an audit list. Reuses the shared
-   <MessageAttachments> atom, which runs
-   hrefs/srcs through safeUrl). The trash button shows only when deletable. */
-
-import { cx } from "../../../lib/cx";
-import { Button, Tooltip } from "antd";
-import { formatTimestamp } from "../../../utils/format";
-import type { Message } from "../../../types";
-import { Icon } from "../../common/Icon";
-import { MessageAttachments } from "../../common/MessageAttachments";
+import { Button, Space } from "antd";
 import { useI18n } from "../../../i18n";
+import type { Message } from "../../../types";
+import { formatTimestamp } from "../../../utils/format";
+import { MessageAttachments } from "../../common/MessageAttachments";
+import { ResourceRow, StatusMark } from "../../ui/fieldwork";
 
 export interface AuditMessageRowProps {
   message: Message;
@@ -18,38 +13,18 @@ export interface AuditMessageRowProps {
 
 export function AuditMessageRow({ message, deletable = false, onDelete }: AuditMessageRowProps) {
   const { t } = useI18n();
-  const author = message.username || t(message.author_type === "agent" ? "admin.audit.agent" : "admin.audit.user");
-  const authorType = message.author_type === "agent"
-    ? t("admin.audit.agent")
-    : message.author_type === "user"
-      ? t("admin.audit.user")
-      : message.author_type;
+  const authorType = message.author_type === "agent" ? t("admin.audit.agent") : message.author_type === "user" ? t("admin.audit.user") : message.author_type;
   return (
-    <article className={cx("audit-message", `audit-message--${message.author_type}`)}>
-      <div className="audit-message__meta">
-        <span className="mono">{`#${message.id}`}</span>
-        <strong>{author}</strong>
-        <span>{authorType}</span>
-        <span>{formatTimestamp(message.created_at)}</span>
-      </div>
-      <div className="audit-message__body">{message.content}</div>
-      {message.attachments?.length ? (
-        <MessageAttachments attachments={message.attachments} />
-      ) : null}
-      {deletable ? (
-        <div className="audit-message__actions">
-          <Tooltip title={t("admin.audit.deleteMessage")}>
-            <Button
-              type="text"
-              danger
-              size="small"
-              icon={<Icon name="trash" size={16} />}
-              aria-label={t("admin.audit.deleteMessage")}
-              onClick={() => onDelete?.()}
-            />
-          </Tooltip>
-        </div>
-      ) : null}
+    <article aria-label={`#${message.id}`}>
+      <ResourceRow
+        title={message.username || authorType}
+        meta={<Space wrap><span>#{message.id}</span><span>{formatTimestamp(message.created_at)}</span></Space>}
+        status={<StatusMark>{authorType}</StatusMark>}
+        actions={onDelete ? <Button danger disabled={!deletable} onClick={onDelete}>{t("admin.audit.deleteMessage")}</Button> : undefined}
+      >
+        <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{message.content}</div>
+        {message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}
+      </ResourceRow>
     </article>
   );
 }

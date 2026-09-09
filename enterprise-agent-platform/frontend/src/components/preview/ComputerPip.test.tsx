@@ -88,6 +88,7 @@ describe("ComputerPip", () => {
     vi.setSystemTime(new Date("2026-08-15T12:00:05.000Z"));
     const context = (computerSurface: ComputerSurface) => ({
       scope: { scope_type: "private" as const, scope_id: "7" },
+      capabilityActions: null,
       browserDrawerOpen: false,
       computerDrawerOpen: false,
       computerMode: "search" as const,
@@ -111,15 +112,13 @@ describe("ComputerPip", () => {
       </I18nProvider>,
     );
 
-    expect(screen.getByText("00:05")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Show the AI computer" }))
-      .toHaveAccessibleDescription("Search · Working · Elapsed 00:05");
+    expect(screen.getByText("Elapsed 00:05")).toBeVisible();
     expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
-    expect(screen.getByText("00:06")).toBeVisible();
+    expect(screen.getByText("Elapsed 00:06")).toBeVisible();
     expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
 
     rendered.rerender(
@@ -129,7 +128,7 @@ describe("ComputerPip", () => {
         </ChatPreviewContext.Provider>
       </I18nProvider>,
     );
-    expect(screen.queryByText("00:06")).not.toBeInTheDocument();
+    expect(screen.queryByText("Elapsed 00:06")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show the AI computer" }))
       .toHaveAccessibleDescription("Search · Read only");
 
@@ -145,7 +144,7 @@ describe("ComputerPip", () => {
         </ChatPreviewContext.Provider>
       </I18nProvider>,
     );
-    expect(screen.getByText("00:00")).toBeVisible();
+    expect(screen.getByText("Elapsed 00:00")).toBeVisible();
   });
 
   it("stays hidden when the computer surface is idle", () => {
@@ -153,6 +152,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: null,
@@ -175,6 +175,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "file",
@@ -202,6 +203,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: true,
           computerDrawerOpen: true,
           computerMode: "browser",
@@ -222,6 +224,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "file",
@@ -243,9 +246,7 @@ describe("ComputerPip", () => {
       </I18nProvider>,
     );
 
-    const line = await screen.findByText("const answer = 42;");
-    expect(line.closest(".computer-file--compact")).not.toBeNull();
-    expect(document.querySelector(".computer-pip__player")).toBeInTheDocument();
+    expect(await screen.findByText("const answer = 42;")).toBeVisible();
     expect(screen.getByRole("button", { name: "Show the AI computer" }))
       .toHaveAccessibleDescription("File · Read only");
   });
@@ -259,6 +260,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "file",
@@ -317,6 +319,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "channel", scope_id: "9" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "search",
@@ -340,8 +343,6 @@ describe("ComputerPip", () => {
     );
 
     expect(screen.getByText("Platform architecture")).toBeInTheDocument();
-    expect(document.querySelector(".computer-search--compact")).toBeInTheDocument();
-    expect(document.querySelector(".computer-pip__idle")).not.toBeInTheDocument();
   });
 
   it("shows a completed presented page inside the compact viewport", () => {
@@ -349,6 +350,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "present",
@@ -373,7 +375,6 @@ describe("ComputerPip", () => {
     );
 
     const frame = screen.getByTitle("Presented page");
-    expect(frame.closest(".computer-present--compact")).not.toBeNull();
     expect(frame).toHaveAttribute("sandbox", "allow-scripts");
     expect(screen.getByRole("button", { name: "Show the AI computer" }))
       .toHaveAccessibleDescription("Page · Read only");
@@ -384,6 +385,7 @@ describe("ComputerPip", () => {
       <I18nProvider>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
           browserDrawerOpen: false,
           computerDrawerOpen: false,
           computerMode: "terminal",
@@ -409,9 +411,9 @@ describe("ComputerPip", () => {
       </I18nProvider>,
     );
 
-    expect(document.querySelector(".terminal-preview-compact__output"))
+    expect(screen.getByLabelText("Read-only terminal output"))
       .toHaveTextContent("$ printf ready");
-    expect(document.querySelector(".terminal-preview-compact__output"))
+    expect(screen.getByLabelText("Read-only terminal output"))
       .toHaveTextContent("ready");
     expect(screen.getByRole("button", { name: "Show the AI computer" }))
       .toHaveAccessibleDescription("Terminal · Read only");

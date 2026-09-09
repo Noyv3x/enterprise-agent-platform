@@ -114,6 +114,21 @@ export const workspaceMessages = defineMessages({
     en: "Notifications are blocked. Allow them again in your browser's site settings.",
     "zh-TW": "瀏覽器已封鎖通知，請在瀏覽器網站設定中重新允許。",
   },
+  "notifications.settings.permissionDefault": {
+    "zh-CN": "尚未授予通知权限",
+    en: "Notification permission not yet granted",
+    "zh-TW": "尚未授予通知權限",
+  },
+  "notifications.settings.enabled": {
+    "zh-CN": "通知已启用",
+    en: "Notifications enabled",
+    "zh-TW": "通知已啟用",
+  },
+  "notifications.settings.disabled": {
+    "zh-CN": "通知已关闭",
+    en: "Notifications disabled",
+    "zh-TW": "通知已關閉",
+  },
   "notifications.reply.title": {
     "zh-CN": "{agent} 已回复",
     en: "{agent} replied",

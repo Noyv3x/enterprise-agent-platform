@@ -1,86 +1,54 @@
-import { useState } from "react";
-import { Button } from "antd";
+import { useRef, useState } from "react";
 import { respondAgentApproval } from "../../data/chatActions";
 import { useI18n, type MessageKey } from "../../i18n";
 import { useStoreHandle } from "../../store/useStore";
 import type { AgentApprovalChoice, AgentApprovalRequest, ChatMode } from "../../types";
-import { Icon } from "../common/Icon";
+import { ApprovalPanel } from "../ui/fieldwork";
 
-const APPROVAL_ACTIONS: Array<{
-  choice: AgentApprovalChoice;
-  labelKey: MessageKey;
-  icon: "checkCircle" | "shield" | "key" | "alert";
-  primary?: boolean;
-}> = [
-  { choice: "once", labelKey: "chat.approval.once", icon: "checkCircle", primary: true },
-  { choice: "session", labelKey: "chat.approval.session", icon: "shield" },
-  { choice: "always", labelKey: "chat.approval.always", icon: "key" },
-  { choice: "deny", labelKey: "chat.approval.deny", icon: "alert" },
+const ACTIONS: ReadonlyArray<{ choice: AgentApprovalChoice; label: MessageKey }> = [
+  { choice: "once", label: "chat.approval.once" },
+  { choice: "session", label: "chat.approval.session" },
+  { choice: "always", label: "chat.approval.always" },
+  { choice: "deny", label: "chat.approval.deny" },
 ];
 
-function allowedChoices(approval: AgentApprovalRequest): Set<string> {
-  const raw = approval.choices || ["once", "session", "always", "deny"];
-  return new Set(raw.map((item) => String(item)));
-}
-
-export function AgentApprovalPrompt({
-  approval,
-  mode,
-  scopeId,
-}: {
+export function AgentApprovalPrompt({ approval, mode, scopeId }: {
   approval: AgentApprovalRequest;
   mode: ChatMode;
   scopeId: string;
 }) {
   const store = useStoreHandle();
   const { t } = useI18n();
+  const pending = useRef(false);
   const [submitting, setSubmitting] = useState<AgentApprovalChoice | null>(null);
-  const choices = allowedChoices(approval);
-  const description = approval.description || t("chat.approval.fallbackDescription");
-  const command = approval.command || "";
-
+  const [outcome, setOutcome] = useState<{ mode: ChatMode; scopeId: string; runId?: string; approvalId?: string; ok: boolean } | null>(null);
+  const currentOutcome = outcome?.mode === mode && outcome.scopeId === scopeId
+    && outcome.runId === approval.run_id && outcome.approvalId === approval.approval_id ? outcome : null;
+  const allowed = new Set(approval.choices || ["once", "session", "always", "deny"]);
   const submit = async (choice: AgentApprovalChoice) => {
-    if (submitting) return;
+    if (pending.current || !allowed.has(choice)) return;
+    pending.current = true;
     setSubmitting(choice);
+    setOutcome(null);
     try {
-      await respondAgentApproval(store, mode, scopeId, approval, choice);
+      const ok = await respondAgentApproval(store, mode, scopeId, approval, choice);
+      setOutcome({ mode, scopeId, runId: approval.run_id, approvalId: approval.approval_id, ok });
     } finally {
+      pending.current = false;
       setSubmitting(null);
     }
   };
-
-  return (
-    <article className="msg msg--agent msg--activity">
-      <div className="msg__avatar">
-        <Icon name="shield" size={18} />
-      </div>
-      <section className="agent-approval">
-        <div className="agent-approval__head">
-          <Icon name="shield" size={16} />
-          <div>
-            <strong>{t("chat.approval.title")}</strong>
-            <span>{description}</span>
-          </div>
-        </div>
-        {command ? <pre className="agent-approval__command">{command}</pre> : null}
-        <div className="agent-approval__actions">
-          {APPROVAL_ACTIONS.filter((action) => choices.has(action.choice)).map((action) => (
-            <Button
-              className="agent-approval__action"
-              type={action.primary ? "primary" : "default"}
-              danger={action.choice === "deny"}
-              size="small"
-              disabled={!!submitting}
-              loading={submitting === action.choice}
-              key={action.choice}
-              icon={<Icon name={action.icon} size={14} />}
-              onClick={() => void submit(action.choice)}
-            >
-              <span>{submitting === action.choice ? t("chat.approval.submitting") : t(action.labelKey)}</span>
-            </Button>
-          ))}
-        </div>
-      </section>
-    </article>
-  );
+  return <ApprovalPanel
+    title={t("chat.approval.title")}
+    description={approval.description || t("chat.approval.fallbackDescription")}
+    detail={approval.command ? <pre className="wf-work-approval-command" tabIndex={0}>{approval.command}</pre> : undefined}
+    busy={submitting !== null}
+    status={submitting ? <span role="status">{t("chat.approval.submitting")}</span> : currentOutcome ? <span role={currentOutcome.ok ? "status" : "alert"}>{t(currentOutcome.ok ? "chat.approvalSubmitted" : "chat.approvalFailed")}</span> : undefined}
+    choices={ACTIONS.filter(({ choice }) => allowed.has(choice)).map(({ choice, label }) => ({
+      key: choice,
+      label: submitting === choice ? t("chat.approval.submitting") : t(label),
+      danger: choice === "deny",
+      onChoose: () => { void submit(choice); },
+    }))}
+  />;
 }

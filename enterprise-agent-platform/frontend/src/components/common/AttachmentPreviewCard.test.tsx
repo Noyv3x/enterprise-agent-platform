@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
@@ -9,6 +9,12 @@ import { resetApiSession } from "../../lib/api";
 import { TestUiProviders } from "../../test/TestUiProviders";
 import type { Attachment } from "../../types";
 import { MessageAttachments } from "./MessageAttachments";
+
+interface MockResponse {
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+}
 
 function response(status: number, body: unknown) {
   return {
@@ -26,7 +32,7 @@ afterEach(() => {
 });
 
 describe("AttachmentPreviewCard", () => {
-  it("loads a table preview and keeps expand and download actions in the header", async () => {
+  it("loads one authenticated response for compact and expanded sheet navigation", async () => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
     const fetchMock = vi.fn(async () => response(200, {
       attachment_id: 9,
@@ -80,6 +86,9 @@ describe("AttachmentPreviewCard", () => {
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Summary" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Notes" })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Notes" }));
+    expect(await screen.findByText("Reviewed")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("renders document text previews for Word, slides, and PDF", async () => {
@@ -182,5 +191,45 @@ describe("AttachmentPreviewCard", () => {
       "/api/attachments/10?download=1",
     );
     expect(screen.getByRole("button", { name: "Expand spreadsheet preview" })).toBeDisabled();
+  });
+
+  it("never fetches external images or HTML previews but retains safe downloads", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <TestUiProviders>
+        <MessageAttachments attachments={[
+          { id: 21, filename: "remote.png", is_image: true, url: "https://other.example/pixel.png", download_url: "/api/attachments/21?download=1" },
+          { id: 22, filename: "page.html", preview_url: "/api/attachments/22/preview", download_url: "/api/attachments/22?download=1" },
+        ]} />
+      </TestUiProviders>,
+    );
+    expect(screen.queryByRole("img", { name: "remote.png" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
+      "/api/attachments/21?download=1", "/api/attachments/22?download=1",
+    ]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects late preview results after attachment identity changes", async () => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
+    let finishOld!: (value: MockResponse) => void;
+    const fetchMock = vi.fn((url: string) => !String(url).includes("?revision=2")
+      ? new Promise<MockResponse>((resolve) => { finishOld = resolve; })
+      : Promise.resolve(response(200, { attachment_id: 31, filename: "new.docx", kind: "docx", truncated: false, sections: [{ blocks: ["Current document"], truncated: false }] })));
+    vi.stubGlobal("fetch", fetchMock);
+    const { rerender } = render(<TestUiProviders><MessageAttachments attachments={[
+      { id: 31, filename: "old.docx", preview_url: "/api/attachments/31/preview" },
+    ]} /></TestUiProviders>);
+    rerender(<TestUiProviders><MessageAttachments attachments={[
+      { id: 31, filename: "new.docx", preview_url: "/api/attachments/31/preview?revision=2" },
+    ]} /></TestUiProviders>);
+    expect(await screen.findByText("Current document")).toBeInTheDocument();
+    await act(async () => {
+      finishOld(response(200, { attachment_id: 31, filename: "old.docx", kind: "docx", truncated: false, sections: [{ blocks: ["Outgoing document"], truncated: false }] }));
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText("Outgoing document")).not.toBeInTheDocument();
+    expect(screen.getByText("Current document")).toBeInTheDocument();
   });
 });

@@ -1,17 +1,20 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeContext } from "../../context/ThemeContext";
 import { ToastProvider } from "../../context/ToastContext";
+import { navigateToView } from "../../data/chatActions";
+import { endpoints } from "../../lib/endpoints";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AppState, User } from "../../types";
 import { AntDesignProvider } from "../ui/AntDesignProvider";
+import { PublicUtilities } from "../ui/PublicUtilities";
 import { AppShell } from "./AppShell";
 import { ChannelCreateForm } from "./ChannelCreateForm";
 import { UserMenu } from "./UserMenu";
@@ -64,7 +67,10 @@ describe("application shell controls", () => {
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
       value: vi.fn((query: string) => ({
-        matches: query === "(max-width: 800px)",
+        matches: query === "(prefers-reduced-motion: reduce)"
+          || query === "(max-width: 1039px)"
+          || query === "(max-width: 1040px)"
+          || query === "(max-width: 1040px), (pointer: coarse)",
         media: query,
         onchange: null,
         addListener: vi.fn(),
@@ -83,52 +89,76 @@ describe("application shell controls", () => {
     window.localStorage.clear();
   });
 
-  it("uses the library menu for account preferences without losing platform state", async () => {
+  it("keeps account actions and independent theme and locale controls available", async () => {
     const user = userEvent.setup();
-    const { toggleTheme } = renderShell(<UserMenu />);
+    const { toggleTheme } = renderShell(<><UserMenu /><PublicUtilities /></>);
 
     const trigger = screen.getByRole("button", { name: "Open user menu" });
     await user.click(trigger);
-    expect(trigger).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("menuitem", { name: "Personal settings" })).toBeInTheDocument();
-
-    await user.click(screen.getByRole("switch", { name: "Dark theme" }));
-    expect(toggleTheme).toHaveBeenCalledTimes(1);
-
-    await user.click(screen.getByText("繁體中文"));
-    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("zh-TW");
-
+    await waitFor(() => expect(screen.getByRole("menuitem", { name: "Sign out" })).toBeVisible());
     await user.keyboard("{Escape}");
     await waitFor(() => expect(trigger).toHaveAttribute("aria-expanded", "false"));
+
+    await user.click(screen.getByRole("button", { name: "Dark theme" }));
+    expect(toggleTheme).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("combobox", { name: "Language" }));
+    await user.click(screen.getByText("繁體中文"));
+    expect(window.localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("zh-TW");
   });
 
   it("does not use a permission group as the identity subtitle", async () => {
     const user = userEvent.setup();
-    const { container } = renderShell(<UserMenu />, {
+    renderShell(<UserMenu />, {
       user: { ...currentUser, position: "" },
     });
 
-    expect(container.querySelector(".user__role")).toBeNull();
+    expect(screen.getByText("Avery Chen")).toBeVisible();
+    expect(screen.getByText("@avery")).toBeVisible();
+    expect(screen.queryByText("Engineer")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Open user menu" }));
     expect(screen.queryByText("Administrator")).not.toBeInTheDocument();
   });
 
   it("opens and dismisses one focus-managed mobile navigation drawer", async () => {
     const user = userEvent.setup();
-    const { store } = renderShell(<AppShell />);
+    renderShell(<AppShell />);
 
     const trigger = screen.getByRole("button", { name: "Open menu" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     await user.click(trigger);
 
-    expect(await screen.findByRole("dialog")).toBeVisible();
-    expect(screen.getAllByRole("navigation", { name: "Main navigation" })).toHaveLength(1);
-    expect(screen.queryByRole("menuitem", { name: "Knowledge" })).not.toBeInTheDocument();
-    expect(store.getState().sidebarOpen).toBe(true);
-
+    const drawer = await screen.findByRole("dialog");
+    expect(drawer).toBeVisible();
+    expect(within(drawer).getByRole("navigation", { name: "Main navigation" })).toBeVisible();
     await user.keyboard("{Escape}");
-    await waitFor(() => expect(store.getState().sidebarOpen).toBe(false));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("dismisses mobile navigation and restores focus after programmatic scope navigation", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), window.location.origin);
+      const payload = url.pathname === endpoints.privateMessages.path()
+        ? { messages: [], agent_status: null, next_before_id: null, has_more: false }
+        : url.pathname === endpoints.privateTelegram.path()
+          ? { gateway: { enabled: false }, link: null, pending: null }
+          : null;
+      if (!payload) throw new Error(`Unexpected request: ${url.pathname}`);
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }));
+    const { store } = renderShell(<AppShell />, { personalAiGuideShownThisSession: true });
+    const trigger = screen.getByRole("button", { name: "Open menu" });
+    await user.click(trigger);
+    expect(await screen.findByRole("dialog")).toBeVisible();
+
+    await act(async () => { await navigateToView(store, "private"); });
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await waitFor(() => expect(trigger).toHaveFocus());
   });
 
   it("keeps the channel API payload verbatim after the whitespace guard", async () => {
@@ -142,9 +172,11 @@ describe("application shell controls", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     renderShell(<ChannelCreateForm />);
-
-    await user.type(screen.getByLabelText("New public channel name"), "  roadmap  ");
     await user.click(screen.getByRole("button", { name: "Create public channel" }));
+    const dialog = screen.getByRole("dialog", { name: "Create public channel" });
+
+    await user.type(within(dialog).getByLabelText("New public channel name"), "  roadmap  ");
+    await user.click(within(dialog).getByRole("button", { name: "Create public channel" }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({

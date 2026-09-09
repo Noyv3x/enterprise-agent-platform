@@ -50,11 +50,6 @@ export const coreMessages = defineMessages({
     en: "Restoring your secure session…",
     "zh-TW": "正在恢復安全工作階段…",
   },
-  "maintenance.eyebrow": {
-    "zh-CN": "系统维护",
-    en: "System maintenance",
-    "zh-TW": "系統維護",
-  },
   "maintenance.probingTitle": {
     "zh-CN": "正在连接服务",
     en: "Connecting to the service",

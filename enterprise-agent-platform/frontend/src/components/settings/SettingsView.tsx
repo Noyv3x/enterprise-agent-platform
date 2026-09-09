@@ -1,36 +1,17 @@
-import {
-  Alert,
-  AutoComplete,
-  Avatar,
-  Button,
-  Card,
-  Form,
-  Input,
-  Space,
-  Typography,
-} from "antd";
+import { AutoComplete, Button, Form, Input } from "antd";
 import { useEffect, useId, useMemo, useState } from "react";
 import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import { initials } from "../../utils/format";
-import { EmptyState } from "../common/EmptyState";
-import { Icon } from "../common/Icon";
-import { PageHeader } from "../common/PageHeader";
+import { EmptyState, FormFooter, FormGrid, Notice, PageHeader, PageLayout, Section, SectionIndex } from "../ui/fieldwork";
 import { BrowserNotificationSettings } from "./BrowserNotificationSettings";
 import { MailAccountSettings } from "./MailAccountSettings";
 import "./settings.css";
 
-const MIN_PASSWORD_LENGTH = 8;
-
 function timezoneOptions(current: string): string[] {
   const intl = Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] };
   let values: string[] = [];
-  try {
-    values = intl.supportedValuesOf?.("timeZone") || [];
-  } catch {
-    values = [];
-  }
+  try { values = intl.supportedValuesOf?.("timeZone") || []; } catch { /* Free entry remains available. */ }
   return [...new Set([current, "UTC", ...values].filter(Boolean))];
 }
 
@@ -38,227 +19,74 @@ export function SettingsView() {
   const { t } = useI18n();
   const store = useStoreHandle();
   const user = useStore((state) => state.user);
-  const pendingOperations = useStore((state) => state.pendingOperations);
-
+  const pending = useStore((state) => state.pendingOperations);
   const [displayName, setDisplayName] = useState("");
   const [position, setPosition] = useState("");
   const [timezone, setTimezone] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [passwordError, setPasswordError] = useState<"mismatch" | "too-short" | "">("");
-  const formId = useId();
-  const timezoneHintId = useId();
-  const timezones = useMemo(() => timezoneOptions(timezone), [timezone]);
-
+  const [confirmation, setConfirmation] = useState("");
+  const [passwordError, setPasswordError] = useState<"mismatch" | "short" | "">("");
+  const [activeSection, setActiveSection] = useState("profile");
+  const id = useId();
+  const zones = useMemo(() => timezoneOptions(timezone).map((value) => ({ value })), [timezone]);
   useEffect(() => {
     setDisplayName(user?.display_name || user?.username || "");
     setPosition(user?.position || "");
-  }, [user?.display_name, user?.id, user?.position, user?.username]);
-
+  }, [user?.id, user?.display_name, user?.username, user?.position]);
+  useEffect(() => { setTimezone(user?.timezone || browserTimezone() || "UTC"); }, [user?.id, user?.timezone]);
   useEffect(() => {
-    setTimezone(user?.timezone || browserTimezone() || "UTC");
-  }, [user?.id, user?.timezone]);
+    setCurrentPassword(""); setNewPassword(""); setConfirmation(""); setPasswordError("");
+  }, [user?.id]);
 
-  if (!user) {
-    return (
-      <div className="panel">
-        <div className="panel__inner">
-          <EmptyState
-            icon="settings"
-            title={t("session.loginRequired")}
-            text={t("account.loginRequiredDetail")}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  const profilePending = pendingOperations.includes("account:profile");
-  const passwordPending = pendingOperations.includes("account:password");
-  const identityPosition = user.position?.trim();
-  const profileDirty =
-    displayName !== (user.display_name || user.username || "") ||
-    position !== (user.position || "") ||
-    timezone !== (user.timezone || "");
-  const passwordDirty = !!(currentPassword || newPassword || confirmPassword);
-
-  const handleProfileSubmit = () => {
-    void updateCurrentUser(store, {
-      display_name: displayName,
-      position,
-      timezone: timezone.trim(),
+  if (!user) return <EmptyState title={t("session.loginRequired")} description={t("account.loginRequiredDetail")} />;
+  const profilePending = pending.includes("account:profile");
+  const passwordPending = pending.includes("account:password");
+  const profileDirty = displayName !== (user.display_name || user.username || "") || position !== (user.position || "") || timezone !== (user.timezone || "");
+  const submitPassword = () => {
+    if (newPassword !== confirmation) { setPasswordError("mismatch"); return; }
+    if (newPassword.length < 8) { setPasswordError("short"); return; }
+    setPasswordError("");
+    const owner = String(user.id);
+    void changePassword(store, { current_password: currentPassword, new_password: newPassword }, () => {
+      if (String(store.getState().user?.id) !== owner) return;
+      setCurrentPassword(""); setNewPassword(""); setConfirmation("");
     });
   };
-
-  const handlePasswordSubmit = () => {
-    if (newPassword !== confirmPassword) {
-      setPasswordError("mismatch");
-      return;
-    }
-    if (newPassword.length < MIN_PASSWORD_LENGTH) {
-      setPasswordError("too-short");
-      return;
-    }
-    setPasswordError("");
-    void changePassword(
-      store,
-      {
-        current_password: currentPassword,
-        new_password: newPassword,
-      },
-      () => {
-        setCurrentPassword("");
-        setNewPassword("");
-        setConfirmPassword("");
-      },
-    );
-  };
-
-  return (
-    <div className="panel">
-      <div className="panel__inner settings-panel">
-        <PageHeader
-          title={t("nav.settings")}
-          description={t("account.settingsDescription")}
-        />
-        <Card
-          className="account-identity"
-          classNames={{ body: "account-identity__body" }}
-          aria-label={t("account.identitySummary")}
-        >
-          <Avatar className="account-identity__avatar" size={44}>
-            {initials(user.display_name || user.username)}
-          </Avatar>
-          <div className="account-identity__main">
-            <Typography.Text strong>{user.display_name || user.username}</Typography.Text>
-            <Typography.Text type="secondary">@{user.username}</Typography.Text>
-          </div>
-          {identityPosition ? (
-            <div className="account-identity__meta">
-              <Typography.Text type="secondary">{identityPosition}</Typography.Text>
-            </div>
-          ) : null}
-        </Card>
-        <BrowserNotificationSettings userId={user.id} />
-        <MailAccountSettings />
-        <Card
-          className="settings-card"
-          classNames={{ body: "settings-card__body" }}
-          title={<Space><Icon name="settings" />{t("account.profile")}</Space>}
-        >
-          <Form layout="vertical" onFinish={handleProfileSubmit} requiredMark="optional">
-            <div className="settings-form__grid">
-              <Form.Item label={t("account.displayName")} htmlFor={`${formId}-display-name`}>
-                <Input
-                  id={`${formId}-display-name`}
-                  aria-label={t("account.displayName")}
-                  autoComplete="name"
-                  value={displayName}
-                  onChange={(event) => setDisplayName(event.target.value)}
-                />
-              </Form.Item>
-              <Form.Item label={t("account.position")} htmlFor={`${formId}-position`}>
-                <Input
-                  id={`${formId}-position`}
-                  aria-label={t("account.position")}
-                  autoComplete="organization-title"
-                  placeholder={t("account.position")}
-                  value={position}
-                  onChange={(event) => setPosition(event.target.value)}
-                />
-              </Form.Item>
-              <Form.Item
-                label={t("account.timezone")}
-                htmlFor={`${formId}-timezone`}
-                required
-              >
-                <div className="field-stack">
-                  <AutoComplete
-                    id={`${formId}-timezone`}
-                    aria-label={t("account.timezone")}
-                    options={timezones.map((item) => ({ value: item }))}
-                    showSearch
-                    virtual
-                    value={timezone}
-                    aria-describedby={timezoneHintId}
-                    onChange={setTimezone}
-                  />
-                  <div className="field-help" id={timezoneHintId}>{t("account.timezoneHint")}</div>
-                </div>
-              </Form.Item>
-            </div>
-            <div className="form-actions">
-              <Button
-                htmlType="submit"
-                type="primary"
-                loading={profilePending}
-                disabled={!profileDirty || !timezone.trim()}
-              >
-                {profilePending ? t("account.saving") : t("account.saveProfile")}
-              </Button>
-            </div>
-          </Form>
-        </Card>
-
-        <Card
-          className="settings-card"
-          classNames={{ body: "settings-card__body" }}
-          title={<Space><Icon name="key" />{t("account.changePassword")}</Space>}
-        >
-          <Form layout="vertical" onFinish={handlePasswordSubmit} requiredMark="optional">
-            <div className="settings-form__grid">
-              <Form.Item label={t("account.currentPassword")} htmlFor={`${formId}-current-password`}>
-                <Input.Password
-                  id={`${formId}-current-password`}
-                  aria-label={t("account.currentPassword")}
-                  autoComplete="current-password"
-                  value={currentPassword}
-                  onChange={(event) => setCurrentPassword(event.target.value)}
-                />
-              </Form.Item>
-              <Form.Item label={t("account.newPassword")} htmlFor={`${formId}-new-password`}>
-                <Input.Password
-                  id={`${formId}-new-password`}
-                  aria-label={t("account.newPassword")}
-                  autoComplete="new-password"
-                  value={newPassword}
-                  onChange={(event) => setNewPassword(event.target.value)}
-                />
-              </Form.Item>
-              <Form.Item label={t("account.confirmPassword")} htmlFor={`${formId}-confirm-password`}>
-                <Input.Password
-                  id={`${formId}-confirm-password`}
-                  aria-label={t("account.confirmPassword")}
-                  autoComplete="new-password"
-                  value={confirmPassword}
-                  onChange={(event) => setConfirmPassword(event.target.value)}
-                />
-              </Form.Item>
-            </div>
-            {passwordError ? (
-              <Alert
-                className="settings-error"
-                type="error"
-                showIcon
-                title={passwordError === "mismatch"
-                  ? t("account.passwordMismatch")
-                  : t("account.passwordMinLength", { count: MIN_PASSWORD_LENGTH })}
-              />
-            ) : null}
-            <div className="form-actions">
-              <Button
-                htmlType="submit"
-                type="primary"
-                loading={passwordPending}
-                disabled={!passwordDirty}
-              >
-                {passwordPending ? t("account.updatingPassword") : t("account.updatePassword")}
-              </Button>
-            </div>
-          </Form>
-        </Card>
-      </div>
+  const items = [
+    { key: "profile", label: t("account.profile") },
+    { key: "password", label: t("account.changePassword") },
+    { key: "notifications", label: t("notifications.settings.title") },
+    { key: "mail", label: t("mail.title") },
+  ];
+  return <PageLayout
+    header={<PageHeader title={t("nav.settings")} description={t("account.settingsDescription")} meta={<span>{user.display_name || user.username} · @{user.username}{user.position?.trim() ? ` · ${user.position.trim()}` : ""}</span>} />}
+    navigation={<SectionIndex label={t("nav.settings")} groups={[{ key: "settings", label: null, items }]} activeKey={activeSection} onSelect={(key) => { setActiveSection(key); document.getElementById(`${id}-${key}`)?.scrollIntoView({ block: "start" }); }} />}
+  >
+    <div className="wf-settings-sections">
+      <Section id={`${id}-profile`} title={t("account.profile")}>
+        <Form layout="vertical" onFinish={() => void updateCurrentUser(store, { display_name: displayName, position, timezone: timezone.trim() })} disabled={profilePending}>
+          <FormGrid>
+            <Form.Item label={t("account.displayName")} htmlFor={`${id}-name`}><Input id={`${id}-name`} value={displayName} autoComplete="name" onChange={(event) => setDisplayName(event.target.value)} /></Form.Item>
+            <Form.Item label={t("account.position")} htmlFor={`${id}-position`}><Input id={`${id}-position`} value={position} maxLength={80} onChange={(event) => setPosition(event.target.value)} /></Form.Item>
+            <Form.Item label={t("account.timezone")} htmlFor={`${id}-zone`} extra={t("account.timezoneHint")}><AutoComplete id={`${id}-zone`} aria-label={t("account.timezone")} value={timezone} options={zones} onChange={setTimezone} filterOption={(input, option) => String(option?.value || "").toLowerCase().includes(input.toLowerCase())} /></Form.Item>
+          </FormGrid>
+          <FormFooter><Button type="primary" htmlType="submit" loading={profilePending} disabled={!profileDirty || !timezone.trim()}>{t("account.saveProfile")}</Button></FormFooter>
+        </Form>
+      </Section>
+      <Section id={`${id}-password`} title={t("account.changePassword")}>
+        <Form layout="vertical" onFinish={submitPassword} disabled={passwordPending}>
+          <FormGrid>
+            <Form.Item label={t("account.currentPassword")} htmlFor={`${id}-current`}><Input.Password id={`${id}-current`} autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Form.Item>
+            <Form.Item label={t("account.newPassword")} htmlFor={`${id}-new`}><Input.Password id={`${id}-new`} autoComplete="new-password" value={newPassword} onChange={(event) => { setNewPassword(event.target.value); setPasswordError(""); }} /></Form.Item>
+            <Form.Item label={t("account.confirmPassword")} htmlFor={`${id}-confirmation`}><Input.Password id={`${id}-confirmation`} autoComplete="new-password" value={confirmation} onChange={(event) => { setConfirmation(event.target.value); setPasswordError(""); }} /></Form.Item>
+          </FormGrid>
+          {passwordError ? <Notice tone="danger" title={passwordError === "mismatch" ? t("account.passwordMismatch") : t("account.passwordMinLength", { count: 8 })} /> : null}
+          <FormFooter><Button htmlType="submit" loading={passwordPending} disabled={!(currentPassword || newPassword || confirmation)}>{t("account.updatePassword")}</Button></FormFooter>
+        </Form>
+      </Section>
+      <div id={`${id}-notifications`}><BrowserNotificationSettings key={String(user.id)} userId={user.id} /></div>
+      <div id={`${id}-mail`}><MailAccountSettings key={String(user.id)} /></div>
     </div>
-  );
+  </PageLayout>;
 }

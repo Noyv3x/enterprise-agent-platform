@@ -63,7 +63,7 @@ describe("conversation context details", () => {
 
     expect(screen.getByRole("dialog", { name: "Context usage" })).toBeInTheDocument();
     expect(screen.getByText("32,000 / 128,000 tokens")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar", { name: "Context usage percentage" }))
+    expect(screen.getByRole("meter", { name: "Context usage percentage" }))
       .toHaveAttribute("aria-valuenow", "25");
     expect(screen.queryByText(/provider|session/i)).not.toBeInTheDocument();
   });
@@ -79,7 +79,7 @@ describe("conversation context details", () => {
     await user.click(screen.getByRole("button", { name: "Details" }));
 
     expect(screen.getByText("64,000 / 128,000 tokens")).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+    expect(screen.getByRole("meter")).toHaveAttribute("aria-valuenow", "50");
   });
 
   it("keeps the details button useful before a context snapshot exists", async () => {
@@ -91,7 +91,7 @@ describe("conversation context details", () => {
     expect(
       screen.getByText("Context usage will appear after the Agent completes a reply."),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.queryByRole("meter")).not.toBeInTheDocument();
   });
 
   it("does not mislabel an older snapshot as the latest completed reply", async () => {
@@ -114,7 +114,7 @@ describe("conversation context details", () => {
     expect(
       screen.getByText("Context usage will appear after the Agent completes a reply."),
     ).toBeInTheDocument();
-    expect(screen.queryByText("32,000 / 128,000 tokens")).not.toBeInTheDocument();
+    expect(screen.queryByRole("meter")).not.toBeInTheDocument();
   });
 
   it("does not show conversation details until a channel is selected", () => {

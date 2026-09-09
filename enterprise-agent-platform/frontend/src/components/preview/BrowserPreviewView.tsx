@@ -1,10 +1,9 @@
-import { Button, Input, Space, Spin, Tag } from "antd";
+import { Button, Input, Space } from "antd";
 import {
   useCallback,
   useEffect,
   useRef,
   useState,
-  type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
@@ -22,9 +21,7 @@ import {
   waitForBrowserControlRelinquish,
 } from "../../lib/browserControl";
 import type { AgentPreviewScope } from "../../types";
-import { EmptyState } from "../common/EmptyState";
-import { Icon } from "../common/Icon";
-import { InlineAlert } from "../common/InlineAlert";
+import { BrowserControlBar, EmptyState, LoadingState, Notice } from "../ui/fieldwork";
 import { PreviewStatus } from "./PreviewStatus";
 import { useBrowserPreview } from "./useBrowserPreview";
 
@@ -604,142 +601,46 @@ export function BrowserPreviewView({
     && !Object.is(consumedControlRequestRef.current, controlRequestId);
 
   return (
-    <section className="browser-preview" aria-label={t("browserPreview.title")}>
-      <header className="preview-toolbar">
-        <div className="preview-toolbar__status">
-          <PreviewStatus connection={state.connection} idle={state.activity === "idle"} />
-          <Tag className="preview-readonly" icon={<Icon name="shield" size={12} />}>
-            {controlling ? t("browserPreview.assisting") : t("preview.readOnly")}
-          </Tag>
-          {lastUpdate ? <span className="preview-updated">{t("preview.updatedAt", { time: lastUpdate })}</span> : null}
-        </div>
-        <Space size={6}>
-          {state.tabId ? (
-            <Button
-              size="small"
-              type={controlling ? "default" : "primary"}
-              danger={controlling}
-              loading={controlBusy}
-              onClick={() => controlling ? void endControl() : void beginControl()}
-            >
-              {controlling ? t("browserPreview.endControl") : t("browserPreview.takeControl")}
-            </Button>
-          ) : null}
-          <Button className="preview-toolbar__action" size="small" icon={<Icon name="refresh" size={14} />} onClick={refresh}>
-            <span>{t("preview.refresh")}</span>
-          </Button>
-        </Space>
-      </header>
-      {state.error ? (
-        <InlineAlert variant="warning">{state.error || t("preview.loadFailed")}</InlineAlert>
-      ) : null}
-      {controlError ? <InlineAlert variant="warning">{controlError}</InlineAlert> : null}
-      {controlling ? (
-        <div className="browser-preview__controls">
-          <Space.Compact>
-            <Button size="small" onClick={() => void sendInput({ action: "back" })}>{t("browserPreview.back")}</Button>
-            <Button size="small" onClick={() => void sendInput({ action: "forward" })}>{t("browserPreview.forward")}</Button>
-            <Button size="small" onClick={() => void sendInput({ action: "refresh" })}>{t("browserPreview.reload")}</Button>
-          </Space.Compact>
-          <Space.Compact className="browser-preview__text-control">
-            <Input
-              size="small"
-              value={textInput}
-              maxLength={4096}
-              placeholder={t("browserPreview.typePlaceholder")}
-              onChange={(event) => setTextInput(event.target.value)}
-              onPressEnter={() => {
-                if (!textInput) return;
-                void sendInput({ action: "text", text: textInput });
-                setTextInput("");
-              }}
-            />
-            <Button size="small" disabled={!textInput} onClick={() => {
-              if (!textInput) return;
-              void sendInput({ action: "text", text: textInput });
-              setTextInput("");
-            }}>{t("browserPreview.typeSend")}</Button>
-          </Space.Compact>
-        </div>
-      ) : null}
-      <div className="browser-preview__window">
-        <div className="browser-preview__chrome" aria-hidden="true">
-          <span className="browser-preview__lights"><i /><i /><i /></span>
-          <div className="browser-preview__address">
-            <Icon name="shield" size={12} />
-            <span>{state.url || state.title || t("browserPreview.page")}</span>
-          </div>
-        </div>
-        <div
-          className={controlling ? "browser-preview__screen is-controlling" : "browser-preview__screen"}
-          tabIndex={controlling ? 0 : -1}
-          role={controlling ? "application" : undefined}
-          aria-label={controlling ? t("browserPreview.controlSurface") : undefined}
-          onClick={onFrameClick}
-          onPointerDown={onFramePointerDown}
-          onPointerMove={onFramePointerMove}
-          onPointerUp={onFramePointerUp}
-          onPointerCancel={onFramePointerCancel}
-          onLostPointerCapture={onFramePointerCancel}
-          onWheel={(event) => {
-            if (!controlling) return;
-            event.preventDefault();
-            void sendInput({ action: "wheel", delta_x: Math.round(event.deltaX), delta_y: Math.round(event.deltaY) });
-          }}
-          onKeyDown={(event) => {
-            if (!controlling || event.target !== event.currentTarget) return;
-            const allowed = new Set(["Enter", "Tab", "Escape", "Backspace", "Delete", " ", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"]);
-            if (!allowed.has(event.key)) return;
-            event.preventDefault();
-            void sendInput({ action: "key", key: event.key === " " ? "Space" : event.key });
-          }}
-        >
-          {state.frameUrl ? (
-            <img
-              ref={imageRef}
-              src={state.frameUrl}
-              alt={t("browserPreview.frameAlt")}
-              draggable={false}
-            />
-          ) : state.activity === "idle" && !waitingForQuickControl ? (
-            <EmptyState
-              icon="browser"
-              title={t("browserPreview.noBrowser")}
-              text={t("browserPreview.noBrowserDetail")}
-            />
-          ) : (
-            <div
-              className="browser-preview__loading"
-              role="status"
-              aria-live="polite"
-              aria-busy="true"
-            >
-              <Spin size="large" />
-              <h3>{t("browserPreview.loadingFrame")}</h3>
-              <p>{t("browserPreview.loadingFrameDetail")}</p>
-            </div>
-          )}
-          {pointerFeedback ? (
-            <span
-              className={pointerFeedback.dragging
-                ? "browser-preview__pointer-feedback is-dragging"
-                : "browser-preview__pointer-feedback"}
-              style={{
-                "--pointer-left": `${pointerFeedback.left}px`,
-                "--pointer-top": `${pointerFeedback.top}px`,
-              } as CSSProperties}
-              aria-hidden="true"
-            />
-          ) : null}
-          {!controlling ? <div className="browser-preview__readonly-shield" aria-hidden="true" /> : null}
-        </div>
+    <section className="wf-browser-view" aria-label={t("browserPreview.title")}>
+      <BrowserControlBar
+        status={controlling ? t("browserPreview.assisting") : t("preview.readOnly")}
+        description={<PreviewStatus connection={state.connection} idle={state.activity === "idle"} />}
+        danger={Boolean(controlError)}
+        action={<Space wrap>
+          {state.tabId ? <Button type={controlling ? "default" : "primary"} loading={controlBusy} onClick={() => controlling ? endControl() : void beginControl()}>{t(controlling ? "browserPreview.endControl" : "browserPreview.takeControl")}</Button> : null}
+          <Button onClick={refresh}>{t("preview.refresh")}</Button>
+        </Space>}
+      />
+      {state.error ? <Notice tone="warning" title={state.error} /> : null}
+      {controlError ? <Notice tone="warning" title={controlError} /> : null}
+      {controlling ? <div className="wf-browser-inputs">
+        <Space wrap>{(["back", "forward", "refresh"] as const).map(action => <Button key={action} onClick={() => void sendInput({action})}>{t(action === "refresh" ? "browserPreview.reload" : action === "back" ? "browserPreview.back" : "browserPreview.forward")}</Button>)}</Space>
+        <Space.Compact block><Input aria-label={t("browserPreview.typePlaceholder")} value={textInput} maxLength={4096} placeholder={t("browserPreview.typePlaceholder")} onChange={event => setTextInput(event.target.value)} onPressEnter={event => {
+          if (event.nativeEvent.isComposing || !textInput) return;
+          void sendInput({action: "text", text: textInput}); setTextInput("");
+        }} /><Button disabled={!textInput} onClick={() => { if (!textInput) return; void sendInput({action: "text", text: textInput}); setTextInput(""); }}>{t("browserPreview.typeSend")}</Button></Space.Compact>
+      </div> : null}
+      <div className="wf-browser-frame" data-controlling={controlling || undefined}
+        tabIndex={controlling ? 0 : -1} role={controlling ? "application" : undefined}
+        aria-label={controlling ? t("browserPreview.controlSurface") : undefined}
+        onClick={onFrameClick} onPointerDown={onFramePointerDown} onPointerMove={onFramePointerMove} onPointerUp={onFramePointerUp}
+        onPointerCancel={onFramePointerCancel} onLostPointerCapture={onFramePointerCancel}
+        onWheel={event => { if (!controlling) return; event.preventDefault(); void sendInput({action:"wheel",delta_x:Math.round(event.deltaX),delta_y:Math.round(event.deltaY)}); }}
+        onKeyDown={event => {
+          if (!controlling || event.target !== event.currentTarget || (event.key === "Tab" && event.shiftKey)) return;
+          if (!["Enter","Tab","Escape","Backspace","Delete"," ","ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Home","End","PageUp","PageDown"].includes(event.key)) return;
+          event.preventDefault(); event.stopPropagation(); void sendInput({action:"key",key:event.key === " " ? "Space" : event.key});
+        }}>
+        {state.frameUrl ? <img ref={imageRef} src={state.frameUrl} alt={t("browserPreview.frameAlt")} draggable={false} />
+          : state.activity === "idle" && !waitingForQuickControl ? <EmptyState title={t("browserPreview.noBrowser")} description={t("browserPreview.noBrowserDetail")} />
+          : <div aria-busy="true"><LoadingState label={t("browserPreview.loadingFrame")} detail={t("browserPreview.loadingFrameDetail")} /></div>}
+        {pointerFeedback ? <span className="wf-browser-pointer" data-dragging={pointerFeedback.dragging || undefined} style={{left:pointerFeedback.left,top:pointerFeedback.top}} aria-hidden="true" /> : null}
       </div>
-      {state.title || state.url ? (
-        <footer className="browser-preview__meta">
-          <strong>{state.title || t("browserPreview.page")}</strong>
-          {state.url ? <span>{state.url}</span> : null}
-        </footer>
-      ) : null}
+      <footer className="wf-preview-meta">
+        {state.title ? <strong>{state.title}</strong> : null}
+        {state.url ? <span>{state.url}</span> : null}
+        {lastUpdate ? <span>{t("preview.updatedAt", {time:lastUpdate})}</span> : null}
+      </footer>
     </section>
   );
 }

@@ -1,5 +1,6 @@
+import { Button } from "antd";
 import { useI18n } from "../../i18n";
-import { Button, Space } from "antd";
+import { FormFooter } from "../ui/fieldwork";
 import { Dialog } from "./Dialog";
 
 export interface ConfirmDialogProps {
@@ -12,40 +13,14 @@ export interface ConfirmDialogProps {
   onCancel: () => void;
 }
 
-/** Promise-friendly confirmation surface using the shared accessible modal. */
-export function ConfirmDialog({
-  message,
-  title,
-  confirmText,
-  cancelText,
-  danger,
-  onConfirm,
-  onCancel,
-}: ConfirmDialogProps) {
+export function ConfirmDialog({ message, title, confirmText, cancelText, danger, onConfirm, onCancel }: ConfirmDialogProps) {
   const { t } = useI18n();
-  return (
-    <Dialog
-      open
-      onClose={onCancel}
-      title={title || t("chat.confirm.label")}
-      showCloseButton={false}
-      className="eap-confirm-dialog"
-      footer={
-        <Space>
-          <Button onClick={onCancel}>
-            {cancelText ?? t("chat.confirm.cancel")}
-          </Button>
-          <Button
-            type="primary"
-            danger={danger}
-            onClick={onConfirm}
-          >
-            {confirmText ?? t("chat.confirm.confirm")}
-          </Button>
-        </Space>
-      }
-    >
-      <p className="eap-confirm-dialog__message">{message}</p>
-    </Dialog>
-  );
+  return <Dialog open onClose={onCancel} title={title || t("chat.confirm.label")} showCloseButton={false}
+    footer={<FormFooter>
+      <Button onClick={onCancel}>{cancelText ?? t("chat.confirm.cancel")}</Button>
+      <Button type="primary" danger={danger} onClick={onConfirm}>{confirmText ?? t("chat.confirm.confirm")}</Button>
+    </FormFooter>}
+  >
+    <p className="wf-reading">{message}</p>
+  </Dialog>;
 }

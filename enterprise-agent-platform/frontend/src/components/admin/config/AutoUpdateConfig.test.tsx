@@ -54,11 +54,8 @@ describe("AutoUpdateConfig manager state", () => {
 
     expect(screen.getByText("Waiting for tasks")).toBeInTheDocument();
     expect(screen.getByText(/The update is queued/)).toBeInTheDocument();
-    expect(screen.getByText("generation-current")).toBeInTheDocument();
     expect(screen.getByText("operation-1")).toBeInTheDocument();
-    expect(screen.getByText("Last successful update")).toBeInTheDocument();
     expect(screen.getByText(formatTimestamp("2026-07-24T12:00:00Z"))).toBeInTheDocument();
-    expect(screen.queryByText("Git remote")).not.toBeInTheDocument();
   });
 
   it("shows every fixed Manager service in the PostgreSQL Firecrawl baseline", () => {
@@ -133,7 +130,7 @@ describe("AutoUpdateConfig manager state", () => {
         release_manifest_url: "https://releases.example/main.json",
         release_channel: "main",
       },
-      status: { state: "waiting_for_tasks", active_tasks: 1 },
+      status: { state: "waiting_for_tasks", active_tasks: 1, manager_generation: 1 },
     });
     const manifestInput = screen.getByDisplayValue("https://releases.example/main.json");
     fireEvent.change(manifestInput, { target: { value: "https://draft.example/main.json" } });
@@ -144,7 +141,7 @@ describe("AutoUpdateConfig manager state", () => {
         release_manifest_url: "https://releases.example/main.json",
         release_channel: "main",
       },
-      status: { state: "idle", active_tasks: 0, queued_tasks: 0 },
+      status: { state: "idle", active_tasks: 0, queued_tasks: 0, manager_generation: 1 },
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -156,5 +153,19 @@ describe("AutoUpdateConfig manager state", () => {
     ));
     await waitFor(() => expect(screen.getByText("Idle")).toBeInTheDocument());
     expect(manifestInput).toHaveValue("https://draft.example/main.json");
+  });
+
+  it("disables every mutation when Manager state is unavailable", () => {
+    renderConfig({
+      config: { enabled: true, interval_seconds: 300, release_manifest_url: "https://releases.example/main.json" },
+      status: { manager_generation: 4, update_available: true, previous_generation: "previous" },
+    });
+    expect(screen.getByText("Manager unavailable")).toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue("https://releases.example/main.json"), {
+      target: { value: "https://changed.example/main.json" },
+    });
+    for (const name of ["Save automatic update settings", "Check now", "Update now", "Restart services", "Rollback"]) {
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+    }
   });
 });

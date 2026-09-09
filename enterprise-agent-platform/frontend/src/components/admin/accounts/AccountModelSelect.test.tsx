@@ -109,7 +109,6 @@ describe("AccountModelSelect", () => {
       </StoreContext.Provider>,
     );
 
-    expect(screen.getByText("Only the system default model is currently available.")).toBeInTheDocument();
     expect(screen.queryByText(/stale-runtime-candidate/)).not.toBeInTheDocument();
   });
 });

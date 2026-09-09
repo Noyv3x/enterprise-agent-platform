@@ -1,42 +1,16 @@
-/* <ComposerFiles/> — selected-but-unsent attachment chips with remove buttons.
-   `files` are raw File objects
-   from the per-scope draftFiles store entry. */
-
-import { formatFileSize } from "../../utils/format";
+import { Button } from "antd";
 import { useI18n } from "../../i18n";
-import { Button, Tooltip } from "antd";
+import { formatFileSize } from "../../utils/format";
 import { Icon } from "../common/Icon";
+import { AttachmentSlot } from "../ui/fieldwork";
 
-export function ComposerFiles({
-  files,
-  onRemove,
-}: {
-  files: File[];
-  onRemove: (index: number) => void;
-}) {
+export function ComposerFiles({ files, onRemove }: { files: File[]; onRemove: (index: number) => void }) {
   const { t } = useI18n();
-  return (
-    <div className="composer-files">
-      {files.map((file, index) => (
-        <div className="composer-file" key={`${file.name}-${file.size}-${index}`}>
-          <span className="composer-file__icon">
-            <Icon name={file.type?.startsWith("image/") ? "image" : "doc"} size={15} />
-          </span>
-          <span className="composer-file__name">{file.name || t("chat.attachment")}</span>
-          <span className="composer-file__size">{formatFileSize(file.size || 0)}</span>
-          <Tooltip title={t("chat.attach.remove")}>
-            <Button
-              className="composer-file__remove"
-              type="text"
-              shape="circle"
-              size="small"
-              aria-label={t("chat.attach.removeAttachment")}
-              icon={<Icon name="close" size={14} />}
-              onClick={() => onRemove(index)}
-            />
-          </Tooltip>
-        </div>
-      ))}
-    </div>
-  );
+  return <ul className="wf-draft-files">
+    {files.map((file, index) => <li key={`${file.name}-${file.size}-${index}`}>
+      <AttachmentSlot name={file.name || t("chat.attachment")} meta={formatFileSize(file.size)} actions={
+        <Button type="text" htmlType="button" aria-label={t("chat.attach.removeAttachment")} title={t("chat.attach.remove")} icon={<Icon name="close" size={16} />} onClick={() => onRemove(index)} />
+      } />
+    </li>)}
+  </ul>;
 }

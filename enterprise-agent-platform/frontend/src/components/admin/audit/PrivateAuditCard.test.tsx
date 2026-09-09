@@ -60,9 +60,9 @@ describe("PrivateAuditCard selection under a slow earlier read", () => {
       }
       if (path === endpoints.auditPrivateMessages.path("11")) {
         aliceReads += 1;
-        // The first re-read of Alice is the slow one; every later read sees the
-        // post-delete thread.
-        if (aliceReads === 1) {
+        // Hold a pre-return snapshot after deletion; returning to Alice must
+        // issue another read even while this older request is still pending.
+        if (aliceReads === 2) {
           return new Promise<FetchStub>((resolve) => {
             releaseSlowAlice = resolve;
           });
@@ -97,16 +97,16 @@ describe("PrivateAuditCard selection under a slow earlier read", () => {
       </I18nProvider>,
     );
 
-    // A1: re-selecting Alice starts a read that stays slow for the whole scenario.
-    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
-    await waitFor(() => expect(aliceReads).toBe(1));
-
-    // A2: deleting a row cascades a fresh Alice read that completes normally.
     const deletedRow = screen.getByText("A_DELETED_ROW").closest("article");
     expect(deletedRow).not.toBeNull();
     fireEvent.click(within(deletedRow as HTMLElement).getByRole("button", { name: "Delete message" }));
     await waitFor(() => expect(screen.queryByText("A_DELETED_ROW")).not.toBeInTheDocument());
     expect(screen.getByText("A_REMAINING_ROW")).toBeVisible();
+
+    // A1 stays pending. Mutations are disabled, but selection must stay live.
+    fireEvent.click(screen.getByRole("button", { name: /Alice/ }));
+    await waitFor(() => expect(aliceReads).toBe(2));
+    expect(screen.getAllByRole("button", { name: "Delete message" })[0]).toBeDisabled();
 
     // Bob, then back to Alice while A1 is still pending.
     fireEvent.click(screen.getByRole("button", { name: /Bob/ }));

@@ -1,426 +1,87 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Badge, Button, Tooltip } from "antd";
-import { useMediaQuery } from "../../hooks/useMediaQuery";
+import { Button, Modal } from "antd";
 import { useI18n } from "../../i18n";
-import { cx } from "../../lib/cx";
 import { useStore } from "../../store/useStore";
 import type { AgentPreviewScope, ComputerMode, Message } from "../../types";
-import { Icon } from "../common/Icon";
-import { Spinner } from "../common/Spinner";
+import { LoadingState, OverlayPanel, useFieldworkContainer } from "../ui/fieldwork";
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerScreen } from "./ComputerScreen";
 import { deriveComputerSurface, latestComputerStep } from "./computer";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 import "./preview.css";
 
-const ScheduledTasksPanel = lazy(() =>
-  import("../scheduled-tasks/ScheduledTasksPanel").then((module) => ({
-    default: module.ScheduledTasksPanel,
-  })),
-);
-const MemoryPanel = lazy(() =>
-  import("../memory/MemoryPanel").then((module) => ({
-    default: module.MemoryPanel,
-  })),
-);
-const SkillsPanel = lazy(() =>
-  import("../skills/SkillsPanel").then((module) => ({
-    default: module.SkillsPanel,
-  })),
-);
+const MemoryPanel=lazy(() => import("../memory/MemoryPanel").then(module => ({default:module.MemoryPanel})));
+const SkillsPanel=lazy(() => import("../skills/SkillsPanel").then(module => ({default:module.SkillsPanel})));
+const ScheduledTasksPanel=lazy(() => import("../scheduled-tasks/ScheduledTasksPanel").then(module => ({default:module.ScheduledTasksPanel})));
+const EMPTY_MESSAGES:Message[]=[];
+type Capability="memory"|"skills"|"tasks"|"computer";
 
-type SidePanelKind = "memory" | "skills" | "tasks" | "computer";
-
-const EMPTY_MESSAGES: Message[] = [];
-
-interface ChatPreviewSidebarProps {
-  scope: AgentPreviewScope | null;
-  canManageSkills?: boolean;
-  children: ReactNode;
-}
-
-export function ChatPreviewSidebar({
-  scope,
-  canManageSkills = true,
-  children,
-}: ChatPreviewSidebarProps) {
-  const { t } = useI18n();
-  const { state, refresh } = usePreviewAvailability(scope);
-  const status = useStore((storeState) => {
-    if (!scope) return null;
-    return scope.scope_type === "private"
-      ? storeState.agentStatuses.private
-      : storeState.agentStatuses.channels[String(scope.scope_id)] || null;
-  });
-  const messages = useStore((storeState) => {
-    if (!scope) return EMPTY_MESSAGES;
-    return scope.scope_type === "private" ? storeState.privateMessages : storeState.messages;
-  });
-  const computerSurface = useMemo(
-    () => deriveComputerSurface({ status, messages, availability: state }),
-    [messages, state, status],
-  );
-  const [openPreview, setOpenPreview] = useState<SidePanelKind | null>(null);
-  const [browserIntentPending, setBrowserIntentPending] = useState(false);
-  const [browserControlRequestId, setBrowserControlRequestId] = useState(0);
-  const [browserIntentScopeKey, setBrowserIntentScopeKey] = useState("");
-  const memoryButton = useRef<HTMLButtonElement>(null);
-  const skillsButton = useRef<HTMLButtonElement>(null);
-  const tasksButton = useRef<HTMLButtonElement>(null);
-  const computerButton = useRef<HTMLButtonElement>(null);
-  const closeButton = useRef<HTMLButtonElement>(null);
-  const previousOpen = useRef<SidePanelKind | null>(null);
-  const previewOpener = useRef<HTMLElement | null>(null);
-  const browserControlSequence = useRef(0);
-  const fullWidthPreview = useMediaQuery("(max-width: 520px)");
-  const scopeKey = scope ? `${scope.scope_type}:${scope.scope_id}` : "";
-  const browserIntentCurrent = Boolean(scopeKey) && browserIntentScopeKey === scopeKey;
-  const browserIntentVisible = browserIntentCurrent && browserIntentPending;
-  const currentBrowserControlRequestId = browserIntentCurrent
-    ? browserControlRequestId
-    : 0;
-  const computerActive = Boolean(scope) && (
-    computerSurface.visible
-    || browserIntentVisible
-    || (state.loading && Boolean(latestComputerStep(status) || status?.computer))
-  );
-  const memoryActive = scope?.scope_type === "private";
-  const skillsActive = !!scope;
-  const tasksActive = scope?.scope_type === "private";
-  const hasPreviews = memoryActive || skillsActive || tasksActive || computerActive;
-  const visiblePreview = (
-    (openPreview === "memory" && memoryActive)
-    || (openPreview === "skills" && skillsActive)
-    || (openPreview === "tasks" && tasksActive)
-    || (openPreview === "computer" && computerActive)
-  ) ? openPreview : null;
-  const mobilePreviewOpen = fullWidthPreview && visiblePreview !== null;
-  const computerMode: ComputerMode | null = browserIntentVisible
-    ? (computerSurface.mode || "browser")
-    : computerSurface.mode;
-  const screenSurface = useMemo(
-    () => (browserIntentVisible
-      ? { ...computerSurface, visible: true, mode: computerMode }
-      : computerSurface),
-    [browserIntentVisible, computerMode, computerSurface],
-  );
-  const latestTerminal = latestComputerStep(status);
-
+export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope:AgentPreviewScope|null;canManageSkills?:boolean;children:ReactNode}) {
+  const {t}=useI18n();
+  const container=useFieldworkContainer();
+  const {state,refresh}=usePreviewAvailability(scope);
+  const status=useStore(value => !scope ? null : scope.scope_type === "private" ? value.agentStatuses.private : value.agentStatuses.channels[String(scope.scope_id)] || null);
+  const messages=useStore(value => !scope ? EMPTY_MESSAGES : scope.scope_type === "private" ? value.privateMessages : value.messages);
+  const surface=useMemo(() => deriveComputerSurface({status,messages,availability:state}),[status,messages,state]);
+  const scopeKey=scope ? `${scope.scope_type}:${scope.scope_id}` : "";
+  const [selection,setSelection]=useState<{scope:string;kind:Capability}|null>(null);
+  const [intent,setIntent]=useState<{scope:string;request:number;pending:boolean}|null>(null);
+  const sequence=useRef(0);
+  const opener=useRef<HTMLElement|null>(null);
+  const computerCloseIcon = useRef<HTMLSpanElement|null>(null);
+  const intentCurrent=intent?.scope === scopeKey;
+  const pending=Boolean(intentCurrent && intent?.pending);
+  const computerActive=Boolean(scope && (surface.visible || pending || state.loading && (latestComputerStep(status) || status?.computer)));
+  const privateScope=scope?.scope_type === "private";
+  const selected=selection?.scope === scopeKey ? selection.kind : null;
+  const visible=selected === "computer" ? computerActive ? selected : null : selected === "skills" ? scope ? selected : null : privateScope ? selected : null;
+  const mode:ComputerMode|null=pending ? surface.mode || "browser" : surface.mode;
+  const screenSurface=useMemo(() => {
+    const visibleSurface=pending ? {...surface,visible:true,mode} : surface;
+    const presentFailed = ["failed", "error", "cancelled"].includes(String(visibleSurface.present?.status || "").trim().toLowerCase());
+    if (mode === "present" && !state.presentAvailable && !presentFailed) return {...visibleSurface,present:{...visibleSurface.present,status:"running"}};
+    return visibleSurface;
+  },[surface,pending,mode,state.presentAvailable]);
   useEffect(() => {
-    setOpenPreview(null);
-    setBrowserIntentPending(false);
-    setBrowserControlRequestId(0);
-    setBrowserIntentScopeKey("");
-    browserControlSequence.current = 0;
-  }, [scopeKey]);
-
-  useEffect(() => {
-    if (openPreview === "computer" && !computerActive) {
-      setOpenPreview(null);
-      setBrowserControlRequestId(0);
-      setBrowserIntentScopeKey("");
-    }
-    if (openPreview === "tasks" && !tasksActive) setOpenPreview(null);
-    if (openPreview === "memory" && !memoryActive) setOpenPreview(null);
-    if (openPreview === "skills" && !skillsActive) setOpenPreview(null);
-  }, [computerActive, memoryActive, openPreview, skillsActive, tasksActive]);
-
-  useEffect(() => {
-    if (state.browserActive && browserIntentPending && browserIntentCurrent) {
-      setBrowserIntentPending(false);
-    }
-  }, [browserIntentCurrent, browserIntentPending, state.browserActive]);
-
-  useEffect(() => {
-    const wasOpen = previousOpen.current;
-    previousOpen.current = openPreview;
-    if (!wasOpen || openPreview) return;
-    const trigger = previewOpener.current;
-    previewOpener.current = null;
-    requestAnimationFrame(() => {
-      if (trigger?.isConnected) trigger.focus();
-      else document.querySelector<HTMLElement>(".composer textarea")?.focus();
-    });
-  }, [openPreview]);
-
-  useEffect(() => {
-    if (!mobilePreviewOpen) return;
-    const frame = requestAnimationFrame(() => closeButton.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [mobilePreviewOpen, visiblePreview]);
-
-  const closePreview = useCallback(() => {
-    setOpenPreview(null);
-    setBrowserIntentPending(false);
-    setBrowserControlRequestId(0);
-    setBrowserIntentScopeKey("");
-  }, []);
-
-  const openComputer = useCallback((mode?: ComputerMode, opener?: HTMLElement | null) => {
-    previewOpener.current = opener || null;
-    setOpenPreview("computer");
-    if (mode !== "browser") {
-      setBrowserIntentPending(false);
-      setBrowserControlRequestId(0);
-      setBrowserIntentScopeKey("");
-    }
-    void mode;
-  }, []);
-
-  const openBrowserAssist = useCallback((opener?: HTMLElement | null) => {
-    previewOpener.current = opener || null;
-    const requestId = ++browserControlSequence.current;
-    setBrowserIntentPending(true);
-    setBrowserIntentScopeKey(scopeKey);
-    setOpenPreview("computer");
-    setBrowserControlRequestId(requestId);
-  }, [scopeKey]);
-
-  const togglePreview = useCallback((kind: SidePanelKind, opener: HTMLElement) => {
-    previewOpener.current = opener;
-    setOpenPreview((current) => current === kind ? null : kind);
-    setBrowserIntentPending(false);
-    setBrowserControlRequestId(0);
-    setBrowserIntentScopeKey("");
-  }, []);
-
-  useEffect(() => {
-    if (!openPreview) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      closePreview();
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [closePreview, openPreview]);
-
-  const drawerTitle = visiblePreview === "memory"
-    ? t("memory.title")
-    : visiblePreview === "skills"
-      ? t("skills.title")
-    : visiblePreview === "tasks"
-      ? t("scheduledTasks.title")
-      : t("computer.title");
-  const drawerDescription = visiblePreview === "memory"
-    ? t("memory.description")
-    : visiblePreview === "skills"
-      ? t("skills.description")
-    : visiblePreview === "tasks"
-      ? t("scheduledTasks.description")
-      : t("computer.description");
-  const drawerIcon = visiblePreview === "memory"
-    ? "library"
-    : visiblePreview === "skills"
-      ? "sparkles"
-    : visiblePreview === "tasks"
-      ? "calendar"
-      : "computer";
-  const drawer = useMemo(() => {
-    if (!scope || !visiblePreview) return null;
-    if (visiblePreview === "memory") {
-      return (
-        <Suspense
-          fallback={(
-            <div className="memory-loading" role="status">
-              <Spinner size={20} />
-              <span>{t("memory.loading")}</span>
-            </div>
-          )}
-        >
-          <MemoryPanel key={scopeKey} />
-        </Suspense>
-      );
-    }
-    if (visiblePreview === "skills") {
-      return (
-        <Suspense
-          fallback={(
-            <div className="skills-loading" role="status">
-              <Spinner size={20} />
-              <span>{t("skills.loading")}</span>
-            </div>
-          )}
-        >
-          <SkillsPanel
-            key={scopeKey}
-            scope={scope}
-            canManage={canManageSkills}
-          />
-        </Suspense>
-      );
-    }
-    if (visiblePreview === "tasks") {
-      return (
-        <Suspense
-          fallback={(
-            <div className="schedule-panel__loading" role="status">
-              <Spinner size={20} />
-              <span>{t("scheduledTasks.loading")}</span>
-            </div>
-          )}
-        >
-          <ScheduledTasksPanel />
-        </Suspense>
-      );
-    }
-    return (
-      <ComputerScreen
-        scope={scope}
-        surface={screenSurface}
-        availabilityError={state.error}
-        onRetryAvailability={refresh}
-        latestTerminalStep={latestTerminal}
-        browserControlRequestId={currentBrowserControlRequestId || undefined}
-      />
-    );
-  }, [
-    canManageSkills,
-    computerSurface,
-    screenSurface,
-    currentBrowserControlRequestId,
-    latestTerminal,
-    refresh,
-    scope,
-    scopeKey,
-    state.error,
-    t,
-    visiblePreview,
-  ]);
-
-  const previewContext = useMemo(() => ({
-    scope,
-    browserDrawerOpen: visiblePreview === "computer" && computerMode === "browser",
-    computerDrawerOpen: visiblePreview === "computer",
-    computerMode,
-    computerSurface,
-    openComputer,
-    openBrowserAssist,
-  }), [
-    computerMode,
-    computerSurface,
-    openBrowserAssist,
-    openComputer,
-    scope,
-    visiblePreview,
-  ]);
-
-  return (
-    <div className={cx("chat-workspace", visiblePreview && "has-preview")}>
-      <ChatPreviewContext.Provider value={previewContext}>
-        <div
-          className="chat"
-          inert={mobilePreviewOpen}
-          aria-hidden={mobilePreviewOpen || undefined}
-        >
-          {children}
-        </div>
-      </ChatPreviewContext.Provider>
-      {hasPreviews ? (
-        <nav
-          className="chat-preview__rail"
-          aria-label={t("preview.sidebarLabel")}
-          inert={mobilePreviewOpen}
-          aria-hidden={mobilePreviewOpen || undefined}
-        >
-          {memoryActive ? (
-            <Tooltip title={t("memory.open")} placement="left">
-              <Button
-                ref={memoryButton}
-                className={cx("chat-preview__toggle", visiblePreview === "memory" && "is-active")}
-                type="text"
-                shape="circle"
-                aria-label={t("memory.open")}
-                aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "memory"}
-                icon={<Icon name="library" size={19} />}
-                onClick={(event) => togglePreview("memory", event.currentTarget)}
-              />
-            </Tooltip>
-          ) : null}
-          {skillsActive ? (
-            <Tooltip title={t("skills.open")} placement="left">
-              <Button
-                ref={skillsButton}
-                className={cx("chat-preview__toggle", visiblePreview === "skills" && "is-active")}
-                type="text"
-                shape="circle"
-                aria-label={t("skills.open")}
-                aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "skills"}
-                icon={<Icon name="sparkles" size={19} />}
-                onClick={(event) => togglePreview("skills", event.currentTarget)}
-              />
-            </Tooltip>
-          ) : null}
-          {tasksActive ? (
-            <Tooltip title={t("scheduledTasks.open")} placement="left">
-              <Button
-                ref={tasksButton}
-                className={cx("chat-preview__toggle", visiblePreview === "tasks" && "is-active")}
-                type="text"
-                shape="circle"
-                aria-label={t("scheduledTasks.open")}
-                aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "tasks"}
-                icon={<Icon name="calendar" size={19} />}
-                onClick={(event) => togglePreview("tasks", event.currentTarget)}
-              />
-            </Tooltip>
-          ) : null}
-          {computerActive ? (
-            <Tooltip title={t("computer.show")} placement="left">
-              <Button
-                ref={computerButton}
-                className={cx("chat-preview__toggle", visiblePreview === "computer" && "is-active")}
-                type="text"
-                shape="circle"
-                aria-label={t("computer.show")}
-                aria-controls="chat-side-panel"
-                aria-expanded={visiblePreview === "computer"}
-                icon={(
-                  <Badge className="chat-preview__live-badge" classNames={{ indicator: "chat-preview__live-indicator" }} dot={computerSurface.live || state.browserActive || state.runningTerminalCount > 0}>
-                    <Icon name="computer" size={19} />
-                  </Badge>
-                )}
-                onClick={(event) => togglePreview("computer", event.currentTarget)}
-              />
-            </Tooltip>
-          ) : null}
-        </nav>
-      ) : null}
-      {visiblePreview && drawer ? (
-        <aside
-          className="chat-preview__drawer"
-          id="chat-side-panel"
-          aria-label={drawerTitle}
-        >
-          <header className="chat-preview__header">
-            <div className="chat-preview__heading">
-              <span className="chat-preview__heading-icon"><Icon name={drawerIcon} size={18} /></span>
-              <span>
-                <strong>{drawerTitle}</strong>
-                <small>{drawerDescription}</small>
-              </span>
-            </div>
-            <Tooltip title={t("preview.close")}>
-              <Button
-                ref={closeButton}
-                className="chat-preview__close"
-                type="text"
-                shape="circle"
-                aria-label={t("preview.close")}
-                icon={<Icon name="close" />}
-                onClick={closePreview}
-              />
-            </Tooltip>
-          </header>
-          <div className={cx(
-            "chat-preview__body",
-            visiblePreview === "computer" && "chat-preview__body--computer",
-          )}>{drawer}</div>
-        </aside>
-      ) : null}
+    if (!pending) return;
+    const request = intent?.request;
+    const timer = window.setTimeout(() => {
+      setIntent(current => current?.scope === scopeKey && current.request === request ? null : current);
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [pending, intent?.request, scopeKey]);
+  const restoreFocus=useCallback(() => {
+    const target=opener.current;opener.current=null;
+    requestAnimationFrame(() => { if(target?.isConnected) target.focus(); else document.querySelector<HTMLElement>("[data-composer-input]")?.focus(); });
+  },[]);
+  const close=useCallback(() => {setSelection(null);setIntent(null);restoreFocus();},[restoreFocus]);
+  useEffect(() => {setSelection(null);setIntent(null);sequence.current=0;},[scopeKey]);
+  useEffect(() => {if (intentCurrent && state.browserActive) setIntent(value => value ? {...value,pending:false} : null);},[intentCurrent,state.browserActive]);
+  useEffect(() => {if (selected && !visible) close();},[selected,visible,close]);
+  const open=useCallback((kind:Capability,trigger?:HTMLElement|null) => {opener.current=trigger || null;setSelection({scope:scopeKey,kind});setIntent(null);},[scopeKey]);
+  const openComputer=useCallback((_mode?:ComputerMode,trigger?:HTMLElement|null) => open("computer",trigger),[open]);
+  const openBrowserAssist=useCallback((trigger?:HTMLElement|null) => {opener.current=trigger || null;setSelection({scope:scopeKey,kind:"computer"});setIntent({scope:scopeKey,request:++sequence.current,pending:true});},[scopeKey]);
+  const capabilityActions = useMemo(() => scope ? (
+    <>
+      {computerActive ? <Button aria-label={t("computer.show")} aria-expanded={visible === "computer"} onClick={event => openComputer(undefined,event.currentTarget)}>{t("computer.title")}</Button> : null}
+      {privateScope ? <Button aria-label={t("memory.open")} aria-expanded={visible === "memory"} onClick={event => open("memory",event.currentTarget)}>{t("memory.title")}</Button> : null}
+      <Button aria-label={t("skills.open")} aria-expanded={visible === "skills"} onClick={event => open("skills",event.currentTarget)}>{t("skills.title")}</Button>
+      {privateScope ? <Button aria-label={t("scheduledTasks.open")} aria-expanded={visible === "tasks"} onClick={event => open("tasks",event.currentTarget)}>{t("scheduledTasks.title")}</Button> : null}
+    </>
+  ) : null, [scope, t, computerActive, visible, openComputer, privateScope, open]);
+  const context=useMemo(() => ({scope,capabilityActions,browserDrawerOpen:visible === "computer" && mode === "browser",computerDrawerOpen:visible === "computer",computerMode:mode,computerSurface:screenSurface,openComputer,openBrowserAssist}),[scope,capabilityActions,visible,mode,screenSurface,openComputer,openBrowserAssist]);
+  const title=visible === "memory" ? t("memory.title") : visible === "skills" ? t("skills.title") : visible === "tasks" ? t("scheduledTasks.title") : t("computer.title");
+  return <ChatPreviewContext.Provider value={context}>
+    <div className="wf-chat-capabilities">
+      <div className="wf-chat-capability-content">{children}</div>
     </div>
-  );
+    <Modal open={visible === "computer"} title={t("computer.title")} aria-label={t("computer.title")} onCancel={close} footer={null} destroyOnHidden getContainer={container} width="min(1120px, calc(100vw - 32px))" centered className="wf-computer-modal" closable={{"aria-label":t("preview.close")}} closeIcon={<span ref={computerCloseIcon} aria-hidden="true">×</span>} afterOpenChange={opened => { if (opened) computerCloseIcon.current?.closest<HTMLButtonElement>("button")?.focus(); }} styles={{body:{height:"min(760px, calc(100dvh - 160px))",minHeight:0,overflow:"hidden"}}}>
+      {visible === "computer" && scope ? <ComputerScreen key={scopeKey} scope={scope} surface={screenSurface} availabilityError={state.error} onRetryAvailability={refresh} latestTerminalStep={latestComputerStep(status)} browserControlRequestId={intentCurrent ? intent?.request : undefined} /> : null}
+    </Modal>
+    <OverlayPanel open={Boolean(visible && visible !== "computer")} onClose={close} title={title} size="wide" closeLabel={t("preview.close")}>
+      <Suspense fallback={<LoadingState label={t("computer.loading")} />}>
+        {visible === "memory" ? <MemoryPanel key={scopeKey} /> : visible === "skills" && scope ? <SkillsPanel key={scopeKey} scope={scope} canManage={canManageSkills} /> : visible === "tasks" ? <ScheduledTasksPanel key={scopeKey} /> : null}
+      </Suspense>
+    </OverlayPanel>
+  </ChatPreviewContext.Provider>;
 }

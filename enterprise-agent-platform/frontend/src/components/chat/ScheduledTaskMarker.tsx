@@ -2,7 +2,7 @@ import { intlLocale, useI18n } from "../../i18n";
 import { useStore } from "../../store/useStore";
 import type { Message, ScheduledTaskMessageMarker } from "../../types";
 import { formatScheduleDate } from "../scheduled-tasks/scheduleFormat";
-import { Icon } from "../common/Icon";
+import { MessageEntry, StatusMark } from "../ui/fieldwork";
 
 export function ScheduledTaskMarker({
   marker,
@@ -20,22 +20,8 @@ export function ScheduledTaskMarker({
   );
   const name = marker.name || t("scheduledTasks.title");
 
-  return (
-    <article
-      className="scheduled-message-marker"
-      role="note"
-      aria-label={t("scheduledTasks.markerLabel", { name, time })}
-      data-schedule-id={String(marker.schedule_id)}
-      data-schedule-run-id={String(marker.schedule_run_id)}
-    >
-      <span className="scheduled-message-marker__line" aria-hidden="true" />
-      <span className="scheduled-message-marker__content">
-        <Icon name="calendar" size={13} />
-        <span>{t("scheduledTasks.marker")}</span>
-        <strong>{name}</strong>
-        {time ? <time dateTime={marker.scheduled_for}>{time}</time> : null}
-      </span>
-      <span className="scheduled-message-marker__line" aria-hidden="true" />
-    </article>
-  );
+  return <MessageEntry kind="system"
+ status={<StatusMark>{t("scheduledTasks.marker")}</StatusMark>} timestamp={time ? <time dateTime={marker.scheduled_for}>{time}</time> : undefined}>
+ <div role="note" aria-label={t("scheduledTasks.markerLabel",{name,time})} data-schedule-id={String(marker.schedule_id)} data-schedule-run-id={String(marker.schedule_run_id)}><strong>{name}</strong></div>
+ </MessageEntry>;
 }

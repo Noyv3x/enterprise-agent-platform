@@ -1,219 +1,120 @@
-/* <TokenUsageMonitoring/> — the token-usage dashboard: overview card with the
-   days filter + refresh, 8 metric tiles, the 7-day SVG curve, and 4 usage tables
-   (by account, detail, by scope, by model). */
-
-import { Button, Form, Select } from "antd";
-import { changeTokenUsageDays, refreshTokenUsage } from "../../../data/adminActions";
+import { Segmented, Space, Table, Tabs } from "antd";
+import type { ColumnsType } from "antd/es/table";
+import { changeTokenUsageDays } from "../../../data/adminActions";
+import { useI18n } from "../../../i18n";
+import { useStore, useStoreHandle } from "../../../store/useStore";
+import type { TokenAccountRow, TokenDailyUsageRow, TokenDetailRow, TokenModelRow, TokenScopeRow } from "../../../types";
 import { formatNumber, formatTimestamp } from "../../../utils/format";
 import { oauthProviderLabel } from "../../../utils/oauth";
-import { useStore, useStoreHandle } from "../../../store/useStore";
-import type {
-  TokenAccountRow,
-  TokenDetailRow,
-  TokenModelRow,
-  TokenScopeRow,
-} from "../../../types";
-import { CardHead } from "../../common/CardHead";
-import { Icon } from "../../common/Icon";
-import { UsageMetricTile } from "../../common/UsageMetricTile";
+import { DataRegion, EmptyState, FactGrid, Section } from "../../ui/fieldwork";
 import { AdminCard } from "../AdminCard";
-import { TokenUsageCurve } from "./TokenUsageCurve";
-import { UsageTable } from "./UsageTable";
-import { useI18n } from "../../../i18n";
 
 const DAY_RANGES = [7, 30, 90, 365];
+type UsageCounts = Pick<TokenDailyUsageRow, "event_count" | "input_tokens" | "output_tokens" | "total_tokens">;
 
 export function TokenUsageMonitoring() {
   const { t } = useI18n();
   const store = useStoreHandle();
   const report = useStore((state) => state.tokenUsage);
-  const tokenUsageDays = useStore((state) => state.tokenUsageDays);
-  const changingRange = useStore((state) =>
-    state.pendingOperations.includes("admin:tokens:range"),
+  const days = useStore((state) => state.tokenUsageDays);
+  const changingRange = useStore((state) => state.pendingOperations.includes("admin:tokens:range"));
+  const refreshing = useStore((state) => state.pendingOperations.includes("admin:tokens:refresh"));
+  const providers = useStore((state) => state.oauthProviders?.providers);
+  const unknown = t("admin.common.unknown");
+  const number = (value: number | undefined) => value === undefined ? unknown : formatNumber(value);
+  const timestamp = (value: number | string | undefined) => value === undefined ? unknown : formatTimestamp(value) || String(value);
+  const summary = report?.summary;
+  const counts = <T extends UsageCounts,>(): ColumnsType<T> => [
+    { title: t("admin.tokens.header.calls"), key: "event_count", align: "right", render: (_, row) => number(row.event_count) },
+    { title: t("admin.tokens.header.input"), key: "input_tokens", align: "right", render: (_, row) => number(row.input_tokens) },
+    { title: t("admin.tokens.header.output"), key: "output_tokens", align: "right", render: (_, row) => number(row.output_tokens) },
+    { title: t("admin.tokens.header.total"), key: "total_tokens", align: "right", render: (_, row) => number(row.total_tokens) },
+  ];
+  const account = (row: TokenAccountRow | TokenDetailRow) => (
+    <Space direction="vertical" size={0}>
+      <span>{row.display_name || row.username || unknown}</span>
+      {row.username && <span>@{row.username}</span>}
+      {row.user_id !== undefined && <span>{t("admin.tokens.userId", { id: row.user_id })}</span>}
+    </Space>
   );
-  const refreshing = useStore((state) =>
-    state.pendingOperations.includes("admin:tokens:refresh"),
+  const scope = (row: TokenScopeRow | TokenDetailRow) => {
+    const identity = row.scope_name || row.display_name || row.username || row.scope_id || unknown;
+    const label = row.scope_type === "private"
+      ? t("admin.tokens.privateScope", { name: identity })
+      : row.scope_type === "channel"
+        ? row.scope_name || t("admin.tokens.channelScope", { id: row.scope_id ?? unknown })
+        : String(identity);
+    return <Space direction="vertical" size={0}>
+      <span>{label}</span>
+      <span>{row.scope_type || unknown}{row.scope_id !== undefined ? ` · ${row.scope_id}` : ""}</span>
+      {row.display_name && row.display_name !== row.scope_name && <span>{row.display_name}</span>}
+      {row.username && <span>@{row.username}</span>}
+    </Space>;
+  };
+  const model = (row: TokenModelRow) => <Space direction="vertical" size={0}>
+    <span>{oauthProviderLabel(row.provider || "", providers) || unknown}</span>
+    {row.provider && oauthProviderLabel(row.provider, providers) !== row.provider && <span>{row.provider}</span>}
+    <span>{row.model || unknown}</span>
+  </Space>;
+  const dailyColumns: ColumnsType<TokenDailyUsageRow> = [
+    { title: t("admin.tokens.daily.date"), dataIndex: "date", render: (value: string | undefined) => value || unknown },
+    { title: t("admin.tokens.daily.label"), dataIndex: "label", render: (value: string | undefined) => value || unknown },
+    { title: t("admin.tokens.daily.start"), dataIndex: "start_at", render: timestamp },
+    ...counts<TokenDailyUsageRow>(),
+  ];
+  const accountColumns: ColumnsType<TokenAccountRow> = [
+    { title: t("admin.tokens.header.account"), key: "account", render: (_, row) => account(row) },
+    ...counts<TokenAccountRow>(),
+    { title: t("admin.tokens.header.lastUsed"), dataIndex: "last_used_at", render: timestamp },
+  ];
+  const scopeColumns: ColumnsType<TokenScopeRow> = [
+    { title: t("admin.tokens.header.scope"), key: "scope", render: (_, row) => scope(row) },
+    ...counts<TokenScopeRow>(),
+  ];
+  const modelColumns: ColumnsType<TokenModelRow> = [
+    { title: t("admin.tokens.header.providerModel"), key: "model", render: (_, row) => model(row) },
+    ...counts<TokenModelRow>(),
+  ];
+  const detailColumns: ColumnsType<TokenDetailRow> = [
+    { title: t("admin.tokens.header.account"), key: "account", render: (_, row) => account(row) },
+    { title: t("admin.tokens.header.scope"), key: "scope", render: (_, row) => scope(row) },
+    { title: t("admin.tokens.header.providerModel"), key: "model", render: (_, row) => model(row) },
+    ...counts<TokenDetailRow>(),
+  ];
+  const table = <T extends object,>(rows: T[] | undefined, columns: ColumnsType<T>, title: string, empty: string) => (
+    <DataRegion state={rows?.length ? "ready" : "empty"} loadingLabel={t("admin.common.refresh")} empty={<EmptyState title={empty} compact />}>
+      <Table<T> aria-label={title} columns={columns} dataSource={rows} rowKey={(_, index) => String(index)} pagination={false} scroll={{ x: "max-content" }} />
+    </DataRegion>
   );
-  const oauthProviders = useStore((state) => state.oauthProviders);
-
-  const summary = report?.summary || {};
-  const today = report?.today || {};
-  const last7 = report?.last_7_days || {};
-  const dailyUsage = Array.isArray(report?.daily_usage) ? report.daily_usage : [];
-  const accountRows = report?.by_account || [];
-  const detailRows = report?.details || [];
-  const scopeRows = report?.by_scope || [];
-  const modelRows = report?.by_model || [];
-  const providers = oauthProviders?.providers;
-
-  const daysValue = String(tokenUsageDays || report?.window?.days || 30);
-
-  const userUsageCell = (row: TokenAccountRow | TokenDetailRow) => {
-    const name = row.display_name || row.username || `u${row.user_id || ""}`;
-    return (
-      <span className="usage-user">
-        <strong>{name}</strong>
-        <small>{row.username ? `@${row.username}` : t("admin.tokens.userId", { id: row.user_id || "-" })}</small>
-      </span>
-    );
-  };
-
-  const tokenScopeLabel = (row: TokenDetailRow | TokenScopeRow): string => {
-    if (row.scope_type === "private") {
-      return t("admin.tokens.privateScope", { name: row.scope_name || row.display_name || row.username || row.scope_id || "-" });
-    }
-    if (row.scope_type === "channel") {
-      return row.scope_name || t("admin.tokens.channelScope", { id: row.scope_id || "-" });
-    }
-    return String(row.scope_name || row.scope_id || "-");
-  };
-
-  const tokenModelLabel = (row: TokenDetailRow | TokenModelRow): string => {
-    const providerId = row.provider || "";
-    const provider = providerId === "openai-codex" ? t("admin.oauth.provider.codex") : providerId === "xai-oauth" ? t("admin.oauth.provider.grok") : oauthProviderLabel(providerId, providers);
-    const model = row.model || t("admin.common.unknown");
-    return provider ? `${provider} / ${model}` : model;
-  };
-
-  return (
-    <div className="token-usage">
-      <AdminCard className="token-usage__overview">
-        <CardHead
-          title={t("admin.tokens.overview.title")}
-          icon="barChart"
-          desc={
-            report?.window
-              ? t("admin.tokens.range", { since: formatTimestamp(report.window.since), until: formatTimestamp(report.window.until) })
-              : t("admin.tokens.noUsage")
-          }
-          extra={
-            <div className="token-usage__filters">
-              <Form.Item
-                className="eap-field"
-                label={t("admin.tokens.timeRange")}
-                htmlFor="token-usage-days"
-                style={{ marginBottom: 0 }}
-              >
-                <Select
-                  id="token-usage-days"
-                  value={daysValue}
-                  disabled={changingRange}
-                  loading={changingRange}
-                  aria-busy={changingRange || undefined}
-                  options={DAY_RANGES.map((value) => ({
-                    value: String(value),
-                    label: t("admin.tokens.days", { count: value }),
-                  }))}
-                  onChange={(value) =>
-                    void changeTokenUsageDays(store, Number(value) || 30)
-                  }
-                />
-              </Form.Item>
-              <Button
-                htmlType="button"
-                size="small"
-                loading={refreshing}
-                aria-label={t(refreshing ? "resource.refreshing" : "admin.common.refresh")}
-                onClick={() => void refreshTokenUsage(store)}
-                icon={<Icon name="refresh" size={14} />}
-              >
-                {t("admin.common.refresh")}
-              </Button>
-            </div>
-          }
-        />
-        <div className="metric-grid">
-          <UsageMetricTile label={t("admin.tokens.today")} value={today.total_tokens ?? 0} />
-          <UsageMetricTile label={t("admin.tokens.last7")} value={last7.total_tokens ?? 0} />
-          <UsageMetricTile label={t("admin.tokens.total")} value={summary.total_tokens ?? 0} />
-          <UsageMetricTile label={t("admin.tokens.input")} value={summary.input_tokens ?? 0} />
-          <UsageMetricTile label={t("admin.tokens.output")} value={summary.output_tokens ?? 0} />
-          <UsageMetricTile label={t("admin.tokens.agentCalls")} value={summary.event_count ?? 0} suffix={t("admin.tokens.callsSuffix", { count: summary.event_count ?? 0 })} />
-          <UsageMetricTile label={t("admin.tokens.accountsInvolved")} value={summary.account_count ?? 0} suffix={t("admin.tokens.accountsSuffix", { count: summary.account_count ?? 0 })} />
-          <UsageMetricTile
-            label={t("admin.tokens.channelPrivate")}
-            value={`${summary.channel_event_count || 0}/${summary.private_event_count || 0}`}
-            suffix={t("admin.tokens.callsSuffix", { count: (summary.channel_event_count || 0) + (summary.private_event_count || 0) })}
-          />
-        </div>
-        <TokenUsageCurve rows={dailyUsage} />
-      </AdminCard>
-
-      <UsageTable<TokenAccountRow>
-        title={t("admin.tokens.byAccount.title")}
-        desc={t("admin.tokens.byAccount.description")}
-        icon="users"
-        headers={[t("admin.tokens.header.account"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total"), t("admin.tokens.header.lastUsed")]}
-        rows={accountRows}
-        renderRow={(row) => (
-          <>
-            {userUsageCell(row)}
-            <span>{formatNumber(row.event_count)}</span>
-            <span>{formatNumber(row.input_tokens)}</span>
-            <span>{formatNumber(row.output_tokens)}</span>
-            <strong>{formatNumber(row.total_tokens)}</strong>
-            <span>{formatTimestamp(row.last_used_at) || "-"}</span>
-          </>
-        )}
-        emptyText={t("admin.tokens.byAccount.empty")}
-      />
-
-      <UsageTable<TokenDetailRow>
-        title={t("admin.tokens.details.title")}
-        desc={t("admin.tokens.details.description")}
-        icon="barChart"
-        headers={[t("admin.tokens.header.account"), t("admin.tokens.header.scope"), t("admin.tokens.header.providerModel"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
-        rows={detailRows}
-        renderRow={(row) => (
-          <>
-            {userUsageCell(row)}
-            <span>{tokenScopeLabel(row)}</span>
-            <span>{tokenModelLabel(row)}</span>
-            <span>{formatNumber(row.event_count)}</span>
-            <span>{formatNumber(row.input_tokens)}</span>
-            <span>{formatNumber(row.output_tokens)}</span>
-            <strong>{formatNumber(row.total_tokens)}</strong>
-          </>
-        )}
-        emptyText={t("admin.tokens.details.empty")}
-      />
-
-      <div className="token-usage__columns">
-        <UsageTable<TokenScopeRow>
-          title={t("admin.tokens.byScope.title")}
-          desc={t("admin.tokens.byScope.description")}
-          icon="message"
-          headers={[t("admin.tokens.header.scope"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
-          rows={scopeRows}
-          renderRow={(row) => (
-            <>
-              <span>{tokenScopeLabel(row)}</span>
-              <span>{formatNumber(row.event_count)}</span>
-              <span>{formatNumber(row.input_tokens)}</span>
-              <span>{formatNumber(row.output_tokens)}</span>
-              <strong>{formatNumber(row.total_tokens)}</strong>
-            </>
-          )}
-          emptyText={t("admin.tokens.byScope.empty")}
-        />
-        <UsageTable<TokenModelRow>
-          title={t("admin.tokens.byModel.title")}
-          desc={t("admin.tokens.byModel.description")}
-          icon="shield"
-          headers={[t("admin.tokens.header.providerModel"), t("admin.tokens.header.calls"), t("admin.tokens.header.input"), t("admin.tokens.header.output"), t("admin.tokens.header.total")]}
-          rows={modelRows}
-          renderRow={(row) => (
-            <>
-              <span>{tokenModelLabel(row)}</span>
-              <span>{formatNumber(row.event_count)}</span>
-              <span>{formatNumber(row.input_tokens)}</span>
-              <span>{formatNumber(row.output_tokens)}</span>
-              <strong>{formatNumber(row.total_tokens)}</strong>
-            </>
-          )}
-          emptyText={t("admin.tokens.byModel.empty")}
-        />
-      </div>
-    </div>
-  );
+  const groups = [
+    { key: "account", label: t("admin.tokens.byAccount.title"), children: <Section description={t("admin.tokens.byAccount.description")}>{table(report?.by_account, accountColumns, t("admin.tokens.byAccount.title"), t("admin.tokens.byAccount.empty"))}</Section> },
+    { key: "scope", label: t("admin.tokens.byScope.title"), children: <Section description={t("admin.tokens.byScope.description")}>{table(report?.by_scope, scopeColumns, t("admin.tokens.byScope.title"), t("admin.tokens.byScope.empty"))}</Section> },
+    { key: "model", label: t("admin.tokens.byModel.title"), children: <Section description={t("admin.tokens.byModel.description")}>{table(report?.by_model, modelColumns, t("admin.tokens.byModel.title"), t("admin.tokens.byModel.empty"))}</Section> },
+    { key: "details", label: t("admin.tokens.details.title"), children: <Section description={t("admin.tokens.details.description")}>{table(report?.details, detailColumns, t("admin.tokens.details.title"), t("admin.tokens.details.empty"))}</Section> },
+  ];
+  return <AdminCard>
+    <Section actions={<Space wrap>
+      <Segmented aria-label={t("admin.tokens.timeRange")} value={days || report?.window?.days || 30} options={DAY_RANGES.map((count) => ({ value: count, label: t("admin.tokens.days", { count }) }))} disabled={changingRange || refreshing} onChange={(value) => void changeTokenUsageDays(store, Number(value))} />
+    </Space>} description={report?.window ? <Space wrap>
+      <span>{t("admin.tokens.days", { count: report.window.days })}</span>
+      <span>{t("admin.tokens.range", { since: timestamp(report.window.since), until: timestamp(report.window.until) })}</span>
+    </Space> : undefined}>
+      {report ? <FactGrid columns={4} items={[
+        { key: "today", label: t("admin.tokens.today"), value: number(report.today?.total_tokens) },
+        { key: "last7", label: t("admin.tokens.last7"), value: number(report.last_7_days?.total_tokens) },
+        { key: "total", label: t("admin.tokens.total"), value: number(summary?.total_tokens) },
+        { key: "input", label: t("admin.tokens.input"), value: number(summary?.input_tokens) },
+        { key: "output", label: t("admin.tokens.output"), value: number(summary?.output_tokens) },
+        { key: "calls", label: t("admin.tokens.agentCalls"), value: number(summary?.event_count) },
+        { key: "accounts", label: t("admin.tokens.accountsInvolved"), value: number(summary?.account_count) },
+        { key: "scopes", label: t("admin.tokens.channelPrivate"), value: `${number(summary?.channel_event_count)} / ${number(summary?.private_event_count)}` },
+      ]} /> : <EmptyState title={t("admin.tokens.noUsage")} compact />}
+    </Section>
+    {report && <>
+      <Section title={t("admin.tokens.daily.title")}>
+        {table(report.daily_usage, dailyColumns, t("admin.tokens.daily.title"), t("admin.tokens.noUsage"))}
+      </Section>
+      <Tabs items={groups} />
+    </>}
+  </AdminCard>;
 }

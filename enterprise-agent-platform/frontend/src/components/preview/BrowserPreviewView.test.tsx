@@ -126,7 +126,7 @@ describe("BrowserPreviewView", () => {
 
     expect(screen.getByText("Loading browser view")).toBeVisible();
     expect(screen.queryByText("Browser is not running")).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Loading browser view").closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
   });
 
   it("shows the stopped state only after the preview endpoint reports idle", () => {

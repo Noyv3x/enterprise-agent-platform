@@ -30,7 +30,7 @@ describe("LANAccessSettings", () => {
           trusted_ingress_cidrs: ["127.0.0.0/8"],
           lan_active: false,
         },
-        status: { state: "idle" },
+        status: { state: "idle", manager_generation: 1 },
       },
     });
     render(
@@ -46,7 +46,7 @@ describe("LANAccessSettings", () => {
         trusted_ingress_cidrs: ["127.0.0.0/8"],
         lan_active: true,
       },
-      status: { state: "idle" },
+      status: { state: "idle", manager_generation: 2 },
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -77,7 +77,7 @@ describe("LANAccessSettings", () => {
       type: "SET_AUTO_UPDATE_CONFIG",
       payload: {
         config: { lan_enabled: true, lan_active: false, lan_error: "LAN listener is unavailable" },
-        status: { state: "idle" },
+        status: { state: "idle", manager_generation: 1 },
       },
     });
     render(
@@ -87,5 +87,17 @@ describe("LANAccessSettings", () => {
     );
     expect(screen.getByText("Unavailable")).toBeInTheDocument();
     expect(screen.getByText(/primary gateway is still running/)).toBeInTheDocument();
+  });
+
+  it("disables LAN changes without a known Manager generation", () => {
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({
+      type: "SET_AUTO_UPDATE_CONFIG",
+      payload: { config: { lan_enabled: false, lan_active: false }, status: { state: "idle" } },
+    });
+    render(<StoreContext.Provider value={store}><I18nProvider><LANAccessSettings /></I18nProvider></StoreContext.Provider>);
+    expect(screen.getByText("Manager unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Enable the separate LAN listener" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Save LAN settings" })).toBeDisabled();
   });
 });

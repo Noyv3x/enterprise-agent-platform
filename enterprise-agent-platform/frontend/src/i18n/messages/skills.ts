@@ -2,7 +2,10 @@ import { defineMessages } from "../types";
 
 export const skillMessages = defineMessages({
   "skills.open": { "zh-CN": "打开 Skill 管理", en: "Open Skill manager", "zh-TW": "開啟 Skill 管理" },
-  "skills.title": { "zh-CN": "Skill 管理", en: "Skills", "zh-TW": "Skill 管理" },
+  "skills.title": { "zh-CN": "技能", en: "Skills", "zh-TW": "技能" },
+  "skills.source": { "zh-CN": "来源", en: "Source", "zh-TW": "來源" },
+  "skills.source.user": { "zh-CN": "用户技能", en: "User skill", "zh-TW": "使用者技能" },
+  "skills.source.bundled": { "zh-CN": "预设技能", en: "Preset skill", "zh-TW": "預設技能" },
   "skills.description": {
     "zh-CN": "管理当前 Agent 可按需加载的程序性指导。",
     en: "Manage procedural guidance this Agent can load on demand.",

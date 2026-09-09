@@ -1,11 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Badge, Button, Tabs, Tag } from "antd";
+import { Button, Tabs } from "antd";
 import { useI18n, intlLocale, type MessageKey } from "../../i18n";
 import type { ActivityStep, AgentPreviewScope, TerminalPreviewProcess } from "../../types";
-import { EmptyState } from "../common/EmptyState";
-import { Icon } from "../common/Icon";
-import { InlineAlert } from "../common/InlineAlert";
-import { Skeleton } from "../common/Skeleton";
+import { ComputerOutput, EmptyState, LoadingState, Notice, StatusMark } from "../ui/fieldwork";
 import { PreviewStatus } from "./PreviewStatus";
 import { useTerminalPreviews } from "./useTerminalPreviews";
 
@@ -180,11 +177,12 @@ function terminalStatusText(
   return `${status} · exit ${process.exit_code ?? "?"}`;
 }
 
-function terminalStatusColor(process: TerminalPreviewProcess): string {
-  if (process.status === "orphaned") return "hsl(38 92% 58%)";
-  if (process.status === "failed") return "hsl(4 72% 62%)";
-  if (process.status === "cancelled") return "hsl(220 8% 58%)";
-  return "hsl(145 46% 62%)";
+function terminalTone(process: TerminalPreviewProcess): "info" | "warning" | "danger" | "success" | "neutral" {
+  if (process.status === "orphaned") return "warning";
+  if (process.status === "failed") return "danger";
+  if (process.status === "running") return "info";
+  if (process.status === "completed") return "success";
+  return "neutral";
 }
 
 interface CompactTerminalPreviewProps {
@@ -192,42 +190,32 @@ interface CompactTerminalPreviewProps {
   fallbackStep?: ActivityStep | null;
 }
 
-/** Non-interactive terminal tail sized for the computer PiP. */
+/** A single passive consumer of the authoritative terminal tail. */
 export function CompactTerminalPreview({ scope, fallbackStep }: CompactTerminalPreviewProps) {
   const { t } = useI18n();
   const { state } = useTerminalPreviews(scope);
   const process = terminalDisplayProcesses(state.processes, fallbackStep)[0] || null;
-  if (!process) {
-    return (
-      <span
-        className="terminal-preview-compact__loading"
-        role="status"
-        aria-label={t("computer.loading")}
-      >
-        <Skeleton
-          className="computer-pip__skeleton"
-          width="100%"
-          height="100%"
-          label={t("computer.loading")}
-        />
-      </span>
-    );
-  }
-
   return (
-    <span className="terminal-preview-compact">
-      <span className="terminal-preview-compact__status">
-        <Badge color={terminalStatusColor(process)} />
-        <span>{terminalStatusText(process, t)}</span>
-      </span>
-      <span
-        className="terminal-preview-compact__output"
-        aria-label={t("terminalPreview.output")}
-      >
-        {compactTerminalTranscript(process)
-          || (terminalProcessRunning(process) ? t("terminalPreview.emptyOutput") : "")}
-      </span>
-    </span>
+    <div className="wf-terminal-compact">
+      {process ? (
+        <ComputerOutput
+          kind="terminal"
+          meta={<StatusMark tone={terminalTone(process)}>{terminalStatusText(process, t)}</StatusMark>}
+          truncated={process.truncated ? t("terminalPreview.truncated") : undefined}
+        >
+          <pre aria-label={t("terminalPreview.output")}>
+            {compactTerminalTranscript(process) || (terminalProcessRunning(process) ? t("terminalPreview.emptyOutput") : "")}
+          </pre>
+          {state.error ? <Notice tone="warning" title={state.error} /> : null}
+        </ComputerOutput>
+      ) : state.error ? (
+        <Notice tone="warning" title={state.error} />
+      ) : state.loading ? (
+        <div role="status" aria-label={t("computer.loading")}><LoadingState label={t("computer.loading")} /></div>
+      ) : (
+        <EmptyState compact title={t("terminalPreview.noTerminals")} />
+      )}
+    </div>
   );
 }
 
@@ -290,102 +278,55 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
   };
   const capturedAt = previewTime(process?.updated_at || state.capturedAt || state.checkedAt, intlLocale(locale));
   const idle = !state.loading && processes.length === 0;
-  const terminalPanel = process ? (
-    <article
-      className="terminal-preview__terminal"
-      aria-label={terminalTitle(
-        process,
-        t("terminalPreview.terminal", { number: Math.max(1, processes.indexOf(process) + 1) }),
-      )}
-    >
-      <header className="terminal-preview__head">
-        <div>
-          <strong>{terminalTitle(
-            process,
-            t("terminalPreview.terminal", { number: Math.max(1, processes.indexOf(process) + 1) }),
-          )}</strong>
-          <span className={`terminal-preview__state is-${process.status}`}>
-            {terminalStatusText(process, t)}
-          </span>
-        </div>
-        {process.truncated ? <Tag color="warning">{t("terminalPreview.truncated")}</Tag> : null}
-      </header>
-      {orphaned ? (
-        <InlineAlert className="terminal-preview__orphaned" variant="warning">
-          {t("terminalPreview.orphanedDetail")}
-        </InlineAlert>
-      ) : null}
-      <pre
-        ref={terminalRef}
-        className="terminal-preview__output"
-        aria-label={t("terminalPreview.output")}
-        tabIndex={0}
-        onScroll={(event) => {
-          const target = event.currentTarget;
-          followOutput.current = target.scrollHeight - target.scrollTop - target.clientHeight < 32;
-        }}
-      >{transcript}</pre>
-    </article>
-  ) : null;
-
   return (
-    <section className="terminal-preview" aria-label={t("terminalPreview.title")}>
-      <header className="preview-toolbar">
-        <div className="preview-toolbar__status">
-          <PreviewStatus connection={state.connection} idle={idle} />
-          <Tag className="preview-readonly" icon={<Icon name="shield" size={12} />}>
-            {t("preview.readOnly")}
-          </Tag>
-          <span className="preview-updated">{t("terminalPreview.count", { count: processes.length })}</span>
-          {capturedAt ? <span className="preview-updated">{t("preview.updatedAt", { time: capturedAt })}</span> : null}
-        </div>
-        <Button className="preview-toolbar__action" size="small" icon={<Icon name="refresh" size={14} />} onClick={refresh}>
-          <span>{t("preview.refresh")}</span>
-        </Button>
-      </header>
-      {state.error ? (
-        <InlineAlert variant="warning">{state.error || t("preview.loadFailed")}</InlineAlert>
+    <section className="wf-terminal-reader" aria-label={t("terminalPreview.title")}>
+      {processes.length > 1 ? (
+        <Tabs
+          activeKey={process?.id}
+          animated={false}
+          aria-label={t("terminalPreview.title")}
+          onChange={selectProcess}
+          items={processes.map((item, index) => ({
+            key: item.id,
+            label: terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 })),
+          }))}
+        />
       ) : null}
+      {state.error ? <Notice tone="warning" title={state.error} /> : null}
+      {orphaned ? <Notice tone="warning" title={t("terminalPreview.orphanedDetail")} /> : null}
       {process ? (
-        <div className="terminal-preview__workspace">
-          <Tabs
-            className="terminal-preview__tabs"
-            classNames={{
-              header: "terminal-preview__tabs-header",
-              item: "terminal-preview__tabs-item",
-              indicator: "terminal-preview__tabs-indicator",
-              body: "terminal-preview__tabs-body",
-              content: "terminal-preview__tabs-content",
-            }}
-            activeKey={process.id}
-            animated={false}
-            tabBarGutter={3}
-            aria-label={t("terminalPreview.title")}
-            onChange={selectProcess}
-            items={processes.map((item, index) => ({
-              key: item.id,
-              label: (
-                <span className="terminal-preview__tab-label">
-                  <Badge color={terminalStatusColor(item)} />
-                  <span className="terminal-preview__tab-title">{terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 }))}</span>
-                  {terminalProcessOrphaned(item) ? (
-                    <span className="terminal-preview__tab-state">{t("terminalPreview.orphanedShort")}</span>
-                  ) : null}
-                </span>
-              ),
-              children: item.id === process.id ? terminalPanel : null,
-            }))}
-          />
+        <div className="wf-terminal-canvas">
+          <ComputerOutput
+            kind="terminal"
+            meta={<StatusMark tone={terminalTone(process)}>{terminalStatusText(process, t)}</StatusMark>}
+            truncated={process.truncated ? t("terminalPreview.truncated") : undefined}
+          >
+            <pre
+              ref={terminalRef}
+              className="wf-terminal-transcript"
+              aria-label={t("terminalPreview.output")}
+              tabIndex={0}
+              onScroll={(event) => {
+                const target = event.currentTarget;
+                followOutput.current = target.scrollHeight - target.scrollTop - target.clientHeight < 32;
+              }}
+            >{transcript}</pre>
+          </ComputerOutput>
         </div>
-      ) : (
-        <div className="preview-empty-card preview-empty-card--terminal">
-          <EmptyState
-            icon="terminal"
-            title={state.loading ? t("preview.connecting") : t("terminalPreview.noTerminals")}
-            text={t("terminalPreview.noTerminalsDetail")}
-          />
+      ) : state.loading ? (
+        <LoadingState label={t("preview.connecting")} />
+      ) : !state.error ? (
+        <EmptyState title={t("terminalPreview.noTerminals")} description={t("terminalPreview.noTerminalsDetail")} />
+      ) : null}
+      <footer className="wf-terminal-controls">
+        <div className="wf-terminal-meta">
+          <StatusMark>{t("preview.readOnly")}</StatusMark>
+          <PreviewStatus connection={state.connection} idle={idle && !state.error} />
+          <span>{t("terminalPreview.count", { count: processes.length })}</span>
+          {capturedAt ? <span>{t("preview.updatedAt", { time: capturedAt })}</span> : null}
         </div>
-      )}
+        <Button onClick={refresh}>{t("preview.refresh")}</Button>
+      </footer>
     </section>
   );
 }

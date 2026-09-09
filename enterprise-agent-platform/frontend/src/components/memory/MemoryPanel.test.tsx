@@ -9,6 +9,8 @@ import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentMemory, AgentMemoryTarget } from "../../types";
 import { MemoryPanel } from "./MemoryPanel";
 
+const defaultMatchMedia = window.matchMedia;
+
 const mocks = vi.hoisted(() => ({
   loadAgentMemories: vi.fn(),
   createAgentMemory: vi.fn(),
@@ -74,6 +76,19 @@ describe("MemoryPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     localStorage.setItem(LOCALE_STORAGE_KEY, "en");
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: vi.fn((query: string) => ({
+        matches: query === "(prefers-reduced-motion: reduce)",
+        media: query,
+        onchange: null,
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(() => false),
+      })),
+    });
     mocks.loadAgentMemories.mockImplementation((target: AgentMemoryTarget) => Promise.resolve({
       memories: target === "user" ? [userMemory] : [agentMemory],
     }));
@@ -98,19 +113,23 @@ describe("MemoryPanel", () => {
 
   afterEach(() => {
     cleanup();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: defaultMatchMedia,
+    });
     localStorage.clear();
   });
 
-  it("explains chat clearing, searches the active target, and switches to About me", async () => {
+  it("searches the active target and switches to About me", async () => {
     const user = userEvent.setup();
     renderPanel();
 
-    expect(screen.getByText("Chat history and memory are separate")).toBeVisible();
-    expect(screen.getByText(/Clearing chat only hides the conversation/)).toBeVisible();
     expect(await screen.findByText(agentMemory.content)).toBeVisible();
     expect(mocks.loadAgentMemories).toHaveBeenCalledWith("memory", "", expect.any(AbortSignal));
     expect(screen.getByRole("searchbox", { name: "Search this category" })).toHaveAttribute("maxlength", "4000");
+    await user.click(screen.getByRole("button", { name: "Add a memory" }));
     expect(screen.getByRole("textbox", { name: "Add a memory" })).toHaveAttribute("maxlength", "4000");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
 
     await user.type(screen.getByRole("searchbox", { name: "Search this category" }), "frontend");
     await user.click(screen.getByRole("button", { name: "Search" }));
@@ -118,7 +137,7 @@ describe("MemoryPanel", () => {
       expect(mocks.loadAgentMemories).toHaveBeenLastCalledWith("memory", "frontend", expect.any(AbortSignal));
     });
 
-    await user.click(screen.getByRole("tab", { name: "About me" }));
+    await user.click(screen.getByText("About me"));
     expect(await screen.findByText(userMemory.content)).toBeVisible();
     expect(mocks.loadAgentMemories).toHaveBeenLastCalledWith("user", "", expect.any(AbortSignal));
   });
@@ -127,6 +146,7 @@ describe("MemoryPanel", () => {
     const user = userEvent.setup();
     renderPanel();
     await screen.findByText(agentMemory.content);
+    await user.click(screen.getByRole("button", { name: "Add a memory" }));
 
     const addContent = "Use semantic commit subjects.";
     fireEvent.change(screen.getByRole("textbox", { name: "Add a memory" }), { target: { value: addContent } });
@@ -153,6 +173,7 @@ describe("MemoryPanel", () => {
     mocks.createAgentMemory.mockRejectedValueOnce(new Error("Memory write failed"));
     renderPanel();
     await screen.findByText(agentMemory.content);
+    await user.click(screen.getByRole("button", { name: "Add a memory" }));
 
     await user.type(screen.getByRole("textbox", { name: "Add a memory" }), "Will fail");
     await user.click(screen.getByRole("button", { name: "Add" }));
@@ -169,13 +190,21 @@ describe("MemoryPanel", () => {
     mocks.createAgentMemory.mockReturnValueOnce(pendingCreate.promise);
     renderPanel();
     await screen.findByText(agentMemory.content);
+    await user.click(screen.getByRole("button", { name: "Add a memory" }));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Add a memory" })).toBeVisible());
 
-    await user.type(screen.getByRole("textbox", { name: "Add a memory" }), "Remember this later.");
+    await user.click(screen.getByRole("textbox", { name: "Add a memory" }));
+    await user.paste("Remember this later.");
     await user.click(screen.getByRole("button", { name: "Add" }));
     await waitFor(() => expect(mocks.createAgentMemory).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
 
-    await user.click(screen.getByRole("tab", { name: "About me" }));
+    await user.click(screen.getByText("About me"));
     expect(await screen.findByText(userMemory.content)).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Add a memory" }));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Add a memory" })).toBeVisible());
+    await user.click(screen.getByRole("textbox", { name: "Add a memory" }));
+    await user.paste("A newer profile draft");
 
     await act(async () => {
       pendingCreate.resolve({ changed: [{ action: "add", id: 11 }] });
@@ -188,7 +217,31 @@ describe("MemoryPanel", () => {
       expect(screen.getByText(userMemory.content)).toBeVisible();
       expect(screen.queryByText(agentMemory.content)).not.toBeInTheDocument();
     });
+    expect(screen.getByRole("textbox", { name: "Add a memory" })).toHaveValue("A newer profile draft");
   });
+  it("preserves a newly opened target editor when an earlier save completes", async () => {
+    const user = userEvent.setup();
+    const pendingUpdate = deferred<{ changed: Array<{ action: string; id: number }> }>();
+    mocks.updateAgentMemory.mockReturnValueOnce(pendingUpdate.promise);
+    renderPanel();
+    await screen.findByText(agentMemory.content);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Memory content" }), { target: { value: "Earlier edit" } });
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByText("About me"));
+    await screen.findByText(userMemory.content);
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Memory content" }), { target: { value: "New profile editor" } });
+    await act(async () => {
+      pendingUpdate.resolve({ changed: [{ action: "replace", id: agentMemory.id }] });
+      await pendingUpdate.promise;
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("textbox", { name: "Memory content" })).toHaveValue("New profile editor");
+    });
+  });
+
 
   it("closes a delete dialog immediately, prevents duplicate submission, and shows failure", async () => {
     const user = userEvent.setup();
@@ -265,6 +318,7 @@ describe("MemoryPanel", () => {
       expect(await screen.findByText("Excluded from recall")).toBeVisible();
       expect(screen.getByText(/Agent will not read it in conversations/)).toBeVisible();
       await user.click(screen.getByRole("button", { name: "Edit" }));
+      await waitFor(() => expect(screen.getByRole("dialog", { name: "Memory content" })).toBeVisible());
       const editor = screen.getByRole("textbox", { name: "Memory content" });
       await user.clear(editor);
       await user.type(editor, "Safe replacement memory.");

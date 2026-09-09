@@ -1,89 +1,41 @@
-/* <AdminPanel/> — the top-level admin view. Permission-gated by isAdmin, then pager + active page
-   header + content. ContentRouter renders this at the admin placeholder. */
-
 import { useEffect, useState } from "react";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useResourceState } from "../../hooks/useResourceState";
-import { hasAdminPageData, ensureAdminPageResource, refreshAdminPageResource } from "../../data/adminResources";
+import { ensureAdminPageResource, hasAdminPageData, refreshAdminPageResource } from "../../data/adminResources";
+import { refreshTokenUsage } from "../../data/adminActions";
 import { resourceKeys } from "../../data/resourceState";
 import { activeAdminPage } from "../../store/selectors";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import { cx } from "../../lib/cx";
-import { EmptyState } from "../common/EmptyState";
+import { useI18n } from "../../i18n";
+import { EmptyState, PageLayout } from "../ui/fieldwork";
 import { ResourceStatusView } from "../common/ResourceStatusView";
-import { AdminPageContent } from "./AdminPageContent";
 import { AdminPageHeader } from "./AdminPageHeader";
 import { AdminPager } from "./AdminPager";
-import { useI18n } from "../../i18n";
+import { AdminPageContent } from "./AdminPageContent";
 import "./admin.css";
 
 export function AdminPanel() {
   const { t } = useI18n();
   const { isAdmin } = usePermissions();
-  // activeAdminPage() returns the same object reference from ADMIN_PAGES while the
-  // id is unchanged, so the selector is Object.is-stable across renders.
-  const page = useStore(activeAdminPage);
   const store = useStoreHandle();
-  const dataPresent = useStore((state) => hasAdminPageData(state, page.id));
+  const page = useStore(activeAdminPage);
+  const hasData = useStore((state) => hasAdminPageData(state, page.id));
   const resourceKey = resourceKeys.admin(page.id);
   const resource = useResourceState(resourceKey);
-  const mutationPending = useStore((state) =>
-    state.pendingOperations.some((key) => key.startsWith("admin:")),
-  );
-  const [accountCreateOpen, setAccountCreateOpen] = useState(false);
-
-  useEffect(() => {
-    if (isAdmin) void ensureAdminPageResource(store, page.id);
-  }, [isAdmin, page.id, store]);
-
-  useEffect(() => {
-    if (page.id !== "accounts") setAccountCreateOpen(false);
-  }, [page.id]);
-
-  if (!isAdmin) {
-    return (
-      <EmptyState
-        icon="shield"
-        title={t("admin.access.title")}
-        text={t("admin.access.description")}
-      />
-    );
-  }
-
-  return (
-    <div className="panel eap-admin-shell">
-      <div className="eap-admin-layout">
-        <AdminPager activeId={page.id} />
-        <section
-          className={cx("eap-admin-page", `eap-admin-page--${page.id}`)}
-          aria-labelledby={`admin-page-${page.id}-title`}
-        >
-          <AdminPageHeader
-            page={page}
-            refreshing={resource.status === "loading"}
-            onRefresh={() => void refreshAdminPageResource(store, page.id)}
-            refreshDisabled={mutationPending}
-            onCreateAccount={page.id === "accounts" ? () => setAccountCreateOpen(true) : undefined}
-          />
-          <div
-            className="eap-admin-page__content"
-            inert={resource.status === "loading" && dataPresent}
-            aria-busy={resource.status === "loading" || mutationPending}
-          >
-            <ResourceStatusView
-              resourceKey={resourceKey}
-              hasData={dataPresent || resource.updatedAt !== null}
-              onRetry={() => void refreshAdminPageResource(store, page.id)}
-            >
-              <AdminPageContent
-                pageId={page.id}
-                accountCreateOpen={accountCreateOpen}
-                onCloseAccountCreate={() => setAccountCreateOpen(false)}
-              />
-            </ResourceStatusView>
-          </div>
-        </section>
+  const mutationPending = useStore((state) => state.pendingOperations.some((key) => key.startsWith("admin:")));
+  const usageRefreshing = useStore((state) => state.pendingOperations.includes("admin:tokens:refresh"));
+  const [createOpen, setCreateOpen] = useState(false);
+  useEffect(() => { if (isAdmin) void ensureAdminPageResource(store, page.id); }, [isAdmin, page.id, store]);
+  useEffect(() => { if (page.id !== "accounts") setCreateOpen(false); }, [page.id]);
+  if (!isAdmin) return <EmptyState title={t("admin.access.title")} description={t("admin.access.description")} />;
+  const refresh = () => { void (page.id === "tokens" ? refreshTokenUsage(store) : refreshAdminPageResource(store, page.id)); };
+  const refreshing = resource.status === "loading" || usageRefreshing;
+  return <PageLayout width="wide" header={<AdminPageHeader page={page} refreshing={refreshing} onRefresh={refresh} refreshDisabled={mutationPending || refreshing}
+    onCreateAccount={page.id === "accounts" ? () => setCreateOpen(true) : undefined} />} navigation={<AdminPager activeId={page.id} />}>
+    <ResourceStatusView resourceKey={resourceKey} hasData={hasData || resource.updatedAt !== null} onRetry={() => { void refreshAdminPageResource(store, page.id); }}>
+      <div inert={refreshing} aria-busy={refreshing}>
+        <AdminPageContent pageId={page.id} accountCreateOpen={createOpen} onCloseAccountCreate={() => setCreateOpen(false)} />
       </div>
-    </div>
-  );
+    </ResourceStatusView>
+  </PageLayout>;
 }

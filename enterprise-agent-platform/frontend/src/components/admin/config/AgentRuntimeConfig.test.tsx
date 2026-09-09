@@ -154,4 +154,29 @@ describe("AgentRuntimeConfig", () => {
     expect(screen.getByText("Model catalog unavailable")).toBeInTheDocument();
     expect(screen.queryByText(/stale-runtime-candidate/)).not.toBeInTheDocument();
   });
+
+  it("preserves an explicit unavailable model on an unrelated save", async () => {
+    const store = createStore(rootReducer, initialAppState);
+    store.dispatch({
+      type: "SET_AGENT_RUNTIME_CONFIG",
+      payload: { config: { provider: "openai-codex", model: "saved-model", max_concurrency: 4 } },
+    });
+    store.dispatch({
+      type: "SET_OAUTH_PROVIDERS",
+      payload: { providers: [{ id: "openai-codex", configured: true, models: ["new-recommendation"] }] },
+    });
+    render(
+      <StoreContext.Provider value={store}>
+        <I18nProvider><AgentRuntimeConfig /></I18nProvider>
+      </StoreContext.Provider>,
+    );
+    const concurrency = screen.getByRole("spinbutton", { name: "Maximum concurrent tasks" });
+    await userEvent.clear(concurrency);
+    await userEvent.type(concurrency, "8");
+    await userEvent.click(screen.getByRole("button", { name: "Save runtime settings" }));
+    expect(actions.saveAgentRuntimeConfig).toHaveBeenCalledWith(
+      store,
+      expect.objectContaining({ model: "saved-model", max_concurrency: "8" }),
+    );
+  });
 });

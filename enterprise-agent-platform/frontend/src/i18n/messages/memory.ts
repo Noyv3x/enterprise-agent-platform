@@ -2,7 +2,7 @@ import { defineMessages } from "../types";
 
 export const memoryMessages = defineMessages({
   "memory.open": { "zh-CN": "打开记忆管理", en: "Open memory manager", "zh-TW": "開啟記憶管理" },
-  "memory.title": { "zh-CN": "记忆管理", en: "Memory", "zh-TW": "記憶管理" },
+  "memory.title": { "zh-CN": "记忆", en: "Memory", "zh-TW": "記憶" },
   "memory.description": {
     "zh-CN": "查看和管理个人 AI 会在以后对话中使用的信息。",
     en: "Review and manage information your Personal AI can use in future conversations.",

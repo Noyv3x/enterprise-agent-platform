@@ -50,7 +50,7 @@ describe("MessageList Agent work records", () => {
   afterEach(cleanup);
 
   it("uses the lightweight replying indicator when no tool was called", () => {
-    const view = renderMessageList({
+    renderMessageList({
       state: "replying",
       replying_to: { username: "Administrator" },
       activity: [
@@ -60,7 +60,7 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(screen.getByText("Agent is replying to Administrator")).toBeTruthy();
-    expect(view.container.querySelector(".agent-work")).toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
   });
 
   it("offers withdrawal only for the current user's persisted channel messages", () => {
@@ -111,7 +111,7 @@ describe("MessageList Agent work records", () => {
   });
 
   it("keeps approval separate from work records when no tool was called", () => {
-    const view = renderMessageList({
+    renderMessageList({
       state: "approval",
       replying_to: { username: "Administrator" },
       activity: [{ source: "agent", stage: "approval", detail: "Run a command" }],
@@ -129,11 +129,11 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Waiting for Administrator to approve access")).toBeTruthy();
     expect(screen.getByText("Access approval")).toBeTruthy();
     expect(screen.queryByText(/combining 2 messages/)).toBeNull();
-    expect(view.container.querySelector(".agent-work")).toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
   });
 
   it("shows a normal error message instead of an empty work record", () => {
-    const view = renderMessageList({
+    renderMessageList({
       state: "error",
       last_error: "Runtime unavailable",
       activity: [{ source: "platform", stage: "error", detail: "Runtime unavailable" }],
@@ -141,11 +141,11 @@ describe("MessageList Agent work records", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Agent reply failed");
     expect(screen.getByRole("alert")).toHaveTextContent("Runtime unavailable");
-    expect(view.container.querySelector(".agent-work")).toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
   });
 
   it("shows a real tool call as a compact non-interactive row", () => {
-    const view = renderMessageList({
+    renderMessageList({
       state: "replying",
       replying_to: { username: "Administrator" },
       activity: [
@@ -161,19 +161,18 @@ describe("MessageList Agent work records", () => {
       ],
     });
 
-    expect(view.container.querySelector(".agent-work")).not.toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
     expect(screen.getByText("Web search")).toBeVisible();
     expect(screen.getByText("Web search · Running")).toBeVisible();
     expect(screen.getByText("Running")).toBeVisible();
-    expect(view.container.querySelector(".agent-work__item--running")).not.toBeNull();
     expect(screen.queryByText("Unrelated lifecycle row")).toBeNull();
-    expect(view.container.querySelectorAll(".agent-work [role=listitem]")).toHaveLength(1);
-    expect(view.container.querySelector(".agent-work [role=button]")).toBeNull();
+    expect(within(screen.getByRole("region", { name: "View AI work" })).getAllByRole("listitem")).toHaveLength(1);
+    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByRole("button")).toBeNull();
   });
 
   it("shows finalized phase prose only once in the active compact timeline", () => {
     const phase = "The first scan completed; validation is starting.";
-    const view = renderMessageList({
+    renderMessageList({
       run_id: "run-phase",
       state: "replying",
       replying_to: { username: "Administrator" },
@@ -199,9 +198,29 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(screen.getAllByText(phase)).toHaveLength(1);
-    expect(view.container.querySelectorAll(".msg")).toHaveLength(1);
-    expect(view.container.querySelector(".agent-work--active")).not.toBeNull();
-    expect(view.container.querySelector(".msg__bubble")).toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
+  });
+
+  it("deduplicates finalized commentary and prefers the live version of a repeated stream identity", () => {
+    const phase = "The documents are checked.";
+    renderMessageList({
+      run_id: "run-transition",
+      state: "replying",
+      activity: [
+        { stage: "assistant.message", line: phase, detail: phase, sequence: 1 },
+        { stage: "tool.completed", tool: "read_file", tool_call_id: "read-transition", tool_status: "completed", sequence: 2 },
+      ],
+      stream_messages: [
+        { id: "phase-buffer", content: phase },
+        { id: "answer-buffer", content: "Obsolete partial answer" },
+      ],
+      stream_message: { id: "answer-buffer", content: "Current final answer", active: true },
+    });
+
+    expect(screen.getAllByText(phase)).toHaveLength(1);
+    expect(screen.getAllByText("Current final answer")).toHaveLength(1);
+    expect(screen.queryByText("Obsolete partial answer")).toBeNull();
+    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByText("Current final answer")).toBeNull();
   });
 
   it("keeps active work non-interactive when the final response starts streaming", () => {
@@ -222,8 +241,8 @@ describe("MessageList Agent work records", () => {
     };
     const view = renderMessageList(initialStatus);
 
-    expect(view.container.querySelector(".agent-work--active")).not.toBeNull();
-    expect(view.container.querySelector(".agent-work [role=button]")).toBeNull();
+    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
+    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByRole("button")).toBeNull();
 
     act(() => {
       view.store.dispatch({
@@ -244,17 +263,16 @@ describe("MessageList Agent work records", () => {
       });
     });
 
-    const workRecord = view.container.querySelector<HTMLElement>(".agent-work");
+    const workRecord = screen.queryByRole("region", { name: "View AI work" });
     const finalAnswer = screen.getByText("Final answer has started");
-    expect(workRecord).toHaveClass("agent-work--active");
-    expect(workRecord?.querySelector("[role=button]")).toBeNull();
+    expect(within(workRecord!).queryByRole("button")).toBeNull();
     expect(
       workRecord!.compareDocumentPosition(finalAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
 
   it("keeps persisted Agent updates inside work while the final answer stays separate", () => {
-    const view = renderMessageList(
+    renderMessageList(
       { state: "idle" },
       [
         {
@@ -288,11 +306,11 @@ describe("MessageList Agent work records", () => {
       ],
     );
 
-    const workRecord = view.container.querySelector<HTMLElement>(".agent-work");
+    const workRecord = screen.queryByRole("region", { name: "View AI work" });
     const finalAnswer = screen.getByText("Persisted final answer");
     expect(workRecord).not.toBeNull();
     if (!workRecord) throw new Error("Expected persisted work record");
-    const disclosure = workRecord.querySelector<HTMLElement>(".agent-work__collapse-header");
+    const disclosure = within(workRecord).getByRole("button");
     expect(disclosure).toHaveAttribute("aria-expanded", "false");
     expect(workRecord).not.toContainElement(finalAnswer);
     expect(
@@ -302,14 +320,14 @@ describe("MessageList Agent work records", () => {
     fireEvent.click(disclosure!);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
     const updateTitle = within(workRecord).getByText("AI update");
-    const updateRow = updateTitle.closest<HTMLElement>(".agent-work__item");
+    const updateRow = updateTitle.closest<HTMLElement>("[role=listitem]");
     expect(updateRow).not.toBeNull();
     if (!updateRow) throw new Error("Expected persisted Agent update row");
-    const updateDisclosure = updateRow.querySelector<HTMLElement>("[role=button]");
+    const updateDisclosure = within(updateRow).getByRole("button");
     expect(updateDisclosure).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(updateDisclosure!);
     expect(updateDisclosure).toHaveAttribute("aria-expanded", "true");
-    expect(updateRow.querySelector(".agent-work__commentary")).toHaveTextContent(
+    expect(within(updateRow).getByRole("group")).toHaveTextContent(
       "I checked the focused tests. They cover the persisted update.",
     );
     expect(screen.getByText("Persisted final answer")).toBeVisible();
@@ -346,7 +364,6 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Administrator")).toBeVisible();
     expect(screen.getByText("here is the answer")).toBeVisible();
     expect(screen.queryByText("Personal AI")).toBeNull();
-    expect(document.querySelector(".msg--agent .msg__name")).toBeNull();
   });
 
   it("shows one compact status for a joined rapid-message group", () => {
@@ -411,5 +428,26 @@ describe("MessageList Agent work records", () => {
 
     expect(screen.queryByText("tagged obsolete draft")).toBeNull();
     expect(screen.getByText("live consolidated answer")).toBeTruthy();
+  });
+  it("announces a newly persisted member message once but not hydration or older history", () => {
+    const initial: Message = { id: 20, author_type: "user", user_id: 2, username: "Alice", content: "Existing conversation" };
+    const incoming: Message = { id: 21, author_type: "user", user_id: 2, username: "Alice", content: "New member message" };
+    const view = renderMessageList({ state: "idle" }, [initial]);
+    expect(screen.queryByText("1 new message")).toBeNull();
+    act(() => view.store.dispatch({ type: "SET_MESSAGES", payload: [initial, incoming] }));
+    const announcement = screen.getByText("1 new message");
+    expect(announcement.closest("[aria-live]")).toHaveAttribute("aria-live", "polite");
+    act(() => view.store.dispatch({ type: "SET_MESSAGES", payload: [initial, incoming] }));
+    expect(screen.queryByText("1 new message")).toBeNull();
+    act(() => {
+      view.store.dispatch({ type: "SET_MESSAGE_HISTORY", payload: {
+        key: "channel:1", history: { nextBeforeId: null, hasMore: false, loading: false, error: "", prependVersion: 1 },
+      } });
+      view.store.dispatch({ type: "SET_MESSAGES", payload: [
+        { ...initial, id: 19, content: "Older member message" }, initial, incoming,
+      ] });
+    });
+    expect(screen.queryByText("1 new message")).toBeNull();
+    expect(screen.getByText("Older member message")).toBeVisible();
   });
 });

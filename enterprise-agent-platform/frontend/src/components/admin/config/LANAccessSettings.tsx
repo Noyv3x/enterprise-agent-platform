@@ -1,141 +1,40 @@
-import { Alert, Button, Input, Switch, Tag, Typography } from "antd";
-import { useEffect, useId, useState } from "react";
+import { Button, Form, Input, Switch } from "antd";
+import { useEffect, useState } from "react";
 import { saveLANAccessConfig } from "../../../data/adminActions";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { AutoUpdateConfigValues } from "../../../types";
-import { CardHead } from "../../common/CardHead";
-import { Field } from "../../common/Field";
-import { AdminCard } from "../AdminCard";
+import { FormFooter, FormGrid, Notice, Section, StatusMark } from "../../ui/fieldwork";
 
-interface LANFormState {
-  enabled: boolean;
-  listen: string;
-  directCIDRs: string;
-  trustedIngressCIDRs: string;
-}
-
-function seedForm(config: AutoUpdateConfigValues): LANFormState {
-  return {
-    enabled: !!config.lan_enabled,
-    listen: config.lan_listen || "127.0.0.1:8081",
-    directCIDRs: (config.direct_access_cidrs || []).join("\n"),
-    trustedIngressCIDRs: (config.trusted_ingress_cidrs || []).join("\n"),
-  };
-}
-
-function parseCIDRs(value: string): string[] {
-  return value
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
+function seed(config: AutoUpdateConfigValues) { return { enabled: !!config.lan_enabled, listen: config.lan_listen || "127.0.0.1:8081", direct: (config.direct_access_cidrs || []).join("\n"), ingress: (config.trusted_ingress_cidrs || []).join("\n") }; }
+function cidrs(value: string) { return value.split(/[\n,]/).map((item) => item.trim()).filter(Boolean); }
 export function LANAccessSettings() {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const config = useStore((state) => state.autoUpdateConfig?.config || null);
-  const saving = useStore((state) => state.pendingOperations.includes("admin:security:lan:save"));
-  const enabledLabelId = useId();
-  const enabledHintId = useId();
-  const [form, setForm] = useState<LANFormState>(() => seedForm(config || {}));
-
-  useEffect(() => setForm(seedForm(config || {})), [config]);
-
-  if (!config) {
-    return null;
-  }
-
-  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(config));
-  const save = (event: React.FormEvent) => {
-    event.preventDefault();
-    void saveLANAccessConfig(store, {
-      lan_enabled: form.enabled,
-      lan_listen: form.listen.trim(),
-      direct_access_cidrs: parseCIDRs(form.directCIDRs),
-      trusted_ingress_cidrs: parseCIDRs(form.trustedIngressCIDRs),
-    });
-  };
-
-  return (
-    <AdminCard className="config-form security-config eap-lan-access-config">
-      <CardHead
-        title={t("admin.security.lanTitle")}
-        icon="server"
-        desc={t("admin.security.lanDescription")}
-      />
-      <div className="eap-lan-access-config__status">
-        <Typography.Text type="secondary">{t("admin.security.lanRuntimeStatus")}</Typography.Text>
-        <Tag color={config.lan_error ? (config.lan_active ? "warning" : "error") : config.lan_active ? "success" : "default"}>
-          {t(config.lan_error
-            ? config.lan_active
-              ? "admin.security.lanActivePrevious"
-              : "admin.security.lanUnavailable"
-            : config.lan_active
-              ? "admin.security.lanActive"
-              : "admin.security.lanInactive")}
-        </Tag>
-      </div>
-      {config.lan_error ? <Alert showIcon type={config.lan_active ? "warning" : "error"} message={t(config.lan_active ? "admin.security.lanApplyRejected" : "admin.security.lanBindError")} /> : null}
-      {form.enabled ? <Alert showIcon type="warning" message={t("admin.security.lanPlaintextRisk")} /> : null}
-      <form onSubmit={save}>
-        <div className="config-grid">
-          <div className="check-row field--full">
-            <Switch
-              checked={form.enabled}
-              aria-labelledby={enabledLabelId}
-              aria-describedby={enabledHintId}
-              onChange={(enabled) => setForm((previous) => ({ ...previous, enabled }))}
-            />
-            <div className="check-row__text">
-              <strong id={enabledLabelId}>{t("admin.security.lanEnable")}</strong>
-              <span id={enabledHintId}>{t("admin.security.lanEnableHint")}</span>
-            </div>
-          </div>
-          <div className="field--full">
-            <Field label={t("admin.security.lanListen")}>
-              <div className="field-stack">
-                <Input
-                  aria-label={t("admin.security.lanListen")}
-                  value={form.listen}
-                  placeholder="192.168.1.10:8081"
-                  disabled={!form.enabled}
-                  onChange={(event) => setForm((previous) => ({ ...previous, listen: event.target.value }))}
-                />
-                <div className="field-help">{t("admin.security.lanListenHint")}</div>
-              </div>
-            </Field>
-          </div>
-          <Field label={t("admin.security.lanDirectCIDRs")}>
-            <div className="field-stack">
-              <Input.TextArea
-                aria-label={t("admin.security.lanDirectCIDRs")}
-                autoSize={{ minRows: 3, maxRows: 7 }}
-                value={form.directCIDRs}
-                disabled={!form.enabled}
-                onChange={(event) => setForm((previous) => ({ ...previous, directCIDRs: event.target.value }))}
-              />
-              <div className="field-help">{t("admin.security.lanDirectCIDRsHint")}</div>
-            </div>
-          </Field>
-          <Field label={t("admin.security.lanTrustedIngressCIDRs")}>
-            <div className="field-stack">
-              <Input.TextArea
-                aria-label={t("admin.security.lanTrustedIngressCIDRs")}
-                autoSize={{ minRows: 3, maxRows: 7 }}
-                value={form.trustedIngressCIDRs}
-                onChange={(event) => setForm((previous) => ({ ...previous, trustedIngressCIDRs: event.target.value }))}
-              />
-              <div className="field-help">{t("admin.security.lanTrustedIngressCIDRsHint")}</div>
-            </div>
-          </Field>
-        </div>
-        <div className="form-actions">
-          <Button type="primary" htmlType="submit" disabled={!dirty} loading={saving}>
-            {t(saving ? "admin.common.saving" : "admin.security.lanSave")}
-          </Button>
-        </div>
-      </form>
-    </AdminCard>
-  );
+  const data = useStore((state) => state.autoUpdateConfig);
+  const pending = useStore((state) => state.pendingOperations);
+  const config = data?.config;
+  const [draft, setDraft] = useState(() => seed(config || {}));
+  useEffect(() => setDraft(seed(config || {})), [config]);
+  if (!config) return null;
+  const available = Number.isFinite(data?.status.manager_generation) && ["idle", "waiting_for_tasks", "updating", "failed"].includes(String(data?.status.state));
+  const saving = pending.includes("admin:security:lan:save");
+  const blocked = !available || data?.status.in_progress === true || ["waiting_for_tasks", "updating"].includes(String(data?.status.state)) || pending.some((key) => key === "admin:security:lan:save" || key.startsWith("admin:updates:"));
+  const dirty = JSON.stringify(draft) !== JSON.stringify(seed(config));
+  const listener = !available ? t("admin.security.lanUnavailable") : config.lan_error ? t(config.lan_active ? "admin.security.lanActivePrevious" : "admin.security.lanUnavailable") : config.lan_active === true ? t("admin.security.lanActive") : config.lan_active === false ? t("admin.security.lanInactive") : t("admin.security.lanUnavailable");
+  return <Section title={t("admin.security.lanTitle")} description={t("admin.security.lanDescription")}>
+    <StatusMark tone={available && config.lan_active && !config.lan_error ? "success" : "warning"}>{listener}</StatusMark>
+    {!available && <Notice tone="danger" title={t("admin.updates.unavailable")} >{t("admin.updates.unavailableHint")}</Notice>}
+    {config.lan_error && <Notice tone="warning" title={t(config.lan_active ? "admin.security.lanApplyRejected" : "admin.security.lanBindError")} />}
+    <Form layout="vertical" disabled={blocked} onFinish={() => { if (!blocked && dirty) void saveLANAccessConfig(store, { lan_enabled: draft.enabled, lan_listen: draft.listen.trim(), direct_access_cidrs: cidrs(draft.direct), trusted_ingress_cidrs: cidrs(draft.ingress) }); }}>
+      <FormGrid>
+        <Form.Item label={t("admin.security.lanEnable")} extra={t("admin.security.lanEnableHint")}><Switch aria-label={t("admin.security.lanEnable")} checked={draft.enabled} onChange={(enabled) => setDraft({ ...draft, enabled })} /></Form.Item>
+        <Form.Item label={t("admin.security.lanListen")} extra={t("admin.security.lanListenHint")}><Input aria-label={t("admin.security.lanListen")} value={draft.listen} disabled={blocked || !draft.enabled} onChange={(e) => setDraft({ ...draft, listen: e.target.value })} /></Form.Item>
+        <Form.Item label={t("admin.security.lanDirectCIDRs")} extra={t("admin.security.lanDirectCIDRsHint")}><Input.TextArea aria-label={t("admin.security.lanDirectCIDRs")} autoSize={{ minRows: 3, maxRows: 8 }} value={draft.direct} disabled={blocked || !draft.enabled} onChange={(e) => setDraft({ ...draft, direct: e.target.value })} /></Form.Item>
+        <Form.Item label={t("admin.security.lanTrustedIngressCIDRs")} extra={t("admin.security.lanTrustedIngressCIDRsHint")}><Input.TextArea aria-label={t("admin.security.lanTrustedIngressCIDRs")} autoSize={{ minRows: 3, maxRows: 8 }} value={draft.ingress} onChange={(e) => setDraft({ ...draft, ingress: e.target.value })} /></Form.Item>
+      </FormGrid>
+      {draft.enabled && <Notice tone="warning" title={t("admin.security.lanPlaintextRisk")} />}
+      <FormFooter><Button htmlType="submit" loading={saving} disabled={!dirty || blocked}>{t("admin.security.lanSave")}</Button></FormFooter>
+    </Form>
+  </Section>;
 }

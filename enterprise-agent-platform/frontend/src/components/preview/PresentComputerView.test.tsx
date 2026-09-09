@@ -47,7 +47,7 @@ describe("PresentComputerView", () => {
     );
 
     expect(screen.queryByTitle("Presented page")).not.toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Preparing the AI computer").closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
 
     rendered.rerender(
       <I18nProvider>

@@ -3,6 +3,9 @@ import { defineMessages } from "../types";
 export const scheduledTaskMessages = defineMessages({
   "scheduledTasks.open": { "zh-CN": "打开定时任务", en: "Open scheduled tasks", "zh-TW": "開啟排程任務" },
   "scheduledTasks.title": { "zh-CN": "定时任务", en: "Scheduled tasks", "zh-TW": "排程任務" },
+  "scheduledTasks.createdAtLabel": { "zh-CN": "创建时间", en: "Created", "zh-TW": "建立時間" },
+  "scheduledTasks.updatedAtLabel": { "zh-CN": "更新时间", en: "Updated", "zh-TW": "更新時間" },
+  "scheduledTasks.idLabel": { "zh-CN": "任务 ID", en: "Task ID", "zh-TW": "任務 ID" },
   "scheduledTasks.description": {
     "zh-CN": "管理个人 AI 已创建的自动任务。",
     en: "Manage automations created by your Personal AI.",

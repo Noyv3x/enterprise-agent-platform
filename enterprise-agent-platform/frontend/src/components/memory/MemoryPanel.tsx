@@ -1,26 +1,12 @@
-import { Alert, Button, Card, Form, Input, Space, Tabs, Tag, Typography } from "antd";
+import { Button, Form, Input, Modal, Segmented, Space, Tag } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  clearAgentMemories,
-  createAgentMemory,
-  deleteAgentMemory,
-  exportAgentMemories,
-  loadAgentMemories,
-  updateAgentMemory,
-} from "../../data/memoryActions";
+import { clearAgentMemories, createAgentMemory, deleteAgentMemory, exportAgentMemories, loadAgentMemories, updateAgentMemory } from "../../data/memoryActions";
 import { toast } from "../../context/ToastContext";
 import { intlLocale, useI18n } from "../../i18n";
 import { downloadJson } from "../../lib/api";
-import { cx } from "../../lib/cx";
 import type { AgentMemory, AgentMemoryTarget } from "../../types";
-import { ConfirmDialog } from "../common/ConfirmDialog";
-import { EmptyState } from "../common/EmptyState";
-import { Icon } from "../common/Icon";
-import { InlineAlert } from "../common/InlineAlert";
-import { Spinner } from "../common/Spinner";
+import { CapabilityHeader, SearchToolbar, DataRegion, EmptyState, FormFooter, Notice, OverlayPanel, ResourceList, ResourceRow, Section, useFieldworkContainer } from "../ui/fieldwork";
 import "./memory.css";
-
-const { TextArea } = Input;
 
 type Confirmation =
   | { kind: "delete"; memory: AgentMemory }
@@ -48,122 +34,26 @@ function targetLabel(target: AgentMemoryTarget, translate: ReturnType<typeof use
   return translate(target === "user" ? "memory.target.user" : "memory.target.agent");
 }
 
-interface MemoryCardProps {
-  memory: AgentMemory;
-  busy: boolean;
-  editing: boolean;
-  editContent: string;
-  locale: string;
-  onEditContent: (content: string) => void;
-  onStartEdit: () => void;
-  onCancelEdit: () => void;
-  onSave: () => void;
-  onDelete: () => void;
-}
-
-function MemoryCard({
-  memory,
-  busy,
-  editing,
-  editContent,
-  locale,
-  onEditContent,
-  onStartEdit,
-  onCancelEdit,
-  onSave,
-  onDelete,
-}: MemoryCardProps) {
-  const { t } = useI18n();
-  const updated = memoryTime(memory.updated_at, locale);
-  return (
-    <article className={cx("memory-card", editing && "is-editing", memory.blocked && "is-blocked")}>
-      <Card className="memory-card__surface" classNames={{ body: "memory-card__body" }} size="small">
-        {editing ? (
-          <Form.Item className="memory-card__editor" label={t("memory.contentLabel")}>
-            <TextArea
-              autoFocus
-              aria-label={t("memory.contentLabel")}
-              value={editContent}
-              maxLength={4000}
-              disabled={busy}
-              autoSize={{ minRows: 3, maxRows: 10 }}
-              onChange={(event) => onEditContent(event.target.value)}
-            />
-          </Form.Item>
-        ) : (
-          <Typography.Paragraph className="memory-card__content">{memory.content}</Typography.Paragraph>
-        )}
-        {memory.blocked ? (
-          <Alert
-            className="memory-card__blocked"
-            type="warning"
-            showIcon
-            title={t("memory.blockedTitle")}
-            description={t("memory.blockedMessage")}
-          />
-        ) : null}
-        {(memory.tags || []).length ? (
-          <Space className="memory-card__tags" wrap aria-label={t("memory.tags")}>
-            {(memory.tags || []).map((tag) => <Tag key={tag}>{tag}</Tag>)}
-          </Space>
-        ) : null}
-        <footer className="memory-card__footer">
-          <Typography.Text type="secondary">
-            {updated ? t("memory.updatedAt", { time: updated }) : `#${memory.id}`}
-          </Typography.Text>
-          <Space className="memory-card__actions" wrap>
-            {editing ? (
-              <>
-                <Button size="small" disabled={busy} onClick={onCancelEdit}>
-                  {t("memory.cancel")}
-                </Button>
-                <Button
-                  size="small"
-                  type="primary"
-                  loading={busy}
-                  disabled={!editContent.trim()}
-                  onClick={onSave}
-                >
-                  {t("memory.save")}
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button size="small" disabled={busy} onClick={onStartEdit}>
-                  {t("memory.edit")}
-                </Button>
-                <Button
-                  size="small"
-                  danger
-                  icon={<Icon name="trash" size={13} />}
-                  disabled={busy}
-                  onClick={onDelete}
-                >
-                  {t("memory.delete")}
-                </Button>
-              </>
-            )}
-          </Space>
-        </footer>
-      </Card>
-    </article>
-  );
-}
-
 export function MemoryPanel() {
   const { t, locale } = useI18n();
+  const getContainer = useFieldworkContainer();
   const [target, setTarget] = useState<AgentMemoryTarget>("memory");
   const [memories, setMemories] = useState<AgentMemory[]>([]);
   const [queryDraft, setQueryDraft] = useState("");
   const [query, setQuery] = useState("");
   const [newContent, setNewContent] = useState("");
-  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editorMemory, setEditorMemory] = useState<AgentMemory | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const [editContent, setEditContent] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [mutationError, setMutationError] = useState("");
   const [busyKey, setBusyKey] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
+  const targetEpoch = useRef(0);
+  const draftRevision = useRef(0);
+  const editorRevision = useRef(0);
+  const mounted = useRef(true);
   const memoryController = useRef<AbortController | null>(null);
   const memoryRequestVersion = useRef(0);
   const busyRef = useRef(false);
@@ -210,6 +100,11 @@ export function MemoryPanel() {
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+
+  useEffect(() => {
     void refreshMemories();
     return () => {
       const controller = memoryController.current;
@@ -233,34 +128,44 @@ export function MemoryPanel() {
     options: { refreshMemories?: boolean } = {},
   ) => {
     if (busyRef.current) return false;
+    const mutationEpoch = targetEpoch.current;
     busyRef.current = true;
     setBusyKey(key);
     setMutationError("");
     if (options.refreshMemories !== false) stopStaleMemoryLoad();
     try {
       await action();
+      if (!mounted.current) return false;
       toast(successMessage, { type: "ok" });
       if (options.refreshMemories !== false) await refreshMemories();
       return true;
     } catch (error) {
-      setMutationError(errorText(error) || t("memory.mutationFailed"));
+      if (mounted.current && targetEpoch.current === mutationEpoch) setMutationError(errorText(error) || t("memory.mutationFailed"));
       return false;
     } finally {
       busyRef.current = false;
-      setBusyKey("");
+      if (mounted.current) setBusyKey("");
     }
   }, [refreshMemories, stopStaleMemoryLoad, t]);
 
   const switchTarget = (next: AgentMemoryTarget) => {
     if (next === target) return;
+    stopStaleMemoryLoad();
+    targetEpoch.current += 1;
+    draftRevision.current += 1;
+    editorRevision.current += 1;
     targetRef.current = next;
     queryRef.current = "";
     setTarget(next);
+    setLoading(true);
+    setLoadError("");
+    setConfirmation(null);
+    setCreateOpen(false);
     setMemories([]);
     setQuery("");
     setQueryDraft("");
     setNewContent("");
-    setEditingId(null);
+    setEditorMemory(null);
     setEditContent("");
     setMutationError("");
   };
@@ -271,12 +176,17 @@ export function MemoryPanel() {
       setMutationError(t("memory.required"));
       return;
     }
+    const epoch = targetEpoch.current;
+    const revision = draftRevision.current;
     const saved = await runMutation(
       "create",
       () => createAgentMemory({ target, content }),
       t("memory.createSuccess"),
     );
-    if (saved) setNewContent("");
+    if (saved && mounted.current && targetEpoch.current === epoch && draftRevision.current === revision) {
+      setNewContent("");
+      setCreateOpen(false);
+    }
   };
 
   const saveMemory = async (memory: AgentMemory) => {
@@ -285,19 +195,20 @@ export function MemoryPanel() {
       setMutationError(t("memory.required"));
       return;
     }
+    const epoch = targetEpoch.current;
+    const revision = editorRevision.current;
     const saved = await runMutation(
       `update:${memory.id}`,
       () => updateAgentMemory(memory.id, {
         target: memory.target,
         content,
-        // A blocked record may carry an unsafe tag that this compact editor does
-        // not expose. Clear its tags so a safe edit can restore it.
+        // Unsafe hidden tags must not survive a blocked record’s safe replacement.
         tags: memory.blocked ? [] : memory.tags || [],
       }),
       t("memory.updateSuccess"),
     );
-    if (saved) {
-      setEditingId(null);
+    if (saved && mounted.current && targetEpoch.current === epoch && editorRevision.current === revision) {
+      setEditorMemory(null);
       setEditContent("");
     }
   };
@@ -322,236 +233,137 @@ export function MemoryPanel() {
 
   const exportMemories = async () => {
     if (busyRef.current) return;
+    const exportEpoch = targetEpoch.current;
     busyRef.current = true;
     setBusyKey("export");
     setMutationError("");
     try {
       const payload = await exportAgentMemories();
+      if (!mounted.current) return;
       const stamp = new Date().toISOString().slice(0, 10);
       downloadJson(payload, `agent-memories-${stamp}.json`);
       toast(t("memory.exportSuccess"), { type: "ok" });
     } catch (error) {
-      setMutationError(errorText(error) || t("memory.exportFailed"));
+      if (mounted.current && targetEpoch.current === exportEpoch) setMutationError(errorText(error) || t("memory.exportFailed"));
     } finally {
       busyRef.current = false;
-      setBusyKey("");
+      if (mounted.current) setBusyKey("");
     }
   };
 
-  const activeHint = target === "user" ? t("memory.target.userHint") : t("memory.target.agentHint");
-  const clearLabel = target === "user" ? t("memory.clearTarget.user") : t("memory.clearTarget.agent");
-  const emptyTitle = query ? t("memory.noResults") : t("memory.empty");
-  const emptyDetail = query
-    ? t("memory.noResultsDetail")
-    : target === "user"
-      ? t("memory.emptyDetail.user")
-      : t("memory.emptyDetail.agent");
-
-  const memoryTabPanel = (
-    <div className="memory-tab-panel">
-      <Typography.Paragraph className="memory-target-hint">{activeHint}</Typography.Paragraph>
-
-      <Form
-        className="memory-search"
-        role="search"
-        aria-label={t("memory.searchLabel")}
-        onFinish={() => {
-          const nextQuery = queryDraft.trim();
-          queryRef.current = nextQuery;
-          setQuery(nextQuery);
-        }}
-      >
-        <Input
-          className="memory-search__input"
-          type="search"
-          prefix={<Icon name="search" size={15} />}
-          suffix={query ? (
-            <Button
-              type="text"
-              size="small"
-              shape="circle"
-              aria-label={t("memory.clearSearch")}
-              title={t("memory.clearSearch")}
-              icon={<Icon name="close" size={14} />}
-              onClick={() => {
-                queryRef.current = "";
-                setQuery("");
-                setQueryDraft("");
-              }}
-            />
-          ) : null}
-          value={queryDraft}
-          maxLength={4000}
-          aria-label={t("memory.searchLabel")}
-          placeholder={t("memory.searchPlaceholder")}
-          onChange={(event) => setQueryDraft(event.target.value)}
-        />
-        <Button htmlType="submit">{t("memory.search")}</Button>
-      </Form>
-
-      <Form
-        className="memory-add"
-        layout="vertical"
-        onFinish={() => void addMemory()}
-      >
-        <Form.Item label={t("memory.addTitle")}>
-          <TextArea
-            value={newContent}
-            maxLength={4000}
-            disabled={!!busyKey}
-            autoSize={{ minRows: 3, maxRows: 10 }}
-            aria-label={t("memory.addTitle")}
-            placeholder={t(target === "user" ? "memory.addPlaceholder.user" : "memory.addPlaceholder.agent")}
-            onChange={(event) => setNewContent(event.target.value)}
-          />
-        </Form.Item>
-        <Button
-          type="primary"
-          htmlType="submit"
-          loading={busyKey === "create"}
-          icon={busyKey === "create" ? undefined : <Icon name="plus" size={14} />}
-          disabled={!!busyKey || !newContent.trim()}
-        >
-          {t("memory.add")}
-        </Button>
-      </Form>
-
-      {mutationError ? <InlineAlert variant="error">{mutationError}</InlineAlert> : null}
-
-      <div className="memory-toolbar">
-        <Typography.Text type="secondary">{t("memory.count", { count: memories.length })}</Typography.Text>
-        <Space wrap>
-          <Button
-            size="small"
-            disabled={!!busyKey}
-            title={t("memory.refresh")}
-            icon={<Icon name="refresh" size={14} />}
-            onClick={() => {
-              void refreshMemories();
-            }}
-          >
-            {t("memory.refresh")}
-          </Button>
-          <Button
-            size="small"
-            disabled={!!busyKey}
-            icon={<Icon name="download" size={14} />}
-            onClick={() => void exportMemories()}
-          >
-            {t("memory.export")}
-          </Button>
-          <Button
-            size="small"
-            danger
-            disabled={!!busyKey}
-            icon={<Icon name="trash" size={14} />}
-            onClick={() => setConfirmation({ kind: "clear", target })}
-          >
-            {clearLabel}
-          </Button>
-        </Space>
-      </div>
-
-      {loadError ? (
-        <InlineAlert
-          variant="error"
-          action={<Button size="small" onClick={() => void refreshMemories()}>{t("common.retry")}</Button>}
-        >
-          {loadError || t("memory.loadFailed")}
-        </InlineAlert>
-      ) : loading ? (
-        <div className="memory-loading" role="status">
-          <Spinner size={20} />
-          <span>{t("memory.loading")}</span>
-        </div>
-      ) : memories.length ? (
-        <div className="memory-list">
-          {memories.map((memory) => (
-            <MemoryCard
-              key={memory.id}
-              memory={memory}
-              busy={!!busyKey}
-              editing={editingId === memory.id}
-              editContent={editingId === memory.id ? editContent : ""}
-              locale={intl}
-              onEditContent={setEditContent}
-              onStartEdit={() => {
-                setEditingId(memory.id);
-                setEditContent(memory.content);
-                setMutationError("");
-              }}
-              onCancelEdit={() => {
-                setEditingId(null);
-                setEditContent("");
-              }}
-              onSave={() => void saveMemory(memory)}
-              onDelete={() => setConfirmation({ kind: "delete", memory })}
-            />
-          ))}
-        </div>
-      ) : (
-        <EmptyState
-          icon={query ? "search" : target === "user" ? "users" : "bot"}
-          title={emptyTitle}
-          text={emptyDetail}
-        />
-      )}
-    </div>
-  );
+  const busy = !!busyKey;
+  const clearLabel = t(target === "user" ? "memory.clearTarget.user" : "memory.clearTarget.agent");
+  const submitQuery = (value: string) => {
+    const next = value.trim();
+    stopStaleMemoryLoad();
+    queryRef.current = next;
+    setMemories([]);
+    if (next === query) void refreshMemories();
+    else setQuery(next);
+  };
+  const closeEditor = () => {
+    editorRevision.current += 1;
+    draftRevision.current += 1;
+    setCreateOpen(false);
+    setEditorMemory(null);
+  };
 
   return (
-    <section className="memory-panel" aria-label={t("memory.title")}>
-      <InlineAlert variant="warning" title={t("memory.chatNoticeTitle")}>
-        {t("memory.chatNotice")}
-      </InlineAlert>
-
-      <Tabs
-        className="memory-tabs"
-        classNames={{
-          header: "memory-tabs__header",
-          item: "memory-tabs__item",
-          indicator: "memory-tabs__indicator",
-          body: "memory-tabs__body",
-          content: "memory-tabs__content",
-        }}
-        activeKey={target}
-        destroyOnHidden
-        onChange={(key) => switchTarget(key as AgentMemoryTarget)}
-        items={(["memory", "user"] as const).map((item) => ({
-          key: item,
-          label: (
-            <Space size={7}>
-              <Icon name={item === "user" ? "users" : "bot"} size={16} />
-              {targetLabel(item, t)}
-            </Space>
-          ),
-          children: item === target ? memoryTabPanel : null,
-        }))}
+    <div className="wf-memory" aria-label={t("memory.title")}>
+      <CapabilityHeader
+        title={t("memory.title")}
+        description={t(target === "user" ? "memory.target.userHint" : "memory.target.agentHint")}
+        scope={targetLabel(target, t)}
+        actions={<Space wrap>
+          <Button onClick={() => { draftRevision.current += 1; setEditorMemory(null); setCreateOpen(true); }}>{t("memory.addTitle")}</Button>
+          <Button disabled={busy} onClick={() => void refreshMemories()}>{t("memory.refresh")}</Button>
+          <Button loading={busyKey === "export"} disabled={busy} onClick={() => void exportMemories()}>{t("memory.export")}</Button>
+        </Space>}
       />
-
-      {confirmation?.kind === "delete" ? (
-        <ConfirmDialog
-          title={t("memory.deleteConfirmTitle")}
-          message={t("memory.deleteConfirm")}
-          confirmText={t("memory.delete")}
-          danger
-          onCancel={() => setConfirmation(null)}
-          onConfirm={() => void confirmDelete(confirmation.memory)}
-        />
-      ) : confirmation?.kind === "clear" ? (
-        <ConfirmDialog
-          title={t("memory.clearConfirmTitle", { target: targetLabel(confirmation.target, t) })}
-          message={t("memory.clearConfirm")}
-          confirmText={
-            confirmation.target === "user"
-              ? t("memory.clearTarget.user")
-              : t("memory.clearTarget.agent")
-          }
-          danger
-          onCancel={() => setConfirmation(null)}
-          onConfirm={() => void confirmClear(confirmation.target)}
-        />
-      ) : null}
-    </section>
+      <Notice title={t("memory.chatNoticeTitle")}>{t("memory.chatNotice")}</Notice>
+      <Segmented
+        block
+        aria-label={t("memory.title")}
+        value={target}
+        options={(["memory", "user"] as const).map((value) => ({ value, label: targetLabel(value, t) }))}
+        onChange={(value) => switchTarget(value as AgentMemoryTarget)}
+      />
+      <SearchToolbar search={
+        <Form className="wf-memory-search" role="search" aria-label={t("memory.searchLabel")} onFinish={() => submitQuery(queryDraft)}>
+          <Input type="search" maxLength={4000} aria-label={t("memory.searchLabel")} placeholder={t("memory.searchPlaceholder")} value={queryDraft} onChange={(event) => setQueryDraft(event.target.value)} />
+          <Button htmlType="submit">{t("memory.search")}</Button>
+          <Button disabled={!query && !queryDraft} onClick={() => { setQueryDraft(""); submitQuery(""); }}>{t("memory.clearSearch")}</Button>
+        </Form>
+      } />
+      {mutationError && !createOpen && !editorMemory ? <Notice tone="danger" title={mutationError} /> : null}
+      <DataRegion
+        state={memories.length ? "ready" : loading ? "loading" : loadError ? "error" : "empty"}
+        loadingLabel={t("memory.loading")}
+        refreshing={loading && memories.length > 0}
+        refreshingLabel={t("memory.loading")}
+        error={loadError || undefined}
+        retry={<Button onClick={() => void refreshMemories()}>{t("common.retry")}</Button>}
+        empty={<EmptyState compact title={t(query ? "memory.noResults" : "memory.empty")} description={t(query ? "memory.noResultsDetail" : target === "user" ? "memory.emptyDetail.user" : "memory.emptyDetail.agent")} />}
+      >
+        <ResourceList label={t("memory.title")}>
+          {memories.map((memory) => (
+            <ResourceRow
+              key={memory.id}
+              title={<span className="wf-memory-content">{memory.content}</span>}
+              meta={t("memory.updatedAt", { time: memoryTime(memory.updated_at, intl) })}
+              description={memory.tags?.length ? <Space wrap aria-label={t("memory.tags")}>{memory.tags.map((tag) => <Tag key={tag}>{tag}</Tag>)}</Space> : undefined}
+              actions={<Space wrap>
+                <Button disabled={loading} onClick={() => { editorRevision.current += 1; setEditorMemory(memory); setEditContent(memory.content); setMutationError(""); }}>{t("memory.edit")}</Button>
+                <Button danger disabled={busy || loading} onClick={() => setConfirmation({ kind: "delete", memory })}>{t("memory.delete")}</Button>
+              </Space>}
+            >
+              {memory.blocked ? <Notice tone="warning" title={t("memory.blockedTitle")}>{t("memory.blockedMessage")}</Notice> : null}
+            </ResourceRow>
+          ))}
+        </ResourceList>
+      </DataRegion>
+      <Section tone="danger"><Button danger disabled={busy || loading} onClick={() => setConfirmation({ kind: "clear", target })}>{clearLabel}</Button></Section>
+      <OverlayPanel
+        open={createOpen || editorMemory !== null}
+        onClose={closeEditor}
+        title={t(createOpen ? "memory.addTitle" : "memory.contentLabel")}
+        closeLabel={t("common.close")}
+      >
+        <Form layout="vertical" onFinish={() => { if (createOpen) void addMemory(); else if (editorMemory) void saveMemory(editorMemory); }}>
+          {editorMemory?.blocked ? <Notice tone="warning" title={t("memory.blockedTitle")}>{t("memory.blockedMessage")}</Notice> : null}
+          <Form.Item label={t(createOpen ? "memory.addTitle" : "memory.contentLabel")}>
+            <Input.TextArea
+              autoFocus
+              aria-label={t(createOpen ? "memory.addTitle" : "memory.contentLabel")}
+              maxLength={4000}
+              showCount
+              autoSize={{ minRows: 6, maxRows: 16 }}
+              value={createOpen ? newContent : editContent}
+              onChange={(event) => {
+                if (createOpen) { draftRevision.current += 1; setNewContent(event.target.value); }
+                else { editorRevision.current += 1; setEditContent(event.target.value); }
+              }}
+            />
+          </Form.Item>
+          {mutationError ? <Notice tone="danger" title={mutationError} /> : null}
+          <FormFooter>
+            <Button onClick={closeEditor}>{t("memory.cancel")}</Button>
+            <Button type="primary" htmlType="submit" loading={busyKey === "create" || busyKey.startsWith("update:")} disabled={busy || !(createOpen ? newContent : editContent).trim()}>{t(createOpen ? "memory.add" : "memory.save")}</Button>
+          </FormFooter>
+        </Form>
+      </OverlayPanel>
+      {confirmation ? <Modal
+        getContainer={getContainer}
+        open={confirmation !== null}
+        title={confirmation?.kind === "delete" ? t("memory.deleteConfirmTitle") : t("memory.clearConfirmTitle", { target: targetLabel(confirmation?.kind === "clear" ? confirmation.target : target, t) })}
+        onCancel={() => setConfirmation(null)}
+        onOk={() => { if (confirmation?.kind === "delete") void confirmDelete(confirmation.memory); else if (confirmation?.kind === "clear") void confirmClear(confirmation.target); }}
+        okText={confirmation?.kind === "delete" ? t("memory.delete") : t(confirmation?.kind === "clear" && confirmation.target === "user" ? "memory.clearTarget.user" : "memory.clearTarget.agent")}
+        cancelText={t("memory.cancel")}
+        okButtonProps={{ danger: true, disabled: busy }}
+      >
+        {t(confirmation?.kind === "delete" ? "memory.deleteConfirm" : "memory.clearConfirm")}
+      </Modal> : null}
+    </div>
   );
 }

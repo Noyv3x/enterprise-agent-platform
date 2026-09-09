@@ -10,13 +10,19 @@ export const chatMessages = defineMessages({
     en: "Channel messages are visible to all members with workspace access",
     "zh-TW": "頻道訊息對平台內有權存取的成員公開",
   },
+  "nav.channels.memberVisible": { "zh-CN": "平台成员可见", en: "Visible to workspace members", "zh-TW": "平台成員可見" },
+  "nav.channel.nameHint": {
+    "zh-CN": "使用 2–49 个英文字母或数字，可含 _ . -。保存时转为小写，空格转为连字符。",
+    en: "Use 2–49 English letters or digits; _ . - are allowed. Names are saved in lowercase and spaces become hyphens.",
+    "zh-TW": "使用 2–49 個英文字母或數字，可含 _ . -。儲存時轉為小寫，空格轉為連字號。",
+  },
   "nav.privateAgent": { "zh-CN": "个人 AI", en: "Personal AI", "zh-TW": "個人 AI" },
   "nav.settings": { "zh-CN": "设置", en: "Settings", "zh-TW": "設定" },
-  "nav.admin": { "zh-CN": "管理面板", en: "Admin", "zh-TW": "管理面板" },
+  "nav.admin": { "zh-CN": "管理面板", en: "Administration", "zh-TW": "管理面板" },
   "nav.channels.empty": {
-    "zh-CN": "暂无公共频道，创建一个开始协作。",
-    en: "No public channels yet. Create one to start collaborating.",
-    "zh-TW": "尚無公共頻道，建立一個以開始協作。",
+    "zh-CN": "暂无公共频道",
+    en: "No public channels",
+    "zh-TW": "尚無公共頻道",
   },
   "nav.channel.createPlaceholder": {
     "zh-CN": "新公共频道名称",
@@ -48,9 +54,9 @@ export const chatMessages = defineMessages({
     "zh-TW": "Telegram 私訊設定",
   },
   "nav.topbar.privateSubtitle": {
-    "zh-CN": "仅你可见的个人 AI 会话",
-    en: "A Personal AI conversation visible only to you",
-    "zh-TW": "只有你看得到的個人 AI 對話",
+    "zh-CN": "在下方输入消息或添加附件。",
+    en: "Enter a message or attach files below.",
+    "zh-TW": "在下方輸入訊息或新增附件。",
   },
   "nav.topbar.adminSubtitle": {
     "zh-CN": "系统管理与运行配置",
@@ -79,21 +85,20 @@ export const chatMessages = defineMessages({
     "zh-TW": "個人 AI 使用指南",
   },
   "personalAi.guide.title": {
-    "zh-CN": "认识你的个人 AI",
-    en: "Meet your Personal AI",
-    "zh-TW": "認識你的個人 AI",
+    "zh-CN": "个人 AI 使用指南",
+    en: "Personal AI guide",
+    "zh-TW": "個人 AI 使用指南",
   },
   "personalAi.guide.description": {
-    "zh-CN": "每个 AI 都有自己的电脑和工作区，能完成大部分日常工作。选择一项直接试试。",
-    en: "Every AI has its own computer and workspace and can handle most day-to-day tasks. Pick something to try.",
-    "zh-TW": "每個 AI 都有自己的電腦和工作區，能完成大部分日常工作。選一項直接試試。",
+    "zh-CN": "个人 AI 和每个频道的主 Agent 各有自己的电脑与文件工作区，可以运行命令、处理文件和操作网页。文件可在后续任务中继续使用；有可查看的工作内容时，可打开 AI 的电脑查看。",
+    en: "Your Personal AI and each channel's main Agent have their own computer and file workspace for commands, files, and browser tasks. Files remain available for later tasks. Open the AI computer when work content is available to view.",
+    "zh-TW": "個人 AI 和每個頻道的主 Agent 各有自己的電腦與檔案工作區，可以執行命令、處理檔案和操作網頁。檔案可在後續任務中繼續使用；有可查看的工作內容時，可開啟 AI 的電腦查看。",
   },
   "personalAi.guide.reopen": {
     "zh-CN": "这个指南会一直保留在侧边栏，之后可以随时再次打开。",
     en: "This guide stays in the sidebar, so you can reopen it at any time.",
     "zh-TW": "這個指南會一直保留在側邊欄，之後可以隨時再次開啟。",
   },
-  "personalAi.guide.try": { "zh-CN": "试试", en: "Try", "zh-TW": "試試" },
   "personalAi.guide.tryNamed": {
     "zh-CN": "试试：{capability}",
     en: "Try: {capability}",
@@ -110,11 +115,6 @@ export const chatMessages = defineMessages({
     en: "Its own computer",
     "zh-TW": "一台自己的電腦",
   },
-  "personalAi.guide.computer.description": {
-    "zh-CN": "在独立工作区里运行命令、整理项目，并长期保留有用文件。",
-    en: "Run commands, organize projects, and keep useful files in an independent workspace.",
-    "zh-TW": "在獨立工作區裡執行命令、整理專案，並長期保留有用檔案。",
-  },
   "personalAi.guide.computer.prompt": {
     "zh-CN": "请检查你的工作区，说明当前目录结构，并创建一份 README.md 介绍如何保持工作区整洁。完成后把文件发给我。",
     en: "Inspect your workspace, explain its current structure, and create a README.md about keeping it tidy. Send me the file when it is ready.",
@@ -126,9 +126,9 @@ export const chatMessages = defineMessages({
     "zh-TW": "處理並交付檔案",
   },
   "personalAi.guide.files.description": {
-    "zh-CN": "制作和整理表格、文档、演示稿、PDF 等真实文件。",
-    en: "Create and organize real spreadsheets, documents, presentations, PDFs, and more.",
-    "zh-TW": "製作和整理試算表、文件、簡報、PDF 等真實檔案。",
+    "zh-CN": "可提供文件或说明所需格式，让 AI 制作、整理并发送表格、文档、演示稿或 PDF。",
+    en: "Provide files or specify a format for AI to create, organize, and send spreadsheets, documents, presentations, or PDFs.",
+    "zh-TW": "可提供檔案或說明所需格式，讓 AI 製作、整理並傳送試算表、文件、簡報或 PDF。",
   },
   "personalAi.guide.files.prompt": {
     "zh-CN": "请帮我制作一份 Excel 任务计划表并作为文件发送给我。开始前先问我需要哪些项目和字段。",
@@ -165,6 +165,7 @@ export const chatMessages = defineMessages({
     "zh-TW": "最近一次已完成回覆後的上下文占用。",
   },
   "chat.context.used": { "zh-CN": "已使用", en: "Used", "zh-TW": "已使用" },
+  "chat.context.limit": { "zh-CN": "上下文上限", en: "Context limit", "zh-TW": "上下文上限" },
   "chat.context.percent": {
     "zh-CN": "{percent}%",
     en: "{percent}%",
@@ -270,6 +271,7 @@ export const chatMessages = defineMessages({
     en: "Your current permission group has read-only access",
     "zh-TW": "目前權限群組只能檢視內容",
   },
+  "chat.composer.label": { "zh-CN": "消息编辑区", en: "Message composer", "zh-TW": "訊息編輯區" },
   "chat.composer.inputLabel": { "zh-CN": "消息输入框", en: "Message input", "zh-TW": "訊息輸入框" },
   "chat.composer.send": { "zh-CN": "发送", en: "Send", "zh-TW": "傳送" },
   "chat.sendFailed": { "zh-CN": "发送失败", en: "Send failed", "zh-TW": "傳送失敗" },
@@ -365,26 +367,31 @@ export const chatMessages = defineMessages({
   },
 
   "chat.empty.noChannelTitle": { "zh-CN": "还没有公共频道", en: "No public channels yet", "zh-TW": "尚無公共頻道" },
-  "chat.empty.noChannelText": {
-    "zh-CN": "在左侧创建一个公共频道，开始与团队和 Agent 协作。",
-    en: "Create a public channel from the sidebar to collaborate with your team and Agent.",
-    "zh-TW": "在左側建立一個公共頻道，開始與團隊和 Agent 協作。",
+  "chat.empty.noAccessibleChannelText": {
+    "zh-CN": "当前没有可访问的公共频道。请从导航选择可用的会话。",
+    en: "No public channel is currently available to you. Choose an available conversation from navigation.",
+    "zh-TW": "目前沒有可存取的公共頻道。請從導覽選擇可用的對話。",
+  },
+  "chat.empty.readOnlyChannelText": {
+    "zh-CN": "该公共频道的消息对成员可见。你的账号可以阅读，但不能发送消息。",
+    en: "Messages in this public channel are visible to members. Your account can read, but cannot send messages.",
+    "zh-TW": "此公共頻道的訊息對成員可見。你的帳號可以閱讀，但不能傳送訊息。",
   },
   "chat.empty.privateTitle": {
-    "zh-CN": "开启你的个人 AI",
-    en: "Start your Personal AI",
-    "zh-TW": "開啟你的個人 AI",
+    "zh-CN": "暂无消息",
+    en: "No messages yet",
+    "zh-TW": "尚無訊息",
   },
   "chat.empty.privateText": {
-    "zh-CN": "这是仅你可见的助手。发送第一条消息试试看。",
-    en: "This assistant is visible only to you. Send your first message to get started.",
-    "zh-TW": "這是只有你看得到的助理。傳送第一則訊息試試看。",
+    "zh-CN": "在下方输入消息，可附上需要处理的文件。",
+    en: "Enter a message below. You can attach files to work on.",
+    "zh-TW": "在下方輸入訊息，可附上需要處理的檔案。",
   },
   "chat.empty.channelTitle": { "zh-CN": "暂无消息", en: "No messages yet", "zh-TW": "尚無訊息" },
   "chat.empty.channelText": {
-    "zh-CN": "成为第一个在该公共频道发言的人。消息对所有成员可见，需要时 @agent。",
-    en: "Be the first to post in this public channel. All members can see it; mention @agent when needed.",
-    "zh-TW": "成為第一個在此公共頻道發言的人。訊息對所有成員可見，需要時 @agent。",
+    "zh-CN": "在下方输入消息。消息对频道成员可见，需要 AI 回复时请 @agent。",
+    en: "Enter a message below. Channel members can see messages; mention @agent for an AI response.",
+    "zh-TW": "在下方輸入訊息。訊息對頻道成員可見，需要 AI 回覆時請 @agent。",
   },
   "chat.log.privateLabel": {
     "zh-CN": "个人 AI 消息",
@@ -394,6 +401,7 @@ export const chatMessages = defineMessages({
   "chat.log.channelLabel": { "zh-CN": "公共频道消息", en: "Public channel messages", "zh-TW": "公共頻道訊息" },
   "chat.message.sending": { "zh-CN": "发送中", en: "Sending", "zh-TW": "傳送中" },
   "chat.message.generating": { "zh-CN": "生成中", en: "Generating", "zh-TW": "產生中" },
+  "chat.message.needsReview": { "zh-CN": "未完成 · 需要复核", en: "Unfinished · Needs review", "zh-TW": "未完成 · 需要複核" },
   "chat.withdraw.action": { "zh-CN": "撤回", en: "Withdraw", "zh-TW": "收回" },
   "chat.withdraw.confirmTitle": {
     "zh-CN": "撤回这条消息？",
@@ -647,6 +655,7 @@ export const chatMessages = defineMessages({
 
   "chat.telegram.botFallback": { "zh-CN": "Telegram Bot", en: "Telegram bot", "zh-TW": "Telegram Bot" },
   "chat.telegram.title": { "zh-CN": "Telegram 私聊", en: "Telegram direct messages", "zh-TW": "Telegram 私訊" },
+  "chat.telegram.refresh": { "zh-CN": "刷新绑定状态", en: "Refresh binding status", "zh-TW": "重新整理綁定狀態" },
   "chat.telegram.statusLinked": { "zh-CN": "{bot} 已绑定", en: "{bot} linked", "zh-TW": "{bot} 已綁定" },
   "chat.telegram.statusDisabled": {
     "zh-CN": "管理员尚未启用",

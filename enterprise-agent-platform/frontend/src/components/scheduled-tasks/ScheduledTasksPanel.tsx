@@ -1,180 +1,22 @@
-import { Badge, Button, Card, Descriptions, Space, Tag, Typography } from "antd";
+import { Button, Space } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  deleteAgentSchedule,
-  loadAgentSchedule,
-  loadAgentScheduleRuns,
-  loadAgentSchedules,
-  pauseAgentSchedule,
-  resumeAgentSchedule,
-  runAgentScheduleNow,
-} from "../../data/scheduleActions";
+import { deleteAgentSchedule, loadAgentSchedule, loadAgentScheduleRuns, loadAgentSchedules, pauseAgentSchedule, resumeAgentSchedule, runAgentScheduleNow } from "../../data/scheduleActions";
 import { toast } from "../../context/ToastContext";
 import { intlLocale, useI18n } from "../../i18n";
 import type { AgentSchedule, AgentScheduleRun } from "../../types";
 import { ConfirmDialog } from "../common/ConfirmDialog";
-import { EmptyState } from "../common/EmptyState";
-import { Icon } from "../common/Icon";
-import { InlineAlert } from "../common/InlineAlert";
-import { Spinner } from "../common/Spinner";
+import { CapabilityHeader, ResourceList, ResourceRow, StatusMark, Notice, DataRegion, EmptyState, FactGrid, SplitDetail, Section } from "../ui/fieldwork";
+import { formatScheduleDate, scheduleIsRunning, scheduleRuleLabel, scheduleRunStatusLabel, scheduleStateLabel } from "./scheduleFormat";
 import "./scheduled-tasks.css";
-import {
-  formatScheduleDate,
-  scheduleIsRunning,
-  scheduleRuleLabel,
-  scheduleRunStatusLabel,
-  scheduleStateLabel,
-} from "./scheduleFormat";
 
 const HISTORY_PAGE_SIZE = 20;
-
-type Confirmation =
-  | { kind: "run"; schedule: AgentSchedule }
-  | { kind: "delete"; schedule: AgentSchedule }
-  | null;
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function taskTone(schedule: AgentSchedule): "success" | "warning" | "default" {
-  if (scheduleIsRunning(schedule) || schedule.state === "active") return "success";
-  return schedule.state === "paused" ? "warning" : "default";
-}
-
-function runTone(status: string): "success" | "warning" | "error" | "default" {
-  if (status === "succeeded") return "success";
-  if (status === "failed" || status === "blocked") return "error";
-  if (status === "queued" || status === "running" || status === "needs_review") return "warning";
-  return "default";
-}
-
-function TaskStatus({ schedule }: { schedule: AgentSchedule }) {
-  const { t } = useI18n();
-  const running = scheduleIsRunning(schedule);
-  const label = running && schedule.last_run
-    ? scheduleRunStatusLabel(schedule.last_run.status, t)
-    : scheduleStateLabel(schedule.state, t);
-  return (
-    <Badge className={running ? "schedule-status is-running" : "schedule-status"} status={taskTone(schedule)} text={label} />
-  );
-}
-
-interface ScheduleCardProps {
-  schedule: AgentSchedule;
-  busy: boolean;
-  onHistory?: () => void;
-  onPause: () => void;
-  onResume: () => void;
-  onRunNow: () => void;
-  onDelete: () => void;
-}
-
-function ScheduleCard({
-  schedule,
-  busy,
-  onHistory,
-  onPause,
-  onResume,
-  onRunNow,
-  onDelete,
-}: ScheduleCardProps) {
-  const { t, locale } = useI18n();
-  const intl = intlLocale(locale);
-  const next = formatScheduleDate(schedule.next_run_at, intl, schedule.timezone);
-  const last = formatScheduleDate(schedule.last_run?.scheduled_for, intl, schedule.timezone);
-
-  return (
-    <article className="schedule-card">
-      <Card className="schedule-card__surface" classNames={{ body: "schedule-card__body" }} size="small">
-        <header className="schedule-card__head">
-          <div>
-            <Typography.Title level={3}>{schedule.name}</Typography.Title>
-            <TaskStatus schedule={schedule} />
-          </div>
-          <Tag className="schedule-card__id">#{schedule.id}</Tag>
-        </header>
-        <Typography.Paragraph className="schedule-card__prompt" title={schedule.prompt} ellipsis={{ rows: 2 }}>
-          {schedule.prompt}
-        </Typography.Paragraph>
-        <Descriptions
-          className="schedule-card__facts"
-          size="small"
-          column={1}
-          items={[
-            {
-              key: "schedule",
-              label: t("scheduledTasks.schedule"),
-              children: scheduleRuleLabel(schedule.schedule, schedule.timezone, intl, t),
-            },
-            {
-              key: "next",
-              label: t("scheduledTasks.nextRunLabel"),
-              children: next || t("scheduledTasks.noNextRun"),
-            },
-          ]}
-        />
-        <Space className="schedule-card__meta" orientation="vertical" size={2}>
-          <Typography.Text type="secondary">{t("scheduledTasks.timezone", { timezone: schedule.timezone })}</Typography.Text>
-          {last && schedule.last_run ? (
-            <Typography.Text type="secondary">
-              {t("scheduledTasks.lastRun", { time: last })} · {scheduleRunStatusLabel(schedule.last_run.status, t)}
-            </Typography.Text>
-          ) : null}
-          <Typography.Text type="secondary">
-            {schedule.delivery === "chat_and_telegram"
-              ? t("scheduledTasks.delivery.telegram")
-              : t("scheduledTasks.delivery.chat")}
-          </Typography.Text>
-        </Space>
-        <footer className="schedule-card__actions">
-          {onHistory ? (
-            <Button size="small" disabled={busy} onClick={onHistory} icon={<Icon name="barChart" size={14} />}>
-              {t("scheduledTasks.history")}
-            </Button>
-          ) : null}
-          {schedule.state === "active" ? (
-            <Button size="small" disabled={busy} onClick={onPause}>
-              {t("scheduledTasks.pause")}
-            </Button>
-          ) : schedule.state === "paused" ? (
-            <Button size="small" disabled={busy} onClick={onResume}>
-              {t("scheduledTasks.resume")}
-            </Button>
-          ) : null}
-          <Button size="small" disabled={busy} onClick={onRunNow} icon={<Icon name="send" size={14} />}>
-            {t("scheduledTasks.runNow")}
-          </Button>
-          <Button size="small" danger disabled={busy} onClick={onDelete} icon={<Icon name="trash" size={14} />}>
-            {t("scheduledTasks.delete")}
-          </Button>
-        </footer>
-      </Card>
-    </article>
-  );
-}
-
-function RunHistoryRow({ run, timezone }: { run: AgentScheduleRun; timezone: string }) {
-  const { t, locale } = useI18n();
-  const intl = intlLocale(locale);
-  return (
-    <li className="schedule-run">
-      <div className="schedule-run__head">
-        <Badge
-          className={run.status === "running" ? "schedule-run__status is-running" : "schedule-run__status"}
-          status={runTone(run.status)}
-          text={scheduleRunStatusLabel(run.status, t)}
-        />
-        <Tag className="schedule-run__id">#{run.id}</Tag>
-      </div>
-      <div className="schedule-run__times">
-        <Typography.Text type="secondary">{t("scheduledTasks.scheduledFor", { time: formatScheduleDate(run.scheduled_for, intl, timezone) })}</Typography.Text>
-        {run.started_at ? <Typography.Text type="secondary">{t("scheduledTasks.startedAt", { time: formatScheduleDate(run.started_at, intl, timezone) })}</Typography.Text> : null}
-        {run.finished_at ? <Typography.Text type="secondary">{t("scheduledTasks.finishedAt", { time: formatScheduleDate(run.finished_at, intl, timezone) })}</Typography.Text> : null}
-      </div>
-      {run.error ? <Typography.Paragraph className="schedule-run__error">{run.error}</Typography.Paragraph> : null}
-    </li>
-  );
+type Confirmation = { kind: "run" | "delete"; schedule: AgentSchedule } | null;
+function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+function RunHistoryRow({run,timezone}:{run:AgentScheduleRun;timezone:string}) {
+ const {t,locale}=useI18n(); const intl=intlLocale(locale);
+ return <ResourceRow title={<code>#{run.id}</code>} status={<StatusMark tone={run.status === "succeeded" ? "success" : run.status === "failed" || run.status === "blocked" ? "danger" : "warning"}>{scheduleRunStatusLabel(run.status,t)}</StatusMark>}
+ meta={<Space orientation="vertical"><span>{t("scheduledTasks.scheduledFor",{time:formatScheduleDate(run.scheduled_for,intl,timezone)})}</span>{run.started_at ? <span>{t("scheduledTasks.startedAt",{time:formatScheduleDate(run.started_at,intl,timezone)})}</span> : null}{run.finished_at ? <span>{t("scheduledTasks.finishedAt",{time:formatScheduleDate(run.finished_at,intl,timezone)})}</span> : null}</Space>}>
+ {run.error ? <Notice tone="danger" title={run.error}/> : null}</ResourceRow>;
 }
 
 export function ScheduledTasksPanel() {
@@ -422,126 +264,32 @@ export function ScheduledTasksPanel() {
     }
   };
 
-  const card = (schedule: AgentSchedule, showHistory = true) => (
-    <ScheduleCard
-      key={schedule.id}
-      schedule={schedule}
-      busy={!!busyKey}
-      onHistory={showHistory ? () => {
-        if (selectedId === schedule.id) setHistoryRevision((value) => value + 1);
-        else selectSchedule(schedule.id);
-      } : undefined}
-      onPause={() => handlePause(schedule)}
-      onResume={() => handleResume(schedule)}
-      onRunNow={() => setConfirmation({ kind: "run", schedule })}
-      onDelete={() => setConfirmation({ kind: "delete", schedule })}
-    />
-  );
-
-  return (
-    <section className="scheduled-tasks" aria-label={t("scheduledTasks.title")}>
-      {mutationError ? <InlineAlert variant="error">{mutationError}</InlineAlert> : null}
-      {selectedId != null ? (
-        <div className="schedule-history">
-          <div className="schedule-panel__toolbar">
-            <Button size="small" onClick={() => selectSchedule(null)}>
-              <span aria-hidden="true">←</span>
-              <span>{t("scheduledTasks.back")}</span>
-            </Button>
-            <Typography.Text>{detail ? t("scheduledTasks.historyFor", { name: detail.name }) : t("scheduledTasks.history")}</Typography.Text>
-            <Button
-              type="text"
-              shape="circle"
-              disabled={historyLoading || !!busyKey}
-              aria-label={t("scheduledTasks.refreshHistory")}
-              title={t("scheduledTasks.refreshHistory")}
-              icon={<Icon name="refresh" size={14} cls={historyLoading ? "spin" : undefined} />}
-              onClick={() => setHistoryRevision((value) => value + 1)}
-            />
-          </div>
-          {historyError ? (
-            <InlineAlert
-              variant="error"
-              action={<Button size="small" onClick={() => setHistoryRevision((value) => value + 1)}>{t("resource.retry")}</Button>}
-            >
-              {historyError}
-            </InlineAlert>
-          ) : null}
-          {historyLoading && !detail ? (
-            <div className="schedule-panel__loading" role="status">
-              <Spinner size={20} />
-              <span>{t("scheduledTasks.loading")}</span>
-            </div>
-          ) : detail ? (
-            <>
-              {card(detail, false)}
-              {runs.length ? (
-                <ol className="schedule-runs">
-                  {runs.map((run) => <RunHistoryRow key={run.id} run={run} timezone={detail.timezone} />)}
-                </ol>
-              ) : !historyLoading ? (
-                <EmptyState icon="barChart" title={t("scheduledTasks.historyEmpty")} text={t("scheduledTasks.historyEmptyDetail")} />
-              ) : null}
-              {historyLoading && runs.length ? <div className="schedule-panel__more"><Spinner size={16} /></div> : null}
-              {nextBeforeId != null ? (
-                <Button className="schedule-panel__load-more" size="small" disabled={historyLoading} onClick={() => void loadMore()}>
-                  {t("scheduledTasks.loadMore")}
-                </Button>
-              ) : null}
-            </>
-          ) : null}
-        </div>
-      ) : (
-        <>
-          <div className="schedule-panel__toolbar">
-            <Typography.Text>{t("scheduledTasks.count", { count: schedules.length })}</Typography.Text>
-            <Button
-              size="small"
-              disabled={loading || !!busyKey}
-              icon={<Icon name="refresh" size={14} cls={loading ? "spin" : undefined} />}
-              onClick={() => void refresh()}
-            >
-              {t("scheduledTasks.refresh")}
-            </Button>
-          </div>
-          {loadError ? (
-            <InlineAlert
-              variant="error"
-              title={t("scheduledTasks.loadFailed")}
-              action={<Button size="small" onClick={() => void refresh()}>{t("resource.retry")}</Button>}
-            >
-              {loadError}
-            </InlineAlert>
-          ) : null}
-          {loading && !schedules.length ? (
-            <div className="schedule-panel__loading" role="status">
-              <Spinner size={20} />
-              <span>{t("scheduledTasks.loading")}</span>
-            </div>
-          ) : schedules.length ? (
-            <div className="schedule-list">{schedules.map((schedule) => card(schedule))}</div>
-          ) : !loadError ? (
-            <EmptyState icon="calendar" title={t("scheduledTasks.empty")} text={t("scheduledTasks.emptyDetail")} />
-          ) : null}
-        </>
-      )}
-      {confirmation ? (
-        <ConfirmDialog
-          danger={confirmation.kind === "delete"}
-          title={confirmation.kind === "delete" ? t("scheduledTasks.deleteConfirmTitle") : t("scheduledTasks.runNowConfirmTitle")}
-          message={confirmation.kind === "delete"
-            ? t("scheduledTasks.deleteConfirm", { name: confirmation.schedule.name })
-            : t("scheduledTasks.runNowConfirm", { name: confirmation.schedule.name })}
-          confirmText={confirmation.kind === "delete" ? t("scheduledTasks.delete") : t("scheduledTasks.runNow")}
-          onCancel={() => setConfirmation(null)}
-          onConfirm={() => {
-            const current = confirmation;
-            setConfirmation(null);
-            if (current.kind === "delete") void handleDelete(current.schedule);
-            else handleRunNow(current.schedule);
-          }}
-        />
-      ) : null}
-    </section>
-  );
+  const { locale } = useI18n();
+  const intl = intlLocale(locale);
+  const taskRow = (schedule: AgentSchedule, detailed = false) => {
+    if (!detailed && selectedId === schedule.id) return <ResourceRow key={schedule.id} title={schedule.name} selected />;
+    return <ResourceRow key={schedule.id}
+    title={<h3>{schedule.name}</h3>} description={detailed ? <p className="wf-schedule-prompt">{schedule.prompt}</p> : scheduleRuleLabel(schedule.schedule,schedule.timezone,intl,t)}
+    selected={selectedId === schedule.id}
+    status={<StatusMark tone={scheduleIsRunning(schedule) || schedule.state === "active" ? "success" : schedule.state === "paused" ? "warning" : "neutral"}>{scheduleIsRunning(schedule) && schedule.last_run ? scheduleRunStatusLabel(schedule.last_run.status,t) : scheduleStateLabel(schedule.state,t)}</StatusMark>}
+    meta={<Space orientation="vertical"><span>{t("scheduledTasks.timezone",{timezone:schedule.timezone})}</span><span>{formatScheduleDate(schedule.next_run_at,intl,schedule.timezone) || t("scheduledTasks.noNextRun")}</span>{schedule.last_run ? <span>{t("scheduledTasks.lastRun",{time:formatScheduleDate(schedule.last_run.scheduled_for,intl,schedule.timezone)})} · {scheduleRunStatusLabel(schedule.last_run.status,t)}</span> : null}<span>{t(schedule.delivery === "chat_and_telegram" ? "scheduledTasks.delivery.telegram" : "scheduledTasks.delivery.chat")}</span></Space>}
+    actions={<Space wrap>{!detailed ? <Button disabled={!!busyKey || loading} onClick={() => {if(selectedId === schedule.id)setHistoryRevision(value=>value+1);else selectSchedule(schedule.id);}}>{t("scheduledTasks.history")}</Button> : null}
+      {schedule.state === "active" ? <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => handlePause(schedule)}>{t("scheduledTasks.pause")}</Button> : schedule.state === "paused" ? <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => handleResume(schedule)}>{t("scheduledTasks.resume")}</Button> : null}
+      <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"run",schedule})}>{t("scheduledTasks.runNow")}</Button><Button danger disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"delete",schedule})}>{t("scheduledTasks.delete")}</Button>
+    </Space>}>
+      {detailed ? <FactGrid columns={2} items={[{key:"id",label:t("scheduledTasks.idLabel"),value:schedule.id},{key:"rule",label:t("scheduledTasks.schedule"),value:scheduleRuleLabel(schedule.schedule,schedule.timezone,intl,t)},{key:"next",label:t("scheduledTasks.nextRunLabel"),value:formatScheduleDate(schedule.next_run_at,intl,schedule.timezone)||t("scheduledTasks.noNextRun")},{key:"created",label:t("scheduledTasks.createdAtLabel"),value:formatScheduleDate(schedule.created_at,intl,schedule.timezone)},{key:"updated",label:t("scheduledTasks.updatedAtLabel"),value:formatScheduleDate(schedule.updated_at,intl,schedule.timezone)}]}/> : null}
+    </ResourceRow>;
+  };
+  return <section className="wf-schedules" aria-label={t("scheduledTasks.title")}>
+    <CapabilityHeader title={t("scheduledTasks.title")} description={t("scheduledTasks.emptyDetail")} actions={<Button disabled={loading || !!busyKey} onClick={() => void refresh()}>{t("scheduledTasks.refresh")}</Button>}/>
+    {mutationError ? <Notice tone="danger" title={mutationError}/> : null}
+    <SplitDetail detailOpen={selectedId != null} onBack={() => selectSchedule(null)} backLabel={t("scheduledTasks.back")}
+      list={<DataRegion state={schedules.length ? "ready" : loading ? "loading" : loadError ? "error" : "empty"} loadingLabel={t("scheduledTasks.loading")} error={loadError} refreshing={loading && !!schedules.length} refreshingLabel={t("scheduledTasks.loading")} retry={<Button onClick={() => void refresh()}>{t("resource.retry")}</Button>} empty={<EmptyState title={t("scheduledTasks.empty")}/>}><ResourceList label={t("scheduledTasks.count",{count:schedules.length})}>{schedules.map(schedule=>taskRow(schedule))}</ResourceList></DataRegion>}
+      detail={selectedId != null ? <Section title={detail ? t("scheduledTasks.historyFor",{name:detail.name}) : t("scheduledTasks.history")} actions={<Button disabled={historyLoading || !!busyKey} onClick={() => setHistoryRevision(value=>value+1)}>{t("scheduledTasks.refreshHistory")}</Button>}>
+        <DataRegion state={detail ? "ready" : historyLoading ? "loading" : historyError ? "error" : "empty"} loadingLabel={t("scheduledTasks.loading")} error={historyError} refreshing={historyLoading && !!detail} refreshingLabel={t("scheduledTasks.loading")} retry={<Button onClick={() => setHistoryRevision(value=>value+1)}>{t("resource.retry")}</Button>}>
+          {detail ? <><ResourceList>{taskRow(detail,true)}</ResourceList>{runs.length ? <ResourceList label={t("scheduledTasks.history")}>{runs.map(run=><RunHistoryRow key={run.id} run={run} timezone={detail.timezone}/>)}</ResourceList> : !historyLoading ? <EmptyState title={t("scheduledTasks.historyEmpty")} description={t("scheduledTasks.historyEmptyDetail")}/> : null}{nextBeforeId != null ? <Button disabled={historyLoading || !!busyKey} onClick={() => void loadMore()}>{t("scheduledTasks.loadMore")}</Button> : null}</> : null}
+        </DataRegion>
+      </Section> : null}/>
+    {confirmation ? <ConfirmDialog danger={confirmation.kind === "delete"} title={t(confirmation.kind === "delete" ? "scheduledTasks.deleteConfirmTitle" : "scheduledTasks.runNowConfirmTitle")} message={t(confirmation.kind === "delete" ? "scheduledTasks.deleteConfirm" : "scheduledTasks.runNowConfirm",{name:confirmation.schedule.name})} confirmText={t(confirmation.kind === "delete" ? "scheduledTasks.delete" : "scheduledTasks.runNow")} onCancel={() => setConfirmation(null)} onConfirm={() => {const current=confirmation;setConfirmation(null);if(current.kind === "delete")void handleDelete(current.schedule);else handleRunNow(current.schedule);}}/> : null}
+  </section>;
 }

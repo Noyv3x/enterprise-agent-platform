@@ -6,18 +6,16 @@ export const LOCALE_NAMES: Record<Locale, string> = {
   en: "English",
   "zh-TW": "繁體中文",
 };
+const localeOptions = SUPPORTED_LOCALES.map((value) => ({ value, label: LOCALE_NAMES[value] }));
 
 export function LanguageSelect() {
   const { locale, setLocale, t } = useI18n();
-  return (
-    <Select
-      className="language-select"
-      aria-label={t("language.label")}
-      title={t("language.label")}
-      value={locale}
-      onChange={(value) => setLocale(value as Locale)}
-      options={SUPPORTED_LOCALES.map((item) => ({ value: item, label: LOCALE_NAMES[item] }))}
-      popupMatchSelectWidth={false}
-    />
-  );
+  return <Select<Locale>
+    aria-label={t("language.label")}
+    title={t("language.label")}
+    value={locale}
+    onChange={setLocale}
+    options={localeOptions}
+    popupMatchSelectWidth={false}
+  />;
 }

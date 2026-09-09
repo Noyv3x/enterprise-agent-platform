@@ -1,74 +1,26 @@
-/* <GrokOAuthFlow/> — manual-callback verification UI: open the authorize URL,
-   show the redirect URI, paste the full callback URL, and complete verification
-   from the callback textarea. It is controlled by store state
-   (oauthCallbackUrls[providerId]) — the same place
-   completeOAuthVerification reads from. The backend-supplied authorize_url runs
-   through safeUrl. */
-
-import { Button, Input, Typography } from "antd";
+import { Button, Form, Input, Typography } from "antd";
 import { completeOAuthVerification, setOAuthCallbackUrl } from "../../../data/adminActions";
+import { useI18n } from "../../../i18n";
 import { safeUrl } from "../../../lib/api";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { OAuthManualCallbackFlow } from "../../../types";
-import { Icon } from "../../common/Icon";
-import { useI18n } from "../../../i18n";
+import { FormFooter, Notice } from "../../ui/fieldwork";
 
-function flowStatus(t: ReturnType<typeof useI18n>["t"], status: string | undefined): string {
-  if (status === "waiting_for_user") return t("admin.oauth.waitingForUser");
-  if (status === "waiting_for_callback") return t("admin.oauth.waitingForCallback");
-  if (status === "complete") return t("admin.oauth.complete");
-  return status || t("admin.oauth.waiting");
-}
-
-export interface GrokOAuthFlowProps {
-  providerId: string;
-  flow: OAuthManualCallbackFlow;
-  callbackValue: string;
-}
-
+export interface GrokOAuthFlowProps { providerId: string; flow: OAuthManualCallbackFlow; callbackValue: string }
 export function GrokOAuthFlow({ providerId, flow, callbackValue }: GrokOAuthFlowProps) {
   const { t } = useI18n();
   const store = useStoreHandle();
-  const verifying = useStore((state) =>
-    state.pendingOperations.includes(`admin:oauth:complete:${providerId}`),
-  );
-
-  return (
-    <div className="oauth-guide">
-      <div className="oauth-line">
-        <span>{t("admin.oauth.authorizationPage")}</span>
-        <Typography.Link href={safeUrl(flow.authorize_url)} target="_blank" rel="noreferrer">
-          <span>{t("admin.oauth.openGrok")}</span>
-          <Icon name="external" size={13} />
-        </Typography.Link>
-      </div>
-      <div className="oauth-line">
-        <span>{t("admin.oauth.callbackAddress")}</span>
-        <code>{flow.redirect_uri}</code>
-      </div>
-      <Input.TextArea
-        aria-label={t("admin.oauth.callbackPlaceholder")}
-        placeholder={t("admin.oauth.callbackPlaceholder")}
-        value={callbackValue}
-        autoSize={{ minRows: 3, maxRows: 6 }}
-        onChange={(event) => setOAuthCallbackUrl(store, providerId, event.target.value)}
-      />
-      <div className="oauth-actions">
-        <Button
-          type="primary"
-          size="small"
-          disabled={!callbackValue.trim()}
-          loading={verifying}
-          aria-label={t(verifying ? "admin.common.verifying" : "admin.oauth.completeVerification")}
-          onClick={() => void completeOAuthVerification(store, providerId, flow.flow_id)}
-          icon={<Icon name="checkCircle" size={14} />}
-        >
-          {t("admin.oauth.completeVerification")}
-        </Button>
-        <Typography.Text className="muted" type="secondary" style={{ fontSize: "12px" }} aria-live="polite">
-          {t("admin.oauth.status", { status: flowStatus(t, flow.status) })}
-        </Typography.Text>
-      </div>
-    </div>
-  );
+  const verifying = useStore((state) => state.pendingOperations.includes(`admin:oauth:complete:${providerId}`));
+  const busy = useStore((state) => state.pendingOperations.some((key) => key.startsWith("admin:oauth:") && key.endsWith(`:${providerId}`)));
+  const status = flow.status === "waiting_for_callback" ? t("admin.oauth.waitingForCallback") : flow.status === "complete" ? t("admin.oauth.complete") : flow.status || t("admin.oauth.waiting");
+  return <Notice tone="info" title={t("admin.oauth.status", { status })}>
+    <ol>
+      <li><Typography.Link href={safeUrl(flow.authorize_url)} target="_blank" rel="noopener noreferrer">{t("admin.oauth.authorizationPage")}</Typography.Link></li>
+      <li><Typography.Text>{t("admin.oauth.callbackAddress")}: </Typography.Text><Typography.Text code>{flow.redirect_uri}</Typography.Text></li>
+    </ol>
+    <Form layout="vertical" onFinish={() => { if (callbackValue.trim() && !busy) void completeOAuthVerification(store, providerId, flow.flow_id); }}>
+      <Form.Item label={t("admin.oauth.callbackAddress")}><Input.TextArea aria-label={t("admin.oauth.callbackAddress")} value={callbackValue} placeholder={t("admin.oauth.callbackPlaceholder")} autoSize={{ minRows: 3, maxRows: 6 }} disabled={busy} onChange={(e) => setOAuthCallbackUrl(store, providerId, e.target.value)} /></Form.Item>
+      <FormFooter><Button htmlType="submit" loading={verifying} disabled={!callbackValue.trim() || busy || flow.complete}>{t("admin.oauth.completeVerification")}</Button></FormFooter>
+    </Form>
+  </Notice>;
 }

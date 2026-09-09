@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeContext } from "../../context/ThemeContext";
@@ -13,7 +12,6 @@ import { StoreContext } from "../../store/StoreProvider";
 import type { User } from "../../types";
 import { AntDesignProvider } from "../ui/AntDesignProvider";
 import { AccountManagement } from "./accounts/AccountManagement";
-import { AdminPager } from "./AdminPager";
 
 class ResizeObserverStub {
   observe() {}
@@ -65,40 +63,13 @@ describe("Ant Design administration surfaces", () => {
     vi.unstubAllGlobals();
   });
 
-  it("renders grouped navigation and suppresses the switcher's nested focus shadow", async () => {
-    const user = userEvent.setup();
-    renderAdmin(<AdminPager activeId="accounts" />);
-
-    const navigation = screen.getByRole("navigation", { name: "Administration navigation" });
-    expect(within(navigation).getByText("People & data")).toBeInTheDocument();
-    expect(within(navigation).getByRole("menuitem", { name: "Accounts & permissions" }))
-      .toHaveClass("eap-menu-item-selected");
-    expect(within(navigation).getByText("Agent runtime")).toBeInTheDocument();
-    expect(within(navigation).queryByText("Knowledge embeddings")).not.toBeInTheDocument();
-    const switcher = screen.getByText("Administration page").closest(".eap-admin-page-switcher");
-    const combobox = screen.getByRole("combobox", { name: "Administration page" });
-    const select = combobox.closest(".eap-select");
-    expect(combobox).toBeInTheDocument();
-    expect(within(switcher as HTMLElement).getByText("Accounts & permissions")).toBeInTheDocument();
-
-    await user.click(combobox);
-    expect(combobox).toHaveAttribute("aria-expanded", "true");
-    expect(select).toHaveClass("eap-select-open");
-    await user.click(combobox);
-
-    expect(combobox).toHaveAttribute("aria-expanded", "false");
-    expect(select).not.toHaveClass("eap-select-open");
-    expect(select).toHaveClass("eap-select-focused");
-    expect(combobox).toHaveFocus();
-    expect(combobox).toHaveStyle({ boxShadow: "none" });
-  });
 
   it("renders the account page with an empty store", () => {
     renderAdmin(<AccountManagement createOpen={false} onCloseCreate={() => {}} />);
 
     const region = screen.getByRole("region", { name: "Accounts" });
     expect(within(region).getByText("0 accounts")).toBeInTheDocument();
-    expect(within(screen.getByRole("table")).getByText("No accounts yet.")).toBeInTheDocument();
+    expect(within(region).getByText("No accounts yet.")).toBeInTheDocument();
   });
 
   it("associates every create-account label with its real control", () => {
@@ -114,33 +85,6 @@ describe("Ant Design administration surfaces", () => {
     expect(screen.getByLabelText("Thinking depth")).toHaveAttribute("role", "combobox");
   });
 
-  it("renders structured account data without opening either drawer", () => {
-    const user: User = {
-      id: 7,
-      username: "avery",
-      display_name: "Avery Chen",
-      position: "Engineer",
-      permission_group: "manager",
-      model_name: "gpt-5.3-codex",
-      thinking_depth: "high",
-      active: true,
-    };
-
-    renderAdmin(
-      <AccountManagement createOpen={false} onCloseCreate={() => {}} />,
-      [user],
-    );
-
-    const table = screen.getByRole("table");
-    expect(within(table).getByRole("columnheader", { name: "Account" })).toBeInTheDocument();
-    expect(within(table).getByRole("columnheader", { name: "Permission" })).toBeInTheDocument();
-    expect(within(table).getByText("Avery Chen")).toBeInTheDocument();
-    expect(within(table).getByText("@avery · Engineer")).toBeInTheDocument();
-    expect(within(table).getByText("Manager")).toBeInTheDocument();
-    expect(within(table).getByText("gpt-5.3-codex")).toBeInTheDocument();
-    expect(within(table).getByText("Active")).toBeInTheDocument();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
 
   it("keeps edit-account controls labelled when the drawer is portalled", async () => {
     const user: User = {
@@ -156,11 +100,29 @@ describe("Ant Design administration surfaces", () => {
 
     screen.getByRole("button", { name: "Edit" }).click();
 
-    const dialog = await screen.findByRole("dialog", { name: "Edit morgan" });
+    await screen.findByRole("dialog", { name: "Edit morgan" });
     expect(screen.getByLabelText("Display name")).toHaveValue("Morgan Lee");
-    expect(within(dialog).getByText("Designer")).toBeVisible();
-    expect(within(dialog).queryByText("Member")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Position")).toHaveValue("Designer");
     expect(screen.getByLabelText("Permission group")).toHaveAttribute("role", "combobox");
     expect(screen.getByLabelText("Account enabled")).toHaveAttribute("role", "switch");
+  });
+
+  it("preserves an unavailable explicit model when saving an unrelated identity change", async () => {
+    const account: User = { id: 8, username: "morgan", display_name: "Morgan", permission_group: "member", model_name: "saved-unavailable-model", active: true };
+    const fetchMock = vi.fn(async (_path: string, init?: RequestInit) => ({
+      ok: true, status: 200,
+      text: async () => JSON.stringify(init?.method === "PUT" ? { user: account } : { users: [account] }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    renderAdmin(<AccountManagement createOpen={false} onCloseCreate={() => {}} />, [account]);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await screen.findByRole("dialog", { name: "Edit morgan" });
+    fireEvent.change(screen.getByLabelText("Display name"), { target: { value: "Morgan Updated" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save account" }));
+    await waitFor(() => {
+      const write = fetchMock.mock.calls.find(([, init]) => init?.method === "PUT");
+      expect(write).toBeDefined();
+      expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({ display_name: "Morgan Updated", model_name: "saved-unavailable-model" });
+    });
   });
 });

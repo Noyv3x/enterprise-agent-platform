@@ -1,15 +1,3 @@
-/* <ChatView mode/> — the chat view shell shared by channel and private modes.
-   Owns the per-scope derivations
-   (scopeId, draftKey, gating, placeholder) and the two component-local render
-   tokens used for focus and scroll requests:
-
-   - focusToken: bumped on send, on scope/nav change, on attach-add, and on a
-     send-failure restore; <ComposerTextarea> re-focuses on each bump.
-   - forceBottomToken: bumped on the user's own send; <MessageList> snaps to bottom.
-
-   It renders <MessageList> + <Composer>. It does NOT mount useRealtime/usePolling —
-   those are shell-owned (AppShell) so the stream/poll are not duplicated. */
-
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
@@ -17,6 +5,9 @@ import { activeChannel, hasPermission, scopeIdFor, scopeTypeFor } from "../../st
 import { useStore } from "../../store/useStore";
 import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
+import { Topbar } from "../shell/Topbar";
+import { Notice } from "../ui/fieldwork";
+import { resourceKeys } from "../../data/resourceState";
 import { MessageList } from "./MessageList";
 import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";
 import { ComputerPip } from "../preview/ComputerPip";
@@ -69,20 +60,9 @@ export function ChatView({ mode }: { mode: ChatMode }) {
         : t("chat.composer.channelPlaceholder", { channel: channelName || t("nav.channel") })
       : t("chat.composer.readOnly");
 
-  return (
-    <ChatPreviewSidebar scope={previewScope} canManageSkills={canChat}>
-      <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken} />
-      <ComputerPip />
-      <Composer
-        mode={mode}
-        scopeId={scopeId}
-        draftKey={draftKey}
-        disabled={disabled}
-        placeholder={placeholder}
-        focusToken={focusToken}
-        onBumpFocus={bumpFocus}
-        onBumpForceBottom={bumpForceBottom}
-      />
-    </ChatPreviewSidebar>
-  );
+  return <ChatPreviewSidebar scope={previewScope} canManageSkills={canChat}>
+    <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken}
+      header={<Topbar/>} resourceKey={mode==="private"?resourceKeys.privateChat:resourceKeys.channelChat(scopeId)}
+      composer={<><ComputerPip/>{disabled?<Notice title={placeholder}/>:<Composer mode={mode} scopeId={scopeId} draftKey={draftKey} disabled={disabled} placeholder={placeholder} focusToken={focusToken} onBumpFocus={bumpFocus} onBumpForceBottom={bumpForceBottom}/>}</>}/>
+  </ChatPreviewSidebar>;
 }

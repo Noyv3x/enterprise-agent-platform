@@ -1,7 +1,9 @@
 import { Modal } from "antd";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, type ReactNode, type RefObject } from "react";
 import { useI18n } from "../../i18n";
+import { cx } from "../../lib/cx";
 import { useModalLayer, useTopLayerEscape } from "./modalStack";
+import { useFieldworkContainer } from "../ui/fieldwork";
 
 export interface DialogProps {
   id?: string;
@@ -15,27 +17,14 @@ export interface DialogProps {
   closeOnBackdrop?: boolean;
   showCloseButton?: boolean;
   afterOpenChange?: (open: boolean) => void;
-  /** Focus this element after the panel opens. */
-  initialFocusRef?: React.RefObject<HTMLElement | null>;
+  initialFocusRef?: RefObject<HTMLElement | null>;
 }
 
-/** Product-level dialog API backed by Ant Design's focus-managed Modal. */
-export function Dialog({
-  id,
-  open,
-  onClose,
-  title,
-  description,
-  children,
-  footer,
-  className,
-  closeOnBackdrop = true,
-  showCloseButton = true,
-  afterOpenChange,
-  initialFocusRef,
-}: DialogProps) {
+export function Dialog({ id, open, onClose, title, description, children, footer, className,
+  closeOnBackdrop = true, showCloseButton = true, afterOpenChange, initialFocusRef }: DialogProps) {
   const { t } = useI18n();
   const isTopLayer = useModalLayer(open);
+  const getContainer = useFieldworkContainer();
   useTopLayerEscape(isTopLayer, onClose);
 
   useEffect(() => {
@@ -44,26 +33,30 @@ export function Dialog({
     return () => window.cancelAnimationFrame(frame);
   }, [initialFocusRef, open]);
 
-  return (
-    <Modal
-      open={open}
-      onCancel={onClose}
-      title={title}
-      aria-label={typeof title === "string" ? title : undefined}
-      footer={footer ?? null}
-      className={className}
-      rootClassName="eap-dialog-root"
-      mask={{ closable: closeOnBackdrop && isTopLayer }}
-      closable={showCloseButton}
-      closeIcon={<span aria-label={t("common.close")}>×</span>}
-      keyboard={false}
-      destroyOnHidden
-      centered
-      afterOpenChange={afterOpenChange}
-      modalRender={(node) => id ? <div id={id}>{node}</div> : node}
-    >
-      {description ? <p className="eap-dialog__description">{description}</p> : null}
+  return <Modal
+    open={open}
+    getContainer={getContainer}
+    title={title}
+    aria-label={typeof title === "string" ? title : undefined}
+    onCancel={onClose}
+    keyboard={false}
+    mask={{ closable: closeOnBackdrop && isTopLayer }}
+    closable={showCloseButton ? { "aria-label": t("common.close") } : false}
+    footer={footer ?? null}
+    rootClassName="wf-dialog"
+    className={cx("wf-overlay", className)}
+    destroyOnHidden
+    focusTriggerAfterClose
+    centered
+    afterOpenChange={(visible) => {
+      if (visible) initialFocusRef?.current?.focus();
+      afterOpenChange?.(visible);
+    }}
+    modalRender={(panel) => id ? <div id={id}>{panel}</div> : panel}
+  >
+    <div className="wf-stack">
+      {description ? <div className="wf-muted">{description}</div> : null}
       {children}
-    </Modal>
-  );
+    </div>
+  </Modal>;
 }

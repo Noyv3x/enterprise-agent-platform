@@ -1,223 +1,116 @@
-import {
-  Alert,
-  Button,
-  Descriptions,
-  Input,
-  Popconfirm,
-  Progress,
-  Space,
-  Switch,
-  Tag,
-  Typography,
-} from "antd";
-import { useEffect, useId, useState } from "react";
-import {
-  checkAutoUpdateNow,
-  runManagerOperation,
-  saveAutoUpdateConfig,
-} from "../../../data/adminActions";
+import { Button, Form, Input, Space, Switch } from "antd";
+import { useEffect, useRef, useState } from "react";
+import { checkAutoUpdateNow, runManagerOperation, saveAutoUpdateConfig } from "../../../data/adminActions";
 import { loadAutoUpdateConfig } from "../../../data/loaders";
+import { useConfirm } from "../../../hooks/useConfirm";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import type { AutoUpdateConfigValues, AutoUpdateStatus, ManagerOperation } from "../../../types";
-import { formatTimestamp, shortSha } from "../../../utils/format";
-import { Field } from "../../common/Field";
-import { Icon } from "../../common/Icon";
-import { AdminCard } from "../AdminCard";
+import type { AutoUpdateConfigValues, ManagerOperation } from "../../../types";
+import { formatTimestamp } from "../../../utils/format";
+import { FactGrid, FormFooter, FormGrid, Notice, ResourceList, ResourceRow, Section, StatusMark } from "../../ui/fieldwork";
 
-const ACTIVE_STATES = new Set(["waiting_for_tasks", "updating"]);
-
-function stateLabel(t: ReturnType<typeof useI18n>["t"], status: AutoUpdateStatus): string {
-  switch (status.state) {
-    case "waiting_for_tasks": return t("admin.updates.state.waiting");
-    case "updating": return t("admin.updates.state.updating");
-    case "failed": return t("admin.updates.state.failed");
-    default: return t("admin.updates.idle");
-  }
-}
-
-function seedForm(config: AutoUpdateConfigValues) {
-  return {
-    enabled: config.enabled !== false,
-    interval: String(config.interval_seconds || 300),
-    manifestUrl: String(config.release_manifest_url || ""),
-  };
-}
-
-function generation(value: string | undefined): string {
-  return value ? value.slice(0, 18) : "-";
-}
+const SERVICES = ["platform", "agent-runtime", "camofox", "searxng", "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres", "firecrawl-api"];
+const STATES: Record<string, true> = { idle: true, waiting_for_tasks: true, updating: true, failed: true };
+function seed(config: AutoUpdateConfigValues) { return { enabled: config.enabled !== false, interval: String(config.interval_seconds ?? 300), manifest: config.release_manifest_url || "" }; }
 
 export function AutoUpdateConfig() {
   const { t } = useI18n();
   const store = useStoreHandle();
+  const { confirm, dialog } = useConfirm();
   const data = useStore((state) => state.autoUpdateConfig);
   const pending = useStore((state) => state.pendingOperations);
   const config = data?.config || {};
   const status = data?.status || {};
-  const [form, setForm] = useState(() => seedForm(config));
+  const [draft, setDraft] = useState(() => seed(config));
+  const [pollFailed, setPollFailed] = useState(false);
   const fingerprint = JSON.stringify(config);
-  const enabledLabelId = useId();
-
-  useEffect(() => setForm(seedForm(config)), [fingerprint]);
-
+  useEffect(() => setDraft(seed(config)), [fingerprint]);
   useEffect(() => {
     let stopped = false;
+    let inFlight = false;
     let timer: number | undefined;
     const refresh = async () => {
-      if (stopped || document.hidden) return;
-      try {
-        await loadAutoUpdateConfig(store);
-      } catch {
-        // UpdateGate owns manager/maintenance connectivity feedback.
-      } finally {
-        if (!stopped) {
-          timer = window.setTimeout(
-            () => void refresh(),
-            ACTIVE_STATES.has(String(store.getState().autoUpdateConfig?.status?.state)) ? 2_000 : 8_000,
-          );
-        }
+      if (stopped || document.hidden || inFlight) return;
+      inFlight = true;
+      try { await loadAutoUpdateConfig(store); if (!stopped) setPollFailed(false); }
+      catch { if (!stopped) setPollFailed(true); }
+      finally {
+        inFlight = false;
+        if (!stopped && !document.hidden) timer = window.setTimeout(() => void refresh(), ["waiting_for_tasks", "updating"].includes(String(store.getState().autoUpdateConfig?.status.state)) ? 2000 : 8000);
       }
     };
-    timer = window.setTimeout(() => void refresh(), 8_000);
-    const visibility = () => {
-      if (timer) window.clearTimeout(timer);
-      if (!document.hidden) void refresh();
-    };
+    const visibility = () => { if (timer) window.clearTimeout(timer); if (!document.hidden) void refresh(); };
+    timer = window.setTimeout(() => void refresh(), 8000);
     document.addEventListener("visibilitychange", visibility);
-    return () => {
-      stopped = true;
-      if (timer) window.clearTimeout(timer);
-      document.removeEventListener("visibilitychange", visibility);
-    };
+    return () => { stopped = true; if (timer) window.clearTimeout(timer); document.removeEventListener("visibilitychange", visibility); };
   }, [store]);
-
+  const available = !pollFailed && Number.isFinite(status.manager_generation) && STATES[String(status.state)] === true;
   const saving = pending.includes("admin:updates:save");
   const checking = pending.includes("admin:updates:check");
-  const operationRunning = pending.some((item) => item.startsWith("admin:updates:") && item !== "admin:updates:save" && item !== "admin:updates:check");
-  const busy = status.state === "updating" || operationRunning;
-  const dirty = JSON.stringify(form) !== JSON.stringify(seedForm(config));
-  const services = Object.entries(status.services || {});
-  const images = Object.entries(status.images || {});
-
-  const save = (event: React.FormEvent) => {
-    event.preventDefault();
-    void saveAutoUpdateConfig(store, {
-      enabled: form.enabled,
-      interval_seconds: form.interval,
-      release_manifest_url: form.manifestUrl,
-    });
+  const pendingMutation = pending.some((key) => key.startsWith("admin:updates:") || key === "admin:security:lan:save");
+  const blocked = !available || status.in_progress === true || status.state === "updating" || status.state === "waiting_for_tasks" || pendingMutation;
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const dirty = JSON.stringify(draft) !== JSON.stringify(seed(config));
+  const stateLabel = !available ? t("admin.updates.unavailable") : status.state === "idle" ? t("admin.updates.idle") : status.state === "failed" ? t("admin.updates.state.failed") : status.state === "updating" ? t("admin.updates.state.updating") : t("admin.updates.state.waiting");
+  const operate = async (operation: Exclude<ManagerOperation, "install">) => {
+    if (blocked || typeof status.manager_generation !== "number") return;
+    const generation = status.manager_generation;
+    if (operation === "restart" || operation === "rollback") {
+      if (!await confirm(t(operation === "restart" ? "admin.updates.restartConfirm" : "admin.updates.rollbackConfirm"), { danger: true, confirmText: t(operation === "restart" ? "admin.updates.restart" : "admin.updates.rollback") })) return;
+      const latest = store.getState().autoUpdateConfig?.status;
+      if (blockedRef.current || !latest || latest.manager_generation !== generation || STATES[String(latest.state)] !== true || latest.in_progress || ["updating", "waiting_for_tasks"].includes(String(latest.state))) return;
+    }
+    void runManagerOperation(store, operation, generation);
   };
-
-  const operate = (operation: Exclude<ManagerOperation, "install">) => {
-    if (typeof status.manager_generation !== "number") return;
-    void runManagerOperation(store, operation, status.manager_generation);
-  };
-
-  const checkNow = () => {
-    void checkAutoUpdateNow(store);
-  };
-
-  return (
-    <div className="eap-manager-update-page">
-      <AdminCard className="eap-manager-overview">
-        <div className="eap-manager-overview__head">
-          <div>
-            <Typography.Title level={4}>{t("admin.updates.managerTitle")}</Typography.Title>
-            <Typography.Paragraph type="secondary">{t("admin.updates.managerDescription")}</Typography.Paragraph>
-          </div>
-          <Tag color={status.state === "failed" ? "error" : status.state === "idle" ? "success" : "processing"}>
-            {stateLabel(t, status)}
-          </Tag>
-        </div>
-
-        {status.state === "updating" ? (
-          <Progress percent={100} status="active" showInfo={false} aria-label={t("admin.updates.state.updating")} />
-        ) : null}
-        {status.state === "waiting_for_tasks" ? <Alert showIcon type="info" message={t("admin.updates.waitingNotice")} /> : null}
-        {status.last_error ? (
-          <Alert showIcon type="error" message={t("admin.updates.state.failed")} description={status.last_error} />
-        ) : null}
-
-        <Descriptions className="eap-manager-generations" size="small" column={{ xs: 1, sm: 2, lg: 3 }}>
-          <Descriptions.Item label={t("admin.updates.currentGeneration")}>{generation(status.current_generation)}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.targetGeneration")}>{generation(status.target_generation)}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.previousGeneration")}>{generation(status.previous_generation)}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.currentRevision")}>{shortSha(status.current_revision)}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.targetRevision")}>{shortSha(status.remote_revision)}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.phase")}>{status.phase || "-"}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.operationId")} span={3}>
-            <Typography.Text code copyable={!!status.operation_id}>{status.operation_id || "-"}</Typography.Text>
-          </Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.currentActivatedAt")}>{formatTimestamp(status.last_successful_update_at) || "-"}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.lastCheck")}>{formatTimestamp(status.last_check_at) || "-"}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.activeTasks")}>{status.active_tasks ?? "-"}</Descriptions.Item>
-          <Descriptions.Item label={t("admin.updates.queuedTasks")}>{status.queued_tasks ?? "-"}</Descriptions.Item>
-        </Descriptions>
-
-        {services.length ? (
-          <div className="eap-manager-service-list" aria-label={t("admin.updates.services")}>
-            {services.map(([name, service]) => (
-              <Tag key={name} color={service.available === false ? "error" : "success"}>
-                {name}: {service.state || (service.available === false ? "unavailable" : "ready")}
-              </Tag>
-            ))}
-          </div>
-        ) : null}
-
-        {images.length ? (
-          <details className="eap-manager-images">
-            <summary>{t("admin.updates.imageDigests")}</summary>
-            {images.map(([name, digest]) => <code key={name}>{name}: {digest}</code>)}
-          </details>
-        ) : null}
-
-        <Space wrap className="eap-manager-actions">
-          <Button loading={checking} disabled={busy} icon={<Icon name="refresh" size={15} />} onClick={checkNow}>
-            {t("admin.updates.checkNow")}
-          </Button>
-          <Button type="primary" disabled={busy || !status.update_available || typeof status.manager_generation !== "number"} onClick={() => operate("update")}>
-            {t("admin.updates.updateNow")}
-          </Button>
-          <Popconfirm title={t("admin.updates.restartConfirm")} onConfirm={() => operate("restart")}>
-            <Button disabled={busy || typeof status.manager_generation !== "number"}>{t("admin.updates.restart")}</Button>
-          </Popconfirm>
-          <Popconfirm title={t("admin.updates.rollbackConfirm")} onConfirm={() => operate("rollback")}>
-            <Button disabled={busy || !status.previous_generation || typeof status.manager_generation !== "number"}>{t("admin.updates.rollback")}</Button>
-          </Popconfirm>
-          {status.state === "failed" ? (
-            <Button danger disabled={operationRunning || typeof status.manager_generation !== "number"} onClick={() => operate("repair")}>{t("admin.updates.repair")}</Button>
-          ) : null}
-        </Space>
-      </AdminCard>
-
-      <AdminCard className="config-form">
-        <form onSubmit={save}>
-          <div className="config-grid">
-            <div className="check-row field--full">
-              <Switch checked={form.enabled} aria-labelledby={enabledLabelId} onChange={(enabled) => setForm((current) => ({ ...current, enabled }))} />
-              <div className="check-row__text">
-                <strong id={enabledLabelId}>{t("admin.updates.enableWatcher")}</strong>
-                <span>{t("admin.updates.enableWatcherHint")}</span>
-              </div>
-            </div>
-            <Field label={t("admin.updates.interval")}>
-              <Input type="number" min="30" max="86400" value={form.interval} onChange={(event) => setForm((current) => ({ ...current, interval: event.target.value }))} />
-            </Field>
-            <Field label={t("admin.updates.channel")}>
-              <Input value={config.release_channel || "main"} disabled />
-            </Field>
-            <div className="field--full">
-              <Field label={t("admin.updates.manifestUrl")}>
-                <Input value={form.manifestUrl} placeholder="https://…/main.json" onChange={(event) => setForm((current) => ({ ...current, manifestUrl: event.target.value }))} />
-              </Field>
-            </div>
-          </div>
-          <div className="form-actions">
-            <Button type="primary" htmlType="submit" disabled={!dirty || busy} loading={saving}>{t("admin.updates.save")}</Button>
-          </div>
-        </form>
-      </AdminCard>
-    </div>
-  );
+  return <>
+    {dialog}
+    <Notice tone={!available || status.state === "failed" ? "danger" : status.state === "idle" ? "neutral" : "info"} title={stateLabel}>
+      {!available && t("admin.updates.unavailableHint")}
+      {available && status.state === "waiting_for_tasks" && t("admin.updates.waitingNotice")}
+      {status.phase && <div>{t("admin.updates.phase")}: {status.phase}</div>}
+      {status.last_error && <div>{status.last_error}</div>}
+      {status.state === "failed" && <div>{t("admin.updates.recoveryHint")}</div>}
+    </Notice>
+    <Section title={t("admin.updates.managerTitle")} description={t("admin.updates.managerDescription")}>
+      <FactGrid columns={3} items={[
+        { key: "current", label: t("admin.updates.currentGeneration"), value: status.current_generation || "—" },
+        { key: "target", label: t("admin.updates.targetGeneration"), value: status.target_generation || "—" },
+        { key: "previous", label: t("admin.updates.previousGeneration"), value: status.previous_generation || "—" },
+        { key: "commit", label: t("admin.updates.currentRevision"), value: status.current_revision || "—" },
+        { key: "remote", label: t("admin.updates.targetRevision"), value: status.remote_revision || "—" },
+        { key: "activated", label: t("admin.updates.currentActivatedAt"), value: formatTimestamp(status.last_successful_update_at || undefined) },
+        { key: "checked", label: t("admin.updates.lastCheck"), value: formatTimestamp(status.last_check_at) },
+        { key: "active", label: t("admin.updates.activeTasks"), value: status.active_tasks ?? "—" },
+        { key: "queued", label: t("admin.updates.queuedTasks"), value: status.queued_tasks ?? "—" },
+        { key: "operation", label: t("admin.updates.operationId"), value: status.operation_id || "—" },
+        { key: "version", label: t("admin.updates.generationVersion"), value: status.manager_generation ?? "—" },
+      ]} />
+      <Space wrap>
+        <Button loading={checking} disabled={blocked} onClick={() => { if (!blocked) void checkAutoUpdateNow(store); }}>{t("admin.updates.checkNow")}</Button>
+        <Button type="primary" disabled={blocked || !status.update_available} onClick={() => void operate("update")}>{t("admin.updates.updateNow")}</Button>
+        <Button disabled={blocked} onClick={() => void operate("restart")}>{t("admin.updates.restart")}</Button>
+        <Button danger disabled={blocked || !status.previous_generation} onClick={() => void operate("rollback")}>{t("admin.updates.rollback")}</Button>
+        {status.state === "failed" && <Button disabled={blocked} onClick={() => void operate("repair")}>{t("admin.updates.repair")}</Button>}
+      </Space>
+    </Section>
+    <Section title={t("admin.updates.enableWatcher")}>
+      <Form layout="vertical" onFinish={() => { if (!blocked && dirty) void saveAutoUpdateConfig(store, { enabled: draft.enabled, interval_seconds: draft.interval, release_manifest_url: draft.manifest }); }}>
+        <FormGrid>
+          <Form.Item label={t("admin.updates.enableWatcher")} extra={t("admin.updates.enableWatcherHint")}><Switch aria-label={t("admin.updates.enableWatcher")} checked={draft.enabled} disabled={blocked} onChange={(enabled) => setDraft({ ...draft, enabled })} /></Form.Item>
+          <Form.Item label={t("admin.updates.interval")}><Input aria-label={t("admin.updates.interval")} type="number" min={30} max={86400} value={draft.interval} onChange={(e) => setDraft({ ...draft, interval: e.target.value })} /></Form.Item>
+          <Form.Item label={t("admin.updates.manifestUrl")}><Input aria-label={t("admin.updates.manifestUrl")} value={draft.manifest} onChange={(e) => setDraft({ ...draft, manifest: e.target.value })} /></Form.Item>
+          <Form.Item label={t("admin.updates.channel")}><span>{config.release_channel || "—"}</span></Form.Item>
+        </FormGrid>
+        <FormFooter><Button htmlType="submit" loading={saving} disabled={!dirty || blocked}>{t("admin.updates.save")}</Button></FormFooter>
+      </Form>
+    </Section>
+    <Section title={t("admin.updates.services")}><ResourceList>{Array.from(new Set([...SERVICES, ...Object.keys(status.services || {})])).map((name) => {
+      const service = status.services?.[name];
+      const ready = service?.available === true && ["running", "available", "healthy"].includes(service.state || "");
+      const label = service?.state || t("admin.runtime.down");
+      return <ResourceRow key={name} title={`${name}: ${label}`} status={<StatusMark tone={ready ? "success" : "warning"}>{ready ? t("admin.runtime.ready") : t("admin.runtime.down")}</StatusMark>} description={service?.error} />;
+    })}</ResourceList></Section>
+    {!!Object.keys(status.images || {}).length && <Section title={t("admin.updates.imageDigests")}><ResourceList>{Object.entries(status.images || {}).map(([name, digest]) => <ResourceRow key={name} title={name} description={<code>{digest}</code>} />)}</ResourceList></Section>}
+  </>;
 }

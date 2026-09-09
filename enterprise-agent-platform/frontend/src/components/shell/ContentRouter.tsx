@@ -1,68 +1,32 @@
-/* <ContentRouter/> — the main content-area router. Switches on activeView and applies the per-view
-   .view-enter entrance animation (replayed by keying the section on the view, so
-   the CSS keyframe runs once per view change; reduced-motion is handled in CSS).
-
-   Permission view guard: a demoted or limited user must never be stuck on a
-   forbidden view. We render the
-   COERCED ("effective") view immediately, and persist the coercion to the store
-   in an effect so the rest of the tree (nav highlight, topbar) follows.
-
-   Realtime/poll note: AppShell owns useRealtime()/usePolling() — the views must
-   not mount them again, so this router only selects which view subtree renders. */
-
 import { lazy, Suspense, useEffect } from "react";
-import { cx } from "../../lib/cx";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useDispatch, useStore } from "../../store/useStore";
+import { useI18n } from "../../i18n";
 import type { ActiveView } from "../../types";
 import { ChatView } from "../chat/ChatView";
 import { TelegramLinkPopover } from "../chat/TelegramLinkPopover";
-import { Spinner } from "../common/Spinner";
-import {
-  loadAdminRoute,
-  loadSettingsRoute,
-} from "./routePreload";
+import { LoadingState } from "../ui/fieldwork";
+import { loadAdminRoute, loadSettingsRoute } from "./routePreload";
 
-const SettingsView = lazy(() =>
-  loadSettingsRoute().then((module) => ({ default: module.SettingsView })),
-);
-const AdminPanel = lazy(() =>
-  loadAdminRoute().then((module) => ({ default: module.AdminPanel })),
-);
-
-/* ------------------------------------------------------------- router */
+const SettingsView = lazy(() => loadSettingsRoute().then(module => ({ default: module.SettingsView })));
+const AdminPanel = lazy(() => loadAdminRoute().then(module => ({ default: module.AdminPanel })));
 
 export function ContentRouter() {
-  const perms = usePermissions();
-  const view = useStore((state) => state.activeView);
-  const telegramExpanded = useStore((state) => state.privateTelegramExpanded);
+  const permissions = usePermissions();
+  const view = useStore(state => state.activeView);
+  const telegramExpanded = useStore(state => state.privateTelegramExpanded);
   const dispatch = useDispatch();
-
-  // Coerce away from a forbidden view (silent redirect to channel).
-  const effective: ActiveView =
-    !perms.isAdmin && view === "admin"
-      ? "channel"
-      : !perms.has("private_agent") && view === "private"
-        ? "channel"
-        : view;
-
+  const { t } = useI18n();
+  const effective: ActiveView = !permissions.isAdmin && view === "admin" ? "channel"
+    : !permissions.has("private_agent") && view === "private" ? "channel" : view;
   useEffect(() => {
     if (effective !== view) dispatch({ type: "SET_ACTIVE_VIEW", payload: effective });
-  }, [effective, view, dispatch]);
+  }, [dispatch, effective, view]);
 
-  let body: React.ReactNode;
-  if (effective === "private") body = <ChatView mode="private" />;
-  else if (effective === "settings") body = <SettingsView />;
-  else if (effective === "admin") body = <AdminPanel />;
-  else body = <ChatView mode="channel" />;
-
-  return (
-    // key on the effective view replays the .view-enter keyframe once per change.
-    <section className={cx("content", "view-enter")} key={effective}>
-      <Suspense fallback={<div className="view-loading" role="status"><Spinner size={24} /></div>}>
-        {body}
-      </Suspense>
-      {effective === "private" && telegramExpanded ? <TelegramLinkPopover /> : null}
-    </section>
-  );
+  return <div className="wf-route" key={effective}>
+    <Suspense fallback={<LoadingState label={t("common.loading")} />}>
+      {effective === "settings" ? <SettingsView /> : effective === "admin" ? <AdminPanel /> : <ChatView mode={effective === "private" ? "private" : "channel"} />}
+    </Suspense>
+    {effective === "private" && telegramExpanded ? <TelegramLinkPopover /> : null}
+  </div>;
 }

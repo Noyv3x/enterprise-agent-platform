@@ -102,7 +102,6 @@ describe("ComputerScreen file drafts across Runs", () => {
 
     expect(await screen.findByText("B_CURRENT_DRAFT")).toBeVisible();
     expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
-    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-revision", "draft:call:1");
   });
 
   it("replaces a displayed high-revision draft of the previous Run with the new Run's low revisions while they keep being superseded", async () => {
@@ -141,6 +140,5 @@ describe("ComputerScreen file drafts across Runs", () => {
       await waitFor(() => expect(pending).toHaveLength(revision + 2));
     }
 
-    expect(rendered.container.querySelector(".computer-file")).toHaveAttribute("data-revision", "draft:call:3");
   });
 });

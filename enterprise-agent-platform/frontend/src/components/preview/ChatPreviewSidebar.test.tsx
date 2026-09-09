@@ -1,14 +1,15 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentPreviewScope, AppState } from "../../types";
 import { useChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerPip } from "./ComputerPip";
@@ -84,6 +85,11 @@ vi.mock("../skills/SkillsPanel", () => ({
 
 const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" };
 
+function PreviewHeaderFixture() {
+  const preview = useChatPreviewContext();
+  return <header>{preview?.capabilityActions}</header>;
+}
+
 function renderSidebar(
   scope: AgentPreviewScope | null = privateScope,
   canManageSkills = true,
@@ -93,14 +99,15 @@ function renderSidebar(
   const store = createStore(rootReducer, state);
   return render(
     <StoreContext.Provider value={store}>
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewSidebar
           scope={scope}
           canManageSkills={canManageSkills}
         >
+          <PreviewHeaderFixture />
           {children}
         </ChatPreviewSidebar>
-      </I18nProvider>
+      </TestUiProviders>
     </StoreContext.Provider>,
   );
 }
@@ -115,6 +122,16 @@ function BrowserAssistFixture() {
       Open browser from work
     </button>
   );
+}
+
+async function waitForOpenPreview(name: string) {
+  const dialog = await screen.findByRole("dialog", { name });
+  await waitFor(() => expect(dialog).toBeVisible());
+  return dialog;
+}
+
+async function waitForClosedPreview() {
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 }
 
 describe("ChatPreviewSidebar", () => {
@@ -136,7 +153,8 @@ describe("ChatPreviewSidebar", () => {
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
       value: (query: string): MediaQueryList => ({
-        matches: query === "(max-width: 520px)" && mocks.mobile,
+        matches: query === "(prefers-reduced-motion: reduce)" ||
+          (query === "(max-width: 520px)" && mocks.mobile),
         media: query,
         onchange: null,
         addListener: () => {},
@@ -157,7 +175,6 @@ describe("ChatPreviewSidebar", () => {
     renderSidebar();
 
     expect(screen.getByText("Chat content")).toBeVisible();
-    expect(screen.getByRole("navigation", { name: "Agent side tools" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open memory manager" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
     expect(screen.getByRole("button", { name: "Open scheduled tasks" })).toBeVisible();
@@ -172,24 +189,27 @@ describe("ChatPreviewSidebar", () => {
     const view = renderSidebar();
     await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
 
-    expect(screen.getByRole("complementary", { name: "Skills" })).toBeVisible();
+    await waitForOpenPreview("Skills");
     expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
     expect(mocks.skillsRender).toHaveBeenLastCalledWith(privateScope);
 
     const channelScope: AgentPreviewScope = { scope_type: "channel", scope_id: "4" };
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={channelScope}>
+            <PreviewHeaderFixture />
             <div>Channel chat</div>
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
+    await waitForClosedPreview();
     expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
     expect(screen.queryByTestId("skills-panel-fixture")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
+    await waitForOpenPreview("Skills");
     expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
     expect(mocks.skillsRender).toHaveBeenLastCalledWith(channelScope);
   });
@@ -200,6 +220,7 @@ describe("ChatPreviewSidebar", () => {
       false,
     );
     await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
+    await waitForOpenPreview("Skills");
 
     expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
     expect(mocks.skillsCanManageRender).toHaveBeenLastCalledWith(false);
@@ -208,18 +229,20 @@ describe("ChatPreviewSidebar", () => {
   it("opens memory management on demand only for a private Agent", async () => {
     const view = renderSidebar();
     await userEvent.click(screen.getByRole("button", { name: "Open memory manager" }));
-    expect(screen.getByRole("complementary", { name: "Memory" })).toBeVisible();
+    await waitForOpenPreview("Memory");
     expect(await screen.findByTestId("memory-panel-fixture")).toBeVisible();
 
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+            <PreviewHeaderFixture />
             <div>Channel chat</div>
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
+    await waitForClosedPreview();
     expect(screen.queryByRole("button", { name: "Open memory manager" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("memory-panel-fixture")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
@@ -228,18 +251,20 @@ describe("ChatPreviewSidebar", () => {
   it("opens scheduled tasks on demand only for a private Agent", async () => {
     const view = renderSidebar();
     await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
-    expect(screen.getByRole("complementary", { name: "Scheduled tasks" })).toBeVisible();
+    await waitForOpenPreview("Scheduled tasks");
     expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
 
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+            <PreviewHeaderFixture />
             <div>Channel chat</div>
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
+    await waitForClosedPreview();
     expect(screen.queryByRole("button", { name: "Open scheduled tasks" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
@@ -258,12 +283,10 @@ describe("ChatPreviewSidebar", () => {
     await userEvent.click(computerButton);
 
     expect(computerButton).toHaveAttribute("aria-expanded", "true");
-    const computerDrawer = screen.getByRole("complementary", { name: "AI computer" });
+    const computerDrawer = await waitForOpenPreview("AI computer");
     const browserFixture = screen.getByTestId("browser-preview-fixture");
     expect(computerDrawer).toBeVisible();
-    expect(computerDrawer.querySelector(".chat-preview__body--computer")).not.toBeNull();
     expect(browserFixture).toBeVisible();
-    expect(browserFixture.closest(".computer-screen__viewport.is-browser")).not.toBeNull();
     expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: undefined }));
   });
 
@@ -274,13 +297,14 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
 
-    expect(screen.getByRole("complementary", { name: "AI computer" })).toBeVisible();
+    await waitForOpenPreview("AI computer");
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
     expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
 
     await user.click(screen.getByRole("button", { name: "Close preview" }));
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitForClosedPreview();
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    await waitForOpenPreview("AI computer");
     expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 2 }));
   });
 
@@ -288,22 +312,24 @@ describe("ChatPreviewSidebar", () => {
     const user = userEvent.setup();
     const view = renderSidebar(privateScope, true, <BrowserAssistFixture />);
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
-    expect(screen.getByRole("complementary")).toBeVisible();
+    await waitForOpenPreview("AI computer");
     const browserRenderCount = mocks.browserRender.mock.calls.length;
 
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+            <PreviewHeaderFixture />
             <BrowserAssistFixture />
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
 
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitForClosedPreview();
     expect(mocks.browserRender).toHaveBeenCalledTimes(browserRenderCount);
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    await waitForOpenPreview("AI computer");
     expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
   });
 
@@ -314,37 +340,30 @@ describe("ChatPreviewSidebar", () => {
     const computerButton = screen.getByRole("button", { name: "Show the AI computer" });
 
     await user.click(computerButton);
-    expect(screen.getByRole("complementary", { name: "AI computer" })).toBeVisible();
+    const dialog = await waitForOpenPreview("AI computer");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
 
     await user.keyboard("{Escape}");
 
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitForClosedPreview();
     await waitFor(() => expect(computerButton).toHaveFocus());
   });
 
-  it("moves focus into a full-width mobile preview and makes covered controls inert", async () => {
+  it("moves focus into the mobile preview and restores the trigger on Escape", async () => {
     mocks.mobile = true;
     const user = userEvent.setup();
     renderSidebar();
     const skillsButton = screen.getByRole("button", { name: "Open Skill manager" });
-    const chat = screen.getByText("Chat content").closest(".chat");
-    const rail = screen.getByRole("navigation", { name: "Agent side tools" });
 
     await user.click(skillsButton);
 
-    const close = screen.getByRole("button", { name: "Close preview" });
-    await waitFor(() => expect(close).toHaveFocus());
-    expect(chat).toHaveAttribute("inert");
-    expect(chat).toHaveAttribute("aria-hidden", "true");
-    expect(rail).toHaveAttribute("inert");
-    expect(rail).toHaveAttribute("aria-hidden", "true");
+    const dialog = await waitForOpenPreview("Skills");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
 
     await user.keyboard("{Escape}");
+    await waitForClosedPreview();
 
     await waitFor(() => expect(skillsButton).toHaveFocus());
-    expect(chat).not.toHaveAttribute("inert");
-    expect(chat).not.toHaveAttribute("aria-hidden");
-    expect(rail).not.toHaveAttribute("inert");
   });
 
   it("returns focus to the composer when a mobile PiP opener unmounts", async () => {
@@ -371,22 +390,24 @@ describe("ChatPreviewSidebar", () => {
     renderSidebar(
       privateScope,
       true,
-      <div className="composer">
-        <textarea aria-label="Message input" />
+      <section aria-label="Chat composer">
+        <textarea data-composer-input aria-label="Message input" />
         <ComputerPip />
-      </div>,
+      </section>,
       state,
     );
     const composer = screen.getByRole("textbox", { name: "Message input" });
-    const pipButton = document.querySelector<HTMLButtonElement>(".computer-pip__button");
-    expect(pipButton).not.toBeNull();
+    const pipButton = within(screen.getByRole("region", { name: "Chat composer" }))
+      .getByRole("button", { name: "Show the AI computer" });
+    expect(pipButton).toBeVisible();
 
     await user.click(pipButton!);
 
     expect(pipButton?.isConnected).toBe(false);
-    const close = screen.getByRole("button", { name: "Close preview" });
-    await waitFor(() => expect(close).toHaveFocus());
+    const dialog = await waitForOpenPreview("AI computer");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
     await user.keyboard("{Escape}");
+    await waitForClosedPreview();
 
     await waitFor(() => expect(composer).toHaveFocus());
   });
@@ -396,12 +417,15 @@ describe("ChatPreviewSidebar", () => {
     renderSidebar();
 
     await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
+    await waitForOpenPreview("Scheduled tasks");
     const scheduledFixture = await screen.findByTestId("scheduled-tasks-fixture");
     expect(scheduledFixture).toBeVisible();
-    expect(scheduledFixture.closest(".chat-preview__body")).not.toHaveClass("chat-preview__body--computer");
     expect(screen.queryByTestId("browser-preview-fixture")).not.toBeInTheDocument();
 
+    await userEvent.click(screen.getByRole("button", { name: "Close preview" }));
+    await waitForClosedPreview();
     await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
+    await waitForOpenPreview("AI computer");
     expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
     expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
   });
@@ -410,9 +434,13 @@ describe("ChatPreviewSidebar", () => {
     renderSidebar();
 
     await userEvent.click(screen.getByRole("button", { name: "Open memory manager" }));
+    await waitForOpenPreview("Memory");
     expect(await screen.findByTestId("memory-panel-fixture")).toBeVisible();
 
+    await userEvent.click(screen.getByRole("button", { name: "Close preview" }));
+    await waitForClosedPreview();
     await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
+    await waitForOpenPreview("Scheduled tasks");
     expect(screen.queryByTestId("memory-panel-fixture")).not.toBeInTheDocument();
     expect(await screen.findByTestId("scheduled-tasks-fixture")).toBeVisible();
   });
@@ -422,42 +450,71 @@ describe("ChatPreviewSidebar", () => {
     const view = renderSidebar();
 
     await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
-    expect(screen.getByRole("complementary", { name: "AI computer" })).toBeVisible();
+    await waitForOpenPreview("AI computer");
     expect(screen.getByTestId("terminal-preview-fixture")).toBeVisible();
 
     mocks.availability.runningTerminalCount = 0;
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={privateScope}>
+            <PreviewHeaderFixture />
             <div>Chat content</div>
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
 
     expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitForClosedPreview();
   });
 
   it("closes an open preview when the active chat scope changes", async () => {
     mocks.availability.browserActive = true;
     const view = renderSidebar();
     await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
-    expect(screen.getByRole("complementary")).toBeVisible();
+    await waitForOpenPreview("AI computer");
 
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
-        <I18nProvider>
+        <TestUiProviders>
           <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
+            <PreviewHeaderFixture />
             <div>Other chat</div>
           </ChatPreviewSidebar>
-        </I18nProvider>
+        </TestUiProviders>
       </StoreContext.Provider>,
     );
 
-    expect(screen.queryByRole("complementary")).not.toBeInTheDocument();
+    await waitForClosedPreview();
     expect(screen.getByText("Other chat")).toBeVisible();
+  });
+
+  it("shows a failed HTML projection instead of waiting for unavailable presentation content", async () => {
+    renderSidebar(privateScope, true, <div>Chat content</div>, {
+      ...initialAppState,
+      agentStatuses: {
+        ...initialAppState.agentStatuses,
+        private: {
+          state: "replying",
+          run_id: "failed-html-run",
+          computer: {
+            mode: "present",
+            present: {
+              workspace_path: "report.html",
+              status: "failed",
+              revision: "html:failed",
+            },
+          },
+        },
+      },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
+    const computer = await waitForOpenPreview("AI computer");
+    expect(within(computer).getByText("The page could not be shown. Chat is unaffected.")).toBeVisible();
+    expect(within(computer).queryByTitle("Presented page")).not.toBeInTheDocument();
+    expect(within(computer).queryByText("Preparing the AI computer")).not.toBeInTheDocument();
   });
 
   it("keeps a present page computer entry after the run ends", () => {
