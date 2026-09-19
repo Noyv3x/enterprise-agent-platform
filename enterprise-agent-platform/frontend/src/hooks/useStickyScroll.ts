@@ -73,7 +73,15 @@ export function useStickyScroll(
   useEffect(() => {
     const element = ref.current;
     if (!element) return;
+    const observesResize = typeof ResizeObserver !== "undefined";
+    let viewportWidth = element.clientWidth;
+    let viewportHeight = element.clientHeight;
     const onScroll = () => {
+      // A layout-induced scroll may arrive before ResizeObserver. Do not
+      // mistake that new geometry for a reader leaving the previous bottom.
+      if (observesResize && (
+        viewportWidth !== element.clientWidth || viewportHeight !== element.clientHeight
+      )) return;
       const nextAtBottom = isNearBottom(element);
       nearBottom.current = nextAtBottom;
       previousGeometry.current = {
@@ -85,7 +93,19 @@ export function useStickyScroll(
     };
     onScroll();
     element.addEventListener("scroll", onScroll, { passive: true });
-    return () => element.removeEventListener("scroll", onScroll);
+    // PiP, the side pane and a growing Composer can resize the viewport without
+    // changing any messages. Follow only if the reader was already following.
+    const observer = observesResize ? new ResizeObserver(() => {
+      if (nearBottom.current) element.scrollTop = element.scrollHeight;
+      viewportWidth = element.clientWidth;
+      viewportHeight = element.clientHeight;
+      onScroll();
+    }) : null;
+    observer?.observe(element);
+    return () => {
+      element.removeEventListener("scroll", onScroll);
+      observer?.disconnect();
+    };
   }, [ref, scopeKey]);
 
   useLayoutEffect(() => {

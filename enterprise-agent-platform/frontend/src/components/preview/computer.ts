@@ -1,4 +1,3 @@
-import { isAgentActive } from "../../store/selectors";
 import type {
   ActivityStep,
   AgentStatus,
@@ -226,7 +225,7 @@ export function deriveComputerSurface({
   messages: Message[];
   availability: ComputerAvailability;
 }): ComputerSurface {
-  const live = isAgentActive(status);
+  const live = status?.state === "replying" || status?.state === "approval";
   const runId = String(status?.run_id || "");
   const rawStartedAt = Number(status?.started_at);
   const startedAt = Number.isFinite(rawStartedAt) && rawStartedAt > 0
@@ -235,7 +234,6 @@ export function deriveComputerSurface({
   const projected = status?.computer;
   const liveStep = latestComputerStep(status);
   const liveMode = projected?.mode || computerModeFromStep(liveStep);
-  const liveWork = Boolean(live && (liveMode || projected));
   const stepFile = fileClueFromStep(liveStep);
   const file = projected?.file
     ? { ...(stepFile || {}), ...projected.file }
@@ -255,9 +253,9 @@ export function deriveComputerSurface({
       : null
   );
   const presentReadable = availability.presentAvailable || Boolean(present);
-  const hasClues = liveWork || Boolean(present);
+  const hasClues = Boolean(present);
 
-  if (liveWork) {
+  if (live) {
     let mode = liveMode;
     if (mode === "browser" && !availability.loading && !availability.browserActive) {
       mode = file ? "file" : searchHits.length ? "search" : presentReadable ? "present" : availability.runningTerminalCount > 0 ? "terminal" : "browser";
@@ -267,7 +265,7 @@ export function deriveComputerSurface({
       live: true,
       runId,
       startedAt,
-      mode: mode || "file",
+      mode,
       latestStep: liveStep,
       file,
       searchHits,

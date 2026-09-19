@@ -74,7 +74,7 @@ export function ContextUsage({ label, usedLabel, limitLabel, used, max, percent,
 }
 
 export interface ComputerPanelProps { title: ReactNode; modeLabel: ReactNode; status?: ReactNode; elapsed?: ReactNode; actions?: ReactNode; children: ReactNode; footer?: ReactNode; expanded?: boolean }
-/** Mount only when a real work clue/resource exists; expanded controller unmounts compact consumer. */
+/** Mount for started work or retained resources; expansion unmounts the compact consumer. */
 export function ComputerPanel({ title, modeLabel, status, elapsed, actions, children, footer, expanded = false }: ComputerPanelProps) {
   return <section className={`wf-computer${expanded ? ' wf-computer--expanded' : ''}`}><header className="wf-computer-header"><div className="wf-computer-heading"><h2>{title}</h2><div className="wf-computer-meta"><span>{modeLabel}</span>{status}{elapsed && <span className="wf-mono">{elapsed}</span>}</div></div>{actions && <div className="wf-actions">{actions}</div>}</header><div className="wf-computer-content">{children}</div>{footer && <footer className="wf-computer-footer">{footer}</footer>}</section>;
 }

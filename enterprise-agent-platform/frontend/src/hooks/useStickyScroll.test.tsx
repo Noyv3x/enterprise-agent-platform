@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
-import { createRef, type RefObject } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createRef, useRef, type RefObject } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../i18n";
@@ -22,7 +22,7 @@ function StickyHarness({
   revision?: number;
   prepend?: number;
 }) {
-  const ref = createRef<HTMLDivElement>();
+  const ref = useRef<HTMLDivElement>(null);
   const state = useStickyScroll(ref, scope, force, count, revision ?? count, prepend);
   return (
     <div>
@@ -33,6 +33,8 @@ function StickyHarness({
     </div>
   );
 }
+
+let resizeViewport: (() => void) | undefined;
 
 function setScrollGeometry(element: HTMLElement) {
   Object.defineProperties(element, {
@@ -46,10 +48,25 @@ function setScrollGeometry(element: HTMLElement) {
       element.scrollTop = Number(top);
     }),
   });
+  act(() => resizeViewport?.());
+  element.scrollTop = 300;
 }
 
 describe("useStickyScroll", () => {
-  afterEach(cleanup);
+  beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", class {
+      constructor(callback: ResizeObserverCallback) {
+        resizeViewport = () => callback([], this as unknown as ResizeObserver);
+      }
+      observe() {}
+      disconnect() {}
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resizeViewport = undefined;
+  });
   it("counts new items while away and resets when returning to latest", () => {
     const view = render(<StickyHarness />);
     const scroller = screen.getByTestId("scroller");
@@ -94,6 +111,31 @@ describe("useStickyScroll", () => {
 
     view.rerender(<StickyHarness revision={20} />);
     expect(scroller.scrollTop).toBe(1_100);
+  });
+
+  it("preserves following or reading position when the viewport changes without new messages", () => {
+    render(<StickyHarness />);
+    const scroller = screen.getByTestId("scroller");
+    setScrollGeometry(scroller);
+    scroller.scrollTop = 800;
+    fireEvent.scroll(scroller);
+
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 100 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_200 });
+    // Browser layout can dispatch this before its resize notification.
+    fireEvent.scroll(scroller);
+    act(() => resizeViewport?.());
+    expect(scroller.scrollTop).toBe(1_200);
+    expect(screen.getByTestId("position")).toHaveTextContent("bottom");
+
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, value: 150 });
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_400 });
+    act(() => resizeViewport?.());
+    expect(scroller.scrollTop).toBe(300);
+    expect(screen.getByTestId("position")).toHaveTextContent("away");
+    expect(screen.getByTestId("unread")).toHaveTextContent("0");
   });
 
   it("preserves the viewport anchor and unread count when older rows are prepended", () => {

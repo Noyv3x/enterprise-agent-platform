@@ -5,23 +5,17 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { ChatPreviewContext } from "./ChatPreviewContext";
-import { ComputerPip, formatComputerElapsed } from "./ComputerPip";
+import { ComputerPip } from "./ComputerPip";
 import type { ComputerSurface } from "./computer";
 import type { AgentPreviewFileResponse } from "../../types";
 
-const mocks = vi.hoisted(() => ({
-  browserPreviewHook: vi.fn(),
-}));
-
 vi.mock("./useBrowserPreview", () => ({
-  useBrowserPreview: (...args: unknown[]) => {
-    mocks.browserPreviewHook(...args);
-    return {
-      state: { frameUrl: "", tabId: "", error: "", title: "", url: "" },
-    };
-  },
+  useBrowserPreview: () => ({
+    state: { frameUrl: "", tabId: "", error: "", title: "", url: "" },
+  }),
 }));
 
 vi.mock("./useTerminalPreviews", () => ({
@@ -58,10 +52,24 @@ const surface: ComputerSurface = {
   present: null,
 };
 
+const defaultMatchMedia = window.matchMedia;
+
 describe("ComputerPip", () => {
   beforeEach(() => {
     localStorage.setItem(LOCALE_STORAGE_KEY, "en");
-    mocks.browserPreviewHook.mockClear();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string): MediaQueryList => ({
+        matches: query === "(prefers-reduced-motion: reduce)",
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
     vi.mocked(fetchPreviewFile).mockReset();
     vi.mocked(fetchPreviewFile).mockResolvedValue({
       workspace_path: "notes.md",
@@ -76,11 +84,10 @@ describe("ComputerPip", () => {
     cleanup();
     vi.useRealTimers();
     localStorage.clear();
-  });
-
-  it("formats elapsed time as MM:SS before one hour and HH:MM:SS afterwards", () => {
-    expect(formatComputerElapsed(5)).toBe("00:05");
-    expect(formatComputerElapsed(3_725)).toBe("01:02:05");
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: defaultMatchMedia,
+    });
   });
 
   it("ticks from the authoritative run start, hides when non-live, and resets for a new run", async () => {
@@ -105,36 +112,37 @@ describe("ComputerPip", () => {
       startedAt: Date.parse("2026-08-15T12:00:00.000Z") / 1_000,
     };
     const rendered = render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={context(liveSurface)}>
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByText("Elapsed 00:05")).toBeVisible();
-    expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1_000);
     });
     expect(screen.getByText("Elapsed 00:06")).toBeVisible();
-    expect(mocks.browserPreviewHook).toHaveBeenCalledTimes(1);
 
     rendered.rerender(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={context({ ...liveSurface, live: false })}>
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     expect(screen.queryByText("Elapsed 00:06")).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Show the AI computer" }))
-      .toHaveAccessibleDescription("Search · Read only");
+    expect(screen.getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(screen.queryByText(/^Elapsed /)).not.toBeInTheDocument();
 
     const nextStartedAt = Date.now() / 1_000;
     rendered.rerender(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={context({
           ...liveSurface,
           runId: "run-timed-2",
@@ -142,14 +150,39 @@ describe("ComputerPip", () => {
         })}>
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     expect(screen.getByText("Elapsed 00:00")).toBeVisible();
   });
 
+  it("shows waiting work without inventing an elapsed time or fetching an arbitrary file", () => {
+    render(
+      <TestUiProviders>
+        <ChatPreviewContext.Provider value={{
+          scope: { scope_type: "private", scope_id: "7" },
+          capabilityActions: null,
+          browserDrawerOpen: false,
+          computerDrawerOpen: false,
+          computerMode: null,
+          computerSurface: { ...surface, mode: null, file: null },
+          openComputer: vi.fn(),
+          openBrowserAssist: vi.fn(),
+        }}
+        >
+          <ComputerPip />
+        </ChatPreviewContext.Provider>
+      </TestUiProviders>,
+    );
+
+    expect(screen.getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(screen.getByText("Waiting for a work preview")).toBeVisible();
+    expect(screen.queryByText(/^Elapsed /)).not.toBeInTheDocument();
+    expect(fetchPreviewFile).not.toHaveBeenCalled();
+  });
+
   it("stays hidden when the computer surface is idle", () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -163,7 +196,7 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
   });
@@ -171,8 +204,9 @@ describe("ComputerPip", () => {
   it("opens the read-only computer and does not take control", async () => {
     const openComputer = vi.fn();
     const openBrowserAssist = vi.fn();
+    const user = userEvent.setup();
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -186,21 +220,23 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     const button = screen.getByRole("button", { name: "Show the AI computer" });
     expect(button).toBeVisible();
-    expect(button).toHaveAccessibleDescription("File · Working");
-    expect(screen.getByText("AI computer")).toBeVisible();
-    await userEvent.click(button);
+    button.focus();
+    expect(button).toHaveFocus();
+    await user.keyboard("{Enter}");
     expect(openComputer).toHaveBeenCalledTimes(1);
     expect(openComputer).toHaveBeenCalledWith(undefined, button);
+    await user.click(button);
+    expect(openComputer).toHaveBeenCalledTimes(2);
     expect(openBrowserAssist).not.toHaveBeenCalled();
   });
 
-  it("unmounts when the computer drawer is open", () => {
+  it("unmounts when the computer is expanded", () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -214,14 +250,14 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
     expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
   });
 
   it("shows the real file snapshot in its compact viewport", async () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -243,12 +279,10 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     expect(await screen.findByText("const answer = 42;")).toBeVisible();
-    expect(screen.getByRole("button", { name: "Show the AI computer" }))
-      .toHaveAccessibleDescription("File · Read only");
   });
 
   it("never shows the previous Run's late draft after the pip switches to a new Run", async () => {
@@ -257,7 +291,7 @@ describe("ComputerPip", () => {
       pending.push({ resolve });
     }));
     const pipFor = (runId: string, draftRevision: number) => (
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -272,6 +306,8 @@ describe("ComputerPip", () => {
               path: "draft.txt",
               workspace_path: "draft.txt",
               target: "sandbox",
+              source: "draft",
+              draft_kind: "file",
               status: "running",
               tool_call_id: "call",
               revision: `draft:call:${draftRevision}`,
@@ -283,7 +319,7 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>
+      </TestUiProviders>
     );
     const draft = (content: string, draftRevision: number): AgentPreviewFileResponse => ({
       workspace_path: "draft.txt",
@@ -316,7 +352,7 @@ describe("ComputerPip", () => {
 
   it("shows bounded search hits instead of a generic computer icon", () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "channel", scope_id: "9" },
           capabilityActions: null,
@@ -339,7 +375,7 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByText("Platform architecture")).toBeInTheDocument();
@@ -347,7 +383,7 @@ describe("ComputerPip", () => {
 
   it("shows a completed presented page inside the compact viewport", () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -371,18 +407,17 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     const frame = screen.getByTitle("Presented page");
     expect(frame).toHaveAttribute("sandbox", "allow-scripts");
-    expect(screen.getByRole("button", { name: "Show the AI computer" }))
-      .toHaveAccessibleDescription("Page · Read only");
+    expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
   });
 
   it("uses the surface step as the compact terminal fallback", () => {
     render(
-      <I18nProvider>
+      <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
           capabilityActions: null,
@@ -408,14 +443,12 @@ describe("ComputerPip", () => {
         >
           <ComputerPip />
         </ChatPreviewContext.Provider>
-      </I18nProvider>,
+      </TestUiProviders>,
     );
 
     expect(screen.getByLabelText("Read-only terminal output"))
       .toHaveTextContent("$ printf ready");
     expect(screen.getByLabelText("Read-only terminal output"))
       .toHaveTextContent("ready");
-    expect(screen.getByRole("button", { name: "Show the AI computer" }))
-      .toHaveAccessibleDescription("Terminal · Read only");
   });
 });

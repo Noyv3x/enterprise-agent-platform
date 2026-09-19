@@ -1,16 +1,17 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as PreviewActions from "../../data/previewActions";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import { TestUiProviders } from "../../test/TestUiProviders";
-import type { AgentPreviewScope, AppState } from "../../types";
+import type { AgentPreviewScope, AgentStatus, AppState } from "../../types";
 import { useChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerPip } from "./ComputerPip";
 import { ChatPreviewSidebar } from "./ChatPreviewSidebar";
@@ -23,14 +24,24 @@ const mocks = vi.hoisted(() => ({
     loading: false,
     error: "",
   },
-  browserRender: vi.fn(),
-  browserProps: vi.fn(),
+  browserState: {
+    connection: "connected",
+    activity: "live",
+    frameUrl: "blob:live-frame",
+    tabId: "tab-1",
+    error: "",
+    title: "",
+    url: "",
+    capturedAt: "",
+    checkedAt: null,
+  },
+  acquire: vi.fn(),
+  release: vi.fn(),
+  input: vi.fn(),
   terminalRender: vi.fn(),
   schedulesRender: vi.fn(),
   memoryRender: vi.fn(),
-  skillsRender: vi.fn(),
-  skillsCanManageRender: vi.fn(),
-  mobile: false,
+  viewportWidth: 1440,
 }));
 
 vi.mock("./usePreviewAvailability", () => ({
@@ -40,13 +51,19 @@ vi.mock("./usePreviewAvailability", () => ({
   }),
 }));
 
-vi.mock("./BrowserPreviewView", () => ({
-  BrowserPreviewView: (props: { controlRequestId?: number }) => {
-    mocks.browserRender();
-    mocks.browserProps(props);
-    return <div data-testid="browser-preview-fixture" />;
-  },
+vi.mock("./useBrowserPreview", () => ({
+  useBrowserPreview: () => ({ state: mocks.browserState, refresh: vi.fn() }),
 }));
+
+vi.mock("../../data/previewActions", async () => {
+  const actual = await vi.importActual<typeof PreviewActions>("../../data/previewActions");
+  return {
+    ...actual,
+    acquireBrowserControl: mocks.acquire,
+    releaseBrowserControl: mocks.release,
+    sendBrowserControlInput: mocks.input,
+  };
+});
 
 vi.mock("./TerminalPreviewView", () => ({
   TerminalPreviewView: () => {
@@ -70,20 +87,44 @@ vi.mock("../memory/MemoryPanel", () => ({
 }));
 
 vi.mock("../skills/SkillsPanel", () => ({
-  SkillsPanel: ({
-    scope,
-    canManage,
-  }: {
-    scope: AgentPreviewScope;
-    canManage?: boolean;
-  }) => {
-    mocks.skillsRender(scope);
-    mocks.skillsCanManageRender(canManage);
-    return <div data-testid="skills-panel-fixture" />;
-  },
+  SkillsPanel: () => <div data-testid="skills-panel-fixture" />,
 }));
 
 const privateScope: AgentPreviewScope = { scope_type: "private", scope_id: "7" };
+const defaultMatchMedia = window.matchMedia;
+const defaultDocumentHidden = Object.getOwnPropertyDescriptor(document, "hidden");
+const mediaQueries = new Map<string, MediaQueryList>();
+
+function matchesViewport(query: string) {
+  if (query === "(prefers-reduced-motion: reduce)") return true;
+  return query.split(",").some((part) => {
+    const widths = [...part.matchAll(/\((min|max)-width:\s*(\d+)px\)/g)];
+    return widths.length > 0 && widths.every(([, bound, width]) => (
+      bound === "min" ? mocks.viewportWidth >= Number(width) : mocks.viewportWidth <= Number(width)
+    ));
+  });
+}
+
+function changeViewport(width: number) {
+  act(() => {
+    mocks.viewportWidth = width;
+    for (const media of mediaQueries.values()) {
+      media.dispatchEvent(Object.assign(new Event("change"), {
+        matches: media.matches,
+        media: media.media,
+      }));
+    }
+  });
+}
+
+function ChatComposerFixture() {
+  return (
+    <section aria-label="Chat composer">
+      <textarea data-composer-input aria-label="Message input" />
+      <ComputerPip />
+    </section>
+  );
+}
 
 function PreviewHeaderFixture() {
   const preview = useChatPreviewContext();
@@ -97,7 +138,7 @@ function renderSidebar(
   state: AppState = initialAppState,
 ) {
   const store = createStore(rootReducer, state);
-  return render(
+  const view = render(
     <StoreContext.Provider value={store}>
       <TestUiProviders>
         <ChatPreviewSidebar
@@ -110,6 +151,7 @@ function renderSidebar(
       </TestUiProviders>
     </StoreContext.Provider>,
   );
+  return { ...view, store };
 }
 
 function BrowserAssistFixture() {
@@ -125,13 +167,17 @@ function BrowserAssistFixture() {
 }
 
 async function waitForOpenPreview(name: string) {
-  const dialog = await screen.findByRole("dialog", { name });
-  await waitFor(() => expect(dialog).toBeVisible());
-  return dialog;
+  const role = name === "AI computer" && mocks.viewportWidth >= 1200 ? "complementary" : "dialog";
+  const panel = await screen.findByRole(role, { name });
+  await waitFor(() => expect(panel).toBeVisible());
+  return panel;
 }
 
 async function waitForClosedPreview() {
-  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await waitFor(() => {
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
+  });
 }
 
 describe("ChatPreviewSidebar", () => {
@@ -142,37 +188,56 @@ describe("ChatPreviewSidebar", () => {
     mocks.availability.presentAvailable = false;
     mocks.availability.loading = false;
     mocks.availability.error = "";
-    mocks.browserRender.mockClear();
-    mocks.browserProps.mockClear();
+    mocks.acquire.mockReset().mockResolvedValue({
+      active: true,
+      lease_id: "lease-1",
+      tab_id: "tab-1",
+      expires_in_ms: 90_000,
+    });
+    mocks.release.mockReset().mockResolvedValue({ active: false, released: true });
+    mocks.input.mockReset().mockResolvedValue({ ok: true, expires_in_ms: 90_000 });
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
     mocks.terminalRender.mockClear();
     mocks.schedulesRender.mockClear();
     mocks.memoryRender.mockClear();
-    mocks.skillsRender.mockClear();
-    mocks.skillsCanManageRender.mockClear();
-    mocks.mobile = false;
+    mocks.viewportWidth = 1440;
+    mediaQueries.clear();
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
-      value: (query: string): MediaQueryList => ({
-        matches: query === "(prefers-reduced-motion: reduce)" ||
-          (query === "(max-width: 520px)" && mocks.mobile),
-        media: query,
-        onchange: null,
-        addListener: () => {},
-        removeListener: () => {},
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => false,
-      }),
+      value: (query: string): MediaQueryList => {
+        const cached = mediaQueries.get(query);
+        if (cached) return cached;
+        const events = new EventTarget();
+        const media: MediaQueryList = {
+          get matches() { return matchesViewport(query); },
+          media: query,
+          onchange: null,
+          addListener: (listener) => events.addEventListener("change", listener as EventListener),
+          removeListener: (listener) => events.removeEventListener("change", listener as EventListener),
+          addEventListener: events.addEventListener.bind(events),
+          removeEventListener: events.removeEventListener.bind(events),
+          dispatchEvent: events.dispatchEvent.bind(events),
+        };
+        mediaQueries.set(query, media);
+        return media;
+      },
     });
   });
 
-  afterEach(() => {
-    cleanup();
+  afterEach(async () => {
+    await act(async () => cleanup());
     localStorage.clear();
+    mediaQueries.clear();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: defaultMatchMedia,
+    });
+    if (defaultDocumentHidden) Object.defineProperty(document, "hidden", defaultDocumentHidden);
+    else Reflect.deleteProperty(document, "hidden");
   });
 
   it("keeps private memory, Skill, and task entries visible while the computer is idle", () => {
-    renderSidebar();
+    renderSidebar(privateScope, true, <><div>Chat content</div><ChatComposerFixture /></>);
 
     expect(screen.getByText("Chat content")).toBeVisible();
     expect(screen.getByRole("button", { name: "Open memory manager" })).toBeVisible();
@@ -181,8 +246,126 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Open browser preview" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Open terminal preview/ })).not.toBeInTheDocument();
-    expect(mocks.browserRender).not.toHaveBeenCalled();
+    expect(screen.queryByRole("img", { name: "Latest Agent browser frame" })).not.toBeInTheDocument();
     expect(mocks.terminalRender).not.toHaveBeenCalled();
+  });
+
+  it.each(["replying", "approval"])("starts %s with a minimized waiting computer before tool content", (state) => {
+    renderSidebar(privateScope, true, <ChatComposerFixture />, {
+      ...initialAppState,
+      agentStatuses: {
+        ...initialAppState.agentStatuses,
+        private: { state, run_id: "run-waiting" },
+      },
+    });
+
+    const composer = screen.getByRole("region", { name: "Chat composer" });
+    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(within(composer).getByText("Waiting for a work preview")).toBeVisible();
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "AI computer" })).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Presented page")).not.toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "Latest Agent browser frame" })).not.toBeInTheDocument();
+    expect(mocks.terminalRender).not.toHaveBeenCalled();
+  });
+
+  it("keeps status updates minimized until explicitly opened and preserves that choice through tool changes", async () => {
+    const user = userEvent.setup();
+    const view = renderSidebar(privateScope, true, <ChatComposerFixture />);
+    const updateStatus = (status: AgentStatus) => act(() => {
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "private", scopeId: "7", status, authoritative: true },
+      });
+    });
+
+    updateStatus({ state: "queued", run_id: "queued-run" });
+    expect(screen.queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
+    updateStatus({ state: "replying", run_id: "run-tools" });
+    expect(screen.getByText("Waiting for a work preview")).toBeVisible();
+
+    const searchStatus: AgentStatus = {
+      state: "replying",
+      run_id: "run-tools",
+      computer: {
+        mode: "search",
+        search: { tool: "web", hits: [{ title: "First tool result" }] },
+      },
+    };
+    updateStatus(searchStatus);
+    expect(screen.getByText("First tool result")).toBeVisible();
+    expect(screen.queryByText("Waiting for a work preview")).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
+
+    const composer = screen.getByRole("region", { name: "Chat composer" });
+    const pip = within(composer).getByRole("button", { name: "Show the AI computer" });
+    await user.click(pip);
+    const computer = await waitForOpenPreview("AI computer");
+    expect(pip.isConnected).toBe(false);
+    expect(screen.getAllByText("First tool result")).toHaveLength(1);
+
+    updateStatus({
+      ...searchStatus,
+      state: "approval",
+      computer: {
+        mode: "search",
+        search: { tool: "search_files", hits: [{ title: "Latest file match", workspace_path: "latest-result.txt" }] },
+      },
+    });
+    expect(within(computer).getByText("latest-result.txt")).toBeVisible();
+    expect(screen.queryByText("First tool result")).not.toBeInTheDocument();
+    expect(within(composer).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
+
+    await user.click(within(computer).getByRole("button", { name: "Minimize the AI computer" }));
+    expect(computer.isConnected).toBe(false);
+    expect(screen.getAllByText("latest-result.txt")).toHaveLength(1);
+    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+
+    updateStatus({ state: "replying", run_id: "next-run" });
+    expect(screen.getByText("Waiting for a work preview")).toBeVisible();
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
+  });
+
+  it("keeps exactly one presented-page consumer through expansion, viewport changes, and minimization", async () => {
+    mocks.availability.presentAvailable = true;
+    const user = userEvent.setup();
+    renderSidebar(privateScope, true, <ChatComposerFixture />);
+    const composer = screen.getByRole("region", { name: "Chat composer" });
+    const compactFrame = screen.getByTitle("Presented page");
+    expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
+
+    await user.click(within(composer).getByRole("button", { name: "Show the AI computer" }));
+    const desktop = await waitForOpenPreview("AI computer");
+    const desktopFrame = within(desktop).getByTitle("Presented page");
+    expect(compactFrame.isConnected).toBe(false);
+    expect(screen.getAllByTitle("Presented page")).toEqual([desktopFrame]);
+
+    changeViewport(1199);
+    const drawer = await waitForOpenPreview("AI computer");
+    const drawerFrame = within(drawer).getByTitle("Presented page");
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
+    expect(desktopFrame.isConnected).toBe(false);
+    expect(screen.getAllByTitle("Presented page")).toEqual([drawerFrame]);
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Minimize the AI computer" }));
+    expect(drawerFrame.isConnected).toBe(false);
+    expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
+    await waitForClosedPreview();
+
+    await user.click(within(composer).getByRole("button", { name: "Show the AI computer" }));
+    const reopenedDrawer = await waitForOpenPreview("AI computer");
+    const reopenedFrame = within(reopenedDrawer).getByTitle("Presented page");
+    changeViewport(1200);
+    const reopenedDesktop = await waitForOpenPreview("AI computer");
+    const currentFrame = within(reopenedDesktop).getByTitle("Presented page");
+    expect(reopenedFrame.isConnected).toBe(false);
+    expect(screen.queryByRole("dialog", { name: "AI computer" })).not.toBeInTheDocument();
+    expect(screen.getAllByTitle("Presented page")).toEqual([currentFrame]);
+
+    fireEvent.click(within(reopenedDesktop).getByRole("button", { name: "Minimize the AI computer" }));
+    expect(currentFrame.isConnected).toBe(false);
+    expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
+    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
   });
 
   it("opens Agent-scoped Skill management for private and channel chats", async () => {
@@ -191,7 +374,6 @@ describe("ChatPreviewSidebar", () => {
 
     await waitForOpenPreview("Skills");
     expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
-    expect(mocks.skillsRender).toHaveBeenLastCalledWith(privateScope);
 
     const channelScope: AgentPreviewScope = { scope_type: "channel", scope_id: "4" };
     view.rerender(
@@ -211,20 +393,8 @@ describe("ChatPreviewSidebar", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
     await waitForOpenPreview("Skills");
     expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
-    expect(mocks.skillsRender).toHaveBeenLastCalledWith(channelScope);
   });
 
-  it("passes read-only Skill management state to the lazy panel", async () => {
-    renderSidebar(
-      { scope_type: "channel", scope_id: "4" },
-      false,
-    );
-    await userEvent.click(screen.getByRole("button", { name: "Open Skill manager" }));
-    await waitForOpenPreview("Skills");
-
-    expect(await screen.findByTestId("skills-panel-fixture")).toBeVisible();
-    expect(mocks.skillsCanManageRender).toHaveBeenLastCalledWith(false);
-  });
 
   it("opens memory management on demand only for a private Agent", async () => {
     const view = renderSidebar();
@@ -270,7 +440,7 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.getByRole("button", { name: "Open Skill manager" })).toBeVisible();
   });
 
-  it("unifies browser and terminal into one computer rail item titled AI computer", async () => {
+  it("opens one read-only computer instead of separate browser and terminal entries", async () => {
     mocks.availability.browserActive = true;
     mocks.availability.runningTerminalCount = 2;
     renderSidebar();
@@ -283,14 +453,13 @@ describe("ChatPreviewSidebar", () => {
     await userEvent.click(computerButton);
 
     expect(computerButton).toHaveAttribute("aria-expanded", "true");
-    const computerDrawer = await waitForOpenPreview("AI computer");
-    const browserFixture = screen.getByTestId("browser-preview-fixture");
-    expect(computerDrawer).toBeVisible();
-    expect(browserFixture).toBeVisible();
-    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: undefined }));
+    const computer = await waitForOpenPreview("AI computer");
+    expect(within(computer).getByRole("img", { name: "Latest Agent browser frame" })).toBeVisible();
+    expect(within(computer).getByRole("button", { name: "Take control" })).toBeVisible();
+    expect(mocks.acquire).not.toHaveBeenCalled();
   });
 
-  it("opens from a work-record intent before availability and issues one monotonic control request", async () => {
+  it("starts assistance before availability only once per explicit work-record gesture", async () => {
     const user = userEvent.setup();
     renderSidebar(privateScope, true, <BrowserAssistFixture />);
 
@@ -298,22 +467,26 @@ describe("ChatPreviewSidebar", () => {
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
 
     await waitForOpenPreview("AI computer");
-    expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
-    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
+    expect(await screen.findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    expect(mocks.acquire).toHaveBeenLastCalledWith(privateScope, "tab-1");
 
-    await user.click(screen.getByRole("button", { name: "Close preview" }));
+    await user.click(screen.getByRole("button", { name: "Minimize the AI computer" }));
     await waitForClosedPreview();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(privateScope, "tab-1", "lease-1"));
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
     await waitForOpenPreview("AI computer");
-    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 2 }));
+    expect(await screen.findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(2);
   });
 
-  it("clears a pending work-record browser intent when the chat scope changes", async () => {
+  it("releases work-record assistance and requires a new gesture when the scope changes", async () => {
     const user = userEvent.setup();
     const view = renderSidebar(privateScope, true, <BrowserAssistFixture />);
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
     await waitForOpenPreview("AI computer");
-    const browserRenderCount = mocks.browserRender.mock.calls.length;
+    expect(await screen.findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
 
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
@@ -327,47 +500,121 @@ describe("ChatPreviewSidebar", () => {
     );
 
     await waitForClosedPreview();
-    expect(mocks.browserRender).toHaveBeenCalledTimes(browserRenderCount);
+    expect(screen.queryByText("Human assistance")).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(privateScope, "tab-1", "lease-1"));
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
     await waitForOpenPreview("AI computer");
-    expect(mocks.browserProps).toHaveBeenLastCalledWith(expect.objectContaining({ controlRequestId: 1 }));
+    expect(await screen.findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(2);
+    expect(mocks.acquire).toHaveBeenLastCalledWith({ scope_type: "channel", scope_id: "4" }, "tab-1");
   });
 
-  it("closes with Escape and restores focus to the computer trigger", async () => {
+  it("releases browser assistance on a responsive remount instead of replaying the old gesture", async () => {
+    mocks.availability.browserActive = true;
+    const user = userEvent.setup();
+    renderSidebar(privateScope, true, <BrowserAssistFixture />);
+
+    await user.click(screen.getByRole("button", { name: "Open browser from work" }));
+    const desktop = await waitForOpenPreview("AI computer");
+    expect(await within(desktop).findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+
+    changeViewport(390);
+    const drawer = await waitForOpenPreview("AI computer");
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(privateScope, "tab-1", "lease-1"));
+    expect(within(drawer).queryByText("Human assistance")).not.toBeInTheDocument();
+    expect(within(drawer).getByRole("button", { name: "Take control" })).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+
+    changeViewport(1440);
+    const returnedDesktop = await waitForOpenPreview("AI computer");
+    expect(within(returnedDesktop).queryByText("Human assistance")).not.toBeInTheDocument();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+
+    await user.click(within(returnedDesktop).getByRole("button", { name: "Take control" }));
+    expect(await within(returnedDesktop).findByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps desktop chat usable and closes only an unconsumed Escape inside the computer", async () => {
+    mocks.availability.browserActive = true;
+    const user = userEvent.setup();
+    const view = renderSidebar(
+      privateScope,
+      true,
+      <textarea data-composer-input aria-label="Message input" />,
+    );
+    const computerButton = screen.getByRole("button", { name: "Show the AI computer" });
+    const composer = screen.getByRole("textbox", { name: "Message input" });
+
+    await user.click(computerButton);
+    const computer = await waitForOpenPreview("AI computer");
+    expect(screen.queryByRole("dialog", { name: "AI computer" })).not.toBeInTheDocument();
+    await waitFor(() => expect(within(computer).getByRole("button", {
+      name: "Minimize the AI computer",
+    })).toHaveFocus());
+
+    await user.click(composer);
+    await user.type(composer, "Keep chatting");
+    await user.keyboard("{Escape}");
+    expect(composer).toHaveValue("Keep chatting");
+    expect(computer).toBeVisible();
+    expect(composer).toHaveFocus();
+
+    await user.click(within(computer).getByRole("button", { name: "Take control" }));
+    const browserInput = await within(computer).findByRole("application");
+    browserInput.focus();
+    act(() => {
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: {
+          mode: "private",
+          scopeId: "7",
+          status: { state: "replying", run_id: "new-browser-work", computer: { mode: "browser" } },
+          authoritative: true,
+        },
+      });
+    });
+    expect(browserInput).toHaveFocus();
+    await user.keyboard("{Escape}");
+    expect(computer).toBeVisible();
+    await waitFor(() => expect(mocks.input).toHaveBeenCalledWith(
+      privateScope,
+      "tab-1",
+      "lease-1",
+      1,
+      { action: "key", key: "Escape" },
+    ));
+
+    const minimize = within(computer).getByRole("button", { name: "Minimize the AI computer" });
+    minimize.focus();
+    await user.keyboard("{Escape}");
+    await waitForClosedPreview();
+    await waitFor(() => expect(computerButton).toHaveFocus());
+  });
+
+  it("moves focus into the narrow computer Drawer and restores its trigger on Escape", async () => {
+    mocks.viewportWidth = 390;
     mocks.availability.browserActive = true;
     const user = userEvent.setup();
     renderSidebar();
     const computerButton = screen.getByRole("button", { name: "Show the AI computer" });
 
     await user.click(computerButton);
+
     const dialog = await waitForOpenPreview("AI computer");
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
     await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
 
     await user.keyboard("{Escape}");
-
     await waitForClosedPreview();
+
     await waitFor(() => expect(computerButton).toHaveFocus());
   });
 
-  it("moves focus into the mobile preview and restores the trigger on Escape", async () => {
-    mocks.mobile = true;
-    const user = userEvent.setup();
-    renderSidebar();
-    const skillsButton = screen.getByRole("button", { name: "Open Skill manager" });
-
-    await user.click(skillsButton);
-
-    const dialog = await waitForOpenPreview("Skills");
-    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
-
-    await user.keyboard("{Escape}");
-    await waitForClosedPreview();
-
-    await waitFor(() => expect(skillsButton).toHaveFocus());
-  });
-
-  it("returns focus to the composer when a mobile PiP opener unmounts", async () => {
-    mocks.mobile = true;
+  it.each([1440, 390])("returns focus to the composer when a PiP opener unmounts at width %s", async (width) => {
+    mocks.viewportWidth = width;
     const user = userEvent.setup();
     const state: AppState = {
       ...initialAppState,
@@ -390,10 +637,7 @@ describe("ChatPreviewSidebar", () => {
     renderSidebar(
       privateScope,
       true,
-      <section aria-label="Chat composer">
-        <textarea data-composer-input aria-label="Message input" />
-        <ComputerPip />
-      </section>,
+      <ChatComposerFixture />,
       state,
     );
     const composer = screen.getByRole("textbox", { name: "Message input" });
@@ -401,9 +645,9 @@ describe("ChatPreviewSidebar", () => {
       .getByRole("button", { name: "Show the AI computer" });
     expect(pipButton).toBeVisible();
 
-    await user.click(pipButton!);
+    await user.click(pipButton);
 
-    expect(pipButton?.isConnected).toBe(false);
+    expect(pipButton.isConnected).toBe(false);
     const dialog = await waitForOpenPreview("AI computer");
     await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
     await user.keyboard("{Escape}");
@@ -412,22 +656,25 @@ describe("ChatPreviewSidebar", () => {
     await waitFor(() => expect(composer).toHaveFocus());
   });
 
-  it("keeps scheduled tasks and the computer drawer mutually exclusive", async () => {
+  it("keeps scheduled tasks and the expanded computer mutually exclusive", async () => {
     mocks.availability.browserActive = true;
     renderSidebar();
+    await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
+    const computer = await waitForOpenPreview("AI computer");
 
     await userEvent.click(screen.getByRole("button", { name: "Open scheduled tasks" }));
     await waitForOpenPreview("Scheduled tasks");
     const scheduledFixture = await screen.findByTestId("scheduled-tasks-fixture");
     expect(scheduledFixture).toBeVisible();
-    expect(screen.queryByTestId("browser-preview-fixture")).not.toBeInTheDocument();
+    expect(computer.isConnected).toBe(false);
+    expect(screen.queryByRole("img", { name: "Latest Agent browser frame" })).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Close preview" }));
     await waitForClosedPreview();
     await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
     await waitForOpenPreview("AI computer");
     expect(screen.queryByTestId("scheduled-tasks-fixture")).not.toBeInTheDocument();
-    expect(screen.getByTestId("browser-preview-fixture")).toBeVisible();
+    expect(screen.getByRole("img", { name: "Latest Agent browser frame" })).toBeVisible();
   });
 
   it("keeps memory and scheduled tasks mutually exclusive", async () => {
@@ -469,25 +716,61 @@ describe("ChatPreviewSidebar", () => {
     await waitForClosedPreview();
   });
 
-  it("closes an open preview when the active chat scope changes", async () => {
-    mocks.availability.browserActive = true;
-    const view = renderSidebar();
-    await userEvent.click(screen.getByRole("button", { name: "Show the AI computer" }));
-    await waitForOpenPreview("AI computer");
+  it("resets an expanded computer to the new scope's compact content and does not reopen on return", async () => {
+    const privateStatus: AgentStatus = {
+      state: "replying",
+      run_id: "private-run",
+      computer: { mode: "search", search: { tool: "web", hits: [{ title: "Private result" }] } },
+    };
+    const channelStatus: AgentStatus = {
+      state: "replying",
+      run_id: "channel-run",
+      computer: { mode: "search", search: { tool: "web", hits: [{ title: "Channel result" }] } },
+    };
+    const view = renderSidebar(privateScope, true, <ChatComposerFixture />, {
+      ...initialAppState,
+      agentStatuses: {
+        ...initialAppState.agentStatuses,
+        private: privateStatus,
+        channels: { "4": channelStatus },
+      },
+    });
+    await userEvent.click(within(screen.getByRole("region", { name: "Chat composer" }))
+      .getByRole("button", { name: "Show the AI computer" }));
+    const computer = await waitForOpenPreview("AI computer");
+    expect(within(computer).getByText("Private result")).toBeVisible();
 
     view.rerender(
-      <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
+      <StoreContext.Provider value={view.store}>
         <TestUiProviders>
           <ChatPreviewSidebar scope={{ scope_type: "channel", scope_id: "4" }}>
             <PreviewHeaderFixture />
-            <div>Other chat</div>
+            <ChatComposerFixture />
           </ChatPreviewSidebar>
         </TestUiProviders>
       </StoreContext.Provider>,
     );
 
+    expect(computer.isConnected).toBe(false);
     await waitForClosedPreview();
-    expect(screen.getByText("Other chat")).toBeVisible();
+    expect(screen.queryByText("Private result")).not.toBeInTheDocument();
+    expect(screen.getByText("Channel result")).toBeVisible();
+    expect(within(screen.getByRole("region", { name: "Chat composer" }))
+      .getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+
+    view.rerender(
+      <StoreContext.Provider value={view.store}>
+        <TestUiProviders>
+          <ChatPreviewSidebar scope={privateScope}>
+            <PreviewHeaderFixture />
+            <ChatComposerFixture />
+          </ChatPreviewSidebar>
+        </TestUiProviders>
+      </StoreContext.Provider>,
+    );
+    expect(screen.getByText("Private result")).toBeVisible();
+    expect(screen.queryByText("Channel result")).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
   });
 
   it("shows a failed HTML projection instead of waiting for unavailable presentation content", async () => {

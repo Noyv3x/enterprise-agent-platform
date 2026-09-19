@@ -11,12 +11,40 @@ const idleAvailability = {
 };
 
 describe("computer surface derivation", () => {
-  it("hides the monitor on an idle empty chat", () => {
+  it.each(["idle", "queued"])("hides an empty computer while %s", (state) => {
     expect(deriveComputerSurface({
-      status: { state: "idle" },
+      status: { state },
       messages: [],
       availability: idleAvailability,
     }).visible).toBe(false);
+  });
+
+  it.each(["replying", "approval"])("shows waiting work while %s without inventing a screen", (state) => {
+    const surface = deriveComputerSurface({
+      status: { state, run_id: "run-waiting", started_at: 1_784_376_000 },
+      messages: [],
+      availability: { ...idleAvailability, loading: true },
+    });
+
+    expect(surface.visible).toBe(true);
+    expect(surface.live).toBe(true);
+    expect(surface.mode).toBeNull();
+    expect(surface.file).toBeNull();
+    expect(surface.present).toBeNull();
+    expect(surface.searchHits).toEqual([]);
+  });
+
+  it("keeps waiting work visible when availability fails before the first tool", () => {
+    const surface = deriveComputerSurface({
+      status: { state: "replying", run_id: "run-waiting" },
+      messages: [],
+      availability: { ...idleAvailability, error: "Preview service unavailable" },
+    });
+
+    expect(surface.visible).toBe(true);
+    expect(surface.live).toBe(true);
+    expect(surface.mode).toBeNull();
+    expect(surface.startedAt).toBeNull();
   });
 
   it("shows a skeleton as soon as a computer tool starts", () => {
@@ -169,6 +197,47 @@ describe("computer surface derivation", () => {
     });
     expect(surface.visible).toBe(true);
     expect(surface.mode).toBe("present");
+    expect(surface.live).toBe(false);
+  });
+
+  it.each([
+    { mode: "browser", browserActive: true, runningTerminalCount: 0 },
+    { mode: "terminal", browserActive: false, runningTerminalCount: 1 },
+  ])("retains an available $mode after the Run without treating it as live work", ({
+    mode,
+    browserActive,
+    runningTerminalCount,
+  }) => {
+    const surface = deriveComputerSurface({
+      status: { state: "idle", run_id: "finished-run", started_at: 1_784_376_000 },
+      messages: [],
+      availability: { ...idleAvailability, browserActive, runningTerminalCount },
+    });
+
+    expect(surface.visible).toBe(true);
+    expect(surface.mode).toBe(mode);
+    expect(surface.live).toBe(false);
+  });
+
+  it("hides a completed file screen when its Run ends without retained resources", () => {
+    const status: AgentStatus = {
+      state: "replying",
+      run_id: "finished-file-run",
+      computer: {
+        mode: "file",
+        file: { workspace_path: "notes.md", target: "sandbox", status: "completed" },
+      },
+    };
+    expect(deriveComputerSurface({
+      status,
+      messages: [],
+      availability: idleAvailability,
+    }).visible).toBe(true);
+    expect(deriveComputerSurface({
+      status: { ...status, state: "idle" },
+      messages: [],
+      availability: idleAvailability,
+    }).visible).toBe(false);
   });
 
   it("does not keep a five-minute dead browser after idle", () => {

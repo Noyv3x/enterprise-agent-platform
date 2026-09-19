@@ -1,3 +1,4 @@
+import { Provider as MotionProvider } from '@rc-component/motion';
 import { App, Button, ConfigProvider, Drawer, theme as antTheme } from 'antd';
 import type { ConfigProviderProps, ThemeConfig } from 'antd';
 import { createContext, useContext, useId, useMemo, useRef, useState } from 'react';
@@ -92,7 +93,7 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
     const config: ThemeConfig = {
       algorithm: mode === 'dark' ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
       token: {
-        colorPrimary: brandRaw, colorPrimaryText: accent, colorLink: accent, colorTextLightSolid: onBrand, motion,
+        colorPrimary: brandRaw, colorPrimaryText: accent, colorLink: accent, colorTextLightSolid: onBrand,
         colorBgBase: palette.surface, colorBgLayout: palette.canvas, colorBgContainer: palette.surface,
         colorBgElevated: palette.surface, colorFillAlter: palette.inset,
         colorText: palette.ink, colorTextSecondary: palette.muted, colorTextTertiary: palette.faint,
@@ -117,12 +118,16 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
       },
     };
     return { variables, config };
-  }, [mode, primaryColor, motion, touch]);
+  }, [mode, primaryColor, touch]);
+  // Keep the public motion provider mounted: changing Ant's token.motion can
+  // insert a provider around the app and discard its unsaved state.
   return (
     <div ref={root} className="wf-root" data-wf-theme={mode} style={design.variables}>
       <SurfaceContext.Provider value={getContainer}>
         <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer}>
-          <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
+          <MotionProvider motion={motion}>
+            <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
+          </MotionProvider>
         </ConfigProvider>
       </SurfaceContext.Provider>
     </div>

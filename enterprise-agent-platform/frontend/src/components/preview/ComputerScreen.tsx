@@ -21,17 +21,24 @@ export function ComputerScreen({scope,surface,availabilityError,onRetryAvailabil
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [timing, surface.runId, surface.startedAt]);
+  const activity=t(surface.live ? "computer.pip.live" : "preview.readOnly");
+  const elapsed=timing ? t("computer.pip.elapsed", {time:formatComputerElapsed((now-Number(surface.startedAt)*1000)/1000)}) : undefined;
   return <div className="wf-computer-screen">
     {availabilityError ? <Notice tone="warning" title={availabilityError} action={<Button onClick={onRetryAvailability}>{t("computer.retry")}</Button>} /> : null}
-    <ComputerPanel expanded title={surface.mode ? t(`computer.mode.${surface.mode}`) : t("computer.title")} modeLabel={t(surface.live ? "computer.pip.live" : "preview.readOnly")} elapsed={timing ? t("computer.pip.elapsed", {time:formatComputerElapsed((now-Number(surface.startedAt)*1000)/1000)}) : undefined}>
-    <div className="wf-computer-viewport" data-mode={surface.mode || undefined}>
+    {surface.mode ? <ComputerPanel expanded title={t(`computer.mode.${surface.mode}`)} modeLabel={activity} elapsed={elapsed}>
+    <div className="wf-computer-viewport" data-mode={surface.mode}>
       {surface.mode === "file" ? <FileComputerView scope={scope} runId={surface.runId} file={surface.file} />
         : surface.mode === "browser" ? <BrowserPreviewView scope={scope} controlRequestId={browserControlRequestId} />
         : surface.mode === "terminal" ? <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
         : surface.mode === "present" ? <PresentComputerView scope={scope} present={surface.present} />
         : surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} />
-        : <LoadingState label={t("computer.loading")} />}
+        : null}
     </div>
-    </ComputerPanel>
+    </ComputerPanel> : <div className="wf-computer-waiting">
+      <div>
+        <LoadingState label={t("computer.waiting")} />
+        <div className="wf-computer-waiting-meta"><span>{activity}</span>{elapsed ? <span className="wf-mono">{elapsed}</span> : null}</div>
+      </div>
+    </div>}
   </div>;
 }

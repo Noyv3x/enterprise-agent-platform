@@ -4,6 +4,7 @@ export const previewMessages = defineMessages({
   "preview.sidebarLabel": { "zh-CN": "Agent 侧边工具", en: "Agent side tools", "zh-TW": "Agent 側邊工具" },
   "computer.title": { "zh-CN": "AI 的电脑", en: "AI computer", "zh-TW": "AI 的電腦" },
   "computer.show": { "zh-CN": "显示 AI 的电脑", en: "Show the AI computer", "zh-TW": "顯示 AI 的電腦" },
+  "computer.minimize": { "zh-CN": "收起 AI 的电脑", en: "Minimize the AI computer", "zh-TW": "收起 AI 的電腦" },
   "computer.description": {
     "zh-CN": "查看 Agent 当前正在做的可见工作。",
     en: "Watch the visible work the Agent is doing now.",
@@ -15,6 +16,7 @@ export const previewMessages = defineMessages({
   "computer.mode.search": { "zh-CN": "搜索", en: "Search", "zh-TW": "搜尋" },
   "computer.mode.present": { "zh-CN": "呈现页", en: "Page", "zh-TW": "呈現頁" },
   "computer.loading": { "zh-CN": "正在准备 AI 的电脑", en: "Preparing the AI computer", "zh-TW": "正在準備 AI 的電腦" },
+  "computer.waiting": { "zh-CN": "等待工作画面", en: "Waiting for a work preview", "zh-TW": "等待工作畫面" },
   "computer.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
   "computer.file.loading": { "zh-CN": "正在读取文件…", en: "Loading file…", "zh-TW": "正在讀取檔案…" },
   "computer.file.empty": { "zh-CN": "没有可显示的文件文本。", en: "No file text is available.", "zh-TW": "沒有可顯示的檔案文字。" },

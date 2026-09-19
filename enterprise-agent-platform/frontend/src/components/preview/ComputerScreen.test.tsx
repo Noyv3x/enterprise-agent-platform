@@ -4,7 +4,8 @@ import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentPreviewFileResponse } from "../../types";
 import type { ComputerSurface } from "./computer";
 import { ComputerScreen } from "./ComputerScreen";
@@ -17,6 +18,7 @@ vi.mock("../../data/previewActions", async () => {
 });
 
 const scope = { scope_type: "private" as const, scope_id: "7" };
+const defaultMatchMedia = window.matchMedia;
 
 /** The same tool call identity across two Runs; only the Run and the draft revision differ. */
 function runningDraftSurface(runId: string, draftRevision: number): ComputerSurface {
@@ -31,6 +33,8 @@ function runningDraftSurface(runId: string, draftRevision: number): ComputerSurf
       path: "draft.txt",
       workspace_path: "draft.txt",
       target: "sandbox",
+      source: "draft",
+      draft_kind: "file",
       status: "running",
       tool_call_id: "call",
       revision: `draft:call:${draftRevision}`,
@@ -55,26 +59,100 @@ function draft(content: string, draftRevision: number): AgentPreviewFileResponse
 
 function screenFor(surface: ComputerSurface) {
   return (
-    <I18nProvider>
+    <TestUiProviders>
       <ComputerScreen
         scope={scope}
         surface={surface}
         availabilityError=""
         onRetryAvailability={() => undefined}
       />
-    </I18nProvider>
+    </TestUiProviders>
   );
 }
 
-describe("ComputerScreen file drafts across Runs", () => {
+describe("ComputerScreen", () => {
   beforeEach(() => {
     localStorage.setItem(LOCALE_STORAGE_KEY, "en");
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string): MediaQueryList => ({
+        matches: query === "(prefers-reduced-motion: reduce)",
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
     vi.mocked(fetchPreviewFile).mockReset();
   });
 
   afterEach(() => {
     cleanup();
     localStorage.clear();
+    vi.useRealTimers();
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: defaultMatchMedia,
+    });
+  });
+
+  it("shows waiting work until real content arrives without reading a fallback file", () => {
+    const waiting: ComputerSurface = {
+      ...runningDraftSurface("run-waiting", 1),
+      mode: null,
+      file: null,
+    };
+    const view = render(screenFor(waiting));
+
+    expect(screen.getByText("Waiting for a work preview")).toBeVisible();
+    expect(screen.queryByText(/^Elapsed /)).not.toBeInTheDocument();
+    expect(fetchPreviewFile).not.toHaveBeenCalled();
+
+    view.rerender(screenFor({
+      ...waiting,
+      mode: "search",
+      searchTool: "web",
+      searchHits: [{ title: "<img src=x onerror=alert(1)>", snippet: "Authoritative search result" }],
+    }));
+
+    expect(screen.getByText("<img src=x onerror=alert(1)>")).toBeVisible();
+    expect(screen.getByText("Authoritative search result")).toBeVisible();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.queryByText("Waiting for a work preview")).not.toBeInTheDocument();
+    expect(fetchPreviewFile).not.toHaveBeenCalled();
+  });
+
+  it("uses the Run start while expanded and stops timing a retained page after the Run ends", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-15T12:00:05.000Z"));
+    const working: ComputerSurface = {
+      ...runningDraftSurface("run-clock", 1),
+      startedAt: Date.parse("2026-08-15T12:00:00.000Z") / 1_000,
+      mode: null,
+      file: null,
+    };
+    const view = render(screenFor(working));
+    expect(screen.getByText("Elapsed 00:05")).toBeVisible();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(screen.getByText("Elapsed 00:06")).toBeVisible();
+
+    view.rerender(screenFor({
+      ...working,
+      live: false,
+      mode: "present",
+      present: { workspace_path: "page.html", status: "completed" },
+    }));
+    expect(screen.getByTitle("Presented page")).toBeInTheDocument();
+    expect(screen.queryByText(/^Elapsed /)).not.toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(screen.queryByText(/^Elapsed /)).not.toBeInTheDocument();
   });
 
   it("never shows the previous Run's late draft once the surface belongs to a new Run", async () => {

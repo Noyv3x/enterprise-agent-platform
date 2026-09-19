@@ -15,26 +15,30 @@ function Fixture({ value }: { value: string }) {
 describe("useAutoGrow", () => {
   afterEach(cleanup);
 
-  it("keeps an empty composer at its CSS single-line baseline without measuring the placeholder", () => {
+  it("caps long input and restores the empty composer's CSS baseline after clearing", () => {
     const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get")
-      .mockReturnValue(103);
+      .mockReturnValue(340);
 
-    render(<Fixture value="" />);
+    const { rerender } = render(<Fixture value="Long input" />);
+    expect(screenTextArea()).toHaveStyle({ height: "200px" });
+    expect(screenTextArea()).toHaveClass("is-scrollable");
 
-    expect(screenTextArea()).not.toHaveStyle({ height: "103px" });
+    rerender(<Fixture value="" />);
     expect(screenTextArea().style.height).toBe("");
-    expect(scrollHeight).not.toHaveBeenCalled();
+    expect(screenTextArea()).not.toHaveClass("is-scrollable");
     scrollHeight.mockRestore();
   });
 
-  it("still grows a non-empty composer to its bounded content height", () => {
+  it("grows and shrinks with non-empty content", () => {
     const scrollHeight = vi.spyOn(HTMLTextAreaElement.prototype, "scrollHeight", "get")
       .mockReturnValue(96);
 
-    render(<Fixture value="Two lines" />);
+    const { rerender } = render(<Fixture value="Two lines" />);
 
     expect(screenTextArea()).toHaveStyle({ height: "96px" });
-    expect(scrollHeight).toHaveBeenCalled();
+    scrollHeight.mockReturnValue(48);
+    rerender(<Fixture value="One line" />);
+    expect(screenTextArea()).toHaveStyle({ height: "48px" });
     scrollHeight.mockRestore();
   });
 });
