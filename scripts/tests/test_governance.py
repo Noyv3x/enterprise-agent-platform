@@ -103,7 +103,7 @@ class GovernanceTests(unittest.TestCase):
 
     def docs_snapshot(self):
         # Snapshot tracked working-tree inputs, excluding ignored build/runtime data.
-        owned = ['docs', 'scripts', '.github', '.gitignore', 'AGENTS.md', 'claude.md', 'README.md',
+        owned = ['docs', 'scripts', '.github', '.gitignore', 'AGENTS.md', 'README.md',
                  'install.sh', 'manager', 'containers', 'enterprise-agent-platform']
         tracked = subprocess.run(['git', '-C', str(ROOT), 'ls-files', '-z', '--', *owned],
                                  env=self.env, check=True, capture_output=True, timeout=30).stdout

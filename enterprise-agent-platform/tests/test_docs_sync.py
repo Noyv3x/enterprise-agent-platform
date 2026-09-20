@@ -487,20 +487,6 @@ class DocsSyncTests(unittest.TestCase):
         unmapped = self.run_command("check", expect=1)
         self.assertIn("covered production path has no documentation domain", unmapped.stderr)
 
-    def test_check_allows_only_the_claude_agents_compatibility_pointer(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        manifest["coverage"]["document_include"].append("claude.md")  # type: ignore[index,union-attr]
-        self.manifest_domain(manifest, "documentation-governance")["documents"].append("claude.md")  # type: ignore[union-attr]
-        self.write_fixture(manifest)
-        (self.root / "claude.md").write_text("@AGENTS.md\n", encoding="utf-8")
-        self.run_command("sync", expect=0)
-        self.run_command("check", expect=0)
-
-        (self.root / "claude.md").write_text("# Independent rules\n", encoding="utf-8")
-        invalid = self.run_command("check", expect=1)
-        self.assertIn("must contain only @AGENTS.md", invalid.stderr)
-
     def test_check_rejects_invalid_contract_bounds(self) -> None:
         self.initialize_git()
         self.write_fixture()
@@ -745,31 +731,6 @@ class DocsSyncTests(unittest.TestCase):
 
         help_result = self.run_command("check-change", "--help", expect=0)
         self.assertIn("INDEX", help_result.stdout)
-
-    def test_index_check_reads_staged_invalid_claude_pointer_after_worktree_repair(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        manifest["coverage"]["document_include"].append("claude.md")  # type: ignore[index,union-attr]
-        self.manifest_domain(manifest, "documentation-governance")["documents"].append("claude.md")  # type: ignore[union-attr]
-        self.write_fixture(manifest)
-        compatibility = self.root / "claude.md"
-        compatibility.write_text("@AGENTS.md\n", encoding="utf-8")
-        self.run_command("sync", expect=0)
-        self.run_command("check", expect=0)
-        base = self.commit("baseline")
-
-        compatibility.write_text("# Staged independent rules\n", encoding="utf-8")
-        self.git("add", "claude.md")
-        compatibility.write_text("@AGENTS.md\n", encoding="utf-8")
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("must contain only @AGENTS.md", result.stderr)
 
     def test_index_check_reads_staged_manifest_after_worktree_repair(self) -> None:
         base = self.ready_repository()

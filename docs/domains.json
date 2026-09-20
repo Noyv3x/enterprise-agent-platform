@@ -42,7 +42,6 @@
     ],
     "document_include": [
       "AGENTS.md",
-      "claude.md",
       "docs/design/*.md",
       "docs/reference/*.md",
       "docs/operations/*.md",
@@ -57,7 +56,6 @@
       "id": "documentation-governance",
       "documents": [
         "AGENTS.md",
-        "claude.md",
         "docs/development/documentation-workflow.md",
         "docs/domains.json"
       ],

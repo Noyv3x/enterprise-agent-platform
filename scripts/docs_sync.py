@@ -28,9 +28,7 @@ from urllib.parse import unquote, urlsplit
 
 
 MANIFEST_PATH = PurePosixPath("docs/domains.json")
-CLAUDE_COMPATIBILITY_PATH = "claude.md"
-CLAUDE_COMPATIBILITY_CONTENT = "@AGENTS.md\n"
-ROOT_DOCUMENT_PATHS = {"AGENTS.md", CLAUDE_COMPATIBILITY_PATH}
+ROOT_DOCUMENT_PATHS = {"AGENTS.md"}
 REQUIRED_RUNTIME_POLICIES = {
     "run_idle_timeout",
     "max_turns_per_run",
@@ -2286,18 +2284,6 @@ def validate_current_tree(
 
     for contract in manifest.contracts:
         document_owners.setdefault(contract.source, set()).update(contract.domains)
-
-    if CLAUDE_COMPATIBILITY_PATH in document_owners:
-        compatibility_path = _safe_path(root, CLAUDE_COMPATIBILITY_PATH)
-        if compatibility_path.is_file():
-            try:
-                compatibility_content = compatibility_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                compatibility_content = ""
-            if compatibility_content != CLAUDE_COMPATIBILITY_CONTENT:
-                errors.append(
-                    f"{CLAUDE_COMPATIBILITY_PATH} must contain only @AGENTS.md as the compatibility pointer"
-                )
 
     for domain in manifest.domains:
         for code_pattern in domain.code:
