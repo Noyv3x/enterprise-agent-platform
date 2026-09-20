@@ -381,7 +381,9 @@ describe("ComputerPip", () => {
     expect(screen.getByText("Platform architecture")).toBeInTheDocument();
   });
 
-  it("shows a completed presented page inside the compact viewport", () => {
+  it("keeps the presented thumbnail passive behind its keyboard-operable card", async () => {
+    const openComputer = vi.fn();
+    const user = userEvent.setup();
     render(
       <TestUiProviders>
         <ChatPreviewContext.Provider value={{
@@ -401,7 +403,7 @@ describe("ComputerPip", () => {
               revision: "write-html:2:completed",
             },
           },
-          openComputer: vi.fn(),
+          openComputer,
           openBrowserAssist: vi.fn(),
         }}
         >
@@ -413,6 +415,13 @@ describe("ComputerPip", () => {
     const frame = screen.getByTitle("Presented page");
     expect(frame).toHaveAttribute("sandbox", "allow-scripts");
     expect(frame.getAttribute("sandbox")).not.toContain("allow-same-origin");
+    expect(frame).toHaveAttribute("tabindex", "-1");
+    expect(frame.closest("[inert]")).toHaveAttribute("aria-hidden", "true");
+    const button = screen.getByRole("button", { name: "Show the AI computer" });
+    expect(screen.getAllByRole("button")).toEqual([button]);
+    button.focus();
+    await user.keyboard("{Enter}");
+    expect(openComputer).toHaveBeenCalledWith(undefined, button);
   });
 
   it("uses the surface step as the compact terminal fallback", () => {

@@ -221,7 +221,10 @@
 .wf-attachment-copy { flex: 1; min-inline-size: 0; display: grid; gap: var(--wf-space-1); font-size: var(--wf-text-sm); overflow-wrap: anywhere; }
 .wf-attachment-meta { color: var(--wf-muted); font-size: var(--wf-text-xs); }
 .wf-attachment-actions { display: flex; align-items: center; gap: var(--wf-space-1); flex-wrap: wrap; }
-.wf-composer-dock { padding: var(--wf-space-2) var(--wf-page-gutter) max(var(--wf-space-4), env(safe-area-inset-bottom)); flex: none; inline-size: 100%; max-inline-size: calc(var(--wf-reading-width) + var(--wf-page-gutter) * 2); margin-inline: auto; }
+.wf-composer-dock { position: relative; padding: var(--wf-space-2) var(--wf-page-gutter) max(var(--wf-space-4), env(safe-area-inset-bottom)); flex: none; inline-size: 100%; max-inline-size: calc(var(--wf-reading-width) + var(--wf-page-gutter) * 2); margin-inline: auto; }
+.wf-composer-rail { position: absolute; inset-inline: var(--wf-page-gutter); inset-block-end: 100%; z-index: 1; display: flex; justify-content: flex-end; align-items: flex-end; gap: var(--wf-space-2); pointer-events: none; }
+.wf-composer-rail > * { pointer-events: auto; max-inline-size: 100%; }
+.wf-root .wf-composer-rail .wf-latest-action { box-shadow: var(--wf-shadow); }
 .wf-composer-area { position: relative; min-inline-size: 0; }
 .wf-composer-frame { border: var(--wf-border) solid var(--wf-strong-line); border-radius: var(--wf-radius); background: var(--wf-surface); transition: border-color var(--wf-fast) var(--wf-ease), box-shadow var(--wf-fast) var(--wf-ease); }
 .wf-composer-frame:focus-within { border-color: var(--wf-accent); box-shadow: 0 0 0 var(--wf-focus-width) var(--wf-accent-wash); }

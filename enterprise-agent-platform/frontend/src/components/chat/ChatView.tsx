@@ -63,6 +63,7 @@ export function ChatView({ mode }: { mode: ChatMode }) {
   return <ChatPreviewSidebar scope={previewScope} canManageSkills={canChat}>
     <MessageList mode={mode} scopeId={scopeId} noChannel={noChannel} forceBottomToken={forceBottomToken}
       header={<Topbar/>} resourceKey={mode==="private"?resourceKeys.privateChat:resourceKeys.channelChat(scopeId)}
-      composer={<><ComputerPip/>{disabled?<Notice title={placeholder}/>:<Composer mode={mode} scopeId={scopeId} draftKey={draftKey} disabled={disabled} placeholder={placeholder} focusToken={focusToken} onBumpFocus={bumpFocus} onBumpForceBottom={bumpForceBottom}/>}</>}/>
+      preview={<ComputerPip/>}
+      composer={disabled?<Notice title={placeholder}/>:<Composer mode={mode} scopeId={scopeId} draftKey={draftKey} disabled={disabled} placeholder={placeholder} focusToken={focusToken} onBumpFocus={bumpFocus} onBumpForceBottom={bumpForceBottom}/>}/>
   </ChatPreviewSidebar>;
 }

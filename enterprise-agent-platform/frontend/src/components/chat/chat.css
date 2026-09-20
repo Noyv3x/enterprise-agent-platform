@@ -1,6 +1,6 @@
 .wf-message-metadata{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
 .wf-message-metadata time{color:var(--wf-muted)}
-.wf-history-action,.wf-latest-action{display:flex;justify-content:center;padding-block:8px}
+.wf-history-action{display:flex;justify-content:center;padding-block:8px}
 .wf-message-prose{min-width:0;overflow-wrap:anywhere;white-space:normal}
 .wf-message-prose>:first-child{margin-block-start:0}
 .wf-message-prose>:last-child{margin-block-end:0}

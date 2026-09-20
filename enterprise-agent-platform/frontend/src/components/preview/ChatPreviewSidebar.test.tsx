@@ -119,10 +119,12 @@ function changeViewport(width: number) {
 
 function ChatComposerFixture() {
   return (
-    <section aria-label="Chat composer">
-      <textarea data-composer-input aria-label="Message input" />
-      <ComputerPip />
-    </section>
+    <>
+      <section aria-label="Computer preview"><ComputerPip /></section>
+      <section aria-label="Chat composer">
+        <textarea data-composer-input aria-label="Message input" />
+      </section>
+    </>
   );
 }
 
@@ -167,7 +169,7 @@ function BrowserAssistFixture() {
 }
 
 async function waitForOpenPreview(name: string) {
-  const role = name === "AI computer" && mocks.viewportWidth >= 1200 ? "complementary" : "dialog";
+  const role = name === "AI computer" ? "complementary" : "dialog";
   const panel = await screen.findByRole(role, { name });
   await waitFor(() => expect(panel).toBeVisible());
   return panel;
@@ -259,9 +261,9 @@ describe("ChatPreviewSidebar", () => {
       },
     });
 
-    const composer = screen.getByRole("region", { name: "Chat composer" });
-    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
-    expect(within(composer).getByText("Waiting for a work preview")).toBeVisible();
+    const preview = screen.getByRole("region", { name: "Computer preview" });
+    expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(within(preview).getByText("Waiting for a work preview")).toBeVisible();
     expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "AI computer" })).not.toBeInTheDocument();
     expect(screen.queryByTitle("Presented page")).not.toBeInTheDocument();
@@ -297,8 +299,8 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.queryByText("Waiting for a work preview")).not.toBeInTheDocument();
     expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
 
-    const composer = screen.getByRole("region", { name: "Chat composer" });
-    const pip = within(composer).getByRole("button", { name: "Show the AI computer" });
+    const preview = screen.getByRole("region", { name: "Computer preview" });
+    const pip = within(preview).getByRole("button", { name: "Show the AI computer" });
     await user.click(pip);
     const computer = await waitForOpenPreview("AI computer");
     expect(pip.isConnected).toBe(false);
@@ -314,58 +316,69 @@ describe("ChatPreviewSidebar", () => {
     });
     expect(within(computer).getByText("latest-result.txt")).toBeVisible();
     expect(screen.queryByText("First tool result")).not.toBeInTheDocument();
-    expect(within(composer).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
+    expect(within(preview).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
 
     await user.click(within(computer).getByRole("button", { name: "Minimize the AI computer" }));
     expect(computer.isConnected).toBe(false);
     expect(screen.getAllByText("latest-result.txt")).toHaveLength(1);
-    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
 
     updateStatus({ state: "replying", run_id: "next-run" });
     expect(screen.getByText("Waiting for a work preview")).toBeVisible();
     expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
   });
 
-  it("keeps exactly one presented-page consumer through expansion, viewport changes, and minimization", async () => {
+  it("keeps the expanded page and chat input mounted through viewport changes", async () => {
+    mocks.viewportWidth = 1568;
     mocks.availability.presentAvailable = true;
     const user = userEvent.setup();
     renderSidebar(privateScope, true, <ChatComposerFixture />);
-    const composer = screen.getByRole("region", { name: "Chat composer" });
+    const preview = screen.getByRole("region", { name: "Computer preview" });
+    const composer = screen.getByRole("textbox", { name: "Message input" });
     const compactFrame = screen.getByTitle("Presented page");
-    expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
+    expect(screen.getAllByTitle("Presented page")).toEqual([compactFrame]);
+    await user.type(composer, "Keep this draft");
 
-    await user.click(within(composer).getByRole("button", { name: "Show the AI computer" }));
-    const desktop = await waitForOpenPreview("AI computer");
-    const desktopFrame = within(desktop).getByTitle("Presented page");
+    await user.click(within(preview).getByRole("button", { name: "Show the AI computer" }));
+    const computer = await waitForOpenPreview("AI computer");
+    const expandedFrame = within(computer).getByTitle("Presented page");
     expect(compactFrame.isConnected).toBe(false);
-    expect(screen.getAllByTitle("Presented page")).toEqual([desktopFrame]);
+    expect(screen.getAllByTitle("Presented page")).toEqual([expandedFrame]);
+    await user.click(composer);
+    fireEvent.select(composer, { target: { selectionStart: 5, selectionEnd: 9 } });
 
-    changeViewport(1199);
-    const drawer = await waitForOpenPreview("AI computer");
-    const drawerFrame = within(drawer).getByTitle("Presented page");
-    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
-    expect(desktopFrame.isConnected).toBe(false);
-    expect(screen.getAllByTitle("Presented page")).toEqual([drawerFrame]);
-
-    fireEvent.click(within(drawer).getByRole("button", { name: "Minimize the AI computer" }));
-    expect(drawerFrame.isConnected).toBe(false);
-    expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
-    await waitForClosedPreview();
-
-    await user.click(within(composer).getByRole("button", { name: "Show the AI computer" }));
-    const reopenedDrawer = await waitForOpenPreview("AI computer");
-    const reopenedFrame = within(reopenedDrawer).getByTitle("Presented page");
-    changeViewport(1200);
-    const reopenedDesktop = await waitForOpenPreview("AI computer");
-    const currentFrame = within(reopenedDesktop).getByTitle("Presented page");
-    expect(reopenedFrame.isConnected).toBe(false);
+    changeViewport(1120);
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
     expect(screen.queryByRole("dialog", { name: "AI computer" })).not.toBeInTheDocument();
-    expect(screen.getAllByTitle("Presented page")).toEqual([currentFrame]);
+    expect(screen.getAllByTitle("Presented page")).toEqual([expandedFrame]);
+    expect(screen.getByRole("textbox", { name: "Message input" })).toBe(composer);
+    expect(composer).toHaveValue("Keep this draft");
+    expect(composer).toHaveFocus();
+    expect(composer).toHaveProperty("selectionStart", 5);
+    expect(composer).toHaveProperty("selectionEnd", 9);
 
-    fireEvent.click(within(reopenedDesktop).getByRole("button", { name: "Minimize the AI computer" }));
-    expect(currentFrame.isConnected).toBe(false);
+    changeViewport(390);
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
+    expect(screen.getAllByTitle("Presented page")).toEqual([expandedFrame]);
+    changeViewport(1568);
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
+    expect(screen.getAllByTitle("Presented page")).toEqual([expandedFrame]);
+
+    await user.click(within(computer).getByRole("button", { name: "Minimize the AI computer" }));
+    await waitForClosedPreview();
+    expect(expandedFrame.isConnected).toBe(false);
     expect(screen.getAllByTitle("Presented page")).toHaveLength(1);
-    expect(within(composer).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "Message input" })).toBe(composer);
+    expect(composer).toHaveValue("Keep this draft");
+
+    changeViewport(1120);
+    await user.click(within(preview).getByRole("button", { name: "Show the AI computer" }));
+    const reopened = await waitForOpenPreview("AI computer");
+    const reopenedFrame = within(reopened).getByTitle("Presented page");
+    changeViewport(1568);
+    expect(await waitForOpenPreview("AI computer")).toBe(reopened);
+    expect(screen.getAllByTitle("Presented page")).toEqual([reopenedFrame]);
   });
 
   it("opens Agent-scoped Skill management for private and channel chats", async () => {
@@ -510,34 +523,55 @@ describe("ChatPreviewSidebar", () => {
     expect(mocks.acquire).toHaveBeenLastCalledWith({ scope_type: "channel", scope_id: "4" }, "tab-1");
   });
 
-  it("releases browser assistance on a responsive remount instead of replaying the old gesture", async () => {
+  it("keeps one browser consumer and assistance lease across viewport changes until close", async () => {
+    mocks.viewportWidth = 1568;
     mocks.availability.browserActive = true;
     const user = userEvent.setup();
     renderSidebar(privateScope, true, <BrowserAssistFixture />);
 
     await user.click(screen.getByRole("button", { name: "Open browser from work" }));
-    const desktop = await waitForOpenPreview("AI computer");
-    expect(await within(desktop).findByText("Human assistance")).toBeVisible();
+    const computer = await waitForOpenPreview("AI computer");
+    expect(await within(computer).findByText("Human assistance")).toBeVisible();
+    const browserInput = within(computer).getByRole("application");
+    const browserFrame = within(computer).getByRole("img", { name: "Latest Agent browser frame" });
     expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    expect(mocks.release).not.toHaveBeenCalled();
+
+    changeViewport(1120);
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
+    expect(within(computer).getByRole("application")).toBe(browserInput);
+    expect(within(computer).getByRole("img", { name: "Latest Agent browser frame" })).toBe(browserFrame);
+    expect(within(computer).getByText("Human assistance")).toBeVisible();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    expect(mocks.release).not.toHaveBeenCalled();
 
     changeViewport(390);
-    const drawer = await waitForOpenPreview("AI computer");
-    await waitFor(() => expect(mocks.release).toHaveBeenCalledWith(privateScope, "tab-1", "lease-1"));
-    expect(within(drawer).queryByText("Human assistance")).not.toBeInTheDocument();
-    expect(within(drawer).getByRole("button", { name: "Take control" })).toBeVisible();
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
+    expect(within(computer).getByRole("application")).toBe(browserInput);
     expect(mocks.acquire).toHaveBeenCalledTimes(1);
-
-    changeViewport(1440);
-    const returnedDesktop = await waitForOpenPreview("AI computer");
-    expect(within(returnedDesktop).queryByText("Human assistance")).not.toBeInTheDocument();
+    expect(mocks.release).not.toHaveBeenCalled();
+    changeViewport(1568);
+    expect(await waitForOpenPreview("AI computer")).toBe(computer);
+    expect(within(computer).getByRole("application")).toBe(browserInput);
     expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    expect(mocks.release).not.toHaveBeenCalled();
 
-    await user.click(within(returnedDesktop).getByRole("button", { name: "Take control" }));
-    expect(await within(returnedDesktop).findByText("Human assistance")).toBeVisible();
-    expect(mocks.acquire).toHaveBeenCalledTimes(2);
+    await user.click(within(computer).getByRole("button", { name: "Minimize the AI computer" }));
+    await waitForClosedPreview();
+    await waitFor(() => expect(mocks.release).toHaveBeenCalledTimes(1));
+    expect(mocks.release).toHaveBeenCalledWith(privateScope, "tab-1", "lease-1");
+
+    changeViewport(1120);
+    await user.click(screen.getByRole("button", { name: "Show the AI computer" }));
+    const reopened = await waitForOpenPreview("AI computer");
+    expect(within(reopened).getByRole("button", { name: "Take control" })).toBeVisible();
+    expect(within(reopened).queryByText("Human assistance")).not.toBeInTheDocument();
+    expect(mocks.acquire).toHaveBeenCalledTimes(1);
+    expect(mocks.release).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps desktop chat usable and closes only an unconsumed Escape inside the computer", async () => {
+  it.each([1568, 1120, 390])("keeps chat usable and scopes Escape to the nonmodal computer at width %s", async (width) => {
+    mocks.viewportWidth = width;
     mocks.availability.browserActive = true;
     const user = userEvent.setup();
     const view = renderSidebar(
@@ -594,24 +628,6 @@ describe("ChatPreviewSidebar", () => {
     await waitFor(() => expect(computerButton).toHaveFocus());
   });
 
-  it("moves focus into the narrow computer Drawer and restores its trigger on Escape", async () => {
-    mocks.viewportWidth = 390;
-    mocks.availability.browserActive = true;
-    const user = userEvent.setup();
-    renderSidebar();
-    const computerButton = screen.getByRole("button", { name: "Show the AI computer" });
-
-    await user.click(computerButton);
-
-    const dialog = await waitForOpenPreview("AI computer");
-    expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
-    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
-
-    await user.keyboard("{Escape}");
-    await waitForClosedPreview();
-
-    await waitFor(() => expect(computerButton).toHaveFocus());
-  });
 
   it.each([1440, 390])("returns focus to the composer when a PiP opener unmounts at width %s", async (width) => {
     mocks.viewportWidth = width;
@@ -641,15 +657,15 @@ describe("ChatPreviewSidebar", () => {
       state,
     );
     const composer = screen.getByRole("textbox", { name: "Message input" });
-    const pipButton = within(screen.getByRole("region", { name: "Chat composer" }))
+    const pipButton = within(screen.getByRole("region", { name: "Computer preview" }))
       .getByRole("button", { name: "Show the AI computer" });
     expect(pipButton).toBeVisible();
 
     await user.click(pipButton);
 
     expect(pipButton.isConnected).toBe(false);
-    const dialog = await waitForOpenPreview("AI computer");
-    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+    const computer = await waitForOpenPreview("AI computer");
+    await waitFor(() => expect(computer.contains(document.activeElement)).toBe(true));
     await user.keyboard("{Escape}");
     await waitForClosedPreview();
 
@@ -735,7 +751,7 @@ describe("ChatPreviewSidebar", () => {
         channels: { "4": channelStatus },
       },
     });
-    await userEvent.click(within(screen.getByRole("region", { name: "Chat composer" }))
+    await userEvent.click(within(screen.getByRole("region", { name: "Computer preview" }))
       .getByRole("button", { name: "Show the AI computer" }));
     const computer = await waitForOpenPreview("AI computer");
     expect(within(computer).getByText("Private result")).toBeVisible();
@@ -755,7 +771,7 @@ describe("ChatPreviewSidebar", () => {
     await waitForClosedPreview();
     expect(screen.queryByText("Private result")).not.toBeInTheDocument();
     expect(screen.getByText("Channel result")).toBeVisible();
-    expect(within(screen.getByRole("region", { name: "Chat composer" }))
+    expect(within(screen.getByRole("region", { name: "Computer preview" }))
       .getByRole("button", { name: "Show the AI computer" })).toBeVisible();
 
     view.rerender(

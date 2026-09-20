@@ -8,7 +8,7 @@ import {useI18n,type Translator} from "../../i18n";
 import {agentStatusFor,hasPermission,isAgentActive,scopeTypeFor} from "../../store/selectors";
 import {useStore,useStoreHandle} from "../../store/useStore";
 import type {AgentStatus,ChatMode,Message,ScopeType,StreamMsg,TypingUser} from "../../types";
-import {ConversationLayout,ConversationEmpty,Notice} from "../ui/fieldwork";
+import {ConversationLayout,ConversationEmpty,ConversationJump,Notice} from "../ui/fieldwork";
 import {ResourceStatusView} from "../common/ResourceStatusView";
 import {AgentActivity} from "./AgentActivity";
 import {AgentApprovalPrompt} from "./AgentApprovalPrompt";
@@ -82,8 +82,8 @@ function agentStreamingMessages(
   }));
 }
 
-export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,composer,resourceKey}: {
- mode:ChatMode;scopeId:string;noChannel:boolean;forceBottomToken:number;header?:ReactNode;composer?:ReactNode;resourceKey?:string;
+export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,composer,preview,resourceKey}: {
+ mode:ChatMode;scopeId:string;noChannel:boolean;forceBottomToken:number;header?:ReactNode;composer?:ReactNode;preview?:ReactNode;resourceKey?:string;
 }) {
   const { t } = useI18n();
   const store = useStoreHandle();
@@ -180,8 +180,10 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
     {!active&&status?.state==="error"&&(hasAgentProcessSteps(status)?<AgentWorkCard work={status} active={false}/>:<Notice tone="danger" title={t("chat.agent.replyFailed")}>{status.last_error||[...(status.activity||[])].reverse().find(step=>step.stage==="error")?.detail}</Notice>)}
     {mode==="channel"&&typingUsers.length>0&&<TypingUsers users={typingUsers}/>}
   </>;
+  const jumpLabel=unreadCount?t("chat.scroll.newMessages",{count:unreadCount}):t("chat.scroll.toBottom");
   return <ConversationLayout header={header} threadRef={ref} threadLabel={mode==="private"?t("chat.log.privateLabel"):t("chat.log.channelLabel")}
-    composer={<>{!atBottom&&<div className="wf-latest-action"><Button onClick={scrollToBottom}>{unreadCount?t("chat.scroll.newMessages",{count:unreadCount}):t("chat.scroll.toBottom")}</Button></div>}{composer}</>}>
+    floatingActions={!atBottom||preview?<>{!atBottom&&<ConversationJump label={jumpLabel} count={unreadCount} onClick={scrollToBottom}/>}{preview}</>:undefined}
+    composer={composer}>
     <div className="wf-sr-only" aria-live="polite" aria-atomic="true" data-message-announcement>
       {incomingAnnouncement?.owner === announcementOwner && <span key={incomingAnnouncement.id}>{t("chat.scroll.newMessages",{count:incomingAnnouncement.count})}</span>}
     </div>

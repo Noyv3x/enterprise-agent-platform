@@ -4,16 +4,19 @@
 .wf-computer-dock { display:grid; grid-template-rows:auto minmax(0,1fr); min-width:0; min-height:0; height:100%; overflow:hidden; border-inline-start:var(--wf-border) solid var(--wf-line); background:var(--wf-surface); animation:wf-computer-enter var(--wf-medium) var(--wf-ease); }
 .wf-computer-dock-header { display:flex; align-items:center; justify-content:space-between; gap:var(--wf-space-3); padding:var(--wf-space-3) var(--wf-space-4); border-block-end:var(--wf-border) solid var(--wf-line); min-width:0; }
 .wf-computer-dock-header h2 { margin:0; font-size:var(--wf-text-lg); font-weight:600; min-width:0; overflow-wrap:anywhere; }
+.wf-computer-dock-header > button { flex:none; }
 .wf-computer-dock-body { min-width:0; min-height:0; overflow:hidden; }
 @keyframes wf-computer-enter { from { opacity:0; transform:translateX(var(--wf-space-3)); } to { opacity:1; transform:translateX(0); } }
-.wf-computer-compact { position:relative; display:grid; grid-template-rows:auto minmax(0,1fr) auto; box-sizing:border-box; width:208px; max-width:100%; aspect-ratio:16 / 9; min-width:0; min-height:0; margin-inline-start:auto; margin-block-end:var(--wf-space-2); overflow:hidden; border:var(--wf-border) solid var(--wf-line); border-radius:var(--wf-radius); background:var(--wf-surface); }
-.wf-computer-pip-heading,.wf-computer-pip-meta { display:flex; align-items:center; justify-content:space-between; gap:var(--wf-space-1); padding:var(--wf-space-1) var(--wf-space-2); min-width:0; min-height:0; overflow:hidden; font-size:var(--wf-text-xs); line-height:1.2; }
+.wf-computer-compact { position:relative; flex:0 1 auto; box-sizing:border-box; width:208px; max-width:100%; aspect-ratio:16 / 9; min-width:0; min-height:0; overflow:hidden; border:var(--wf-border) solid var(--wf-line); border-radius:var(--wf-radius); background:var(--wf-inset); isolation:isolate; }
+.wf-computer-pip-heading,.wf-computer-pip-meta { position:absolute; inset-inline:var(--wf-space-1); z-index:1; display:flex; align-items:center; justify-content:space-between; gap:var(--wf-space-1); min-width:0; min-height:0; overflow:hidden; color:var(--wf-surface); font-size:var(--wf-text-xs); line-height:1.2; pointer-events:none; }
+.wf-computer-pip-heading { inset-block-start:var(--wf-space-1); }
+.wf-computer-pip-heading > *,.wf-computer-pip-meta > span { padding:2px var(--wf-space-1); border-radius:var(--wf-radius-sm); background:color-mix(in srgb,var(--wf-ink) 78%,transparent); }
 .wf-computer-pip-heading strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
-.wf-computer-pip-heading svg { flex:none; }
-.wf-computer-pip-meta { border-block-start:var(--wf-border) solid var(--wf-line); color:var(--wf-muted); }
+.wf-computer-pip-heading svg { flex:none; box-sizing:content-box; padding:2px; }
+.wf-computer-pip-meta { inset-block-end:var(--wf-space-1); }
 .wf-computer-pip-meta > span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wf-computer-pip-meta > :last-child:not(:first-child) { flex:none; font-variant-numeric:tabular-nums; }
-.wf-computer-peek { display:flex; min-width:0; min-height:0; overflow:hidden; pointer-events:none; background:var(--wf-inset); }
+.wf-computer-peek { position:absolute; inset:0; display:flex; min-width:0; min-height:0; overflow:hidden; pointer-events:none; background:var(--wf-inset); }
 .wf-computer-peek > * { flex:1; min-width:0; min-height:0; max-width:100%; }
 .wf-computer-peek .wf-output-header { gap:var(--wf-space-1); padding:2px var(--wf-space-2); font-size:var(--wf-text-xs); line-height:1.2; }
 .wf-computer-peek .wf-output-header strong { max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -22,10 +25,10 @@
 .wf-computer-peek .wf-output-truncated { padding:2px var(--wf-space-2); font-size:var(--wf-text-xs); line-height:1.2; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wf-computer-peek .wf-loading { gap:var(--wf-space-1); padding:var(--wf-space-1) var(--wf-space-2); font-size:var(--wf-text-xs); line-height:1.2; }
 .wf-computer-pip-waiting { display:grid; place-content:center; padding:var(--wf-space-1) var(--wf-space-2); color:var(--wf-muted); font-size:var(--wf-text-xs); line-height:1.35; }
-.wf-root .wf-computer-pip-open { position:absolute; inset:0; width:100%; height:100%; min-width:0; padding:0; border:0; border-radius:inherit; background:transparent; }
+.wf-root .wf-computer-pip-open { position:absolute; inset:0; z-index:2; width:100%; height:100%; min-width:0; padding:0; border:0; border-radius:inherit; background:transparent; }
 .wf-root .wf-computer-pip-open:hover { background:transparent; box-shadow:inset 0 0 0 var(--wf-border) var(--wf-strong-line); }
 .wf-root .wf-computer-pip-open:focus-visible { outline:var(--wf-focus-width) solid var(--wf-accent); outline-offset:calc(-1 * var(--wf-focus-width)); }
-.wf-computer-thumbnail { width:100%; height:100%; object-fit:contain; }
+.wf-computer-thumbnail { width:100%; height:100%; object-fit:cover; object-position:top; }
 .wf-computer-screen { display:flex; flex-direction:column; height:100%; min-width:0; min-height:0; overflow:hidden; }
 .wf-computer-screen > .wf-computer { display:flex; flex-direction:column; flex:1; min-height:0; }
 .wf-computer-screen .wf-computer-content { display:flex; flex-direction:column; flex:1; min-height:0; overflow:hidden; }
@@ -42,6 +45,8 @@
 .wf-file-caret { display:inline-block; width:2px; height:1em; background:currentColor; vertical-align:text-bottom; animation:wf-file-receiving 1s steps(2,end) infinite; }
 @keyframes wf-file-receiving { 50% { opacity:0; } }
 .wf-present-view iframe { flex:1; width:100%; height:100%; min-height:0; border:0; }
+.wf-present-view[data-compact] { position:relative; }
+.wf-present-view[data-compact] iframe { position:absolute; inset:0; flex:none; width:500%; height:500%; max-width:none; transform:scale(.2); transform-origin:0 0; }
 .wf-browser-inputs { display:grid; gap:8px; padding-block:8px; }
 .wf-browser-frame { position:relative; display:flex; align-items:center; justify-content:center; flex:1; min-height:0; min-width:0; overflow:hidden; }
 .wf-browser-frame img { width:100%; height:100%; object-fit:contain; user-select:none; }

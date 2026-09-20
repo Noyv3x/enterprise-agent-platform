@@ -450,4 +450,28 @@ describe("MessageList Agent work records", () => {
     expect(screen.queryByText("1 new message")).toBeNull();
     expect(screen.getByText("Older member message")).toBeVisible();
   });
+
+  it("updates the jump action's unread count without losing keyboard focus, then returns to latest", () => {
+    const earlier: Message = { id: 40, author_type: "user", user_id: 2, username: "Alice", content: "Earlier message" };
+    const view = renderMessageList({ state: "idle" }, [earlier]);
+    const log = screen.getByRole("log", { name: "Public channel messages" });
+    // The setup stub never fires ResizeObserver, so the viewport size must stay at its mount value.
+    Object.defineProperties(log, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      scrollTop: { configurable: true, value: 300, writable: true },
+      scrollTo: { configurable: true, value: ({ top }: ScrollToOptions) => { log.scrollTop = Number(top); } },
+    });
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+
+    fireEvent.scroll(log);
+    const jump = screen.getByRole("button", { name: "Jump to latest" });
+    jump.focus();
+
+    act(() => view.store.dispatch({ type: "SET_MESSAGES", payload: [earlier, { ...earlier, id: 41, content: "Newer message" }] }));
+    expect(screen.getByRole("button", { name: "1 new message" })).toHaveFocus();
+
+    fireEvent.click(jump);
+    expect(log.scrollTop).toBe(1_000);
+    expect(screen.queryByRole("button", { name: /Jump to latest|new message/ })).toBeNull();
+  });
 });
