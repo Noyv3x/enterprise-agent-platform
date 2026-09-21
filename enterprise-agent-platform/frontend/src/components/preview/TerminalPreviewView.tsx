@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Tabs } from "antd";
+import { Button, SegmentedControl } from "../ui/beautiful";
 import { useI18n, intlLocale, type MessageKey } from "../../i18n";
 import type { ActivityStep, AgentPreviewScope, TerminalPreviewProcess } from "../../types";
-import { ComputerOutput, EmptyState, LoadingState, Notice, StatusMark } from "../ui/fieldwork";
+import { ComputerOutput, EmptyState, LoadingState, Notice, StatusMark } from "../ui/beautiful"
 import { PreviewStatus } from "./PreviewStatus";
 import { useTerminalPreviews } from "./useTerminalPreviews";
 
@@ -196,7 +196,7 @@ export function CompactTerminalPreview({ scope, fallbackStep }: CompactTerminalP
   const { state } = useTerminalPreviews(scope);
   const process = terminalDisplayProcesses(state.processes, fallbackStep)[0] || null;
   return (
-    <div className="wf-terminal-compact">
+    <div className="bui-terminal-compact">
       {process ? (
         <ComputerOutput
           kind="terminal"
@@ -279,15 +279,14 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
   const capturedAt = previewTime(process?.updated_at || state.capturedAt || state.checkedAt, intlLocale(locale));
   const idle = !state.loading && processes.length === 0;
   return (
-    <section className="wf-terminal-reader" aria-label={t("terminalPreview.title")}>
+    <section className="bui-terminal-reader" aria-label={t("terminalPreview.title")}>
       {processes.length > 1 ? (
-        <Tabs
-          activeKey={process?.id}
-          animated={false}
+        <SegmentedControl
+          value={process?.id || ""}
           aria-label={t("terminalPreview.title")}
           onChange={selectProcess}
-          items={processes.map((item, index) => ({
-            key: item.id,
+          options={processes.map((item, index) => ({
+            value: item.id,
             label: terminalTitle(item, t("terminalPreview.terminal", { number: index + 1 })),
           }))}
         />
@@ -295,7 +294,7 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
       {state.error ? <Notice tone="warning" title={state.error} /> : null}
       {orphaned ? <Notice tone="warning" title={t("terminalPreview.orphanedDetail")} /> : null}
       {process ? (
-        <div className="wf-terminal-canvas">
+        <div className="bui-terminal-canvas">
           <ComputerOutput
             kind="terminal"
             meta={<StatusMark tone={terminalTone(process)}>{terminalStatusText(process, t)}</StatusMark>}
@@ -303,7 +302,7 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
           >
             <pre
               ref={terminalRef}
-              className="wf-terminal-transcript"
+              className="bui-terminal-transcript"
               aria-label={t("terminalPreview.output")}
               tabIndex={0}
               onScroll={(event) => {
@@ -318,8 +317,8 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
       ) : !state.error ? (
         <EmptyState title={t("terminalPreview.noTerminals")} description={t("terminalPreview.noTerminalsDetail")} />
       ) : null}
-      <footer className="wf-terminal-controls">
-        <div className="wf-terminal-meta">
+      <footer className="bui-terminal-controls">
+        <div className="bui-terminal-meta">
           <StatusMark>{t("preview.readOnly")}</StatusMark>
           <PreviewStatus connection={state.connection} idle={idle && !state.error} />
           <span>{t("terminalPreview.count", { count: processes.length })}</span>

@@ -1,10 +1,11 @@
-import { Button, Modal, Table, Tabs } from "antd";
+import { Button, DataTable, SegmentedControl } from "../ui/beautiful";
 import { useEffect, useState } from "react";
 import { useI18n, type MessageKey } from "../../i18n";
 import { api, isApiRequestCancelled, safeUrl } from "../../lib/api";
 import type { Attachment, AttachmentPreview, AttachmentPreviewKind, AttachmentPreviewSection, XlsxPreviewSheet } from "../../types";
 import { formatFileSize } from "../../utils/format";
-import { AttachmentSlot, LoadingState, Notice, useFieldworkContainer } from "../ui/fieldwork";
+import { AttachmentSlot, LoadingState, Notice } from "../ui/beautiful";
+import { Dialog } from "./Dialog";
 import { Icon } from "./Icon";
 import "../preview/preview.css";
 
@@ -27,17 +28,14 @@ function Sheet({ sheet, compact }: { sheet: XlsxPreviewSheet; compact: boolean }
   const count = Math.max(sheet.columns, ...rows.map((row) => row.length));
   const visibleColumns = compact ? Math.min(8, count) : count;
   const limited = sheet.truncated || rows.length < sheet.rows.length || visibleColumns < count;
-  return <div className="wf-document-sheet">
-    {rows.length && visibleColumns ? <Table<string[]>
+  return <div className="bui-document-sheet">
+    {rows.length && visibleColumns ? <DataTable<{ cells: string[]; index: number }>
       aria-label={t("chat.xlsx.sheet", { name: sheet.name })}
-      dataSource={rows}
+      rows={rows.map((cells, index) => ({ cells, index }))}
       columns={Array.from({ length: visibleColumns }, (_, index) => ({
-        title: columnName(index), key: String(index), render: (_: unknown, row: string[]) => row[index] || "",
+        title: columnName(index), key: String(index), render: (row: { cells: string[] }) => row.cells[index] || "",
       }))}
-      rowKey={(_, index) => String(index)}
-      pagination={false}
-      scroll={{ x: "max-content" }}
-      size="small"
+      rowKey={row => row.index}
     /> : <Notice title={t("chat.xlsx.empty")} />}
     {limited ? <Notice title={t("chat.xlsx.limited")} /> : null}
   </div>;
@@ -47,7 +45,7 @@ function TextSection({ section, compact }: { section?: AttachmentPreviewSection;
   const { t } = useI18n();
   const blocks = section?.blocks || [];
   const visible = compact ? blocks.slice(0, 8) : blocks;
-  return <div className="wf-document-text">
+  return <div className="bui-document-text">
     {visible.length ? visible.map((text, index) => <p key={index}>{text}</p>) : <Notice title={t("chat.preview.empty")} />}
     {section?.truncated || visible.length < blocks.length ? <Notice title={t("chat.preview.limited")} /> : null}
   </div>;
@@ -55,7 +53,6 @@ function TextSection({ section, compact }: { section?: AttachmentPreviewSection;
 
 export function AttachmentPreviewCard({ attachment }: { attachment: Attachment }) {
   const { t } = useI18n();
-  const getContainer = useFieldworkContainer();
   const rawUrl = safeUrl(attachment.preview_url);
   let previewUrl = "";
   try {
@@ -97,7 +94,8 @@ export function AttachmentPreviewCard({ attachment }: { attachment: Attachment }
     kind === "pdf" ? t("chat.preview.page", { number: section.index || index + 1 }) :
     kind === "pptx" ? t("chat.preview.slide", { number: section.index || index + 1 }) : String(index + 1));
   const canExpand = Boolean(preview && (spreadsheet ? sheets.length : sections.some((section) => section.blocks.length)));
-  const downloadAction = <Button type="text" icon={<Icon name="download" size={18} />} aria-label={downloadLabel} title={downloadLabel} href={download || undefined} disabled={!download} target="_blank" rel="noreferrer" />;
+  const downloadAction = download ? <a className="bui-attachment-download" aria-label={downloadLabel} title={downloadLabel} href={download} target="_blank" rel="noreferrer"><Icon name="download" size={18} /></a> : undefined;
+  const selectedIndex = Number(selection.identity === identity ? selection.key : "0");
   const compact = failed ? <Notice tone="warning" title={t("chat.preview.unavailable")} /> : !preview ? <LoadingState label={t("chat.preview.loading")} /> : <>
     {spreadsheet ? sheets[0] ? <><strong>{sheets[0].name}</strong><Sheet sheet={sheets[0]} compact /></> : <Notice title={t("chat.xlsx.empty")} /> : <>
       {sections[0] && (sections[0].title || kind === "pdf" || kind === "pptx") ? <strong>{sectionLabel(sections[0], 0)}</strong> : null}
@@ -107,17 +105,18 @@ export function AttachmentPreviewCard({ attachment }: { attachment: Attachment }
   </>;
   return <>
     <AttachmentSlot name={name} meta={`${kind ? t(KIND_LABELS[kind]) : attachment.mime_type || t("chat.file")} · ${formatFileSize(attachment.size_bytes || 0)}`}
-      actions={<><Button type="text" icon={<Icon name="external" size={18} />} aria-label={expandLabel} title={expandLabel} disabled={!canExpand} onClick={() => setOpenIdentity(identity)} />{downloadAction}</>}
-      preview={<div className="wf-document-compact" aria-live="polite">{compact}</div>}
+      actions={<><Button variant="ghost" icon={<Icon name="external" size={18} />} aria-label={expandLabel} title={expandLabel} disabled={!canExpand} onClick={() => setOpenIdentity(identity)} />{downloadAction}</>}
+      preview={<div className="bui-document-compact" aria-live="polite">{compact}</div>}
     />
-    <Modal open={openIdentity === identity} onCancel={() => setOpenIdentity(null)} title={name} footer={downloadAction} width="min(1080px, calc(100vw - 32px))" destroyOnHidden getContainer={getContainer}>
-      <div className="wf-document-expanded">
+    <Dialog open={openIdentity === identity} onClose={() => setOpenIdentity(null)} title={name} footer={downloadAction}>
+      <div className="bui-document-expanded">
         {preview ? <>
-          <Tabs activeKey={selection.identity === identity ? selection.key : "0"} onChange={(key) => setSelection({ identity, key })}
-            items={spreadsheet ? sheets.map((sheet, index) => ({ key: String(index), label: sheet.name, children: <Sheet sheet={sheet} compact={false} /> })) : sections.map((section, index) => ({ key: String(index), label: sectionLabel(section, index), children: <TextSection section={section} compact={false} /> }))} />
+          <SegmentedControl value={String(selectedIndex)} onChange={key => setSelection({ identity, key })}
+            aria-label={name} options={spreadsheet ? sheets.map((sheet, index) => ({ value: String(index), label: sheet.name })) : sections.map((section, index) => ({ value: String(index), label: sectionLabel(section, index) }))} />
+          {spreadsheet ? sheets[selectedIndex] ? <Sheet sheet={sheets[selectedIndex]} compact={false} /> : null : <TextSection section={sections[selectedIndex]} compact={false} />}
           {preview.truncated ? <Notice title={t(spreadsheet ? "chat.xlsx.limited" : "chat.preview.limited")} /> : null}
         </> : null}
       </div>
-    </Modal>
+    </Dialog>
   </>;
 }

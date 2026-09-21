@@ -1,4 +1,4 @@
-import { Segmented } from "antd";
+import { SegmentedControl } from "../../ui/beautiful";
 import { useEffect, useState } from "react";
 import { selectAuditChannel } from "../../../data/adminActions";
 import { useConfirm } from "../../../hooks/useConfirm";
@@ -20,7 +20,7 @@ export function MessageAuditManagement() {
     if (!auditChannelId && channelId) void selectAuditChannel(store, channelId);
   }, [auditChannelId, channelId, store]);
   return <>
-    <Segmented value={source} onChange={setSource} options={[{ value: "channel", label: t("admin.audit.channel.label") }, { value: "private", label: t("admin.audit.private.title") }]} />
+    <SegmentedControl aria-label={t("admin.page.messages.label")} value={source} onChange={(value) => { if (value === "channel" || value === "private") setSource(value); }} options={[{ value: "channel", label: t("admin.audit.channel.label") }, { value: "private", label: t("admin.audit.private.title") }]} />
     {source === "channel" ? <ChannelAuditCard confirm={confirm} channelId={channelId} /> : <PrivateAuditCard confirm={confirm} />}
     {dialog}
   </>;

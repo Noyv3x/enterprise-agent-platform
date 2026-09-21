@@ -1,6 +1,6 @@
 import type { ChangeEvent, ReactNode, RefObject } from "react";
 import { useI18n } from "../../i18n";
-import { ComposerFrame } from "../ui/fieldwork";
+import { ComposerFrame } from "../ui/beautiful"
 import { AttachButton } from "./AttachButton";
 import { ComposerTextarea, type ComposerTextareaProps } from "./ComposerTextarea";
 import { MentionMenu } from "./MentionMenu";

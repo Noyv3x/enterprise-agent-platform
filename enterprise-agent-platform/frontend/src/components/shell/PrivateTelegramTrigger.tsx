@@ -1,4 +1,4 @@
-import { Badge, Button, Tooltip } from "antd";
+import { Button, Tooltip } from "../ui/beautiful";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { Icon } from "../common/Icon";
@@ -12,10 +12,10 @@ export function PrivateTelegramTrigger() {
   const title = !telegram?.gateway?.enabled ? t("nav.telegram.disabled")
     : linked ? t("nav.telegram.linked") : t("nav.telegram.configure");
   return <Tooltip title={title}>
-    <Badge dot={linked} status="success">
+    <span className="bui-telegram-trigger" data-linked={linked || undefined}>
       <Button icon={<Icon name="message" />} aria-label={t("nav.telegram.settings")}
         aria-expanded={expanded} aria-controls="private-telegram-popover"
         onClick={() => store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: !expanded })} />
-    </Badge>
+    </span>
   </Tooltip>;
 }

@@ -10,7 +10,7 @@ import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { PermissionGroup, User } from "../../types";
-import { AntDesignProvider } from "../ui/AntDesignProvider";
+import { BeautifulProvider } from "../ui/BeautifulProvider";
 import { AccountManagement } from "./accounts/AccountManagement";
 import userEvent from "@testing-library/user-event";
 
@@ -23,7 +23,7 @@ function renderAdmin(ui: ReactNode, users: User[] = [], permissionGroups: Permis
     <StoreContext.Provider value={store}>
       <I18nProvider>
         <ThemeContext.Provider value={{ theme: "light", toggleTheme: () => {} }}>
-          <AntDesignProvider>{ui}</AntDesignProvider>
+          <BeautifulProvider>{ui}</BeautifulProvider>
         </ThemeContext.Provider>
       </I18nProvider>
     </StoreContext.Provider>,
@@ -40,7 +40,7 @@ function AccountCreationHarness() {
   );
 }
 
-describe("Ant Design administration surfaces", () => {
+describe("Administration surfaces", () => {
   beforeEach(() => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
   });
@@ -85,9 +85,8 @@ describe("Ant Design administration surfaces", () => {
     const permissionGroup = within(editor).getByRole("combobox", { name: "Permission group" });
 
     await user.click(permissionGroup);
-    expect(permissionGroup).toHaveAttribute("aria-expanded", "true");
-    expect(permissionGroup).toHaveFocus();
-    fireEvent.keyDown(permissionGroup, { key: "Escape", code: "Escape", keyCode: 27, which: 27 });
+    await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "true"));
+    await user.keyboard("{Escape}");
     await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "false"));
     expect(screen.getAllByRole("dialog")).toEqual([editor]);
     expect(permissionGroup).toHaveFocus();
@@ -95,8 +94,8 @@ describe("Ant Design administration surfaces", () => {
     const displayName = within(editor).getByRole("textbox", { name: "Display name" });
     await user.type(displayName, "Unsaved account");
     await user.click(permissionGroup);
-    expect(permissionGroup).toHaveAttribute("aria-expanded", "true");
-    fireEvent.keyDown(permissionGroup, { key: "Escape", code: "Escape", keyCode: 27, which: 27 });
+    await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "true"));
+    await user.keyboard("{Escape}");
     await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "false"));
     expect(screen.getAllByRole("dialog")).toEqual([editor]);
     expect(displayName).toHaveValue("Unsaved account");

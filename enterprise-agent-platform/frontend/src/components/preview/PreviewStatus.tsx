@@ -1,5 +1,5 @@
 import { useI18n } from "../../i18n";
-import { StatusMark } from "../ui/fieldwork";
+import { StatusMark } from "../ui/beautiful"
 import type { PreviewConnection } from "./useBrowserPreview";
 
 export function PreviewStatus({connection,idle=false}: {connection:PreviewConnection;idle?:boolean}) {

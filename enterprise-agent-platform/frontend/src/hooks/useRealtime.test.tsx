@@ -171,4 +171,62 @@ describe("useRealtime compact updates", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
     expect(FakeEventSource.instances).toHaveLength(2);
   });
+
+  it("reconciles channel access loss on SSE disconnect and never reconnects the removed scope", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const user = { id: 7, username: "viewer", permissions: ["read_workspace"] } as User;
+    const store = createStore(rootReducer, {
+      ...initialAppState,
+      user,
+      activeView: "channel",
+      activeChannelId: 3,
+      channels: [{ id: 3, name: "removed" }, { id: 4, name: "remaining" }],
+    });
+    vi.stubGlobal("fetch", vi.fn(async (path: string) => {
+      if (path === "/api/channels/3/messages") return response({ error: "Unavailable" }, 404);
+      if (path === "/api/channels") return response({ channels: [{ id: 4, name: "remaining" }] });
+      if (path === "/api/auth/me") return response({ user });
+      return response({ messages: [], typing: [] });
+    }));
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
+    );
+    renderHook(() => useRealtime(), { wrapper });
+    const removed = FakeEventSource.instances[0];
+    act(() => {
+      removed.open();
+      removed.fail();
+    });
+    await settle();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(store.getState().activeChannelId).toBe(4);
+    expect(store.getState().channels).toEqual([{ id: 4, name: "remaining" }]);
+    expect(FakeEventSource.instances.map((stream) => stream.url)).toEqual([
+      "/api/channels/3/events", "/api/channels/4/events",
+    ]);
+    act(() => removed.update({ agent_status: { state: "replying" }, typing: [{ user_id: 7 }] }));
+    expect(store.getState().agentStatuses.channels["3"]).toBeUndefined();
+    expect(store.getState().typingUsers).toEqual([]);
+  });
+
+  it("ignores an outgoing actor's events before React cleans up the old stream", () => {
+    const user = { id: 7, username: "viewer", permissions: ["read_workspace"] } as User;
+    const store = createStore(rootReducer, {
+      ...initialAppState, user, activeView: "channel", activeChannelId: 3,
+    });
+    const fetchMock = vi.fn(async () => response({ messages: [] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
+    );
+    renderHook(() => useRealtime(), { wrapper });
+    const outgoing = FakeEventSource.instances[0];
+    act(() => {
+      store.dispatch({ type: "SET_USER", payload: { ...user, id: 8 } });
+      outgoing.update({ agent_status: { state: "replying" }, message_revision: 9 });
+      outgoing.fail();
+    });
+    expect(store.getState().agentStatuses.channels["3"]).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

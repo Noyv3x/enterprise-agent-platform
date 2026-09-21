@@ -30,7 +30,7 @@ import warnings
 import weakref
 import zlib
 from collections import OrderedDict, deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1422,19 +1422,26 @@ class EnterpriseService:
         strict: bool = False,
     ) -> None:
         try:
-            self.agent_client.cleanup_scope(
+            result = self.agent_client.cleanup_scope(
                 scope_key,
                 lifecycle_id=lifecycle_id,
                 delete_sessions=delete_sessions,
             )
+            if strict and (
+                not isinstance(result, dict)
+                or result.get("scope_key") != scope_key
+                or type(result.get("cancelled_runs")) is not int
+                or result["cancelled_runs"] < 0
+                or result.get("sessions_deleted") is not delete_sessions
+            ):
+                raise ValueError("Runtime returned an invalid scope cleanup acknowledgement")
         except Exception as exc:
             if not strict:
                 print(f"Failed to clean Agent scope {scope_key}: {exc}", file=sys.stderr)
             else:
                 raise ServiceError(
                     503,
-                    "Agent scope was reset but Runtime cancellation "
-                    f"could not be confirmed: {exc}",
+                    f"Agent scope cleanup could not be confirmed: {str(exc)[:2000]}",
                 ) from exc
 
         # Delegated Agents derive their own Camofox user identity from their
@@ -1469,6 +1476,11 @@ class EnterpriseService:
                 and int(task.get("_scope_epoch") or 0) == int(self._agent_scope_epochs.get(key, 0))
             )
             if not lifecycle_current:
+                return False
+            if str(task["scope_type"]) == "channel" and not self.db.scalar(
+                "SELECT 1 FROM channels WHERE id = ? AND archived = 0",
+                (str(task["scope_id"]),),
+            ):
                 return False
             job_id = int(task.get("_job_id") or 0)
             if not job_id:
@@ -1737,8 +1749,9 @@ class EnterpriseService:
         *,
         reason: str,
         cleanup_runtime: bool = True,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
-        """Invalidate and terminally cancel active/queued work for a scope."""
+        """Cancel scope work; a supplied transaction must not perform Runtime cleanup."""
 
         scope_type = str(scope_type)
         scope_id = str(scope_id)
@@ -1757,7 +1770,7 @@ class EnterpriseService:
             if int(task.get("_job_id") or 0) > 0
         }
         timestamp = now_ts()
-        with self.db.transaction(immediate=True) as conn:
+        with (nullcontext(conn) if conn is not None else self.db.transaction(immediate=True)) as conn:
             cancellable_job_ids = [
                 int(row["id"])
                 for row in conn.execute(
@@ -2087,6 +2100,11 @@ class EnterpriseService:
         """Hydrate reference-only mail wake jobs from the authoritative message."""
 
         payload = dict(job.payload)
+        if job.scope_type == "channel" and not self.db.scalar(
+            "SELECT 1 FROM channels WHERE id = ? AND archived = 0",
+            (job.scope_id,),
+        ):
+            return None
         is_mail_wake = (
             str(payload.get("task_type") or "") == MAIL_WAKE_TASK_TYPE
             or str(job.dedupe_key).startswith("mail:")
@@ -3554,6 +3572,43 @@ class EnterpriseService:
         except Exception as exc:
             raise ServiceError(409, f"channel already exists: {clean}") from exc
         return self.get_channel(actor, channel_id)
+
+    def delete_channel(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
+        """Archive access and work, then confirm cleanup without erasing data."""
+
+        scope_id = str(channel_id)
+        key = self._conversation_key("channel", scope_id)
+        # Send owns ingress through message persistence, browser handoff and
+        # enqueue. Deletion must not split that accepted operation in half.
+        with self._agent_ingress_lock(key), self._agent_update_admission():
+            with self._conversation_lock:
+                with self.db.transaction(immediate=True) as conn:
+                    actor = self._fresh_active_actor(actor)
+                    require_permission(actor, PERMISSION_MANAGE_CHANNELS)
+                    if conn.execute(
+                        "SELECT 1 FROM channels WHERE id = ?", (channel_id,)
+                    ).fetchone() is None:
+                        raise ServiceError(404, "channel not found")
+                    # The durable fence and terminal jobs commit before any
+                    # network cleanup. An archived row also authorizes retries.
+                    conn.execute(
+                        "UPDATE channels SET archived = 1 WHERE id = ?", (channel_id,)
+                    )
+                    self._cancel_agent_scope_work(
+                        "channel",
+                        scope_id,
+                        reason="Agent request cancelled because the channel was deleted",
+                        cleanup_runtime=False,
+                        conn=conn,
+                    )
+            # Do not hold the global conversation gate during network waits.
+            # Scope-only cleanup also covers an unregistered/recovered family.
+            self._cleanup_agent_scope(
+                self.agent_scopes.channel_scope_key(scope_id),
+                delete_sessions=False,
+                strict=True,
+            )
+        return {"deleted": True, "channel_id": channel_id}
 
     def get_channel(self, actor: dict[str, Any], channel_id: int) -> dict[str, Any]:
         row = self.db.query_one("SELECT * FROM channels WHERE id = ? AND archived = 0", (channel_id,))
@@ -6295,6 +6350,7 @@ class EnterpriseService:
         with self._conversation_lock:
             actor = self._fresh_active_actor(actor)
             require_permission(actor, PERMISSION_CHAT)
+            channel = self.get_channel(actor, channel_id)
             generation = self.account_generation_config(actor)
             user_msg = self._append_message(
                 scope_type="channel",
@@ -6380,20 +6436,40 @@ class EnterpriseService:
         prompt_content = self._agent_prompt_content(content, attachments, default="请处理这些附件。")
         generation = task["generation"]
         user_msg = task["user_message"]
-        self._record_agent_activity("channel", scope_id, "preparing", "准备 Agent 请求", "整理频道上下文")
-        agent_scope = self._channel_agent_scope(scope_id)
+        with self._conversation_lock:
+            self._ensure_agent_task_can_run(task)
+            self._record_agent_activity("channel", scope_id, "preparing", "准备 Agent 请求", "整理频道上下文")
+            agent_scope = self._channel_agent_scope(scope_id)
         system_prompt = self._channel_system_prompt(channel, agent_scope)
-        self._record_agent_activity(
-            "channel",
-            scope_id,
-            "replying",
-            "等待 Agent 运行过程",
-            generation["model"],
-            coalesce=True,
-        )
+        with self._conversation_lock:
+            self._ensure_agent_task_can_run(task)
+            self._record_agent_activity(
+                "channel",
+                scope_id,
+                "replying",
+                "等待 Agent 运行过程",
+                generation["model"],
+                coalesce=True,
+            )
         session_id = agent_scope.session_id
         workspace_path = Path(agent_scope.workspace_path)
         execution = self._agent_execution_metadata(agent_scope)
+
+        def record_progress(event: dict[str, Any]) -> None:
+            with self._conversation_lock:
+                if self._task_scope_is_current(task):
+                    self._record_agent_progress("channel", scope_id, event)
+
+        def record_content(
+            delta: str | None, turn_id: str = "", turn_index: int = 0
+        ) -> None:
+            with self._conversation_lock:
+                if self._task_scope_is_current(task):
+                    self._record_agent_content_delta(
+                        "channel", scope_id, delta,
+                        turn_id=turn_id, turn_index=turn_index,
+                    )
+
         result = self._generate_with_submission_barrier(
             task,
             agent_scope.scope_key,
@@ -6422,22 +6498,8 @@ class EnterpriseService:
             model=generation["model"],
             thinking_depth=generation["thinking_depth"],
             reasoning_config=generation["reasoning_config"],
-            progress_callback=lambda event: (
-                self._record_agent_progress("channel", scope_id, event)
-                if self._task_scope_is_current(task)
-                else None
-            ),
-            content_callback=lambda delta, turn_id="", turn_index=0: (
-                self._record_agent_content_delta(
-                    "channel",
-                    scope_id,
-                    delta,
-                    turn_id=turn_id,
-                    turn_index=turn_index,
-                )
-                if self._task_scope_is_current(task)
-                else None
-            ),
+            progress_callback=record_progress,
+            content_callback=record_content,
         )
         self._ensure_agent_task_can_run(task)
         clean_content, generated_attachments = self._extract_generated_attachments(
@@ -15078,10 +15140,6 @@ class EnterpriseService:
         scope_id = str(task["scope_id"])
         key = self._conversation_key(scope_type, scope_id)
         task = dict(task)
-        with self._conversation_lock:
-            if self._closed:
-                raise ServiceError(503, "service is shutting down")
-            scope_epoch = int(self._agent_scope_epochs.get(key, 0))
         # Epochs are process-local cancellation generations. Do not persist one
         # in the durable payload: after a clean restart current queued work must
         # rebase onto the new process's epoch zero.
@@ -15090,13 +15148,19 @@ class EnterpriseService:
             user_message_id = int((task.get("user_message") or {})["id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ServiceError(500, "Agent task is missing its persisted user message") from exc
-        job, _ = self.jobs.enqueue(
-            kind="agent",
-            dedupe_key=f"message:{user_message_id}",
-            payload=task,
-            scope_type=scope_type,
-            scope_id=scope_id,
-        )
+        with self._conversation_lock:
+            if self._closed:
+                raise ServiceError(503, "service is shutting down")
+            if scope_type == "channel":
+                self.get_channel(task.get("actor") or {}, int(scope_id))
+            scope_epoch = int(self._agent_scope_epochs.get(key, 0))
+            job, _ = self.jobs.enqueue(
+                kind="agent",
+                dedupe_key=f"message:{user_message_id}",
+                payload=task,
+                scope_type=scope_type,
+                scope_id=scope_id,
+            )
         if job.status != "queued":
             association = self.agent_inputs.get_by_job(job.id)
             with self._conversation_lock:
@@ -15698,6 +15762,8 @@ class EnterpriseService:
         with self._conversation_lock:
             if self._closed:
                 raise ServiceError(503, "service is shutting down")
+            if scope_type == "channel":
+                self.get_channel(task.get("actor") or {}, int(scope_id))
             queue = self._agent_queues.setdefault(key, deque())
             job_id = int(task.get("_job_id") or 0)
             if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):

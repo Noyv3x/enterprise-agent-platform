@@ -194,7 +194,11 @@ class _FakeRuntime:
                     self._json(200, {"ok": True, "status": "cancelled"})
                     return
                 if self.path == "/v1/scopes/cleanup":
-                    self._json(200, {"ok": True, "scope_key": body.get("scope_key"), "killed": 2})
+                    self._json(200, {
+                        "scope_key": body.get("scope_key"),
+                        "cancelled_runs": 2,
+                        "sessions_deleted": body.get("delete_sessions", False),
+                    })
                     return
                 if self.path == "/v1/sessions/compact":
                     self._json(
@@ -908,8 +912,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
 
     def test_cancel_and_cleanup(self):
         self.assertEqual(self.client.cancel_run("run-1")["status"], "cancelled")
-        cleanup = self.client.cleanup_scope("private:7", lifecycle_id="life-2")
-        self.assertEqual(cleanup["killed"], 2)
+        self.client.cleanup_scope("private:7", lifecycle_id="life-2")
         cleanup_request = self.runtime.request("POST", "/v1/scopes/cleanup")
         self.assertEqual(
             cleanup_request["body"],

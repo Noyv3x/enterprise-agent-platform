@@ -1,4 +1,4 @@
-import { Select } from "antd";
+import { Select } from "../../ui/beautiful";
 import { THINKING_DEPTH_OPTIONS } from "../../../lib/constants";
 import { useI18n } from "../../../i18n";
 
@@ -10,5 +10,5 @@ const depthLabels = {
 
 export function ThinkingDepthSelect({ id, value, onChange }: { id?: string; value: string; onChange: (value: string) => void }) {
   const { t } = useI18n();
-  return <Select id={id} style={{ width: "100%" }} value={value} onChange={onChange} options={THINKING_DEPTH_OPTIONS.map(([depth]) => ({ value: depth, label: t(depthLabels[depth as keyof typeof depthLabels]) }))} />;
+  return <Select id={id} value={value} onChange={(next) => onChange(String(next))} options={THINKING_DEPTH_OPTIONS.map(([depth]) => ({ value: depth, label: t(depthLabels[depth as keyof typeof depthLabels]) }))} />;
 }

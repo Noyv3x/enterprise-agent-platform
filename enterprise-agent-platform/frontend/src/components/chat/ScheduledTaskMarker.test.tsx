@@ -3,7 +3,8 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
@@ -43,7 +44,7 @@ describe("ScheduledTaskMarker", () => {
 
     render(
       <StoreContext.Provider value={store}>
-        <I18nProvider><MessageBubble message={message} /></I18nProvider>
+        <TestUiProviders><MessageBubble message={message} /></TestUiProviders>
       </StoreContext.Provider>,
     );
 
@@ -77,7 +78,7 @@ describe("ScheduledTaskMarker", () => {
 
     render(
       <StoreContext.Provider value={store}>
-        <I18nProvider><MessageBubble message={response} /></I18nProvider>
+        <TestUiProviders><MessageBubble message={response} /></TestUiProviders>
       </StoreContext.Provider>,
     );
 

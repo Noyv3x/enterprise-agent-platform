@@ -1,9 +1,9 @@
-import { AutoComplete, Button, Form, Input } from "antd";
+import { Button, Input, Field } from "../ui/beautiful";
 import { useEffect, useId, useMemo, useState } from "react";
 import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import { EmptyState, FormFooter, FormGrid, Notice, PageHeader, PageLayout, Section, SectionIndex } from "../ui/fieldwork";
+import { EmptyState, FormFooter, FormGrid, Notice, PageHeader, PageLayout, Section, SectionIndex } from "../ui/beautiful";
 import { BrowserNotificationSettings } from "./BrowserNotificationSettings";
 import { MailAccountSettings } from "./MailAccountSettings";
 import "./settings.css";
@@ -63,27 +63,23 @@ export function SettingsView() {
     header={<PageHeader title={t("nav.settings")} description={t("account.settingsDescription")} meta={<span>{user.display_name || user.username} · @{user.username}{user.position?.trim() ? ` · ${user.position.trim()}` : ""}</span>} />}
     navigation={<SectionIndex label={t("nav.settings")} groups={[{ key: "settings", label: null, items }]} activeKey={activeSection} onSelect={(key) => { setActiveSection(key); document.getElementById(`${id}-${key}`)?.scrollIntoView({ block: "start" }); }} />}
   >
-    <div className="wf-settings-sections">
+    <div className="settings-sections">
       <Section id={`${id}-profile`} title={t("account.profile")}>
-        <Form layout="vertical" onFinish={() => void updateCurrentUser(store, { display_name: displayName, position, timezone: timezone.trim() })} disabled={profilePending}>
-          <FormGrid>
-            <Form.Item label={t("account.displayName")} htmlFor={`${id}-name`}><Input id={`${id}-name`} value={displayName} autoComplete="name" onChange={(event) => setDisplayName(event.target.value)} /></Form.Item>
-            <Form.Item label={t("account.position")} htmlFor={`${id}-position`}><Input id={`${id}-position`} value={position} maxLength={80} onChange={(event) => setPosition(event.target.value)} /></Form.Item>
-            <Form.Item label={t("account.timezone")} htmlFor={`${id}-zone`} extra={t("account.timezoneHint")}><AutoComplete id={`${id}-zone`} aria-label={t("account.timezone")} value={timezone} options={zones} onChange={setTimezone} filterOption={(input, option) => String(option?.value || "").toLowerCase().includes(input.toLowerCase())} /></Form.Item>
-          </FormGrid>
-          <FormFooter><Button type="primary" htmlType="submit" loading={profilePending} disabled={!profileDirty || !timezone.trim()}>{t("account.saveProfile")}</Button></FormFooter>
-        </Form>
+        <form onSubmit={(event) => { event.preventDefault(); if (!profilePending && profileDirty && timezone.trim()) void updateCurrentUser(store, { display_name: displayName, position, timezone: timezone.trim() }); }}><fieldset disabled={profilePending}><FormGrid>
+          <Field label={t("account.displayName")} htmlFor={`${id}-name`}><Input id={`${id}-name`} value={displayName} autoComplete="name" onChange={(event) => setDisplayName(event.target.value)} /></Field>
+          <Field label={t("account.position")} htmlFor={`${id}-position`}><Input id={`${id}-position`} value={position} maxLength={80} onChange={(event) => setPosition(event.target.value)} /></Field>
+          <Field label={t("account.timezone")} htmlFor={`${id}-zone`} hint={t("account.timezoneHint")}><Input id={`${id}-zone`} value={timezone} list={`${id}-zones`} onChange={(event) => setTimezone(event.target.value)} /><datalist id={`${id}-zones`}>{zones.map(({ value }) => <option key={value} value={value} />)}</datalist></Field>
+        </FormGrid>
+        <FormFooter><Button variant="primary" type="submit" loading={profilePending} disabled={!profileDirty || !timezone.trim()}>{t("account.saveProfile")}</Button></FormFooter></fieldset></form>
       </Section>
       <Section id={`${id}-password`} title={t("account.changePassword")}>
-        <Form layout="vertical" onFinish={submitPassword} disabled={passwordPending}>
-          <FormGrid>
-            <Form.Item label={t("account.currentPassword")} htmlFor={`${id}-current`}><Input.Password id={`${id}-current`} autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Form.Item>
-            <Form.Item label={t("account.newPassword")} htmlFor={`${id}-new`}><Input.Password id={`${id}-new`} autoComplete="new-password" value={newPassword} onChange={(event) => { setNewPassword(event.target.value); setPasswordError(""); }} /></Form.Item>
-            <Form.Item label={t("account.confirmPassword")} htmlFor={`${id}-confirmation`}><Input.Password id={`${id}-confirmation`} autoComplete="new-password" value={confirmation} onChange={(event) => { setConfirmation(event.target.value); setPasswordError(""); }} /></Form.Item>
-          </FormGrid>
-          {passwordError ? <Notice tone="danger" title={passwordError === "mismatch" ? t("account.passwordMismatch") : t("account.passwordMinLength", { count: 8 })} /> : null}
-          <FormFooter><Button htmlType="submit" loading={passwordPending} disabled={!(currentPassword || newPassword || confirmation)}>{t("account.updatePassword")}</Button></FormFooter>
-        </Form>
+        <form onSubmit={(event) => { event.preventDefault(); if (!passwordPending) submitPassword(); }}><fieldset disabled={passwordPending}><FormGrid>
+          <Field label={t("account.currentPassword")} htmlFor={`${id}-current`}><Input type="password" id={`${id}-current`} autoComplete="current-password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} /></Field>
+          <Field label={t("account.newPassword")} htmlFor={`${id}-new`}><Input type="password" id={`${id}-new`} autoComplete="new-password" value={newPassword} onChange={(event) => { setNewPassword(event.target.value); setPasswordError(""); }} /></Field>
+          <Field label={t("account.confirmPassword")} htmlFor={`${id}-confirmation`}><Input type="password" id={`${id}-confirmation`} autoComplete="new-password" value={confirmation} onChange={(event) => { setConfirmation(event.target.value); setPasswordError(""); }} /></Field>
+        </FormGrid>
+        {passwordError ? <Notice tone="danger" title={passwordError === "mismatch" ? t("account.passwordMismatch") : t("account.passwordMinLength", { count: 8 })} /> : null}
+        <FormFooter><Button  type="submit" loading={passwordPending} disabled={!(currentPassword || newPassword || confirmation)}>{t("account.updatePassword")}</Button></FormFooter></fieldset></form>
       </Section>
       <div id={`${id}-notifications`}><BrowserNotificationSettings key={String(user.id)} userId={user.id} /></div>
       <div id={`${id}-mail`}><MailAccountSettings key={String(user.id)} /></div>

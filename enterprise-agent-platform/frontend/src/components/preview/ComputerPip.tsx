@@ -1,8 +1,7 @@
-import { Button } from "antd";
 import { useEffect, useState } from "react";
 import { useI18n, type MessageKey } from "../../i18n";
 import type { ComputerMode } from "../../types";
-import { Glyph, LoadingState } from "../ui/fieldwork";
+import { Glyph, LoadingState } from "../ui/beautiful"
 import { useChatPreviewContext } from "./ChatPreviewContext";
 import { FileComputerView } from "./FileComputerView";
 import { PresentComputerView } from "./PresentComputerView";
@@ -41,16 +40,16 @@ export function ComputerPip() {
   const running=!['completed','complete','done','failed','error','cancelled'].includes(String(surface.latestStep?.tool_status || 'running').toLowerCase());
   let content=surface.mode
     ? <LoadingState label={t("computer.loading")} />
-    : <span className="wf-computer-pip-waiting">{t("computer.waiting")}</span>;
+    : <span className="bui-computer-pip-waiting">{t("computer.waiting")}</span>;
   if (surface.mode === "file" && (surface.file?.path || surface.file?.workspace_path)) content=<FileComputerView scope={preview.scope} runId={surface.runId} file={surface.file} compact />;
-  else if (surface.mode === "browser" && state.frameUrl) content=<img className="wf-computer-thumbnail" src={state.frameUrl} alt={t("browserPreview.frameAlt")} draggable={false} />;
+  else if (surface.mode === "browser" && state.frameUrl) content=<img className="bui-computer-thumbnail" src={state.frameUrl} alt={t("browserPreview.frameAlt")} draggable={false} />;
   else if (surface.mode === "search" && (surface.searchHits.length || !surface.live || !running)) content=<SearchComputerView hits={surface.searchHits} compact />;
   else if (surface.mode === "present") content=<PresentComputerView scope={preview.scope} present={surface.present} compact />;
   else if (surface.mode === "terminal") content=<CompactTerminalPreview scope={preview.scope} fallbackStep={surface.latestStep} />;
-  return <div className="wf-computer-compact">
-    <div className="wf-computer-pip-heading"><strong>{t("computer.title")}</strong><Glyph name="expand" size={14} /></div>
-    <div className="wf-computer-peek" aria-hidden="true" inert>{content}</div>
-    <div className="wf-computer-pip-meta"><span>{activity}</span><Elapsed live={surface.live} runId={surface.runId} startedAt={surface.startedAt} /></div>
-    <Button type="text" className="wf-computer-pip-open" aria-label={t("computer.show")} aria-description={`${modeLabel} · ${activity}`} aria-expanded={false} title={t("computer.show")} onClick={event => preview.openComputer(undefined,event.currentTarget)} />
+  return <div className="bui-computer-compact">
+    <div className="bui-computer-pip-heading"><strong>{t("computer.title")}</strong><Glyph name="expand" size={14} /></div>
+    <div className="bui-computer-peek" aria-hidden="true" inert>{content}</div>
+    <div className="bui-computer-pip-meta"><span>{activity}</span><Elapsed live={surface.live} runId={surface.runId} startedAt={surface.startedAt} /></div>
+    <button type="button" className="bui-computer-pip-open" aria-label={t("computer.show")} aria-description={`${modeLabel} · ${activity}`} aria-expanded={false} title={t("computer.show")} onClick={event => preview.openComputer(undefined,event.currentTarget)}><span className="bui-computer-pip-open-label"><Glyph name="expand" size={14} />{t("computer.show")}</span></button>
   </div>;
 }

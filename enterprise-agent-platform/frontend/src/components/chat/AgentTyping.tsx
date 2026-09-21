@@ -1,7 +1,7 @@
 import { useI18n } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import type { AgentStatus } from "../../types";
-import { StatusMark } from "../ui/fieldwork";
+import { StatusMark } from "../ui/beautiful"
 
 export function AgentTyping({ status }: { status: AgentStatus }) {
   const { t } = useI18n();

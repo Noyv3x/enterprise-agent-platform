@@ -1,8 +1,8 @@
-import { Button } from "antd";
+import { Button } from "../ui/beautiful";
 import { useEffect, useState } from "react";
 import { useI18n } from "../../i18n";
 import type { ActivityStep, AgentPreviewScope } from "../../types";
-import { ComputerPanel, LoadingState, Notice } from "../ui/fieldwork";
+import { ComputerPanel, LoadingState, Notice } from "../ui/beautiful"
 import { BrowserPreviewView } from "./BrowserPreviewView";
 import type { ComputerSurface } from "./computer";
 import { FileComputerView } from "./FileComputerView";
@@ -23,10 +23,10 @@ export function ComputerScreen({scope,surface,availabilityError,onRetryAvailabil
   }, [timing, surface.runId, surface.startedAt]);
   const activity=t(surface.live ? "computer.pip.live" : "preview.readOnly");
   const elapsed=timing ? t("computer.pip.elapsed", {time:formatComputerElapsed((now-Number(surface.startedAt)*1000)/1000)}) : undefined;
-  return <div className="wf-computer-screen">
+  return <div className="bui-computer-screen">
     {availabilityError ? <Notice tone="warning" title={availabilityError} action={<Button onClick={onRetryAvailability}>{t("computer.retry")}</Button>} /> : null}
     {surface.mode ? <ComputerPanel expanded title={t(`computer.mode.${surface.mode}`)} modeLabel={activity} elapsed={elapsed}>
-    <div className="wf-computer-viewport" data-mode={surface.mode}>
+    <div className="bui-computer-viewport" data-mode={surface.mode}>
       {surface.mode === "file" ? <FileComputerView scope={scope} runId={surface.runId} file={surface.file} />
         : surface.mode === "browser" ? <BrowserPreviewView scope={scope} controlRequestId={browserControlRequestId} />
         : surface.mode === "terminal" ? <TerminalPreviewView scope={scope} fallbackStep={latestTerminalStep} />
@@ -34,10 +34,10 @@ export function ComputerScreen({scope,surface,availabilityError,onRetryAvailabil
         : surface.mode === "search" ? <SearchComputerView hits={surface.searchHits} />
         : null}
     </div>
-    </ComputerPanel> : <div className="wf-computer-waiting">
+    </ComputerPanel> : <div className="bui-computer-waiting">
       <div>
         <LoadingState label={t("computer.waiting")} />
-        <div className="wf-computer-waiting-meta"><span>{activity}</span>{elapsed ? <span className="wf-mono">{elapsed}</span> : null}</div>
+        <div className="bui-computer-waiting-meta"><span>{activity}</span>{elapsed ? <span className="bui-mono">{elapsed}</span> : null}</div>
       </div>
     </div>}
   </div>;

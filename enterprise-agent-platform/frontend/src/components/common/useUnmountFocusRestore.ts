@@ -1,33 +1,38 @@
-import { useLayoutEffect, useRef } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 
-/** Ant owns normal close focus; conditional unmount skips its after-close phase. */
+/** Restore after the real panel detaches, unless another live control took focus. */
 export function useUnmountFocusRestore(open: boolean) {
-  const contentRef = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const openRef = useRef(open);
 
   useLayoutEffect(() => {
     openRef.current = open;
     const focused = document.activeElement;
-    const panel = contentRef.current?.closest('[role="dialog"]');
-    if (open && focused instanceof HTMLElement && !panel?.contains(focused)) {
+    if (open && focused instanceof HTMLElement && focused !== document.body && !panelRef.current?.contains(focused)) {
       openerRef.current = focused;
     }
   }, [open]);
 
-  useLayoutEffect(() => () => {
-    if (!openRef.current) return;
-    const panel = contentRef.current?.closest('[role="dialog"]');
+  return useCallback((panel: HTMLDivElement | null) => {
+    if (panel) {
+      panelRef.current = panel;
+      const focused = document.activeElement;
+      if (openRef.current && focused instanceof HTMLElement && focused !== document.body && !panel.contains(focused)) {
+        openerRef.current = focused;
+      }
+      return;
+    }
+    const removedPanel = panelRef.current;
     const opener = openerRef.current;
     queueMicrotask(() => {
-      // StrictMode cleanup or a live focus owner must not move focus.
-      if (!panel || panel.isConnected || !opener?.isConnected) return;
+      // StrictMode ref replay keeps the panel connected. A newly focused field
+      // wins over restoration, including autofocus during the same commit.
+      if (!removedPanel || removedPanel.isConnected || !opener?.isConnected) return;
       const focused = document.activeElement;
-      if (focused === document.body || (focused && !focused.isConnected && panel.contains(focused))) {
+      if (focused === document.body || !focused?.isConnected || removedPanel.contains(focused)) {
         opener.focus({ preventScroll: true });
       }
     });
   }, []);
-
-  return contentRef;
 }

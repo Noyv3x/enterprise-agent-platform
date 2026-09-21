@@ -1,11 +1,11 @@
-import { Button, Form, Input } from "antd";
+import { Button, Field, Input } from "../ui/beautiful";
 import { useEffect, useState } from "react";
 import { useBranding } from "../../context/BrandingContext";
 import { login, runBusy } from "../../data/sessionActions";
 import { isApiError } from "../../lib/api";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
-import { AuthPage, FormFooter, Notice } from "../ui/fieldwork";
+import { AuthPage, FormFooter, Notice } from "../ui/beautiful"
 import { PublicUtilities } from "../ui/PublicUtilities";
 
 export function LoginView() {
@@ -16,6 +16,7 @@ export function LoginView() {
   const { branding } = useBranding();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [retryAt, setRetryAt] = useState(0);
   const [retrySeconds, setRetrySeconds] = useState(0);
 
@@ -45,11 +46,10 @@ export function LoginView() {
       footnote={t("workroom.authFootnote")}
       utilities={<PublicUtilities />}
       form={
-        <Form
-          layout="vertical"
-          requiredMark={false}
-          onFinish={() => {
-            if (retrySeconds > 0) return;
+        <form className="bui-stack"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (busy || retrySeconds > 0) return;
             void runBusy(store, "auth:login", async () => {
               try {
                 await login(store, username, password);
@@ -65,7 +65,7 @@ export function LoginView() {
             });
           }}
         >
-          <Form.Item label={t("auth.username")} htmlFor="login-username" required>
+          <Field label={t("auth.username")} htmlFor="login-username">
             <Input
               id="login-username"
               name="username"
@@ -77,9 +77,9 @@ export function LoginView() {
               value={username}
               onChange={(event) => setUsername(event.target.value)}
             />
-          </Form.Item>
-          <Form.Item label={t("auth.password")} htmlFor="login-password" required>
-            <Input.Password
+          </Field>
+          <Field label={t("auth.password")} htmlFor="login-password">
+            <Input type={passwordVisible ? "text" : "password"}
               id="login-password"
               name="password"
               autoComplete="current-password"
@@ -90,14 +90,17 @@ export function LoginView() {
               value={password}
               onChange={(event) => setPassword(event.target.value)}
             />
-          </Form.Item>
+            <Button variant="ghost" size="xs" aria-pressed={passwordVisible} onClick={() => setPasswordVisible(visible => !visible)}>
+              {t(passwordVisible ? "auth.hidePassword" : "auth.showPassword")}
+            </Button>
+          </Field>
           {displayedError && <div id="login-error"><Notice tone="danger" title={displayedError} /></div>}
           <FormFooter>
-            <Button type="primary" htmlType="submit" loading={busy} disabled={busy || retrySeconds > 0}>
+            <Button variant="primary" type="submit" loading={busy} disabled={busy || retrySeconds > 0}>
               {busy ? t("auth.loggingIn") : retrySeconds > 0 ? t("auth.retryIn", { count: retrySeconds }) : t("auth.login")}
             </Button>
           </FormFooter>
-        </Form>
+        </form>
       }
     />
   );

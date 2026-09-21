@@ -9,7 +9,7 @@ function renderToasts() {
   render(
     <I18nProvider>
       <ToastProvider>
-        <div>Application</div>
+        <button type="button">Application</button>
       </ToastProvider>
     </I18nProvider>,
   );
@@ -44,5 +44,19 @@ describe("toast accessibility and timers", () => {
     expect(screen.getByText("keep me")).toBeInTheDocument();
 
     fireEvent.mouseLeave(node);
+    act(() => vi.runAllTimers());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps a notification available while its dismiss button has keyboard focus", () => {
+    act(() => toast("keyboard notice", { type: "error" }));
+    const dismiss = screen.getByRole("button", { name: "Dismiss notification" });
+    act(() => dismiss.focus());
+    act(() => vi.advanceTimersByTime(10_000));
+    expect(screen.getByRole("alert")).toHaveTextContent("keyboard notice");
+
+    act(() => screen.getByRole("button", { name: "Application" }).focus());
+    act(() => vi.runAllTimers());
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

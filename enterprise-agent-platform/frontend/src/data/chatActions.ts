@@ -16,6 +16,7 @@ import {
   api,
   apiUpload,
   ApiRequestCancelledError,
+  getApiSessionGeneration,
   isApiError,
   isApiRequestCancelled,
   type ApiOptions,
@@ -47,8 +48,10 @@ import {
 } from "./statusFence";
 import { messageSyncCursor } from "./messageSync";
 import { messageHistoryState } from "./messageHistory";
+import { isChannelUnavailable, removeUnavailableChannel } from "./channelLifecycle";
 import {
   loadChannelMessages,
+  loadChannels,
   loadPrivateMessages,
   loadPrivateTelegram,
   type AppStore,
@@ -63,6 +66,7 @@ import type {
   AgentSessionCompactResponse,
   AppState,
   ChannelMessagesResponse,
+  ChannelDeleteResponse,
   ChatMode,
   Id,
   Message,
@@ -92,6 +96,8 @@ let pollInFlight = false;
 let pendingRefresh: {
   store: AppStore;
   authoritativeStatus: boolean;
+  actorId: Id;
+  generation: number;
 } | null = null;
 
 /* --------- local mirrors of the loaders' private merge/status helpers ---------
@@ -263,6 +269,8 @@ export function applyScopeRealtimeUpdate(
   scopeId: string,
   update: ScopeRealtimeUpdate,
 ): boolean {
+  if (mode === "channel" && isChannelUnavailable(store, scopeId)) return false;
+  if (mode === "private" && String(store.getState().user?.id) !== scopeId) return false;
   if (update.agent_status) {
     // An SSE snapshot is newer than any status GET already in flight. Invalidate
     // those reads before applying it so an equal-second watchdog response
@@ -307,16 +315,18 @@ export async function refreshActiveChat(
 ): Promise<void> {
   const initial = store.getState();
   if (!initial.user) return;
+  const generation = getApiSessionGeneration();
   if (pollInFlight) {
     // Slow links can leave an older GET in flight when SSE announces a newer
     // revision. Coalesce follow-up triggers, but never discard the newest one:
     // run it immediately after the current request settles.
-    pendingRefresh = { store, authoritativeStatus };
+    pendingRefresh = { store, authoritativeStatus, actorId: initial.user.id, generation };
     return;
   }
   const mode = scopeModeFor(initial.activeView);
   if (!mode) return;
   if (mode === "channel" && !initial.activeChannelId) return;
+  if (mode === "channel" && isChannelUnavailable(store, initial.activeChannelId!)) return;
 
   pollInFlight = true;
   try {
@@ -454,13 +464,31 @@ export async function refreshActiveChat(
         store.getState().messageHistory[privateKey],
       );
     }
-  } catch {
-    // Polling/SSE refresh is best-effort.
+  } catch (error) {
+    if (
+      mode === "channel"
+      && generation === getApiSessionGeneration()
+      && String(store.getState().user?.id) === String(initial.user.id)
+      && (isApiError(error, 403) || isApiError(error, 404))
+    ) {
+      await removeUnavailableChannel(store, initial.activeChannelId!);
+      // Navigation can await another scope's loader. Never start this refresh
+      // under a different account after that await.
+      if (
+        generation === getApiSessionGeneration()
+        && String(store.getState().user?.id) === String(initial.user.id)
+      ) await loadChannels(store).catch(() => undefined);
+    }
+    // Other polling/SSE failures are best-effort.
   } finally {
     pollInFlight = false;
     const next = pendingRefresh;
     pendingRefresh = null;
-    if (next) {
+    if (
+      next
+      && next.generation === getApiSessionGeneration()
+      && String(next.store.getState().user?.id) === String(next.actorId)
+    ) {
       void refreshActiveChat(next.store, {
         authoritativeStatus: next.authoritativeStatus,
       });
@@ -498,6 +526,7 @@ export async function navigateToView(store: AppStore, view: ActiveView): Promise
 
 /** Select a channel, close the drawer, then load its messages. */
 export async function selectChannel(store: AppStore, channelId: Id): Promise<void> {
+  if (!store.getState().user || isChannelUnavailable(store, channelId)) return;
   cacheVisibleChat(store);
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: "channel" });
   store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: channelId });
@@ -516,6 +545,41 @@ export async function selectChannel(store: AppStore, channelId: Id): Promise<voi
     restored,
     () => loadChannelMessages(store),
   ));
+}
+
+/** Archive access and confirm runtime cleanup; a partial cleanup remains retryable. */
+export async function deleteChannel(store: AppStore, channelId: Id): Promise<boolean> {
+  const actorId = store.getState().user?.id;
+  const generation = getApiSessionGeneration();
+  if (actorId == null) return false;
+  const current = () => generation === getApiSessionGeneration()
+    && String(store.getState().user?.id) === String(actorId);
+  try {
+    const result = await api<ChannelDeleteResponse>(
+      endpoints.deleteChannel.path(channelId),
+      { method: "DELETE", body: EMPTY_BODY },
+    );
+    if (!current()) return false;
+    if (result.deleted !== true || String(result.channel_id) !== String(channelId)) {
+      throw new Error(t("nav.channel.deleteFailed"));
+    }
+    await removeUnavailableChannel(store, channelId);
+    if (!current()) return false;
+    toast(t("nav.channel.deleteSuccess"), { type: "ok" });
+    return true;
+  } catch (error) {
+    if (!current() || isApiRequestCancelled(error)) return false;
+    // A 503 may mean archival committed but process cleanup did not. Refresh
+    // availability, without turning the failed cleanup into reported success.
+    if (isApiError(error, 503) || isApiError(error, 403) || isApiError(error, 404)) {
+      await loadChannels(store).catch(() => undefined);
+      if (!current()) return false;
+    }
+    const text = error instanceof Error ? error.message : String(error);
+    store.dispatch({ type: "SET_ERROR", payload: text });
+    toast(text, { type: "error", title: t("nav.channel.deleteFailed") });
+    return false;
+  }
 }
 
 /* ----------------------------------------------------- optimistic send */
@@ -605,6 +669,13 @@ export async function sendMessage(
   content: string,
   files: File[],
 ): Promise<boolean | null> {
+  const actorId = store.getState().user?.id;
+  const generation = getApiSessionGeneration();
+  const current = () => actorId != null
+    && generation === getApiSessionGeneration()
+    && String(store.getState().user?.id) === String(actorId)
+    && (mode !== "channel" || !isChannelUnavailable(store, scopeId));
+  if (!current()) return null;
   localMessageSeq += 1;
   const seq = localMessageSeq;
   const message = buildOptimisticMessage(store.getState(), mode, scopeId, content, files, seq);
@@ -614,7 +685,7 @@ export async function sendMessage(
     state: "queued" | "uploading" | "processing",
     progress?: ApiUploadProgress,
   ) => {
-    if (!files.length) return;
+    if (!files.length || !current()) return;
     const fallbackTotal = files.reduce((sum, file) => sum + file.size, 0);
     const total = Math.max(0, progress?.total || fallbackTotal);
     const loaded = state === "processing"
@@ -638,7 +709,7 @@ export async function sendMessage(
     const post = async (): Promise<PostMessageResponse> => {
       // RESET_SESSION removes all pending messages. Do not let an old queued
       // request start later under a newly authenticated browser session.
-      if (!store.getState().pendingMessages.some((pending) => pending.id === message.id)) {
+      if (!current() || !store.getState().pendingMessages.some((pending) => pending.id === message.id)) {
         throw new ApiRequestCancelledError();
       }
       if (files.length) {
@@ -669,6 +740,7 @@ export async function sendMessage(
       mode === "private"
         ? await enqueuePrivatePost(store, scopeId, post)
         : await post();
+    if (!current()) return null;
     store.dispatch({
       type: "REPLACE_OPTIMISTIC_MESSAGE",
       payload: { mode, scopeId, tempId: message.id, saved: result.user_message ?? null },
@@ -683,7 +755,7 @@ export async function sendMessage(
   } catch (error) {
     // A logout/account switch already reset the optimistic state. Do not put the
     // outgoing user's draft back into the newly active account.
-    if (isApiRequestCancelled(error)) return null;
+    if (!current() || isApiRequestCancelled(error)) return null;
     store.dispatch({ type: "REMOVE_OPTIMISTIC_MESSAGE", payload: { mode, scopeId, tempId: message.id } });
     const text = error instanceof Error ? error.message || String(error) : String(error);
     store.dispatch({ type: "SET_ERROR", payload: text });

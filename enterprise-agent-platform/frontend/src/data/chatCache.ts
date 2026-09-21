@@ -139,3 +139,8 @@ export function upsertCachedMessage(
 export function clearChatCache(store: AppStore): void {
   caches.delete(store);
 }
+
+/** Drop only the unavailable scope; other conversations retain their cache. */
+export function removeCachedChat(store: AppStore, mode: ChatMode, scopeId: string): void {
+  caches.get(store)?.delete(chatScopeKey(mode, scopeId));
+}

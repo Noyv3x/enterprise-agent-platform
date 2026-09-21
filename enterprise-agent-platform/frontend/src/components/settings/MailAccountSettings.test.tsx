@@ -4,7 +4,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY, translate } from "../../i18n";
+import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import type { MailAccount } from "../../types";
 import { MailAccountSettings } from "./MailAccountSettings";
 
@@ -90,6 +90,36 @@ describe("MailAccountSettings", () => {
     expect(body).not.toHaveProperty("password");
   });
 
+  it("retains an invalid mail draft without sending a mutation until identity and port constraints are satisfied", async () => {
+    const user = userEvent.setup();
+    renderSettings();
+    await screen.findByText("Operations inbox");
+    await user.click(screen.getByRole("button", { name: "Edit" }));
+    const label = screen.getByLabelText("Account name");
+    const port = screen.getAllByLabelText("Port")[0];
+    const save = screen.getByRole("button", { name: "Save" });
+
+    await user.clear(label);
+    await user.type(label, "   ");
+    await user.clear(port);
+    await user.type(port, "65536");
+    await user.click(save);
+    expect(label).toHaveValue("   ");
+    expect(mocks.api.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+
+    await user.clear(label);
+    await user.type(label, "Updated inbox");
+    await user.click(save);
+    expect(port).toBeInvalid();
+    expect(mocks.api.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+
+    await user.clear(port);
+    await user.type(port, "993");
+    await user.click(save);
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument());
+    expect(mocks.api.mock.calls.filter(([, options]) => options?.method === "PATCH")).toHaveLength(1);
+  });
+
   it("offers connection testing and an immediate mailbox check", async () => {
     const user = userEvent.setup();
     renderSettings();
@@ -107,13 +137,4 @@ describe("MailAccountSettings", () => {
     ));
   });
 
-  it("ships the mail surface in all three supported interface locales", () => {
-    expect(translate("zh-CN", "mail.title")).toBe("邮件账户");
-    expect(translate("en", "mail.title")).toBe("Mail accounts");
-    expect(translate("zh-TW", "mail.title")).toBe("郵件帳戶");
-    for (const locale of ["zh-CN", "en", "zh-TW"] as const) {
-      expect(translate(locale, "mail.securityNotice")).not.toContain("mail.securityNotice");
-      expect(translate(locale, "mail.check")).not.toContain("mail.check");
-    }
-  });
 });

@@ -1,3 +1,29 @@
-.wf-account-fields { min-width: 0; }
-.wf-account-fields .wf-form-grid { min-width: 0; }
-.wf-account-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.admin-record-identity {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--text-sm);
+}
+
+.admin-audit-content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+}
+
+.admin-usage-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3) var(--space-4);
+}
+
+.admin-usage-period {
+  display: grid;
+  flex: 1 1 max-content;
+  gap: var(--space-1);
+  min-width: 0;
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+}

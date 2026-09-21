@@ -1,4 +1,4 @@
-import { Button, Form, Input } from "antd";
+import { Button, Input, Field } from "../../ui/beautiful";
 import { useEffect, useRef, useState } from "react";
 import { clearChannelMessages, clearPrivateMessages, deleteChannelMessage, deleteChannelMessagesBefore, deletePrivateMessage, deletePrivateMessagesBefore } from "../../../data/adminActions";
 import { toast } from "../../../context/ToastContext";
@@ -7,7 +7,7 @@ import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { Id, Message } from "../../../types";
 import { unixFromDatetimeLocal } from "../../../utils/format";
-import { DataRegion, EmptyState, FormGrid, Notice, ResourceList, Section } from "../../ui/fieldwork";
+import { DataRegion, EmptyState, FormGrid, Notice, ResourceList, Section } from "../../ui/beautiful";
 import { AuditMessageRow } from "./AuditMessageRow";
 
 interface AuditThreadProps {
@@ -75,16 +75,12 @@ export function AuditThread({ kind, scopeId, scopeName, messages, total, loading
     </DataRegion>
     <Section tone="danger" title={t("admin.audit.deleteMessage")} description={t(kind === "channel" ? "admin.audit.channel.clearHint" : "admin.audit.private.clearHint")}>
       <FormGrid>
-        <Form layout="vertical" onFinish={() => { void remove("id"); }}>
-          <Form.Item label={t("admin.audit.messageId")}><Input aria-label={t("admin.audit.messageId")} type="number" min={1} step={1} value={messageId} disabled={disabled} onChange={(event) => setMessageId(event.target.value)} /></Form.Item>
-          <Button danger htmlType="submit" disabled={disabled}>{t("admin.audit.deleteId")}</Button>
-        </Form>
-        <Form layout="vertical" onFinish={() => { void remove("before"); }}>
-          <Form.Item label={t("admin.audit.deleteBeforeLabel")}><Input aria-label={t("admin.audit.deleteBeforeLabel")} type="datetime-local" value={beforeTime} disabled={disabled} onChange={(event) => setBeforeTime(event.target.value)} /></Form.Item>
-          <Button danger htmlType="submit" disabled={disabled}>{t("admin.audit.deleteBefore")}</Button>
-        </Form>
+        <form onSubmit={(event) => { event.preventDefault(); void remove("id"); }}><Field label={t("admin.audit.messageId")}><Input aria-label={t("admin.audit.messageId")} type="number" min={1} step={1} value={messageId} disabled={disabled} onChange={(event) => setMessageId(event.target.value)} /></Field>
+        <Button variant="danger" type="submit" disabled={disabled}>{t("admin.audit.deleteId")}</Button></form>
+        <form onSubmit={(event) => { event.preventDefault(); void remove("before"); }}><Field label={t("admin.audit.deleteBeforeLabel")}><Input aria-label={t("admin.audit.deleteBeforeLabel")} type="datetime-local" value={beforeTime} disabled={disabled} onChange={(event) => setBeforeTime(event.target.value)} /></Field>
+        <Button variant="danger" type="submit" disabled={disabled}>{t("admin.audit.deleteBefore")}</Button></form>
       </FormGrid>
-      <Button danger disabled={disabled} onClick={() => { void remove("clear"); }}>{t(kind === "channel" ? "admin.audit.channel.clear" : "admin.audit.private.clear")}</Button>
+      <Button  variant="danger" disabled={disabled} onClick={() => { void remove("clear"); }}>{t(kind === "channel" ? "admin.audit.channel.clear" : "admin.audit.private.clear")}</Button>
     </Section>
   </>;
 }

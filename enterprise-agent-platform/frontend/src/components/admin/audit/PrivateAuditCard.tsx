@@ -1,10 +1,10 @@
-import { Button } from "antd";
+import { Button } from "../../ui/beautiful";
 import { useRef, useState } from "react";
 import { refreshMessageAudit, selectAuditConversation } from "../../../data/adminActions";
 import type { UseConfirm } from "../../../hooks/useConfirm";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
-import { EmptyState, ResourceList, Section, SplitDetail } from "../../ui/fieldwork";
+import { EmptyState, ResourceList, Section, SplitDetail } from "../../ui/beautiful";
 import { AuditThread } from "./AuditThread";
 import { PrivateConversationItem } from "./PrivateConversationItem";
 

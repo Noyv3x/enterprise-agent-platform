@@ -21,6 +21,14 @@ describe("channel message withdrawal endpoint", () => {
   });
 });
 
+describe("channel deletion endpoint", () => {
+  it("deletes the channel resource rather than clearing its message history", () => {
+    expect(endpoints.deleteChannel.method).toBe("DELETE");
+    expect(endpoints.deleteChannel.path(4)).toBe("/api/channels/4");
+    expect(endpoints.withdrawChannelMessage.path(4, 91)).toBe("/api/channels/4/messages/91");
+  });
+});
+
 describe("Agent runtime configuration endpoint", () => {
   it("uses the neutral runtime resource for reads and writes", () => {
     expect(endpoints.agentRuntimeConfig).toMatchObject({ method: "GET" });

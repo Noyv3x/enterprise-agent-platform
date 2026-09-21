@@ -1,4 +1,4 @@
-import { Button } from "antd";
+import { Button } from "../ui/beautiful"
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { registerSessionExpiredHandler } from "../../lib/api";
 import { boot, handleSessionExpired } from "../../data/sessionActions";
@@ -7,7 +7,7 @@ import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
 import { useBranding } from "../../context/BrandingContext";
 import { LoginView } from "../auth/LoginView";
-import { LoadingState, RecoveryPage } from "../ui/fieldwork";
+import { LoadingState, RecoveryPage } from "../ui/beautiful"
 import { PublicUtilities } from "../ui/PublicUtilities";
 
 const AppShell = lazy(() => import("./AppShell").then((module) => ({ default: module.AppShell })));
@@ -21,7 +21,7 @@ function BootScreen({ status = "loading", onRetry }: { status?: "loading" | "err
       title={t(status === "error" ? "boot.failed" : "boot.connecting")}
       description={status === "error" ? <div role="alert">{t("boot.failedDetail")}</div> : undefined}
       status={status === "loading" ? <LoadingState label={t("boot.restoringSession")} /> : undefined}
-      actions={status === "error" ? <Button type="primary" onClick={onRetry}>{t("common.retry")}</Button> : undefined}
+      actions={status === "error" ? <Button variant="primary" onClick={onRetry}>{t("common.retry")}</Button> : undefined}
       utilities={<PublicUtilities />}
     />
   );

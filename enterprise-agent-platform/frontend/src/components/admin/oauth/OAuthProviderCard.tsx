@@ -1,11 +1,11 @@
-import { Button } from "antd";
+import { Button } from "../../ui/beautiful";
 import { startOAuthVerification } from "../../../data/adminActions";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { OAuthProvider } from "../../../types";
 import { formatTimestamp } from "../../../utils/format";
 import { oauthProviderErrorText } from "../../../utils/oauth";
-import { Notice, ResourceRow, StatusMark } from "../../ui/fieldwork";
+import { Notice, ResourceRow, StatusMark } from "../../ui/beautiful";
 import { CodexOAuthFlow } from "./CodexOAuthFlow";
 import { GrokOAuthFlow } from "./GrokOAuthFlow";
 

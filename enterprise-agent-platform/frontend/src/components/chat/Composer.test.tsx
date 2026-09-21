@@ -6,7 +6,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToastProvider } from "../../context/ToastContext";
 import { resetSession } from "../../data/sessionActions";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { BROWSER_CONTROL_RELINQUISH_EVENT } from "../../lib/browserControl";
 import { ApiError } from "../../lib/api";
 import { StoreProvider } from "../../store/StoreProvider";
@@ -76,13 +77,11 @@ function composerTree(
   onStore?: (store: AppStore) => void,
 ) {
   return (
-    <I18nProvider>
-      <ToastProvider>
-        <StoreProvider>
-          <ComposerHarness mode={mode} scopeId={scopeId} failedSend={failedSend} onStore={onStore} />
-        </StoreProvider>
-      </ToastProvider>
-    </I18nProvider>
+    <TestUiProviders><ToastProvider>
+      <StoreProvider>
+        <ComposerHarness mode={mode} scopeId={scopeId} failedSend={failedSend} onStore={onStore} />
+      </StoreProvider>
+    </ToastProvider></TestUiProviders>
   );
 }
 
@@ -477,6 +476,23 @@ describe("Composer store subscriptions", () => {
       "Archived: 3; retained in active context: 6.",
     );
     await waitFor(() => expect(input).not.toBeDisabled());
+  });
+
+  it("does not clear a replacement account's compact draft or publish the outgoing result", async () => {
+    let finish!: (value: { compacted: boolean; omitted_messages: number; retained_messages: number }) => void;
+    mocks.compactAgentSession.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    let store!: AppStore;
+    renderComposer("private", "7", undefined, value => { store = value; });
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "/compact" } });
+    fireEvent.submit(screen.getByRole("button", { name: "Send" }).closest("form")!);
+    act(() => {
+      resetSession(store);
+      store.dispatch({ type: "SET_DRAFT", payload: { key: "private:7", value: "/compact" } });
+    });
+    await act(async () => finish({ compacted: true, omitted_messages: 99, retained_messages: 1 }));
+    expect(screen.getByLabelText("Message input")).toHaveValue("/compact");
+    expect(screen.queryByText("Archived: 99; retained in active context: 1.")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Message input")).not.toBeDisabled();
   });
 
   it("rejects /compact arguments locally but leaves unknown slash text as a message", async () => {

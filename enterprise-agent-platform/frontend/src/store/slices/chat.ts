@@ -32,6 +32,48 @@ export function chatReducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "SET_CHANNELS":
       return { ...state, channels: action.payload };
+    case "REMOVE_CHANNEL_SCOPE": {
+      const channelId = String(action.payload);
+      const key = `channel:${channelId}`;
+      const drafts = { ...state.drafts };
+      const draftFiles = { ...state.draftFiles };
+      const failedSends = { ...state.failedSends };
+      const messageSyncCursors = { ...state.messageSyncCursors };
+      const messageHistory = { ...state.messageHistory };
+      const channels = { ...state.agentStatuses.channels };
+      const resourceStates = { ...state.resourceStates };
+      delete drafts[key];
+      delete draftFiles[key];
+      delete failedSends[key];
+      delete messageSyncCursors[key];
+      delete messageHistory[key];
+      delete channels[channelId];
+      delete resourceStates[`chat:channel:${channelId}`];
+      const pendingMessages = state.pendingMessages.filter((message) => {
+        if (message.scope_type !== "channel" || String(message.scope_id) !== channelId) return true;
+        revokeAttachmentUrls(message);
+        return false;
+      });
+      const selected = String(state.activeChannelId) === channelId;
+      return {
+        ...state,
+        channels: state.channels.filter((channel) => String(channel.id) !== channelId),
+        activeChannelId: selected ? null : state.activeChannelId,
+        messages: selected ? [] : state.messages,
+        typingUsers: selected ? [] : state.typingUsers,
+        pendingMessages,
+        drafts,
+        draftFiles,
+        failedSends,
+        messageSyncCursors,
+        messageHistory,
+        agentStatuses: { ...state.agentStatuses, channels },
+        resourceStates,
+        messageAudit: String(state.messageAudit.auditChannelId) === channelId
+          ? { ...state.messageAudit, auditChannelId: null, channelMessages: [] }
+          : state.messageAudit,
+      };
+    }
     case "SET_ACTIVE_VIEW": {
       let view = action.payload;
       if (!isAdmin(state) && view === "admin") view = "channel";

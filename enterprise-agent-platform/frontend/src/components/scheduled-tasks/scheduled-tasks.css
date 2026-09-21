@@ -1,2 +1,3 @@
-.wf-schedules { min-width: 0; }
-.wf-schedule-prompt { white-space: pre-wrap; overflow-wrap: anywhere; }
+.bui-schedules { display: grid; gap: var(--space-4); min-width: 0; }
+.bui-schedule-prompt { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.6; }
+.bui-schedules .bui-stack { gap: var(--space-1); }

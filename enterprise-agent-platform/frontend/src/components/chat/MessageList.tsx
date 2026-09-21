@@ -1,5 +1,5 @@
 import {useCallback,useEffect,useRef,useState,type ReactNode} from "react";
-import {Button} from "antd";
+import { Button } from "../ui/beautiful"
 import {useStickyScroll} from "../../hooks/useStickyScroll";
 import {loadOlderMessages} from "../../data/loaders";
 import {withdrawChannelMessage,navigateToView,selectChannel} from "../../data/chatActions";
@@ -8,7 +8,7 @@ import {useI18n,type Translator} from "../../i18n";
 import {agentStatusFor,hasPermission,isAgentActive,scopeTypeFor} from "../../store/selectors";
 import {useStore,useStoreHandle} from "../../store/useStore";
 import type {AgentStatus,ChatMode,Message,ScopeType,StreamMsg,TypingUser} from "../../types";
-import {ConversationLayout,ConversationEmpty,ConversationJump,Notice} from "../ui/fieldwork";
+import { ConversationLayout,ConversationEmpty,ConversationJump,Notice } from "../ui/beautiful"
 import {ResourceStatusView} from "../common/ResourceStatusView";
 import {AgentActivity} from "./AgentActivity";
 import {AgentApprovalPrompt} from "./AgentApprovalPrompt";
@@ -167,7 +167,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   const content=noChannel?<ConversationEmpty title={t("chat.empty.noChannelTitle")} description={t("chat.empty.noAccessibleChannelText")}/>:empty?<ConversationEmpty
     title={mode==="private"?t("chat.empty.privateTitle"):t("chat.empty.channelTitle")}
     description={mode==="private"?t("chat.empty.privateText"):canChat?t("chat.empty.channelText"):t("chat.empty.readOnlyChannelText")}/>:<>
-    {history?.hasMore&&<div className="wf-history-action"><Button loading={history.loading} onClick={()=>void loadOlderMessages(store,mode,scopeId).catch(()=>undefined)}>{history.loading?t("chat.history.loading"):history.error?t("chat.history.retry"):t("chat.history.loadOlder")}</Button></div>}
+    {history?.hasMore&&<div className="bui-history-action"><Button loading={history.loading} onClick={()=>void loadOlderMessages(store,mode,scopeId).catch(()=>undefined)}>{history.loading?t("chat.history.loading"):history.error?t("chat.history.retry"):t("chat.history.loadOlder")}</Button></div>}
     {messages.map(message=>{
       const canWithdraw=mode==="channel"&&canChat&&message.author_type==="user"&&message.user_id!=null&&currentUserId!=null&&String(message.user_id)===String(currentUserId)&&!message.metadata?.local_pending;
       return <MessageBubble key={String(message.id)} message={message} canWithdraw={canWithdraw} withdrawing={withdrawingMessageId===String(message.id)} hideAuthorName={mode==="private"} onWithdraw={canWithdraw?handleWithdraw:undefined}/>;
@@ -184,7 +184,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   return <ConversationLayout header={header} threadRef={ref} threadLabel={mode==="private"?t("chat.log.privateLabel"):t("chat.log.channelLabel")}
     floatingActions={!atBottom||preview?<>{!atBottom&&<ConversationJump label={jumpLabel} count={unreadCount} onClick={scrollToBottom}/>}{preview}</>:undefined}
     composer={composer}>
-    <div className="wf-sr-only" aria-live="polite" aria-atomic="true" data-message-announcement>
+    <div className="bui-sr-only" aria-live="polite" aria-atomic="true" data-message-announcement>
       {incomingAnnouncement?.owner === announcementOwner && <span key={incomingAnnouncement.id}>{t("chat.scroll.newMessages",{count:incomingAnnouncement.count})}</span>}
     </div>
     {resourceKey&&!noChannel?<ResourceStatusView resourceKey={resourceKey} hasData={messages.length>0||!!history} onRetry={()=>void (mode==="private"?navigateToView(store,"private"):selectChannel(store,scopeId))}>{content}</ResourceStatusView>:content}

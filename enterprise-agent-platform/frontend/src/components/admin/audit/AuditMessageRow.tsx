@@ -1,9 +1,9 @@
-import { Button, Space } from "antd";
+import { Button } from "../../ui/beautiful";
 import { useI18n } from "../../../i18n";
 import type { Message } from "../../../types";
 import { formatTimestamp } from "../../../utils/format";
 import { MessageAttachments } from "../../common/MessageAttachments";
-import { ResourceRow, StatusMark } from "../../ui/fieldwork";
+import { ResourceRow, StatusMark } from "../../ui/beautiful";
 
 export interface AuditMessageRowProps {
   message: Message;
@@ -18,11 +18,11 @@ export function AuditMessageRow({ message, deletable = false, onDelete }: AuditM
     <article aria-label={`#${message.id}`}>
       <ResourceRow
         title={message.username || authorType}
-        meta={<Space wrap><span>#{message.id}</span><span>{formatTimestamp(message.created_at)}</span></Space>}
+        meta={<div className="bui-actions"><span>#{message.id}</span><span>{formatTimestamp(message.created_at)}</span></div>}
         status={<StatusMark>{authorType}</StatusMark>}
-        actions={onDelete ? <Button danger disabled={!deletable} onClick={onDelete}>{t("admin.audit.deleteMessage")}</Button> : undefined}
+        actions={onDelete ? <Button  variant="danger" disabled={!deletable} onClick={onDelete}>{t("admin.audit.deleteMessage")}</Button> : undefined}
       >
-        <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{message.content}</div>
+        <div className="admin-audit-content">{message.content}</div>
         {message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}
       </ResourceRow>
     </article>

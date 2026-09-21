@@ -1,4 +1,4 @@
-import { Button, Input, Space } from "antd";
+import { Button, Input } from "../ui/beautiful";
 import {
   useCallback,
   useEffect,
@@ -21,7 +21,7 @@ import {
   waitForBrowserControlRelinquish,
 } from "../../lib/browserControl";
 import type { AgentPreviewScope } from "../../types";
-import { BrowserControlBar, EmptyState, LoadingState, Notice } from "../ui/fieldwork";
+import { BrowserControlBar, EmptyState, LoadingState, Notice } from "../ui/beautiful"
 import { PreviewStatus } from "./PreviewStatus";
 import { useBrowserPreview } from "./useBrowserPreview";
 
@@ -601,26 +601,24 @@ export function BrowserPreviewView({
     && !Object.is(consumedControlRequestRef.current, controlRequestId);
 
   return (
-    <section className="wf-browser-view" aria-label={t("browserPreview.title")}>
+    <section className="bui-browser-view" aria-label={t("browserPreview.title")}>
       <BrowserControlBar
         status={controlling ? t("browserPreview.assisting") : t("preview.readOnly")}
         description={<PreviewStatus connection={state.connection} idle={state.activity === "idle"} />}
         danger={Boolean(controlError)}
-        action={<Space wrap>
-          {state.tabId ? <Button type={controlling ? "default" : "primary"} loading={controlBusy} onClick={() => controlling ? endControl() : void beginControl()}>{t(controlling ? "browserPreview.endControl" : "browserPreview.takeControl")}</Button> : null}
-          <Button onClick={refresh}>{t("preview.refresh")}</Button>
-        </Space>}
+        action={<div className="bui-actions">{state.tabId ? <Button variant={controlling ? "secondary" : "primary"} loading={controlBusy} onClick={() => controlling ? endControl() : void beginControl()}>{t(controlling ? "browserPreview.endControl" : "browserPreview.takeControl")}</Button> : null}
+        <Button onClick={refresh}>{t("preview.refresh")}</Button></div>}
       />
       {state.error ? <Notice tone="warning" title={state.error} /> : null}
       {controlError ? <Notice tone="warning" title={controlError} /> : null}
-      {controlling ? <div className="wf-browser-inputs">
-        <Space wrap>{(["back", "forward", "refresh"] as const).map(action => <Button key={action} onClick={() => void sendInput({action})}>{t(action === "refresh" ? "browserPreview.reload" : action === "back" ? "browserPreview.back" : "browserPreview.forward")}</Button>)}</Space>
-        <Space.Compact block><Input aria-label={t("browserPreview.typePlaceholder")} value={textInput} maxLength={4096} placeholder={t("browserPreview.typePlaceholder")} onChange={event => setTextInput(event.target.value)} onPressEnter={event => {
-          if (event.nativeEvent.isComposing || !textInput) return;
-          void sendInput({action: "text", text: textInput}); setTextInput("");
-        }} /><Button disabled={!textInput} onClick={() => { if (!textInput) return; void sendInput({action: "text", text: textInput}); setTextInput(""); }}>{t("browserPreview.typeSend")}</Button></Space.Compact>
+      {controlling ? <div className="bui-browser-inputs">
+        <div className="bui-actions" >{(["back", "forward", "refresh"] as const).map(action => <Button key={action} onClick={() => void sendInput({action})}>{t(action === "refresh" ? "browserPreview.reload" : action === "back" ? "browserPreview.back" : "browserPreview.forward")}</Button>)}</div>
+        <form className="bui-inline" onSubmit={event => { event.preventDefault(); if (!textInput) return; void sendInput({action: "text", text: textInput}); setTextInput(""); }}>
+          <Input aria-label={t("browserPreview.typePlaceholder")} value={textInput} maxLength={4096} placeholder={t("browserPreview.typePlaceholder")} onChange={event => setTextInput(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && event.nativeEvent.isComposing) event.preventDefault(); }} />
+          <Button type="submit" disabled={!textInput}>{t("browserPreview.typeSend")}</Button>
+        </form>
       </div> : null}
-      <div className="wf-browser-frame" data-controlling={controlling || undefined}
+      <div className="bui-browser-frame" data-controlling={controlling || undefined}
         tabIndex={controlling ? 0 : -1} role={controlling ? "application" : undefined}
         aria-label={controlling ? t("browserPreview.controlSurface") : undefined}
         onClick={onFrameClick} onPointerDown={onFramePointerDown} onPointerMove={onFramePointerMove} onPointerUp={onFramePointerUp}
@@ -634,9 +632,9 @@ export function BrowserPreviewView({
         {state.frameUrl ? <img ref={imageRef} src={state.frameUrl} alt={t("browserPreview.frameAlt")} draggable={false} />
           : state.activity === "idle" && !waitingForQuickControl ? <EmptyState title={t("browserPreview.noBrowser")} description={t("browserPreview.noBrowserDetail")} />
           : <div aria-busy="true"><LoadingState label={t("browserPreview.loadingFrame")} detail={t("browserPreview.loadingFrameDetail")} /></div>}
-        {pointerFeedback ? <span className="wf-browser-pointer" data-dragging={pointerFeedback.dragging || undefined} style={{left:pointerFeedback.left,top:pointerFeedback.top}} aria-hidden="true" /> : null}
+        {pointerFeedback ? <span className="bui-browser-pointer" data-dragging={pointerFeedback.dragging || undefined} style={{left:pointerFeedback.left,top:pointerFeedback.top}} aria-hidden="true" /> : null}
       </div>
-      <footer className="wf-preview-meta">
+      <footer className="bui-preview-meta">
         {state.title ? <strong>{state.title}</strong> : null}
         {state.url ? <span>{state.url}</span> : null}
         {lastUpdate ? <span>{t("preview.updatedAt", {time:lastUpdate})}</span> : null}

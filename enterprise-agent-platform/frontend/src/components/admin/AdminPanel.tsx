@@ -7,7 +7,7 @@ import { resourceKeys } from "../../data/resourceState";
 import { activeAdminPage } from "../../store/selectors";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";
-import { EmptyState, PageLayout } from "../ui/fieldwork";
+import { EmptyState, PageLayout } from "../ui/beautiful";
 import { ResourceStatusView } from "../common/ResourceStatusView";
 import { AdminPageHeader } from "./AdminPageHeader";
 import { AdminPager } from "./AdminPager";

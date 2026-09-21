@@ -1,9 +1,9 @@
-import { Button } from "antd";
+import { Button } from "../ui/beautiful";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useI18n } from "../../i18n";
 import type { AgentPreviewScope, ComputerFileClue } from "../../types";
-import { ComputerOutput, EmptyState, LoadingState, Notice } from "../ui/fieldwork";
+import { ComputerOutput, EmptyState, LoadingState, Notice } from "../ui/beautiful"
 import { useComputerFilePreview } from "./useComputerFilePreview";
 
 const STREAM_FRAME_MS = 32;
@@ -125,9 +125,9 @@ function FileText({content, previous, streaming, running}: {content:string; prev
   const lines = !streaming && content.length <= 24_000 ? content.replace(/\r\n?/g, "\n").split("\n") : [];
   const previousLines = previous?.replace(/\r\n?/g, "\n").split("\n") || [];
   const bounded = lines.length > 0 && lines.length <= 240;
-  return <pre className="wf-file-text" aria-label="" data-render-mode={streaming ? "stream" : bounded ? "lines" : "plain"}><code>
-    {bounded ? lines.map((line,index) => <span className="wf-file-line" key={index} data-changed={previous !== null && previousLines[index] !== line || undefined}>{line || "\u00a0"}</span>) : content}
-    {running ? <span className="wf-file-caret" aria-hidden="true" /> : null}
+  return <pre className="bui-file-text" aria-label="" data-render-mode={streaming ? "stream" : bounded ? "lines" : "plain"}><code>
+    {bounded ? lines.map((line,index) => <span className="bui-file-line" key={index} data-changed={previous !== null && previousLines[index] !== line || undefined}>{line || "\u00a0"}</span>) : content}
+    {running ? <span className="bui-file-caret" aria-hidden="true" /> : null}
   </code></pre>;
 }
 
@@ -138,7 +138,7 @@ export function FileComputerView({scope,runId,file,compact=false}: {scope:AgentP
   const identity=[runId,scope.scope_type,scope.scope_id,workspacePath,file?.tool_call_id || "",file?.tool || ""].join("\u0000");
   const progressive=useProgressiveDraftContent(state.content,phase,identity);
   const draftLabel=state.source === "draft" ? t(state.draftKind === "replacement" ? "computer.file.replacementDraft" : "computer.file.uncommittedDraft") : "";
-  return <section className="wf-file-view" data-compact={compact || undefined} aria-busy={state.loading || state.pending} data-source={state.loaded ? state.source : undefined} data-draft-kind={state.source === "draft" ? state.draftKind || undefined : undefined} data-revision={state.revision || undefined}>
+  return <section className="bui-file-view" data-compact={compact || undefined} aria-busy={state.loading || state.pending} data-source={state.loaded ? state.source : undefined} data-draft-kind={state.source === "draft" ? state.draftKind || undefined : undefined} data-revision={state.revision || undefined}>
     <ComputerOutput kind="file" title={file?.path || workspacePath || t("computer.mode.file")} meta={draftLabel || t("preview.readOnly")} truncated={state.truncated ? t("computer.file.truncated") : undefined}>
       {hostTarget ? <EmptyState compact title={t("computer.mode.file")} description={t("computer.file.host")} />
         : state.loaded ? <FileText content={progressive.content} previous={state.previousContent} streaming={progressive.streaming} running={running} />

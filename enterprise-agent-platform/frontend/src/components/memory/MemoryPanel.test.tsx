@@ -329,7 +329,7 @@ describe("MemoryPanel", () => {
         tags: [],
       });
     },
-    // This full Ant editor interaction can exceed Vitest's 5 s default when
+    // This full editor interaction can exceed Vitest's 5 s default when
     // the complete UI suite shares a constrained CI runner.
     10_000,
   );

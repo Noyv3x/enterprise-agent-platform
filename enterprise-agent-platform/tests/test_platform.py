@@ -163,7 +163,11 @@ class RecordingAgent:
         return None
 
     def cleanup_scope(self, _scope_key, *, lifecycle_id=None, delete_sessions=False):
-        return {"ok": True}
+        return {
+            "scope_key": _scope_key,
+            "cancelled_runs": 0,
+            "sessions_deleted": delete_sessions,
+        }
 
     def compact_session(
         self,
@@ -4786,7 +4790,7 @@ class PlatformServiceTests(unittest.TestCase):
     def test_clear_private_conversation_only_hides_current_rows(self):
         with tempfile.TemporaryDirectory() as td:
             agent = BlockingAgent()
-            agent.cleanup_scope = mock.Mock(return_value={"cancelled": 1})
+            agent.cleanup_scope = mock.Mock(wraps=agent.cleanup_scope)
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, admin = service.authenticate("admin", "admin")

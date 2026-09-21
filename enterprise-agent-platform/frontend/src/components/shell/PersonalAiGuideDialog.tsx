@@ -1,11 +1,11 @@
-import { Button } from "antd";
+import { Button } from "../ui/beautiful"
 import { useEffect, useRef, useState } from "react";
 import { resourceKeys } from "../../data/resourceState";
 import { useI18n, type MessageKey } from "../../i18n";
 import { hasPermission, isAgentActive } from "../../store/selectors";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { Dialog } from "../common/Dialog";
-import { GuideSheet, Notice } from "../ui/fieldwork";
+import { GuideSheet, Notice } from "../ui/beautiful"
 
 const GUIDE_ITEMS: ReadonlyArray<{
   id: string;
@@ -135,6 +135,6 @@ export function PersonalAiGuideDialog({ onDraftFilled }: { onDraftFilled: () => 
       ]}
       examples={GUIDE_ITEMS.map(item => ({ key: item.id, label: t("personalAi.guide.tryNamed", { capability: t(item.titleKey) }), onSelect: () => tryPrompt(item.promptKey) }))}
       notice={draftBlocked ? <Notice tone="warning" title={t("personalAi.guide.draftPreserved")} /> : undefined}
-      action={<p className="wf-muted">{t("personalAi.guide.reopen")}</p>} />
+      action={<p className="bui-muted">{t("personalAi.guide.reopen")}</p>} />
   </Dialog>;
 }

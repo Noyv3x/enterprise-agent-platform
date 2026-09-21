@@ -4,7 +4,7 @@ import { topbarInfo } from "../../store/selectors";
 import { useStore } from "../../store/useStore";
 import type { TopbarInfo } from "../../types";
 import { Icon } from "../common/Icon";
-import { PageHeader, StatusMark } from "../ui/fieldwork";
+import { PageHeader, StatusMark } from "../ui/beautiful"
 import { TopbarActions } from "./TopbarActions";
 
 function sameInfo(left: TopbarInfo, right: TopbarInfo) {

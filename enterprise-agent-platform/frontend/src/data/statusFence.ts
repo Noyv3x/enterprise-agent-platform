@@ -1,3 +1,4 @@
+import { getApiSessionGeneration } from "../lib/api";
 import type { ChatMode } from "../types";
 import type { AppStore } from "./loaders";
 
@@ -9,12 +10,31 @@ interface ScopeFence {
   latestReadId: number;
 }
 
-export interface StatusMutationTicket {
+interface SessionFence {
+  store: AppStore;
+  actorId: string;
+  generation: number;
+}
+
+function sessionFence(store: AppStore): SessionFence {
+  return {
+    store,
+    actorId: String(store.getState().user?.id ?? ""),
+    generation: getApiSessionGeneration(),
+  };
+}
+
+function sessionIsCurrent(ticket: SessionFence): boolean {
+  return ticket.generation === getApiSessionGeneration()
+    && ticket.actorId === String(ticket.store.getState().user?.id ?? "");
+}
+
+export interface StatusMutationTicket extends SessionFence {
   fence: ScopeFence;
   revision: number;
 }
 
-export interface StatusReadTicket {
+export interface StatusReadTicket extends SessionFence {
   fence: ScopeFence;
   mutationRevision: number;
   realtimeStatusRevision: number;
@@ -59,11 +79,11 @@ export function beginStatusMutation(
   fence.mutationRevision += 1;
   const revision = fence.mutationRevision;
   fence.pendingMutations.add(revision);
-  return { fence, revision };
+  return { ...sessionFence(store), fence, revision };
 }
 
 export function isStatusMutationCurrent(ticket: StatusMutationTicket): boolean {
-  return ticket.fence.mutationRevision === ticket.revision;
+  return sessionIsCurrent(ticket) && ticket.fence.mutationRevision === ticket.revision;
 }
 
 export function finishStatusMutation(ticket: StatusMutationTicket): void {
@@ -79,6 +99,7 @@ export function issueStatusRead(
   fence.nextReadId += 1;
   fence.latestReadId = fence.nextReadId;
   return {
+    ...sessionFence(store),
     fence,
     mutationRevision: fence.mutationRevision,
     realtimeStatusRevision: fence.realtimeStatusRevision,
@@ -97,9 +118,18 @@ export function invalidateStatusReads(
   fence.realtimeStatusRevision += 1;
 }
 
+/** Invalidate both pending mutations and every read of an unavailable scope. */
+export function invalidateScopeRequests(store: AppStore, mode: ChatMode, scopeId: string): void {
+  const fence = scopeFence(store, mode, scopeId);
+  fence.mutationRevision += 1;
+  fence.realtimeStatusRevision += 1;
+  fence.latestReadId = ++fence.nextReadId;
+}
+
 /** Whether this is still the newest safe conversation read for the scope. */
 export function isScopeReadCurrent(ticket: StatusReadTicket): boolean {
   return (
+    sessionIsCurrent(ticket) &&
     !ticket.issuedDuringMutation &&
     ticket.fence.pendingMutations.size === 0 &&
     ticket.fence.mutationRevision === ticket.mutationRevision &&

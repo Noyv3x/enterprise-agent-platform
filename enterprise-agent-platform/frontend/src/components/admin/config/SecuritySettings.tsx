@@ -1,10 +1,10 @@
-import { Button, Form, Input, Switch } from "antd";
+import { Button, Input, Switch, Field } from "../../ui/beautiful";
 import { useEffect, useState } from "react";
 import { saveSecurityConfig } from "../../../data/adminActions";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { SecurityConfigValues } from "../../../types";
-import { FactGrid, FormFooter, FormGrid, Notice, Section } from "../../ui/fieldwork";
+import { FactGrid, FormFooter, FormGrid, Notice, Section } from "../../ui/beautiful";
 import { LANAccessSettings } from "./LANAccessSettings";
 
 function seed(config: SecurityConfigValues) { return { url: config.public_base_url || "", proxy: !!config.trusted_proxy, ttl: String(config.session_ttl_seconds ?? 604800), secret: "" }; }
@@ -20,15 +20,13 @@ export function SecuritySettings() {
   const stateText = (value: boolean | undefined) => value === undefined ? t("admin.common.unknown") : t(value ? "admin.common.enabled" : "admin.common.disabled");
   return <>
     <Section title={t("admin.security.title")} description={t("admin.security.description")}>
-      <Form layout="vertical" disabled={saving} onFinish={() => { if (dirty && !saving) void saveSecurityConfig(store, { public_base_url: draft.url, trusted_proxy: draft.proxy, session_ttl_seconds: draft.ttl, session_secret: draft.secret }); }}>
-        <FormGrid>
-          <Form.Item label={t("admin.security.publicUrl")} extra={t("admin.security.publicUrlHint")}><Input aria-label={t("admin.security.publicUrl")} placeholder={t("admin.security.publicUrlPlaceholder")} value={draft.url} onChange={(e) => setDraft({ ...draft, url: e.target.value })} /></Form.Item>
-          <Form.Item label={t("admin.security.trustProxy")} extra={t("admin.security.trustProxyHint")}><Switch aria-label={t("admin.security.trustProxy")} checked={draft.proxy} onChange={(proxy) => setDraft({ ...draft, proxy })} /></Form.Item>
-          <Form.Item label={t("admin.security.sessionTtl")} extra={t("admin.security.sessionTtlHint")}><Input aria-label={t("admin.security.sessionTtl")} type="number" min={60} max={2592000} step={60} value={draft.ttl} onChange={(e) => setDraft({ ...draft, ttl: e.target.value })} /></Form.Item>
-          <Form.Item label={t("admin.security.rotateSecret")} extra={t("admin.security.rotateSecretHint")}><Input.Password aria-label={t("admin.security.rotateSecret")} autoComplete="new-password" placeholder={t("admin.security.secretPlaceholder")} value={draft.secret} onChange={(e) => setDraft({ ...draft, secret: e.target.value })} /></Form.Item>
-        </FormGrid>
-        <FormFooter><Button type="primary" htmlType="submit" loading={saving} disabled={!dirty || saving || (!!draft.secret && draft.secret.trim().length < 32)}>{t("admin.security.save")}</Button></FormFooter>
-      </Form>
+      <form onSubmit={(event) => { event.preventDefault(); if (dirty && !saving && (!draft.secret || draft.secret.trim().length >= 32)) void saveSecurityConfig(store, { public_base_url: draft.url, trusted_proxy: draft.proxy, session_ttl_seconds: draft.ttl, session_secret: draft.secret }); }}><fieldset disabled={saving}><FormGrid>
+        <Field label={t("admin.security.publicUrl")} hint={t("admin.security.publicUrlHint")} ><Input aria-label={t("admin.security.publicUrl")} placeholder={t("admin.security.publicUrlPlaceholder")} value={draft.url} onChange={(e) => setDraft({ ...draft, url: e.target.value })} /></Field>
+        <Field label={t("admin.security.trustProxy")} hint={t("admin.security.trustProxyHint")} ><Switch aria-label={t("admin.security.trustProxy")} checked={draft.proxy} onChange={(proxy) => setDraft({ ...draft, proxy })} /></Field>
+        <Field label={t("admin.security.sessionTtl")} hint={t("admin.security.sessionTtlHint")} ><Input aria-label={t("admin.security.sessionTtl")} type="number" min={60} max={2592000} step={60} value={draft.ttl} onChange={(e) => setDraft({ ...draft, ttl: e.target.value })} /></Field>
+        <Field label={t("admin.security.rotateSecret")} hint={t("admin.security.rotateSecretHint")} ><Input type="password" aria-label={t("admin.security.rotateSecret")} autoComplete="new-password" placeholder={t("admin.security.secretPlaceholder")} value={draft.secret} onChange={(e) => setDraft({ ...draft, secret: e.target.value })} /></Field>
+      </FormGrid>
+      <FormFooter><Button variant="primary" type="submit" loading={saving} disabled={!dirty || saving || (!!draft.secret && draft.secret.trim().length < 32)}>{t("admin.security.save")}</Button></FormFooter></fieldset></form>
       {(data?.restart_required || data?.session_secret_restart_required) && <Notice tone="warning" title={t("admin.toast.restartRequired")}>{t(data.session_secret_restart_required ? "admin.toast.securitySecretRestart" : "admin.toast.securityRestart")}</Notice>}
       <FactGrid items={[
         { key: "cookie", label: t("admin.security.secureCookie"), value: stateText(config.secure_cookie_enabled) },

@@ -1,5 +1,6 @@
 import type { FailedSend } from "../types";
 import type { AppStore } from "./loaders";
+import { isChannelUnavailable } from "./channelLifecycle";
 
 let failedSendSequence = 0;
 
@@ -18,6 +19,7 @@ export function preserveFailedSend(
     // attachment validation.
     files: [...files],
   };
+  if (draftKey.startsWith("channel:") && isChannelUnavailable(store, draftKey.slice(8))) return send;
   store.dispatch({ type: "ADD_FAILED_SEND", payload: { key: draftKey, send } });
   store.dispatch({ type: "RESTORE_NEXT_FAILED_SEND", payload: { key: draftKey } });
   return send;

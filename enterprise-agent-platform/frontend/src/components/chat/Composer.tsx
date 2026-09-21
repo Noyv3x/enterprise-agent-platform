@@ -183,6 +183,9 @@ export function Composer({
         });
         return;
       }
+      const accountGeneration = getApiSessionGeneration();
+      const submittingUserId = store.getState().user?.id ?? null;
+      const submittingScope = activeScopeRef.current;
       const requestToken = Symbol(draftKey);
       commandRequestsRef.current.set(draftKey, requestToken);
       setCommandScopesInFlight((current) => {
@@ -192,6 +195,9 @@ export function Composer({
       });
       try {
         const result = await compactAgentSession(mode, scopeId);
+        if (!mountedRef.current || activeScopeRef.current !== submittingScope
+          || getApiSessionGeneration() !== accountGeneration
+          || (store.getState().user?.id ?? null) !== submittingUserId) return;
         const currentDraft = store.getState().drafts[draftKey] || "";
         if (currentDraft.trim().toLocaleLowerCase() === "/compact") {
           setDraft("");
@@ -214,6 +220,9 @@ export function Composer({
           }
         }
       } catch (error) {
+        if (!mountedRef.current || activeScopeRef.current !== submittingScope
+          || getApiSessionGeneration() !== accountGeneration
+          || (store.getState().user?.id ?? null) !== submittingUserId) return;
         if (activeDraftKeyRef.current === draftKey) {
           toast(
             isApiError(error, 409)
@@ -225,13 +234,16 @@ export function Composer({
       } finally {
         if (commandRequestsRef.current.get(draftKey) === requestToken) {
           commandRequestsRef.current.delete(draftKey);
-          setCommandScopesInFlight((current) => {
-            if (!current.has(draftKey)) return current;
-            const next = new Set(current);
-            next.delete(draftKey);
-            return next;
-          });
-          if (activeDraftKeyRef.current === draftKey) onBumpFocus();
+          if (mountedRef.current) {
+            setCommandScopesInFlight((current) => {
+              if (!current.has(draftKey)) return current;
+              const next = new Set(current);
+              next.delete(draftKey);
+              return next;
+            });
+            if (activeScopeRef.current === submittingScope && getApiSessionGeneration() === accountGeneration
+              && (store.getState().user?.id ?? null) === submittingUserId) onBumpFocus();
+          }
         }
       }
       return;
@@ -321,7 +333,7 @@ export function Composer({
   };
 
   return (
-    <form className="wf-chat-compose" aria-busy={commandInFlight} onSubmit={(event) => {
+    <form className="bui-chat-compose" aria-busy={commandInFlight} onSubmit={(event) => {
       event.preventDefault();
       void submit();
     }}>

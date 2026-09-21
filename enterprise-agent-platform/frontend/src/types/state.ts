@@ -201,6 +201,10 @@ interface SetChannelsAction {
   type: "SET_CHANNELS";
   payload: Channel[];
 }
+interface RemoveChannelScopeAction {
+  type: "REMOVE_CHANNEL_SCOPE";
+  payload: Id;
+}
 interface SetActiveViewAction {
   type: "SET_ACTIVE_VIEW";
   payload: ActiveView;
@@ -433,6 +437,7 @@ export type Action =
   | SetUserAction
   /* chat */
   | SetChannelsAction
+  | RemoveChannelScopeAction
   | SetActiveViewAction
   | SetActiveChannelIdAction
   | SetMessagesAction

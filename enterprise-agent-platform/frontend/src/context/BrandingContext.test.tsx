@@ -15,7 +15,7 @@ import {
   parseBrandingCache,
   useBranding,
 } from "./BrandingContext";
-import { BrandMark } from "../components/ui/fieldwork";
+import { BrandMark } from "../components/ui/beautiful";
 
 function snapshot(overrides: Partial<BrandingSnapshot> = {}): BrandingSnapshot {
   const revision = overrides.revision ?? 7;

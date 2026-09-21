@@ -1,6 +1,0 @@
-/* Host document and route sizing only; all presentation tokens/compositions live in design-system.css. */
-html, body, #react-root { margin: 0; min-inline-size: 0; min-block-size: 100%; }
-html { color-scheme: light dark; }
-html[data-theme="light"] { color-scheme: light; }
-html[data-theme="dark"] { color-scheme: dark; }
-.wf-route { block-size: 100%; min-block-size: 0; min-inline-size: 0; }

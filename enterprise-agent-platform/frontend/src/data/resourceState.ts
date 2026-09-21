@@ -1,4 +1,4 @@
-import { isApiRequestCancelled } from "../lib/api";
+import { getApiSessionGeneration, isApiRequestCancelled } from "../lib/api";
 import type { ResourceState } from "../types";
 import type { AppStore } from "./loaders";
 
@@ -48,6 +48,11 @@ export async function runResourceLoad(
 ): Promise<boolean> {
   if (store.getState().resourceStates[key]?.status === "loading") return false;
   const generation = nextGeneration(store, key);
+  const actorId = store.getState().user?.id;
+  const sessionGeneration = getApiSessionGeneration();
+  const ownsRequest = () => sessionGeneration === getApiSessionGeneration()
+    && String(store.getState().user?.id) === String(actorId)
+    && ownsLatestRequest(store, key, generation);
   const previous = store.getState().resourceStates[key] || IDLE_RESOURCE_STATE;
   store.dispatch({
     type: "SET_RESOURCE_STATE",
@@ -55,7 +60,7 @@ export async function runResourceLoad(
   });
   try {
     await load();
-    if (!ownsLatestRequest(store, key, generation)) return false;
+    if (!ownsRequest()) return false;
     store.dispatch({
       type: "SET_RESOURCE_STATE",
       payload: {
@@ -68,7 +73,7 @@ export async function runResourceLoad(
     // Session reset cancels outgoing reads. Never write their result into the
     // next account's freshly reset resource registry.
     if (isApiRequestCancelled(error)) return false;
-    if (!ownsLatestRequest(store, key, generation)) return false;
+    if (!ownsRequest()) return false;
     store.dispatch({
       type: "SET_RESOURCE_STATE",
       payload: {

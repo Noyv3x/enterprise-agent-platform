@@ -20,7 +20,7 @@
      recovery timer. */
 
 import { useEffect, useState } from "react";
-import { api, isApiError, isApiRequestCancelled } from "../lib/api";
+import { api, getApiSessionGeneration, isApiError, isApiRequestCancelled } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import { SSE_RECONNECT_MS, SSE_RECOVERY_MAX_MS } from "../lib/constants";
 import { registerSessionTeardown } from "../data/sessionActions";
@@ -69,6 +69,11 @@ export function useRealtime(): boolean {
     // logout) while the probe is in flight, its .then() must not schedule a
     // reconnect that would open a second EventSource bound to the now-stale scope.
     let disposed = false;
+    const generation = getApiSessionGeneration();
+    const ownsScope = () => !disposed
+      && generation === getApiSessionGeneration()
+      && String(store.getState().user?.id) === String(userId)
+      && currentScopeStreamUrl(store.getState()) === url;
 
     const clearReconnect = () => {
       if (reconnect != null) {
@@ -91,15 +96,16 @@ export function useRealtime(): boolean {
     };
 
     const open = () => {
+      if (!ownsScope()) return;
       if (es && es.readyState !== 2) return; // already connected to this scope
       close();
       const current = new EventSource(url, { withCredentials: true });
       es = current;
       current.addEventListener("open", () => {
-        if (es === current && !disposed) setConnected(true);
+        if (es === current && ownsScope()) setConnected(true);
       });
       current.addEventListener("update", (event) => {
-        if (es !== current) return;
+        if (es !== current || !ownsScope()) return;
         let payload: RealtimePayload;
         try {
           payload = JSON.parse((event as MessageEvent<string>).data || "{}") as RealtimePayload;
@@ -131,8 +137,11 @@ export function useRealtime(): boolean {
         }
       });
       current.addEventListener("error", () => {
-        if (es !== current) return;
-        if (!disposed) setConnected(false);
+        if (es !== current || !ownsScope()) return;
+        setConnected(false);
+        // EventSource hides HTTP status. A scoped read distinguishes an ordinary
+        // disconnect from archived/revoked access and reconciles navigation.
+        if (mode === "channel") void refreshActiveChat(store);
         // readyState 0 = the browser is auto-reconnecting; leave it. readyState 2
         // (CLOSED) is terminal — probe auth, then self-reconnect once if valid.
         if (current.readyState === 2) {
@@ -145,23 +154,24 @@ export function useRealtime(): boolean {
     // Both timers share `reconnect`, so close() (scope change, teardown, pagehide)
     // cancels whichever recovery step is pending and open() never runs twice.
     const schedule = (delayMs: number, step: () => void) => {
-      if (disposed || reconnect != null) return;
+      if (!ownsScope() || reconnect != null) return;
       reconnect = window.setTimeout(() => {
         reconnect = null;
-        if (!disposed && store.getState().user) step();
+        if (ownsScope()) step();
       }, delayMs);
     };
 
     const recover = () => {
       api(endpoints.authMe.path())
         .then(() => {
+          if (!ownsScope() || es !== null) return;
           recoveryAttempt = 0;
           schedule(SSE_RECONNECT_MS, open);
         })
         .catch((error: unknown) => {
           // A cancelled probe means the session generation moved on (401 →
           // handleSessionExpired) and a 401 without a handler is equally final.
-          if (disposed || es !== null || isApiRequestCancelled(error) || isApiError(error, 401)) return;
+          if (!ownsScope() || es !== null || isApiRequestCancelled(error) || isApiError(error, 401)) return;
           const delayMs = Math.min(SSE_RECONNECT_MS * 2 ** recoveryAttempt, SSE_RECOVERY_MAX_MS);
           recoveryAttempt += 1;
           schedule(delayMs, recover);

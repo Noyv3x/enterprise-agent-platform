@@ -1,9 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Button } from "antd";
+import { Button } from "../ui/beautiful";
 import { useI18n } from "../../i18n";
 import { useStore } from "../../store/useStore";
 import type { AgentPreviewScope, ComputerMode, Message } from "../../types";
-import { Glyph, LoadingState, OverlayPanel } from "../ui/fieldwork";
+import { Glyph, LoadingState, OverlayPanel } from "../ui/beautiful"
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerScreen } from "./ComputerScreen";
 import { deriveComputerSurface, latestComputerStep } from "./computer";
@@ -101,19 +101,19 @@ export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope
   const context=useMemo(() => ({scope,capabilityActions,browserDrawerOpen:visible === "computer" && mode === "browser",computerDrawerOpen:visible === "computer",computerMode:mode,computerSurface:screenSurface,openComputer,openBrowserAssist}),[scope,capabilityActions,visible,mode,screenSurface,openComputer,openBrowserAssist]);
   const title=visible === "memory" ? t("memory.title") : visible === "skills" ? t("skills.title") : visible === "tasks" ? t("scheduledTasks.title") : t("computer.title");
   const computerScreen=visible === "computer" && scope ? <ComputerScreen key={scopeKey} scope={scope} surface={screenSurface} availabilityError={state.error} onRetryAvailability={refresh} latestTerminalStep={latestComputerStep(status)} browserControlRequestId={intentCurrent ? intent?.request : undefined} /> : null;
-  const minimizeAction=<Button type="text" aria-label={t("computer.minimize")} title={t("computer.minimize")} onClick={close} icon={<span ref={computerCloseIcon}><Glyph name="close" /></span>} />;
+  const minimizeAction=<Button variant="ghost" aria-label={t("computer.minimize")} title={t("computer.minimize")} onClick={close} icon={<span ref={computerCloseIcon}><Glyph name="close" /></span>} />;
   return <ChatPreviewContext.Provider value={context}>
-    <div className={`wf-chat-capabilities${computerScreen ? " wf-chat-capabilities--computer" : ""}`}>
-      <div className="wf-chat-capability-content">{children}</div>
-      {computerScreen ? <aside ref={computerPane} className="wf-computer-dock" aria-label={t("computer.title")} onKeyDown={event => {
+    <div className={`bui-chat-capabilities${computerScreen ? " bui-chat-capabilities--computer" : ""}`}>
+      <div className="bui-chat-capability-content">{children}</div>
+      {computerScreen ? <aside ref={computerPane} className="bui-computer-dock" aria-label={t("computer.title")} onKeyDown={event => {
         if (event.key === "Escape" && !event.defaultPrevented && !event.nativeEvent.isComposing) {
           event.preventDefault();
           event.stopPropagation();
           close();
         }
       }}>
-        <header className="wf-computer-dock-header"><h2>{t("computer.title")}</h2>{minimizeAction}</header>
-        <div className="wf-computer-dock-body">{computerScreen}</div>
+        <header className="bui-computer-dock-header"><h2>{t("computer.title")}</h2>{minimizeAction}</header>
+        <div className="bui-computer-dock-body">{computerScreen}</div>
       </aside> : null}
     </div>
     <OverlayPanel open={Boolean(visible && visible !== "computer")} onClose={close} title={title} size="wide" closeLabel={t("preview.close")}>

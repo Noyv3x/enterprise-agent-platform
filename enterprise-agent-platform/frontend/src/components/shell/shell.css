@@ -1,0 +1,19 @@
+/* Account/footer composition follows Beautiful UI SidebarNav density. */
+.bui-spread { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-width: 0; }
+.bui-break { min-width: 0; overflow-wrap: anywhere; }
+.bui-stack-tight { display: grid; gap: var(--space-1); }
+.bui-account-name { color: var(--ink); font-size: var(--text-sm); font-weight: 500; }
+.bui-account-detail { margin-block-start: var(--space-1); color: var(--ink-3); font-size: var(--text-xs); }
+.bui-telegram-trigger { position: relative; display: inline-flex; }
+.bui-telegram-trigger[data-linked]::after { content: ""; position: absolute; inset-block-start: 0; inset-inline-end: 0; width: var(--space-2); height: var(--space-2); border-radius: 50%; background: var(--green); box-shadow: 0 0 0 2px var(--surface); pointer-events: none; }
+.bui-channel-delete-retry {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  min-height: calc(var(--space-10) + var(--space-1));
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+  text-align: start;
+}

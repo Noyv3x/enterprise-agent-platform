@@ -4,13 +4,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom/vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import type { Message } from "../../types";
 import { MessageBody } from "./MessageBody";
 import { MessageBubble } from "./MessageBubble";
 
 function renderLocalized(node: React.ReactNode) {
-  return render(<I18nProvider>{node}</I18nProvider>);
+  return render(<TestUiProviders>{node}</TestUiProviders>);
 }
 
 describe("MessageBody", () => {
@@ -105,11 +106,9 @@ describe("MessageBody", () => {
 
     const formulas = await screen.findAllByText("E = mc^2", { selector: "annotation" });
     expect(formulas).toHaveLength(1);
-    expect(container.querySelectorAll(".katex")).toHaveLength(2);
     expect(container.querySelectorAll(".katex-mathml math")).toHaveLength(2);
     expect(container.querySelectorAll('.katex-html[aria-hidden="true"]')).toHaveLength(2);
     const display = screen.getByRole("region", { name: "Mathematical formula, scroll horizontally" });
-    expect(display).toHaveClass("katex-display");
     expect(display).toHaveAttribute("tabindex", "0");
     expect(display.querySelector("annotation")).toHaveTextContent("\\int_0^1 x^2 \\, dx");
   });

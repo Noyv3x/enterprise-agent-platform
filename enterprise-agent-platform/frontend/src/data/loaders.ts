@@ -8,13 +8,14 @@
    batches).
    ===================================================================== */
 
-import { api } from "../lib/api";
+import { api, getApiSessionGeneration, isApiError } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
 import { scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { cacheChat, chatScopeKey } from "./chatCache";
 import { messageSyncCursor } from "./messageSync";
 import { messageHistoryState } from "./messageHistory";
+import { isChannelUnavailable, reconcileChannels, removeUnavailableChannel } from "./channelLifecycle";
 import {
   isScopeReadCurrent,
   isStatusReadCurrent,
@@ -199,21 +200,42 @@ export async function loadSessionBootstrap(store: AppStore): Promise<void> {
   }
 }
 
+const channelListReads = new WeakMap<AppStore, number>();
+
 export async function loadChannels(store: AppStore): Promise<void> {
+  const actorId = store.getState().user?.id;
+  const generation = getApiSessionGeneration();
+  if (actorId == null) return;
+  const readId = (channelListReads.get(store) ?? 0) + 1;
+  channelListReads.set(store, readId);
   const result = await api<ChannelsResponse>(endpoints.channels.path());
-  store.dispatch({ type: "SET_CHANNELS", payload: result.channels });
-  const state = store.getState();
-  if (!state.activeChannelId && state.channels.length) {
-    store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: state.channels[0].id });
-  }
+  if (
+    generation !== getApiSessionGeneration()
+    || String(store.getState().user?.id) !== String(actorId)
+    || channelListReads.get(store) !== readId
+  ) return;
+  await reconcileChannels(store, result.channels);
 }
 
 export async function loadChannelMessages(store: AppStore): Promise<void> {
   const activeChannelId = store.getState().activeChannelId;
-  if (!activeChannelId) return;
+  if (!activeChannelId || isChannelUnavailable(store, activeChannelId)) return;
   const channelId = String(activeChannelId);
   const statusRead = issueStatusRead(store, "channel", channelId);
-  const result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
+  let result: ChannelMessagesResponse;
+  try {
+    result = await api<ChannelMessagesResponse>(endpoints.channelMessages.path(channelId));
+  } catch (error) {
+    if (isScopeReadCurrent(statusRead) && (isApiError(error, 403) || isApiError(error, 404))) {
+      await removeUnavailableChannel(store, channelId);
+      if (
+        statusRead.generation === getApiSessionGeneration()
+        && statusRead.actorId === String(store.getState().user?.id ?? "")
+      ) await loadChannels(store);
+      return;
+    }
+    throw error;
+  }
   // Channel-switch race guard: discard a response for a channel we left.
   if (String(store.getState().activeChannelId) !== channelId) return;
   if (!isScopeReadCurrent(statusRead)) return;
@@ -329,6 +351,11 @@ export async function loadOlderMessages(
 ): Promise<void> {
   const key = chatScopeKey(mode, scopeId);
   const startedState = store.getState();
+  const actorId = startedState.user?.id;
+  const generation = getApiSessionGeneration();
+  const currentSession = () => generation === getApiSessionGeneration()
+    && String(store.getState().user?.id) === String(actorId)
+    && (mode !== "channel" || !isChannelUnavailable(store, scopeId));
   const current = startedState.messageHistory[key];
   if (!current?.hasMore || !current.nextBeforeId || current.loading) return;
   const requestedBeforeId = current.nextBeforeId;
@@ -348,7 +375,7 @@ export async function loadOlderMessages(
     const state = store.getState();
     const history = state.messageHistory[key];
     const currentResetRevision = state.messageSyncCursors[key]?.resetRevision;
-    return ownsHistoryRequest(store, key, requestId)
+    return currentSession() && ownsHistoryRequest(store, key, requestId)
       && scopeStillVisible(store, mode, scopeId)
       && Boolean(history?.loading)
       && history?.nextBeforeId === requestedBeforeId
@@ -357,6 +384,10 @@ export async function loadOlderMessages(
   };
   const releaseOwnedRequest = (error = ""): void => {
     if (!ownsHistoryRequest(store, key, requestId)) return;
+    if (!currentSession()) {
+      releaseHistoryRequest(store, key, requestId);
+      return;
+    }
     const history = store.getState().messageHistory[key];
     if (
       history?.loading
@@ -422,7 +453,13 @@ export async function loadOlderMessages(
 }
 
 export async function loadPrivateTelegram(store: AppStore): Promise<void> {
+  const actorId = store.getState().user?.id;
+  const generation = getApiSessionGeneration();
   const result = await api<PrivateTelegramResponse>(endpoints.privateTelegram.path());
+  if (
+    generation !== getApiSessionGeneration()
+    || String(store.getState().user?.id) !== String(actorId)
+  ) return;
   store.dispatch({ type: "SET_PRIVATE_TELEGRAM", payload: result });
 }
 

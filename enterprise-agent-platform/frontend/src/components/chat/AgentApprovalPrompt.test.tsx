@@ -4,7 +4,8 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { TestUiProviders } from "../../test/TestUiProviders";
 import { StoreProvider } from "../../store/StoreProvider";
 import { AgentApprovalPrompt } from "./AgentApprovalPrompt";
 
@@ -31,21 +32,19 @@ describe("AgentApprovalPrompt", () => {
     const user = userEvent.setup();
 
     render(
-      <I18nProvider>
-        <StoreProvider>
-          <AgentApprovalPrompt
-            mode="private"
-            scopeId="7"
-            approval={{
-              run_id: "run-1",
-              approval_id: "approval-1",
-              description: "Run the requested command",
-              command: "git status --short",
-              choices: ["once", "deny"],
-            }}
-          />
-        </StoreProvider>
-      </I18nProvider>,
+      <TestUiProviders><StoreProvider>
+        <AgentApprovalPrompt
+          mode="private"
+          scopeId="7"
+          approval={{
+            run_id: "run-1",
+            approval_id: "approval-1",
+            description: "Run the requested command",
+            command: "git status --short",
+            choices: ["once", "deny"],
+          }}
+        />
+      </StoreProvider></TestUiProviders>,
     );
 
     expect(screen.getByText("git status --short")).toBeVisible();

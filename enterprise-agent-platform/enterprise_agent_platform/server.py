@@ -872,6 +872,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             channel = service.create_channel(actor, str(body.get("name", "")), str(body.get("description", "")))
             self._json({"channel": channel}, status=201)
             return
+        m = re.fullmatch(r"/api/channels/(\d+)", path)
+        if m and method == "DELETE":
+            self._json(service.delete_channel(actor, int(m.group(1))))
+            return
 
         m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
         if m and method == "GET":

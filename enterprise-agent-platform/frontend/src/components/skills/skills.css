@@ -1,2 +1,4 @@
-.wf-skills { min-width: 0; }
-.wf-skill-instructions { overflow-wrap: anywhere; }
+.bui-skills { display: grid; gap: var(--space-4); min-width: 0; }
+.bui-skills .bui-inline { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.bui-skills .bui-inline > input { flex: 1 1 12rem; min-width: 0; }
+.bui-skill-instructions { overflow-wrap: anywhere; resize: vertical; font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.6; }

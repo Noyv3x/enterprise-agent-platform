@@ -1,7 +1,7 @@
 import { lazy, Suspense } from "react";
 import type { AdminPageId } from "../../types";
 import { useI18n } from "../../i18n";
-import { LoadingState } from "../ui/fieldwork";
+import { LoadingState } from "../ui/beautiful";
 
 const AccountManagement = lazy(() => import("./accounts/AccountManagement").then((m) => ({ default: m.AccountManagement })));
 const TokenUsageMonitoring = lazy(() => import("./tokens/TokenUsageMonitoring").then((m) => ({ default: m.TokenUsageMonitoring })));

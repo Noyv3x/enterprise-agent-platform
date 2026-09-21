@@ -1,9 +1,9 @@
 import {memo} from "react";
-import {Progress} from "antd";
+import { Progress } from "../ui/beautiful"
 import {useI18n} from "../../i18n";
 import type {Message} from "../../types";
 import {messageFingerprintKey} from "../../utils/fingerprint";
-import {MessageEntry} from "../ui/fieldwork";
+import { MessageEntry } from "../ui/beautiful"
 import {MessageAttachments} from "../common/MessageAttachments";
 import {AgentWorkCard,hasAgentProcessSteps} from "./AgentWorkCard";
 import {MessageBody} from "./MessageBody";
@@ -23,7 +23,7 @@ function MessageBubbleImpl({message,canWithdraw=false,withdrawing=false,hideAuth
  work={work&&hasAgentProcessSteps(work)?<AgentWorkCard work={work} active={false}/>:undefined}
  attachments={message.attachments?.length?<MessageAttachments attachments={message.attachments}/>:undefined}>
  {message.content&&<MessageBody content={message.content}/>}
- {pending&&upload&&<div role="status"><span>{t(`chat.upload.${upload.state}`)}</span><Progress percent={upload.percent} status="active" aria-label={t("chat.upload.progress",{count:upload.percent})}/></div>}
+ {pending&&upload&&<div role="status"><span>{t(`chat.upload.${upload.state}`)}</span><Progress value={upload.percent} label={t("chat.upload.progress",{count:upload.percent})}/></div>}
  </MessageEntry>;
 }
 export const MessageBubble=memo(MessageBubbleImpl,(a,b)=>messageFingerprintKey(a.message)===messageFingerprintKey(b.message)&&a.canWithdraw===b.canWithdraw&&a.withdrawing===b.withdrawing&&a.hideAuthorName===b.hideAuthorName&&a.onWithdraw===b.onWithdraw);

@@ -12,7 +12,7 @@ import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AppState, Message, User } from "../../types";
-import { AntDesignProvider } from "../ui/AntDesignProvider";
+import { BeautifulProvider } from "../ui/BeautifulProvider";
 import { AppShell } from "./AppShell";
 import { PersonalAiGuideDialog } from "./PersonalAiGuideDialog";
 
@@ -78,9 +78,9 @@ function renderShell(overrides: Partial<AppState> = {}, ui: React.ReactNode = <A
     <StoreContext.Provider value={store}>
       <I18nProvider>
         <ThemeContext.Provider value={{ theme: "light", toggleTheme: vi.fn() }}>
-          <AntDesignProvider>
+          <BeautifulProvider>
             <ToastProvider>{ui}</ToastProvider>
-          </AntDesignProvider>
+          </BeautifulProvider>
         </ThemeContext.Provider>
       </I18nProvider>
     </StoreContext.Provider>,

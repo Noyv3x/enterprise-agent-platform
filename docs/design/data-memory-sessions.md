@@ -30,6 +30,10 @@ SQLite 使用 WAL、外键、按线程连接。事务正文或 commit 失败（�
 
 管理单删/时间删/清空和本人频道撤回都是**逻辑隐藏**，不轮换 session、不清 Runtime/memory/附件/workspace、不取消已排队/运行回复。撤回仅本人可见持久用户消息，乐观临时行无服务端语义；[授权](security-and-trust.md#认证与权限)单独复验。当前无物理 purge；未来须以版本化操作共同设计消息、附件、job、scope，不能复用隐藏。
 
+**删除频道**不同于隐藏消息：使用既有 `channels.archived` 持久阻断访问与新任务，同时终结排队/运行任务，等待 Runtime/Manager 的 scope cleanup 确认，不删除 session、workspace、附件或审计，不轮换身份。管理员/经理的 `manage_channels` 在串行提交边界复验；发送、入队、恢复和迟到发布都须拒绝已归档频道。清理失败返回错误且频道保持不可用；同频道删除可重试清理，不能伪报成功或重新开放。无需新 schema、物理 purge 或恢复协议。
+
+`DELETE /api/channels/{id}` 成功返回 `200 {"deleted":true,"channel_id":<id>}`；无对应记录为 404，无管理权限为 403，未确认清理为 503。已归档记录允许同权限重试并返回相同成功结构；保留名称唯一性。
+
 `/compact` 是控制操作，不写产品消息/伪用户输入；只归档并原子改写当前上下文，产品消息/附件/memory/workspace 不删。内部 handoff 用 Runtime-owned entry 顶层标记识别；无标记的同文真实用户消息仍须归档。
 
 ### Journal 提交

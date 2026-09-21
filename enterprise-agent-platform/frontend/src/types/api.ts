@@ -129,6 +129,11 @@ export interface ChannelCreateRequest {
   name: string;
 }
 
+export interface ChannelDeleteResponse {
+  deleted: true;
+  channel_id: number;
+}
+
 export interface ChannelMessagesResponse {
   messages: Message[];
   agent_status?: AgentStatus | null;

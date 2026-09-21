@@ -39,6 +39,7 @@ import type {
   ChangePasswordRequest,
   ChangePasswordResponse,
   ChannelCreateRequest,
+  ChannelDeleteResponse,
   ChannelMessagesResponse,
   ChannelsResponse,
   CreateUserRequest,
@@ -161,6 +162,10 @@ export const endpoints = {
   /* channels */
   channels: ep<void, ChannelsResponse>("GET", () => "/api/channels"),
   createChannel: ep<ChannelCreateRequest, unknown>("POST", () => "/api/channels"),
+  deleteChannel: ep<string, ChannelDeleteResponse, [Id]>(
+    "DELETE",
+    (id) => `/api/channels/${id}`,
+  ),
   channelMessages: ep<void, ChannelMessagesResponse, [Id]>(
     "GET",
     (id) => `/api/channels/${id}/messages`,

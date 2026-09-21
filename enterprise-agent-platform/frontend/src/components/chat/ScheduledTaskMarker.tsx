@@ -2,7 +2,7 @@ import { intlLocale, useI18n } from "../../i18n";
 import { useStore } from "../../store/useStore";
 import type { Message, ScheduledTaskMessageMarker } from "../../types";
 import { formatScheduleDate } from "../scheduled-tasks/scheduleFormat";
-import { MessageEntry, StatusMark } from "../ui/fieldwork";
+import { MessageEntry, StatusMark } from "../ui/beautiful"
 
 export function ScheduledTaskMarker({
   marker,
