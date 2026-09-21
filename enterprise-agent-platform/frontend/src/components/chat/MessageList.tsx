@@ -182,7 +182,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   </>;
   const jumpLabel=unreadCount?t("chat.scroll.newMessages",{count:unreadCount}):t("chat.scroll.toBottom");
   return <ConversationLayout header={header} threadRef={ref} threadLabel={mode==="private"?t("chat.log.privateLabel"):t("chat.log.channelLabel")}
-    floatingActions={!atBottom||preview?<>{!atBottom&&<ConversationJump label={jumpLabel} count={unreadCount} onClick={scrollToBottom}/>}{preview}</>:undefined}
+    floatingActions={!atBottom||preview?<>{!atBottom&&<div className="wf-composer-jump"><ConversationJump label={jumpLabel} count={unreadCount} onClick={scrollToBottom}/></div>}{preview}</>:undefined}
     composer={composer}>
     <div className="wf-sr-only" aria-live="polite" aria-atomic="true" data-message-announcement>
       {incomingAnnouncement?.owner === announcementOwner && <span key={incomingAnnouncement.id}>{t("chat.scroll.newMessages",{count:incomingAnnouncement.count})}</span>}

@@ -18,7 +18,7 @@ function MessageBubbleImpl({message,canWithdraw=false,withdrawing=false,hideAuth
  const pending=!!message.metadata?.local_pending;
  const upload=message.metadata?.upload;
  if(message.author_type==="system"&&message.metadata?.scheduled_task)return <ScheduledTaskMarker message={message} marker={message.metadata.scheduled_task}/>;
- return <MessageEntry kind={message.author_type==="user"?"user":message.author_type==="agent"?"agent":"system"} status={<MessageMeta message={message} isUser={message.author_type==="user"} pending={pending} streaming={!!message.metadata?.streaming} hideAuthorName={hideAuthorName&&message.author_type==="agent"}/>}
+ return <MessageEntry kind={message.author_type==="user"?"user":message.author_type==="agent"?"agent":"system"} streaming={!!message.metadata?.streaming} status={<MessageMeta message={message} isUser={message.author_type==="user"} pending={pending} streaming={!!message.metadata?.streaming} hideAuthorName={hideAuthorName&&message.author_type==="agent"}/>}
  actions={<>{message.content&&<CopyButton value={message.content} kind="message"/>}{canWithdraw&&onWithdraw&&<WithdrawMessageButton loading={withdrawing} onConfirm={()=>onWithdraw(message.id)}/>}</>}
  work={work&&hasAgentProcessSteps(work)?<AgentWorkCard work={work} active={false}/>:undefined}
  attachments={message.attachments?.length?<MessageAttachments attachments={message.attachments}/>:undefined}>

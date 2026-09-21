@@ -19,4 +19,6 @@
 .wf-memory-content {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  font-weight: 400;
+  line-height: 1.6;
 }

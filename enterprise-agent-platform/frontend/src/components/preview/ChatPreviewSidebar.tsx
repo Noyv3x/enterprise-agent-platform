@@ -25,6 +25,7 @@ export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope
   const scopeKey=scope ? `${scope.scope_type}:${scope.scope_id}` : "";
   const [selection,setSelection]=useState<{scope:string;kind:Capability}|null>(null);
   const [intent,setIntent]=useState<{scope:string;request:number;pending:boolean}|null>(null);
+  const [pipDismissed,setPipDismissed]=useState<{scope:string;runId:string}|null>(null);
   const sequence=useRef(0);
   const opener=useRef<HTMLElement|null>(null);
   const computerCloseIcon = useRef<HTMLSpanElement|null>(null);
@@ -69,12 +70,17 @@ export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope
   useEffect(() => {
     setSelection(null);
     setIntent(null);
+    setPipDismissed(null);
     sequence.current=0;
     opener.current=null;
     return () => {
       if (focusFrame.current != null) cancelAnimationFrame(focusFrame.current);
     };
   },[scopeKey]);
+  // A hidden floating computer returns only when a different run starts working in this scope.
+  useEffect(() => {
+    if (pipDismissed?.scope === scopeKey && surface.live && surface.runId !== pipDismissed.runId) setPipDismissed(null);
+  },[pipDismissed,scopeKey,surface.live,surface.runId]);
   useLayoutEffect(() => {
     if (visible === "computer" && !computerPane.current?.contains(document.activeElement)) {
       computerCloseIcon.current?.closest<HTMLButtonElement>("button")?.focus({preventScroll:true});
@@ -90,6 +96,10 @@ export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope
   },[scopeKey]);
   const openComputer=useCallback((_mode?:ComputerMode,trigger?:HTMLElement|null) => open("computer",trigger),[open]);
   const openBrowserAssist=useCallback((trigger?:HTMLElement|null) => {open("computer",trigger);setIntent({scope:scopeKey,request:++sequence.current,pending:true});},[scopeKey,open]);
+  const dismissComputerPip=useCallback(() => {
+    setPipDismissed({scope:scopeKey,runId:surface.runId});
+    document.querySelector<HTMLElement>("[data-composer-input]")?.focus({preventScroll:true});
+  },[scopeKey,surface.runId]);
   const capabilityActions = useMemo(() => scope ? (
     <>
       {computerActive ? <Button aria-label={t("computer.show")} aria-expanded={visible === "computer"} onClick={event => openComputer(undefined,event.currentTarget)}>{t("computer.title")}</Button> : null}
@@ -98,7 +108,8 @@ export function ChatPreviewSidebar({scope,canManageSkills=true,children}: {scope
       {privateScope ? <Button aria-label={t("scheduledTasks.open")} aria-expanded={visible === "tasks"} onClick={event => open("tasks",event.currentTarget)}>{t("scheduledTasks.title")}</Button> : null}
     </>
   ) : null, [scope, t, computerActive, visible, openComputer, privateScope, open]);
-  const context=useMemo(() => ({scope,capabilityActions,browserDrawerOpen:visible === "computer" && mode === "browser",computerDrawerOpen:visible === "computer",computerMode:mode,computerSurface:screenSurface,openComputer,openBrowserAssist}),[scope,capabilityActions,visible,mode,screenSurface,openComputer,openBrowserAssist]);
+  const computerPipDismissed=pipDismissed?.scope === scopeKey;
+  const context=useMemo(() => ({scope,capabilityActions,browserDrawerOpen:visible === "computer" && mode === "browser",computerDrawerOpen:visible === "computer",computerMode:mode,computerSurface:screenSurface,openComputer,openBrowserAssist,computerPipDismissed,dismissComputerPip}),[scope,capabilityActions,visible,mode,screenSurface,openComputer,openBrowserAssist,computerPipDismissed,dismissComputerPip]);
   const title=visible === "memory" ? t("memory.title") : visible === "skills" ? t("skills.title") : visible === "tasks" ? t("scheduledTasks.title") : t("computer.title");
   const computerScreen=visible === "computer" && scope ? <ComputerScreen key={scopeKey} scope={scope} surface={screenSurface} availabilityError={state.error} onRetryAvailability={refresh} latestTerminalStep={latestComputerStep(status)} browserControlRequestId={intentCurrent ? intent?.request : undefined} /> : null;
   const minimizeAction=<Button type="text" aria-label={t("computer.minimize")} title={t("computer.minimize")} onClick={close} icon={<span ref={computerCloseIcon}><Glyph name="close" /></span>} />;

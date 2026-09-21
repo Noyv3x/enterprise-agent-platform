@@ -281,8 +281,9 @@ export function Notice({ tone = 'info', title, children, action }: { tone?: Tone
 export function EmptyState({ eyebrow, title, description, action, compact = false }: { eyebrow?: ReactNode; title: ReactNode; description?: ReactNode; action?: ReactNode; compact?: boolean }) {
   return <div className={`wf-empty${compact ? ' wf-empty--compact' : ''}`}>{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h2>{title}</h2>{description && <div className="wf-empty-description">{description}</div>}{action && <div className="wf-empty-action">{action}</div>}</div>;
 }
+/** Shared loading language: the same ring as live work rows, the real label, optional detail. */
 export function LoadingState({ label, detail }: { label: ReactNode; detail?: ReactNode }) {
-  return <div className="wf-loading" role="status" aria-live="polite"><span className="wf-loading-line" aria-hidden="true" /><strong>{label}</strong>{detail && <span className="wf-muted">{detail}</span>}</div>;
+  return <div className="wf-loading" role="status" aria-live="polite"><Spinner size={16} /><strong>{label}</strong>{detail && <span className="wf-muted">{detail}</span>}</div>;
 }
 export interface DataRegionProps { state: 'loading' | 'error' | 'empty' | 'ready'; loadingLabel: ReactNode; error?: ReactNode; empty?: ReactNode; retry?: ReactNode; refreshing?: boolean; refreshingLabel?: ReactNode; children?: ReactNode }
 export function DataRegion({ state, loadingLabel, error, empty, retry, refreshing = false, refreshingLabel, children }: DataRegionProps) {

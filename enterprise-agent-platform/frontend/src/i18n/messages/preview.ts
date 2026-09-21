@@ -60,6 +60,7 @@ export const previewMessages = defineMessages({
     en: "Elapsed {time}",
     "zh-TW": "已用時間 {time}",
   },
+  "computer.pip.hide": { "zh-CN": "隐藏 AI 的电脑", en: "Hide the AI computer", "zh-TW": "隱藏 AI 的電腦" },
   "preview.close": { "zh-CN": "关闭预览", en: "Close preview", "zh-TW": "關閉預覽" },
   "preview.readOnly": { "zh-CN": "只读", en: "Read only", "zh-TW": "唯讀" },
   "preview.live": { "zh-CN": "实时", en: "Live", "zh-TW": "即時" },

@@ -328,6 +328,32 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.queryByRole("complementary", { name: "AI computer" })).not.toBeInTheDocument();
   });
 
+  it("hides the floating computer on request and brings it back only for the next run", async () => {
+    const user = userEvent.setup();
+    const view = renderSidebar(privateScope, true, <ChatComposerFixture />);
+    const updateStatus = (status: AgentStatus) => act(() => {
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "private", scopeId: "7", status, authoritative: true },
+      });
+    });
+    const preview = screen.getByRole("region", { name: "Computer preview" });
+
+    updateStatus({ state: "replying", run_id: "run-1" });
+    expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+
+    await user.click(within(preview).getByRole("button", { name: "Hide the AI computer" }));
+    expect(within(preview).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
+
+    // Same run keeps working: stays hidden, but the header entry still opens the full computer.
+    updateStatus({ state: "replying", run_id: "run-1", computer: { mode: "search", search: { tool: "web", hits: [{ title: "Later hit" }] } } });
+    expect(within(preview).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+
+    updateStatus({ state: "replying", run_id: "run-2" });
+    expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
+  });
+
   it("keeps the expanded page and chat input mounted through viewport changes", async () => {
     mocks.viewportWidth = 1568;
     mocks.availability.presentAvailable = true;

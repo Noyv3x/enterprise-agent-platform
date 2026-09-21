@@ -12,6 +12,9 @@ export interface ChatPreviewContextValue {
   computerSurface: ComputerSurface | null;
   openComputer: (mode?: ComputerMode, opener?: HTMLElement | null) => void;
   openBrowserAssist: (opener?: HTMLElement | null) => void;
+  /** True after the user hid the floating computer; clears when the next agent run starts in this scope. */
+  computerPipDismissed: boolean;
+  dismissComputerPip: () => void;
 }
 
 export const ChatPreviewContext = createContext<ChatPreviewContextValue | null>(null);

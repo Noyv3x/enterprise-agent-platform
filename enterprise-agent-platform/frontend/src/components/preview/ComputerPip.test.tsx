@@ -102,6 +102,8 @@ describe("ComputerPip", () => {
       computerSurface,
       openComputer: vi.fn(),
       openBrowserAssist: vi.fn(),
+      computerPipDismissed: false,
+      dismissComputerPip: vi.fn(),
     });
     const liveSurface: ComputerSurface = {
       ...surface,
@@ -167,6 +169,8 @@ describe("ComputerPip", () => {
           computerSurface: { ...surface, mode: null, file: null },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -192,6 +196,8 @@ describe("ComputerPip", () => {
           computerSurface: { ...surface, visible: false, live: false, mode: null },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -216,6 +222,8 @@ describe("ComputerPip", () => {
           computerSurface: surface,
           openComputer,
           openBrowserAssist,
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -246,6 +254,8 @@ describe("ComputerPip", () => {
           computerSurface: { ...surface, mode: "browser" },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -275,6 +285,8 @@ describe("ComputerPip", () => {
           },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -315,6 +327,8 @@ describe("ComputerPip", () => {
           },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -371,6 +385,8 @@ describe("ComputerPip", () => {
           },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -405,6 +421,8 @@ describe("ComputerPip", () => {
           },
           openComputer,
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />
@@ -418,7 +436,8 @@ describe("ComputerPip", () => {
     expect(frame).toHaveAttribute("tabindex", "-1");
     expect(frame.closest("[inert]")).toHaveAttribute("aria-hidden", "true");
     const button = screen.getByRole("button", { name: "Show the AI computer" });
-    expect(screen.getAllByRole("button")).toEqual([button]);
+    const hide = screen.getByRole("button", { name: "Hide the AI computer" });
+    expect(screen.getAllByRole("button")).toEqual([button, hide]);
     button.focus();
     await user.keyboard("{Enter}");
     expect(openComputer).toHaveBeenCalledWith(undefined, button);
@@ -448,6 +467,8 @@ describe("ComputerPip", () => {
           },
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <ComputerPip />

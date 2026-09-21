@@ -65,6 +65,8 @@ function renderMessageList(status: AgentStatus, messages: Message[]) {
           computerSurface: null,
           openComputer: vi.fn(),
           openBrowserAssist: vi.fn(),
+          computerPipDismissed: false,
+          dismissComputerPip: vi.fn(),
         }}
         >
           <MessageList mode="channel" scopeId="1" noChannel={false} forceBottomToken={0} />

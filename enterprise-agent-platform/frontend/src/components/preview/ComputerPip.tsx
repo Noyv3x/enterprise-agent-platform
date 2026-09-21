@@ -24,7 +24,7 @@ export function ComputerPip() {
   const {t}=useI18n();
   const preview=useChatPreviewContext();
   const surface=preview?.computerSurface;
-  const active=Boolean(preview?.scope && surface?.visible && !preview.computerDrawerOpen);
+  const active=Boolean(preview?.scope && surface?.visible && !preview.computerDrawerOpen && !preview.computerPipDismissed);
   const {state}=useBrowserPreview(active && surface?.mode === "browser" ? preview?.scope || null : null);
   if (!active || !preview?.scope || !surface) return null;
   const modeLabel=surface.mode ? t(MODE_LABELS[surface.mode]) : t("computer.waiting");
@@ -43,5 +43,6 @@ export function ComputerPip() {
     <div className="wf-computer-peek" aria-hidden="true" inert>{content}</div>
     <div className="wf-computer-pip-meta"><span>{activity}</span><Elapsed live={surface.live} runId={surface.runId} startedAt={surface.startedAt} /></div>
     <Button type="text" className="wf-computer-pip-open" aria-label={t("computer.show")} aria-description={`${modeLabel} · ${activity}`} aria-expanded={false} title={t("computer.show")} onClick={event => preview.openComputer(undefined,event.currentTarget)} />
+    <Button type="text" size="small" className="wf-computer-pip-close" aria-label={t("computer.pip.hide")} title={t("computer.pip.hide")} icon={<Glyph name="close" size={14} />} onClick={preview.dismissComputerPip} />
   </div>;
 }

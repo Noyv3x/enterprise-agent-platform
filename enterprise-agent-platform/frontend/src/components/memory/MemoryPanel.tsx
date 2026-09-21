@@ -5,7 +5,7 @@ import { toast } from "../../context/ToastContext";
 import { intlLocale, useI18n } from "../../i18n";
 import { downloadJson } from "../../lib/api";
 import type { AgentMemory, AgentMemoryTarget } from "../../types";
-import { CapabilityHeader, SearchToolbar, DataRegion, EmptyState, FormFooter, Notice, OverlayPanel, ResourceList, ResourceRow, Section, useFieldworkContainer } from "../ui/fieldwork";
+import { CapabilityHeader, SearchToolbar, DataRegion, EmptyState, FormFooter, Glyph, Notice, OverlayPanel, ResourceList, ResourceRow, Section, useFieldworkContainer } from "../ui/fieldwork";
 import "./memory.css";
 
 type Confirmation =
@@ -309,6 +309,7 @@ export function MemoryPanel() {
           {memories.map((memory) => (
             <ResourceRow
               key={memory.id}
+              leading={<Glyph name="memory" size={16} />}
               title={<span className="wf-memory-content">{memory.content}</span>}
               meta={t("memory.updatedAt", { time: memoryTime(memory.updated_at, intl) })}
               description={memory.tags?.length ? <Space wrap aria-label={t("memory.tags")}>{memory.tags.map((tag) => <Tag key={tag}>{tag}</Tag>)}</Space> : undefined}

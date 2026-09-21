@@ -37,9 +37,10 @@ export function ConversationEmpty({ title, description }: ConversationEmptyProps
   );
 }
 
-export interface MessageEntryProps { kind: 'user' | 'agent' | 'system'; author?: ReactNode; timestamp?: ReactNode; status?: ReactNode; actions?: ReactNode; children: ReactNode; attachments?: ReactNode; work?: ReactNode; label?: string }
-export function MessageEntry({ kind, author, timestamp, status, actions, children, attachments, work, label }: MessageEntryProps) {
-  return <article className={`wf-message wf-message--${kind}`} aria-label={label}>{(author || timestamp || status) && <header className="wf-message-meta">{author && <strong className="wf-message-author">{author}</strong>}{timestamp && <span className="wf-message-time">{timestamp}</span>}{status}</header>}{work && <div className="wf-message-work">{work}</div>}<div className="wf-message-body">{children}</div>{attachments && <div className="wf-message-attachments">{attachments}</div>}{actions && <footer className="wf-message-actions">{actions}</footer>}</article>;
+export interface MessageEntryProps { kind: 'user' | 'agent' | 'system'; author?: ReactNode; timestamp?: ReactNode; status?: ReactNode; actions?: ReactNode; children: ReactNode; attachments?: ReactNode; work?: ReactNode; label?: string; streaming?: boolean }
+/** `streaming` only adds a caret after the last received characters; it never fabricates text or motion beyond that mark. */
+export function MessageEntry({ kind, author, timestamp, status, actions, children, attachments, work, label, streaming = false }: MessageEntryProps) {
+  return <article className={`wf-message wf-message--${kind}${streaming ? ' wf-message--streaming' : ''}`} aria-label={label}>{(author || timestamp || status) && <header className="wf-message-meta">{author && <strong className="wf-message-author">{author}</strong>}{timestamp && <span className="wf-message-time">{timestamp}</span>}{status}</header>}{work && <div className="wf-message-work">{work}</div>}<div className="wf-message-body">{children}</div>{attachments && <div className="wf-message-attachments">{attachments}</div>}{actions && <footer className="wf-message-actions">{actions}</footer>}</article>;
 }
 export interface AttachmentSlotProps { name: ReactNode; meta?: ReactNode; preview?: ReactNode; actions?: ReactNode; status?: ReactNode }
 export function AttachmentSlot({ name, meta, preview, actions, status }: AttachmentSlotProps) {
