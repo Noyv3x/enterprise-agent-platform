@@ -3,8 +3,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LOCALE_STORAGE_KEY } from "../../i18n";
-import { TestUiProviders } from "../../test/TestUiProviders";
+import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
@@ -55,21 +54,23 @@ function renderMessageList(status: AgentStatus, messages: Message[]) {
   };
   const store = createStore(rootReducer, state);
   return render(
-    <TestUiProviders><StoreContext.Provider value={store}>
-      <ChatPreviewContext.Provider value={{
-        scope: { scope_type: "channel", scope_id: "1" },
-        capabilityActions: null,
-        browserDrawerOpen: false,
-        computerDrawerOpen: false,
-        computerMode: null,
-        computerSurface: null,
-        openComputer: vi.fn(),
-        openBrowserAssist: vi.fn(),
-      }}
-      >
-        <MessageList mode="channel" scopeId="1" noChannel={false} forceBottomToken={0} />
-      </ChatPreviewContext.Provider>
-    </StoreContext.Provider></TestUiProviders>,
+    <I18nProvider>
+      <StoreContext.Provider value={store}>
+        <ChatPreviewContext.Provider value={{
+          scope: { scope_type: "channel", scope_id: "1" },
+          capabilityActions: null,
+          browserDrawerOpen: false,
+          computerDrawerOpen: false,
+          computerMode: null,
+          computerSurface: null,
+          openComputer: vi.fn(),
+          openBrowserAssist: vi.fn(),
+        }}
+        >
+          <MessageList mode="channel" scopeId="1" noChannel={false} forceBottomToken={0} />
+        </ChatPreviewContext.Provider>
+      </StoreContext.Provider>
+    </I18nProvider>,
   );
 }
 

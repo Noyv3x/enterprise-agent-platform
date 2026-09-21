@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { BeautifulRoot } from "../ui/beautiful"
+import { ConfigProvider } from "antd";
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -33,13 +33,13 @@ function renderActions(overrides: Partial<AppState>) {
   const state: AppState = { ...initialAppState, ...overrides };
   const store = createStore(rootReducer, state);
   return render(
-    <BeautifulRoot mode="light" motion={false}>
+    <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
       <StoreContext.Provider value={store}>
         <I18nProvider>
           <TopbarActions />
         </I18nProvider>
       </StoreContext.Provider>
-    </BeautifulRoot>,
+    </ConfigProvider>,
   );
 }
 

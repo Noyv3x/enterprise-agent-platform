@@ -1,12 +1,11 @@
-import { Button, Field, Input, Select, Switch } from "../ui/beautiful";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Button, Form, Input, InputNumber, Modal, Select, Switch } from "antd";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "../../context/ToastContext";
 import { useI18n } from "../../i18n";
 import { api } from "../../lib/api";
 import { endpoints } from "../../lib/endpoints";
 import type { MailAccount, MailAccountMutationRequest, MailAccountPatchRequest, MailAccountResponse, MailAccountsResponse } from "../../types";
-import { DataRegion, EmptyState, FormFooter, FormGrid, Notice, OverlayPanel, ResourceList, ResourceRow, Section, StatusMark } from "../ui/beautiful";
-import { Dialog } from "../common/Dialog";
+import { DataRegion, EmptyState, FormFooter, FormGrid, Notice, OverlayPanel, ResourceList, ResourceRow, Section, StatusMark, useFieldworkContainer } from "../ui/fieldwork";
 
 type MailFormValues = MailAccountMutationRequest & { password: string };
 const NEW_ACCOUNT: MailFormValues = {
@@ -27,10 +26,8 @@ function editValues(account: MailAccount): MailFormValues {
 
 export function MailAccountSettings() {
   const { t } = useI18n();
-  const [draft, setDraft] = useState(NEW_ACCOUNT);
-  const formId = useId();
-  const field = (name: string) => `${formId}-${name}`;
-  const change = <K extends keyof MailFormValues>(key: K, value: MailFormValues[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const getContainer = useFieldworkContainer();
+  const [form] = Form.useForm<MailFormValues>();
   const [accounts, setAccounts] = useState<MailAccount[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
@@ -70,9 +67,9 @@ export function MailAccountSettings() {
   const openEditor = (account: MailAccount | null) => {
     if (mutation.current) return;
     setEditing(account); setMutationError("");
-    setDraft(account ? editValues(account) : { ...NEW_ACCOUNT }); setOpen(true);
+    form.setFieldsValue(account ? editValues(account) : { ...NEW_ACCOUNT }); setOpen(true);
   };
-  const closeEditor = () => { if (!mutation.current) { setOpen(false); setDraft({ ...NEW_ACCOUNT }); setEditing(null); setMutationError(""); } };
+  const closeEditor = () => { if (!mutation.current) { setOpen(false); form.resetFields(); setEditing(null); setMutationError(""); } };
   const save = async (values: MailFormValues) => {
     if (mutation.current) return;
     mutation.current = true; const owner = generation.current;
@@ -88,7 +85,7 @@ export function MailAccountSettings() {
       }
       if (!validOwner(owner)) return;
       setAccounts((current) => current.some((item) => item.id === result.account.id) ? current.map((item) => item.id === result.account.id ? result.account : item) : [...current, result.account]);
-      setOpen(false); setEditing(null); setDraft({ ...NEW_ACCOUNT });
+      setOpen(false); setEditing(null); form.resetFields();
       toast(t("mail.saved"), { type: "ok", title: t("toast.complete") });
     } catch {
       if (validOwner(owner)) { setMutationError(t("mail.saveFailed")); toast(t("mail.saveFailed"), { type: "error" }); }
@@ -125,59 +122,55 @@ export function MailAccountSettings() {
   };
   const busy = saving || !!actionKey;
   const securityOptions = [{ value: "tls", label: t("mail.security.tls") }, { value: "starttls", label: t("mail.security.starttls") }];
-  return <Section title={t("mail.title")} description={t("mail.description")} actions={<Button variant="primary" disabled={busy || loading} onClick={() => openEditor(null)}>{t("mail.add")}</Button>}>
+  return <Section title={t("mail.title")} description={t("mail.description")} actions={<Button type="primary" disabled={busy || loading} onClick={() => openEditor(null)}>{t("mail.add")}</Button>}>
     {mutationError && !open ? <Notice tone="danger" title={mutationError} /> : null}
     <DataRegion state={accounts.length ? "ready" : loading ? "loading" : loadError ? "error" : "empty"} loadingLabel={t("common.loading")} refreshing={loading && !!accounts.length} error={loadError ? t("mail.loadFailed") : undefined} retry={<Button disabled={busy || loading} onClick={() => void load()}>{t("mail.retry")}</Button>} empty={<EmptyState title={t("mail.empty")} description={t("mail.emptyDetail")} />}>
       <ResourceList label={t("mail.title")}>
         {accounts.map((account) => <ResourceRow key={account.id} title={account.label} description={account.email_address}
           status={<StatusMark tone={account.enabled ? "success" : "neutral"}>{t(account.enabled ? "mail.enabled" : "mail.disabled")}</StatusMark>}
           meta={t(account.wake_enabled ? "mail.wakeOn" : "mail.wakeOff")}
-          actions={<div className="bui-actions">
+          actions={<div className="wf-settings-actions">
             <Button disabled={busy || loading} onClick={() => openEditor(account)}>{t("mail.edit")}</Button>
             <Button disabled={busy || loading} loading={actionKey === `test:${account.id}`} onClick={() => void runAction(account, "test")}>{t("mail.test")}</Button>
             <Button disabled={busy || loading} loading={actionKey === `check:${account.id}`} onClick={() => void runAction(account, "check")}>{t("mail.check")}</Button>
-            <Button variant="danger" disabled={busy || loading} onClick={() => setDeleting(account)}>{t("mail.delete")}</Button>
+            <Button danger disabled={busy || loading} onClick={() => setDeleting(account)}>{t("mail.delete")}</Button>
           </div>}>
           {account.last_error ? <Notice tone="warning" title={t("mail.lastError", { error: account.last_error })} /> : null}
         </ResourceRow>)}
       </ResourceList>
     </DataRegion>
     <OverlayPanel open={open} onClose={closeEditor} title={t(editing ? "mail.editTitle" : "mail.addTitle")} closeLabel={t("mail.cancel")}>
-      <form id={formId} onSubmit={(event) => { event.preventDefault(); if (event.currentTarget.reportValidity()) void save(draft); }}>
-        <fieldset disabled={saving}>
-          <Section title={t("account.identitySummary")}>
-            <FormGrid>
-              <Field htmlFor={field("label")} label={t("mail.label")}><Input id={field("label")} required pattern={".*\\S.*"} maxLength={120} value={draft.label} onChange={(event) => change("label", event.target.value)} /></Field>
-              <Field htmlFor={field("email_address")} label={t("mail.address")}><Input id={field("email_address")} type="email" required maxLength={320} autoComplete="email" value={draft.email_address} onChange={(event) => change("email_address", event.target.value)} /></Field>
-              <Field htmlFor={field("username")} label={t("mail.username")}><Input id={field("username")} required pattern={".*\\S.*"} maxLength={320} autoComplete="username" value={draft.username} onChange={(event) => change("username", event.target.value)} /></Field>
-              <Field htmlFor={field("password")} label={t("mail.password")} hint={t(editing?.credential_configured ? "mail.passwordConfigured" : "mail.passwordHint")}><Input id={field("password")} type="password" required={!editing} maxLength={4096} autoComplete="new-password" value={draft.password} onChange={(event) => change("password", event.target.value)} /></Field>
-            </FormGrid>
-          </Section>
-          {(["imap", "smtp"] as const).map((protocol) => <Section key={protocol} title={t(protocol === "imap" ? "mail.imap" : "mail.smtp")}>
-            <FormGrid>
-              <Field htmlFor={field(`${protocol}_host`)} label={t("mail.host")}><Input id={field(`${protocol}_host`)} required pattern={".*\\S.*"} maxLength={253} value={draft[`${protocol}_host`]} onChange={(event) => change(`${protocol}_host`, event.target.value)} /></Field>
-              <Field htmlFor={field(`${protocol}_port`)} label={t("mail.port")}><Input id={field(`${protocol}_port`)} type="number" required min={1} max={65535} step={1} value={draft[`${protocol}_port`] || ""} onChange={(event) => change(`${protocol}_port`, Number(event.target.value))} /></Field>
-              <Field htmlFor={field(`${protocol}_security`)} label={t("mail.security")}><Select id={field(`${protocol}_security`)} options={securityOptions} value={draft[`${protocol}_security`]} disabled={saving} onChange={(value) => { if (value === "tls" || value === "starttls") change(`${protocol}_security`, value); }} /></Field>
-            </FormGrid>
-          </Section>)}
-          <Section title={t("mail.wakeEnabled")}>
-            <FormGrid>
-              <Field htmlFor={field("enabled")} label={t("mail.enabled")}><Switch id={field("enabled")} checked={draft.enabled} onChange={(value) => change("enabled", value)} /></Field>
-              <Field htmlFor={field("wake_enabled")} label={t("mail.wakeEnabled")}><Switch id={field("wake_enabled")} checked={draft.wake_enabled} onChange={(value) => change("wake_enabled", value)} /></Field>
-              <Field htmlFor={field("wake_folder")} label={t("mail.wakeFolder")}><Input id={field("wake_folder")} required pattern={".*\\S.*"} maxLength={512} value={draft.wake_folder} onChange={(event) => change("wake_folder", event.target.value)} /></Field>
-              <Field htmlFor={field("poll_interval_seconds")} label={`${t("mail.pollInterval")} (${t("mail.seconds")})`}><Input id={field("poll_interval_seconds")} type="number" required min={60} max={3600} step={1} value={draft.poll_interval_seconds || ""} onChange={(event) => change("poll_interval_seconds", Number(event.target.value))} /></Field>
-            </FormGrid>
-          </Section>
-          <Notice tone="info" title={t("mail.securityNotice")} />
-          {mutationError ? <Notice tone="danger" title={mutationError} /> : null}
-          <FormFooter><Button disabled={saving} onClick={closeEditor}>{t("mail.cancel")}</Button><Button variant="primary" type="submit" loading={saving}>{t("mail.save")}</Button></FormFooter>
-        </fieldset>
-      </form>
+      <Form form={form} layout="vertical" onFinish={(values) => void save(values)} disabled={saving}>
+        <Section title={t("account.identitySummary")}>
+          <FormGrid>
+            <Form.Item name="label" label={t("mail.label")} rules={[{ required: true, whitespace: true, max: 120 }]}><Input maxLength={120} /></Form.Item>
+            <Form.Item name="email_address" label={t("mail.address")} rules={[{ required: true, type: "email", max: 320 }]}><Input maxLength={320} autoComplete="email" /></Form.Item>
+            <Form.Item name="username" label={t("mail.username")} rules={[{ required: true, whitespace: true, max: 320 }]}><Input maxLength={320} autoComplete="username" /></Form.Item>
+            <Form.Item name="password" label={t("mail.password")} extra={t(editing?.credential_configured ? "mail.passwordConfigured" : "mail.passwordHint")} rules={[{ required: !editing, max: 4096 }]}><Input.Password maxLength={4096} autoComplete="new-password" /></Form.Item>
+          </FormGrid>
+        </Section>
+        {(["imap", "smtp"] as const).map((protocol) => <Section key={protocol} title={t(protocol === "imap" ? "mail.imap" : "mail.smtp")}>
+          <FormGrid>
+            <Form.Item name={`${protocol}_host`} label={t("mail.host")} rules={[{ required: true, whitespace: true, max: 253 }]}><Input maxLength={253} /></Form.Item>
+            <Form.Item name={`${protocol}_port`} label={t("mail.port")} rules={[{ required: true, type: "integer", min: 1, max: 65535 }]}><InputNumber min={1} max={65535} precision={0} /></Form.Item>
+            <Form.Item name={`${protocol}_security`} label={t("mail.security")} rules={[{ required: true }]}><Select options={securityOptions} /></Form.Item>
+          </FormGrid>
+        </Section>)}
+        <Section title={t("mail.wakeEnabled")}>
+          <FormGrid>
+            <Form.Item name="enabled" label={t("mail.enabled")} valuePropName="checked"><Switch /></Form.Item>
+            <Form.Item name="wake_enabled" label={t("mail.wakeEnabled")} valuePropName="checked"><Switch /></Form.Item>
+            <Form.Item name="wake_folder" label={t("mail.wakeFolder")} rules={[{ required: true, whitespace: true, max: 512 }]}><Input maxLength={512} /></Form.Item>
+            <Form.Item name="poll_interval_seconds" label={`${t("mail.pollInterval")} (${t("mail.seconds")})`} rules={[{ required: true, type: "integer", min: 60, max: 3600 }]}><InputNumber min={60} max={3600} precision={0} /></Form.Item>
+          </FormGrid>
+        </Section>
+        <Notice tone="info" title={t("mail.securityNotice")} />
+        {mutationError ? <Notice tone="danger" title={mutationError} /> : null}
+        <FormFooter><Button disabled={saving} onClick={closeEditor}>{t("mail.cancel")}</Button><Button type="primary" htmlType="submit" loading={saving}>{t("mail.save")}</Button></FormFooter>
+      </Form>
     </OverlayPanel>
-    <Dialog open={!!deleting} title={t("mail.deleteConfirm")} onClose={() => { if (!busy) setDeleting(null); }} closeOnBackdrop={!busy} showCloseButton={!busy}
-      footer={<FormFooter><Button disabled={busy} onClick={() => setDeleting(null)}>{t("mail.cancel")}</Button><Button variant="danger" loading={!!actionKey} disabled={busy} onClick={() => { if (deleting) void remove(deleting); }}>{t("mail.delete")}</Button></FormFooter>}>
+    <Modal getContainer={getContainer} open={!!deleting} title={t("mail.deleteConfirm")} onCancel={() => { if (!busy) setDeleting(null); }} onOk={() => { if (deleting) void remove(deleting); }} okText={t("mail.delete")} cancelText={t("mail.cancel")} okButtonProps={{ danger: true }} confirmLoading={!!actionKey} cancelButtonProps={{ disabled: busy }} closable={!busy} maskClosable={!busy}>
       <p>{deleting?.label} · {deleting?.email_address}</p><p>{t("mail.deleteConfirmDetail")}</p>
-      {mutationError && <Notice tone="danger" title={mutationError} />}
-    </Dialog>
+    </Modal>
   </Section>;
 }

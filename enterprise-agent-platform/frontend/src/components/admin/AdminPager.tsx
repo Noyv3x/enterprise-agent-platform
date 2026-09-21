@@ -1,4 +1,4 @@
-import { SectionIndex } from "../ui/beautiful";
+import { SectionIndex } from "../ui/fieldwork";
 import { selectAdminPage } from "../../data/adminActions";
 import { useStoreHandle } from "../../store/useStore";
 import { useI18n } from "../../i18n";

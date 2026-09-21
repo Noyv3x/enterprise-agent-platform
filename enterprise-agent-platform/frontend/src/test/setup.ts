@@ -1,7 +1,13 @@
+import { afterAll, beforeEach, vi } from "vitest";
 
-/* Deterministic browser APIs for production UI primitives in jsdom. */
+/* Browser APIs used by Ant Design's responsive and overlay primitives. Keep
+   these deterministic so component tests exercise real providers in jsdom. */
 
 if (typeof window !== "undefined") {
+  // rc-component's test-mode IDs collide across native portal/focus stacks.
+  vi.stubEnv("NODE_ENV", "development");
+  beforeEach(() => vi.stubEnv("NODE_ENV", "development"));
+  afterAll(() => vi.unstubAllEnvs());
 
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {

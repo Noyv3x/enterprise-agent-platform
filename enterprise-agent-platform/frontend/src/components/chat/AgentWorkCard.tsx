@@ -3,7 +3,7 @@ import { useI18n, type MessageKey, type Translator } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
 import type { ActivityStep, AgentStatus, AgentWork } from "../../types";
-import { StatusMark, WorkRecord, WorkStep } from "../ui/beautiful"
+import { StatusMark, WorkRecord, WorkStep } from "../ui/fieldwork";
 import { MessageBody } from "./MessageBody";
 import "./work.css";
 
@@ -503,7 +503,7 @@ function completedWorkSummary(entries: ProcessLineEntry[], translate: Translator
 
 function Evidence({ entry }: { entry: ProcessLineEntry }) {
   const { t, locale } = useI18n();
-  if (entry.kind === "commentary") return <div className="bui-work-evidence" role="group" aria-label={entry.title}>
+  if (entry.kind === "commentary") return <div className="wf-work-evidence" role="group" aria-label={entry.title}>
     {entry.detail && <MessageBody content={entry.detail} />}
     {entry.detailNotice && <p role="note">{entry.detailNotice}</p>}
   </div>;
@@ -523,7 +523,7 @@ function Evidence({ entry }: { entry: ProcessLineEntry }) {
       <dt>{parameterLabel(key, t)}</dt><dd><code>{formatParameterValue(value)}</code></dd>
     </div>)}</dl>
   </section> : null;
-  return <div className="bui-work-evidence" role="group" aria-label={entry.title}>
+  return <div className="wf-work-evidence" role="group" aria-label={entry.title}>
     {command && <section><h4>{t("chat.activity.commandPreview")}</h4>
       <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
     </section>}
@@ -563,8 +563,8 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const queued = Number(work.queued_count || 0);
   const waiting = active ? work.state === "replying" ? queued : Math.max(0, queued - 1) : 0;
   if (!hasAgentProcessSteps(work)) return null;
-  return <WorkRecord label={t("chat.work.view")} title={title} active={active} expanded={expanded}
+  return <div role="region" aria-label={t("chat.work.view")}><WorkRecord title={title} active={active} expanded={expanded}
     onExpandedChange={(next) => dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: next } })}
     status={<><StatusMark tone={warning ? "warning" : active ? "info" : "neutral"}>{status}</StatusMark>{waiting > 0 && <span>{t("chat.work.waitingCount", { count: waiting })}</span>}</>}
-  >{(active || expanded) && <div role="list">{entries.map((entry) => <div role="listitem" key={entry.key}><ProcessStep entry={entry} active={active} /></div>)}</div>}</WorkRecord>;
+  >{(active || expanded) && <div role="list">{entries.map((entry) => <div role="listitem" key={entry.key}><ProcessStep entry={entry} active={active} /></div>)}</div>}</WorkRecord></div>;
 }

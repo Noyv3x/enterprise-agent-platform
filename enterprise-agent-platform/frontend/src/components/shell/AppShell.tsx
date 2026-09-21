@@ -7,7 +7,7 @@ import { useReplyNotifications } from "../../hooks/useReplyNotifications";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import { topbarInfo } from "../../store/selectors";
-import { AppFrame } from "../ui/beautiful"
+import { AppFrame } from "../ui/fieldwork";
 import { PublicUtilities } from "../ui/PublicUtilities";
 import { ContentRouter } from "./ContentRouter";
 import { PersonalAiComposerFocusContext } from "./PersonalAiGuideContext";

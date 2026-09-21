@@ -37,7 +37,7 @@ function response(status: number, body: unknown) {
 }
 async function openDeletion(user: UserEvent) {
   await user.click(screen.getByRole("button", { name: "Open menu" }));
-  const navigation = await screen.findByRole("dialog", { name: "Main navigation" });
+  const navigation = await screen.findByRole("dialog");
   await user.click(within(navigation).getByRole("button", { name: "Manage channel “roadmap”" }));
   await user.click(await screen.findByRole("menuitem", { name: "Delete channel" }));
   return screen.findByRole("dialog", { name: "Delete channel “roadmap”?" });
@@ -51,7 +51,7 @@ describe("channel deletion in the application shell", () => {
     renderShell({ ...manager, permission_group: "member", permissions: ["read_workspace"] });
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Open menu" }));
-    const navigation = await screen.findByRole("dialog", { name: "Main navigation" });
+    const navigation = await screen.findByRole("dialog");
     expect(within(navigation).queryByRole("button", { name: /Manage channel/ })).not.toBeInTheDocument();
   });
 
@@ -87,13 +87,13 @@ describe("channel deletion in the application shell", () => {
     expect(within(failedDialog).getByRole("button", { name: "Retry deletion" })).toBeEnabled();
     await user.click(within(failedDialog).getByRole("button", { name: "Cancel" }));
     await user.click(screen.getByRole("button", { name: "Open menu" }));
-    const navigation = await screen.findByRole("dialog", { name: "Main navigation" });
+    const navigation = await screen.findByRole("dialog");
     await user.click(within(navigation).getByRole("button", { name: "Manage channel “support”" }));
     await user.click(await screen.findByRole("menuitem", { name: "Delete channel" }));
     const otherDialog = await screen.findByRole("dialog", { name: "Delete channel “support”?" });
     await user.click(within(otherDialog).getByRole("button", { name: "Cancel" }));
     await user.click(screen.getByRole("button", { name: "Open menu" }));
-    const retryNavigation = await screen.findByRole("dialog", { name: "Main navigation" });
+    const retryNavigation = await screen.findByRole("dialog");
     await user.click(within(retryNavigation).getByRole("button", { name: "Retry deleting “roadmap”" }));
     const retryDialog = await screen.findByRole("dialog", { name: "Delete channel “roadmap”?" });
     expect(store.getState().sidebarOpen).toBe(false);

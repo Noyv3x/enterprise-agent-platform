@@ -9,7 +9,7 @@ import { I18nProvider } from "./i18n";
 import { ThemeProvider } from "./context/ThemeContext";
 import { ToastProvider } from "./context/ToastContext";
 import { StoreProvider } from "./store/StoreProvider";
-import { BeautifulProvider } from "./components/ui/BeautifulProvider";
+import { AntDesignProvider } from "./components/ui/AntDesignProvider";
 import { BrandingProvider } from "./context/BrandingContext";
 
 export default function App() {
@@ -17,7 +17,7 @@ export default function App() {
     <I18nProvider>
       <BrandingProvider>
         <ThemeProvider>
-          <BeautifulProvider>
+          <AntDesignProvider>
             <UpdateGate>
               <ErrorBoundary>
                 <ToastProvider>
@@ -27,7 +27,7 @@ export default function App() {
                 </ToastProvider>
               </ErrorBoundary>
             </UpdateGate>
-          </BeautifulProvider>
+          </AntDesignProvider>
         </ThemeProvider>
       </BrandingProvider>
     </I18nProvider>

@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
-import { Button, DataRegion } from "../ui/beautiful";
+import { Button } from "antd";
 import { useResourceState } from "../../hooks/useResourceState";
 import { useI18n } from "../../i18n";
+import { DataRegion } from "../ui/fieldwork";
 
 export function ResourceStatusView({ resourceKey, hasData, onRetry, children }: {
   resourceKey: string;

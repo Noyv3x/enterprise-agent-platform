@@ -5,7 +5,7 @@ import { useI18n } from "../../i18n";
 import type { ActiveView } from "../../types";
 import { ChatView } from "../chat/ChatView";
 import { TelegramLinkPopover } from "../chat/TelegramLinkPopover";
-import { LoadingState } from "../ui/beautiful"
+import { LoadingState } from "../ui/fieldwork";
 import { loadAdminRoute, loadSettingsRoute } from "./routePreload";
 
 const SettingsView = lazy(() => loadSettingsRoute().then(module => ({ default: module.SettingsView })));
@@ -23,7 +23,7 @@ export function ContentRouter() {
     if (effective !== view) dispatch({ type: "SET_ACTIVE_VIEW", payload: effective });
   }, [dispatch, effective, view]);
 
-  return <div className="bui-route" key={effective}>
+  return <div className="wf-route" key={effective}>
     <Suspense fallback={<LoadingState label={t("common.loading")} />}>
       {effective === "settings" ? <SettingsView /> : effective === "admin" ? <AdminPanel /> : <ChatView mode={effective === "private" ? "private" : "channel"} />}
     </Suspense>

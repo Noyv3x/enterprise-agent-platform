@@ -6,7 +6,7 @@ import { endpoints } from "../../lib/endpoints";
 import { registerPlatformUpdatingHandler } from "../../lib/api";
 import { PUBLIC_UPDATE_STATES } from "../../container-contract.generated";
 import type { PlatformUpdateState, PlatformUpdateStatus } from "../../types";
-import { LoadingState, RecoveryPage } from "../ui/beautiful"
+import { LoadingState, RecoveryPage } from "../ui/fieldwork";
 import { PublicUtilities } from "../ui/PublicUtilities";
 
 const DEFAULT_POLL_MS = 5_000;

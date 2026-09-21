@@ -3,8 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import { LOCALE_STORAGE_KEY } from "../../i18n";
-import { TestUiProviders } from "../../test/TestUiProviders";
+import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
@@ -34,9 +33,11 @@ function renderMessageList(
   };
   const store = createStore(rootReducer, state);
   const view = render(
-    <TestUiProviders><StoreContext.Provider value={store}>
-      <MessageList mode={mode} scopeId="1" noChannel={false} forceBottomToken={0} />
-    </StoreContext.Provider></TestUiProviders>,
+    <I18nProvider>
+      <StoreContext.Provider value={store}>
+        <MessageList mode={mode} scopeId="1" noChannel={false} forceBottomToken={0} />
+      </StoreContext.Provider>
+    </I18nProvider>,
   );
   return { ...view, store };
 }

@@ -13,7 +13,7 @@ import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
 import type { AppState, User } from "../../types";
-import { BeautifulProvider } from "../ui/BeautifulProvider";
+import { AntDesignProvider } from "../ui/AntDesignProvider";
 import { PublicUtilities } from "../ui/PublicUtilities";
 import { AppShell } from "./AppShell";
 import { ChannelCreateForm } from "./ChannelCreateForm";
@@ -53,7 +53,7 @@ function renderShell(ui: React.ReactNode, overrides: Partial<AppState> = {}) {
     <StoreContext.Provider value={store}>
       <I18nProvider>
         <ThemeContext.Provider value={{ theme: "light", toggleTheme }}>
-          <BeautifulProvider><ToastProvider>{ui}</ToastProvider></BeautifulProvider>
+          <AntDesignProvider><ToastProvider>{ui}</ToastProvider></AntDesignProvider>
         </ThemeContext.Provider>
       </I18nProvider>
     </StoreContext.Provider>,

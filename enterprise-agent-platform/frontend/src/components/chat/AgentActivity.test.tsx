@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { BeautifulRoot } from "../ui/beautiful"
+import { ConfigProvider } from "antd";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -37,13 +37,13 @@ describe("AgentActivity", () => {
 
   it("shows the actual browser work without interactive controls", () => {
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentActivity status={browserStatus} />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
 
     expect(screen.getByText("Browser")).toBeVisible();

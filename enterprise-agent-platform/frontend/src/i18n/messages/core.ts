@@ -11,8 +11,6 @@ export const coreMessages = defineMessages({
   "common.reload": { "zh-CN": "重新加载", en: "Reload", "zh-TW": "重新載入" },
   "common.close": { "zh-CN": "关闭", en: "Close", "zh-TW": "關閉" },
   "common.loading": { "zh-CN": "正在加载", en: "Loading", "zh-TW": "正在載入" },
-  "common.noOptions": { "zh-CN": "暂无可用选项", en: "No options are available", "zh-TW": "暫無可用選項" },
-  "common.noMatches": { "zh-CN": "没有匹配结果，请尝试其他搜索词。", en: "No matches. Try another search.", "zh-TW": "沒有相符結果，請嘗試其他搜尋詞。" },
   "shell.skipToContent": { "zh-CN": "跳到主要内容", en: "Skip to main content", "zh-TW": "跳到主要內容" },
   "shell.navigation": { "zh-CN": "主导航", en: "Main navigation", "zh-TW": "主導覽" },
   "shell.channelsNavigation": { "zh-CN": "公共频道导航", en: "Public channel navigation", "zh-TW": "公共頻道導覽" },
@@ -25,8 +23,6 @@ export const coreMessages = defineMessages({
   "auth.loggingIn": { "zh-CN": "正在登录…", en: "Signing in…", "zh-TW": "正在登入…" },
   "auth.username": { "zh-CN": "用户名", en: "Username", "zh-TW": "使用者名稱" },
   "auth.password": { "zh-CN": "密码", en: "Password", "zh-TW": "密碼" },
-  "auth.showPassword": { "zh-CN": "显示密码", en: "Show password", "zh-TW": "顯示密碼" },
-  "auth.hidePassword": { "zh-CN": "隐藏密码", en: "Hide password", "zh-TW": "隱藏密碼" },
   "auth.invalidCredentials": {
     "zh-CN": "用户名或密码错误。",
     en: "The username or password is incorrect.",

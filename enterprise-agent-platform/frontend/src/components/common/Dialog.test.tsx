@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { BeautifulRoot } from "../ui/beautiful/Root";
+import { ConfigProvider } from "antd";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useRef, useState } from "react";
@@ -30,9 +30,9 @@ function mount(ui: React.ReactNode) {
   return {
     appRoot,
     ...render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <I18nProvider>{ui}</I18nProvider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
       { container: appRoot },
     ),
   };
@@ -98,7 +98,7 @@ describe("Dialog", () => {
     await user.tab({ shift: true });
     expect(dialog).toContainElement(document.activeElement as HTMLElement);
     await user.tab({ shift: true });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Save" })).toHaveFocus();
 
     await user.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
@@ -126,6 +126,7 @@ describe("Dialog", () => {
     await user.click(screen.getByRole("button", { name: "Discard" }));
 
     const confirmation = screen.getByRole("dialog", { name: "Discard changes" });
+    expect(screen.getAllByRole("dialog")).toHaveLength(2);
     await waitFor(() => expect(confirmation).toContainElement(document.activeElement as HTMLElement));
 
     await user.keyboard("{Escape}");

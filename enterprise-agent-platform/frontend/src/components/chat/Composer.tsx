@@ -333,7 +333,7 @@ export function Composer({
   };
 
   return (
-    <form className="bui-chat-compose" aria-busy={commandInFlight} onSubmit={(event) => {
+    <form className="wf-chat-compose" aria-busy={commandInFlight} onSubmit={(event) => {
       event.preventDefault();
       void submit();
     }}>

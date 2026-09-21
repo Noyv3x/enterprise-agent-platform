@@ -1,7 +1,7 @@
 import { useI18n } from "../../../i18n";
 import { useStore } from "../../../store/useStore";
 import { isOAuthSecret } from "../../../utils/oauth";
-import { EmptyState, Notice, ResourceList, Section } from "../../ui/beautiful";
+import { EmptyState, Notice, ResourceList, Section } from "../../ui/fieldwork";
 import { SecretRow } from "./SecretRow";
 
 export function SecretsSettings() {

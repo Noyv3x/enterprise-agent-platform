@@ -6,7 +6,7 @@ import { useStore } from "../../store/useStore";
 import type { ChatMode } from "../../types";
 import { Composer } from "./Composer";
 import { Topbar } from "../shell/Topbar";
-import { Notice } from "../ui/beautiful"
+import { Notice } from "../ui/fieldwork";
 import { resourceKeys } from "../../data/resourceState";
 import { MessageList } from "./MessageList";
 import { ChatPreviewSidebar } from "../preview/ChatPreviewSidebar";

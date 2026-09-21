@@ -1,8 +1,9 @@
 import { Component } from "react";
 import type { ErrorInfo, ReactNode } from "react";
-import { Button, RecoveryPage } from "../ui/beautiful";
+import { Button } from "antd";
 import { useI18n } from "../../i18n";
 import { useBranding } from "../../context/BrandingContext";
+import { RecoveryPage } from "../ui/fieldwork";
 import { PublicUtilities } from "../ui/PublicUtilities";
 
 interface ErrorBoundaryState {
@@ -35,7 +36,7 @@ function ErrorFallback() {
       brand={{ productName: branding.product_name, logoUrl: branding.logo_url }}
       title={t("errorBoundary.title")}
       description={<div role="alert">{t("errorBoundary.detail")}</div>}
-      actions={<Button variant="primary" onClick={() => location.reload()}>{t("common.reload")}</Button>}
+      actions={<Button type="primary" onClick={() => location.reload()}>{t("common.reload")}</Button>}
       utilities={<PublicUtilities />}
     />
   );

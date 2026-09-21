@@ -1,5 +1,6 @@
-import { Button, FormFooter } from "../ui/beautiful";
+import { Button } from "antd";
 import { useI18n } from "../../i18n";
+import { FormFooter } from "../ui/fieldwork";
 import { Dialog } from "./Dialog";
 import { useState } from "react";
 
@@ -24,17 +25,17 @@ export function ConfirmDialog({ message, title, confirmText, cancelText, danger,
     showCloseButton={false}
     afterOpenChange={(open) => {
       if (open || decision === null) return;
-      // Restore the opener before the owner unmounts this confirmation.
+      // Let Ant restore focus before the owner unmounts this confirmation.
       if (decision) onConfirm();
       else onCancel();
     }}
     footer={
       <FormFooter>
         <Button onClick={() => close(false)} disabled={decision !== null}>{cancelText ?? t("chat.confirm.cancel")}</Button>
-        <Button variant={danger ? "danger" : "primary"} onClick={() => close(true)} disabled={decision !== null}>{confirmText ?? t("chat.confirm.confirm")}</Button>
+        <Button type="primary" danger={danger} onClick={() => close(true)} disabled={decision !== null}>{confirmText ?? t("chat.confirm.confirm")}</Button>
       </FormFooter>
     }
   >
-    <p>{message}</p>
+    <p className="wf-reading">{message}</p>
   </Dialog>;
 }

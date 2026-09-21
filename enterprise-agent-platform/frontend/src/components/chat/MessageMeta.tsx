@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
-import { StatusMark } from "../ui/beautiful"
+import { StatusMark } from "../ui/fieldwork";
 function formatMessageTime(value: number | null | undefined, locale: string): string {
   if (!value) return "";
   const date = new Date(value * 1000);
@@ -23,7 +23,7 @@ export function MessageMeta({message,isUser,pending,streaming,hideAuthorName=fal
  message:Message; isUser:boolean; pending:boolean; streaming:boolean; hideAuthorName?:boolean; action?:ReactNode;
 }) {
  const {t,locale}=useI18n();
- return <div className="bui-message-metadata">
+ return <div className="wf-message-metadata">
    {!hideAuthorName && <strong>{authorName(message,isUser,t)}</strong>}
    <time dateTime={message.created_at ? new Date(message.created_at * 1000).toISOString() : undefined}>{formatMessageTime(message.created_at,locale)}</time>
    {message.metadata?.needs_review && <StatusMark tone="warning">{t("chat.message.needsReview")}</StatusMark>}

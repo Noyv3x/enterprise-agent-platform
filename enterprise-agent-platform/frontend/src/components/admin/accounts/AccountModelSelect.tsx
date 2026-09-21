@@ -1,7 +1,7 @@
-import { Select } from "../../ui/beautiful";
+import { Select } from "antd";
 import { useStore } from "../../../store/useStore";
 import { useI18n } from "../../../i18n";
-import { Notice } from "../../ui/beautiful";
+import { Notice } from "../../ui/fieldwork";
 
 export interface AccountModelSelectProps { id?: string; value: string; onChange: (value: string) => void }
 
@@ -19,7 +19,7 @@ export function AccountModelSelect({ id, value, onChange }: AccountModelSelectPr
   const inherited = runtime?.config?.model || recommendation;
   const unavailable = !!value && !models.includes(value);
   return <>
-    <Select id={id} value={value} onChange={(next) => onChange(String(next))} options={[
+    <Select id={id} style={{ width: "100%" }} value={value} onChange={onChange} options={[
       { value: "", label: inherited ? t("admin.model.defaultOption", { model: inherited }) : t("admin.model.inheritPolicy") },
       ...(unavailable ? [{ value, label: value }] : []), ...models.map((model) => ({ value: model, label: model })),
     ]} />

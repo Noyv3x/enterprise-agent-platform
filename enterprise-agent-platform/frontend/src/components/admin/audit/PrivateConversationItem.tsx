@@ -1,7 +1,7 @@
 import { useI18n } from "../../../i18n";
 import type { PrivateConversation } from "../../../types";
 import { formatTimestamp } from "../../../utils/format";
-import { ResourceRow } from "../../ui/beautiful";
+import { ResourceRow } from "../../ui/fieldwork";
 
 export interface PrivateConversationItemProps {
   item: PrivateConversation;

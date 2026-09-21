@@ -84,9 +84,9 @@ describe("AttachmentPreviewCard", () => {
 
     await user.click(expand);
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: "Summary" })).toBeChecked();
-    expect(screen.getByRole("radio", { name: "Notes" })).not.toBeChecked();
-    await user.click(screen.getByRole("radio", { name: "Notes" }));
+    expect(screen.getByRole("tab", { name: "Summary" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Notes" })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Notes" }));
     expect(await screen.findByText("Reviewed")).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -164,8 +164,8 @@ describe("AttachmentPreviewCard", () => {
 
     await user.click(screen.getAllByRole("button", { name: "Expand preview" })[1]);
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: "Slide 1" })).toBeChecked();
-    expect(screen.getByRole("radio", { name: "Slide 2" })).not.toBeChecked();
+    expect(screen.getByRole("tab", { name: "Slide 1" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Slide 2" })).toBeInTheDocument();
   });
 
   it("keeps the original download available when preview parsing fails", async () => {

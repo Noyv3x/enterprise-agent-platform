@@ -55,7 +55,7 @@ describe("TerminalPreviewView rendering", () => {
     localStorage.clear();
   });
 
-  it("switches running terminals and keeps the preview read-only", async () => {
+  it("switches running terminals with Ant tabs and keeps the preview read-only", async () => {
     const user = userEvent.setup();
     render(
       <TestUiProviders>
@@ -63,14 +63,14 @@ describe("TerminalPreviewView rendering", () => {
       </TestUiProviders>,
     );
 
-    expect(screen.getByRole("radio", { name: "Build" })).toBeChecked();
+    expect(screen.getByRole("tab", { name: "Build" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ npm run build");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("building");
     expect(screen.getByText("Read only")).toBeVisible();
 
-    await user.click(screen.getByRole("radio", { name: /Tests/ }));
+    await user.click(screen.getByRole("tab", { name: /Tests/ }));
 
-    expect(screen.getByRole("radio", { name: /Tests/ })).toBeChecked();
+    expect(screen.getByRole("tab", { name: /Tests/ })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("250 tests passed");
     expect(screen.getByText("Showing latest output only")).toBeVisible();
     expect(screen.getByText("Needs attention · still active")).toBeVisible();
@@ -97,7 +97,7 @@ describe("TerminalPreviewView rendering", () => {
       </TestUiProviders>,
     );
 
-    expect(screen.getByRole("radio", { name: /Terminal 1 · \/workspace/ })).toBeChecked();
+    expect(screen.getByRole("tab", { name: /Terminal 1 · \/workspace/ })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ printf 'ready'");
     expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("ready");
     expect(screen.getByText("Completed · exit 0")).toBeVisible();
@@ -158,7 +158,7 @@ describe("TerminalPreviewView rendering", () => {
     expect(screen.getByText("Completed · exit 0")).toBeVisible();
   });
 
-  it("automatically follows a newly prepended primary terminal when none is pinned", async () => {
+  it("automatically follows a newly prepended primary terminal when no tab is pinned", async () => {
     const originalProcesses = mocks.state.processes;
     mocks.state.processes = [originalProcesses[0]!];
     const renderPreview = () => (
@@ -183,7 +183,7 @@ describe("TerminalPreviewView rendering", () => {
       rerender(renderPreview());
 
       await waitFor(() => {
-        expect(screen.getByRole("radio", { name: "Foreground" })).toBeChecked();
+        expect(screen.getByRole("tab", { name: "Foreground" })).toHaveAttribute("aria-selected", "true");
         expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("$ npm test");
       });
     } finally {
@@ -202,7 +202,7 @@ describe("TerminalPreviewView rendering", () => {
 
     try {
       const { rerender } = render(renderPreview());
-      await user.click(screen.getByRole("radio", { name: /Tests/ }));
+      await user.click(screen.getByRole("tab", { name: /Tests/ }));
 
       mocks.state.processes = [{
         id: "terminal-foreground",
@@ -216,7 +216,7 @@ describe("TerminalPreviewView rendering", () => {
       rerender(renderPreview());
 
       await waitFor(() => {
-        expect(screen.getByRole("radio", { name: /Tests/ })).toBeChecked();
+        expect(screen.getByRole("tab", { name: /Tests/ })).toHaveAttribute("aria-selected", "true");
         expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("250 tests passed");
       });
     } finally {
@@ -235,7 +235,7 @@ describe("TerminalPreviewView rendering", () => {
     const { rerender } = render(renderPreview());
 
     try {
-      await user.click(screen.getByRole("radio", { name: /Tests/ }));
+      await user.click(screen.getByRole("tab", { name: /Tests/ }));
       const selectedOutput = screen.getByLabelText("Read-only terminal output");
       Object.defineProperties(selectedOutput, {
         scrollHeight: { configurable: true, value: 240 },
@@ -270,7 +270,7 @@ describe("TerminalPreviewView rendering", () => {
       mocks.state.processes = originalProcesses;
       rerender(renderPreview());
       await waitFor(() => {
-        expect(screen.getByRole("radio", { name: "Build" })).toBeChecked();
+        expect(screen.getByRole("tab", { name: "Build" })).toHaveAttribute("aria-selected", "true");
       });
     } finally {
       mocks.state.processes = originalProcesses;

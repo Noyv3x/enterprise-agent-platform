@@ -1,6 +1,6 @@
 import type { TypingUser } from "../../types";
 import { useI18n } from "../../i18n";
-import { StatusMark } from "../ui/beautiful"
+import { StatusMark } from "../ui/fieldwork";
 
 export function TypingUsers({ users }: { users: TypingUser[] }) {
   const { locale, t } = useI18n();

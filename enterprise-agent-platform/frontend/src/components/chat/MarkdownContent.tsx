@@ -20,11 +20,11 @@ function CodeBlock({children}:ComponentPropsWithoutRef<"pre">) {
  const code=isValidElement<{className?:string;children?:ReactNode}>(first)?first:null;
  const language=/(?:^|\s)language-([^\s]+)/.exec(code?.props.className||"")?.[1];
  const value=textOf(code?.props.children??children).replace(/\n$/,"");
- return <figure className="bui-code-block"><figcaption><span>{language||t("chat.markdown.codeLabel")}</span><CopyButton value={value} kind="code"/></figcaption><pre tabIndex={0} aria-label={language||t("chat.markdown.codeLabel")}><code className={code?.props.className}>{value.split("\n").map((line,index)=><span className="bui-code-line" key={index}><span className="bui-code-line-number" aria-hidden="true">{index+1}</span><span className="bui-code-line-text">{line}{"\n"}</span></span>)}</code></pre></figure>;
+ return <figure className="wf-code-block"><figcaption><span>{language||t("chat.markdown.codeLabel")}</span><CopyButton value={value} kind="code"/></figcaption><pre><code className={code?.props.className}>{value}</code></pre></figure>;
 }
 function Table({children,node:_node,...props}:ComponentPropsWithoutRef<"table">&{node?:unknown}) {
  const {t}=useI18n();
- return <div className="bui-markdown-table" role="region" aria-label={t("chat.markdown.tableLabel")} tabIndex={0}><table {...props}>{children}</table></div>;
+ return <div className="wf-markdown-table" role="region" aria-label={t("chat.markdown.tableLabel")} tabIndex={0}><table {...props}>{children}</table></div>;
 }
 function BlockedImage({alt}:{alt?:string}) {
  const {t}=useI18n();

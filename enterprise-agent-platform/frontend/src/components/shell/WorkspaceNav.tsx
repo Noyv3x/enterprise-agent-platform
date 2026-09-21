@@ -1,3 +1,4 @@
+import { Button, Dropdown } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { deleteChannel, navigateToView, selectChannel } from "../../data/chatActions";
 import { usePermissions } from "../../hooks/usePermissions";
@@ -7,7 +8,7 @@ import { useStore, useStoreHandle } from "../../store/useStore";
 import type { Channel } from "../../types";
 import { Dialog } from "../common/Dialog";
 import { Icon } from "../common/Icon";
-import { Button, MenuButton, Notice, WorkspaceNav as Navigation, type NavigationGroup } from "../ui/beautiful";
+import { FormFooter, Notice, WorkspaceNav as Navigation, type NavigationGroup } from "../ui/fieldwork";
 import { ChannelCreateForm } from "./ChannelCreateForm";
 import { preloadRoute } from "./routePreload";
 
@@ -86,10 +87,10 @@ export function useChannelDeletion() {
   return {
     beginDelete,
     busy,
-    retryAction: <div className="bui-stack-tight">{failedTargets.filter(item => canManage
+    retryAction: <div className="wf-stack-tight">{failedTargets.filter(item => canManage
       && item.actor === String(userId) && item.generation === generation
       && !(open && target && String(target.id) === String(item.id))).map(item =>
-      <Button key={String(item.id)} className="bui-channel-delete-retry" variant="danger" disabled={busy} onClick={() => {
+      <Button key={String(item.id)} className="wf-channel-delete-retry" danger disabled={busy} onClick={() => {
         if (pending.current) return;
         setTarget(item);
         setFailed(true);
@@ -101,13 +102,13 @@ export function useChannelDeletion() {
       <Dialog open={open} onClose={() => { if (!pending.current) setOpen(false); }}
         title={t("nav.channel.deleteTitle", { name: target.name })}
         description={t("nav.channel.deleteDescription")}
-        footer={<>
+        footer={<FormFooter>
           <Button disabled={busy} onClick={() => setOpen(false)}>{t("chat.confirm.cancel")}</Button>
-          <Button variant="danger" disabled={busy} loading={busy} onClick={() => void submitDelete()}>
+          <Button type="primary" danger disabled={busy} loading={busy} onClick={() => void submitDelete()}>
             {t(busy ? "nav.channel.deleting" : failed ? "nav.channel.deleteRetry" : "nav.channel.delete")}
           </Button>
-        </>}>
-        <p>{t("nav.channel.deleteRetention")}</p>
+        </FormFooter>}>
+        <p className="wf-reading">{t("nav.channel.deleteRetention")}</p>
         {failed && <Notice tone="warning" title={t("nav.channel.deleteFailed")}>{t("nav.channel.deleteRetryHint", { name: target.name })}</Notice>}
       </Dialog>
     </>}
@@ -135,10 +136,12 @@ export function WorkspaceNav({ onDelete, deleteBusy }: { onDelete: (channel: Cha
     action: canManage ? <ChannelCreateForm /> : undefined,
     items: channels.length ? channels.map(channel => ({
       key: `channel:${String(channel.id)}`, label: channel.name,
-      description: <span className="bui-stack-tight"><span>{t("nav.channels.memberVisible")}</span>{channel.description ? <span>{channel.description}</span> : null}</span>,
+      description: <span className="wf-stack-tight"><span>{t("nav.channels.memberVisible")}</span>{channel.description ? <span>{channel.description}</span> : null}</span>,
       icon: <Icon name="hash" />,
-      trailing: canManage ? <MenuButton label={<Icon name="menu" />} aria-label={t("nav.channel.manage", { name: channel.name })}
-        disabled={deleteBusy} items={[{ key: "delete", label: t("nav.channel.delete"), danger: true, onSelect: () => onDelete(channel) }]} /> : undefined,
+      trailing: canManage ? <Dropdown trigger={["click"]} disabled={deleteBusy}
+        menu={{ items: [{ key: "delete", label: t("nav.channel.delete"), danger: true }], onClick: () => onDelete(channel) }}>
+        <Button type="text" icon={<Icon name="menu" />} aria-label={t("nav.channel.manage", { name: channel.name })} disabled={deleteBusy} />
+      </Dropdown> : undefined,
     })) : [{ key: "no-channels", label: t("nav.channels.empty"), description: t("nav.channels.visibility"), disabled: true }],
   });
   groups.push({ key: "tools", label: null, items: [

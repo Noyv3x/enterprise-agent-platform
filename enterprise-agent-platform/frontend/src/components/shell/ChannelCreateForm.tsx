@@ -1,4 +1,4 @@
-import { Button, Field, Input, Tooltip } from "../ui/beautiful";
+import { Button, Form, Input, Tooltip } from "antd";
 import { useState } from "react";
 import { loadChannels } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
@@ -16,11 +16,10 @@ export function ChannelCreateForm() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   return <>
-    <Tooltip title={t("nav.channel.create")}><Button variant="ghost" icon={<Icon name="plus" />}
+    <Tooltip title={t("nav.channel.create")}><Button type="text" icon={<Icon name="plus" />}
       aria-label={t("nav.channel.create")} onClick={() => setOpen(true)} /></Tooltip>
     <Dialog open={open} onClose={() => { if (!creating) setOpen(false); }} title={t("nav.channel.create")} description={t("nav.channels.visibility")}>
-      <form className="bui-stack" onSubmit={(event) => {
-        event.preventDefault();
+      <Form layout="vertical" onFinish={() => {
         if (creating || !name.trim()) return;
         void runBusy(store, "channel:create", async () => {
           await api(endpoints.createChannel.path(), { method: "POST", body: JSON.stringify({ name }) });
@@ -29,12 +28,12 @@ export function ChannelCreateForm() {
           setOpen(false);
         });
       }}>
-        <Field label={t("nav.channel.createPlaceholder")} htmlFor="bui-channel-name" hint={t("nav.channel.nameHint")}>
-          <Input id="bui-channel-name" name="channel-name" value={name} required disabled={creating}
+        <Form.Item label={t("nav.channel.createPlaceholder")} htmlFor="wf-channel-name" help={t("nav.channel.nameHint")}>
+          <Input id="wf-channel-name" name="channel-name" value={name} required disabled={creating}
             onChange={event => setName(event.target.value)} />
-        </Field>
-        <Button variant="primary" type="submit" loading={creating} disabled={creating || !name.trim()}>{t("nav.channel.create")}</Button>
-      </form>
+        </Form.Item>
+        <Button type="primary" htmlType="submit" loading={creating} disabled={creating || !name.trim()}>{t("nav.channel.create")}</Button>
+      </Form>
     </Dialog>
   </>;
 }

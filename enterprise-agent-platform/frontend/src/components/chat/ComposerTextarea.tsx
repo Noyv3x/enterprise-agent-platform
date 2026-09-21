@@ -41,7 +41,7 @@ export function ComposerTextarea({ textareaRef, pendingCaretRef, isComposingRef,
     if (focusToken > 0) textareaRef.current?.focus();
   }, [focusToken, textareaRef]);
 
-  return <textarea className="bui-composer-input" data-composer-input
+  return <textarea className="wf-composer-input" data-composer-input
     ref={textareaRef} value={value} disabled={disabled} placeholder={placeholder} rows={1}
     aria-label={t("chat.composer.inputLabel")}
     role={hasPopup ? "combobox" : undefined}

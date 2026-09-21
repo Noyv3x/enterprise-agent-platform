@@ -1,28 +1,18 @@
-/* Code panel and message typography adapted from Beautiful UI ChatComposer/CodeBlock.
-   Upstream c99a3586cf4fc093091feb47d3c066da1fb2e342; MIT notice in the shared UI source. */
-.bui-message-metadata { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); min-width: 0; font-size: var(--text-xs); color: var(--ink-2); }
-.bui-message-metadata strong { font-weight: 500; color: var(--ink); }
-.bui-message-metadata time { color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.bui-history-action { display: flex; justify-content: center; padding-block: var(--space-2); }
-.bui-message-prose { min-width: 0; overflow-wrap: anywhere; white-space: normal; color: var(--ink); font-size: var(--text-base); line-height: 1.65; }
-.bui-message-prose > :first-child { margin-block-start: 0; }
-.bui-message-prose > :last-child { margin-block-end: 0; }
-.bui-message-prose :is(p, ul, ol, blockquote, figure, pre, table) { margin-block: var(--space-3); }
-.bui-message-prose :is(h1, h2, h3, h4, h5, h6) { margin-block: var(--space-5) var(--space-2); font-size: var(--text-lg); font-weight: 600; line-height: 1.4; }
-.bui-message-prose li > p { margin-block: var(--space-1); }
-.bui-message-prose blockquote { margin-inline: 0; padding-inline-start: var(--space-4); border-inline-start: 2px solid var(--line-strong); color: var(--ink-2); }
-.bui-message-prose a { color: var(--accent-ink); text-underline-offset: var(--space-1); }
-.bui-message-prose :not(pre) > code { padding-inline: var(--space-1); border-radius: var(--radius-chip); background: var(--field); font-size: var(--text-sm); }
-.bui-message-plaintext { white-space: pre-wrap; }
-.bui-code-block { margin-inline: 0; min-width: 0; overflow: hidden; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow-card); }
-.bui-code-block figcaption { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: var(--space-10); padding-inline: var(--space-4); border-bottom: 1px solid var(--line); font-size: var(--text-xs); }
-.bui-message-prose .bui-code-block pre { margin: 0; padding: var(--space-3); overflow: auto; max-width: 100%; color: var(--ink-2); font-size: var(--text-sm); line-height: 1.65; white-space: pre; }
-.bui-code-line { display: flex; gap: var(--space-3); }
-.bui-code-line-number { flex: 0 0 var(--space-6); text-align: end; color: var(--ink-3); user-select: none; border-inline-end: 1px solid var(--line); padding-inline-end: var(--space-2); }
-.bui-code-line-text { min-width: 0; }
-.bui-markdown-table { overflow: auto; max-width: 100%; border-radius: var(--radius-control); box-shadow: var(--shadow-card); }
-.bui-markdown-table table { border-collapse: collapse; min-width: 100%; font-size: var(--text-sm); }
-.bui-markdown-table :is(th, td) { text-align: start; padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--line); }
-.bui-markdown-table th { background: var(--field); color: var(--ink-2); font-weight: 500; }
-.bui-message-prose .katex-display { display: block; overflow: auto; max-width: 100%; padding-block: var(--space-1); }
-.bui-telegram-command { max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--space-3); border-radius: var(--radius-control); background: var(--field); color: var(--ink); }
+.wf-message-metadata{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
+.wf-message-metadata time{color:var(--wf-muted)}
+.wf-history-action{display:flex;justify-content:center;padding-block:8px}
+.wf-message-prose{min-width:0;overflow-wrap:anywhere;white-space:normal}
+.wf-message-prose>:first-child{margin-block-start:0}
+.wf-message-prose>:last-child{margin-block-end:0}
+.wf-message-prose :is(p,ul,ol,blockquote,figure,pre,table){margin-block:12px}
+.wf-message-prose :is(h1,h2,h3,h4,h5,h6){margin-block:20px 8px}
+.wf-message-prose li>p{margin-block:4px}
+.wf-message-prose pre{white-space:pre;overflow:auto;max-width:100%;padding:16px;background:var(--wf-inset)}
+.wf-message-plaintext{white-space:pre-wrap}
+.wf-code-block{margin-inline:0;min-width:0}
+.wf-code-block figcaption{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--wf-line)}
+.wf-markdown-table{overflow:auto;max-width:100%}
+.wf-markdown-table table{border-collapse:collapse;min-width:100%}
+.wf-markdown-table :is(th,td){text-align:start;padding:8px 12px;border-bottom:1px solid var(--wf-line)}
+.wf-message-prose .katex-display{display:block;overflow:auto;max-width:100%;padding-block:4px}
+.wf-telegram-command{max-width:100%;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}

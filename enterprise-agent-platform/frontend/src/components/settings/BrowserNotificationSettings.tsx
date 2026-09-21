@@ -1,9 +1,9 @@
-import { Switch } from "../ui/beautiful";
+import { Switch } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { useI18n } from "../../i18n";
 import { browserNotificationsEnabled, browserNotificationsSupported, setBrowserNotificationsEnabled } from "../../lib/browserNotifications";
 import type { Id } from "../../types";
-import { FormFooter, Notice, Section } from "../ui/beautiful";
+import { FormFooter, Notice, Section } from "../ui/fieldwork";
 
 export function BrowserNotificationSettings({ userId }: { userId: Id }) {
   const { t } = useI18n();
@@ -47,7 +47,7 @@ export function BrowserNotificationSettings({ userId }: { userId: Id }) {
   const state = !supported ? "notifications.settings.unsupported" : permission === "denied" ? "notifications.settings.denied" : permission === "default" ? "notifications.settings.permissionDefault" : enabled ? "notifications.settings.enabled" : "notifications.settings.disabled";
   return <Section title={t("notifications.settings.title")} description={t("notifications.settings.description")}>
     <FormFooter note={t("notifications.settings.replyComplete")}>
-      <span aria-busy={pending}><Switch aria-label={t("notifications.settings.replyComplete")} checked={supported && permission === "granted" && enabled} disabled={!supported || permission === "denied" || pending} onChange={(checked) => void toggle(checked)} /></span>
+      <Switch aria-label={t("notifications.settings.replyComplete")} checked={supported && permission === "granted" && enabled} disabled={!supported || permission === "denied"} loading={pending} onChange={(checked) => void toggle(checked)} />
     </FormFooter>
     <Notice tone={!supported || permission === "denied" ? "warning" : "info"} title={t(state)} />
   </Section>;

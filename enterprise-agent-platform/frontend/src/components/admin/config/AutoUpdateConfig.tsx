@@ -1,4 +1,4 @@
-import { Button, Input, Switch, Field } from "../../ui/beautiful";
+import { Button, Form, Input, Space, Switch } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { checkAutoUpdateNow, runManagerOperation, saveAutoUpdateConfig } from "../../../data/adminActions";
 import { loadAutoUpdateConfig } from "../../../data/loaders";
@@ -7,7 +7,7 @@ import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { AutoUpdateConfigValues, ManagerOperation } from "../../../types";
 import { formatTimestamp } from "../../../utils/format";
-import { FactGrid, FormFooter, FormGrid, Notice, ResourceList, ResourceRow, Section, StatusMark } from "../../ui/beautiful";
+import { FactGrid, FormFooter, FormGrid, Notice, ResourceList, ResourceRow, Section, StatusMark } from "../../ui/fieldwork";
 
 const SERVICES = ["platform", "agent-runtime", "camofox", "searxng", "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres", "firecrawl-api"];
 const STATES: Record<string, true> = { idle: true, waiting_for_tasks: true, updating: true, failed: true };
@@ -86,20 +86,24 @@ export function AutoUpdateConfig() {
         { key: "operation", label: t("admin.updates.operationId"), value: status.operation_id || "—" },
         { key: "version", label: t("admin.updates.generationVersion"), value: status.manager_generation ?? "—" },
       ]} />
-      <div className="bui-actions"><Button loading={checking} disabled={blocked} onClick={() => { if (!blocked) void checkAutoUpdateNow(store); }}>{t("admin.updates.checkNow")}</Button>
-      <Button  variant="primary" disabled={blocked || !status.update_available} onClick={() => void operate("update")}>{t("admin.updates.updateNow")}</Button>
-      <Button disabled={blocked} onClick={() => void operate("restart")}>{t("admin.updates.restart")}</Button>
-      <Button  variant="danger" disabled={blocked || !status.previous_generation} onClick={() => void operate("rollback")}>{t("admin.updates.rollback")}</Button>
-      {status.state === "failed" && <Button disabled={blocked} onClick={() => void operate("repair")}>{t("admin.updates.repair")}</Button>}</div>
+      <Space wrap>
+        <Button loading={checking} disabled={blocked} onClick={() => { if (!blocked) void checkAutoUpdateNow(store); }}>{t("admin.updates.checkNow")}</Button>
+        <Button type="primary" disabled={blocked || !status.update_available} onClick={() => void operate("update")}>{t("admin.updates.updateNow")}</Button>
+        <Button disabled={blocked} onClick={() => void operate("restart")}>{t("admin.updates.restart")}</Button>
+        <Button danger disabled={blocked || !status.previous_generation} onClick={() => void operate("rollback")}>{t("admin.updates.rollback")}</Button>
+        {status.state === "failed" && <Button disabled={blocked} onClick={() => void operate("repair")}>{t("admin.updates.repair")}</Button>}
+      </Space>
     </Section>
     <Section title={t("admin.updates.enableWatcher")}>
-      <form onSubmit={(event) => { event.preventDefault(); if (!blocked && dirty) void saveAutoUpdateConfig(store, { enabled: draft.enabled, interval_seconds: draft.interval, release_manifest_url: draft.manifest }); }}><FormGrid>
-        <Field label={t("admin.updates.enableWatcher")} hint={t("admin.updates.enableWatcherHint")} ><Switch aria-label={t("admin.updates.enableWatcher")} checked={draft.enabled} disabled={blocked} onChange={(enabled) => setDraft({ ...draft, enabled })} /></Field>
-        <Field label={t("admin.updates.interval")}><Input aria-label={t("admin.updates.interval")} type="number" min={30} max={86400} value={draft.interval} onChange={(e) => setDraft({ ...draft, interval: e.target.value })} /></Field>
-        <Field label={t("admin.updates.manifestUrl")}><Input aria-label={t("admin.updates.manifestUrl")} value={draft.manifest} onChange={(e) => setDraft({ ...draft, manifest: e.target.value })} /></Field>
-        <Field label={t("admin.updates.channel")}><span>{config.release_channel || "—"}</span></Field>
-      </FormGrid>
-      <FormFooter><Button  type="submit" loading={saving} disabled={!dirty || blocked}>{t("admin.updates.save")}</Button></FormFooter></form>
+      <Form layout="vertical" onFinish={() => { if (!blocked && dirty) void saveAutoUpdateConfig(store, { enabled: draft.enabled, interval_seconds: draft.interval, release_manifest_url: draft.manifest }); }}>
+        <FormGrid>
+          <Form.Item label={t("admin.updates.enableWatcher")} extra={t("admin.updates.enableWatcherHint")}><Switch aria-label={t("admin.updates.enableWatcher")} checked={draft.enabled} disabled={blocked} onChange={(enabled) => setDraft({ ...draft, enabled })} /></Form.Item>
+          <Form.Item label={t("admin.updates.interval")}><Input aria-label={t("admin.updates.interval")} type="number" min={30} max={86400} value={draft.interval} onChange={(e) => setDraft({ ...draft, interval: e.target.value })} /></Form.Item>
+          <Form.Item label={t("admin.updates.manifestUrl")}><Input aria-label={t("admin.updates.manifestUrl")} value={draft.manifest} onChange={(e) => setDraft({ ...draft, manifest: e.target.value })} /></Form.Item>
+          <Form.Item label={t("admin.updates.channel")}><span>{config.release_channel || "—"}</span></Form.Item>
+        </FormGrid>
+        <FormFooter><Button htmlType="submit" loading={saving} disabled={!dirty || blocked}>{t("admin.updates.save")}</Button></FormFooter>
+      </Form>
     </Section>
     <Section title={t("admin.updates.services")}><ResourceList>{Array.from(new Set([...SERVICES, ...Object.keys(status.services || {})])).map((name) => {
       const service = status.services?.[name];

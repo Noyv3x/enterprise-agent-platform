@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { BeautifulRoot } from "../ui/beautiful"
+import { ConfigProvider } from "antd";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -63,13 +63,13 @@ describe("AgentWorkCard", () => {
     };
 
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard work={work} active={true} />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
 
     const card = screen.getByRole("region", { name: "View AI work" });
@@ -124,13 +124,13 @@ describe("AgentWorkCard", () => {
       ],
     };
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard work={work} active={false} />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     expect(card).not.toBeNull();
@@ -221,13 +221,13 @@ describe("AgentWorkCard", () => {
     };
 
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard work={work} active={false} />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     const disclosure = within(card!).getByRole("button");
@@ -256,7 +256,7 @@ describe("AgentWorkCard", () => {
   it("renders needs-review work as a warning instead of successful completion", () => {
     const store = createStore(rootReducer, initialAppState);
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard
@@ -274,7 +274,7 @@ describe("AgentWorkCard", () => {
             />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     expect(card).toHaveTextContent("AI work failed");
@@ -283,7 +283,7 @@ describe("AgentWorkCard", () => {
   it("shows file evidence first without repeating tool, status, or path facts", () => {
     const store = createStore(rootReducer, initialAppState);
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard
@@ -306,7 +306,7 @@ describe("AgentWorkCard", () => {
             />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     expect(within(card!).getByText("View AI work")).toBeVisible();
@@ -333,7 +333,7 @@ describe("AgentWorkCard", () => {
     const store = createStore(rootReducer, initialAppState);
     const longPath = "packages/enterprise-agent-platform/frontend/src/components/chat/generated/deeply/nested/notes.md";
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard
@@ -359,7 +359,7 @@ describe("AgentWorkCard", () => {
             />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     fireEvent.click(within(card!).getByRole("button")!);
@@ -375,7 +375,7 @@ describe("AgentWorkCard", () => {
   it("keeps action-only session identities static while preserving mixed row order", () => {
     const store = createStore(rootReducer, initialAppState);
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard
@@ -416,7 +416,7 @@ describe("AgentWorkCard", () => {
             />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     fireEvent.click(within(card!).getByRole("button")!);
@@ -529,7 +529,7 @@ describe("AgentWorkCard", () => {
   }) => {
     const store = createStore(rootReducer, initialAppState);
     render(
-      <BeautifulRoot mode="light" motion={false}>
+      <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
             <AgentWorkCard
@@ -542,7 +542,7 @@ describe("AgentWorkCard", () => {
             />
           </I18nProvider>
         </StoreContext.Provider>
-      </BeautifulRoot>,
+      </ConfigProvider>,
     );
     const card = screen.getByRole("region", { name: "View AI work" });
     fireEvent.click(within(card!).getByRole("button")!);

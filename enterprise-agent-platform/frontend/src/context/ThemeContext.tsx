@@ -24,10 +24,6 @@ export const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<ResolvedTheme>(() => currentTheme());
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-    document.documentElement.style.colorScheme = theme;
-  }, [theme]);
 
   const toggleTheme = useCallback(() => {
     const next: ResolvedTheme = currentTheme() === "dark" ? "light" : "dark";

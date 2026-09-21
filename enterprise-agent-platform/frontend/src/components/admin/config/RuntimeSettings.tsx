@@ -1,7 +1,7 @@
 import { useI18n } from "../../../i18n";
 import { useStore } from "../../../store/useStore";
 import { formatTimestamp } from "../../../utils/format";
-import { EmptyState, Notice, ResourceList, ResourceRow, Section, StatusMark } from "../../ui/beautiful";
+import { EmptyState, Notice, ResourceList, ResourceRow, Section, StatusMark } from "../../ui/fieldwork";
 
 export function RuntimeSettings() {
   const { t } = useI18n();

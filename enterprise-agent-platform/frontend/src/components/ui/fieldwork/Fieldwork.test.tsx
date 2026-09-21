@@ -5,7 +5,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, expect, it } from "vitest";
-import { BeautifulRoot } from "./Root";
+import { FieldworkProvider } from "./Fieldwork";
 
 function WorkingDraft() {
   const [draft, setDraft] = useState("");
@@ -21,17 +21,17 @@ afterEach(cleanup);
 
 it("keeps unsent input, expanded content and focus when motion preferences change", async () => {
   const user = userEvent.setup();
-  const view = render(<BeautifulRoot mode="light" motion><WorkingDraft /></BeautifulRoot>);
+  const view = render(<FieldworkProvider mode="light" motion><WorkingDraft /></FieldworkProvider>);
   await user.type(screen.getByRole("textbox", { name: "Draft" }), "Unsent working note");
   await user.click(screen.getByRole("button", { name: "Details" }));
   await user.click(screen.getByRole("textbox", { name: "Draft" }));
 
-  view.rerender(<BeautifulRoot mode="light" motion={false}><WorkingDraft /></BeautifulRoot>);
+  view.rerender(<FieldworkProvider mode="light" motion={false}><WorkingDraft /></FieldworkProvider>);
   expect(screen.getByRole("textbox", { name: "Draft" })).toHaveValue("Unsent working note");
   expect(screen.getByRole("textbox", { name: "Draft" })).toHaveFocus();
   expect(screen.getByRole("region", { name: "Working view" })).toBeVisible();
 
-  view.rerender(<BeautifulRoot mode="dark" motion><WorkingDraft /></BeautifulRoot>);
+  view.rerender(<FieldworkProvider mode="dark" motion><WorkingDraft /></FieldworkProvider>);
   expect(screen.getByRole("textbox", { name: "Draft" })).toHaveValue("Unsent working note");
   expect(screen.getByRole("textbox", { name: "Draft" })).toHaveFocus();
   expect(screen.getByRole("region", { name: "Working view" })).toBeVisible();

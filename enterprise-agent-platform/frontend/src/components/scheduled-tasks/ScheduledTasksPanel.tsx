@@ -1,11 +1,11 @@
-import { Button } from "../ui/beautiful";
+import { Button, Space } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { deleteAgentSchedule, loadAgentSchedule, loadAgentScheduleRuns, loadAgentSchedules, pauseAgentSchedule, resumeAgentSchedule, runAgentScheduleNow } from "../../data/scheduleActions";
 import { toast } from "../../context/ToastContext";
 import { intlLocale, useI18n } from "../../i18n";
 import type { AgentSchedule, AgentScheduleRun } from "../../types";
 import { ConfirmDialog } from "../common/ConfirmDialog";
-import { CapabilityHeader, ResourceList, ResourceRow, StatusMark, Notice, DataRegion, EmptyState, FactGrid, SplitDetail, Section } from "../ui/beautiful"
+import { CapabilityHeader, ResourceList, ResourceRow, StatusMark, Notice, DataRegion, EmptyState, FactGrid, SplitDetail, Section } from "../ui/fieldwork";
 import { formatScheduleDate, scheduleIsRunning, scheduleRuleLabel, scheduleRunStatusLabel, scheduleStateLabel } from "./scheduleFormat";
 import "./scheduled-tasks.css";
 
@@ -15,7 +15,7 @@ function errorText(error: unknown): string { return error instanceof Error ? err
 function RunHistoryRow({run,timezone}:{run:AgentScheduleRun;timezone:string}) {
  const {t,locale}=useI18n(); const intl=intlLocale(locale);
  return <ResourceRow title={<code>#{run.id}</code>} status={<StatusMark tone={run.status === "succeeded" ? "success" : run.status === "failed" || run.status === "blocked" ? "danger" : "warning"}>{scheduleRunStatusLabel(run.status,t)}</StatusMark>}
- meta={<div className="bui-stack"><span>{t("scheduledTasks.scheduledFor",{time:formatScheduleDate(run.scheduled_for,intl,timezone)})}</span>{run.started_at ? <span>{t("scheduledTasks.startedAt",{time:formatScheduleDate(run.started_at,intl,timezone)})}</span> : null}{run.finished_at ? <span>{t("scheduledTasks.finishedAt",{time:formatScheduleDate(run.finished_at,intl,timezone)})}</span> : null}</div>}>
+ meta={<Space orientation="vertical"><span>{t("scheduledTasks.scheduledFor",{time:formatScheduleDate(run.scheduled_for,intl,timezone)})}</span>{run.started_at ? <span>{t("scheduledTasks.startedAt",{time:formatScheduleDate(run.started_at,intl,timezone)})}</span> : null}{run.finished_at ? <span>{t("scheduledTasks.finishedAt",{time:formatScheduleDate(run.finished_at,intl,timezone)})}</span> : null}</Space>}>
  {run.error ? <Notice tone="danger" title={run.error}/> : null}</ResourceRow>;
 }
 
@@ -269,17 +269,18 @@ export function ScheduledTasksPanel() {
   const taskRow = (schedule: AgentSchedule, detailed = false) => {
     if (!detailed && selectedId === schedule.id) return <ResourceRow key={schedule.id} title={schedule.name} selected />;
     return <ResourceRow key={schedule.id}
-    title={<h3>{schedule.name}</h3>} description={detailed ? <p className="bui-schedule-prompt">{schedule.prompt}</p> : scheduleRuleLabel(schedule.schedule,schedule.timezone,intl,t)}
+    title={<h3>{schedule.name}</h3>} description={detailed ? <p className="wf-schedule-prompt">{schedule.prompt}</p> : scheduleRuleLabel(schedule.schedule,schedule.timezone,intl,t)}
     selected={selectedId === schedule.id}
     status={<StatusMark tone={scheduleIsRunning(schedule) || schedule.state === "active" ? "success" : schedule.state === "paused" ? "warning" : "neutral"}>{scheduleIsRunning(schedule) && schedule.last_run ? scheduleRunStatusLabel(schedule.last_run.status,t) : scheduleStateLabel(schedule.state,t)}</StatusMark>}
-    meta={<div className="bui-stack"><span>{t("scheduledTasks.timezone",{timezone:schedule.timezone})}</span><span>{formatScheduleDate(schedule.next_run_at,intl,schedule.timezone) || t("scheduledTasks.noNextRun")}</span>{schedule.last_run ? <span>{t("scheduledTasks.lastRun",{time:formatScheduleDate(schedule.last_run.scheduled_for,intl,schedule.timezone)})} · {scheduleRunStatusLabel(schedule.last_run.status,t)}</span> : null}<span>{t(schedule.delivery === "chat_and_telegram" ? "scheduledTasks.delivery.telegram" : "scheduledTasks.delivery.chat")}</span></div>}
-    actions={<div className="bui-actions" >{!detailed ? <Button disabled={!!busyKey || loading} onClick={() => {if(selectedId === schedule.id)setHistoryRevision(value=>value+1);else selectSchedule(schedule.id);}}>{t("scheduledTasks.history")}</Button> : null}
+    meta={<Space orientation="vertical"><span>{t("scheduledTasks.timezone",{timezone:schedule.timezone})}</span><span>{formatScheduleDate(schedule.next_run_at,intl,schedule.timezone) || t("scheduledTasks.noNextRun")}</span>{schedule.last_run ? <span>{t("scheduledTasks.lastRun",{time:formatScheduleDate(schedule.last_run.scheduled_for,intl,schedule.timezone)})} · {scheduleRunStatusLabel(schedule.last_run.status,t)}</span> : null}<span>{t(schedule.delivery === "chat_and_telegram" ? "scheduledTasks.delivery.telegram" : "scheduledTasks.delivery.chat")}</span></Space>}
+    actions={<Space wrap>{!detailed ? <Button disabled={!!busyKey || loading} onClick={() => {if(selectedId === schedule.id)setHistoryRevision(value=>value+1);else selectSchedule(schedule.id);}}>{t("scheduledTasks.history")}</Button> : null}
       {schedule.state === "active" ? <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => handlePause(schedule)}>{t("scheduledTasks.pause")}</Button> : schedule.state === "paused" ? <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => handleResume(schedule)}>{t("scheduledTasks.resume")}</Button> : null}
-      <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"run",schedule})}>{t("scheduledTasks.runNow")}</Button><Button variant="danger" disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"delete",schedule})}>{t("scheduledTasks.delete")}</Button></div>}>
+      <Button disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"run",schedule})}>{t("scheduledTasks.runNow")}</Button><Button danger disabled={!!busyKey || loading || (detailed && historyLoading)} onClick={() => setConfirmation({kind:"delete",schedule})}>{t("scheduledTasks.delete")}</Button>
+    </Space>}>
       {detailed ? <FactGrid columns={2} items={[{key:"id",label:t("scheduledTasks.idLabel"),value:schedule.id},{key:"rule",label:t("scheduledTasks.schedule"),value:scheduleRuleLabel(schedule.schedule,schedule.timezone,intl,t)},{key:"next",label:t("scheduledTasks.nextRunLabel"),value:formatScheduleDate(schedule.next_run_at,intl,schedule.timezone)||t("scheduledTasks.noNextRun")},{key:"created",label:t("scheduledTasks.createdAtLabel"),value:formatScheduleDate(schedule.created_at,intl,schedule.timezone)},{key:"updated",label:t("scheduledTasks.updatedAtLabel"),value:formatScheduleDate(schedule.updated_at,intl,schedule.timezone)}]}/> : null}
     </ResourceRow>;
   };
-  return <section className="bui-schedules" aria-label={t("scheduledTasks.title")}>
+  return <section className="wf-schedules" aria-label={t("scheduledTasks.title")}>
     <CapabilityHeader title={t("scheduledTasks.title")} description={t("scheduledTasks.emptyDetail")} actions={<Button disabled={loading || !!busyKey} onClick={() => void refresh()}>{t("scheduledTasks.refresh")}</Button>}/>
     {mutationError ? <Notice tone="danger" title={mutationError}/> : null}
     <SplitDetail detailOpen={selectedId != null} onBack={() => selectSchedule(null)} backLabel={t("scheduledTasks.back")}

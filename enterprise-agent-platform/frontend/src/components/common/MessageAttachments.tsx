@@ -1,15 +1,16 @@
+import { Button, Image } from "antd";
 import { safeUrl } from "../../lib/api";
 import { useI18n } from "../../i18n";
 import { formatFileSize } from "../../utils/format";
 import type { Attachment } from "../../types";
-import { AttachmentSlot } from "../ui/beautiful"
+import { AttachmentSlot } from "../ui/fieldwork";
 import { AttachmentPreviewCard } from "./AttachmentPreviewCard";
 import { Icon } from "./Icon";
 import "../preview/preview.css";
 
 export function MessageAttachments({ attachments }: { attachments: Attachment[] }) {
   const { t } = useI18n();
-  return <div className="bui-message-files">
+  return <div className="wf-message-files">
     {attachments.map((attachment) => {
       const name = attachment.filename || t("chat.attachment");
       const download = safeUrl(attachment.download_url || attachment.url);
@@ -30,8 +31,8 @@ export function MessageAttachments({ attachments }: { attachments: Attachment[] 
       }
       return <AttachmentSlot key={String(attachment.id)} name={name}
         meta={`${attachment.mime_type || t("chat.file")} · ${formatFileSize(attachment.size_bytes || 0)}`}
-        actions={download ? <a className="bui-attachment-download" aria-label={t("chat.preview.download")} title={t("chat.preview.download")} href={download} target="_blank" rel="noreferrer"><Icon name="download" size={18} /></a> : undefined}
-        preview={image ? <div className="bui-attachment-image"><img src={image} alt={name} loading="lazy" /></div> : undefined}
+        actions={<Button type="text" icon={<Icon name="download" size={18} />} aria-label={t("chat.preview.download")} title={t("chat.preview.download")} href={download || undefined} disabled={!download} target="_blank" rel="noreferrer" />}
+        preview={image ? <div className="wf-attachment-image"><Image src={image} alt={name} loading="lazy" preview={false} /></div> : undefined}
       />;
     })}
   </div>;

@@ -1,7 +1,7 @@
-import { Button, Tooltip } from "../ui/beautiful"
+import { Button, Tooltip } from "antd";
 import { useI18n } from "../../i18n";
 import type { FailedSend } from "../../types";
-import { Notice } from "../ui/beautiful"
+import { Notice } from "../ui/fieldwork";
 
 function summary(send: FailedSend, fallback: string): string {
   const text = send.content.trim().replace(/\s+/g, " ");
@@ -14,10 +14,10 @@ export function FailedSendRecovery({ sends, blocked, onRestore }: { sends: Faile
   if (!next) return null;
   return <Notice tone="warning" title={t("chat.failedSend.title", { count: sends.length })} action={
     <Tooltip title={blocked ? t("chat.failedSend.restoreBlocked") : undefined}>
-      <Button type="button" disabled={blocked} onClick={onRestore}>{t("chat.failedSend.restore")}</Button>
+      <Button htmlType="button" disabled={blocked} onClick={onRestore}>{t("chat.failedSend.restore")}</Button>
     </Tooltip>
   }>
-    <div className="bui-draft-recovery-text">{summary(next, t("chat.attachment"))}</div>
+    <div className="wf-draft-recovery-text">{summary(next, t("chat.attachment"))}</div>
     {next.files.length > 0 && <span>{t("chat.failedSend.attachments", { count: next.files.length })}</span>}
   </Notice>;
 }

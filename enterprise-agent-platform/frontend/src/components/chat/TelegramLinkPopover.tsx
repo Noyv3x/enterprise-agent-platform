@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Button } from "../ui/beautiful"
+import { Button } from "antd";
 import { loadPrivateTelegram } from "../../data/loaders";
 import { runBusy } from "../../data/sessionActions";
 import { useI18n } from "../../i18n";
@@ -12,7 +12,7 @@ import {
   telegramChallengeTiming,
   telegramLinkView,
 } from "../../utils/telegramLink";
-import { OverlayPanel, Notice, Section, FactGrid, StatusMark } from "../ui/beautiful"
+import { OverlayPanel, Notice, Section, FactGrid, StatusMark } from "../ui/fieldwork";
 import {copyText} from "../../utils/clipboard";
 
 const LINK_POLL_INTERVAL_MS = 3_000;
@@ -170,15 +170,15 @@ export function TelegramLinkPopover() {
   return <OverlayPanel open onClose={()=>dispatch({type:"SET_PRIVATE_TELEGRAM_EXPANDED",payload:false})} title={t("chat.telegram.title")} description={status} closeLabel={t("common.close")}
  footer={<Button disabled={busy} loading={pendingOperations.includes("telegram:refresh")} onClick={()=>void runBusy(store,"telegram:refresh",()=>loadPrivateTelegram(store))}>{t("chat.telegram.refresh")}</Button>}>
  <StatusMark tone={linked?"success":gateway.enabled?"info":"warning"}>{status}</StatusMark>
- {view==="disabled"?<Notice tone="warning" title={t("chat.telegram.disabledNotice")}/>:view==="linked"?<Section actions={<Button variant="danger" disabled={busy} loading={unlinkBusy} onClick={()=>void onUnbind()}>{t("chat.telegram.unbind")}</Button>}>
+ {view==="disabled"?<Notice tone="warning" title={t("chat.telegram.disabledNotice")}/>:view==="linked"?<Section actions={<Button danger disabled={busy} loading={unlinkBusy} onClick={()=>void onUnbind()}>{t("chat.telegram.unbind")}</Button>}>
  <FactGrid items={[{key:"account",label:t("chat.telegram.accountFallback"),value:link.telegram_username?`@${link.telegram_username}`:t("chat.telegram.accountFallback")},{key:"id",label:"ID",value:String(link.telegram_user_id)}]}/>
  </Section>:<Section description={t("chat.telegram.instructions",{bot:botName})}>
  {challengeVisible?<Section tone="inset" title={t("chat.telegram.code")} actions={<Button onClick={()=>void onCopy()}>{copied?t("chat.telegram.copied"):t("chat.telegram.copyCommand")}</Button>}>
- <strong>{code}</strong><pre className="bui-telegram-command">{command}</pre>
+ <strong>{code}</strong><pre className="wf-telegram-command">{command}</pre>
  <p role="status">{relativeExpiry}</p>{timing.valid&&<p>{t("chat.telegram.expiresAt",{time:formatExpiryTimestamp(pending?.expires_at,locale)})}</p>}
  <p>{t("chat.telegram.commandHint")}</p>
  </Section>:pendingActive?<Notice tone="warning" title={t("chat.telegram.pendingHidden")}/>:timing.expired?<Notice tone="warning" title={t("chat.telegram.expiredNotice")}/>:null}
- <Button variant="primary" disabled={busy} loading={linkBusy} onClick={()=>void onGenerate()}>{pending?t("chat.telegram.regenerate"):t("chat.telegram.generate")}</Button>
+ <Button type="primary" disabled={busy} loading={linkBusy} onClick={()=>void onGenerate()}>{pending?t("chat.telegram.regenerate"):t("chat.telegram.generate")}</Button>
  </Section>}
  </OverlayPanel>;
 }
