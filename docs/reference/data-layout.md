@@ -1,13 +1,22 @@
 # 数据布局
 
-本文定义 Docker 部署的宿主持久状态。逻辑所有权见[数据、记忆与会话](../design/data-memory-sessions.md)，部署见[部署](../operations/deployment.md)。
+本页拥有路径、marker、备份集合和直接迁移例外；事务见[数据设计](../design/data-memory-sessions.md)，fd/发布安全见[安全设计](../design/security-and-trust.md#文件与附件)，步骤见[部署](../operations/deployment.md)。
 
 ## 唯一根目录
 
-用户级部署默认使用：
+| 对象 | 固定位置 |
+| --- | --- |
+| 宿主入口 | `~/.local/bin/agent-platform-manager` |
+| 配置 | `~/.config/agent-platform/manager.toml` |
+| 用户 unit | `~/.config/systemd/user/agent-platform-manager.service` |
+| 默认持久根 | `~/.local/share/agent-platform/` |
+| Platform 权威目录 | `$data_root/data`；`data_root` 是唯一可配置持久根 |
+| 容器数据根 / 工作区 / 内部工作目录 | `/var/lib/agent-platform` / `/workspace` / `.agent-platform` |
+
+`~` 只从当前 UID 的唯一操作系统账户 home 记录派生；安装器与 Manager 忽略 ambient `HOME`、`XDG_BIN_HOME`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`。control socket 可使用安全验证后的 `XDG_RUNTIME_DIR`，缺失时回退 `/run/user/<uid>`。
 
 ```text
-~/.local/share/agent-platform/
+<data_root>/
 ├── manager/
 │   ├── state.json
 │   ├── operations/
@@ -18,13 +27,12 @@
 │   ├── secrets/
 │   └── logs/
 ├── data/
-│   ├── platform.db
-│   ├── platform.db-wal
-│   ├── platform.db-shm
+│   ├── .agent-platform.lock
+│   ├── platform.db{,-wal,-shm}
 │   ├── attachments/
 │   ├── upload-staging/
 │   ├── workspaces/
-│   ├── agent-envs/<scope-hash>/
+│   ├── agent-envs/<scope-hash>/{home,env}/
 │   ├── agent-skill-state/<scope-hash>/
 │   ├── runtimes/
 │   │   ├── agent/{sessions,approvals,idempotency,logs}/
@@ -35,56 +43,87 @@
 └── backups/
 ```
 
-`manager.toml` 位于 `~/.config/agent-platform/`。`data_root` 是唯一可配置的持久根，Platform 权威目录始终是 `$data_root/data`。容器内数据根固定为 `/var/lib/agent-platform`，内部工作目录固定为 `.agent-platform`。
-
-当前代码只接受 `agent-platform-container-baseline-v1`、`.agent-platform-scope.json`、`.agent-platform-runtime.json` 和当前 Sandbox registry。旧根、旧 marker、旧 profile、未知字段或混合身份直接失败；普通启动、更新、repair、rollback 和恢复不提供旧格式转换或双读。
-
-管理员品牌设置只保存在 Platform 业务数据中，不改变任何路径、数据库、workspace/session identity、Manager journal、备份、容器或文件名。
+仅接受 `agent-platform-container-baseline-v1`、`.agent-platform-scope.json`、`.agent-platform-runtime.json` 和当前 Sandbox registry；字段精确闭合，旧根/profile/marker、未知字段或混合身份拒绝。普通操作无旧路径发现、双读或历史解码，唯一例外是[受控迁移](#受控迁移)。品牌不改变机器身份。
 
 ## 权威数据与文件安全
 
-`platform.db` 是账号、平台凭据、消息、记忆、任务和设置的权威存储。SQLite 使用 WAL。备份必须使用 SQLite backup，或先停止唯一 writer 并 checkpoint；不得只复制主文件。
+权威状态必须宿主 bind mount，不用匿名 volume。镜像、writable layer、Engine metadata、缓存与日志不是备份数据。
 
-Platform 从逐段 no-follow 打开的数据根 fd 打开数据库。既有数据库、WAL 与 SHM 必须是当前 UID 所有、单硬链接的普通文件；缺失数据库只在固定父目录以 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建为 `0600`。符号链接、硬链接、特殊文件、owner 异常或 inode 置换在 writer 启动前失败关闭。`.agent-platform.lock` 的独占 flock 贯穿 Platform 生命周期。
-
-所有权威状态使用宿主 bind mount。Docker image、container writable layer、Engine metadata、缓存和有界日志不是备份数据；不得用匿名 volume 保存权威数据。
+| 对象 / 时点 | 必须成立 |
+| --- | --- |
+| 数据库 | 固定数据根 fd 逐段 no-follow 打开；DB/WAL/SHM 必须当前 UID、单链接普通文件，缺 DB 以 `O_CREAT | O_EXCL | O_NOFOLLOW`、`0600` 创建。owner/type/link/inode 异常在 writer 前拒绝。 |
+| 实例锁 | SQLite/worker/副作用前从同根 fd 打开 `.agent-platform.lock`，`O_NOFOLLOW | O_CLOEXEC`、创建 exclusive；当前 UID、普通/nlink=1，验明后才可 fd 收紧 `0600`，异常不修复。 |
+| 锁生命周期 | 非阻塞独占 flock；取得及写 PID 前后复验锁 fd、父项、规范数据根 inode。置换即释放失败，锁/父 fd 持生命周期，关闭不 unlink。 |
+| DB 备份 | SQLite backup，或停唯一 writer 后 checkpoint；不能仅复制活动主文件。 |
 
 ## Workspace、附件与 Skill
 
-个人 AI 的默认 workspace 为 `data/workspaces/user-<id>/`，频道主 Agent 使用 `data/workspaces/channels/channel-<id>/`。数据库只保存相对 workspace identity。Sandbox 内统一映射为 `/workspace`；可信系统提示可同时说明该 scope 的精确宿主映射，但宿主绝对路径不得进入公共 API、普通 Runtime metadata 或数据库。
+| 状态 | 位置与身份 |
+| --- | --- |
+| 私人 / 频道 workspace | `data/workspaces/user-<id>/` / `data/workspaces/channels/channel-<id>/` → `/workspace`；委派共用父目录。 |
+| 用户环境 | `agent-envs/<scope-hash>/{home,env}` → `/home/agent`、`/opt/agent-env`；系统层随重建丢失。 |
+| Skill 包 | workspace `.agent-platform/skills/<skill-id>/`，仅 `SKILL.md`、`references/`、`templates/`、`scripts/`、`assets/`。 |
+| Skill 状态 | Platform-only `agent-skill-state/<scope-hash>/`，不挂 Sandbox；workspace sidecar 不授权。 |
+| MCP | workspace `.agent-platform/mcp.json`、`.agent-platform/mcp/<server-id>/`；不双存/搜索其它客户端路径。 |
+| 上传 / 附件 | `upload-staging/` 请求目录 `0700`、文件 `0600`；提交到 `attachments/`，DB 路径相对。生命周期见[上传](../design/security-and-trust.md#上传交付与预览)。 |
+| 附件挂载 | 当前 scope 只读 `/workspace/.agent-platform/attachments`，不能挂全局/其它 scope。 |
 
-`agent-envs/<scope-hash>/home` 和 `env` 保存用户级工具与环境。每个 workspace 内的 `.agent-platform/skills/<skill-id>/` 只保存可移植 Skill 包，`.agent-platform/mcp.json` 保存 MCP 清单，`.agent-platform/mcp/<server-id>/` 保存本地 MCP server 包。不向 Sandbox 挂载的 `agent-skill-state/<scope-hash>/` 保存 Skill 的原子生命周期、授权与 usage 状态；workspace 中的同名 sidecar 始终是不可信输入。私人和频道主 Agent 各用自己的 workspace；委派子 Agent使用父主 Agent 的目录。
-
-Multipart 上传增量写入 `upload-staging/` 下按请求隔离的 `0700` 目录和 `0600` 文件。完整校验后流式提交到 `attachments/`；成功、失败、取消或空闲超时都清除 staging。附件数据库路径必须是相对路径。每个 Sandbox 只读挂载当前 scope 的附件到 `/workspace/.agent-platform/attachments`。
+scope marker 精确含 logical key/type/id、当前 Runtime lifecycle、sandbox/workspace identity、`technical_profile`、固定隔离边界。DB 仅存 canonical 相对 workspace identity，不存绝对路径/可选后端；越界、字段/profile/身份漂移在启动及每次读取拒绝，缓存不豁免。宿主映射仅可进入当前 scope 可信系统提示，不入公共 API/普通 metadata/DB；生命周期见[数据设计](../design/data-memory-sessions.md#agent-scope)。
 
 ## Sandbox
 
-Sandbox registry 是容器 identity 的真相源；容器名和 writable layer 不是。registry 记录 sandbox/workspace identity、UID/GID、相对挂载与镜像 digest。首次绑定后 `sandbox_id` 不能改绑其它 workspace。
-
-Manager 每次创建或启动容器前验证 workspace、HOME、env、附件源以及 workspace 内的 `.agent-platform/attachments` 挂载目标都位于数据目录内、无符号链接并由部署 UID/GID 拥有且为 `0700`；缺失挂载目标由 Manager 在调用 Docker 前创建，不能交给 Docker daemon 以 root 代建。registry 原子写入是 ensure 的提交边界；写入失败必须停止或删除本次创建的容器并恢复调用前记录。
-
-Sandbox 系统层修改随容器重建丢失。需持久的软件和文件放入 `/opt/agent-env`、`/home/agent` 或 `/workspace`。
+registry 记录 sandbox/workspace identity、UID/GID、相对挂载、image digest；名称/layer 不授身份，首次 `sandbox_id` 不改绑。每次创建/启动前 Manager 验 workspace/HOME/env/附件源与目标：数据目录内、无 symlink、部署 UID/GID、`0700`；缺挂载目标在 Docker 前创建，不由 root daemon 代建。registry 原子写是 ensure 提交点，失败停/删本次新容器并恢复原记录。
 
 ## Runtime 与集成服务
 
-Agent Runtime 的 session、approval 与 idempotency 位于 `runtimes/agent`。程序和依赖在镜像内。
+程序/依赖在镜像，Runtime 状态在 `runtimes/agent`，Camoufox 状态在 `runtimes/camofox`；浏览器 staging 在请求结束/服务启动清理。SearXNG 完整 `config/` 只读映射 `/etc/searxng`；Firecrawl 无 FoundationDB。
 
-Camoufox 的 Profile、Cookie 和 trace 位于 `runtimes/camofox`；浏览器程序在镜像内。上传暂存位于受控 `upload-staging/` 并在请求完成或服务启动时清理。SearXNG 的完整 `config/` 只读映射到 `/etc/searxng`。Firecrawl 只使用 Redis、RabbitMQ 与 PostgreSQL 目录；当前布局没有 FoundationDB。
-
-Platform 管理的 `runtimes/camofox/.agent-platform-runtime.json` 是既有部署的必需身份文件，直接前版本迁移保留它，不负责补建。普通启动与 Candidate 对缺失或不匹配的 sidecar 失败关闭。仅在创建数据库前明确确认数据库不存在的 fresh 初始化中，`serve` 或 `migrate` 才能校验并创建该文件；fresh `migrate` 成功后必须能作为既有部署启动。迁移冒烟夹具必须同时包含旧 schema、旧 Skill 布局与既有受管 sidecar，不能用启动时隐式补建掩盖不完整部署。
+既有部署必须有 `runtimes/camofox/.agent-platform-runtime.json` 及受管父目录；普通/候选启动缺失或错身份拒绝。`serve/migrate` 仅在**建 DB 前确认 DB 不存在**的 fresh 上下文可创建 sidecar，资格显式传递，不从缺失推断、不误拒同次新 DB；旧库迁移保留而不补建，fresh migrate 后可按既有部署启动。
 
 ## Manager 状态、快照与清理
 
-Manager 保存 Current/Previous/Candidate、operation journal、不可变 release、Manager version、control capability 和活动 generation。`active-generation` 明确指出停止、日志与恢复命令使用的 generation，不能按目录时间猜测。
+`active-generation` 决定停止/日志/恢复目标，不按目录时间猜测。可能改 DB/sidecar 的 operation 停 writer 后建绑定 generation 的快照：owner-only staging → 文件/manifest/父目录 fsync → 原子发布 `backups/<operation-id>/`，失败仅清本次 staging。
 
-可能改变数据库或 sidecar 的 operation 在停止 writer 后建立与目标 generation 绑定的快照。快照先写 owner-only staging，文件、manifest 和父目录全部 fsync 后再原子发布到 `backups/<operation-id>/`。发布前失败只精确清理本次 staging。
-
-以下对象始终受保护：Current、Previous、Candidate、active/finalize operation、未 finalized journal、对应快照与被运行容器引用的 release/镜像。Manager 只在稳定 idle 状态，从单一保护快照精确删除过期且未引用的 operation、备份、release、Manager version、staging、容器和镜像；每个删除点复核 epoch、owner、类型、inode、label 与 digest。禁止全局 prune 和通配递归删除。
-
-日志必须轮转，不能包含 secret、原始宿主执行凭据或 registry 凭据。
+始终保护 Current/Previous/Candidate、active/finalize operation、未 finalized journal、关联快照及运行容器引用的 release/镜像。仅稳定 idle 从单一保护快照删过期未引用对象，每个删除点复验 epoch/owner/type/inode/label/digest，禁全局 prune/通配递归。保留策略见[自动更新](../operations/auto-update.md)，tmp 删除授权见[安全设计](../design/security-and-trust.md#管理器与更新)。日志轮转，不含 secret/执行或 registry 凭据。
 
 ## 备份与恢复
 
-一致备份至少包含 SQLite backup、attachments、workspaces、agent-envs、agent-skill-state、Runtime session/approval/idempotency 与 Manager release/operation state。workspace 已包含每个 Agent 的 Skill、MCP 清单、本地 server 包和用户自行保存的环境值。需要保留网页登录态时包含 Camoufox Profile；Firecrawl 数据按恢复成本纳入。
+一个恢复点至少含 SQLite backup、attachments、workspaces、agent-envs、agent-skill-state、Runtime session/approval/idempotency、Manager release/operation/generation。workspace 包含 Skill/MCP/server/自存环境值，不跨 scope 配回；需网页登录态纳入 Camoufox Profile，Firecrawl 按恢复成本纳入。
 
-恢复先停止 Platform writer，完整验证快照 manifest、文件类型、大小和 SHA-256，再在同文件系统 staging 中准备全部文件，最后原子切换并同步目录。任一步失败必须补偿回提交前完整集合。不得手工编辑 Runtime JSONL、幂等记录或 Manager journal。
+恢复停唯一 writer，验 manifest/type/size/SHA-256，同文件系统 staging 准备完整集合，再原子切换并同步目录；失败补偿完整原集合。不手改 JSONL/idempotency/journal；新 generation 已写业务后不回滚分叉旧快照，走新快照 operation。
+
+## 受控迁移
+
+这是当前唯一活动兼容例外，不授权普通启动修复旧目录。schema 单调递增；未来格式变化须先更新文档、schema 和迁移测试，并只接受当次明确声明的直接来源。
+
+### 来源资格与转换范围
+
+- 仅 `2026080801 → 2026082901`；Manager 停 current writer 并建可回滚快照后运行固定 `migrate`。精确验证业务表/列集合、关键 CHECK、索引、唯一约束、外键；未知 marker/table/column、缺失结构或不安全 DB 在写入前拒绝。
+- 删除退役的六张知识表、两张原生 Sylver 连接/凭据表、知识设置及残留知识索引任务；不自动转成 MCP。需保留者升级前从旧版/快照导出。
+- 旧 `agent-skills/<scope-hash>/<skill-id>/` **不移动、不删除、不改写**：便携内容复制到对应 workspace Skill 包，`.skill.json` 与 scope 根 `.skill-usage.json` 规范化复制到 Platform-only 状态。旧 Manager 快照不含旧 Skill 根；恢复前一 DB 后旧 Platform 仍依赖原树。当前版本不双读。
+- 全部旧 scope 一次预规划，以 DB canonical scope type/id 推导唯一 workspace；未知 scope/root 项、非规范 key/workspace、重复目标、symlink 组件、hardlink/特殊文件、缺失私有状态、目标差异/额外项，须在目录创建、DDL、marker 更新前拒绝。没有旧 source 的 Skill 目录不检查、不改写。
+- 唯一允许的旧控制文件是 scope 根空 `.lock`：当前 UID、单链接、`0600` 普通文件，纳入源指纹但不复制/改写；不因该例外接受其它 residue。预检不缓存所有正文；apply 按 scope 重读并匹配有界源指纹。
+
+### 旧 Docker 挂载点权限例外
+
+当前 Compose 可让同一 Platform entrypoint 短暂 root 启动，以兼容仍运行的旧 Manager；没有额外 helper 镜像。普通 root 命令的闭合白名单与立即降权见[安全设计](../design/security-and-trust.md#容器与网络边界)。仅固定 `migrate` 带镜像内 `2026080801-to-2026082901` 标记时：
+
+1. 先以部署 UID/GID、清附加组、镜像内绝对 isolated Python、root-owned cwd，只读固定 `platform.db` 检查来源。精确旧 marker 才进入 root 兼容；fresh/current 跳过，未知/不安全 DB 拒绝。root 兼容本身不打开 DB、不读 secret、不执行任意路径/命令。
+2. 只在逐段 no-follow 固定、部署 UID/GID 所有的 `data/workspaces` 下处理规范私人/频道 workspace；部署用户所有 `.agent-platform` 只允许精确 `0755 → 0700`，不遍历内容、不改 owner。
+3. root 所有对象只接受旧 Docker 精确 `0755 .agent-platform/attachments` 两层空目录。允许的崩溃重试中间态仅为 root 父下唯一空 `attachments` 已属部署 UID/GID、模式 `0755` 或 `0700`。额外项、symlink、跨设备挂载、其它 owner/group/mode 或身份漂移都拒绝。
+4. 子后父、非递归改为部署 UID/GID 与 `0700`；完成后重新固定并完整复核 data/workspaces 身份，立即清附加组、禁止新特权并降权进入普通迁移，不保留 root shell/能力/业务进程。fresh/current 或已规范对象无副作用。
+
+这次权限收紧单调且兼容旧 generation，不属于 SQLite 快照，失败回滚也不反向放宽。后续 baseline 必须随直接迁移消费者删除固定标记及 root 分支。
+
+### 文件发布与数据库提交
+
+Sandbox 可跨 fixed-stack 更新存活，维护态**不等于 workspace 排他锁**。
+
+| 阶段 | 不变量 |
+| --- | --- |
+| 固定对象 | apply 从固定 data/workspaces fd 逐段 no-follow 重开并持有 workspace、`.agent-platform`、protected state parent、staging fd；不重新解析预检 Path。 |
+| 发布 | 缺失目标用同父 staging，逐文件/目录持久化后 `renameat2(RENAME_NOREPLACE)`；创建、写入、fsync、身份读取与复核全用固定 fd。既有目标仅完整树、字节、权限精确相同时幂等成功，不合并/覆盖。exact-final 重试仍须完成耐久屏障。 |
+| 状态绑定 | portable 包发布/确认后，protected sidecar 写入该包 `device/inode/ctime`，同 id 重建不得继承 agent-owned 权限。 |
+| 清 staging | 只在同父名称仍等于固定 inode 时 no-follow fd 递归；替换、未知类型、身份漂移保留证据并失败，不按字符串递归删除。 |
+| 提交 DB | 所有文件耐久后，再精确复核每个 portable/state 树；通过后才在单一 DB 事务中执行 DDL、marker 更新、外键及精确结构验证。 |
+| 失败 / 重试 | DB 事务失败保留旧 source 与已发布精确目标，重试仅按相同内容收敛；回滚恢复前一 DB 与 generation，旧 source 仍可用。普通/候选启动随后只验证当前身份，不补目录/marker/alias/sidecar。 |

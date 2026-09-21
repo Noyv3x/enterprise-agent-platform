@@ -1,224 +1,202 @@
 # Agent Runtime 私有 API
 
-本文定义 Python 平台与 Node Agent Runtime 之间的私有协议。Runtime 行为见 [Agent Runtime 设计](../design/agent-runtime.md)。Run 空闲、模型轮次和 terminal 默认超时的跨层值见 [`runtime-policy.json`](../contracts/runtime-policy.json)；其它协议边界见[配置参考](configuration.md)并由双方测试校验。
+本文定义 Platform↔Runtime wire；状态机、耐久顺序和工具行为见 [Runtime 设计](../design/agent-runtime.md)。跨层数值以 [`runtime-policy.json`](../contracts/runtime-policy.json)为准，其它上限见[配置](configuration.md)。下文 `?` 表示可省略，**不是可传 null**；明确列出的 null 才有语义。object 指非数组对象，JSON 包括 null 等 JSON 值；除另有说明外，时间戳为 RFC3339 string。
 
 ## 传输与认证
 
-Runtime 只监听私有容器网络。所有 endpoint，包括健康检查，都要求 `Authorization: Bearer <token>`。比较必须使用定时安全方法；失败响应不返回内部 traceback。
+仅私有网络；所有 endpoint（含 health）要求 `Authorization: Bearer <token>`、定时安全比较。JSON 为 UTF-8 `application/json`，受 body 字节/完整读取 deadline 限制；cancel 可无 body，否则只能 `{}`。JSON 响应为 `application/json; charset=utf-8`、`Cache-Control: no-store`；另有 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: default-src 'none'`。
 
-JSON 请求使用 UTF-8、明确的 body 上限和完整读取 deadline。JSON 响应使用 `Cache-Control: no-store`；SSE journal 使用 `Cache-Control: no-cache, no-transform`，避免中间层缓存或改写事件流。Python client 对普通请求和 SSE 断链使用传输级 deadline，这些 deadline 不能作为 Agent 任务总时限。
+错误 `{error:string}` 不含 traceback；SSE 已开始则关闭连接，不改发 JSON。HTTP：400 请求/JSON/字段/身份/游标非法；401 bearer 无效；404 路径/方法/Run 不存在；408 body 超时、413 超限（均关连接）；409 input 冲突/session busy；415 非 JSON；429 队列满；未分类内部错误 500。传输/SSE deadline 不等于 Run 总时限，失败不证明无副作用。
 
 ## Endpoint
 
-| 方法与路径 | 用途 |
+除表列 query 外均拒绝查询参数；未知/重复 query 在订阅/副作用前拒绝。body 顶层与标注的闭对象拒未知字段。metadata 是 Platform 内部 JSON 容器，未记录键不提供授权或兼容承诺。
+
+| 方法、路径 | 请求 → 成功响应 |
 |---|---|
-| `GET /health` | Runtime 进程健康 |
-| `GET /v1/models` | Runtime 唯一可执行模型目录 |
-| `POST /v1/runs` | 创建或复用 Run |
-| `GET /v1/runs/{run_id}` | 读取 Run 状态和终态结果 |
-| `GET /v1/runs/{run_id}/events` | 可恢复 SSE journal |
-| `POST /v1/runs/{run_id}/input` | 向活动 Run 提交追加输入 |
-| `POST /v1/runs/{run_id}/approval` | 处理当前审批 |
-| `POST /v1/runs/{run_id}/cancel` | 取消 Run |
-| `POST /v1/sessions/compact` | 立即压缩一个空闲 session |
-| `POST /v1/scopes/cleanup` | 取消 scope Run、进程并可删除 session |
-| `GET /v1/scopes/processes` | 读取一个 scope/lifecycle 的终端预览 |
-| `GET /v1/scopes/process-summary` | 读取进程摘要 |
+| `GET /health` | 200 `{status:"ok",service:"agent-platform-runtime",version:string,pid:number,uptime_seconds:number}` |
+| `GET /v1/models` | 200 模型目录 |
+| `POST /v1/runs` | Run body → 202 `{run_id:string,status:RunStatus,events_url:string}` |
+| `GET /v1/runs/{run_id}` | 200 Run 快照 |
+| `GET /v1/runs/{run_id}/events` | query `after?` → 200 SSE |
+| `POST /v1/runs/{run_id}/input` | Input body → accepted 202 / injected 200 |
+| `POST /v1/runs/{run_id}/approval` | 审批 body → 200 `{run_id,approval_id:string\|null,decision,resolved:true}` |
+| `POST /v1/runs/{run_id}/cancel` | 空 body/`{}` → 202 `{run_id,status}`；不是清理已完成确认 |
+| `POST /v1/sessions/compact` | compact body → 200 压缩结果 |
+| `POST /v1/scopes/cleanup` | cleanup body → 200 `{scope_key,cancelled_runs:number,sessions_deleted:boolean}` |
+| `GET /v1/scopes/processes` | query `scope_key,lifecycle_id,since_revision?` → 200 预览 |
+| `GET /v1/scopes/process-summary` | query `scope_key,lifecycle_id` → 200 `{running_terminal_count:number}` |
 
-未知路径和不支持的方法返回 404。模型目录、预览、Run、Input、Cleanup 与控制 endpoint 严格拒绝未知 query/body 字段。调用方不得依赖未记录字段；新增字段必须先更新本文、类型和双方测试。
-
-事件游标必须是非负、安全整数的完整十进制表示；带尾随字符、负数、溢出或重复 `after` query 一律在建立订阅前拒绝。取消请求不接受业务字段，未知正文必须在取消 Run 前拒绝。
+未标类型的 run_id/scope_key/decision 为 string。`RunStatus=queued|running|completed|failed|cancelled|needs_review`，后四项终态；幂等创建可返回已终态状态。产品消息撤回不是 Runtime cancel。
 
 ## 模型目录
 
-`GET /v1/models` 返回版本、`pi-runtime` 来源和 provider 目录。产品 provider id 只接受 `openai-codex` 和 `xai-oauth`，不解析简写或历史别名。每个模型条目包含 id、显示名称、reasoning、输入模态、context window 和最大输出等 Runtime 元数据。OAuth provider 的 `default_model` 始终为空；推荐值必须由账号级供应商目录决定，调用方不得擅自替换为 Runtime 列表第一项。
+响应为 `{version:1,source:"pi-runtime",providers:{"openai-codex":Provider,"xai-oauth":Provider}}`。Provider 为 `{provider:string,runtime_provider:string,default_model:string,models:Model[]}`；Model 为 `{id:string,name:string,reasoning:boolean,input:string[],context_window:number,max_tokens:number}`。
 
-目录从锁定 Pi 依赖计算，本文不复制模型 ID。Python 必须将目录与当前 OAuth 账号可见模型求交，不能创造任一目录外模型；两个 provider 都以供应商返回顺序中的第一个安全交集模型作为推荐默认。已有显式选择只有仍在安全交集中才可执行，且不随推荐值变化而改写。
+只接受规范 provider，无别名；runtime_provider 分别为 openai-codex/xai，OAuth default_model 固定为空串而非 null。锁定 Pi 目录与账号目录的交集、推荐、stale 和空目录规则由[集成](../design/integrations.md)定义；不在此固定模型 ID，也不能从 Runtime 首项推默认。
 
 ## 创建 Run
 
-最小请求结构：
+| 字段 | 类型、约束 |
+|---|---|
+| `scope_key,lifecycle_id,session_id` | 必填非空 string，各≤512 字符；scope/lifecycle 禁 NUL |
+| `workspace` | 必填 string，固定 `/workspace` |
+| `execution_context` | 必填闭对象 `{sandbox_id:string,workspace_id:string}`；Platform 派生，委派继承 |
+| `system_prompt` | 必填 string，Platform context，不从正文推权限 |
+| `input` | 必填 string 或内容块数组 |
+| `model` | 必填闭对象 `{provider:string,id:string,reasoning?:boolean}`；provider/id 非空且在 Runtime 目录，禁 api/base_url/baseUrl |
+| `history?` | 锁定 Pi `AgentMessage[]`，上下文 seed，不是授权 |
+| `attachments?` | ≤64 个闭对象 `{path?:string,name?:string,mime_type?:string}`；禁 url/image MIME |
+| `thinking_level?` | string，锁定 Pi ThinkingLevel，缺省 off |
+| `gateway?` | 闭对象 `{base_url?:string,token?:string}`；内部工具 Gateway，非模型 endpoint |
+| `metadata?` | Platform 内部对象，字段见下表 |
 
-```json
-{
-  "scope_key": "private:42",
-  "lifecycle_id": "lifecycle-id",
-  "session_id": "session-id",
-  "workspace": "/workspace",
-  "execution_context": {
-    "sandbox_id": "agent_opaque_id",
-    "workspace_id": "user-42"
-  },
-  "system_prompt": "You are Agent.",
-  "input": "处理这个任务",
-  "model": {
-    "provider": "openai-codex",
-    "id": "runtime-catalog-model-id"
-  }
-}
-```
+sandbox_id 匹配 `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`；workspace_id 为≤512 字符相对标识，每个 `/` 分段符合相同规则。身份不得与已建立 scope/lifecycle 冲突。禁 OAuth token、宿主路径、Docker 身份、provider endpoint 覆盖；物化准入见 Runtime 设计。
 
-`execution_context` 由 Platform 从数据库 scope 派生，不能接受模型值；委派请求继承父值。可选字段包括 `history`、`attachments`、`thinking_level`、内部 Gateway 信息和 metadata。图片附件由 Platform 读取受限字节后放入 `input` image block；其它附件只携带 `path`、`name` 和 `mime_type`。`attachments` 不得带 `url` 或图片 MIME；Runtime 不把工作区文件再读成模型图片，也不直接读取 Platform 文件系统。metadata 可携带 parent/delegation、idempotency、source message、触发来源、计划任务和可用技能索引；scheduled occurrence 的 `schedule_recurring` 必须是 Platform 从权威 schedule type 派生的布尔值，interval/cron 为 true、once 为 false。OAuth token、宿主路径、Docker 身份和可覆盖 provider endpoint 的值不得出现。Platform 内部学习复盘还同时携带 `review_mode=memory_skill`、`trigger=learning_review`、`unattended=true` 和正整数 `review_job_id`，并把 session 与幂等身份固定为 `session_id=learning-review-<review_job_id>`、`metadata.idempotency_key=agent-learning-review:<review_job_id>`。Runtime 只有在 canonical private 顶层 scope、当前 source message、无 parent/delegation 且这两个派生身份精确匹配的完整组合下才启用受限能力；对应 session/idempotency 命名空间为内部保留，普通 Run 也不能预占。这些字段不是公共提权开关。
+input 闭块为 `{type:"text",text:string}` 或 `{type:"image",data:string,mimeType:string}`；图片由 Platform 读取受限安全位图后内联 base64，Runtime 不从 attachments 读模型图片或直接访问 Platform 文件系统。
 
-成功创建返回 HTTP 202：
+| metadata 可选字段 | 类型 |
+|---|---|
+| `parent_run_id,approval_owner_run_id,approval_scope_key,approval_session_id,idempotency_key,trigger,review_mode,schedule_id,schedule_run_id,scheduled_for` | string |
+| `delegation_depth` / `delegation_role` | number / `"leaf"\|"orchestrator"` |
+| `source_message_id,review_job_id` | 正安全整数 |
+| `unattended,schedule_recurring` | boolean；recurring 由权威 interval/cron 派生 true，once=false |
+| `available_skills` | 有界 `{id:string,name:string,description?:string,category?:string}[]` |
 
-```json
-{
-  "run_id": "run_...",
-  "status": "queued",
-  "events_url": "/v1/runs/run_.../events"
-}
-```
+复盘组合：canonical `private:<正整数>` scope、正 source_message_id/review_job_id、无 parent（省略/空串）及 depth（省略/0）、`review_mode=memory_skill,trigger=learning_review,unattended=true`、`session_id=learning-review-<job>`、`idempotency_key=agent-learning-review:<job>`。排队/session 初始化前校验；两个命名空间为保留，普通 Run 不得预占。能力与 lifecycle 见[学习复盘](../design/agent-runtime.md#学习复盘-run)。
 
-非空 `metadata.idempotency_key` 在 `scope_key` 内唯一。重复请求返回原 Run；已持久终态可以在重启后合成可重放事件。并发队列满时返回 429。
+非空幂等键 scope 内唯一，重复复用原 Run；重启中断 Run 为 needs_review、不重做，持久终态仅合成重放事件。保留/提交规则见[状态机](../design/agent-runtime.md#run-状态机)。
+
+快照 `{run_id,status,created_at,updated_at,session_id,scope_key,result?:RunResult,error?:string}`（除 status/result 外其余 string）。RunResult 为 `{content:string,messages:AgentMessage[],model:{provider:string,id:string},usage?:object,context_usage?:ContextUsage,input_message_ids?:string[],unconsumed_input_message_ids?:string[]}`。无可选值则省略；durable messages 脱敏且不存 live image base64，恢复 messages=[]，不恢复原消息流。
+
+ContextUsage 为 `{used_tokens:number,max_tokens:number,percent:number,estimated:boolean}`，表示现役上下文非累计账单；含估算即 true，max 来自可信目录，percent 展示夹取不截断 used_tokens。[计量规则](../design/agent-runtime.md#会话与压缩)禁止复用失效/上个 Run 的 usage。
 
 ## 追加输入
 
-请求包含稳定 `message_id`、与原 Run 一致的 `scope_key`、`lifecycle_id`、input 和可选附件。Runtime 必须拒绝跨 scope/lifecycle 注入。
-
-响应状态为：
-
-- `accepted`：已登记，等待模型循环消费；
-- `injected`：已进入下一模型 turn；
-- `unconsumed`：Run 已结束或无法消费，平台需要重新排队。
-
-平台不能把 HTTP 接收成功等同于模型已经消费。
+闭 body `{message_id:string,scope_key:string,lifecycle_id:string,input,attachments?}`：id 非空≤512，input/attachments 同创建，仅私人顶层交互支持，须匹配原 scope/lifecycle。同 message_id 同内容复用，异内容/窗口关闭409。响应 `{run_id:string,message_id:string,state:"accepted"|"injected"}`；accepted只登记，injected才消费。未消费经 input.unconsumed/终态 ids 交回[原队列](../design/data-memory-sessions.md)，不重执行/假报消费。
 
 ## 立即压缩 Session
 
-`POST /v1/sessions/compact` 只接受以下严格 JSON；`model` 与 `gateway` 由已认证 Platform 从当前账号配置构造，仅用于这次摘要，不写入 session：
+闭 body 为 `{scope_key:string,lifecycle_id:string,session_id:string,model,gateway?}`。身份非空、各≤512字符且禁控制字符，model/gateway 同创建，仅供本次摘要、不写 session。当前身份有 queued/running Run 或压缩时返回409，非法请求400。
 
-```json
-{
-  "scope_key": "private:42",
-  "lifecycle_id": "lifecycle-id",
-  "session_id": "session-id",
-  "model": {"provider": "openai-codex", "id": "catalog-model-id"},
-  "gateway": {"base_url": "http://platform:8765", "token": "internal-token"}
-}
-```
-
-Runtime 验证三个身份字段并在同一 session 身份门闩下确认没有 queued/running Run，再串行执行 archive 与 journal 原子替换。存在活动 Run 返回 409；未知字段、空身份或非法身份返回 400。会话不存在或没有足够历史可省略不是错误，返回 HTTP 200：
-
-```json
-{
-  "compacted": false,
-  "omitted_messages": 0,
-  "retained_messages": 4
-}
-```
-
-实际压缩时 `compacted=true`；`omitted_messages` 只统计归档的真实会话消息，`retained_messages` 统计改写后的活动 journal 条目并包含一条 Runtime 内部结构化摘要。摘要由 Runtime-owned entry 标记识别，不能按正文识别。对已经压缩且没有新增可省略历史的 session 重复调用是幂等 no-op，不归档内部摘要、不增长 journal 或 archive。自动压缩则在同一 Run 的每个后续 provider turn 对“当前摘要 + 保留 tail + 新增消息”重新计算阈值；再次超限时迭代更新摘要、归档新省略的真实消息并丢弃旧摘要，不能把首次摘要当成永久免压缩标记。该 endpoint 不创建用户 Run、不写入命令消息，也不删除 archive；它会进行一次无工具的有界摘要模型请求，Platform 为该调用使用五分钟读取 deadline。HTTP 客户端断开、deadline、摘要失败或空摘要在最终提交点前都会取消本次操作，Runtime 在释放 session 门闩前确认摘要协作停止并保持 journal、archive 与 sidecar 原样；已进入最终提交点时则完成有界的 archive-first 原子替换，不把两份持久状态留在危险的半提交方向。
+200 响应 `{compacted:boolean,omitted_messages:number,retained_messages:number}`：omitted 只计真实消息，retained 在实际压缩时含现役摘要；无可省略历史为 false，重复调用不增长文件。控制操作不创建 Run/命令、不删除 archive。Platform 读取 deadline 为五分钟；取消、提交与删除边界见[压缩契约](../design/agent-runtime.md#会话与压缩)。
 
 ## SSE journal
 
-每个 `data` 是递增 sequence 的 envelope：
+头：`Content-Type: text/event-stream; charset=utf-8`、`Cache-Control: no-cache, no-transform`、`Connection: keep-alive`、`X-Accel-Buffering: no`。帧含 `id:<sequence>`、`event:<type>`、`data:<JSON>`；envelope `{sequence:number,type:string,run_id:string,timestamp:string,data:object}`。连接/heartbeat 为注释。
 
-```json
-{
-  "sequence": 1,
-  "type": "run.queued",
-  "run_id": "run_...",
-  "timestamp": "RFC3339 timestamp",
-  "data": {}
-}
-```
+先记录再广播，单 journal sequence 递增。Last-Event-ID/after 必须完整非负安全整数十进制，取较大值并送后续事件；尾随字符/负数/溢出/重复 after 在订阅前拒绝。只补读**当前内存保留后缀**，无 gap sentinel、永久历史、跨重启稳定游标或 exactly-once 保证；越过保留窗口不能补齐。幂等重启恢复是新 journal 的 reused+终态，不复原旧消息/工具流，live 重复创建不发 reused。
 
-客户端可以使用 `Last-Event-ID` 或 `?after=` 恢复；Runtime 以两者中较大的合法 sequence 为起点。事件 journal 先记录再广播，慢或断开的客户端可在保留窗口内补读。
+每连接独立有界发送队列；背压解除按 sequence 排完整帧，超限断该连接，不阻塞 Agent/其它读者。heartbeat/终态同界，终态排空关闭。
 
-每条 SSE 连接还必须独立处理网络背压；有界 journal 不能替代有界的 socket 待发送队列。可写后继续按 sequence 排出完整事件，积压超出保留预算时断开该连接，由客户端在保留窗口内恢复，不阻塞 Agent 或其它读取者；heartbeat 与终态同样遵守该队列及关闭边界。
+以下为正常未截断 data：`T={turn_id:string,turn_index:number}`，`C={tool_call_id:string,tool_name:string}`；除明确标注外，identity/name/content/reason/error/status/decision/outcome 为 string，arguments/result/partial_result 为工具相关 JSON。JSON 复制省略 undefined、保留 null、去内部 approval key；超限可变成 `{truncated:true,original_bytes:number|"unserializable",…容得下的字段}`，省略不等于成功证据。
 
-稳定事件族包括：
+| 事件 | data |
+|---|---|
+| `run.queued / run.started` | `status:"queued" / "running"` |
+| `run.reused` | `status,persisted:true` |
+| `message.delta / thinking.delta` | `delta:string,content_index:number,...T` |
+| `message.final` | `content,stop_reason:string,usage:object,...T`；可多次，非唯一终稿 |
+| `tool.arguments.delta` | `content_index:number,...T`，可加下述草稿，无 raw delta |
+| `execution.audit` | `audit_id,...C,operation:string,target:string,details:object`，非 receipt |
+| `tool.started` | `...C,arguments,execution_started:true,audit_id?:string,executor_id?:string,target?:string`（后三项仅 receipt） |
+| `tool.updated` | `...C,partial_result,execution_started:true`（已权威开始） |
+| `tool.completed / tool.failed` | `...C,result,is_error:boolean,execution_started:boolean,unattended_authorization_required?:true,reason?:string` |
+| 委派转发 `tool.failed` | `child_run_id,unattended_authorization_required:true,reason,tool_call_id?:string,tool_name?:string`，无其它常规结果保证 |
+| `approval.requested` | `approval_id,tool_name,arguments,reason,allow_session:boolean,allow_permanent:boolean,choices:string[],scope_key,session_id` |
+| `approval.resolved` | `approval_id,tool_name,decision,outcome`；后二者相同 resolution token |
+| `input.accepted / input.injected` | `message_id,state:"accepted"` / `message_id,state:"injected",...T` |
+| `input.unconsumed` | `message_id,state:"unconsumed",reason` |
+| `delegation.started` | `child_run_id,depth:number` |
+| `delegation.completed` | `child_run_id,content,side_effects_started:boolean,changed_files:string[],unknown_change:boolean` |
+| `delegation.failed` | `child_run_id,status,error,side_effects_started:boolean` |
+| `context.compacted / session.repaired` | `omitted_messages:number,retained_messages:number` / `interrupted_tool_messages:number` |
+| `run.idle_timeout` | `timeout_ms:number,idle_ms:number,last_activity:string,last_activity_at:string` |
+| `run.turn_limit / run.cleanup_timeout` | `max_turns:number,completed_turns:number,blocked_turn:number` / `cleanup_grace_ms:number` |
 
-- `run.queued`、`run.started`、`run.reused` 及 Run 终态；
-- `message.delta`、`message.final`、`thinking.delta`；
-- `tool.arguments.delta`、`tool.started`、`tool.updated`、`tool.completed`、`tool.failed`；
-- `execution.audit`，在 sandbox 或 host 执行开始前记录安全展示参数；
-- `approval.requested`、`approval.resolved`；
-- `input.accepted`、`input.injected`、`input.unconsumed`；
-- `delegation.*`、`context.compacted`、`session.repaired`；
-- `run.idle_timeout`、`run.turn_limit`、`run.cleanup_timeout`。
+journal 图片用元数据/bytes/省略标志代 base64，敏感值脱敏；mail/MCP 结果仅省略投影。终态 `run.completed|run.failed|run.cancelled|run.needs_review` data 含 `status,input_message_ids:string[],unconsumed_input_message_ids:string[],error?:string`；有结果加 `output:string,content:string,session_id:string,model:{provider:string,id:string},usage:object,context_usage?:ContextUsage`，output/content 同文；无结果省略，恢复另加 reused:true。
 
-`tool.arguments.delta` 的默认数据仍只有 `content_index` 与 turn identity，不携带原始 `delta`。当且仅当本次请求是规范 `openai-codex` OAuth provider、锁定 API 为 `openai-codex-responses`，且逐步解析到 sandbox `write_file` 或 `patch_file` 的安全工作区相对路径时，事件可以额外携带：
+needs_review 正文仅真实有界阶段诊断，error 独立给 blocker，Python 为 `AgentRuntimeRunError.partial_content`，幂等重放仍非成功；非成功 MEDIA 不解析/复制/发布附件。成功 output 仅在内部复验清除相关变更后保留中间回复规范 MEDIA，仍须 Platform 授权。[模型重试](../design/agent-runtime.md#run-状态机)仅无可见增量请求，不新增 Run/session/tool 记录，Platform 不按错误文字重提 Run。
 
-```json
-{
-  "tool_call_id": "call_...",
-  "tool_name": "write_file",
-  "file_draft": {
-    "workspace_path": "src/app.ts",
-    "kind": "file",
-    "content": "bounded redacted text",
-    "revision": 3,
-    "complete": false,
-    "truncated": false,
-    "discarded": false
-  }
-}
-```
+### 文件草稿
 
-`patch_file` 的 `kind` 固定为 `replacement`，其 `content` 只表示 `new_text` 替换片段。`revision` 在一个 tool call 内严格递增；非终结版本保留尾部安全窗口并只在有界检查点发布，`complete=true` 只表示模型已经输出完整工具参数，不表示参数已通过 schema/策略、工具已执行或文件已提交。若后续增量把 target/path 收敛为 host、工作区外或其它不再允许投影的值，Runtime 发送同一 identity 的 `discarded=true`（省略 `content`）撤回已有草稿。原始 JSON fragment、`old_text`、host/工作区外正文与未脱敏凭据没有事件表示。Platform 可以把该字段投影到当前 Run 的临时文件预览，但不得把正文复制进通用状态 SSE 或持久工作记录。
+仅 openai-codex + openai-codex-responses 的 sandbox write_file/patch_file、安全工作区路径可追加 `{...C,file_draft:{workspace_path:string,kind:"file"|"replacement",content?:string,revision:number,complete:boolean,truncated:boolean,discarded:boolean}}`。
 
-终态为 `run.completed`、`run.failed`、`run.cancelled` 或 `run.needs_review`。完成数据包含 output/content、session、model、usage、context usage 和输入消费信息。Runtime 可以在 Agent 主循环的单次模型 stream 尚未发布任何非空正文、思考或工具调用时，对明确的瞬时供应商错误做有界可取消重试；重试过程不产生额外 Run、工具工作记录或 session 消息。一旦 stream 已发布内容便不重试，上下文/输出大小、额度、账单、认证、内容策略错误也不重试；预算耗尽后继续使用原终态和 `sideEffectsStarted` 安全分类，Platform 不根据错误字符串重新提交整个 Run。该重试边界不包含 browser 工具结果的视觉辅助模型请求。若 Runtime 在一个含规范 `MEDIA: /workspace/<relative-path>` 的 assistant 回复后自动插入内部文件复验，只有相关变更已被成功复验清除时，`run.completed` 的 output/content 才把该交付标记去重保留下来，即使被持久化的最终 assistant 文本只报告复验结果；复验失败或仍有未确认变更时不恢复标记。Platform 仍是解析并授权附件的唯一边界。
+write 取累积 content/kind=file，patch 仅 new_text/kind=replacement；路径为规范 workspace 相对路径。call identity 稳定、revision 严增；累积正文脱敏有界、非终结保留安全尾窗、仅检查点发布，toolcall_end 发最终版。complete 只指参数输出完，不是校验/审批/执行/提交。后续 target/path 不合格，同 identity discarded=true、**省略 content**撤回。
 
-`context_usage` 描述现役模型上下文而非整个 Run 的累计账单用量。`used_tokens` 优先使用与当前请求前缀匹配的本 Run 供应商测量，另加该测量之后新增消息的估算；无有效测量时回退为消息、系统提示和工具 schema 的合计估算。只要采用回退或包含估算的新增内容，`estimated=true`。压缩后旧历史中的 usage 不得污染新投影，恢复或切换模型的首轮也不能复用上个 Run 的测量；`max_tokens` 仍来自当前可信模型目录，`percent` 只在展示层范围内夹取，不截断真实 `used_tokens`。
+raw JSON fragment、old_text、host/工作区外正文、凭据不传；其它 provider/API/工具/无安全路径仅无正文进度。仅 Codex 两工具模型 schema 要显式 target；完整调用意外省略在校验/执行/历史前补 sandbox，显式 host 和其它 provider/工具默认不变。未完成参数不校验/审批/执行，不授权副作用。前端只能平滑揭示已收到字符，不缩安全窗/造 revision；正文只在当前 Run 临时预览，不进通用状态 SSE/持久工作记录。
 
-由 Runtime 机械完成守卫产生的 `run.needs_review` 可以在同一个终态 data 中携带有界 `output`/`content`、session、model、usage 和 context usage。该正文只能取自最后一段真实 assistant 阶段性说明，表示尚未成功的进度或 blocker 诊断；`error` 必须继续给出独立的机械失败原因，状态仍是 `needs_review`。Python client 将正文暴露为 `AgentRuntimeRunError.partial_content`，但不得把它转成成功结果。幂等重放必须保持同一非成功状态与诊断。任何非成功终态中的 `MEDIA:` 都只是普通诊断文本，Platform 不解析、不复制也不发布附件。
-
-`delegate_task` 的实时工具结果由 Runtime 添加结构化 child 证据：单任务包含 `child_run_id`、`status`、`content`、`side_effects_started`、`changed_files` 和 `unknown_change`；批量任务在有序 `results[]` 中逐项携带同一成功证据或失败摘要。这些字段不是模型参数，也不能从 child 文本解析。任一成功 child 的 `side_effects_started=true` 会在父 Run 建立待复验状态；只有随后成功的非委派聚焦验证工具才能清除，纯只读 child 不建立该状态。
+delegate_task 实时单结果 `{child_run_id,status:"completed",content,side_effects_started:boolean,changed_files:string[],unknown_change:boolean}`；批量 `{results:[{index:number,...成功证据}|{index:number,status:"failed",error:string}]}` 按输入顺序。证据 Runtime 生成，非模型参数/文字解析；父[复验](../design/agent-runtime.md#委派)不由成功自述替代。
 
 ## 审批与执行审计
 
-审批 body 只接受 `approval_id` 和 `decision`。decision 是 `once`、`session`、`always` 或 `deny`。省略 `approval_id` 时处理该 Run 最新待决审批；未知字段或无效 decision 返回 400。
+闭 body 为 `{approval_id?:string,decision:"once"|"session"|"always"|"deny"}`。显式 id 必须非空；省略时处理最新待决项，响应 approval_id=null。浏览器必须提交展示时的 run_id/approval_id/choice；迟到身份返回409，不得换成当前项。实际允许值以 choices 为准。resolution token 另含 timeout/cancelled/notification_failed，这些均按未授权关闭，不是内部 approved/denied。secret 与内部 key 不进事件；[审批范围和精确绑定](../design/security-and-trust.md#工具执行与审计)由安全设计定义。
 
-Platform 面向浏览器的审批入口不使用“最新待决项”的省略语义：客户端必须提交展示时的 `run_id`、`approval_id` 与 `choice`，Platform 复验当前 scope 的精确待决身份后，把该 `approval_id` 和转换后的 `decision` 转发到指定 Run；迟到身份返回 `409`，不得换成当前项。
-
-审批用于 host terminal、普通前台 Skill 修改、MCP `call`、计划修改和其它明确需要用户决定的业务动作。MCP 调用只允许 `once|deny`，不形成 session/always 授权。自动记忆不使用审批；经过完整校验的内部学习复盘可以免批执行受限的 memory 与 agent-owned Skill create/patch，其它 Skill 动作仍失败关闭。`approval.requested` 只携带可展示的脱敏参数、复用范围和本次 choices；原始 secret 与内部稳定 key 不得进入事件日志。`approval.resolved` 的 outcome 除用户决定外还可为 `timeout`、`cancelled` 或 `notification_failed`，这些结果全部按未授权关闭。
-
-terminal、process 和文件工具必须带 `target=sandbox|host`，省略时为 sandbox。Sandbox 不使用人工审批；host terminal 在调用 Manager 之前逐次请求审批，choices 固定为 `once|deny`，不支持 session/always 复用，也不能成为 Run 默认。terminal 在 `background=true` 时可额外使用 `background_kind=task|service`，省略为 `task`；前台调用携带该字段、未知值或任何其它 schema 外字段都会在工具执行前拒绝。该字段只控制 Runtime 是否必须观察进程终态，不原样进入 Manager executor 的 audit/terminal 请求；task 会由 Runtime 派生 `completion_required` 和不可逆 session owner 摘要，二者都不是模型参数。批准后 Runtime 写入 `execution.audit`，数据包含 target、完整安全展示参数、canonical cwd/路径、前后台方式和有效 timeout。Manager 响应回显不可伪造的 executor id、实际 target 和审计 id，Runtime 才能发出 `tool.started`。
-
-子 Run 可以把审批所有权委托给顶层 Run，但 scope 和 session 必须来自可信 metadata。审批决定不能通过工具参数指定。
+执行 target 仅 sandbox/host，缺省 sandbox。terminal 仅在后台可携带 background_kind=task/service，缺省 task；前台携带或未知值拒绝。该字段不直接发送给 Manager，只派生 completion_required 和 owner 摘要。audit 包含完整脱敏参数、canonical 路径/cwd、target、前后台方式和有效 timeout；Manager receipt 回显 audit/executor id 与实际 target 后才发 tool.started。子审批的 scope/session 必须来自可信 metadata，不能由模型参数决定。
 
 ## Scope 与进程
 
-`POST /v1/scopes/cleanup` 要求 `scope_key`，可带 `lifecycle_id` 和 `delete_sessions`。Runtime 先封锁并取消匹配 Run 与审批，再以 root scope/lifecycle 单次请求 Manager 停止整个 scope family；该请求不依赖 Runtime 进程内 execution-context 缓存。Manager 必须先安装 family/lifecycle 启动 admission fence，拒绝 fence 后到达的同边界 terminal start，并等待 fence 前已 admitted 的 start 登记进程或无副作用退出；等待不得持有 start 登记所需的互斥锁。fence 存续期间相邻 family 与未命中的 lifecycle 仍可启动，重叠 cleanup 有界失败。只有 pending start 已收敛后，Manager 才执行 evidence 上限预检、停止进程并确认 controller 收敛，保证 cleanup 返回后不会出现未纳入清理的迟到启动。Manager 随后返回有界、闭世界的未确认 completion-task evidence，但不得先 acknowledge 或裁剪这些记录。Runtime 通过同一文件队列删除精确 scope family/lifecycle 下的有限后台 task responsibility sidecar；journal、todo、approval 与普通 session 内容继续保留，`delete_sessions=true` 才删除整个 session family。本地状态提交成功后，Runtime 使用 evidence 中的精确 owner、process 与 execution context 逐项 acknowledge，全部确认后才删除内存 execution context。停止、文件提交或 acknowledge 任一步失败时请求失败；重试会重复停止、幂等提交本地状态并只确认剩余 evidence，不能报告部分成功。
+cleanup 闭 body 为 `{scope_key:string,lifecycle_id?:string,delete_sessions?:boolean}`：scope 非空且≤512字符；lifecycle 若提供为≤512字符的 string，省略/空串表示不限 lifecycle；delete_sessions 缺省 false。普通 cleanup 清 task 责任，保留 journal/todo/普通 session；true 删除整个 session family。只有全部阶段确认才返回成功，不报告部分成功；[start fence、本地提交和 ack 顺序](../design/agent-runtime.md#停止与恢复)由 Runtime 设计定义。
 
-终端预览要求同时提供 root scope 和 lifecycle，并可携带不透明 `since_revision`。预览、`running_terminal_count` 和 scope cleanup 都覆盖 root scope 本身及以 `root + "/delegate/"` 开头的委派 scope family；其它相似前缀不属于该 family。revision 是服务端游标，客户端不得解析其内部结构；游标必须随可展示输出或进程状态变化，并包含 Manager 进程实例身份，因此 Manager 重启后的旧游标必然失效。响应只用于只读展示。
+预览/summary 的 scope/lifecycle query 各恰好一个，trim 后非空且≤512字符。family 是 root 本身及 `root+"/delegate/"` 后代，不含相似前缀。revision 不透明，展示输出/状态改变时必须变化，Manager 重启后旧值失效。预览响应为 `{processes:Preview[],revision:string}` 或 `{processes:[],revision:string,unchanged:true}`；普通空数组不是 unchanged。
 
-进程预览数据来自 Manager executor，由 Runtime 按 scope/lifecycle 过滤和脱敏后返回。进程列表先展示活动状态（`running`、`orphaned`），同组再按 `started_at` 倒序排列。Platform 更新不停止独立 Sandbox 后台进程；目标版本需要刷新某个 Sandbox 时，只延迟该 Sandbox。库存不可确定时不能销毁容器。
+| 对象 | 字段 |
+|---|---|
+| Preview 的 string 字段 | `id,title,command,cwd,output,started_at,updated_at` |
+| Preview 其它字段 | `status:ProcessStatus,running:boolean,truncated:boolean,exit_code?:number\|null,finished_at?:string` |
+| ProcessStatus | `running\|completed\|failed\|cancelled\|orphaned` |
+| Snapshot 的 string 字段 | `id,run_id,scope_key,lifecycle_id,command,cwd,stdout,stderr,started_at` |
+| Snapshot 其它字段 | `status:ProcessStatus,background:boolean,pid?:number,exit_code?:number\|null,finished_at?:string,stop_confirmed?:boolean` |
 
-Manager 进程快照和预览的 `status` 只允许 `running`、`completed`、`failed`、`cancelled` 和 `orphaned`。`orphaned` 表示 Manager 无法确认进程已经终止或仍由原执行器可靠持有，不是完成态；它必须保持 `running: true`，计入运行中终端和更新阻塞，并保留对应 Sandbox，直至 Manager 明确确认终态。Runtime 与 Platform 必须原样接受该状态，不能拒绝响应，也不能把它降级为 `completed`。前端只读预览将其展示为“需关注、仍占用”，不提供交互或强制清理入口。
+Manager 是清单权威，Runtime 过滤/脱敏。预览先活动组，同组按 started_at 倒序。orphaned 必须 running=true，计入运行数及更新阻塞，保留 Sandbox，不能降级为完成；[前端](../design/frontend.md)只读预览显示“需关注、仍占用”，不提供强制清理。summary 为非负安全整数，不等于有限预览长度；库存未知不能销毁容器，更新只延迟需要刷新的对应 Sandbox。
 
-模型侧 `process` action 还包含 `wait`：必须携带 `process_id`，可携带 `timeout_ms`，其上下限与 [`runtime-policy.json`](../contracts/runtime-policy.json) 一致。Manager 私有 executor 在验证精确 execution context、scope、lifecycle 与 target 后等待权威进程终态；超时返回当前快照并附 `wait_timed_out=true`，不发送终止信号。Runtime 到 Manager 的单次 HTTP deadline 必须至少覆盖本次有效等待时长和固定传输余量，不能因为通用 Manager 请求 timeout 更短而提前切断合法长等待。Runtime 在该请求期间暂停 Run idle guard，HTTP/Abort 取消只结束等待。对于当前 session 持久登记的 `background_kind=task`，只有 `wait`、`read` 或 `kill` 以匹配 target 对同一 id 返回 `completed`、`failed` 或 `cancelled` 才形成终态证据并原子解除责任；list、write、wait timeout、running 与 orphaned 均不能解除完成守卫。责任跨 Run 和 Runtime 重启恢复，直到取得终态证据或 scope/session cleanup 删除整个身份状态；损坏或身份不一致时请求失败关闭。责任仍活动时，Runtime preflight 必须拒绝 `schedule.create`，且不能向 Platform 发送请求或产生审批；全部解除后恢复正常，未登记责任的 service 不受影响。
+process.wait 必填 process_id，可选 timeout_ms（值取策略 JSON），返回 Snapshot 加 `wait_timed_out:boolean`。它观察精确 execution context/scope/lifecycle/target/id；超时或 Abort 只结束等待，不杀进程，重复等待可读同一终态。责任解除、idle 暂停与 HTTP 等待余量见[有限后台任务](../design/agent-runtime.md#有限后台任务)。
 
-委派 Run 的 scope/session 会在子 Run 终态后删除，不具备跨 Run 责任归属。Runtime 因此必须在工具执行、审批和 Manager 请求之前拒绝委派 Run 的所有 `terminal background=true` 调用；子 Agent 只能使用前台 terminal 并等待结果，不能创建 task 或 service 后把其生命周期遗留给父 Run。
+### Manager 私有控制
 
-Runtime 到 Manager 的私有 `POST /v1/executor/runs/cancel` 可携带 `preserve_process_ids`，但该字段不属于模型工具协议，只能由 Runtime 在 todo、有限后台 task 或 recurring decision 完成守卫产生 `needs_review` 时，从当前 session 的可信 task responsibility sidecar 计算。Manager 严格复验每个 id 属于同一 run/scope/lifecycle 且是后台进程，保留这些 task 并清理同 Run 其它进程。显式取消、idle timeout、普通失败、sidecar 不可验证和 scope cleanup 不携带该字段。
+以下仅允许 Runtime bearer，不是模型接口。TaskIdentity 为 `{scope_id:string,lifecycle_id:string,execution_context,completion_owner_id:string}`；owner 是 Runtime 派生固定摘要，禁止 session 原文和命令。
 
-Manager 私有 task reconciliation/acknowledgement 路由只接受 Runtime bearer、精确 scope/lifecycle/execution context 和 Runtime 派生的固定 owner 摘要；不接受命令、目标 session 文本或模型工具参数。reconcile 返回该 owner 尚未确认的有界进程快照，Runtime 在模型启动前将其并入责任 sidecar。acknowledge 只接受同一 owner 已处于 `completed|failed|cancelled` 的单个 process id；Runtime 必须先把 sidecar 条目从 `active` 原子写成 `resolved` tombstone，失败时不发送 acknowledge，Manager 确认后才原子删除 tombstone。scope cleanup 是同一确认协议的批量取消边界：Manager 只返回已确认终止且仍未 acknowledge 的责任身份，不返回命令、输出或 session 原文；Runtime 只有在对应本地 scope 状态已经提交后才能使用这些身份确认。
+| POST 路径 | 请求 → 响应 |
+|---|---|
+| `/v1/executor/tasks/reconcile` | TaskIdentity → `{processes:(Snapshot & {target:"sandbox"\|"host"})[]}`，有界未确认 task |
+| `/v1/executor/tasks/acknowledge` | TaskIdentity 加 `process_id:string` → `{confirmed:boolean}`；只接受同 owner 终态，必须 confirmed=true |
+| `/v1/executor/scopes/cleanup` | `{scope_id:string,lifecycle_id?:string}` → `{confirmed:true,completion_tasks:(TaskIdentity & {process_id:string,target:string})[]}`；闭世界 evidence 不含命令/输出/session |
+| `/v1/executor/runs/cancel` | `{run_id:string,scope_id:string,lifecycle_id:string,execution_context,preserve_process_ids?:string[]}` → `{confirmed:boolean}` |
+
+reconcile/ack 是必需方法。tombstone 提交顺序及可信保留集合见[Runtime](../design/agent-runtime.md#有限后台任务)，不能静默跳过。Manager HTTP 必须完整编码 JSON 后才提交状态码；operation mutation 的控制 ACK 只返回固定大小确认，executor cancel/ack 返回确认字段，scope cleanup 则必须返回有界 completion_tasks evidence。需要正文的客户端以 limit+1 有界读取并区分超限。2xx 正文丢失/损坏不能推断未执行，使用[原键和 journal 对账](../operations/auto-update.md)。
 
 ## Python 内部工具 Gateway
 
-Runtime 使用与浏览器 session 分离的 bearer token 回调 Python。路由按平台现有所有者拆分：memory 使用 `/api/agent/tools/memory` 与 `/api/agent/tools/memory/search`，session search 使用 `/api/agent/tools/session/search`，模型访问凭据使用 `/api/agent/tools/credentials/resolve`；web、browser、schedule、skill 和其它 Runtime gateway 工具使用 `/internal/agent/tools/{tool}`。请求携带 Run、scope、lifecycle、session、workspace 和由平台提供的 actor/source message context。
+使用独立 bearer，不使用浏览器 session。已配置的 managed URL 是权威地址，Run 的 gateway.base_url 不能覆盖它；Run 的非空 gateway.token 只能替换发往该固定地址的默认 Token。未配置 managed URL 时才使用 Run 的 URL/Token，不能把 Run URL 与部署默认 Token 配对。
 
-Python 必须从可信 context 推导 memory owner、schedule owner、browser identity 和 credential provider；模型 arguments 中出现这些所有权字段时应拒绝，而不是覆盖 context。工具 action 只接受 Runtime schema 声明的当前名称：web 为 `search|extract`，browser 为其 schema 中的规范 action。`/internal/agent/tools/{tool}` 只承载 web、browser、schedule、skill 和 mail；memory 与 session 只走上述专用路由。未声明的 action 别名、参数别名或把专用工具改发到通用路由都必须失败，不做转换。
+通用 envelope 为 `{tool:string,action:string,arguments:object,context:Context}`；专用路由不发送此 envelope：
 
-scheduled Run 的 Gateway context 额外包含 Platform 签发的 `schedule_id`、`schedule_run_id` 与 `schedule_recurring`。`schedule.continue_current` 和 `schedule.complete_current` 的模型参数都必须是空对象；Python 只用可信 context 定位当前 occurrence。`continue_current` 原子复验当前 recurring occurrence、确认仍保留已经计算的下一次执行但不修改 schedule，`complete_current` 原子结束该计划。普通 Run、委派 Run、once occurrence、缺少任一身份、过期 occurrence、错误 recurring 标记或企图提供目标 id 都失败关闭。这两个窄 current-occurrence 动作是 unattended schedule 管理禁令的唯一例外；Runtime 只把 Gateway 成功的其中一个结果视为本轮机械决策，不能根据自然语言推断。
+| POST 路由 | wire |
+|---|---|
+| `/internal/agent/tools/{web\|browser\|schedule\|skill\|mail}` | 通用 envelope，仅当前 schema 的 action/参数，无别名；web 为 search/extract |
+| `/api/agent/tools/memory/search` | 扁平 arguments 加可信身份，action 为 search/read/list |
+| `/api/agent/tools/memory` | 同上；store/forget 映射为 add/remove，其它动作不变 |
+| `/api/agent/tools/session/search` | 扁平 arguments 加身份，action 为 search/list/read；read.session_id 是已授权目标 |
+| `/api/agent/tools/credentials/resolve` | `{provider:string,model:string,scope_key:string,force_refresh?:boolean}` → `{provider:string,access_token:string,token_type:"Bearer",expires_at:number\|null,base_url:string,model:string}`；expires_at 为 Unix 秒，无到期时间时为 null |
 
-顶层 recurring scheduled Run 若在有界 follow-up 后仍没有机械决策，Runtime 以 `needs_review` 结束。Platform 把对应 schedule run 的 `needs_review` 或 `blocked` 终态与暂停所属计划放在同一 SQLite 事务：仅当 run 仍属于计划当前 `last_run_id` 和当前 revision 时设置 `state=paused`、`enabled=0`、`next_run_at=NULL`，重复执行保持幂等，迟到旧 occurrence 不得暂停或改写新 revision。
+| Context 字段 | 类型 |
+|---|---|
+| `run_id,scope_key,lifecycle_id,session_id,workspace` | 必填 string |
+| `owner_user_id,source_message_id,review_job_id,delegation_depth` | 可选 number |
+| `tool_call_id,parent_run_id,trigger,review_mode,schedule_id,schedule_run_id` | 可选 string |
+| `unattended,schedule_recurring` | 可选 boolean |
 
-模型访问凭据请求只接受必填的 `provider`、`model`、`scope_key` 和可选的内部 `force_refresh`；`provider` 必须是规范 OAuth product id，`model` 必须是本次实际调用的非空模型 ID，`scope_key` 必须是当前 Run scope。Platform 在返回 Token 前确认 provider 是当前支持的 OAuth 类型，并确认 model 仍在同一凭据最近成功发现的账号目录与 Runtime 目录交集中。目录未配置、从未成功获取、已被新凭据替代或模型不在交集时失败关闭；Runtime 为视觉辅助模型请求 Token 时同样使用该模型自己的 ID，不能沿用主模型的授权判断。
+memory/session 扁平请求携带 run/scope/lifecycle/session；owner 和自动来源由可信 context 派生，模型不得指定。每次凭据请求（包括辅助视觉）必须使用本次实际 model 和当前 scope，复验[账号目录安全交集](../design/integrations.md)。
 
-memory 额外支持原子 `reconcile`，其 `operations` 至多二十项且只含 `store|replace|forget`。skill 额外支持精确 `patch`：参数包含 id、可选 support `file_path`、`old_string`、`new_string` 与 `expected_replacements`。复盘 Gateway context 在 memory 的 `search|read|list` 与变更请求中都必须携带 `parent_run_id`、`delegation_depth`、`trigger`、`unattended`、`review_mode` 和 `review_job_id`，并结合已有 run/scope/lifecycle/owner/source message 构成完整主体。Python 在执行任何复盘记忆查询或写入前必须反查 running job、当前 lifecycle、激活账号与权限；过期或不完整主体返回 403，不读取记忆。复盘 Skill 不能 delete、enable/disable、完整 update 或 remove/write support，支持文件修改同样走精确 patch。
+响应为 `{content?:string,data?:JSON,memories?:JSON[],memory?:JSON,found?:boolean,is_error?:boolean,error?:string}`；成功与失败（包括非2xx正文）都经过同一[不可信 framing](../design/security-and-trust.md#不可信内容与提示词注入)。
 
-Gateway 中网页、浏览器、邮件、记忆、技能、计划和会话来源的成功内容与失败文本都是不可信数据。Runtime 必须在将两种结果交给模型前使用同一防伪边界；Python 返回非 2xx 不得使错误正文绕过该边界。
-
-`mail` Gateway 只接受由 Run context 派生的私人账户所有权。读取动作为 `accounts/folders/search/read`，副作用动作为 `send/reply/move/mark/save_attachment`；unattended trigger 只能使用读取动作。SMTP mutation 携带 `run_id + tool_call_id` 幂等身份，结果不确定时返回 `needs_review` 语义而不是自动重发。
-
-`mcp` 不经过 Python Gateway。其 schema 固定为 `list|call`：`list` 可选 server id；`call` 必须包含 server id、tool name 和有界 JSON arguments。`call` 的 `approval.requested` 必须展示全部普通参数，只将敏感字段值替换为脱敏占位；不可见/双向控制字符或完整脱敏 JSON 超过审批上限时直接 hard-block，不得用截断或省略后的展示换取批准。Runtime 在批准 `call` 后以当前 execution context 和审计 receipt 请求 Manager 执行镜像内固定客户端命令；模型不能提供 executable、config path、cwd、env、transport 或 owner。Runtime 事件、Manager 审计/保留进程快照/终端预览和平台持久工作记录对 MCP 只携带 `action/server/tool` 安全投影；可逆命令载荷与原始 stdout/stderr 只能在该次 Manager→Runtime 执行响应中短暂存在。客户端每次读取 `/workspace/.agent-platform/mcp.json`，直接以 argv 启动清单中的 stdio server，完成 `initialize`、`notifications/initialized` 和一个 `tools/list|tools/call` 后退出。响应只接受与请求 id 匹配的 JSON-RPC result/error，server 发来的 request 以 method-not-supported 回应，通知忽略；stderr、行长、消息数、总输出与墙钟超限均失败关闭。工具描述和结果进入与 Gateway 结果相同的不可信 framing，环境值不进入审批或事件。
-
-浏览器人工接管不是 Runtime 工具。登录浏览器通过 Platform 同源 API 申请当前 scope/tab 的短期租约并发送限幅输入；连续拖拽只接受有界、单调计时的 `down → move[] → up` 完整轨迹，Camoufox 在异常路径保证最终抬键。Runtime 的变更型 browser 工具在租约存续时收到可重试冲突。客户端提供的 user id、selector、脚本和任意导航 URL 一律不进入该协议。
+- **recurring**：Platform 签发完整 schedule context，continue_current/complete_current 只接受空 arguments；只有这两个动作例外于 unattended 计划管理禁令。非当前顶层 recurring、缺失/过期身份、错误标记或目标 id 均拒绝；仅成功 Gateway 结果构成[机械决策](../design/agent-runtime.md#完成守卫)。
+- **memory/Skill**：reconcile 的原子 operations 至多20项，仅 store/replace/forget。Skill patch 为 `{id:string,file_path?:string,old_string:string,new_string:string,expected_replacements:integer}`。
+- **复盘**：所有读写传递完整主体：parent_run_id/delegation_depth、trigger/unattended、review_mode/review_job_id，以及 owner、source message、run、scope、lifecycle。旧/不完整主体在访问数据前返回403；允许动作、逐读写授权与预算见[Runtime](../design/agent-runtime.md#学习复盘-run)和[Data](../design/data-memory-sessions.md#学习复盘)。
+- **mail**：只使用可信私人 context；读取 accounts/folders/search/read，副作用 send/reply/move/mark/save_attachment；unattended 只读。SMTP mutation 用 run_id+tool_call_id 幂等，不确定结果为 needs_review，不能重发。
+- **MCP** 不经过 Python：list 可选 server，call 必需 server/tool/有界 JSON arguments。完整参数审批、hard-block、stdio 生命周期及日志隐私见[集成](../design/integrations.md)。
+- 人工 **browser** 接管不是 Runtime 工具；租约期间变更型工具收到可重试冲突。[Platform 租约](../design/frontend.md#浏览器接管与发送)与[输入校验边界](../design/security-and-trust.md#浏览器接管与局域网)不由模型指定。
 
 ## 协议演进
 
-协议变更必须先更新本文和相关机器契约，再同步 TypeScript 类型、Python client、事件映射和双方测试。删除字段或改变状态语义需要提升协议版本并原子升级双方；不提供未声明字段、状态或执行路径的静默 fallback。
+字段/状态变更先更新本文与机器契约，再同步 TypeScript、Python client、事件映射和双方测试；删除字段或改变状态语义须提升协议版本，双方原子升级。scope cleanup、空闲 session compact、终端 preview、model catalog、approval response、active input 都是完整客户端的必需方法；缺失属于编程契约错误，不能按旧 Runtime 静默跳过、降级或重新排队，也不提供未声明字段/执行路径的 fallback。
