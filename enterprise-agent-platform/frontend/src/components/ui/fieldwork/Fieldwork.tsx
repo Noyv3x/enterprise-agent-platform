@@ -242,8 +242,18 @@ export interface PageHeaderProps { eyebrow?: ReactNode; title: ReactNode; descri
 export function PageHeader({ eyebrow, title, description, meta, actions }: PageHeaderProps) {
   return <header className="wf-page-header"><div className="wf-page-heading">{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h1 className="wf-page-title">{title}</h1>{description && <div className="wf-page-description">{description}</div>}{meta && <div className="wf-page-meta">{meta}</div>}</div>{actions && <div className="wf-page-actions">{actions}</div>}</header>;
 }
-export function PageLayout({ header, navigation, children, aside, width = 'wide' }: { header: ReactNode; navigation?: ReactNode; children: ReactNode; aside?: ReactNode; width?: 'reading' | 'wide' }) {
-  return <div className={`wf-page wf-page--${width}`}><div className="wf-page-top">{header}{navigation}</div><div className={`wf-page-body${aside ? ' wf-page-body--with-aside' : ''}`}><div className="wf-page-content">{children}</div>{aside && <aside className="wf-page-aside">{aside}</aside>}</div></div>;
+export function PageLayout({ header, navigation, children }: { header: ReactNode; navigation?: ReactNode; children: ReactNode }) {
+  return (
+    <div className="wf-page">
+      <div className="wf-page-top">
+        {header}
+        {navigation}
+      </div>
+      <div className="wf-page-body">
+        <div className="wf-page-content">{children}</div>
+      </div>
+    </div>
+  );
 }
 export function Section({ id, title, description, actions, children, tone = 'plain' }: { id?: string; title?: ReactNode; description?: ReactNode; actions?: ReactNode; children: ReactNode; tone?: 'plain' | 'inset' | 'danger' }) {
   const heading = useId();

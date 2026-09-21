@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import hmac
 import json
 import mimetypes
 import os
@@ -1527,7 +1526,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 "Vary": "Cookie, Authorization",
                 "Cross-Origin-Resource-Policy": "same-origin",
             }
-            if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+            if _etag_matches(self.headers.get("If-None-Match", ""), etag):
                 self.send_response(HTTPStatus.NOT_MODIFIED)
                 self.send_header("Content-Length", "0")
                 self._send_security_headers()
@@ -1568,7 +1567,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "X-Preview-Height": str(max(0, int(preview.get("height") or 0))),
             "X-Preview-Tab-Count": str(max(0, int(preview.get("tab_count") or 0))),
         }
-        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
@@ -1597,7 +1596,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "ETag": etag,
             "Cross-Origin-Resource-Policy": "same-origin",
         }
-        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
@@ -1634,7 +1633,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "Content-Disposition": "inline",
             "Cross-Origin-Resource-Policy": "same-origin",
         }
-        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
@@ -1662,18 +1661,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         clean = str(value or "")[:max_characters]
         return urllib.parse.quote(clean, safe="")
 
-    @staticmethod
-    def _preview_etag_matches(value: str, etag: str) -> bool:
-        for candidate in str(value or "").split(","):
-            clean = candidate.strip()
-            if clean == "*":
-                return True
-            if clean.startswith("W/"):
-                clean = clean[2:].strip()
-            if hmac.compare_digest(clean, etag):
-                return True
-        return False
-
     def _preview_json(self, payload: Any) -> None:
         """Send a private, conditionally cacheable read-only preview."""
 
@@ -1694,7 +1681,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 response_headers["Content-Encoding"] = "gzip"
         etag = f'"{hashlib.sha256(body).hexdigest()}"'
         response_headers["ETag"] = etag
-        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers()
@@ -2106,7 +2093,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             "Cross-Origin-Resource-Policy": "same-origin",
             "Content-Disposition": "inline",
         }
-        if self._preview_etag_matches(self.headers.get("If-None-Match", ""), etag):
+        if _etag_matches(self.headers.get("If-None-Match", ""), etag):
             self.send_response(HTTPStatus.NOT_MODIFIED)
             self.send_header("Content-Length", "0")
             self._send_security_headers(
@@ -2328,12 +2315,15 @@ def _append_vary(current: str, value: str) -> str:
 
 
 def _etag_matches(header: str, etag: str) -> bool:
-    candidates = {
-        item.strip()
-        for item in str(header or "").split(",")
-        if item.strip()
-    }
-    return "*" in candidates or etag in candidates or f"W/{etag}" in candidates
+    for candidate in str(header or "").split(","):
+        clean = candidate.strip()
+        if clean == "*":
+            return True
+        if clean.startswith("W/"):
+            clean = clean[2:].strip()
+        if clean == etag:
+            return True
+    return False
 
 
 def bearer_token(value: str) -> str | None:

@@ -30,8 +30,18 @@ export function AdminPanel() {
   if (!isAdmin) return <EmptyState title={t("admin.access.title")} description={t("admin.access.description")} />;
   const refresh = () => { void (page.id === "tokens" ? refreshTokenUsage(store) : refreshAdminPageResource(store, page.id)); };
   const refreshing = resource.status === "loading" || usageRefreshing;
-  return <PageLayout width="wide" header={<AdminPageHeader page={page} refreshing={refreshing} onRefresh={refresh} refreshDisabled={mutationPending || refreshing}
-    onCreateAccount={page.id === "accounts" ? () => setCreateOpen(true) : undefined} />} navigation={<AdminPager activeId={page.id} />}>
+  return <PageLayout
+    header={
+      <AdminPageHeader
+        page={page}
+        refreshing={refreshing}
+        onRefresh={refresh}
+        refreshDisabled={mutationPending || refreshing}
+        onCreateAccount={page.id === "accounts" ? () => setCreateOpen(true) : undefined}
+      />
+    }
+    navigation={<AdminPager activeId={page.id} />}
+  >
     <ResourceStatusView resourceKey={resourceKey} hasData={hasData || resource.updatedAt !== null} onRetry={() => { void refreshAdminPageResource(store, page.id); }}>
       <div inert={refreshing} aria-busy={refreshing}>
         <AdminPageContent pageId={page.id} accountCreateOpen={createOpen} onCloseAccountCreate={() => setCreateOpen(false)} />

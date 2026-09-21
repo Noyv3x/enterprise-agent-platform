@@ -17,6 +17,17 @@ permissions:
   actions: read
   contents: read
 
+env:
+  PINNED_INTEGRATION_IMAGES: |
+    {
+      "searxng": "ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812",
+      "firecrawl-api": "ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c",
+      "firecrawl-playwright": "ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2",
+      "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6",
+      "firecrawl-redis": "redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005",
+      "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
+    }
+
 concurrency:
   # Build each qualified commit once; the final publish job separately
   # serializes the mutable main-channel pointer.
@@ -36,6 +47,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       source_commit: ${{ steps.release.outputs.source_commit }}
+      release_required: ${{ steps.eligibility.outputs.release_required }}
       image_matrix: ${{ steps.release.outputs.image_matrix }}
       image_namespace: ${{ steps.release.outputs.image_namespace }}
       firecrawl_revision: ${{ steps.release.outputs.firecrawl_revision }}
@@ -81,6 +93,7 @@ jobs:
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
           {
             echo "source_commit=$source_commit"
+            echo "published_commit=$current_generation"
             echo "image_matrix=$image_matrix"
             echo "image_namespace=$image_namespace"
             echo "firecrawl_revision=$firecrawl_revision"
@@ -130,9 +143,32 @@ jobs:
             echo "run_attempt=$(jq -er '.run_attempt' "$run_json")"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Determine cumulative release eligibility
+        id: eligibility
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ steps.release.outputs.source_commit }}
+          PUBLISHED_COMMIT: ${{ steps.release.outputs.published_commit }}
+        run: |
+          set -euo pipefail
+          args=(--repo . --source "$SOURCE_COMMIT")
+          if [[ -n "$PUBLISHED_COMMIT" ]]; then
+            args+=(--published "$PUBLISHED_COMMIT")
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            args+=(--manual)
+          fi
+          release_required="$(python3 scripts/release_eligibility.py "${args[@]}")"
+          case "$release_required" in
+            true|false) ;;
+            *) echo "Invalid release eligibility output" >&2; exit 1 ;;
+          esac
+          echo "release_required=$release_required" >> "$GITHUB_OUTPUT"
+
   upstream-contracts:
     name: Validate managed upstream sources
     needs: prepare
+    if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -172,21 +208,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          images=(
-            'ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812'
-            'ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c'
-            'ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2'
-            'ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6'
-            'redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
-            'rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
-          )
-          for image in "${images[@]}"; do
+          images="$(jq -er '.[]' <<< "$PINNED_INTEGRATION_IMAGES")"
+          while IFS= read -r image; do
             raw="$(docker buildx imagetools inspect "$image" --raw)"
             jq -e '
               [.manifests[]?.platform | select(.os == "linux") | .architecture]
               | (index("amd64") != null and index("arm64") != null)
             ' <<<"$raw" >/dev/null
-          done
+          done <<<"$images"
 
   images:
     name: Build ${{ matrix.component }} image
@@ -303,13 +332,15 @@ jobs:
             [agent-runtime]="$(jq -er '.reference + "@" + .digest' image-metadata/agent-runtime.json)"
             [camofox]="$(jq -er '.reference + "@" + .digest' image-metadata/camofox.json)"
             [agent-sandbox]="$(jq -er '.reference + "@" + .digest' image-metadata/agent-sandbox.json)"
-            [searxng]='ghcr.io/searxng/searxng@sha256:b8ca38ba06eea544d7555e88321e212ddc0d5c3c7de055419cfb2e5c6bf30812'
-            [firecrawl-api]='ghcr.io/firecrawl/firecrawl@sha256:c2e8fc46fbc9dba57463b4b4f5c23fffe2aaf578a7691c5aaaf2cae58a01f80c'
-            [firecrawl-playwright]='ghcr.io/firecrawl/playwright-service@sha256:6359b0d9070f27400b4a9b615509be06919e40121fc1fdc42d4efeddf02653d2'
-            [firecrawl-postgres]='ghcr.io/firecrawl/nuq-postgres@sha256:aed86f62858f29bd971abddcdeb301c12888098d2cf5d33c1ba42b053bc460f6'
-            [firecrawl-redis]='redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005'
-            [firecrawl-rabbitmq]='rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69'
           )
+          integrations="$(jq -er 'to_entries[] | [.key, .value] | @tsv' <<< "$PINNED_INTEGRATION_IMAGES")"
+          while IFS=$'\t' read -r component image; do
+            [[ -n "$component" && -z "${images[$component]+present}" ]] || {
+              echo "Invalid or overlapping pinned integration image: ${component}" >&2
+              exit 1
+            }
+            images["$component"]="$image"
+          done <<<"$integrations"
           mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)
           [[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]
           for component in "${components[@]}"; do
@@ -561,6 +592,7 @@ jobs:
   manager-binaries:
     name: Manager linux/${{ matrix.arch }}
     needs: prepare
+    if: needs.prepare.outputs.release_required == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -614,6 +646,7 @@ jobs:
   manager-systemd-integration:
     name: Manager user-systemd activation gate
     needs: prepare
+    if: needs.prepare.outputs.release_required == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1237,6 +1270,7 @@ jobs:
     if: >-
       always() &&
       needs.prepare.result == 'success' &&
+      needs.prepare.outputs.release_required == 'true' &&
       needs.upstream-contracts.result == 'success' &&
       needs.images.result == 'success' &&
       needs.image-catalog.result == 'success' &&
@@ -1546,7 +1580,6 @@ jobs:
             verify_asset_set "$release_api" 0
             if jq -e '.draft == false' "$release_api" >/dev/null; then
               verify_asset_set "$release_api" 1
-              compare_downloaded_assets
             fi
           else
             gh release create "$release_tag" \

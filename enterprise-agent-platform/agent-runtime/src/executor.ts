@@ -117,8 +117,8 @@ export interface ExecutionManager {
     identity: Omit<ExecutionIdentity, "tool_call_id">,
     preserveProcessIds?: readonly string[],
   ): Promise<boolean>;
-  reconcileTasks?(identity: TaskExecutionIdentity): Promise<ReconciledTaskSnapshot[]>;
-  acknowledgeTask?(identity: TaskExecutionIdentity, processId: string): Promise<boolean>;
+  reconcileTasks(identity: TaskExecutionIdentity): Promise<ReconciledTaskSnapshot[]>;
+  acknowledgeTask(identity: TaskExecutionIdentity, processId: string): Promise<boolean>;
   cleanupScope(identity: ScopeCleanupIdentity): Promise<ScopeCleanupResult>;
   preview(
     identity: Required<ScopeExecutionIdentity>,

@@ -7,7 +7,6 @@ import type { TokenAccountRow, TokenDailyUsageRow, TokenDetailRow, TokenModelRow
 import { formatNumber, formatTimestamp } from "../../../utils/format";
 import { oauthProviderLabel } from "../../../utils/oauth";
 import { DataRegion, EmptyState, FactGrid, Section } from "../../ui/fieldwork";
-import { AdminCard } from "../AdminCard";
 
 const DAY_RANGES = [7, 30, 90, 365];
 type UsageCounts = Pick<TokenDailyUsageRow, "event_count" | "input_tokens" | "output_tokens" | "total_tokens">;
@@ -92,7 +91,7 @@ export function TokenUsageMonitoring() {
     { key: "model", label: t("admin.tokens.byModel.title"), children: <Section description={t("admin.tokens.byModel.description")}>{table(report?.by_model, modelColumns, t("admin.tokens.byModel.title"), t("admin.tokens.byModel.empty"))}</Section> },
     { key: "details", label: t("admin.tokens.details.title"), children: <Section description={t("admin.tokens.details.description")}>{table(report?.details, detailColumns, t("admin.tokens.details.title"), t("admin.tokens.details.empty"))}</Section> },
   ];
-  return <AdminCard>
+  return <Section>
     <Section actions={<Space wrap>
       <Segmented aria-label={t("admin.tokens.timeRange")} value={days || report?.window?.days || 30} options={DAY_RANGES.map((count) => ({ value: count, label: t("admin.tokens.days", { count }) }))} disabled={changingRange || refreshing} onChange={(value) => void changeTokenUsageDays(store, Number(value))} />
     </Space>} description={report?.window ? <Space wrap>
@@ -116,5 +115,5 @@ export function TokenUsageMonitoring() {
       </Section>
       <Tabs items={groups} />
     </>}
-  </AdminCard>;
+  </Section>;
 }

@@ -59,11 +59,13 @@ Python Platform 容器拥有产品业务状态：
 
 SQLite 使用 WAL 和按线程连接。会产生外部副作用的 Agent 任务及 Telegram 投递通过持久任务账本记录；进程重启后，安全可重试的任务可重新排队，已开始副作用的任务进入人工复核。Platform 只接受当前数据库 marker 与精确结构，任何其它非空数据库都在修改前拒绝。直接前一 baseline 的迁移必须显式识别该版本自身生成的控制文件：安全校验后只作为源一致性证据，不复制、不改写，也不把未知输入放宽为兼容项。当前 `2026080801` 到 `2026082901` 的直接迁移还允许候选镜像的闭世界 entrypoint 先以部署身份和 isolated Python 只读确认精确旧 marker，再回到 root 非递归接管旧 Docker 自动创建的精确空 mountpoint，随后立即降为部署 UID/GID；fresh/current/未知 marker、普通启动、其它路径和后续 baseline 没有该权限。由权威业务表可重建的派生索引在启动时单独验证自身契约；只有这类派生对象可以从权威数据原地修复，具体边界见[数据、记忆与会话](data-memory-sessions.md)。Platform 不安装依赖、拉取上游源码、调用 Compose 或拥有服务生命周期。
 
-本轮业务状态边界进一步统一：所有 SQLite 写入口在失败后回滚再复用线程连接；管理员写在短准入/事务边界重新验证非序列化的认证版本，密码修改以旧 hash、活动状态和 token version 做 CAS；同一 OAuth 凭据组原子提交，并用单调凭据世代把返回 token 与账号模型目录绑定。邮件 checkpoint、Telegram update 前缀、计划 occurrence、Agent worker 建账和 Camoufox sidecar 都必须保留各自明确的持久所有权，不能从缺失值或旧内存快照猜测成功。
+业务状态遵循短事务与明确持久所有权：
 
-文件发布和预览沿用同一“固定对象后操作”原则：普通文件发布重放重新完成耐久屏障，复制失败释放全部目录/文件描述符；PPTX 通过包内 presentation relationship 解释声明页序而不是 ZIP 文件名；current 数据布局缺少受管 sidecar 时失败，只有创建数据库前已经证明的 fresh 安装可以显式延迟初始化。
+- 管理员写在短准入／事务边界复验非序列化的认证版本；密码修改以旧 hash、活动状态和 token version 做 CAS。
+- 同一 OAuth 凭据组原子提交，用单调凭据世代绑定返回 token 与账号模型目录；具体交换与锁边界见[模型 OAuth](integrations.md#模型-oauth)。
+- SQLite 失败回滚、Agent 建账与计划 occurrence 由[数据与持久任务](data-memory-sessions.md)定义；邮件 checkpoint 与 Telegram 连续确认前缀由[外部集成](integrations.md)定义，不能从缺失值或旧内存快照猜测成功。
 
-`migrate` 与直接启动共用这一身份边界：仅在创建数据库前已确认 fresh 的调用中完成 Camoufox sidecar 初始化，再允许后续 `serve` 按既有部署启动；旧数据库迁移必须保留原有 sidecar，不能借迁移补建缺失身份文件。具体持久布局见[数据目录](../reference/data-layout.md)。
+文件操作固定对象后再使用，复制失败释放全部目录／文件描述符；发布重放的耐久屏障与 Camoufox fresh 资格见[文件安全](security-and-trust.md#文件与附件)。`migrate` 与 `serve` 共用创建数据库前确认的 fresh 资格：仅 fresh 初始化 sidecar，旧库迁移必须保留、不能补建缺失身份。PPTX 声明页序由[前端附件预览](frontend.md#实时对话)定义，持久布局见[数据目录](../reference/data-layout.md)。
 
 ## Agent Runtime
 

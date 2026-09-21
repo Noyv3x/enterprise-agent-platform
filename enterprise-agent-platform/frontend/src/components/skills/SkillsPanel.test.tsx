@@ -313,8 +313,8 @@ describe("SkillsPanel", () => {
       confirm.click();
     });
 
-    expect(screen.queryByRole("dialog", { name: "Delete “review-code”?" })).not.toBeInTheDocument();
-    expect(mocks.deleteAgentSkill).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Delete “review-code”?" })).not.toBeInTheDocument());
+    await waitFor(() => expect(mocks.deleteAgentSkill).toHaveBeenCalledTimes(1));
 
     await act(async () => {
       pendingDelete.resolve({ deleted: true, id: reviewSkill.id });

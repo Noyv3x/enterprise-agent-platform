@@ -2,26 +2,22 @@
 
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeContext } from "../../context/ThemeContext";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
-import type { User } from "../../types";
+import type { PermissionGroup, User } from "../../types";
 import { AntDesignProvider } from "../ui/AntDesignProvider";
 import { AccountManagement } from "./accounts/AccountManagement";
+import userEvent from "@testing-library/user-event";
 
-class ResizeObserverStub {
-  observe() {}
-  unobserve() {}
-  disconnect() {}
-}
-
-function renderAdmin(ui: ReactNode, users: User[] = []) {
+function renderAdmin(ui: ReactNode, users: User[] = [], permissionGroups: PermissionGroup[] = []) {
   const store = createStore(rootReducer, initialAppState);
   if (users.length) store.dispatch({ type: "SET_USERS", payload: users });
+  if (permissionGroups.length) store.dispatch({ type: "SET_PERMISSION_GROUPS", payload: permissionGroups });
 
   return render(
     <StoreContext.Provider value={store}>
@@ -34,32 +30,24 @@ function renderAdmin(ui: ReactNode, users: User[] = []) {
   );
 }
 
+function AccountCreationHarness() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>Open account editor</button>
+      <AccountManagement createOpen={open} onCloseCreate={() => setOpen(false)} />
+    </>
+  );
+}
+
 describe("Ant Design administration surfaces", () => {
   beforeEach(() => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
-    const getComputedStyle = window.getComputedStyle.bind(window);
-    vi.spyOn(window, "getComputedStyle").mockImplementation((element) => getComputedStyle(element));
-    Object.defineProperty(window, "matchMedia", {
-      configurable: true,
-      writable: true,
-      value: vi.fn((query: string) => ({
-        matches: false,
-        media: query,
-        onchange: null,
-        addListener: vi.fn(),
-        removeListener: vi.fn(),
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-        dispatchEvent: vi.fn(() => false),
-      })),
-    });
-    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
   });
 
   afterEach(() => {
     cleanup();
     window.localStorage.clear();
-    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -83,6 +71,51 @@ describe("Ant Design administration surfaces", () => {
     expect(screen.getByLabelText("Permission group")).toHaveAttribute("role", "combobox");
     expect(screen.getByLabelText("Model")).toHaveAttribute("role", "combobox");
     expect(screen.getByLabelText("Thinking depth")).toHaveAttribute("role", "combobox");
+  });
+
+  it("dismisses the account Select before its editor and preserves a draft when discard is cancelled", async () => {
+    const user = userEvent.setup();
+    renderAdmin(<AccountCreationHarness />, [], [
+      { id: "member", permissions: [] },
+      { id: "admin", permissions: ["admin"] },
+    ]);
+    const opener = screen.getByRole("button", { name: "Open account editor" });
+    await user.click(opener);
+    const editor = await screen.findByRole("dialog", { name: "Create account" });
+    const permissionGroup = within(editor).getByRole("combobox", { name: "Permission group" });
+
+    await user.click(permissionGroup);
+    expect(permissionGroup).toHaveAttribute("aria-expanded", "true");
+    expect(permissionGroup).toHaveFocus();
+    fireEvent.keyDown(permissionGroup, { key: "Escape", code: "Escape", keyCode: 27, which: 27 });
+    await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.getAllByRole("dialog")).toEqual([editor]);
+    expect(permissionGroup).toHaveFocus();
+
+    const displayName = within(editor).getByRole("textbox", { name: "Display name" });
+    await user.type(displayName, "Unsaved account");
+    await user.click(permissionGroup);
+    expect(permissionGroup).toHaveAttribute("aria-expanded", "true");
+    fireEvent.keyDown(permissionGroup, { key: "Escape", code: "Escape", keyCode: 27, which: 27 });
+    await waitFor(() => expect(permissionGroup).toHaveAttribute("aria-expanded", "false"));
+    expect(screen.getAllByRole("dialog")).toEqual([editor]);
+    expect(displayName).toHaveValue("Unsaved account");
+
+    const cancelEditor = within(editor).getByRole("button", { name: "Cancel" });
+    await user.click(cancelEditor);
+    const confirmation = await screen.findByRole("dialog", { name: "Discard unsaved changes?" });
+    await waitFor(() => expect(confirmation).toContainElement(document.activeElement as HTMLElement));
+    fireEvent.keyDown(document.activeElement!, { key: "Escape", code: "Escape", keyCode: 27, which: 27 });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Discard unsaved changes?" })).not.toBeInTheDocument());
+    expect(screen.getAllByRole("dialog")).toEqual([editor]);
+    expect(displayName).toHaveValue("Unsaved account");
+    await waitFor(() => expect(cancelEditor).toHaveFocus());
+
+    await user.click(cancelEditor);
+    const reopenedConfirmation = await screen.findByRole("dialog", { name: "Discard unsaved changes?" });
+    await user.click(within(reopenedConfirmation).getByRole("button", { name: "Discard changes" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 
 

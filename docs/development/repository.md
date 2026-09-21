@@ -22,9 +22,7 @@
 
 ## 文档权威
 
-设计变更必须先修改 `docs/` 中对应设计或契约，再修改代码和测试。根 `AGENTS.md` 只记录行为准则与文档先行工作方式，不记录代码库事实，也不替代本文。根 README 和组件 README 只提供启动/导航，不复制规范内容。
-
-如果文档与实现不一致，默认视为实现尚未同步，而不是直接把文档改成现状。确需改变设计时，应在同一个变更中先明确新设计、必要时新增 ADR，然后同步实现。
+规范与机器契约的权威、修改顺序和当前树检查统一由[文档工作流](documentation-workflow.md)定义。根 `AGENTS.md` 只提供行为与导航，根及组件 README 只提供启动入口；均不复制本文或产品规范。实现与既有契约不符时修复实现，不以改写文档掩盖偏差；确需改变设计时先明确新设计，必要时记录 ADR。
 
 ## 上游源码
 
@@ -46,14 +44,16 @@ Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。其官方 URL
 - Platform 的 Python 构建阶段只接收 `pyproject.toml`、包说明和 `enterprise_agent_platform/`；Runtime、Camoufox、前端源码及测试不得进入该阶段。容器内的前端独立构建后只把生成的 `static/` 覆盖进 Platform wheel。
 - `enterprise_agent_platform/static/` 是忽略的生成资源，禁止手改或提交；本地前端构建可随时完整重建它。
 - bundled skills 是产品资产，不是项目说明文档；只有技能功能变更才修改。
+- 工具链版本以组件 manifest 与 CI 为准；使用现有 npm lockfile 和 `npm ci`，不因本地工具方便而替换包管理器。仓库 Python 工具显式用 `python3`；测试命名与框架见[测试与验证](testing.md)。
 
 ## 实现原则
 
 - 业务授权在服务端执行，前端只负责表达状态。
 - 配置必须有单一所有者和明确回退顺序。
-- 外部副作用先建立持久账本和幂等边界。
+- 外部副作用先建立持久账本和幂等边界；复用已有事务助手与 typed error，不确定结果保持需复核，不能在超时后盲目重放 mutation。
 - 长任务用活动、心跳和可恢复事件，不用固定 Run 墙钟时限。
 - 不通过生成一个包办多种职责的临时脚本绕开已有专用工具或模块边界。
+- 复用已有 client/executor 注入边界，不把测试专用执行回退放入生产代码。异步工作保留 account、scope、Run 与 lifecycle 栅栏；取消不代替迟到响应隔离，所有出口释放锁、订阅和容量。
 - 保护用户工作树；不得使用 `git reset --hard` 或覆盖不相关本地变化。
 - 对上游服务使用确定性 fake 测试，真实凭据/网络测试必须显式隔离。
 
@@ -65,21 +65,10 @@ Firecrawl 不作为 submodule 或 vendored 源码进入本仓库。其官方 URL
 
 ## Git 变更
 
-提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。一个可交付变更集应同时包含规范、实现、测试和必要生成产物，避免文档与代码跨提交长期漂移。代码域允许多重匹配；修改跨域文件时必须同步每个声明域，并由评审补充路径映射无法识别的真实语义域。
+提交主题使用简短祈使句，可带范围，例如 `runtime: ...`、`frontend: ...`、`docs: ...`。可交付变更应完成实际受影响的规范、实现、行为测试和生成消费者同步；实现修复、重构、测试或文档维护可以独立交付。路径可匹配多个域，评审须核对各域的真实语义影响，不以“每个域都碰过文档”代替契约一致性。
 
 开始实现时记录预期交付物、非目标、受影响域与大致变更规模。若实际受影响域或文件数超出预估两倍，或任务从组件变更演变为新协议、新迁移层或发布架构改造，必须在继续扩大变更前重新报告范围。发现的无关缺陷记入后续项，除非它直接阻断本交付物，不在当前变更中顺手扩展。
 
-`main` 的每次 push 都会触发完整 Quality、不可变容器构建和通道提升，因此只推送已完成、已通过本地全量门禁的垂直交付单元。调试提交、只有文档或只有实现的中间检查点可保留在本地分支，交付前收敛为一个可回滚单元；不得为获取 CI 反馈而连续向自动发布分支推送试错提交。
+`main` 的每次 push 都触发完整 Quality，是否需要构建及提升 release 由[自动更新的发布通道](../operations/auto-update.md#发布通道)判定。只推送已完成且通过本地全量门禁的可回滚交付单元；调试和未完成的中间检查点留在本地分支，不为获取 CI 反馈连续推送试错提交。文档-only 维护不是未完成检查点，也不能让尚未发布的产品变化绕过累计发布判定。
 
-不可变容器 release 同时发布 Manager 架构工件、精确 manifest、Compose、安装器、校验文件和全部镜像 digest。四个自有镜像构建完成后只生成一份精确镜像目录；AMD64、ARM64 的匿名拉取及容量验证与真实 AMD64 Compose 冒烟从该目录并行执行，最终发布等待全部门禁汇合，不把网络验证和 Compose 启动串成单一关键路径。最终 publish job 在 `container-channel-main` 全局锁内复验成功 Quality、Git 祖先关系、资产封印、Actions provenance、tag identity 与匿名镜像可达性后，原子推进 latest。其它 workflow 不得修改 release visibility 或 latest；发布链没有迁移 stage、固定部署前任或人工回执分支。
-
-最终 publish job 直接以排序后的闭世界目录绑定每个 release asset 的精确名称、SHA-256 和字节数，并经 GitHub API 重证本次 workflow run/attempt、实际 source commit、成功 Quality run/attempt、release ID、asset ID/digest/size 与 lightweight tag。重复发布同一 source commit 时必须逐项比较本地、重新下载字节和 API identity，禁止 `--clobber`、重名、未知资产或上传后漂移。main 通道提升前后都以匿名 registry 请求复验 manifest 中全部受管镜像 digest，并复读 release ID、tag、target commit、draft/latest 和资产 identity；任一公开前漂移都不得公开，公开后镜像后验失败必须明确报告为已可见事故。安装器只使用同一 release 中经过 SHA-256 验证的 Manager 工件和清单；Manager 更新不得下载并执行网络脚本。该边界不需要第二个 promotion workflow、自定义 provenance 文件或部署机回执。
-
-提交前检查：
-
-- `git status --short` 中没有意外运行数据或生成源码；
-- 文档映射和相对链接通过；
-- 相关 component test/check/build 通过；
-- 前端变化已通过 static 重新生成验证，且产物没有进入 Git；
-- 管理器、Compose 或 Dockerfile 变化已通过空数据启动和更新/回滚 smoke test；
-- 配置、secret 和数据迁移变化已在文档明确说明。
+提交前确认范围内没有意外运行数据或生成源码，实际契约变化已说明，生成消费者一致；按[测试与验证](testing.md)完成对应组件、实际界面及安装／更新／回滚验收，诚实区分本地证据与完整发布证据。

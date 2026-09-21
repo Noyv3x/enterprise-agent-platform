@@ -27,9 +27,14 @@ export function ConversationJump({ label, count = 0, onClick }: ConversationJump
 }
 
 export interface DraftSuggestion { key: string; label: ReactNode; description?: ReactNode; onSelect: () => void }
-export interface ConversationEmptyProps { title: ReactNode; description?: ReactNode; suggestions?: DraftSuggestion[]; footer?: ReactNode }
-export function ConversationEmpty({ title, description, suggestions, footer }: ConversationEmptyProps) {
-  return <section className="wf-conversation-empty"><h2>{title}</h2>{description && <div className="wf-conversation-empty-description">{description}</div>}{suggestions && suggestions.length > 0 && <ul className="wf-suggestions">{suggestions.map((suggestion) => <li key={suggestion.key}><Button type="text" className="wf-suggestion" onClick={suggestion.onSelect}><span><strong>{suggestion.label}</strong>{suggestion.description && <span className="wf-suggestion-description">{suggestion.description}</span>}</span><Glyph name="arrow" /></Button></li>)}</ul>}{footer && <div className="wf-conversation-empty-footer">{footer}</div>}</section>;
+export interface ConversationEmptyProps { title: ReactNode; description?: ReactNode }
+export function ConversationEmpty({ title, description }: ConversationEmptyProps) {
+  return (
+    <section className="wf-conversation-empty">
+      <h2>{title}</h2>
+      {description && <div className="wf-conversation-empty-description">{description}</div>}
+    </section>
+  );
 }
 
 export interface MessageEntryProps { kind: 'user' | 'agent' | 'system'; author?: ReactNode; timestamp?: ReactNode; status?: ReactNode; actions?: ReactNode; children: ReactNode; attachments?: ReactNode; work?: ReactNode; label?: string }
@@ -97,10 +102,49 @@ export function BrowserControlBar({ status, description, action, danger = false 
 export function CapabilityHeader({ title, description, scope, actions }: { title: ReactNode; description?: ReactNode; scope?: ReactNode; actions?: ReactNode }) {
   return <header className="wf-capability-header"><div>{scope && <div className="wf-eyebrow">{scope}</div>}<h2>{title}</h2>{description && <div className="wf-capability-description">{description}</div>}</div>{actions && <div className="wf-actions">{actions}</div>}</header>;
 }
-export function SearchToolbar({ search, filters, actions }: { search: ReactNode; filters?: ReactNode; actions?: ReactNode }) {
-  return <div className="wf-search-toolbar"><div className="wf-search-input">{search}</div>{filters && <div className="wf-search-filters">{filters}</div>}{actions && <div className="wf-actions">{actions}</div>}</div>;
+export function SearchToolbar({ search }: { search: ReactNode }) {
+  return (
+    <div className="wf-search-toolbar">
+      <div className="wf-search-input">{search}</div>
+    </div>
+  );
 }
-export interface GuideSheetProps { title: ReactNode; intro: ReactNode; sections: { key: string; title: ReactNode; body: ReactNode }[]; example?: ReactNode; examples?: DraftSuggestion[]; action?: ReactNode; notice?: ReactNode }
-export function GuideSheet({ title, intro, sections, example, examples, action, notice }: GuideSheetProps) {
-  return <div className="wf-guide"><header><h2>{title}</h2><div className="wf-guide-intro">{intro}</div></header><ol className="wf-guide-sections">{sections.map((section, index) => <li key={section.key}><span className="wf-guide-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span><div><h3>{section.title}</h3><div>{section.body}</div></div></li>)}</ol>{example && <div className="wf-guide-example">{example}</div>}{examples && examples.length > 0 && <ul className="wf-suggestions">{examples.map((item) => <li key={item.key}><Button type="text" className="wf-suggestion" onClick={item.onSelect}><span><strong>{item.label}</strong>{item.description && <span className="wf-suggestion-description">{item.description}</span>}</span><Glyph name="arrow" /></Button></li>)}</ul>}{notice}{action && <div className="wf-guide-action">{action}</div>}</div>;
+export interface GuideSheetProps { title: ReactNode; intro: ReactNode; sections: { key: string; title: ReactNode; body: ReactNode }[]; examples?: DraftSuggestion[]; action?: ReactNode; notice?: ReactNode }
+export function GuideSheet({ title, intro, sections, examples, action, notice }: GuideSheetProps) {
+  return (
+    <div className="wf-guide">
+      <header>
+        <h2>{title}</h2>
+        <div className="wf-guide-intro">{intro}</div>
+      </header>
+      <ol className="wf-guide-sections">
+        {sections.map((section, index) => (
+          <li key={section.key}>
+            <span className="wf-guide-number" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+            <div>
+              <h3>{section.title}</h3>
+              <div>{section.body}</div>
+            </div>
+          </li>
+        ))}
+      </ol>
+      {examples && examples.length > 0 && (
+        <ul className="wf-suggestions">
+          {examples.map((item) => (
+            <li key={item.key}>
+              <Button type="text" className="wf-suggestion" onClick={item.onSelect}>
+                <span>
+                  <strong>{item.label}</strong>
+                  {item.description && <span className="wf-suggestion-description">{item.description}</span>}
+                </span>
+                <Glyph name="arrow" />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {notice}
+      {action && <div className="wf-guide-action">{action}</div>}
+    </div>
+  );
 }

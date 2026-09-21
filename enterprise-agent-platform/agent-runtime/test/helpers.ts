@@ -112,6 +112,8 @@ export function fakeExecutionManager(overrides: Partial<ExecutionManager> = {}):
       return { content: "No matches", details: { count: 0 } };
     },
     async cancelRun() { return true; },
+    async reconcileTasks() { return []; },
+    async acknowledgeTask() { return true; },
     async cleanupScope() { return { confirmed: true, completion_tasks: [] }; },
     async preview() { return { processes: [], revision: "preview_test:0" }; },
     async previewSummary() { return { running_terminal_count: 0 }; },

@@ -387,6 +387,8 @@ test("managed background task evidence uses Manager snapshots without forwarding
     },
     async file() { throw new Error("unexpected file call"); },
     async cancelRun() { return true; },
+    async reconcileTasks() { return []; },
+    async acknowledgeTask() { return true; },
     async cleanupScope() { return { confirmed: true, completion_tasks: [] }; },
     async preview() { return { processes: [], revision: "preview_test:1" }; },
     async previewSummary() { return { running_terminal_count: 0 }; },
@@ -502,48 +504,126 @@ test("Manager task reconciliation repairs a crash before Runtime sidecar registr
   }
 });
 
-test("run-start reconciliation completes a resolved tombstone acknowledgement before the model runs", async () => {
+test("a rejected task acknowledgement retains a resolved tombstone and recovers without replay", async () => {
   const home = await temporaryDirectory("agent-managed-background-tombstone-");
-  const faux = fauxProvider();
+  const firstFaux = fauxProvider();
+  const taskIdentity = identity("resolved-tombstone");
+  const request = {
+    ...baseRequest("/workspace", taskIdentity.session_id),
+    execution_context: { sandbox_id: "agent_1", workspace_id: "workspace_1" },
+  };
   const acknowledgements: string[] = [];
+  const acknowledgedStates: string[][] = [];
+  let observedStates: string[] = [];
+  let terminalCalls = 0;
+  let processCalls = 0;
+  let acknowledged = false;
   const manager: ExecutionManager = {
     ...managedBackgroundManager(),
+    async terminal() {
+      terminalCalls += 1;
+      return { result: managedSnapshot("running") };
+    },
+    async process() {
+      processCalls += 1;
+      observedStates = (await taskState.read()).obligations.map((task) => task.state);
+      return { result: { ...managedSnapshot("completed"), wait_timed_out: false } };
+    },
     async reconcileTasks() {
-      return [{
-        ...managedSnapshot("completed"),
-        id: "proc_resolved",
-        run_id: "run-before-restart",
-        target: "sandbox",
-      }];
+      return terminalCalls > 0 && !acknowledged
+        ? [{ ...managedSnapshot("completed"), target: "sandbox" }]
+        : [];
     },
     async acknowledgeTask(_identity, processId) {
       acknowledgements.push(processId);
-      return true;
+      acknowledgedStates.push((await taskState.read()).obligations.map((task) => task.state));
+      acknowledged = acknowledgements.length > 1;
+      return acknowledged;
     },
   };
-  faux.setResponses([
-    (context) => {
-      assert.doesNotMatch(context.systemPrompt || "", /proc_resolved/);
-      assert.deepEqual(acknowledgements, ["proc_resolved"]);
-      return fauxAssistantMessage("The prior task acknowledgement was recovered before this turn.");
-    },
+  firstFaux.setResponses([
+    fauxAssistantMessage(fauxToolCall("terminal", {
+      command: "managed batch",
+      background: true,
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage(fauxToolCall("process", {
+      action: "wait",
+      process_id: "process_managed",
+      timeout_ms: 1_000,
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The task acknowledgement needs review."),
+    fauxAssistantMessage("The task acknowledgement needs review."),
+    fauxAssistantMessage("The task acknowledgement needs review."),
+    fauxAssistantMessage("The task acknowledgement needs review."),
   ]);
-  const coordinator = new RunCoordinator({
+  const first = new RunCoordinator({
     config: testConfig(home),
     executor: manager,
+    streamFn: firstFaux.provider.streamSimple,
+  });
+  const taskState = first.sessions.backgroundTaskState(taskIdentity);
+  let second: RunCoordinator | undefined;
+  try {
+    const failed = await first.wait(first.createRun(request).id);
+    assert.equal(failed.status, "needs_review");
+    assert.equal(failed.error, BACKGROUND_STATE_REVIEW_ERROR);
+    assert.deepEqual(observedStates, ["active"]);
+    assert.deepEqual(acknowledgements, ["process_managed"]);
+    const tombstone = (await taskState.read()).obligations;
+    assert.deepEqual(tombstone.map(({ process_id, target, state }) => ({ process_id, target, state })), [{
+      process_id: "process_managed",
+      target: "sandbox",
+      state: "resolved",
+    }]);
+    first.shutdown();
+
+    const secondFaux = fauxProvider();
+    secondFaux.setResponses([
+      async () => {
+        assert.deepEqual(acknowledgements, ["process_managed", "process_managed"]);
+        assert.deepEqual((await taskState.read()).obligations, []);
+        return fauxAssistantMessage("The prior task acknowledgement was recovered before this turn.");
+      },
+    ]);
+    second = new RunCoordinator({
+      config: testConfig(home),
+      executor: manager,
+      streamFn: secondFaux.provider.streamSimple,
+    });
+    const recovered = await second.wait(second.createRun(request).id);
+    assert.equal(recovered.status, "completed", recovered.error);
+    assert.deepEqual(acknowledgedStates, [["resolved"], ["resolved"]]);
+    assert.equal(terminalCalls, 1, "acknowledgement recovery must not replay the task");
+    assert.equal(processCalls, 1, "resolved tombstones must not require another process observation");
+    assert.deepEqual((await second.sessions.backgroundTaskState(taskIdentity).read()).obligations, []);
+  } finally {
+    first.shutdown();
+    second?.shutdown();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("Manager reconciliation failure stops admission before the model runs", async () => {
+  const home = await temporaryDirectory("agent-managed-background-reconcile-failure-");
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage("must not execute")]);
+  const coordinator = new RunCoordinator({
+    config: testConfig(home),
+    executor: {
+      ...managedBackgroundManager(),
+      async reconcileTasks() { throw new Error("Manager task reconciliation is unavailable"); },
+    },
     streamFn: faux.provider.streamSimple,
   });
   try {
-    const state = coordinator.sessions.backgroundTaskState(identity("resolved-tombstone"));
-    await state.register("proc_resolved", "sandbox");
-    await state.resolve("proc_resolved", "sandbox");
     const completed = await coordinator.wait(coordinator.createRun({
-      ...baseRequest("/workspace", "resolved-tombstone"),
+      ...baseRequest("/workspace", "reconcile-failure"),
       execution_context: { sandbox_id: "agent_1", workspace_id: "workspace_1" },
     }).id);
-    assert.equal(completed.status, "completed", completed.error);
-    assert.deepEqual(acknowledgements, ["proc_resolved"]);
-    assert.deepEqual((await state.read()).obligations, []);
+    assert.equal(completed.status, "needs_review");
+    assert.equal(completed.error, BACKGROUND_STATE_REVIEW_ERROR);
+    assert.equal(faux.state.callCount, 0);
+    assert.equal(completed.sideEffectsStarted, false);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -875,6 +955,8 @@ function managedBackgroundManager(): ExecutionManager {
     },
     async file() { throw new Error("unexpected file call"); },
     async cancelRun() { return true; },
+    async reconcileTasks() { return []; },
+    async acknowledgeTask() { return true; },
     async cleanupScope() { return { confirmed: true, completion_tasks: [] }; },
     async preview() { return { processes: [], revision: "preview_test:restart" }; },
     async previewSummary() { return { running_terminal_count: 0 }; },

@@ -2,8 +2,8 @@ import { Modal } from "antd";
 import { useEffect, type ReactNode, type RefObject } from "react";
 import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
-import { useModalLayer, useTopLayerEscape } from "./modalStack";
 import { useFieldworkContainer } from "../ui/fieldwork";
+import { useUnmountFocusRestore } from "./useUnmountFocusRestore";
 
 export interface DialogProps {
   id?: string;
@@ -23,9 +23,8 @@ export interface DialogProps {
 export function Dialog({ id, open, onClose, title, description, children, footer, className,
   closeOnBackdrop = true, showCloseButton = true, afterOpenChange, initialFocusRef }: DialogProps) {
   const { t } = useI18n();
-  const isTopLayer = useModalLayer(open);
   const getContainer = useFieldworkContainer();
-  useTopLayerEscape(isTopLayer, onClose);
+  const contentRef = useUnmountFocusRestore(open);
 
   useEffect(() => {
     if (!open || !initialFocusRef?.current) return;
@@ -39,14 +38,13 @@ export function Dialog({ id, open, onClose, title, description, children, footer
     title={title}
     aria-label={typeof title === "string" ? title : undefined}
     onCancel={onClose}
-    keyboard={false}
-    mask={{ closable: closeOnBackdrop && isTopLayer }}
+    mask={{ closable: closeOnBackdrop }}
     closable={showCloseButton ? { "aria-label": t("common.close") } : false}
     footer={footer ?? null}
     rootClassName="wf-dialog"
     className={cx("wf-overlay", className)}
     destroyOnHidden
-    focusTriggerAfterClose
+    focusable={{ focusTriggerAfterClose: true }}
     centered
     afterOpenChange={(visible) => {
       if (visible) initialFocusRef?.current?.focus();
@@ -54,7 +52,7 @@ export function Dialog({ id, open, onClose, title, description, children, footer
     }}
     modalRender={(panel) => id ? <div id={id}>{panel}</div> : panel}
   >
-    <div className="wf-stack">
+    <div ref={contentRef} className="wf-stack">
       {description ? <div className="wf-muted">{description}</div> : null}
       {children}
     </div>

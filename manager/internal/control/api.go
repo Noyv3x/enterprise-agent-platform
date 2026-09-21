@@ -23,6 +23,13 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
+const checkCacheCapacity = 128
+
+type checkResult struct {
+	manifestURL string
+	manifest    release.Manifest
+}
+
 type API struct {
 	Store          *journal.Store
 	Operations     *operation.Orchestrator
@@ -36,7 +43,7 @@ type API struct {
 	ManagerSHA256  string
 	IdentityOnly   bool
 	mu             sync.Mutex
-	checks         map[string]release.Manifest
+	checks         map[string]checkResult
 }
 
 func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
@@ -405,27 +412,44 @@ func (a *API) check(response http.ResponseWriter, request *http.Request) {
 		writeError(response, http.StatusBadRequest, "idempotency_key is required")
 		return
 	}
-	a.mu.Lock()
-	cached, ok := a.checks[body.IdempotencyKey]
-	a.mu.Unlock()
-	if ok {
-		writeJSON(response, http.StatusOK, map[string]any{"manifest": cached, "reused": true})
-		return
-	}
 	ctx, cancel := context.WithTimeout(request.Context(), 45*time.Second)
 	defer cancel()
-	manifest, err := a.Operations.Check(ctx, body.ManifestURL)
-	if err != nil {
+	// Check also publishes Candidate, so serialize its side effects with cache
+	// admission rather than electing a response after competing checks finish.
+	a.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		a.mu.Unlock()
 		writeError(response, http.StatusBadGateway, err.Error())
 		return
 	}
-	a.mu.Lock()
-	if a.checks == nil {
-		a.checks = map[string]release.Manifest{}
+	cached, ok := a.checks[body.IdempotencyKey]
+	if ok && cached.manifestURL != body.ManifestURL {
+		a.mu.Unlock()
+		writeError(response, http.StatusConflict, "idempotency_key is already bound to another manifest_url")
+		return
 	}
-	a.checks[body.IdempotencyKey] = manifest
+	if !ok {
+		manifest, err := a.Operations.Check(ctx, body.ManifestURL)
+		if err != nil {
+			a.mu.Unlock()
+			writeError(response, http.StatusBadGateway, err.Error())
+			return
+		}
+		if a.checks == nil {
+			a.checks = make(map[string]checkResult)
+		}
+		if len(a.checks) >= checkCacheCapacity {
+			// Replay retention is bounded, not an ordering guarantee.
+			for key := range a.checks {
+				delete(a.checks, key)
+				break
+			}
+		}
+		cached = checkResult{manifestURL: body.ManifestURL, manifest: manifest}
+		a.checks[body.IdempotencyKey] = cached
+	}
 	a.mu.Unlock()
-	writeJSON(response, http.StatusOK, map[string]any{"manifest": manifest, "reused": false})
+	writeJSON(response, http.StatusOK, map[string]any{"manifest": cached.manifest, "reused": ok})
 }
 func (a *API) startOperation(response http.ResponseWriter, request *http.Request) {
 	var body struct {

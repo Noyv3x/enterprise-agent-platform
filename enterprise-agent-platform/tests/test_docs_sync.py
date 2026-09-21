@@ -43,13 +43,6 @@ class DocsSyncTests(unittest.TestCase):
 
     def initialize_git(self) -> None:
         self.git("init", "--quiet")
-        self.git("config", "user.email", "docs-sync@example.invalid")
-        self.git("config", "user.name", "Docs Sync Test")
-
-    def commit(self, message: str) -> str:
-        self.git("add", "--all")
-        self.git("commit", "--quiet", "-m", message)
-        return self.git("rev-parse", "HEAD")
 
     @staticmethod
     def manifest() -> dict[str, object]:
@@ -422,12 +415,12 @@ class DocsSyncTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
 
-    def ready_repository(self) -> str:
+    def ready_repository(self) -> None:
         self.initialize_git()
         self.write_fixture()
         self.run_command("sync", expect=0)
         self.run_command("check", expect=0)
-        return self.commit("baseline")
+        self.git("add", "--all")
 
     def test_sync_is_deterministic_and_check_rejects_stale_generated_code(self) -> None:
         self.initialize_git()
@@ -620,40 +613,9 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("sync", expect=1)
         self.assertIn("exactly the current ten-image set", result.stderr)
 
-    def test_check_change_requires_documentation_for_code(self) -> None:
-        base = self.ready_repository()
-        source = self.root / "src/main.py"
-        source.write_text("VALUE = 2\n", encoding="utf-8")
-        head = self.commit("code only")
-        result = self.run_command("check-change", "--base", base, "--head", head, expect=1)
-        self.assertIn("code changed in domain platform", result.stderr)
-
-    def test_check_change_treats_go_test_fixture_as_test_implementation(self) -> None:
-        base = self.ready_repository()
-        fixture = self.root / "manager/internal/example/helper_test.go"
-        fixture.parent.mkdir(parents=True, exist_ok=True)
-        fixture.write_text("package example\n\nconst fixture = 1\n", encoding="utf-8")
-        head = self.commit("test fixture only")
-
-        self.run_command("check-change", "--base", base, "--head", head, expect=0)
-
-    def test_check_change_allows_documentation_only_clarification(self) -> None:
-        base = self.ready_repository()
-        document = self.root / "docs/design/feature.md"
-        document.write_text("# Feature\n\nA changed design.\n", encoding="utf-8")
-        head = self.commit("docs only")
-        result = self.run_command("check-change", "--base", base, "--head", head, expect=0)
-        self.assertIn("documentation and code changes are synchronized", result.stdout)
-
-    def test_check_change_accepts_paired_change(self) -> None:
-        base = self.ready_repository()
-        (self.root / "docs/design/feature.md").write_text("# Feature\n\nVersion two.\n", encoding="utf-8")
-        (self.root / "src/main.py").write_text("VALUE = 2\n", encoding="utf-8")
-        head = self.commit("paired")
-        self.run_command("check-change", "--base", base, "--head", head, expect=0)
 
     def test_contract_change_passes_after_generated_targets_are_synchronized(self) -> None:
-        base = self.ready_repository()
+        self.ready_repository()
         contract = self.contract()
         contract["max_turns_per_run"]["default"] = 91  # type: ignore[index]
         contract_path = self.root / "docs/contracts/runtime-policy.json"
@@ -662,348 +624,25 @@ class DocsSyncTests(unittest.TestCase):
         stale = self.run_command("check", expect=1)
         self.assertIn("generated contract target is stale", stale.stderr)
         self.run_command("sync", expect=0)
-        head = self.commit("update contract")
-        self.run_command("check-change", "--base", base, "--head", head, expect=0)
-
-    def test_check_change_supports_staged_unstaged_and_untracked_worktree_files(self) -> None:
-        base = self.ready_repository()
-        source = self.root / "src/main.py"
-        source.write_text("VALUE = 2\n", encoding="utf-8")
-        self.git("add", "src/main.py")
-        document = self.root / "docs/design/feature.md"
-        document.write_text("# Feature\n\nWorktree design.\n", encoding="utf-8")
-        (self.root / "notes.txt").write_text("untracked and outside coverage\n", encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "WORKTREE",
-            expect=0,
-        )
-        self.assertIn("documentation and code changes are synchronized", result.stdout)
-
-    def test_worktree_check_cannot_hide_staged_code_with_an_unstaged_revert(self) -> None:
-        base = self.ready_repository()
-        source = self.root / "src/main.py"
-        source.write_text("VALUE = 2\n", encoding="utf-8")
-        self.git("add", "src/main.py")
-        source.write_text("VALUE = 1\n", encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "WORKTREE",
-            expect=1,
-        )
-        self.assertIn("code changed in domain platform", result.stderr)
-
-    def test_index_check_excludes_unstaged_documentation(self) -> None:
-        base = self.ready_repository()
-        source = self.root / "src/main.py"
-        source.write_text("VALUE = 2\n", encoding="utf-8")
-        self.git("add", "src/main.py")
-        (self.root / "docs/design/feature.md").write_text(
-            "# Feature\n\nUnstaged design.\n",
-            encoding="utf-8",
-        )
-
-        index = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("code changed in domain platform", index.stderr)
-        self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "WORKTREE",
-            expect=0,
-        )
-
-        help_result = self.run_command("check-change", "--help", expect=0)
-        self.assertIn("INDEX", help_result.stdout)
-
-    def test_index_check_reads_staged_manifest_after_worktree_repair(self) -> None:
-        base = self.ready_repository()
-        manifest_path = self.root / "docs/domains.json"
-        original = manifest_path.read_text(encoding="utf-8")
-        manifest_path.write_text("{ invalid staged JSON\n", encoding="utf-8")
-        self.git("add", "docs/domains.json")
-        manifest_path.write_text(original, encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("documentation manifest is not valid JSON", result.stderr)
-
-    def test_index_check_reads_staged_generated_code_after_worktree_repair(self) -> None:
-        base = self.ready_repository()
-        generated = (
-            self.root
-            / "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py"
-        )
-        original = generated.read_text(encoding="utf-8")
-        generated.write_text(original + "# staged stale output\n", encoding="utf-8")
-        self.git("add", generated.relative_to(self.root).as_posix())
-        generated.write_text(original, encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("generated contract target is stale", result.stderr)
-
-    def test_index_snapshot_tolerates_historical_gitlink_outside_owned_tree(self) -> None:
-        base = self.ready_repository()
-        self.git("update-index", "--add", "--cacheinfo", "160000", base, "retired-upstream")
-
-        self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=0,
-        )
-
-    def test_index_snapshot_rejects_staged_parent_symlink_after_worktree_repair(self) -> None:
-        base = self.ready_repository()
-        generated = (
-            self.root
-            / "enterprise-agent-platform/frontend/src/design-contract.generated.ts"
-        )
-        original = generated.read_text(encoding="utf-8")
-        container_generated = generated.with_name("container-contract.generated.ts")
-        container_original = container_generated.read_text(encoding="utf-8")
-        generated.unlink()
-        container_generated.unlink()
-        generated.parent.rmdir()
-        generated.parent.symlink_to("../redirected-src", target_is_directory=True)
-        self.git("add", "-A", "enterprise-agent-platform/frontend/src")
-
-        generated.parent.unlink()
-        generated.parent.mkdir()
-        generated.write_text(original, encoding="utf-8")
-        container_generated.write_text(container_original, encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("must not use symlinks", result.stderr)
-
-    def test_index_snapshot_rejects_staged_symlink_loop_without_crashing(self) -> None:
-        base = self.ready_repository()
-        generated = (
-            self.root
-            / "enterprise-agent-platform/frontend/src/design-contract.generated.ts"
-        )
-        original = generated.read_text(encoding="utf-8")
-        generated.unlink()
-        generated.symlink_to(generated.name)
-        self.git("add", generated.relative_to(self.root).as_posix())
-
-        generated.unlink()
-        generated.write_text(original, encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "INDEX",
-            expect=1,
-        )
-        self.assertIn("could not safely resolve repository-relative path", result.stderr)
-
-    def test_commit_check_uses_merge_base_and_policy_base_for_bootstrap(self) -> None:
-        self.initialize_git()
-        (self.root / "src").mkdir(parents=True)
-        source = self.root / "src/main.py"
-        source.write_text("VALUE = 1\n", encoding="utf-8")
-        before_docs = self.commit("before docs")
-        policy_branch = self.git("branch", "--show-current")
-
-        self.git("checkout", "--quiet", "-b", "topic", before_docs)
-        source.write_text("VALUE = 2\n", encoding="utf-8")
-        topic_head = self.commit("topic code only")
-
-        self.git("checkout", "--quiet", policy_branch)
-        self.write_fixture()
-        self.run_command("sync", expect=0)
-        policy_base = self.commit("install documentation policy")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            policy_base,
-            "--head",
-            topic_head,
-            expect=1,
-        )
-        self.assertNotIn("bootstrap detected", result.stdout)
-        self.assertIn("code changed in domain platform", result.stderr)
-
-    def test_rename_out_of_coverage_still_reports_the_deleted_code_path(self) -> None:
-        base = self.ready_repository()
-        self.git("mv", "src/main.py", "renamed.txt")
-        head = self.commit("rename code out of coverage")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            head,
-            expect=1,
-        )
-        self.assertIn("code changed in domain platform", result.stderr)
-        self.assertIn("src/main.py", result.stderr)
-
-    def test_code_change_requires_documents_for_every_matching_domain(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        runtime = self.manifest_domain(manifest, "agent-runtime")
-        runtime["code"].append("src/shared.py")
-        self.write_fixture(manifest)
-        (self.root / "src/shared.py").write_text("SHARED = 1\n", encoding="utf-8")
-        self.run_command("sync", expect=0)
         self.run_command("check", expect=0)
-        base = self.commit("overlapping domains")
 
-        (self.root / "src/shared.py").write_text("SHARED = 2\n", encoding="utf-8")
-        head = self.commit("shared code only")
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            head,
-            expect=1,
-        )
-        self.assertIn("code changed in domain platform", result.stderr)
-        self.assertIn("code changed in domain agent-runtime", result.stderr)
 
-    def test_committed_manifest_cannot_exclude_code_in_the_same_diff(self) -> None:
-        base = self.ready_repository()
+    def test_native_go_tests_do_not_satisfy_production_code_coverage(self) -> None:
+        self.ready_repository()
+        fixture = self.root / "manager/internal/example/helper_test.go"
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text("package example\n\nconst fixture = 1\n", encoding="utf-8")
+        self.run_command("check", expect=0)
+
         manifest_path = self.root / "docs/domains.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["coverage"]["code_exclude"].append("src/main.py")
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        (self.root / "src/main.py").write_text("VALUE = 2\n", encoding="utf-8")
-        (self.root / "scripts/policy.py").write_text("POLICY = False\n", encoding="utf-8")
-        head = self.commit("try to exclude changed code")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            head,
-            expect=1,
+        self.manifest_domain(manifest, "deployment")["code"].append("manager/internal/example/*")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        result = self.run_command("check", expect=1)
+        self.assertIn(
+            "code pattern matches no covered production files: manager/internal/example/*",
+            result.stderr,
         )
-        self.assertIn("code changed in domain platform", result.stderr)
-        self.assertIn("src/main.py", result.stderr)
-
-    def test_historical_manifest_does_not_require_current_invariants(self) -> None:
-        self.initialize_git()
-        historical_manifest = {
-            "version": 1,
-            "coverage": {
-                "code_include": ["src/*.py"],
-                "code_exclude": [],
-                "document_include": ["docs/design/*.md"],
-                "document_exclude": [],
-            },
-            "domains": [
-                {
-                    "id": "feature",
-                    "documents": ["docs/design/feature.md"],
-                    "code": ["src/*.py"],
-                    "tests": [],
-                }
-            ],
-            "contracts": [],
-        }
-        for relative, content in {
-            "docs/domains.json": json.dumps(historical_manifest, indent=2) + "\n",
-            "docs/design/feature.md": "# Feature\n\nThe current feature design.\n",
-            "src/main.py": "VALUE = 1\n",
-            "src/keep.py": "KEEP = True\n",
-        }.items():
-            path = self.root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
-        historical_base = self.commit("historical documentation policy")
-
-        self.write_fixture()
-        self.run_command("sync", expect=0)
-        self.run_command("check", expect=0)
-        current_head = self.commit("current documentation policy")
-        self.run_command(
-            "check-change",
-            "--base",
-            historical_base,
-            "--head",
-            current_head,
-            expect=0,
-        )
-
-    def test_worktree_manifest_cannot_delete_an_existing_domain_owner(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        runtime = self.manifest_domain(manifest, "agent-runtime")
-        runtime["code"].append("src/shared.py")  # type: ignore[union-attr]
-        self.write_fixture(manifest)
-        (self.root / "src/shared.py").write_text("SHARED = 1\n", encoding="utf-8")
-        self.run_command("sync", expect=0)
-        self.run_command("check", expect=0)
-        base = self.commit("overlapping owner baseline")
-
-        manifest_path = self.root / "docs/domains.json"
-        updated = json.loads(manifest_path.read_text(encoding="utf-8"))
-        updated_runtime = self.manifest_domain(updated, "agent-runtime")
-        updated_runtime["code"].remove("src/shared.py")  # type: ignore[union-attr]
-        manifest_path.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
-        (self.root / "src/shared.py").write_text("SHARED = 2\n", encoding="utf-8")
-        (self.root / "docs/design/feature.md").write_text(
-            "# Feature\n\nShared implementation changed.\n",
-            encoding="utf-8",
-        )
-        (self.root / "scripts/policy.py").write_text("POLICY = False\n", encoding="utf-8")
-
-        result = self.run_command(
-            "check-change",
-            "--base",
-            base,
-            "--head",
-            "WORKTREE",
-            expect=1,
-        )
-        self.assertIn("code changed in domain agent-runtime", result.stderr)
-        self.assertIn("src/shared.py", result.stderr)
 
     def test_current_tree_does_not_count_deleted_code_or_test_files(self) -> None:
         self.ready_repository()
@@ -1100,54 +739,6 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("coverage must include owned production probes", result.stderr)
         self.assertIn(".gitignore", result.stderr)
 
-    def test_repository_manifest_classifies_release_and_scope_regressions(self) -> None:
-        manifest = json.loads(
-            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
-        )
-        deployment = self.manifest_domain(manifest, "deployment")
-        data = self.manifest_domain(manifest, "data-memory-sessions")
-
-        self.assertIn("scripts/tests/**", manifest["coverage"]["code_exclude"])
-        self.assertIn("scripts/assemble_release_manifest.py", deployment["code"])
-        self.assertIn("scripts/container-smoke.sh", deployment["code"])
-        self.assertIn("scripts/tests/**", deployment["tests"])
-        self.assertIn(
-            "enterprise-agent-platform/tests/test_agent_scopes.py",
-            data["tests"],
-        )
-
-    def test_repository_manifest_assigns_manager_selfupdate_security_ownership(self) -> None:
-        manifest = json.loads(
-            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
-        )
-        deployment = self.manifest_domain(manifest, "deployment")
-        security = self.manifest_domain(manifest, "security-and-trust")
-
-        self.assertIn("manager/**", deployment["code"])
-        self.assertIn("manager/internal/selfupdate/**", security["code"])
-
-    def test_repository_manifest_assigns_precise_container_integration_and_data_ownership(self) -> None:
-        manifest = json.loads(
-            (REPOSITORY_ROOT / "docs" / "domains.json").read_text(encoding="utf-8")
-        )
-        deployment = self.manifest_domain(manifest, "deployment")
-        integrations = self.manifest_domain(manifest, "integrations")
-        data = self.manifest_domain(manifest, "data-memory-sessions")
-
-        self.assertIn("containers/**", deployment["code"])
-        self.assertIn("containers/compose.yaml", data["code"])
-        self.assertNotIn("containers/**", integrations["code"])
-        for path in (
-            "containers/compose.yaml",
-            "containers/compose.dev.yaml",
-            "containers/dev.env.example",
-            "containers/platform.Dockerfile",
-            "containers/platform-entrypoint.sh",
-            "containers/camofox.Dockerfile",
-            "containers/camofox-entrypoint.sh",
-            "containers/release-manifest.schema.json",
-        ):
-            self.assertIn(path, integrations["code"])
 
     def test_manifest_probes_require_their_design_domain_owners(self) -> None:
         self.initialize_git()
@@ -1382,17 +973,6 @@ class DocsSyncTests(unittest.TestCase):
             process_wait_timer.stderr,
         )
 
-    def test_first_manifest_commit_is_a_bootstrap(self) -> None:
-        self.initialize_git()
-        (self.root / "src").mkdir(parents=True)
-        (self.root / "src/main.py").write_text("VALUE = 1\n", encoding="utf-8")
-        base = self.commit("before docs")
-
-        self.write_fixture()
-        self.run_command("sync", expect=0)
-        head = self.commit("bootstrap docs")
-        result = self.run_command("check-change", "--base", base, "--head", head, expect=0)
-        self.assertIn("bootstrap detected", result.stdout)
 
 
 if __name__ == "__main__":

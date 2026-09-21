@@ -172,7 +172,7 @@ describe("ScheduledTasksPanel", () => {
     await user.click(screen.getByRole("button", { name: "Run now" }));
     let dialog = screen.getByRole("dialog", { name: "Run task now?" });
     await user.click(within(dialog).getByRole("button", { name: "Run now" }));
-    expect(mocks.runAgentScheduleNow).toHaveBeenCalledWith(9);
+    await waitFor(() => expect(mocks.runAgentScheduleNow).toHaveBeenCalledWith(9));
 
     await user.click(screen.getByRole("button", { name: "Delete" }));
     dialog = screen.getByRole("dialog", { name: "Delete scheduled task?" });
@@ -180,8 +180,8 @@ describe("ScheduledTasksPanel", () => {
       "Deleting “Morning brief” stops future scheduled triggers and cannot be undone. Runs that are already queued or in progress may still complete.",
     )).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Delete" }));
-    expect(mocks.deleteAgentSchedule).toHaveBeenCalledWith(9);
-    expect(screen.queryByRole("heading", { name: "Morning brief" })).not.toBeInTheDocument();
+    await waitFor(() => expect(mocks.deleteAgentSchedule).toHaveBeenCalledWith(9));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Morning brief" })).not.toBeInTheDocument());
   });
 
   it("loads task detail and paginated run history only when history opens", async () => {

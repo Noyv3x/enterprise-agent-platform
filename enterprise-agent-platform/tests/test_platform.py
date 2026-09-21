@@ -43,13 +43,15 @@ from enterprise_agent_platform.service import (
     ServiceError,
     UploadedFile,
     _ResizableConcurrencyGate,
-    agent_tool_detail,
-    agent_tool_parameters,
-    agent_tool_result_preview,
     normalize_attachment_mime,
 )
 from enterprise_agent_platform.telegram_gateway import TelegramGateway
 from enterprise_agent_platform.technical_profile import TARGET_TECHNICAL_PROFILE
+from enterprise_agent_platform.tool_work_projection import (
+    agent_tool_detail,
+    agent_tool_parameters,
+    agent_tool_result_preview,
+)
 
 
 def make_xlsx_attachment() -> bytes:
@@ -7592,6 +7594,34 @@ class PlatformHTTPTests(unittest.TestCase):
                 )
                 snapshot_etag = response.getheader("ETag")
                 self.assertEqual(snapshot_etag, '"branding-0"')
+
+                conn.request(
+                    "GET",
+                    "/api/platform/branding",
+                    headers={"If-None-Match": '"café"'},
+                )
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read().decode("utf-8")), snapshot)
+                self.assertEqual(response.getheader("ETag"), snapshot_etag)
+                self.assertEqual(
+                    response.getheader("Cache-Control"),
+                    "public, no-cache, max-age=0",
+                )
+
+                conn.request(
+                    "GET",
+                    "/api/platform/branding",
+                    headers={"If-None-Match": f'"café", W/{snapshot_etag}'},
+                )
+                response = conn.getresponse()
+                self.assertEqual(response.status, 304)
+                self.assertEqual(response.read(), b"")
+                self.assertEqual(response.getheader("ETag"), snapshot_etag)
+                self.assertEqual(
+                    response.getheader("Cache-Control"),
+                    "public, no-cache, max-age=0",
+                )
 
                 conn.request("GET", "/api/platform/branding/logo")
                 response = conn.getresponse()

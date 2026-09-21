@@ -4,16 +4,15 @@ import { useI18n } from "../../i18n";
 import { cx } from "../../lib/cx";
 import type { DialogProps } from "./Dialog";
 import { useFieldworkContainer } from "../ui/fieldwork";
-import { useModalLayer, useTopLayerEscape } from "./modalStack";
 import { Icon } from "./Icon";
+import { useUnmountFocusRestore } from "./useUnmountFocusRestore";
 
 export function Drawer({ id, open, onClose, title, description, children, footer, className,
   closeOnBackdrop = true, showCloseButton = true, initialFocusRef, afterOpenChange }: DialogProps) {
   const { t } = useI18n();
-  const isTopLayer = useModalLayer(open);
   const getContainer = useFieldworkContainer();
   const closeIcon = useRef<HTMLSpanElement | null>(null);
-  useTopLayerEscape(isTopLayer, onClose);
+  const contentRef = useUnmountFocusRestore(open);
 
   return <AntDrawer
     id={id}
@@ -22,8 +21,7 @@ export function Drawer({ id, open, onClose, title, description, children, footer
     getContainer={getContainer}
     aria-label={typeof title === "string" ? title : undefined}
     onClose={onClose}
-    keyboard={false}
-    mask={{ closable: closeOnBackdrop && isTopLayer }}
+    mask={{ closable: closeOnBackdrop }}
     closable={showCloseButton ? { "aria-label": t("common.close") } : false}
     closeIcon={<span ref={closeIcon}><Icon name="close" /></span>}
     footer={footer}
@@ -40,7 +38,7 @@ export function Drawer({ id, open, onClose, title, description, children, footer
       afterOpenChange?.(visible);
     }}
   >
-    <div className="wf-stack">
+    <div ref={contentRef} className="wf-stack">
       {description ? <div className="wf-muted">{description}</div> : null}
       {children}
     </div>

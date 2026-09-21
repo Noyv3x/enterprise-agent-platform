@@ -107,20 +107,10 @@ func (l *StartupOwnershipLease) Release() {
 	release()
 }
 
-// ValidateStartupOwnership is the first serve-time self-update gate. It is
-// deliberately read-only with respect to Manager state, activation plans and
-// the stable executable. A persisted takeover journal is an ownership marker
-// even in the reboot window before recover-current has disabled the main unit.
-func (m *Manager) ValidateStartupOwnership() error {
-	lease, err := m.AcquireStartupOwnership()
-	if lease != nil {
-		lease.Release()
-	}
-	return err
-}
-
-// AcquireStartupOwnership performs the same validation while returning any
-// newly acquired global recovery lock to the caller. The caller must retain it
+// AcquireStartupOwnership is the first serve-time self-update gate. It leaves
+// Manager state, activation plans and the stable executable unchanged. A
+// persisted takeover journal remains an ownership marker before recover-current
+// disables the main unit. The caller must retain any acquired recovery lock
 // until the control listener is live and a pending activation is settled.
 func (m *Manager) AcquireStartupOwnership() (*StartupOwnershipLease, error) {
 	if err := m.validateStartupOwnershipRoot(); err != nil {

@@ -10,16 +10,67 @@ import {
 } from "../src/session-store.js";
 import { temporaryDirectory } from "./helpers.js";
 
-test("SessionStore seeds once and isolates sessions", async () => {
+test("SessionStore serializes same-session initialization without blocking adjacent sessions", async (context) => {
   const home = await temporaryDirectory("agent-session-");
+  let releaseRead = (): void => {};
+  const pending: Promise<unknown>[] = [];
   try {
     const store = new SessionStore(home);
     const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const sibling = { ...identity, session_id: "other" };
     const seed: UserMessage = { role: "user", content: "seed", timestamp: 1 };
-    assert.deepEqual(await store.initialize(identity, [seed]), [seed]);
-    assert.deepEqual(await store.initialize(identity, [{ ...seed, content: "must-not-reseed" }]), [seed]);
-    const other = { ...identity, session_id: "other" };
-    assert.deepEqual(await store.load(other), []);
+    const otherSeed: UserMessage = { ...seed, content: "independent session" };
+    const readEntries = store.readEntries.bind(store);
+    let readReached = (): void => {};
+    const reachedRead = new Promise<void>((resolve) => { readReached = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    let intercepted = false;
+    context.mock.method(store, "readEntries", async (candidate: Parameters<SessionStore["readEntries"]>[0]) => {
+      const entries = await readEntries(candidate);
+      if (!intercepted && candidate.session_id === identity.session_id) {
+        intercepted = true;
+        readReached();
+        await readGate;
+      }
+      return entries;
+    });
+
+    const first = store.initializeTracked(identity, [seed]);
+    pending.push(first);
+    await reachedRead;
+    const second = store.initializeTracked(identity, [{ ...seed, content: "must-not-reseed" }]);
+    pending.push(second);
+    assert.deepEqual(await store.initialize(sibling, [otherSeed]), [otherSeed]);
+
+    releaseRead();
+    const [firstTracked, secondTracked] = await Promise.all([first, second]);
+    assert.deepEqual(firstTracked.map((entry) => entry.message), [seed]);
+    assert.deepEqual(secondTracked, firstTracked, "concurrent callers must receive the same durable entry ids");
+    assert.deepEqual(await store.initialize(identity, [otherSeed]), [seed]);
+    assert.equal((await store.readEntries(identity)).filter((entry) => entry.type === "header").length, 1);
+    const reloaded = new SessionStore(home);
+    assert.deepEqual(await reloaded.loadTracked(identity), firstTracked);
+    assert.deepEqual(await reloaded.load(sibling), [otherSeed]);
+  } finally {
+    releaseRead();
+    await Promise.allSettled(pending);
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore releases a failed initialization so the repaired journal can be retried", async () => {
+  const home = await temporaryDirectory("agent-session-initialize-retry-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
+    const seed: UserMessage = { role: "user", content: "retry seed", timestamp: 1 };
+    await mkdir(store.path(identity), { recursive: true, mode: 0o700 });
+    await assert.rejects(store.initializeTracked(identity, [seed]), /not a regular file/);
+
+    await rm(store.path(identity), { recursive: true });
+    const tracked = await store.initializeTracked(identity, [seed]);
+    assert.deepEqual(tracked.map((entry) => entry.message), [seed]);
+    assert.deepEqual(await new SessionStore(home).loadTracked(identity), tracked);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

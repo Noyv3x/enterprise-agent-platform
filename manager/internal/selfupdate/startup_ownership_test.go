@@ -269,14 +269,18 @@ func writeStartupFinalizePlatformEvidence(t *testing.T, manager *Manager, candid
 func TestStartupOwnershipPreparedCandidateRequiresExactLiveOwner(t *testing.T) {
 	fixture := newStartupOwnershipFixture(t)
 	candidate, _, _ := fixture.installPreparedCandidate(t, false)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("exact Prepare checkpoint was rejected: %v", err)
 	}
 
 	plan := fixture.ordinaryPlan(candidate, ordinaryRolledBackStatus)
 	plan.Error = "candidate was rejected"
 	writeStartupJSON(t, plan.PlanPath, plan)
-	if err := fixture.manager.ValidateStartupOwnership(); err == nil || !strings.Contains(err.Error(), "terminal plan") {
+	lease, err = fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err == nil || !strings.Contains(err.Error(), "terminal plan") {
 		t.Fatalf("ownerless terminal Candidate checkpoint was accepted: %v", err)
 	}
 }
@@ -328,7 +332,8 @@ func TestStartupOwnershipPreparedCandidateReservationBoundaries(t *testing.T) {
 			}
 			writeStartupJSON(t, filepath.Join(fixture.stateDir, "operations", operation.ID+".json"), operation)
 			writeStartupJSON(t, fixture.platformPath, platform)
-			err := fixture.manager.ValidateStartupOwnership()
+			lease, err := fixture.manager.AcquireStartupOwnership()
+			lease.Release()
 			if test.want && err != nil {
 				t.Fatalf("valid reservation checkpoint was rejected: %v", err)
 			}
@@ -342,7 +347,9 @@ func TestStartupOwnershipPreparedCandidateReservationBoundaries(t *testing.T) {
 func TestStartupOwnershipCommittedCandidateUsesFinalizeEvidenceNotMutableMetadata(t *testing.T) {
 	fixture := newStartupOwnershipFixture(t)
 	fixture.installPreparedCandidate(t, true)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("Prepare -> MarkPlatformCommitted checkpoint was rejected: %v", err)
 	}
 }
@@ -375,7 +382,9 @@ func TestStartupOwnershipRealPrepareMarkRestartUsesImmutableMetadataFields(t *te
 		t.Fatal("test no longer covers state-only PlatformCommitted mutation")
 	}
 	writeStartupFinalizePlatformEvidence(t, fixture.manager, *state.Candidate, manifest)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("restart rejected real Prepare -> MarkPlatformCommitted checkpoint: %v", err)
 	}
 }
@@ -413,7 +422,9 @@ func TestStartupOwnershipRecoveredCurrentCanRestartAndOwnNextRealPrepare(t *test
 	if err := fixture.manager.RecoverCurrent(ctx, fixture.executablePath, fixture.platformPath, fixture.newSHA); err != nil {
 		t.Fatalf("real RecoverCurrent protocol: %v", err)
 	}
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("recovered Current restart was rejected: %v", err)
 	}
 	state, err := fixture.manager.State()
@@ -449,7 +460,9 @@ func TestStartupOwnershipRecoveredCurrentCanRestartAndOwnNextRealPrepare(t *test
 		t.Fatalf("next prepared Candidate = %#v, err=%v", state, err)
 	}
 	writeStartupActivePlatformEvidence(t, fixture.manager, *state.Candidate, manifest)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err = fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("recovered Current plus next real Prepare was rejected: %v", err)
 	}
 }
@@ -470,7 +483,9 @@ func TestStartupOwnershipAdmitsOrdinaryRollbackPlanFirstHalfCheckpoint(t *testin
 		UpdatedAt: plan.UpdatedAt,
 	}
 	writeStartupJSON(t, fixture.statePath, state)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	defer lease.Release()
+	if err != nil {
 		t.Fatalf("exact ordinary rollback half-checkpoint was rejected: %v", err)
 	}
 	if err := fixture.manager.AcknowledgeStartup(); err != nil {
@@ -538,7 +553,9 @@ func TestStartupOwnershipRejectsTamperedOrdinaryRollbackHalfCandidate(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := fixture.manager.ValidateStartupOwnership(); err == nil {
+			lease, err := fixture.manager.AcquireStartupOwnership()
+			lease.Release()
+			if err == nil {
 				t.Fatal("tampered ordinary rollback half-checkpoint was accepted")
 			}
 			after, err := os.ReadFile(fixture.statePath)
@@ -577,7 +594,9 @@ func TestStartupOwnershipAdmitsOnlyExactOrdinaryStateFirstCommitCheckpoint(t *te
 		HealthTimeoutMS: 45_000, BootID: "boot-state-first-commit",
 	}
 	writeStartupJSON(t, plan.PlanPath, plan)
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("exact acknowledged state-first commit checkpoint was rejected: %v", err)
 	}
 	manifest := releasetest.NewTarget(
@@ -597,7 +616,9 @@ func TestStartupOwnershipAdmitsOnlyExactOrdinaryStateFirstCommitCheckpoint(t *te
 
 	plan.CandidateSHA = strings.Repeat("f", 64)
 	writeStartupJSON(t, plan.PlanPath, plan)
-	if err := fixture.manager.ValidateStartupOwnership(); err == nil || !strings.Contains(err.Error(), "exactly match") {
+	lease, err = fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err == nil || !strings.Contains(err.Error(), "exactly match") {
 		t.Fatalf("mismatched acknowledged state-first checkpoint was accepted: %v", err)
 	}
 }
@@ -674,7 +695,8 @@ func TestStartupOwnershipRejectsPreWatchdogJournalWithoutMutation(t *testing.T) 
 		before[path], _ = os.ReadFile(path)
 	}
 	calls := fixture.runner.snapshot()
-	err := fixture.manager.ValidateStartupOwnership()
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
 	if err == nil || !strings.Contains(err.Error(), "externally owned") {
 		t.Fatalf("pre-watchdog journal was admitted: %v", err)
 	}
@@ -701,7 +723,9 @@ func TestStartupOwnershipTerminalJournalSurvivesLaterArtifactPruning(t *testing.
 	if err := commitActivation(testActiveProfile, plan.PlanPath, plan); err != nil {
 		t.Fatalf("commit recovery activation fixture: %v", err)
 	}
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("direct committed recovery restart was rejected: %v", err)
 	}
 
@@ -720,7 +744,9 @@ func TestStartupOwnershipTerminalJournalSurvivesLaterArtifactPruning(t *testing.
 			t.Fatal(err)
 		}
 	}
-	if err := fixture.manager.ValidateStartupOwnership(); err != nil {
+	lease, err = fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err != nil {
 		t.Fatalf("historical terminal journal depended on pruned transaction artifacts: %v", err)
 	}
 }
@@ -758,7 +784,9 @@ func TestStartupOwnershipRejectsTerminalSupersededPlanMissingIdentityWithoutMuta
 		before[path] = data
 	}
 	calls := fixture.runner.snapshot()
-	if err := fixture.manager.ValidateStartupOwnership(); err == nil || !strings.Contains(err.Error(), "not bound") {
+	lease, err := fixture.manager.AcquireStartupOwnership()
+	lease.Release()
+	if err == nil || !strings.Contains(err.Error(), "not bound") {
 		t.Fatalf("terminal superseded plan with missing identity was admitted: %v", err)
 	}
 	activationTakeoverAssertFiles(t, before)
@@ -787,7 +815,9 @@ func TestStartupOwnershipRejectsMalformedAndUnknownRecoveryArtifacts(t *testing.
 			}
 			stateBefore, _ := os.ReadFile(fixture.statePath)
 			stableBefore, _ := os.ReadFile(fixture.stablePath)
-			if err := fixture.manager.ValidateStartupOwnership(); err == nil {
+			lease, err := fixture.manager.AcquireStartupOwnership()
+			lease.Release()
+			if err == nil {
 				t.Fatal("unsafe recovery artifact was accepted")
 			}
 			stateAfter, _ := os.ReadFile(fixture.statePath)

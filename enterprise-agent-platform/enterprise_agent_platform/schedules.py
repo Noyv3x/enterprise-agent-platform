@@ -338,8 +338,7 @@ class AgentScheduleStore:
         next_run_at: int,
     ) -> dict[str, Any]:
         ts = now_ts()
-        with self.db.transaction() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self.db.transaction(immediate=True) as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM agent_schedules WHERE owner_user_id = ? AND deleted_at IS NULL",
                 (int(owner_user_id),),

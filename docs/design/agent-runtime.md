@@ -31,7 +31,7 @@ Runtime 必须以单一、确定性的组装边界构造模型系统提示，顺
 
 邮件唤醒的 durable Agent job 只保存 Platform 权威源消息引用；Platform 在队列调度和重启/中断恢复边界严格校验该引用后，在内存中重建有界预览任务再提交 Runtime。Runtime 不从 job 键、邮件正文或其它文本猜测账户与 scope 身份。
 
-Runtime 的进程与文件工具始终通过 Manager executor 接口执行，源码和配置不保留只供测试使用的本地执行后备；单元测试在同一接口注入确定性 fake。为避免共享 runner 调度影响亚秒真实计时断言，本地与 Quality 的 Runtime 测试入口直接用 Node test runner 串行执行全部编译测试；完整规则见[测试与验证](../development/testing.md)。
+Runtime 的进程与文件工具始终通过 Manager executor 接口执行，不保留测试专用的本地执行后备。`ExecutionManager` 的 task reconcile/ack 是必需接口，生产客户端与注入的确定性 fake 遵守同一耐久顺序；无任务可返回空 evidence，不能因缺少方法跳过对账或把未确认 tombstone 当作成功。只暴露 memory/skill 的学习复盘不进入 task 对账路径。验证方法见[测试与验证](../development/testing.md#agent-runtime)。
 
 浏览器 live 调用只接受当前 schema 的 action 名，不为历史别名或 `tool` 字段做转换。附件只保留 path/name/mime 元数据；模型图片只来自已经内联的 input block。执行 target 闭世界只使用生成契约中的 `sandbox|host`。
 
@@ -123,6 +123,8 @@ Runtime 不从最终回复中的“继续”“完成”文字猜测决策。rec
 
 这里的 session 是 Runtime JSONL 模型上下文，不是浏览器登录 Cookie。登录态寿命由 Platform 认证策略决定，不因 Runtime 压缩、修复或删除模型 session 而改变。
 
+同一 canonical journal 路径只由一条 mutation queue 串行化初始化、header/seed、尾部修复、追加、manifest 写入、压缩提交与删除；初始化不再嵌套另一条同路径队列。session 准入、archive 与 approval 等不同事务边界仍保留各自所有权，不能因“精简队列”合并或绕过。
+
 每条模型或工具消息先追加到带 scope、lifecycle、session 身份的 JSONL journal。活动 journal 在每次追加前必须在同一 session mutation queue 内修复崩溃留下的尾部：完整但缺少换行的 JSON 对象只补终止换行，不完整或非法尾部截断到最后一个已验证边界；不得把新记录拼接到残片后。上下文超过策略阈值时，Runtime 先按合法 user/assistant/tool 边界保护最近 tail，并用当前已授权模型把待省略历史更新成一个结构化 handoff。首轮自动压缩后，Runtime 可以复用“handoff + tail”的模型投影，但每次新增消息后都必须重新计算该投影的上下文用量；同一 Run 的长工具循环再次越过阈值时必须再次自动压缩，不能因为已有 handoff 永久绕过阈值判断。后续压缩把上一轮 handoff 作为不可信历史迭代更新，只保留一个现役 handoff，旧 handoff 不写入 archive。摘要模型输入在总字符预算内必须为最早目标/验收条件和待省略段中最新用户请求分别预留首尾有界锚点，再把其余预算按时间倒序分给最近工具证据；大量工具输出不能把原始目标完全挤出摘要输入。摘要必须保留最新未完成用户请求、验收条件、已完成动作及证据、决策与约束、文件和关键工具结果、blocker、下一步，以及 Runtime-owned 活动 todo/process 状态；旧摘要采用迭代更新而不是作为普通历史重复堆叠。历史正文和既有摘要都属于不可信数据，不能授予工具、审批或身份。Runtime 使用同一集中敏感文本清洗器同时处理发送给摘要模型的历史和模型返回的摘要，覆盖常见供应商 Token、认证头、JWT、私钥、带密码连接串、敏感配置字段与 URL 参数；原始 journal/archive 仍按会话访问边界保存真实历史，不能把清洗后的摘要反向当作原文替换。摘要输出有独立大小上限；摘要请求失败、被取消、为空或不合法时，本次压缩不改活动 journal，也不丢任何上下文，已经安全提交的上一轮压缩保持有效。
 
 自动压缩的阈值与终态 `context_usage` 必须使用同一上下文计量边界：没有有效供应商用量时，估算当前模型投影中的消息、完整系统提示及本轮可用工具的名称、说明和参数 schema；不把图片 base64 字节当文本 token，也不把工具执行器或审计字段计入请求。供应商返回的有效用量已包含系统提示和工具，不得再重复加算。用量锚点只对产生它的本 Run、同一请求前缀有效；恢复历史、换 Run、压缩改写或其它前缀变化后，旧 assistant 上的用量只能保留作审计，不能继续作为现役上下文的计量依据。压缩后在新请求返回有效用量前重新估算 handoff + tail；终态回退也统计该投影，而不是已经归档的逻辑历史。字符估算是显式标记的近似值，不是供应商 tokenizer 的精确计数或不会溢出的保证。
@@ -167,10 +169,10 @@ Platform 可创建 `metadata.review_mode=memory_skill`、`trigger=learning_revie
 
 用户取消、scope cleanup、管理器执行断开和无进展保护都会中止模型与当前前台工具。Runtime 等待有限清理窗口；如果发生副作用且无法确认安全终止，则使用 `needs_review`。后台服务属于 Sandbox 生命周期，不因单个 Run 完成而停止；当前任务启动但尚未观察终态的有界后台进程不是“完成”，模型必须等待、明确转为独立服务，或进入可恢复的复核状态。管理器根据任务和进程登记决定空闲回收。
 
-普通 Run 只有在没有活动 todo、没有尚未观察完成的有界进程、文件变更已经聚焦验证且不存在未解决的执行承诺时才可完成。Runtime 可以有界追加模型 follow-up 要求继续执行或修正 todo；follow-up 预算耗尽不能把原来的进度陈述升级为成功。真实需要用户输入、授权或外部状态变化时应明确说明 blocker；可能已有副作用而无法确认结果时使用 `needs_review`。
+完成规则以[提示词组装与执行纪律](#提示词组装与执行纪律)为准：活动 todo、有限 task、recurring decision 与委派副作用复验是硬责任；普通文件验证和承诺式／空终稿恢复是有界、非持久的软提示，不因启发式判断自动升级为 `needs_review`。真实外部 blocker 必须说明，可能已有副作用而无法确认结果时保持需复核，不能伪造成功。
 
 Runtime 没有活动任务的固定墙钟上限。无进展保护、模型轮次上限和 terminal 默认超时的精确跨层值由 [`runtime-policy.json`](../contracts/runtime-policy.json) 定义。审批、请求体、清理和保留等其它边界由[配置参考](../reference/configuration.md)列出，并由 Runtime 配置测试校验。
 
 ## 验证稳定性
 
-Runtime 的 Node 测试文件并发数固定为 4，避免共享 CI runner 的调度竞争饿死短时异步观测。等待 journal 事件等测试条件的观测预算可以高于产品超时，但测试不得借此放宽产品配置值或删除对应时序与终态断言。
+编译一次、串行 suite、确定性异步同步和观测预算统一见[Runtime 验证](../development/testing.md#agent-runtime)；测试不能放宽产品超时、删除时序／终态断言或把 runner 抖动解释为产品语义。

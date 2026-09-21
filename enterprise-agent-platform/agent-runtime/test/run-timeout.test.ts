@@ -197,9 +197,24 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
   const home = await temporaryDirectory("agent-active-process-wait-");
   const workspace = await temporaryDirectory("agent-active-process-wait-workspace-");
   const faux = fauxProvider();
+  let releaseWait = (): void => {};
+  let waitReached = (): void => {};
+  const reachedWait = new Promise<void>((resolve) => { waitReached = resolve; });
+  const waitGate = new Promise<void>((resolve) => { releaseWait = resolve; });
+  let waitDurationMs = 0;
+  const executor = fakeExecutionManager();
+  const observeProcess = executor.process;
+  executor.process = async (context, action, arguments_, signal) => {
+    assert.equal(action, "wait");
+    const started = Date.now();
+    waitReached();
+    await waitGate;
+    waitDurationMs = Date.now() - started;
+    return await observeProcess(context, action, arguments_, signal);
+  };
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("terminal", {
-      command: "sleep 0.20; printf finished",
+      command: "printf finished",
       background: true,
     }), { stopReason: "toolUse" }),
     (context) => {
@@ -216,14 +231,20 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
   const coordinator = new RunCoordinator({
     config: testConfig(home, { runIdleTimeoutMs: SURVIVES_SCHEDULER_IDLE_MS }),
     streamFn: faux.provider.streamSimple,
+    executor,
   });
   try {
-    const started = Date.now();
     const run = coordinator.createRun(baseRequest(workspace));
+    await withDeadline(reachedWait);
+    await delay(SURVIVES_SCHEDULER_IDLE_MS * 2);
+    assert.equal(coordinator.getRun(run.id)?.status, "running", "the pending wait must survive the idle window");
+    assert.equal(faux.state.callCount, 2, "the model must not resume before process observation finishes");
+    releaseWait();
+
     const completed = await withDeadline(coordinator.wait(run.id));
     assert.equal(completed.status, "completed", completed.error);
     assert.equal(completed.result?.content, "background task complete");
-    assert.ok(Date.now() - started >= 150, "the process wait should outlive the previous 50 ms idle window");
+    assert.ok(waitDurationMs >= SURVIVES_SCHEDULER_IDLE_MS, "the wait itself must span the configured idle window");
     assert.equal(
       coordinator.getJournal(run.id)?.list().some((event) => event.type === "run.idle_timeout"),
       false,
@@ -233,6 +254,7 @@ test("process wait pauses the run idle guard for its full observation lifecycle"
     );
     assert.match(JSON.stringify(waitEvent?.data.result), /wait_timed_out/);
   } finally {
+    releaseWait();
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
     await rm(workspace, { recursive: true, force: true });
@@ -587,8 +609,8 @@ async function delay(milliseconds: number): Promise<void> {
 function blockEventLoop(milliseconds: number): void {
   const deadline = Date.now() + milliseconds;
   while (Date.now() < deadline) {
-    // Deliberately simulate a contended CI event loop. The foreground process
-    // continues in the operating system while JavaScript timers cannot fire.
+    // Delay callback delivery to exercise timer ordering under contention.
+    // The injected executor uses JavaScript timers, not an OS process.
   }
 }
 

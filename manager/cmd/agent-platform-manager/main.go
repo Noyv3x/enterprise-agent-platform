@@ -593,12 +593,6 @@ func acquireServeStartupOwnership(cfg config.Config) (*serveStartupAdmission, er
 			serveLease.Release()
 		}
 	}()
-	// Keep the requested public guard in the pre-construction path, then close
-	// its point-in-time race by acquiring and retaining a freshly revalidated
-	// lease for the rest of serve startup.
-	if err := manager.ValidateStartupOwnership(); err != nil {
-		return nil, err
-	}
 	lease, err := manager.AcquireStartupOwnership()
 	if err != nil {
 		return nil, err

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -497,4 +498,130 @@ func TestRecoverCurrentRefusesToBypassHealthyCurrentManager(t *testing.T) {
 		t.Fatalf("healthy Current Manager was stopped: %#v", fixture.runner.calls)
 	}
 	assertRecoveryKeptOldCurrent(t, fixture)
+}
+
+func TestRecoveryFileOpenRejectsPathReplacementsWithoutBlocking(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"fifo", "symlink to inspected inode", "different regular inode"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "recovery-state")
+			if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inspected, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := path + ".original"
+			if err := os.Rename(path, original); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "fifo":
+				err = syscall.Mkfifo(path, 0o600)
+			case "symlink to inspected inode":
+				err = os.Symlink(original, path)
+			case "different regular inode":
+				err = os.WriteFile(path, []byte("replaced"), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, _, readErr := readRecoveryInspectedFile(path, inspected, 4096, true)
+				done <- readErr
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("recovery reader accepted a replaced path")
+				}
+			case <-time.After(2 * time.Second):
+				// Release a regressed blocking open before failing the test.
+				if kind == "fifo" {
+					if fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0); err == nil {
+						_ = syscall.Close(fd)
+					}
+				}
+				t.Fatal("recovery reader waited for a replacement FIFO writer")
+			}
+		})
+	}
+}
+
+func TestRecoveryFileOpenRevalidatesInspectedMetadata(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		private bool
+		mutate  func(*testing.T, string)
+	}{
+		{name: "private file became readable", private: true, mutate: func(t *testing.T, path string) {
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "executable became writable", mutate: func(t *testing.T, path string) {
+			if err := os.Chmod(path, 0o775); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "file grew beyond limit", private: true, mutate: func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("original plus more"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "file owner changed", private: true, mutate: func(t *testing.T, path string) {
+			if os.Getuid() != 0 {
+				t.Skip("changing file ownership requires root")
+			}
+			if err := os.Chown(path, 1, -1); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "recovery-state")
+			if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inspected, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, path)
+			if _, _, err := readRecoveryInspectedFile(path, inspected, inspected.Size(), test.private); err == nil {
+				t.Fatal("recovery reader trusted stale pathname metadata")
+			}
+		})
+	}
+}
+
+func TestRecoveryRegularFileReadsPrivateAndExecutableAtByteLimit(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name    string
+		mode    os.FileMode
+		private bool
+	}{
+		{name: "private state", mode: 0o600, private: true},
+		{name: "executable", mode: 0o755},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, "recovery-file")
+			content := "recovery-data"
+			if err := os.WriteFile(path, []byte(content), test.mode); err != nil {
+				t.Fatal(err)
+			}
+			data, _, err := readRecoveryRegularFile(path, int64(len(content)), test.private)
+			if err != nil || string(data) != content {
+				t.Fatalf("read recovery bytes = %q, err=%v", data, err)
+			}
+		})
+	}
 }

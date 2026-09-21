@@ -15,8 +15,10 @@ from enterprise_agent_platform.service import (
     PRESENT_PAGE_CSP,
     ServiceError,
     agent_search_hits,
-    agent_tool_parameters,
     project_computer_clues,
+)
+from enterprise_agent_platform.tool_work_projection import (
+    agent_tool_parameters,
     workspace_relative_path,
 )
 from test_platform import MediaReturningAgent, RecordingAgent, make_config, make_xlsx_attachment

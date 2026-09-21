@@ -580,30 +580,44 @@ func readRecoveryRegularFile(path string, maxBytes int64, private bool) ([]byte,
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, nil, errors.New("path must be a non-symlink regular file")
 	}
-	if err := validateRecoveryOwner(path, info); err != nil {
-		return nil, nil, err
-	}
-	if private {
-		if info.Mode().Perm()&0o077 != 0 {
-			return nil, nil, errors.New("private recovery file is accessible by another host identity")
-		}
-	} else if info.Mode().Perm()&0o022 != 0 {
-		return nil, nil, errors.New("recovery file is writable by another host identity")
-	}
-	if info.Size() < 0 || info.Size() > maxBytes {
-		return nil, nil, fmt.Errorf("recovery file exceeds %d-byte limit", maxBytes)
-	}
-	file, err := os.Open(path)
+	return readRecoveryInspectedFile(path, info, maxBytes, private)
+}
+
+// readRecoveryInspectedFile opens the inspected path without following a
+// replacement symlink or waiting for a replacement FIFO, then trusts only the fd.
+func readRecoveryInspectedFile(path string, info os.FileInfo, maxBytes int64, private bool) ([]byte, os.FileInfo, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, nil, errors.New("open recovery file: invalid file descriptor")
 	}
 	defer file.Close()
 	opened, err := file.Stat()
 	if err != nil {
 		return nil, nil, err
 	}
+	if !opened.Mode().IsRegular() {
+		return nil, nil, errors.New("path must be a non-symlink regular file")
+	}
 	if !os.SameFile(info, opened) {
 		return nil, nil, errors.New("recovery file changed while it was opened")
+	}
+	if err := validateRecoveryOwner(path, opened); err != nil {
+		return nil, nil, err
+	}
+	if private {
+		if opened.Mode().Perm()&0o077 != 0 {
+			return nil, nil, errors.New("private recovery file is accessible by another host identity")
+		}
+	} else if opened.Mode().Perm()&0o022 != 0 {
+		return nil, nil, errors.New("recovery file is writable by another host identity")
+	}
+	if opened.Size() < 0 || opened.Size() > maxBytes {
+		return nil, nil, fmt.Errorf("recovery file exceeds %d-byte limit", maxBytes)
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {

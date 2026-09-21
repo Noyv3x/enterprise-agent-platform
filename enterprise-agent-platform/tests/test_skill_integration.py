@@ -11,8 +11,8 @@ from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
     EnterpriseService,
     ServiceError,
-    agent_tool_detail,
 )
+from enterprise_agent_platform.tool_work_projection import agent_tool_detail
 
 from test_platform import RecordingAgent, make_config
 

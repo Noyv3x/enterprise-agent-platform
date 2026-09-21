@@ -12,12 +12,10 @@ if [[ "$#" -ne 0 || ("$MODE" != "affected" && "$MODE" != "full") ]]; then
   exit 2
 fi
 
-if [[ "${AGENT_PLATFORM_DOCS_ALREADY_CHECKED:-0}" != "1" ]]; then
-  "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check
-  "$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check-change \
-    --base HEAD \
-    --head WORKTREE
-fi
+"$PYTHON_BIN" "$ROOT/scripts/docs_sync.py" check
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/agent-platform-tests.XXXXXX")"
+trap 'rm -rf -- "$work"' EXIT
 
 declare -A selected=()
 
@@ -33,18 +31,14 @@ select_full() {
 
 select_path() {
   local path="$1"
+  if [[ "$path" =~ ^docs/(design|reference|operations|development|decisions)/[^/]+\.md$ ]]; then
+    return
+  fi
   case "$path" in
-    AGENTS.md|README.md|enterprise-agent-platform/README.md|docs/*.md|docs/*/*.md)
+    AGENTS.md|README.md|docs/README.md)
       ;;
-    docs/contracts/*|docs/domains.json|.github/*|.github/**/*|scripts/test.sh)
+    docs/contracts/*|docs/domains.json|.github/*|scripts/*|containers/*|install.sh|.gitignore|enterprise-agent-platform/README.md)
       select_full
-      ;;
-    scripts/*)
-      selected[scripts]=1
-      ;;
-    containers/*|install.sh)
-      selected[containers]=1
-      selected[manager]=1
       ;;
     manager/*)
       selected[manager]=1
@@ -62,14 +56,10 @@ select_path() {
       select_full
       ;;
     enterprise-agent-platform/enterprise_agent_platform/server.py|enterprise-agent-platform/enterprise_agent_platform/service.py|enterprise-agent-platform/enterprise_agent_platform/runtimes.py|enterprise-agent-platform/enterprise_agent_platform/agent_runtime_client.py)
-      selected[python]=1
-      selected[runtime]=1
-      selected[frontend]=1
+      select_full
       ;;
     enterprise-agent-platform/enterprise_agent_platform/*|enterprise-agent-platform/tests/*|enterprise-agent-platform/pyproject.toml)
       selected[python]=1
-      ;;
-    .gitignore)
       ;;
     *)
       echo "Unclassified path forces the full gate: $path" >&2
@@ -81,12 +71,12 @@ select_path() {
 if [[ "$MODE" == "full" ]]; then
   select_full
 else
+  git -C "$ROOT" diff --cached --no-renames --name-only --diff-filter=ACDMRTUXB -z HEAD -- > "$work/changed-paths"
+  git -C "$ROOT" diff --no-renames --name-only --diff-filter=ACDMRTUXB -z -- >> "$work/changed-paths"
+  git -C "$ROOT" ls-files --others --exclude-standard -z >> "$work/changed-paths"
   while IFS= read -r -d '' path; do
     select_path "$path"
-  done < <(
-    git -C "$ROOT" diff --name-only --diff-filter=ACDMRTUXB -z HEAD --
-    git -C "$ROOT" ls-files --others --exclude-standard -z
-  )
+  done < "$work/changed-paths"
 fi
 
 component_order=(scripts manager python runtime camofox frontend containers)
@@ -101,9 +91,6 @@ if [[ "${#selected_names[@]}" -eq 0 ]]; then
   exit 0
 fi
 echo "Selected checks: ${selected_names[*]}"
-if [[ "${AGENT_PLATFORM_TEST_PLAN_ONLY:-0}" == "1" ]]; then
-  exit 0
-fi
 
 ensure_npm_dependencies() {
   local directory="$1"
@@ -194,8 +181,6 @@ run_containers() {
   "$ROOT/scripts/container-smoke.sh"
 }
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/agent-platform-tests.XXXXXX")"
-trap 'rm -rf -- "$work"' EXIT
 declare -a pids=() names=()
 for component in "${selected_names[@]}"; do
   names+=("$component")

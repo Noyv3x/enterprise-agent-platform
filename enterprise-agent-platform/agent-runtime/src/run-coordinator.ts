@@ -570,11 +570,8 @@ export class RunCoordinator {
       } else {
         await this.sessions.deleteBackgroundTaskScopeFamily(scopeKey, lifecycleId);
       }
-      if (cleaned.completion_tasks.length > 0 && !this.executor.acknowledgeTask) {
-        throw new Error("Manager task acknowledgement is unavailable after scope cleanup");
-      }
       for (const task of cleaned.completion_tasks) {
-        if (!await this.executor.acknowledgeTask!({
+        if (!await this.executor.acknowledgeTask({
           scope_id: task.scope_id,
           lifecycle_id: task.lifecycle_id,
           execution_context: task.execution_context,
@@ -975,40 +972,38 @@ export class RunCoordinator {
       let activeBackgroundTasksAtStart: BackgroundTaskObligation[] = [];
       if (!learningReview) {
         try {
-          if (this.executor.reconcileTasks) {
-            const recoveredTasks = await this.executor.reconcileTasks({
-              scope_id: record.request.scope_key,
-              lifecycle_id: record.request.lifecycle_id,
-              execution_context: executionContext(record.request),
-              completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
-            });
-            const recoveredById = new Map(recoveredTasks.map((task) => [task.id, task]));
-            const localState = await backgroundTaskState.read();
-            for (const obligation of localState.obligations) {
-              if (obligation.state !== "resolved") continue;
-              const recovered = recoveredById.get(obligation.process_id);
-              if (recovered) {
-                if (recovered.target !== obligation.target || processStatusIsActive(recovered.status)) {
-                  throw new Error("Manager task reconciliation conflicts with a resolved Runtime tombstone");
-                }
-                if (!this.executor.acknowledgeTask || !await this.executor.acknowledgeTask({
-                  scope_id: record.request.scope_key,
-                  lifecycle_id: record.request.lifecycle_id,
-                  execution_context: executionContext(record.request),
-                  completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
-                }, obligation.process_id)) {
-                  throw new Error("Manager did not acknowledge a recovered background task tombstone");
-                }
-                recoveredById.delete(obligation.process_id);
+          const recoveredTasks = await this.executor.reconcileTasks({
+            scope_id: record.request.scope_key,
+            lifecycle_id: record.request.lifecycle_id,
+            execution_context: executionContext(record.request),
+            completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
+          });
+          const recoveredById = new Map(recoveredTasks.map((task) => [task.id, task]));
+          const localState = await backgroundTaskState.read();
+          for (const obligation of localState.obligations) {
+            if (obligation.state !== "resolved") continue;
+            const recovered = recoveredById.get(obligation.process_id);
+            if (recovered) {
+              if (recovered.target !== obligation.target || processStatusIsActive(recovered.status)) {
+                throw new Error("Manager task reconciliation conflicts with a resolved Runtime tombstone");
               }
-              await backgroundTaskState.acknowledge(obligation.process_id, obligation.target);
-            }
-            for (const task of recoveredById.values()) {
-              if (!task.background) {
-                throw new Error("Manager reconciled a non-background completion task");
+              if (!await this.executor.acknowledgeTask({
+                scope_id: record.request.scope_key,
+                lifecycle_id: record.request.lifecycle_id,
+                execution_context: executionContext(record.request),
+                completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
+              }, obligation.process_id)) {
+                throw new Error("Manager did not acknowledge a recovered background task tombstone");
               }
-              await backgroundTaskState.register(task.id, task.target);
+              recoveredById.delete(obligation.process_id);
             }
+            await backgroundTaskState.acknowledge(obligation.process_id, obligation.target);
+          }
+          for (const task of recoveredById.values()) {
+            if (!task.background) {
+              throw new Error("Manager reconciled a non-background completion task");
+            }
+            await backgroundTaskState.register(task.id, task.target);
           }
           activeBackgroundTasksAtStart = await backgroundTaskState.active();
         } catch {
@@ -1197,14 +1192,12 @@ export class RunCoordinator {
                 executionReview,
                 backgroundTaskState,
                 currentRunBackgroundTaskIds,
-                this.executor.acknowledgeTask
-                  ? async (processId) => await this.executor.acknowledgeTask!({
-                    scope_id: record.request.scope_key,
-                    lifecycle_id: record.request.lifecycle_id,
-                    execution_context: executionContext(record.request),
-                    completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
-                  }, processId)
-                  : undefined,
+                async (processId) => await this.executor.acknowledgeTask({
+                  scope_id: record.request.scope_key,
+                  lifecycle_id: record.request.lifecycle_id,
+                  execution_context: executionContext(record.request),
+                  completion_owner_id: backgroundTaskCompletionOwnerId(record.request),
+                }, processId),
                 tool.name,
                 recordValue(executionParams),
                 result.details,
@@ -3083,7 +3076,7 @@ async function updateBackgroundTaskEvidence(
   state: ExecutionReviewState,
   persisted: BackgroundTaskSessionState,
   currentRunTaskIds: Set<string>,
-  acknowledgeTask: ((processId: string) => Promise<boolean>) | undefined,
+  acknowledgeTask: (processId: string) => Promise<boolean>,
   toolName: string,
   params: Record<string, unknown>,
   detailsValue: unknown,
@@ -3119,7 +3112,7 @@ async function updateBackgroundTaskEvidence(
     throw new Error("Process target does not match its registered background task");
   }
   await persisted.resolve(requestedId, target);
-  if (acknowledgeTask && !await acknowledgeTask(requestedId)) {
+  if (!await acknowledgeTask(requestedId)) {
     throw new Error("Manager did not acknowledge the completed background task");
   }
   await persisted.acknowledge(requestedId, target);

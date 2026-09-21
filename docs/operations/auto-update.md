@@ -10,7 +10,7 @@
 
 ## 发布通道
 
-每个可发布的 main commit 必须先通过文档同步、Python、Runtime、前端、Manager 和容器门禁。Container workflow 随后：
+每个候选 main commit 都必须先通过完整 Quality（文档当前树、Python、Runtime、前端、Manager 和容器门禁）。自动 Container workflow 在构建前判定候选是否影响发布物；需要发布时仍执行以下完整流程：
 
 1. 构建受支持架构的 Manager 与受管镜像；
 2. 从同一精确镜像目录并行执行 AMD64、ARM64 匿名按 digest 拉取与容量验证和真实 AMD64 Compose 冒烟，发布只等待这些互不依赖的门禁汇合；
@@ -19,15 +19,33 @@
 5. 创建不可变 `container-<40-hex-commit>` release；
 6. 在全局 main-channel 锁内确认候选是当前公开 generation 的 Git 后代，再原子推进 latest。
 
-较旧 workflow 后完成时不得降级 latest。连续 push 可以省略中间 deployment，但最新通过质量门的 main head 必须在队列收敛后自动成为 latest。相同 generation 的资产若已存在，只接受逐字节一致的幂等重放；任一内容、asset identity、tag commit 或 digest 漂移都失败关闭。
+候选级并发锁只去重同一完整 source commit 的构建／重放；最终 `publish` 独占 `container-channel-main` 通道全局锁，串行化不同 generation 对同一 latest 的提交。其它 workflow 不得修改 release visibility 或 latest；不能用候选锁代替通道锁。
+
+自动发布的唯一跳过条件是：候选相对**当前已公开 generation**的累计差异只涉及明确列入白名单的、未打包的说明文件。白名单为根 `AGENTS.md`、根 `README.md`、`docs/README.md`，以及 `docs/design/`、`docs/reference/`、`docs/operations/`、`docs/development/`、`docs/decisions/` 下直接的普通 `.md` 文件。空差异也可跳过自动重放。不得按最近一次 push 或相邻提交判断，以免“产品改动发布失败后又提交文档”遗漏尚未发布的产品改动。
+
+白名单之外一律执行完整发布，包括机器契约、域映射、脚本、工作流、测试、产品工作区及其 README／bundled Skill。禁止用 `*.md` 或 `docs/**` 泛化白名单。新增／删除与 rename 两端均须参与判断；符号链接、类型或异常 mode 变化不能被当作普通说明。未知合法路径需要发布；Git 差异读取失败、缺失历史、非法身份或非祖先关系必须失败，不能误报无需发布。资格判定没有公开基线时不能给出安全跳过；当前 prepare／publisher 仍必须取得经认证的现有公开 generation，查询缺失或失败即拒绝，不新增首发 bootstrap 或 API 错误回退。
+
+白名单中的说明文件还必须是非可执行普通文件；控制字符等导致名称解释不明确的路径不得判为无需发布。
+
+手工恢复入口仍是经过现有身份验证的明确强制发布／重放，不受自动说明文件跳过规则影响。跳过时不创建候选 release/tag、不构建或上传发布资产，不改变 latest；完整 Quality 证据照常保留。不引入另一套通道、manifest、部署协议或按镜像跨 generation 拼装机制。
+
+较旧 workflow 后完成时不得降级 latest。连续 push 可以省略中间 deployment，但最新通过质量门且含尚未发布的发布物变化的 main 候选必须在队列收敛后自动成为 latest；只有说明变化的后代可以保留原 latest。相同 generation 的资产若已存在，只接受逐字节一致的幂等重放；任一内容、asset identity、tag commit 或 digest 漂移都失败关闭。
 
 manifest 必须最后公开，部署机不能看到半套资产。品牌配置不是 release identity，不能改变 manifest URL、commit、digest、Manager 路径或更新幂等键。
 
 发布中的 draft 通过认证的 release identity 和数字 ID 读取、上传及复验；公开的按 tag REST 查询只用于已经可见的 release，不能作为发现 draft 的前提。这样发布任务在上传前、上传后和最终公开后始终校验同一个 release 对象。
 
+来源绑定以 GitHub API 的精确 repository、source commit、Quality run/attempt 与 Container run/attempt 为准。自动入口只接受同仓库 `main` push 的成功 Quality；手工恢复可使用对当前 `origin/main` 精确 HEAD 显式触发的 Quality，并在准备与通道提交前复验仍为远端 HEAD。`workflow_run` 自身 head 不代表候选，候选由上游 Quality 与 prepare 输出绑定；手工入口自身 head 必须等于候选。提交前的 Container run 应为 `in_progress` 且无 conclusion，不能要求正在发布的 run 已完成。
+
+四个自有镜像构建输出只收敛一次为闭世界 `managed-images` 目录，双架构匿名 digest 拉取／压缩与展开容量门、真实 Compose 和最终 manifest 共用它。发布直接等待目录、两个架构门与 Compose 成功，不重新拼接原始 `image-*` 输出。中间 artifact 下载显式绑定当前 repository/run 与必需的镜像、Manager family；禁止全量 `*` 下载或混入 `.dockerbuild` 诊断记录，缺任一必需 family 即失败。同一 run 的全量重跑可覆盖同名中间 artifact，但不取得跨 run 来源授权。
+
+最终资产目录排序后绑定精确名称、SHA-256 和字节数，并与 release ID、asset ID/digest/size、lightweight tag 和 source commit 一同复验。重放逐项比较本地字节、重新下载字节和 API identity；禁止 `--clobber`、未知或重名资产。main 提升前后都匿名复验全部受管镜像，并复读 release/tag/target commit、draft/latest 与资产身份；公开后的验证失败必须明确报告为已可见事故，不能声称未发布。安装器只运行同一 release 中校验过的 Manager 工件，Manager 更新不下载执行网络脚本；不另造 promotion workflow、自定义 provenance 文件或部署回执。
+
 耗时的匿名拉取、下载和逐字节验证完成后，最终公开操作紧前必须再次核对同一 release 的资产身份/摘要、精确 source commit、Quality run/attempt 的成功状态，以及本次 Container run/attempt 的来源绑定。可观察到任何漂移都应在 draft 公开前拒绝；公开后的复验不能替代这一提交前边界。
 
 创建候选 lightweight tag 后，GitHub 控制面可能短暂返回 ref 不存在。发布器只对该次写后读取执行秒级、有界退避；可见后仍须验证 tag 精确指向候选 commit，超过预算、读到其它对象或其它 commit 都失败关闭，不能跳过验证或无限等待。
+
+GHCR 登录共用固定的有界动作：同一最小权限 `GITHUB_TOKEN` 最多三次、间隔短暂退避，全部失败则关闭发布；不得扩权、忽略错误或发布缺镜像的 generation。Firecrawl 构建直接读取 canonical 上游 URL、revision 与全部 `required_paths`，缺项即失败。
 
 ## 检测与预拉取
 
@@ -35,7 +53,7 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 
 管理面板的“上次更新成功时间”读取 Manager 当前 generation 持久化的 `activated_at`，Platform 只做只读投影，不另建更新历史或以浏览器时间猜测。回滚后该值仍是被恢复 generation 原本成功启用的时间。
 
-当前基线不依赖中心推送服务或逐部署 webhook secret；这样公开供应的安装实例不需要把地址和凭据登记到上游。检查阶段只做纯读验证；没有更新时不创建 operation。候选必须满足：
+当前基线不依赖中心推送服务或逐部署 webhook secret；公开安装实例无需把地址和凭据登记到上游。检查可以刷新候选，但不创建更新 operation、不安装或切换 Current。候选必须满足：
 
 - schema、protocol、技术 profile 与镜像键集合精确匹配当前契约；
 - source commit 是 40 位小写十六进制，并且不是 current 的降级；
@@ -43,7 +61,9 @@ Manager 默认每分钟读取 latest manifest。轮询保留上一份成功响�
 - Manager version 等于 source commit，工件 basename、SHA-256 与只读 `version` 输出一致；
 - Compose 和所有镜像都由完整 digest 固定。
 
-候选数据库 schema 不得低于 Current 的已提交版本。该比较既在无副作用的接受边界执行，也在实际更新进入预拉取、Manager 准备或维护之前复验；显式 rollback 继续使用它自己的已验证快照恢复语义。相同 schema 的 Git 先后关系仍由既有发布通道证明，不按 commit 字符串或构建时间猜测。
+候选数据库 schema 不得低于 Current 的已提交版本。该比较在接受候选前执行，并在实际更新进入预拉取、Manager 准备或维护之前复验；显式 rollback 继续使用它自己的已验证快照恢复语义。相同 schema 的 Git 先后关系仍由既有发布通道证明，不按 commit 字符串或构建时间猜测。
+
+`/v1/check` 校验、保存 manifest 并可刷新持久 Candidate，但不开始安装或 generation 切换。容量受限的进程内结果缓存只在条目保留期间将幂等键绑定到精确 `manifest_url`：命中直接复用已选定结果，同键不同 URL 返回 `409`；缓存判定、候选刷新与结果选择在同一检查串行边界内完成，命中、冲突和并发同键请求不得重复候选变更。淘汰或重启即遗忘该检查的重放身份，后续即使用同键也是新检查；`reused` 只表示实际缓存命中。不建立独立持久 check journal、无限期 key 身份或 tombstone；该缓存不替代更新 operation 的耐久幂等所有权。
 
 核心镜像在进入维护前预拉取。Manager 先检查本地 RepoDigest，本地已有精确 digest 时不访问 registry。拉取使用“无进展超时 + 较大的绝对上限”；有持续字节进展不会被固定四分钟墙钟中断。原始 registry 输出只用于有界、脱敏诊断，不递归写入长期错误。
 
@@ -113,15 +133,4 @@ Docker 空间达到预警阈值时，Manager 优先运行安全清理，再决�
 
 ## 验证门
 
-发布前至少验证：
-
-- 发布组装器由 `python3` 显式调用，不依赖源码文件的可执行位；
-- 全新数据根安装，其中 stable Manager 与 manifest 候选同摘要时不创建 activation；
-- 一个普通 Manager 不同摘要自更新在真实 user-systemd 下提交和回滚；
-- 多个正常任务跨过轮询周期时更新保持排队，空闲后自动继续；
-- 数据库迁移成功、失败、外键回滚和各持久 phase 重启恢复；直接旧 baseline 还要覆盖旧 Docker 空 mountpoint 的精确接管、拒绝未知形态、崩溃重试、降权后的真实迁移以及后续 Manager 预建附件挂载目标；
-- 核心 registry 无进展、ENOSPC、核心 readiness 与响应丢失；
-- Firecrawl 等能力不可用时核心 generation 仍提交，能力恢复后自行健康；
-- Current/Previous 快照往返回滚；
-- 受保护对象永不删除，未引用 release、镜像、临时文件和终态 journal 会在保留期后自动回收；
-- 快速连续 main push 最终把 latest 与部署机收敛到最新合格 generation。
+安装、真实 user-systemd、任务排空、迁移／回滚／phase 恢复、能力降级、清理及累计发布／通道竞态的验收统一由[测试与验证](../development/testing.md#部署与冒烟)定义。本地全量门禁不替代同一候选的真实发布门禁。

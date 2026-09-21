@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import contextlib
 import io
-import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,26 +62,59 @@ class PythonTestShardTests(unittest.TestCase):
                 with self.assertRaises(shard_runner.ShardConfigurationError):
                     shard_runner.select_shard(modules, shard_index, shard_count)
 
-    def test_runner_uses_discovery_compatible_top_level_module_imports(self) -> None:
-        completed = mock.Mock(returncode=0)
-        with mock.patch.object(
-            shard_runner,
-            "discover_test_modules",
-            return_value=(shard_runner.TEST_DIRECTORY / "test_mail.py",),
-        ), mock.patch.object(shard_runner.subprocess, "run", return_value=completed) as run:
+    def run_fixture(self, root: Path, test_body: str) -> subprocess.CompletedProcess[str]:
+        scripts = root / "scripts"
+        scripts.mkdir()
+        runner = scripts / "python_test_shard.py"
+        runner.write_bytes((ROOT / "scripts/python_test_shard.py").read_bytes())
+        platform = root / "enterprise-agent-platform"
+        tests = platform / "tests"
+        tests.mkdir(parents=True)
+        package = platform / "enterprise_agent_platform"
+        package.mkdir()
+        (package / "__init__.py").write_text("VALUE = 17\n")
+        (tests / "fixture_helper.py").write_text("VALUE = 25\n")
+        (tests / "test_imports.py").write_text(
+            "import unittest\n"
+            "from pathlib import Path\n"
+            "import enterprise_agent_platform\n"
+            "import fixture_helper\n\n"
+            "class ImportTests(unittest.TestCase):\n"
+            "    def test_child(self):\n"
+            + test_body
+        )
+        return subprocess.run(
+            [sys.executable, str(runner), "--shard-index", "0", "--shard-count", "1"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def test_runner_imports_sibling_fixtures_and_platform_in_a_real_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = self.run_fixture(
+                root,
+                "        total = enterprise_agent_platform.VALUE + fixture_helper.VALUE\n"
+                "        self.assertEqual(total, 42)\n"
+                "        Path('child-observation').write_text(str(total))\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(
-                shard_runner.main(
-                    ["--shard-index", "0", "--shard-count", "1"]
-                ),
-                0,
+                (root / "enterprise-agent-platform/child-observation").read_text(),
+                "42",
             )
 
-        command = run.call_args.args[0]
-        self.assertEqual(command[-1], "test_mail")
-        self.assertEqual(run.call_args.kwargs["cwd"], shard_runner.PLATFORM_ROOT)
-        python_path = run.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)
-        self.assertEqual(Path(python_path[0]), shard_runner.TEST_DIRECTORY)
-        self.assertEqual(Path(python_path[1]), shard_runner.PLATFORM_ROOT)
+    def test_runner_propagates_a_real_child_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_fixture(
+                Path(temporary),
+                "        self.fail('real child failure reached')\n",
+            )
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("real child failure reached", result.stderr)
 
 
 if __name__ == "__main__":

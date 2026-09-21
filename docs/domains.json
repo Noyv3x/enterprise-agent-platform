@@ -95,6 +95,7 @@
         "scripts/container-smoke.sh",
         "scripts/ensure-release-candidate-tag.sh",
         "scripts/fixtures/**",
+        "scripts/release_eligibility.py",
         "scripts/verify-release-images-anonymous.sh",
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
@@ -121,6 +122,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/agent_scopes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/tool_work_projection.py",
         "enterprise-agent-platform/agent-runtime/src/session-store.ts",
         "enterprise-agent-platform/agent-runtime/src/platform-gateway.ts"
       ],
@@ -150,6 +152,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/tool_work_projection.py",
         "enterprise-agent-platform/agent-runtime/src/approval-broker.ts",
         "enterprise-agent-platform/agent-runtime/src/config.ts",
         "enterprise-agent-platform/agent-runtime/src/model-resolver.ts",
@@ -183,6 +186,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/tool_work_projection.py",
         "enterprise-agent-platform/enterprise_agent_platform/telegram_gateway.py",
         "enterprise-agent-platform/enterprise_agent_platform/schedules.py",
         "enterprise-agent-platform/enterprise_agent_platform/skills.py",
@@ -218,7 +222,8 @@
       "code": [
         "enterprise-agent-platform/frontend/**",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
-        "enterprise-agent-platform/enterprise_agent_platform/service.py"
+        "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/tool_work_projection.py"
       ],
       "tests": [
         "enterprise-agent-platform/frontend/src/**/*.test.ts",
@@ -238,6 +243,7 @@
         "enterprise-agent-platform/enterprise_agent_platform/runtimes.py",
         "enterprise-agent-platform/enterprise_agent_platform/server.py",
         "enterprise-agent-platform/enterprise_agent_platform/service.py",
+        "enterprise-agent-platform/enterprise_agent_platform/tool_work_projection.py",
         "containers/agent-sandbox-mcp-client.mjs"
       ],
       "tests": [

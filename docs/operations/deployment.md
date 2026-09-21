@@ -60,7 +60,7 @@ curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/d
 
 自定义 manifest URL 仍决定目标 release 和工件地址，不改变 bootstrap 校验器的受信来源。目标 Manager 与已验证 bootstrap 字节一致时直接复用；不同则按已验证清单下载并校验目标工件。校验失败只回收本次私有临时文件，不进入 fresh root 变更；不增加公开资产、常驻 helper 或第二套发布协议。
 
-安装器写入 stable 的 Manager 已经与 manifest Manager 完全相同时，这是初始 Current，不创建同摘要 Candidate、Activation 或 watchdog。只有现役 Current 与候选摘要不同时才进入 Manager 自更新协议。
+首次 Current 登记与不同摘要 Manager 自更新的边界见[自动更新](auto-update.md#manager-自更新)，不在安装器另建 activation 协议。
 
 Manager 激活前失败只删除本次安装进程创建且身份仍匹配的对象，使同一命令可安全重试。Manager 激活后，容器 operation 由持久 journal 接管；不得重跑安装器或手工删除数据根。
 
@@ -95,19 +95,21 @@ release manifest 固定 source commit、数据库版本、Manager SHA-256、Comp
 
 发布冒烟只组装和验证当前 schema 的十镜像清单、八个公开资产以及单一 main 发布工作流；它不接受迁移阶段、前任清单或第二套提升协议作为输入。
 
-发布资格由当前源码的真实构建图、canonical 文档同步、各语言门禁、容器冒烟和闭世界 manifest 校验共同证明。当前基线不另外维护一份已退役路径或历史技术名称的源码黑名单；无消费者的历史实现应直接从产品树删除。
+发布资格与资产身份见[自动更新](auto-update.md#发布通道)，各门禁证据见[测试与验证](../development/testing.md#部署与冒烟)。不另建已退役路径或历史技术名称的源码黑名单；无消费者的历史实现直接删除。
 
 Platform 镜像的构建上下文必须排除开发机已生成的 `enterprise_agent_platform/static/`；镜像只接受本次 frontend build stage 从受控源码生成的完整资产树，不能让本地旧 bundle 通过 Docker context 混入 wheel。
 
-Manager 先等待 Platform 与 Agent Runtime 核心 readiness，再提交 generation 并退出维护。Camoufox、SearXNG 与 Firecrawl 是可降级能力：故障会显示并由后台有界重试，不得导致健康的 Manager/Platform 崩溃循环或长期 503。用户工作区里的 MCP server 不属于部署 readiness。
+核心 readiness、提交与能力降级统一遵循[自动更新](auto-update.md#提交回滚与能力降级)；用户 workspace MCP 不进入部署 readiness。
 
 Platform、Agent Runtime 与 Camoufox 自有镜像的健康检查只在各自 Dockerfile 定义，固定 Compose 栈直接继承镜像 HEALTHCHECK；不得在 Compose 复制同一命令和时序形成第二真源。上游镜像仍由 Compose 显式声明平台所需的健康检查。
 
-任何时刻最多一个可写 Platform 打开 SQLite。账号级集成凭据、有界登录失败窗口，以及消息 `metadata.agent_work` 中的工作记录详情都属于 SQLite 中的 Platform 状态，必须随同一个候选快照、提交和回滚边界切换；聊天文档预览是从附件原件即时派生的 JSON，不另存一份预览副本。电脑画面的文件正文与 HTML 呈现页同样是按当前 scope 即时读取的有界派生结果，不另建表，也不在观察路径上创建 workspace、启动 Sandbox/Camoufox 或改写文件。更新不能清空防爆破计数，也不能让旧、新 generation 同时修改连接凭据。已持久化的 session secret 随同一 SQLite 切换，候选切换或 Platform 容器重启不得改写该 secret，因此未到期且未被吊销的浏览器登录在 generation 切换后继续有效；登录 TTL 与活动续期见[安全设计](../design/security-and-trust.md)。容器 listen 继续只来自 Manager 生成的环境与入口参数，不能从 Platform SQLite 回写。候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
+任何时刻最多一个可写 Platform 打开 SQLite。账号集成凭据、登录失败窗口、session secret 与 `metadata.agent_work` 随同一快照、提交和回滚边界切换；更新不能清空防爆破计数，也不能让两代同时修改凭据。已持久 session secret 不因切换或重启改写，未过期／未吊销登录继续有效，TTL 与续期见[安全设计](../design/security-and-trust.md)。文档、电脑文件与 HTML 预览是按授权 scope 即时派生的有界结果，不另建表／副本，观察不创建 workspace、启动 Sandbox/Camoufox 或改写文件。容器 listen 只来自 Manager 环境与入口参数，不从 SQLite 回写。
 
-模型尚未完成文件工具参数时，面向电脑画面的未提交草稿只存在于当前 Run 的 Runtime→Platform 进程内瞬态链路；正文不写入 SQLite、消息、更新快照或 release 资产，相关进程重启、generation 切换或 Run 结束都会丢弃它。现有认证文件预览 HTTP 路径按精确 scope/path 读取正文，SSE 只公布有界 revision 元数据；该能力不新增服务、端口、持久目录、配置项或数据库迁移。最终工作区文件仍由 Sandbox 工具原子写入，并在完成后取代草稿成为权威预览。
+电脑草稿只存在于当前 Run 的 Runtime→Platform 瞬态链路，不写 SQLite、消息、更新快照或 release；进程重启、generation 切换或 Run 终结即丢弃。认证 HTTP 按精确 scope/path 读正文，SSE 只公布有界 revision；不新增服务、端口、目录、配置或迁移，最终 Sandbox 原子文件取代草稿。行为见[电脑画面](../design/frontend.md#电脑画面)。
 
 Codex 提示缓存优化同样不新增部署状态：`prompt_cache_key` 只在 Runtime 组装 provider 请求时由稳定策略、工具 schema 和当前 scope 的本地单向分片派生，不写入镜像、SQLite、session、更新快照或发布清单。进程重启后从相同可执行策略重算；供应商缓存未命中时完整请求仍按相同权限与语义执行，不得把缓存可用性纳入 readiness 或发布成功条件。
+
+候选先执行无业务 writer 的 preflight；停止 current writer 后再运行：
 
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
@@ -143,16 +145,6 @@ completion-required task 同时支持 Sandbox 与经过逐次审批的 host targ
 
 ## 验收
 
-安装或更新至少验证：
-
-- Manager active/enabled，且没有 active/finalize operation；
-- Platform、Runtime 与公共 `/healthz` 正常；
-- 登录、首页、消息、SSE 与附件可用；
-- 本人频道消息撤回会推进会话 reset revision，并在同一 current generation 的多客户端消息同步中收敛；
-- Sandbox 可按需创建、停止并保留工作区；
-- Sandbox 可离线生成可打开的 XLSX、DOCX、PPTX 和 PDF，并由 Agent 作为消息附件回传；
-- terminal、搜索、浏览器和网页提取分别报告真实状态；
-- Firecrawl 在保留 PostgreSQL 数据重建后仍可完成真实抓取；
-- SQLite 完整性、current generation 与 Manager journal 一致。
+安装、登录／消息／SSE／附件、跨客户端撤回、Sandbox 离线文档交付、真实服务、SQLite 与 generation/journal 一致性按[部署验收](../development/testing.md#部署与冒烟)执行；不能以本地静态检查替代实际服务。
 
 生产故障只通过 Manager operation、当前快照和 current/previous generation 处理。不得手工编辑 journal、切换 mutable tag、直接运行 Platform 或创建第二套 Compose 栈。

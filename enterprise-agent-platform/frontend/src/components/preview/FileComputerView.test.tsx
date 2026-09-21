@@ -29,6 +29,20 @@ describe("FileComputerView", () => {
   beforeEach(() => {
     localStorage.setItem(LOCALE_STORAGE_KEY, "en");
     vi.mocked(fetchPreviewFile).mockReset();
+    // This suite exercises progressive rendering; reduced motion is a separate case below.
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      value: (query: string): MediaQueryList => ({
+        matches: query === "(prefers-reduced-motion: no-preference)",
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
   });
 
   afterEach(() => {

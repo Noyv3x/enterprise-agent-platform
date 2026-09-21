@@ -1,67 +1,43 @@
 # 文档与代码同步流程
 
-`docs/` 是 Agent Platform 当前设计的唯一真相源。设计约束、运行边界、公开契约和运维行为应先在这里修改，再落实到代码与测试。根目录 `AGENTS.md` 只提供与工具无关的工作行为和“先读、先改文档”的入口，不得复制代码库结构、配置值或产品设计。
-
-完整文档入口见 [文档索引](../README.md)，代码域映射见 [`domains.json`](../domains.json)。
+`docs/` 定义产品意图和稳定契约；代码与测试实现、验证这些契约。根 `AGENTS.md` 和 README 只提供工作规则与导航，不维护第二份架构、配置或运维说明。入口见[文档索引](../README.md)，所有权及生成关系见 [`domains.json`](../domains.json)。
 
 ## 修改顺序
 
-1. 在对应设计或参考文档中描述期望的最终行为。
-2. 如果精确默认值、边界或枚举跨语言/进程共享，或被声明为稳定设计契约，先修改相应的机器可读契约；当前跨层 Runtime 策略契约为 [`runtime-policy.json`](../contracts/runtime-policy.json)，其中同时校验 Run 空闲、模型轮次、终端执行和后台进程单次等待的默认值与上下限，并为 Platform、Runtime、前端及需要执行等待边界的 Manager 生成语言原生常量；容器服务集合、容量预算与更新边界由 [`container-platform.json`](../contracts/container-platform.json) 统一定义。
-3. 运行 `python3 scripts/docs_sync.py sync`，生成各语言消费的契约模块。
-4. 修改生产代码，并补充或更新映射域中的验收测试。
-5. 运行 `python3 scripts/docs_sync.py check` 和该代码域的完整测试。
-6. 提交前用 `check-change` 检查基准提交到待提交版本之间是否按变更方向同步。
+1. 明确交付物、非目标、受影响的所有者与验证方式。
+2. 行为、公开接口、配置或持久格式变化，先修改对应规范；跨语言或稳定的精确值先修改机器契约。
+3. 契约变更后运行 `sync`，再同步实现、生成消费者和必要的行为测试。
+4. 修复实现使其恢复既有契约、内部重构、测试或文档维护，不要求制造无语义的文档改动。
+5. 运行当前树检查及影响域验证，交付前按[测试与验证](testing.md)执行完整门禁；评审确认语义一致性。
+
+文档有变更不等于行为正确。撤销仅凭 Git diff 要求“每个代码域同时修改文档”的机制，不提供豁免标记或替代审批表；语义责任仍由实现者、评审和行为验收承担。
 
 ## 命令
 
-```bash
+```sh
 python3 scripts/docs_sync.py sync
 python3 scripts/docs_sync.py check
-python3 scripts/docs_sync.py check-change --base <base-sha> --head <head-sha>
-python3 scripts/docs_sync.py check-change --base HEAD --head INDEX
-python3 scripts/docs_sync.py check-change --base HEAD --head WORKTREE
 ```
 
-`sync` 只写由契约完整生成的文件，输出不包含时间戳，因此相同输入始终得到相同结果。生成文件禁止手工编辑。由 CI、发布脚本或验收程序直接读取的机器契约可以是无生成目标的 validation-only contract；同步器仍必须完整校验其 schema 和安全边界，不能因为没有生成消费者而跳过验证。
+`sync` 只写机器契约登记的确定性生成文件；没有生成目标的契约仍须完整校验。不要手改生成文件、把哈希收据当成实现证据，或给单模块内部调优值再造一份易漂移的配置。
 
-Manifest、canonical 文档、机器契约及生成目标都必须位于仓库内，路径链不能借助符号链接改写其它文件。生成目标必须是普通文件且不可执行。校验不要求固定为 `0644`：Git 只保存可执行位，实际读取权限会受部署机 `umask` 影响；`sync` 创建或修复目标时使用安全的非执行权限。生成到 JavaScript/TypeScript 的全部整数及单位换算结果必须保持在 `Number.MAX_SAFE_INTEGER` 内；直接交给 Node timer 的毫秒值还必须位于其有效延迟范围内。
+`check` 验证当前磁盘树：
 
-`check` 验证当前树中的以下不变量：
+- 文档、代码、测试的覆盖与所有权有效，类别不冲突；登记的路径和模式有实际消费者。
+- 机器契约满足闭世界 schema、边界与必需消费者，生成结果逐字节一致。
+- manifest、源契约和目标路径留在仓库内，拒绝符号链接逃逸；生成目标为普通、非可执行文件。
+- Markdown 本地链接目标有效；标题锚点和自然语言内容仍需人工检查。
 
-- 代码域、设计文档、测试和契约路径有效；
-- 自有生产代码均映射到至少一个文档域；同一路径匹配多个域时，所有匹配域都必须共同同步；
-- 应纳入同步的设计文档均登记在域清单中；
-- 生成模块与机器可读契约逐字节一致；
-- `docs/` 中的本地相对链接没有失效；
-- `AGENTS.md` 只包含行为准则并纳入文档治理域。
+共享整数及换算结果不得超过 JavaScript 安全整数范围；直接用于 Node timer 的毫秒值必须可安全执行。生成文件权限不锁死为单一模式，但不得可执行。
 
-`check-change` 先运行全部当前树检查。比较两个提交时，以它们的 Git merge-base 到 head 作为变更集，避免落后主线的分支把主线变化误算成自己的修改；是否属于首次 bootstrap 仍以 policy base 上是否已有 manifest 判断。校验同时读取 merge-base 与目标版本的 domain manifest，并按前后 coverage 与 owner 的并集归类路径，因此删除 owner、缩窄 coverage、删除文件或把文件 rename 出受管路径都不能绕过原设计域。将 `--head` 设为 `INDEX` 时只检查基准提交、已有提交和暂存快照，防止“已暂存代码、文档仍未暂存”的下一次提交逃逸；设为 `WORKTREE` 时会进一步合并未暂存修改和未跟踪文件。两种本地模式都把 rename 当成删除加新增，并由 `./scripts/test.sh` 与 CI 共同执行。
-
-提交前检查尚未入库的完整变更必须使用 `--head WORKTREE`（或在全部暂存后使用 `INDEX`）；`--head HEAD` 只能检查已提交快照，不能用它为未提交修改出具文档同步结论。发布 promotion evaluator 同时属于文档治理与部署协议：更改其选择或前任绑定时，必须同时更新本流程文档、部署自动更新契约与对应验收测试。
-
-受管生产路径改变时，它匹配的每个文档域都必须有设计文档或契约改变。纯文档澄清、索引整理以及删除过时或历史叙述可以独立提交，只要不改变机器契约或声称实现了尚未落地的新行为；同步器不得要求为这类修改制造无意义的代码或测试改动。机器契约改变仍必须通过 `sync` 更新全部生成目标，并由当前树检查拒绝缺失、陈旧或非法消费者。Go 的语言原生 `*_test.go` 文件只由 `go test` 编译，不属于生产路径；同步器按其所在代码路径自动归入相同设计域的测试实现，因此单纯修正测试或夹具也不要求制造无语义的文档改动。构建配置、依赖 lockfile、前端 public 资产、bundled skill、CI workflow 和上游源码契约同样属于受管生产路径。首次引入 `docs/domains.json` 的提交属于 bootstrap，只执行当前树检查。
+受管镜像容量目录必须与当前镜像键集合精确相等，并生成同一份 Python、TypeScript 和 Go 只读目录。生产限额只在 canonical JSON 定义；校验和测试验证闭世界结构、类型、边界与消费安全范围，不复制具体生产数值作为第二真源。
 
 ## 边界
 
-文档同步门禁能够保证行为代码变化带上对应设计依据，并保证机器契约与生成消费者一致，但不能证明作者实际编辑文件的时间顺序，也不能理解任意自然语言是否被正确实现。它也不把纯文档维护误判为实现变化。自动映射是最低 owner/affected-domain 约束；像 Python `service.py` 这样的跨领域聚合文件会映射到多个域，长期应继续拆分，作者和评审者仍需补充路径映射无法识别的真实语义域。跨层或稳定的精确设计值必须进入机器可读契约并生成代码；单模块内部调优值可由对应实现与测试约束，但不得在文档中复制另一份易漂移数值。行为约束必须由对应测试验证。不要用仅记录文档 hash 的文件代替可执行契约。
+不再提供 `check-change`、Git 历史所有权并集或独立 INDEX/WORKTREE 快照认证。当前树的覆盖、路径安全和生成契约检查保留；CI 对实际候选 checkout 运行同一 `check`。它不能证明文档编辑顺序、语义正确或暂存区与工作树相同，交付者必须确认提交范围。
 
-CI 在生成 release 前验证当前文档树与代码共改关系。部署机只消费已经通过门禁的不可变发布物；CI、发布门和本地测试使用同一脚本，不能各自维护一套规则。
+所有权映射用于定位责任与覆盖，不代替跨组件评审。一个修改涉及多个契约时仍须逐一核对；没有契约变化就不要求触碰每个域的说明文档。`affected` 的代码影响选择独立于文档检查，见[测试与验证](testing.md)。
 
-容器发布的静态门禁还要锁定真实浏览器人工接管验收入口及动作集合，避免后续把跨层验收退化为直连 sidecar 的 health/tab 测试；静态门只确认验收脚本仍被调用，能力是否工作由同一次 Compose job 中的真实服务链路判定。
+发布资格、资产身份和通道提交只在[自动更新](../operations/auto-update.md)定义；安装、真实服务和恢复验收只在[测试与验证](testing.md)定义。共享门禁使用明确提供的基础工具，不得因缺少可选本地搜索工具而跳过安全检查。
 
-顶层 `scripts/test.sh` 必须可以在没有生产部署变量的开发机或 CI 工作区中直接运行。它对 Compose 做静态解析时使用隔离环境、不可变占位镜像引用和无副作用的占位挂载路径，不读取项目 `.env`，也不连接或修改正在运行的产品容器。
-
-部署工作流的静态验收必须先按顶层 job 边界提取目标 job，再检查其权限、依赖、安全清理、artifact 选择和串行锁片段，不能只在整份 workflow 中搜索字符串。尤其是 Compose 发布冒烟的异 UID 临时目录前缀、路径 guard 与提权清理必须同时出现在 `compose-smoke` job 内；发布组装的镜像身份与 Manager 二进制 family 选择、按解析后 source commit 建立的锁必须同时出现在 `publish` job 内，并拒绝全量 artifact 通配，避免相同片段误落到其它 job 仍被判为通过。发布器生成的镜像键必须与当前 JSON Schema 的必需集合精确相等；上游 Firecrawl Compose 验证只要求源码契约列出的现役受管服务存在，不能把未采用的上游实验服务重新带入产品契约。外部服务的静态 Compose 验收还必须检查挂载目标，禁止 bind mount 遮蔽镜像的入口、脚本或配置根目录；Firecrawl 发布门禁必须确认 PostgreSQL 是唯一队列基线、Compose 不含 FoundationDB 服务或注入，并真实启动 PostgreSQL、Redis、RabbitMQ、Playwright 与 API。随后在保留同一 PostgreSQL bind 数据的前提下重建服务，以容器 id 变化、精确读回首轮数据哨兵和真实提取请求共同证明持久与运行契约；不能以 `docker compose create`、单次空库启动或仅复用目录代替运行时验收。
-
-同一静态验收还必须按 job 边界证明 Manager 的全量 `go test` 只在 Quality 中以禁用结果复用的方式出现一次；Container 的 Manager 工件矩阵只能交叉编译两个受支持架构并分别生成、上传校验和。Quality、工件矩阵与真实 user-systemd job 都必须把 Go 缓存绑定到仓库内精确的 Manager 依赖文件；缓存不能移除真实 systemd 测试、双架构编译或发布对这些 job 的依赖。
-
-受管镜像容量目录同样属于机器契约：文档同步器必须要求它与当前受管镜像集合精确相等，并为 Python、TypeScript 与 Go 生成同一份只读目录。发布静态验收必须证明匿名拉取、双架构压缩/展开尺寸门、真实 Compose 和最终 release manifest 全部消费同一份已经验证的镜像工件；每次临时拉取后只能按刚刚观察到的精确 image ID 清理，身份漂移、缺失或 Docker 状态不可读时失败关闭，不能用宽泛 prune 或忽略删除错误掩盖 CI 磁盘增长。
-
-镜像声明为 volume 的配置根必须由完整受管目录 bind 覆盖，并在发布工作流启动真实容器后检查 Mounts，确认没有匿名卷；SearXNG 的 `/etc/searxng` 是该规则的固定回归边界。
-
-容器定义的静态门禁还必须验证：只随发布 generation 变化的 revision/version 参数只在最后一个文件系统构建指令之后被 label 消费；Camoufox 不得把锁定浏览器、依赖和小型运行源文件作为一个整体跨阶段复制。该检查不改变最终镜像的发布标签、路径、所有权或运行入口。
-
-`scripts/**` 同时属于 `documentation-governance` 与 `repository-development`；其中发布、容器验收和 release 资产脚本还属于 `deployment`，容器发布 workflow 也同时归入部署域。根 `install.sh` 纳入生产覆盖并归属 `deployment`，不能因位于仓库根绕过同步门。共享门禁脚本只能依赖对应 CI runner 明确提供的基础命令；可选的本地搜索工具不得成为流水线正确性前提。数据库 schema migration 属于 `data-memory-sessions`；Manager generation 更新和快照回滚属于 `deployment`。回归应通过真实 `check-change` 对代码独改的拒绝来证明多域同步，不以锁死旧 owner 列表或文档措辞代替行为证据。
-
-Firecrawl 不进入产品 Git tree；其 URL、revision 和必需路径由 [`upstream-sources.json`](../contracts/upstream-sources.json) 定义并属于集成设计域。用户自行安装的 Skill/MCP 包只属于对应 Agent workspace，不进入该上游源码契约。研究用第三方 checkout、GitHub 凭据和下载缓存不属于产品源码、运行数据或发布输入。
+上游所有权与允许修改的范围见[仓库开发指南](repository.md)。用户安装的 Skill/MCP、研究 checkout、凭据、缓存与运行数据不属于产品源码或发布输入。

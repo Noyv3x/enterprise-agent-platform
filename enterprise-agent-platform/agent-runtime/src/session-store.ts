@@ -48,7 +48,6 @@ export const CURRENT_MODEL_CONTENT_SECURITY_VERSION = 1;
 export class SessionStore {
   private readonly sessionsRoot: string;
   private readonly writeQueues = new Map<string, Promise<void>>();
-  private readonly initializeQueues = new Map<string, Promise<void>>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
   private readonly archiveQueues = new Map<string, Promise<void>>();
@@ -115,43 +114,41 @@ export class SessionStore {
     history: AgentMessage[] = [],
   ): Promise<TrackedSessionMessage[]> {
     const file = this.path(identity);
-    return await this.withQueue(this.initializeQueues, file, async () => {
-      return await this.withQueue(this.mutationQueues, file, async () => {
-        const entries = await this.readEntries(identity);
-        if (entries.some((entry) => entry.type === "header")) {
-          return entries
-            .filter((entry) => entry.type === "message")
-            .map((entry) => ({
-              entry_id: entry.id,
-              message: entry.payload as AgentMessage,
-              ...(entry.model_content_security_version !== undefined
-                ? { model_content_security_version: entry.model_content_security_version }
-                : {}),
-              ...(entry.synthetic_kind !== undefined
-                ? { synthetic_kind: entry.synthetic_kind }
-                : {}),
-            }));
-        }
-        await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-        await this.writeScopeManifest(identity.scope_key);
-        const header = this.entry(identity, "header", {
-          version: 1,
-          scope_key: identity.scope_key,
-          lifecycle_id: identity.lifecycle_id,
-          session_id: identity.session_id,
-        });
-        await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
-        await this.appendRaw(file, header);
-        const tracked: TrackedSessionMessage[] = [];
-        for (const message of history) {
-          await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
-          const entry = this.entry(identity, "message", durableSessionMessage(message));
-          await this.appendRaw(file, entry);
-          tracked.push({ entry_id: entry.id, message });
-        }
-        await this.writeManifest(identity);
-        return tracked;
+    return await this.withQueue(this.mutationQueues, file, async () => {
+      const entries = await this.readEntries(identity);
+      if (entries.some((entry) => entry.type === "header")) {
+        return entries
+          .filter((entry) => entry.type === "message")
+          .map((entry) => ({
+            entry_id: entry.id,
+            message: entry.payload as AgentMessage,
+            ...(entry.model_content_security_version !== undefined
+              ? { model_content_security_version: entry.model_content_security_version }
+              : {}),
+            ...(entry.synthetic_kind !== undefined
+              ? { synthetic_kind: entry.synthetic_kind }
+              : {}),
+          }));
+      }
+      await mkdir(dirname(file), { recursive: true, mode: 0o700 });
+      await this.writeScopeManifest(identity.scope_key);
+      const header = this.entry(identity, "header", {
+        version: 1,
+        scope_key: identity.scope_key,
+        lifecycle_id: identity.lifecycle_id,
+        session_id: identity.session_id,
       });
+      await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
+      await this.appendRaw(file, header);
+      const tracked: TrackedSessionMessage[] = [];
+      for (const message of history) {
+        await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
+        const entry = this.entry(identity, "message", durableSessionMessage(message));
+        await this.appendRaw(file, entry);
+        tracked.push({ entry_id: entry.id, message });
+      }
+      await this.writeManifest(identity);
+      return tracked;
     });
   }
 

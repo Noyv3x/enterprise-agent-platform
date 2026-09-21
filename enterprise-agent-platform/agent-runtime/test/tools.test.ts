@@ -70,33 +70,6 @@ test("managed file and process policy auto-allows sandbox and requires one-shot 
   }
 });
 
-test("tool descriptions route semantic file work away from terminal scripts", () => {
-  const tools = createTools({
-    runId: "run",
-    request: { scope_key: "private:1" } as never,
-    gateway: {} as never,
-    querySession: async () => null,
-    delegate: async () => "",
-    markSideEffect: () => undefined,
-  });
-  const terminal = tools.find((tool) => tool.name === "terminal");
-  const readFile = tools.find((tool) => tool.name === "read_file");
-  const searchFiles = tools.find((tool) => tool.name === "search_files");
-  const patchFile = tools.find((tool) => tool.name === "patch_file");
-  const writeFile = tools.find((tool) => tool.name === "write_file");
-  assert.ok(terminal && readFile && searchFiles && patchFile && writeFile);
-  assert.match(terminal.description, /Do not use cat\/head\/tail/);
-  assert.match(terminal.description, /Prefer search_files over grep\/rg\/find/);
-  assert.match(terminal.description, /use ls only when the directory listing itself matters/);
-  assert.match(terminal.description, /Do not use sed\/awk or Python to edit files/);
-  assert.match(terminal.description, /one-off Python scripts/);
-  assert.match(terminal.description, /process\.wait/);
-  assert.match(readFile.description, /before editing/);
-  assert.match(searchFiles.description, /definitions and usages/);
-  assert.match(patchFile.description, /re-read/);
-  assert.match(writeFile.description, /do not create files by terminal heredoc/);
-});
-
 test("only Codex file schemas require explicit target and prepare omitted sandbox defaults", () => {
   const fileTools = (provider: "openai-codex" | "xai-oauth") => createTools({
     runId: `run-${provider}`,

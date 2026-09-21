@@ -17,8 +17,8 @@ from enterprise_agent_platform.service import (
     SESSION_SEARCH_SNIPPET_MAX_CHARACTERS,
     EnterpriseService,
     ServiceError,
-    agent_tool_detail,
 )
+from enterprise_agent_platform.tool_work_projection import agent_tool_detail
 
 from test_platform import RecordingAgent, make_config
 

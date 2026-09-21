@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/operation"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
@@ -752,6 +755,279 @@ func TestAPIProjectsOversizedDiagnosticsWithoutRewritingJournal(t *testing.T) {
 	if !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(opBefore, opAfter) {
 		t.Fatal("API observation rewrote journal evidence")
 	}
+}
+
+func TestCheckReplaysOnlyTheExactManifestURL(t *testing.T) {
+	t.Parallel()
+	var fixture releasetest.Fixture
+	var fetches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/agent-platform-compose.yaml" {
+			_, _ = response.Write(fixture.Compose)
+			return
+		}
+		fetches.Add(1)
+		_ = json.NewEncoder(response).Encode(fixture.Manifest)
+	}))
+	defer server.Close()
+	fixture = releasetest.NewTarget(strings.Repeat("a", 40), releasetest.WithArtifactBaseURL(server.URL))
+	api := newCheckAPI(t, server, fixture)
+	url := server.URL + "/manifest"
+
+	first := decodeCheckResponse(t, requestCheck(t, api, "check-key", url))
+	if first.Reused || first.Manifest.SourceCommit != fixture.Manifest.SourceCommit {
+		t.Fatalf("first check = %#v", first)
+	}
+	replayed := decodeCheckResponse(t, requestCheck(t, api, "check-key", url))
+	if !replayed.Reused || replayed.Manifest.SourceCommit != first.Manifest.SourceCommit {
+		t.Fatalf("replayed check = %#v", replayed)
+	}
+	conflict := requestCheck(t, api, "check-key", url+"?other-catalog")
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("different URL returned %d: %s", conflict.Code, conflict.Body.String())
+	}
+	if got := fetches.Load(); got != 1 {
+		t.Fatalf("replay or conflicting URL fetched another manifest: fetches=%d", got)
+	}
+}
+
+func TestCheckEvictionAllowsRefetch(t *testing.T) {
+	t.Parallel()
+	var fixture releasetest.Fixture
+	var fetches atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/agent-platform-compose.yaml" {
+			_, _ = response.Write(fixture.Compose)
+			return
+		}
+		fetches.Add(1)
+		_ = json.NewEncoder(response).Encode(fixture.Manifest)
+	}))
+	defer server.Close()
+	fixture = releasetest.NewTarget(strings.Repeat("a", 40), releasetest.WithArtifactBaseURL(server.URL))
+	api := newCheckAPI(t, server, fixture)
+	url := server.URL + "/manifest"
+	for i := 0; i <= checkCacheCapacity; i++ {
+		result := decodeCheckResponse(t, requestCheck(t, api, strconv.Itoa(i), url))
+		if result.Reused || result.Manifest.SourceCommit != fixture.Manifest.SourceCommit {
+			t.Fatalf("new key %d returned %#v", i, result)
+		}
+	}
+	before := fetches.Load()
+	if before != int32(checkCacheCapacity+1) {
+		t.Fatalf("distinct keys fetched %d manifests", before)
+	}
+	// The cache does not promise which entry it evicts, only bounded retention.
+	for i := 0; i <= checkCacheCapacity; i++ {
+		key := strconv.Itoa(i)
+		result := decodeCheckResponse(t, requestCheck(t, api, key, url))
+		if result.Manifest.SourceCommit != fixture.Manifest.SourceCommit {
+			t.Fatalf("retained or refetched check returned %#v", result)
+		}
+		if !result.Reused {
+			if got := fetches.Load(); got != before+1 {
+				t.Fatalf("evicted key did not refetch exactly once: before=%d after=%d", before, got)
+			}
+			replayed := decodeCheckResponse(t, requestCheck(t, api, key, url))
+			if !replayed.Reused || fetches.Load() != before+1 {
+				t.Fatal("refetched result was not retained for replay")
+			}
+			return
+		}
+	}
+	t.Fatal("all results survived beyond the cache capacity")
+}
+
+func TestCheckConcurrentRequestsRetainThePublishedResult(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name         string
+		differentURL bool
+		firstFails   bool
+		cancelQueued bool
+	}{
+		{name: "same URL"},
+		{name: "different URL", differentURL: true},
+		{name: "failed admission can retry", firstFails: true},
+		{name: "canceled waiter cannot replay", cancelQueued: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var first, later releasetest.Fixture
+			var fetches atomic.Int32
+			started := make(chan struct{})
+			unblock := make(chan struct{}, 1)
+			fetchedAgain := make(chan struct{}, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/agent-platform-compose.yaml" {
+					_, _ = response.Write(first.Compose)
+					return
+				}
+				if fetches.Add(1) == 1 {
+					close(started)
+					select {
+					case <-unblock:
+					case <-request.Context().Done():
+						return
+					}
+					if test.firstFails {
+						http.Error(response, "unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					_ = json.NewEncoder(response).Encode(first.Manifest)
+					return
+				}
+				select {
+				case fetchedAgain <- struct{}{}:
+				default:
+				}
+				_ = json.NewEncoder(response).Encode(later.Manifest)
+			}))
+			defer server.Close()
+			defer close(unblock)
+			first = releasetest.NewTarget(strings.Repeat("a", 40), releasetest.WithArtifactBaseURL(server.URL))
+			later = releasetest.NewTarget(strings.Repeat("b", 40), releasetest.WithArtifactBaseURL(server.URL))
+			api := newCheckAPI(t, server, first)
+			url := server.URL + "/manifest"
+			queuedURL := url
+			if test.differentURL {
+				queuedURL += "?other-catalog"
+			}
+			firstDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				firstDone <- requestCheck(t, api, "concurrent-check", url)
+			}()
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first manifest fetch did not start")
+			}
+
+			queuedContext, cancelQueued := context.WithCancel(context.Background())
+			defer cancelQueued()
+			body, err := json.Marshal(map[string]string{"idempotency_key": "concurrent-check", "manifest_url": queuedURL})
+			if err != nil {
+				t.Fatal(err)
+			}
+			queuedRequest := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewReader(body)).WithContext(queuedContext)
+			queuedRequest.Header.Set("Authorization", "Bearer "+api.ControlToken)
+			queuedStarted := make(chan struct{})
+			queuedDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				response := httptest.NewRecorder()
+				close(queuedStarted)
+				api.ServeHTTP(response, queuedRequest)
+				queuedDone <- response
+			}()
+			<-queuedStarted
+			if test.cancelQueued {
+				cancelQueued()
+			}
+			select {
+			case <-fetchedAgain:
+				t.Error("a competing check fetched before the first admission settled")
+			case <-time.After(50 * time.Millisecond):
+			}
+			unblock <- struct{}{}
+
+			select {
+			case response := <-firstDone:
+				if test.firstFails {
+					if response.Code != http.StatusBadGateway {
+						t.Fatalf("failed check returned %d: %s", response.Code, response.Body.String())
+					}
+				} else {
+					selected := decodeCheckResponse(t, response)
+					if selected.Reused || selected.Manifest.SourceCommit != first.Manifest.SourceCommit {
+						t.Fatalf("first admitted check = %#v", selected)
+					}
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("first manifest check did not finish")
+			}
+
+			expected := first.Manifest.SourceCommit
+			expectedFetches := int32(1)
+			if test.firstFails {
+				expected = later.Manifest.SourceCommit
+				expectedFetches = 2
+			}
+			select {
+			case response := <-queuedDone:
+				switch {
+				case test.cancelQueued:
+					if response.Code != http.StatusBadGateway {
+						t.Fatalf("canceled waiter replayed a result: %d %s", response.Code, response.Body.String())
+					}
+				case test.differentURL:
+					if response.Code != http.StatusConflict {
+						t.Fatalf("concurrent URL conflict returned %d: %s", response.Code, response.Body.String())
+					}
+				default:
+					result := decodeCheckResponse(t, response)
+					if result.Reused != !test.firstFails || result.Manifest.SourceCommit != expected {
+						t.Fatalf("queued check = %#v", result)
+					}
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("queued manifest check did not finish")
+			}
+			state := api.Operations.Store.State()
+			if state.Candidate == nil || state.Candidate.SourceCommit != expected {
+				t.Fatalf("check response and durable Candidate disagree: %#v; expected=%s", state.Candidate, expected)
+			}
+			replayed := decodeCheckResponse(t, requestCheck(t, api, "concurrent-check", url))
+			if !replayed.Reused || replayed.Manifest.SourceCommit != expected || fetches.Load() != expectedFetches {
+				t.Fatalf("admitted result was not retained: %#v; fetches=%d", replayed, fetches.Load())
+			}
+		})
+	}
+}
+
+func newCheckAPI(t *testing.T, server *httptest.Server, fixture releasetest.Fixture) *API {
+	t.Helper()
+	root := t.TempDir()
+	store, err := journal.Open(filepath.Join(root, "state"), time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &API{
+		ControlToken: "control-token-0123456789abcdef",
+		Operations: &operation.Orchestrator{
+			Store: store, TechnicalProfile: technicalidentity.CompileTimeActiveProfile(),
+			ReleasesDir: filepath.Join(root, "releases"), Channel: fixture.Manifest.Channel,
+			ReleaseClient: release.Client{HTTP: server.Client()},
+		},
+	}
+}
+
+func requestCheck(t *testing.T, api *API, key, url string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"idempotency_key": key, "manifest_url": url})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/check", bytes.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+api.ControlToken)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, request)
+	return response
+}
+
+type apiCheckResponse struct {
+	Manifest release.Manifest `json:"manifest"`
+	Reused   bool             `json:"reused"`
+}
+
+func decodeCheckResponse(t *testing.T, response *httptest.ResponseRecorder) apiCheckResponse {
+	t.Helper()
+	if response.Code != http.StatusOK {
+		t.Fatalf("check returned %d: %s", response.Code, response.Body.String())
+	}
+	var result apiCheckResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func TestWriteJSONEncodesBeforeCommittingSuccess(t *testing.T) {

@@ -1,12 +1,19 @@
+import { afterAll, beforeEach, vi } from "vitest";
+
 /* Browser APIs used by Ant Design's responsive and overlay primitives. Keep
    these deterministic so component tests exercise real providers in jsdom. */
 
 if (typeof window !== "undefined") {
+  // rc-component's test-mode IDs collide across native portal/focus stacks.
+  vi.stubEnv("NODE_ENV", "development");
+  beforeEach(() => vi.stubEnv("NODE_ENV", "development"));
+  afterAll(() => vi.unstubAllEnvs());
+
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
       value: (query: string): MediaQueryList => ({
-        matches: false,
+        matches: query === "(prefers-reduced-motion: reduce)",
         media: query,
         onchange: null,
         addListener: () => {},

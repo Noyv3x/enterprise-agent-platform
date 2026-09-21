@@ -3,9 +3,7 @@
 
 The checker deliberately uses only the Python standard library so it can run
 before project dependencies are installed.  ``sync`` writes deterministic
-generated contract modules; ``check`` validates the current tree; and
-``check-change`` additionally verifies that behavior-code changes carry their
-canonical documentation between two Git revisions.
+generated contract modules; ``check`` validates the current tree.
 """
 
 from __future__ import annotations
@@ -37,9 +35,6 @@ REQUIRED_RUNTIME_POLICIES = {
 }
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 DOMAIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-ZERO_SHA_RE = re.compile(r"^0+$")
-WORKTREE_REVISION = "WORKTREE"
-INDEX_REVISION = "INDEX"
 JAVASCRIPT_MAX_SAFE_INTEGER = (1 << 53) - 1
 NODE_MAX_TIMER_MILLISECONDS = 2_147_483_647
 ENTRY_MARKDOWN_PATHS = (
@@ -141,12 +136,6 @@ class Manifest:
     contracts: tuple[Contract, ...]
 
 
-@dataclass(frozen=True)
-class GitTreeEntry:
-    mode: str
-    object_type: str
-    object_id: str
-    path: str
 
 
 def _repo_root_from_script() -> Path:
@@ -686,136 +675,6 @@ def load_manifest(root: Path) -> Manifest:
     return manifest
 
 
-def _parse_historical_manifest(raw: Any, label: str) -> Manifest:
-    value = _expect_object(raw, label)
-    version = value.get("version")
-    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
-        raise DocsSyncError(f"{label} version must be a positive integer")
-
-    coverage_raw = _expect_object(value.get("coverage"), f"{label}.coverage")
-    coverage = Coverage(
-        code_include=_expect_string_list(
-            coverage_raw.get("code_include"), f"{label}.coverage.code_include"
-        ),
-        code_exclude=_expect_string_list(
-            coverage_raw.get("code_exclude", []),
-            f"{label}.coverage.code_exclude",
-            allow_empty=True,
-        ),
-        document_include=_expect_string_list(
-            coverage_raw.get("document_include"),
-            f"{label}.coverage.document_include",
-        ),
-        document_exclude=_expect_string_list(
-            coverage_raw.get("document_exclude", []),
-            f"{label}.coverage.document_exclude",
-            allow_empty=True,
-        ),
-    )
-    for pattern in (
-        *coverage.code_include,
-        *coverage.code_exclude,
-        *coverage.document_include,
-        *coverage.document_exclude,
-    ):
-        _glob_regex(pattern)
-
-    domains_raw = value.get("domains")
-    if not isinstance(domains_raw, list) or not domains_raw:
-        raise DocsSyncError(f"{label}.domains must be a non-empty JSON array")
-    domains: list[Domain] = []
-    domain_ids: set[str] = set()
-    for index, item in enumerate(domains_raw):
-        domain_label = f"{label}.domains[{index}]"
-        domain_raw = _expect_object(item, domain_label)
-        identifier = domain_raw.get("id")
-        if not isinstance(identifier, str) or not DOMAIN_ID_RE.fullmatch(identifier):
-            raise DocsSyncError(f"{domain_label}.id must match {DOMAIN_ID_RE.pattern}")
-        if identifier in domain_ids:
-            raise DocsSyncError(f"{label} contains duplicate domain id: {identifier}")
-        domain_ids.add(identifier)
-        documents = _expect_string_list(
-            domain_raw.get("documents"), f"{domain_label}.documents"
-        )
-        code = _expect_string_list(domain_raw.get("code"), f"{domain_label}.code")
-        tests = _expect_string_list(
-            domain_raw.get("tests", []),
-            f"{domain_label}.tests",
-            allow_empty=True,
-        )
-        for document in documents:
-            _relative_path(document)
-        for pattern in (*code, *tests):
-            _glob_regex(pattern)
-        domains.append(Domain(identifier, documents, code, tests))
-
-    contracts_raw = value.get("contracts", [])
-    if not isinstance(contracts_raw, list):
-        raise DocsSyncError(f"{label}.contracts must be a JSON array")
-    contracts: list[Contract] = []
-    contract_ids: set[str] = set()
-    for index, item in enumerate(contracts_raw):
-        contract_label = f"{label}.contracts[{index}]"
-        contract_raw = _expect_object(item, contract_label)
-        identifier = contract_raw.get("id")
-        if not isinstance(identifier, str) or not DOMAIN_ID_RE.fullmatch(identifier):
-            raise DocsSyncError(f"{contract_label}.id must match {DOMAIN_ID_RE.pattern}")
-        if identifier in contract_ids:
-            raise DocsSyncError(f"{label} contains duplicate contract id: {identifier}")
-        contract_ids.add(identifier)
-        source = contract_raw.get("source")
-        if not isinstance(source, str):
-            raise DocsSyncError(f"{contract_label}.source must be a string")
-        _relative_path(source)
-        contract_domains = _expect_string_list(
-            contract_raw.get("domains"), f"{contract_label}.domains"
-        )
-        unknown_domains = sorted(set(contract_domains) - domain_ids)
-        if unknown_domains:
-            raise DocsSyncError(
-                f"{contract_label} references unknown domains: {', '.join(unknown_domains)}"
-            )
-        targets_raw = contract_raw.get("targets", [])
-        if not isinstance(targets_raw, list):
-            raise DocsSyncError(f"{contract_label}.targets must be a JSON array")
-        targets: list[ContractTarget] = []
-        for target_index, target_item in enumerate(targets_raw):
-            target_label = f"{contract_label}.targets[{target_index}]"
-            target_raw = _expect_object(target_item, target_label)
-            target_path = target_raw.get("path")
-            target_format = target_raw.get("format")
-            if not isinstance(target_path, str) or not isinstance(target_format, str):
-                raise DocsSyncError(f"{target_label} path and format must be strings")
-            _relative_path(target_path)
-            targets.append(ContractTarget(target_path, target_format))
-        contracts.append(
-            Contract(identifier, source, contract_domains, tuple(targets))
-        )
-
-    # Historical manifests are used only to classify paths in a Git diff.
-    # Current repository guards never inherit policy fields from old commits.
-    return Manifest(
-        version,
-        coverage,
-        tuple(domains),
-        tuple(contracts),
-    )
-
-
-def load_manifest_at_revision(root: Path, revision: str) -> Manifest | None:
-    result = _git(
-        root,
-        ["show", f"{revision}:{MANIFEST_PATH.as_posix()}"],
-        check=False,
-    )
-    if result.returncode != 0:
-        return None
-    label = f"historical documentation manifest at {revision}"
-    try:
-        raw = json.loads(result.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise DocsSyncError(f"{label} is not valid UTF-8 JSON: {exc}") from exc
-    return _parse_historical_manifest(raw, label)
 
 
 @lru_cache(maxsize=None)
@@ -858,123 +717,12 @@ def _git(root: Path, arguments: Sequence[str], *, check: bool = True) -> subproc
             stderr=subprocess.PIPE,
         )
     except FileNotFoundError as exc:
-        raise DocsSyncError("git is required for documentation change checks") from exc
+        raise DocsSyncError("git is required for repository file enumeration") from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.decode("utf-8", errors="replace").strip()
         raise DocsSyncError(f"git {' '.join(arguments)} failed: {detail or exc.returncode}") from exc
 
 
-def _index_tree(root: Path) -> str:
-    result = _git(root, ["write-tree"])
-    tree = result.stdout.decode("ascii", errors="strict").strip()
-    if not tree:
-        raise DocsSyncError("git write-tree returned no index snapshot")
-    return tree
-
-
-def _tree_entries(root: Path, tree: str) -> tuple[GitTreeEntry, ...]:
-    result = _git(root, ["ls-tree", "-r", "--full-tree", "-z", tree])
-    entries: list[GitTreeEntry] = []
-    for record in result.stdout.split(b"\0"):
-        if not record:
-            continue
-        try:
-            metadata, raw_path = record.split(b"\t", 1)
-            raw_mode, raw_type, raw_object = metadata.split(b" ", 2)
-            mode = raw_mode.decode("ascii")
-            object_type = raw_type.decode("ascii")
-            object_id = raw_object.decode("ascii")
-            path = raw_path.decode("utf-8", errors="surrogateescape")
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise DocsSyncError("git index tree contains malformed metadata") from exc
-        _relative_path(path)
-        entries.append(GitTreeEntry(mode, object_type, object_id, path))
-    return tuple(entries)
-
-
-def _materialize_index_tree(root: Path, destination: Path) -> tuple[str, ...]:
-    tree = _index_tree(root)
-    entries = _tree_entries(root, tree)
-    blob_entries = [entry for entry in entries if entry.object_type == "blob"]
-    if blob_entries:
-        with tempfile.TemporaryFile() as error_stream:
-            try:
-                process = subprocess.Popen(
-                    ["git", "-C", str(root), "cat-file", "--batch"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=error_stream,
-                )
-            except FileNotFoundError as exc:
-                raise DocsSyncError("git is required for index snapshot checks") from exc
-            assert process.stdin is not None
-            assert process.stdout is not None
-            try:
-                for entry in blob_entries:
-                    process.stdin.write(entry.object_id.encode("ascii") + b"\n")
-                    process.stdin.flush()
-                    header = process.stdout.readline().rstrip(b"\n")
-                    header_parts = header.split(b" ")
-                    if len(header_parts) != 3 or header_parts[1] != b"blob":
-                        raise DocsSyncError(
-                            f"could not read staged blob for index path: {entry.path}"
-                        )
-                    try:
-                        size = int(header_parts[2])
-                    except ValueError as exc:
-                        raise DocsSyncError(
-                            f"staged blob has an invalid size for index path: {entry.path}"
-                        ) from exc
-                    content = process.stdout.read(size)
-                    terminator = process.stdout.read(1)
-                    if len(content) != size or terminator != b"\n":
-                        raise DocsSyncError(
-                            f"staged blob ended unexpectedly for index path: {entry.path}"
-                        )
-                    target = destination / Path(*PurePosixPath(entry.path).parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        if entry.mode == "120000":
-                            os.symlink(os.fsdecode(content), target)
-                        elif entry.mode in {"100644", "100755"}:
-                            with target.open("wb") as handle:
-                                handle.write(content)
-                            target.chmod(0o755 if entry.mode == "100755" else 0o644)
-                        else:
-                            raise DocsSyncError(
-                                f"unsupported staged blob mode {entry.mode} for index path: {entry.path}"
-                            )
-                    except (OSError, ValueError) as exc:
-                        raise DocsSyncError(
-                            f"could not materialize staged index path {entry.path}: {exc}"
-                        ) from exc
-            finally:
-                try:
-                    process.stdin.close()
-                except BrokenPipeError:
-                    pass
-                return_code = process.wait()
-                error_stream.seek(0)
-                process_error = error_stream.read().decode(
-                    "utf-8", errors="replace"
-                ).strip()
-            if return_code != 0:
-                raise DocsSyncError(
-                    "git cat-file failed while materializing the index: "
-                    f"{process_error or return_code}"
-                )
-
-    for entry in entries:
-        if entry.object_type == "blob":
-            continue
-        target = destination / Path(*PurePosixPath(entry.path).parts)
-        if entry.mode == "160000" and entry.object_type == "commit":
-            target.mkdir(parents=True, exist_ok=True)
-            continue
-        raise DocsSyncError(
-            f"unsupported staged object {entry.mode} {entry.object_type} at index path: {entry.path}"
-        )
-    return tuple(entry.path for entry in entries)
 
 
 def list_repository_files(root: Path) -> tuple[str, ...]:
@@ -2252,14 +2000,9 @@ def validate_markdown_links(root: Path) -> list[str]:
 def validate_current_tree(
     root: Path,
     manifest: Manifest,
-    repository_files: Sequence[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
-    files = (
-        tuple(repository_files)
-        if repository_files is not None
-        else list_repository_files(root)
-    )
+    files = list_repository_files(root)
     document_owners: dict[str, set[str]] = {}
     for domain in manifest.domains:
         for document in domain.documents:
@@ -2353,134 +2096,6 @@ def validate_current_tree(
     return errors
 
 
-def _git_object_exists(root: Path, revision: str) -> bool:
-    if not revision or ZERO_SHA_RE.fullmatch(revision):
-        return False
-    result = _git(root, ["cat-file", "-e", f"{revision}^{{commit}}"], check=False)
-    return result.returncode == 0
-
-
-def _manifest_exists_at_revision(root: Path, revision: str) -> bool:
-    result = _git(root, ["cat-file", "-e", f"{revision}:{MANIFEST_PATH.as_posix()}"], check=False)
-    return result.returncode == 0
-
-
-def _merge_base(root: Path, base: str, head: str) -> str:
-    result = _git(root, ["merge-base", base, head])
-    revision = result.stdout.decode("ascii", errors="strict").strip()
-    if not revision:
-        raise DocsSyncError(f"revisions do not share a merge base: {base}, {head}")
-    return revision
-
-
-def _decode_path_output(*outputs: bytes) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                item.decode("utf-8", errors="surrogateescape")
-                for output in outputs
-                for item in output.split(b"\0")
-                if item
-            }
-        )
-    )
-
-
-def changed_paths(root: Path, base: str, head: str) -> tuple[str, ...]:
-    if not _git_object_exists(root, base):
-        raise DocsSyncError(f"base revision is not a commit: {base}")
-    if head in {WORKTREE_REVISION, INDEX_REVISION}:
-        if not _git_object_exists(root, "HEAD"):
-            raise DocsSyncError("HEAD is not a commit")
-        comparison_base = _merge_base(root, base, "HEAD")
-        committed = _git(
-            root,
-            [
-                "diff", "--no-renames", "--name-only", "--diff-filter=ACDMRTUXB", "-z",
-                comparison_base, "HEAD", "--",
-            ],
-        )
-        staged = _git(
-            root,
-            [
-                "diff", "--cached", "--no-renames", "--name-only",
-                "--diff-filter=ACDMRTUXB", "-z", comparison_base, "--",
-            ],
-        )
-        if head == INDEX_REVISION:
-            return _decode_path_output(committed.stdout, staged.stdout)
-        unstaged = _git(
-            root,
-            ["diff", "--no-renames", "--name-only", "--diff-filter=ACDMRTUXB", "-z", "--"],
-        )
-        untracked = _git(root, ["ls-files", "--others", "--exclude-standard", "-z"])
-        return _decode_path_output(
-            committed.stdout,
-            staged.stdout,
-            unstaged.stdout,
-            untracked.stdout,
-        )
-    else:
-        if not _git_object_exists(root, head):
-            raise DocsSyncError(
-                f"head revision is not a commit, {INDEX_REVISION}, or {WORKTREE_REVISION}: {head}"
-            )
-        comparison_base = _merge_base(root, base, head)
-        result = _git(
-            root,
-            [
-                "diff", "--no-renames", "--name-only", "--diff-filter=ACDMRTUXB", "-z",
-                comparison_base, head, "--",
-            ],
-        )
-        return _decode_path_output(result.stdout)
-
-
-def validate_change(root: Path, manifest: Manifest, base: str, head: str) -> tuple[list[str], bool]:
-    if head not in {WORKTREE_REVISION, INDEX_REVISION} and not _git_object_exists(root, head):
-        raise DocsSyncError(
-            f"head revision is not a commit, {INDEX_REVISION}, or {WORKTREE_REVISION}: {head}"
-        )
-    if not _git_object_exists(root, base):
-        if ZERO_SHA_RE.fullmatch(base):
-            return [], True
-        raise DocsSyncError(f"base revision is not a commit: {base}")
-    if not _manifest_exists_at_revision(root, base):
-        return [], True
-
-    comparison_head = "HEAD" if head in {WORKTREE_REVISION, INDEX_REVISION} else head
-    comparison_base = _merge_base(root, base, comparison_head)
-    historical_manifest = load_manifest_at_revision(root, comparison_base)
-    classification_manifests = tuple(
-        candidate
-        for candidate in (historical_manifest, manifest)
-        if candidate is not None
-    )
-    paths = changed_paths(root, base, head)
-    domain_ids = {
-        domain.identifier
-        for candidate in classification_manifests
-        for domain in candidate.domains
-    }
-    changed_documents: dict[str, set[str]] = {identifier: set() for identifier in domain_ids}
-    changed_code: dict[str, set[str]] = {identifier: set() for identifier in domain_ids}
-
-    for path in paths:
-        for candidate in classification_manifests:
-            for domain_id in domains_for_document(candidate, path):
-                changed_documents[domain_id].add(path)
-            if _is_covered_code(candidate, path):
-                for domain in domains_for_code(candidate, path):
-                    changed_code[domain.identifier].add(path)
-
-    errors: list[str] = []
-    for identifier in sorted(domain_ids):
-        if changed_code[identifier] and not changed_documents[identifier]:
-            errors.append(
-                f"code changed in domain {identifier} without its canonical documentation: "
-                f"{', '.join(sorted(changed_code[identifier]))}"
-            )
-    return errors, False
 
 
 def _print_errors(errors: Sequence[str]) -> None:
@@ -2518,37 +2133,6 @@ def command_check(root: Path) -> int:
     return 0
 
 
-def command_check_change(root: Path, base: str, head: str) -> int:
-    try:
-        if head == INDEX_REVISION:
-            with tempfile.TemporaryDirectory(prefix="docs-sync-index-") as temporary:
-                snapshot_root = Path(temporary)
-                repository_files = _materialize_index_tree(root, snapshot_root)
-                manifest = load_manifest(snapshot_root)
-                errors = validate_current_tree(
-                    snapshot_root,
-                    manifest,
-                    repository_files=repository_files,
-                )
-        else:
-            manifest = load_manifest(root)
-            errors = validate_current_tree(root, manifest)
-        if not errors:
-            change_errors, bootstrap = validate_change(root, manifest, base, head)
-            errors.extend(change_errors)
-        else:
-            bootstrap = False
-    except DocsSyncError as exc:
-        errors = [str(exc)]
-        bootstrap = False
-    if errors:
-        _print_errors(errors)
-        return 1
-    if bootstrap:
-        print("documentation sync bootstrap detected; current-tree checks passed")
-    else:
-        print("documentation and code changes are synchronized")
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2557,17 +2141,6 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("sync", "check"):
         command = subparsers.add_parser(name)
         command.add_argument("--root", type=Path, default=_repo_root_from_script())
-    change = subparsers.add_parser("check-change")
-    change.add_argument("--root", type=Path, default=_repo_root_from_script())
-    change.add_argument("--base", required=True)
-    change.add_argument(
-        "--head",
-        required=True,
-        help=(
-            f"Git commit to check, {INDEX_REVISION} for committed and staged files, "
-            f"or {WORKTREE_REVISION} for committed, staged, unstaged, and untracked files"
-        ),
-    )
     return parser
 
 
@@ -2578,8 +2151,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return command_sync(root)
     if args.command == "check":
         return command_check(root)
-    if args.command == "check-change":
-        return command_check_change(root, args.base, args.head)
     raise AssertionError(f"unhandled command: {args.command}")
 
 
