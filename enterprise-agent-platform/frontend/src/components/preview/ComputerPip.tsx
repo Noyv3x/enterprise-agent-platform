@@ -1,7 +1,8 @@
 import { Button } from "antd";
-import { useEffect, useState } from "react";
+import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n, type MessageKey } from "../../i18n";
 import type { ComputerMode } from "../../types";
+import { formatElapsed } from "../../utils/format";
 import { Glyph, LoadingState } from "../ui/fieldwork";
 import { useChatPreviewContext } from "./ChatPreviewContext";
 import { FileComputerView } from "./FileComputerView";
@@ -13,20 +14,10 @@ import "./preview.css";
 
 const MODE_LABELS: Record<ComputerMode, MessageKey> = {file:"computer.mode.file",terminal:"computer.mode.terminal",browser:"computer.mode.browser",search:"computer.mode.search",present:"computer.mode.present"};
 
-export function formatComputerElapsed(totalSeconds:number):string {
-  const bounded=Math.max(0,Math.floor(totalSeconds));
-  const seconds=bounded%60;
-  const minutes=Math.floor(bounded/60)%60;
-  const hours=Math.floor(bounded/3600);
-  return [...(hours ? [String(hours).padStart(2,"0")] : []),String(minutes).padStart(2,"0"),String(seconds).padStart(2,"0")].join(":");
-}
-
 function Elapsed({live,runId,startedAt}: {live:boolean;runId:string;startedAt:number|null}) {
   const {t}=useI18n();
-  const [now,setNow]=useState(Date.now);
-  const timing=live && Boolean(runId) && startedAt != null && Number.isFinite(startedAt) && startedAt > 0;
-  useEffect(() => { if (!timing) return; setNow(Date.now());const timer=window.setInterval(() => setNow(Date.now()),1000);return () => window.clearInterval(timer); },[timing,runId,startedAt]);
-  return timing ? <span>{t("computer.pip.elapsed",{time:formatComputerElapsed((now-Number(startedAt)*1000)/1000)})}</span> : null;
+  const seconds=useElapsedSeconds(startedAt,live && Boolean(runId),runId);
+  return seconds == null ? null : <span>{t("computer.pip.elapsed",{time:formatElapsed(seconds)})}</span>;
 }
 
 export function ComputerPip() {

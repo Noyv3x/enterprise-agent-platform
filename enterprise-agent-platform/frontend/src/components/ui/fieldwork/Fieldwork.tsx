@@ -166,6 +166,9 @@ const glyphs = {
   download: 'M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5',
   moon: 'M20 15A9 9 0 0 1 9 4a9 9 0 1 0 11 11Z',
   sun: 'M12 2v2m0 16v2M2 12h2m16 0h2M5 5l2 2m10 10 2 2M5 19l2-2M17 7l2-2M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0',
+  arrowUp: 'M12 20V4m-7 7 7-7 7 7',
+  trash: 'M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6m4-6v6',
+  sparkle: 'm12 3 2 6 7 3-7 3-2 6-2-6-7-3 7-3 2-6Z',
 } as const;
 export type GlyphName = keyof typeof glyphs;
 export function Glyph({ name, size = 20, className }: { name: GlyphName; size?: number; className?: string }) {
@@ -265,8 +268,12 @@ export function FormGrid({ children, columns = 2 }: { children: ReactNode; colum
 export function FormFooter({ note, children }: { note?: ReactNode; children: ReactNode }) {
   return <div className="wf-form-footer">{note && <div className="wf-form-note">{note}</div>}<div className="wf-actions">{children}</div></div>;
 }
-export function StatusMark({ tone = 'neutral', children, subtle = false }: { tone?: Tone; children: ReactNode; subtle?: boolean }) {
-  return <span className={`wf-status wf-tone-${tone}${subtle ? ' wf-status--subtle' : ''}`}><span className="wf-status-dot" aria-hidden="true" />{children}</span>;
+/** Ring that spins while work is live; reduced-motion leaves it static, which still reads as "in progress" beside check/warning glyphs. */
+export function Spinner({ size = 16, className }: { size?: number; className?: string }) {
+  return <span className={`wf-spinner${className ? ` ${className}` : ''}`} style={{ inlineSize: size, blockSize: size }} aria-hidden="true" />;
+}
+export function StatusMark({ tone = 'neutral', children, subtle = false, busy = false }: { tone?: Tone; children: ReactNode; subtle?: boolean; busy?: boolean }) {
+  return <span className={`wf-status wf-tone-${tone}${subtle ? ' wf-status--subtle' : ''}`}>{busy ? <Spinner size={12} /> : <span className="wf-status-dot" aria-hidden="true" />}{children}</span>;
 }
 export function Notice({ tone = 'info', title, children, action }: { tone?: Tone; title: ReactNode; children?: ReactNode; action?: ReactNode }) {
   return <div className={`wf-notice wf-tone-${tone}`} role={tone === 'danger' ? 'alert' : 'status'}><span className="wf-notice-sign"><Glyph name={tone === 'danger' || tone === 'warning' ? 'warning' : tone === 'success' ? 'check' : 'file'} /></span><div className="wf-notice-copy"><strong>{title}</strong>{children && <div className="wf-notice-detail">{children}</div>}</div>{action && <div className="wf-notice-action">{action}</div>}</div>;

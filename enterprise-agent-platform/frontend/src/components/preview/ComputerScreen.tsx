@@ -1,7 +1,8 @@
 import { Button } from "antd";
-import { useEffect, useState } from "react";
+import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n } from "../../i18n";
 import type { ActivityStep, AgentPreviewScope } from "../../types";
+import { formatElapsed } from "../../utils/format";
 import { ComputerPanel, LoadingState, Notice } from "../ui/fieldwork";
 import { BrowserPreviewView } from "./BrowserPreviewView";
 import type { ComputerSurface } from "./computer";
@@ -9,20 +10,12 @@ import { FileComputerView } from "./FileComputerView";
 import { PresentComputerView } from "./PresentComputerView";
 import { SearchComputerView } from "./SearchComputerView";
 import { TerminalPreviewView } from "./TerminalPreviewView";
-import { formatComputerElapsed } from "./ComputerPip";
 
 export function ComputerScreen({scope,surface,availabilityError,onRetryAvailability,latestTerminalStep,browserControlRequestId}: {scope:AgentPreviewScope;surface:ComputerSurface;availabilityError:string;onRetryAvailability:()=>void;latestTerminalStep?:ActivityStep|null;browserControlRequestId?:number}) {
   const {t}=useI18n();
-  const [now, setNow] = useState(Date.now);
-  const timing = surface.live && Boolean(surface.runId) && surface.startedAt != null && surface.startedAt > 0;
-  useEffect(() => {
-    if (!timing) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [timing, surface.runId, surface.startedAt]);
+  const seconds = useElapsedSeconds(surface.startedAt, surface.live && Boolean(surface.runId), surface.runId);
   const activity=t(surface.live ? "computer.pip.live" : "preview.readOnly");
-  const elapsed=timing ? t("computer.pip.elapsed", {time:formatComputerElapsed((now-Number(surface.startedAt)*1000)/1000)}) : undefined;
+  const elapsed=seconds == null ? undefined : t("computer.pip.elapsed", {time:formatElapsed(seconds)});
   return <div className="wf-computer-screen">
     {availabilityError ? <Notice tone="warning" title={availabilityError} action={<Button onClick={onRetryAvailability}>{t("computer.retry")}</Button>} /> : null}
     {surface.mode ? <ComputerPanel expanded title={t(`computer.mode.${surface.mode}`)} modeLabel={activity} elapsed={elapsed}>

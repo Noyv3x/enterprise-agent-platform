@@ -569,6 +569,11 @@ export const chatMessages = defineMessages({
     en: { one: "{count} more waiting", other: "{count} more waiting" },
     "zh-TW": { other: "另有 {count} 條等待" },
   },
+  "chat.work.elapsed": {
+    "zh-CN": "已用时 {time}",
+    en: "Elapsed {time}",
+    "zh-TW": "已用時間 {time}",
+  },
   "chat.activity.toolFallback": { "zh-CN": "工具", en: "tool", "zh-TW": "工具" },
   "chat.activity.currentTool": {
     "zh-CN": "{tool} · {status}",

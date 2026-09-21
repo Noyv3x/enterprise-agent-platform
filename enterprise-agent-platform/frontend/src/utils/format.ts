@@ -67,6 +67,15 @@ export function formatFileSize(value: unknown): string {
   return "0 B";
 }
 
+/** Seconds → `MM:SS`, or `HH:MM:SS` once an hour has elapsed. Negative or non-finite input clamps to 00:00. */
+export function formatElapsed(totalSeconds: number): string {
+  const bounded = Math.max(0, Math.floor(Number.isFinite(totalSeconds) ? totalSeconds : 0));
+  const seconds = bounded % 60;
+  const minutes = Math.floor(bounded / 60) % 60;
+  const hours = Math.floor(bounded / 3600);
+  return [...(hours ? [String(hours).padStart(2, "0")] : []), String(minutes).padStart(2, "0"), String(seconds).padStart(2, "0")].join(":");
+}
+
 /** <input type="datetime-local"> value → UNIX seconds (or null if blank/invalid). */
 export function unixFromDatetimeLocal(value: string | null | undefined): number | null {
   if (!value) return null;

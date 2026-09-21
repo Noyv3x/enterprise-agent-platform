@@ -48,6 +48,7 @@ export function AgentApprovalPrompt({ approval, mode, scopeId }: {
       key: choice,
       label: submitting === choice ? t("chat.approval.submitting") : t(label),
       danger: choice === "deny",
+      primary: choice === "once",
       onChoose: () => { void submit(choice); },
     }))}
   />;

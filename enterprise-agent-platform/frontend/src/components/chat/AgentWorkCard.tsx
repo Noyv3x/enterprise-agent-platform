@@ -1,9 +1,11 @@
 import { useState } from "react";
+import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n, type MessageKey, type Translator } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore } from "../../store/useStore";
 import type { ActivityStep, AgentStatus, AgentWork } from "../../types";
-import { StatusMark, WorkRecord, WorkStep } from "../ui/fieldwork";
+import { formatElapsed } from "../../utils/format";
+import { Glyph, Spinner, StatusMark, WorkRecord, WorkStep, type GlyphName } from "../ui/fieldwork";
 import { MessageBody } from "./MessageBody";
 import "./work.css";
 
@@ -535,13 +537,26 @@ function Evidence({ entry }: { entry: ProcessLineEntry }) {
   </div>;
 }
 
+const FAMILY_GLYPHS: Record<ToolFamily, GlyphName> = { file: "file", terminal: "terminal", search: "search", browser: "browser", generic: "sparkle" };
+
+/** One glyph per state so running/completed/failed are distinguishable without colour or motion. */
+function StateGlyph({ state }: { state: ProcessState }) {
+  if (state === "running") return <Spinner size={14} className="wf-tone-info" />;
+  if (state === "failed") return <Glyph name="warning" size={14} className="wf-work-glyph wf-tone-danger" />;
+  return <Glyph name="check" size={14} className="wf-work-glyph wf-tone-success" />;
+}
+
 function ProcessStep({ entry, active }: { entry: ProcessLineEntry; active: boolean }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
+  const family = toolFamily(entry.rawTool);
+  const mono = entry.kind === "tool" && (family === "file" || family === "terminal" || family === "search");
   return <WorkStep
-    title={entry.title}
-    meta={entry.preview ? <span title={toolFamily(entry.rawTool) === "file" ? entry.preview : undefined}>{entry.preview}</span> : undefined}
-    status={<StatusMark tone={entry.state === "failed" ? "danger" : entry.state === "running" ? "info" : "neutral"}>{agentStepStateText(entry.state, t)}</StatusMark>}
+    leading={<StateGlyph state={entry.state} />}
+    title={<>{entry.kind === "tool" && <Glyph name={FAMILY_GLYPHS[family]} size={14} className="wf-work-family" />}{entry.title}</>}
+    meta={entry.preview ? <span title={family === "file" ? entry.preview : undefined}>{entry.preview}</span> : undefined}
+    mono={mono}
+    status={<StatusMark subtle tone={entry.state === "failed" ? "danger" : entry.state === "running" ? "info" : "neutral"}>{agentStepStateText(entry.state, t)}</StatusMark>}
     expanded={expanded}
     onExpandedChange={setExpanded}
   >{!active && entryHasExpandedDetail(entry) ? <>{expanded && <Evidence entry={entry} />}</> : undefined}</WorkStep>;
@@ -552,6 +567,7 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const dispatch = useDispatch();
   const runId = work.run_id || `${work.scope_type || "agent"}:${work.scope_id || ""}:${work.started_at || ""}`;
   const expanded = useStore((state) => state.expandedAgentRuns[runId] === true);
+  const elapsedSeconds = useElapsedSeconds(work.started_at, active, runId);
   const entries = processEntries(work, t);
   const warning = work.state === "error" || work.state === "needs_review";
   let current: ProcessLineEntry | undefined;
@@ -564,7 +580,9 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const waiting = active ? work.state === "replying" ? queued : Math.max(0, queued - 1) : 0;
   if (!hasAgentProcessSteps(work)) return null;
   return <div role="region" aria-label={t("chat.work.view")}><WorkRecord title={title} active={active} expanded={expanded}
+    leading={work.state === "approval" ? <Glyph name="lock" size={14} className="wf-work-glyph wf-tone-warning" /> : <Spinner size={14} className="wf-tone-info" />}
+    elapsed={elapsedSeconds == null ? undefined : <span aria-label={t("chat.work.elapsed", { time: formatElapsed(elapsedSeconds) })}>{formatElapsed(elapsedSeconds)}</span>}
     onExpandedChange={(next) => dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: next } })}
-    status={<><StatusMark tone={warning ? "warning" : active ? "info" : "neutral"}>{status}</StatusMark>{waiting > 0 && <span>{t("chat.work.waitingCount", { count: waiting })}</span>}</>}
+    status={<><StatusMark subtle={!warning} tone={warning ? "warning" : active ? "info" : "neutral"}>{status}</StatusMark>{waiting > 0 && <span>{t("chat.work.waitingCount", { count: waiting })}</span>}</>}
   >{(active || expanded) && <div role="list">{entries.map((entry) => <div role="listitem" key={entry.key}><ProcessStep entry={entry} active={active} /></div>)}</div>}</WorkRecord></div>;
 }

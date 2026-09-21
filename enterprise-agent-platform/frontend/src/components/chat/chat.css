@@ -1,5 +1,6 @@
-.wf-message-metadata{display:flex;align-items:center;gap:12px;flex-wrap:wrap;min-width:0}
+.wf-message-metadata{display:flex;align-items:center;gap:var(--wf-space-2) var(--wf-space-3);flex-wrap:wrap;min-width:0}
 .wf-message-metadata time{color:var(--wf-muted)}
+.wf-agent-typing{display:flex;align-items:center;gap:var(--wf-space-3);flex-wrap:wrap;min-block-size:var(--wf-control)}
 .wf-history-action{display:flex;justify-content:center;padding-block:8px}
 .wf-message-prose{min-width:0;overflow-wrap:anywhere;white-space:normal}
 .wf-message-prose>:first-child{margin-block-start:0}
@@ -9,8 +10,9 @@
 .wf-message-prose li>p{margin-block:4px}
 .wf-message-prose pre{white-space:pre;overflow:auto;max-width:100%;padding:16px;background:var(--wf-inset)}
 .wf-message-plaintext{white-space:pre-wrap}
-.wf-code-block{margin-inline:0;min-width:0}
-.wf-code-block figcaption{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--wf-line)}
+.wf-code-block{margin-inline:0;min-width:0;border:1px solid var(--wf-line);border-radius:var(--wf-radius);overflow:hidden}
+.wf-code-block figcaption{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:var(--wf-space-1) var(--wf-space-2) var(--wf-space-1) var(--wf-space-3);border-bottom:1px solid var(--wf-line);background:var(--wf-inset);color:var(--wf-muted);font-family:var(--wf-font-mono);font-size:var(--wf-text-xs)}
+.wf-code-block pre{margin:0;background:var(--wf-surface)}
 .wf-markdown-table{overflow:auto;max-width:100%}
 .wf-markdown-table table{border-collapse:collapse;min-width:100%}
 .wf-markdown-table :is(th,td){text-align:start;padding:8px 12px;border-bottom:1px solid var(--wf-line)}

@@ -27,8 +27,8 @@ export function MessageMeta({message,isUser,pending,streaming,hideAuthorName=fal
    {!hideAuthorName && <strong>{authorName(message,isUser,t)}</strong>}
    <time dateTime={message.created_at ? new Date(message.created_at * 1000).toISOString() : undefined}>{formatMessageTime(message.created_at,locale)}</time>
    {message.metadata?.needs_review && <StatusMark tone="warning">{t("chat.message.needsReview")}</StatusMark>}
-   {pending && <StatusMark tone="info">{t("chat.message.sending")}</StatusMark>}
-   {streaming && <StatusMark tone="info">{t("chat.message.generating")}</StatusMark>}
+   {pending && <StatusMark subtle busy tone="info">{t("chat.message.sending")}</StatusMark>}
+   {streaming && <StatusMark subtle busy tone="info">{t("chat.message.generating")}</StatusMark>}
    {action}
  </div>;
 }
