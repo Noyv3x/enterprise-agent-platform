@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject, type TransitionEvent } from "react";
 import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n, type MessageKey, type Translator } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
-import { useDispatch, useStore } from "../../store/useStore";
-import type { ActivityStep, AgentStatus, AgentWork } from "../../types";
+import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
+import type { ActivityStep, AgentStatus, AgentWork, AppState } from "../../types";
 import { formatElapsed } from "../../utils/format";
-import { Glyph, Spinner, StatusMark, WorkRecord, WorkStep, type GlyphName } from "../ui/fieldwork";
+import { Glyph, Spinner, type GlyphName } from "../ui/fieldwork";
 import { MessageBody } from "./MessageBody";
 import "./work.css";
 
@@ -499,90 +499,295 @@ function completedWorkSummary(entries: ProcessLineEntry[], translate: Translator
   ].filter(Boolean);
   return parts.length
     ? parts.join(" · ")
-    : translate("chat.work.records", { count: entries.length });
+    : translate("chat.work.steps", { count: entries.filter((entry) => entry.kind !== "notice").length });
 }
-
 
 function Evidence({ entry }: { entry: ProcessLineEntry }) {
   const { t, locale } = useI18n();
-  if (entry.kind === "commentary") return <div className="wf-work-evidence" role="group" aria-label={entry.title}>
+  if (entry.kind === "commentary") return <div className="wf-trace-evidence wf-trace-evidence--prose" role="group" aria-label={entry.title}>
     {entry.detail && <MessageBody content={entry.detail} />}
-    {entry.detailNotice && <p role="note">{entry.detailNotice}</p>}
+    {entry.detailNotice && <p className="wf-trace-note" role="note">{entry.detailNotice}</p>}
   </div>;
   const command = terminalCommand(entry);
   const summary = semanticDetail(entry);
   const parameters = detailParameterEntries(entry);
+  const failed = entry.state === "failed";
   const started = formatWorkInstant(entry.startedAt, locale);
   const completed = formatWorkInstant(entry.completedAt, locale);
   const time = started && completed && started !== completed ? `${started} – ${completed}` : started || completed;
-  const result = entry.result ? <section aria-label={t(resultSectionKey(entry))}>
-    <h4>{t(resultSectionKey(entry))}</h4>
+  const resultLabel = t(resultSectionKey(entry));
+  const result = entry.result ? <section aria-label={resultLabel} data-tone={failed ? "danger" : undefined}>
+    <h4>{resultLabel}</h4>
     <pre tabIndex={0}><code>{entry.result}</code></pre>
   </section> : null;
-  const context = parameters.length ? <section aria-label={t(parameterSectionKey(entry))}>
-    <h4>{t(parameterSectionKey(entry))}</h4>
+  const contextLabel = t(parameterSectionKey(entry));
+  const context = parameters.length ? <section aria-label={contextLabel}>
+    <h4>{contextLabel}</h4>
     <dl>{parameters.map(([key, value]) => <div key={key}>
-      <dt>{parameterLabel(key, t)}</dt><dd><code>{formatParameterValue(value)}</code></dd>
+      <dt>{parameterLabel(key, t)}</dt><dd>{formatParameterValue(value)}</dd>
     </div>)}</dl>
   </section> : null;
-  return <div className="wf-work-evidence" role="group" aria-label={entry.title}>
-    {command && <section><h4>{t("chat.activity.commandPreview")}</h4>
-      <pre aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
+  const summaryIsError = failed && !entry.result;
+  return <div className="wf-trace-evidence" role="group" aria-label={entry.title}>
+    {command && <section>
+      <h4>{t("chat.activity.commandPreview")}</h4>
+      <pre className="wf-trace-command" aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
     </section>}
     {toolFamily(entry.rawTool) === "file" || entry.rawTool === "terminal" ? <>{result}{context}</> : <>{context}{result}</>}
-    {summary && <section><h4>{t(entry.state === "failed" && !entry.result ? "chat.work.detail.error" : "chat.work.detail.summary")}</h4><pre tabIndex={0}>{summary}</pre></section>}
-    {entry.detailNotice && <p role="note">{entry.detailNotice}</p>}
-    {entry.resultNotice && <p role="note">{entry.resultNotice}</p>}
-    {time && <p>{t("chat.work.detail.time")} <time>{time}</time></p>}
+    {summary && <section data-tone={summaryIsError ? "danger" : undefined}>
+      <h4>{t(summaryIsError ? "chat.work.detail.error" : "chat.work.detail.summary")}</h4>
+      <pre tabIndex={0}>{summary}</pre>
+    </section>}
+    {entry.detailNotice && <p className="wf-trace-note" role="note">{entry.detailNotice}</p>}
+    {entry.resultNotice && <p className="wf-trace-note" role="note">{entry.resultNotice}</p>}
+    {time && <p className="wf-trace-instant">{t("chat.work.detail.time")} <time>{time}</time></p>}
   </div>;
+}
+
+/** Longest computed transition (duration + delay) in ms; 0 under reduced motion, where the global rule removes transitions. */
+function transitionMilliseconds(element: HTMLElement): number {
+  const style = window.getComputedStyle(element);
+  const toMilliseconds = (list: string) => list.split(",").map((part) => {
+    const value = part.trim();
+    const amount = Number.parseFloat(value);
+    if (!Number.isFinite(amount)) return 0;
+    return value.endsWith("ms") ? amount : amount * 1000;
+  });
+  const durations = toMilliseconds(style.transitionDuration || "");
+  const delays = toMilliseconds(style.transitionDelay || "");
+  return durations.reduce((longest, duration, index) => Math.max(longest, duration + (delays[index % delays.length] || 0)), 0);
+}
+
+/**
+ * Disclosure plumbing shared by the trace and its rows. The panel element stays mounted so the CSS
+ * grid-row/opacity transition can run both ways; its content mounts on open and unmounts only after
+ * the closing transition. Closing a panel that holds focus returns focus to its trigger first,
+ * including the one automatic collapse when a live run settles.
+ */
+function useDisclosure(open: boolean) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [closing, setClosing] = useState(false);
+  const [previous, setPrevious] = useState(open);
+  if (previous !== open) {
+    setPrevious(open);
+    setClosing(!open);
+  }
+  useLayoutEffect(() => {
+    if (open) return;
+    const panel = panelRef.current;
+    if (panel && panel.contains(document.activeElement)) triggerRef.current?.focus({ preventScroll: true });
+  }, [open]);
+  useEffect(() => {
+    if (!closing) return;
+    const duration = panelRef.current ? transitionMilliseconds(panelRef.current) : 0;
+    const timer = window.setTimeout(() => setClosing(false), duration ? duration + 50 : 0);
+    return () => window.clearTimeout(timer);
+  }, [closing]);
+  const onTransitionEnd = (event: TransitionEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget && !open) setClosing(false);
+  };
+  return { mounted: open || closing, triggerRef, panelRef, onTransitionEnd };
 }
 
 const FAMILY_GLYPHS: Record<ToolFamily, GlyphName> = { file: "file", terminal: "terminal", search: "search", browser: "browser", generic: "sparkle" };
 
-/** One glyph per state so running/completed/failed are distinguishable without colour or motion. */
-function StateGlyph({ state }: { state: ProcessState }) {
-  if (state === "running") return <Spinner size={14} className="wf-tone-info" />;
-  if (state === "failed") return <Glyph name="warning" size={14} className="wf-work-glyph wf-tone-danger" />;
-  return <Glyph name="check" size={14} className="wf-work-glyph wf-tone-success" />;
+/** One sign per row: running rows spin, failures warn, settled rows show what kind of work they were. */
+function StepSign({ entry }: { entry: ProcessLineEntry }) {
+  if (entry.kind === "notice" || entry.state === "failed") return <Glyph name="warning" size={14} />;
+  if (entry.state === "running") return <Spinner size={14} />;
+  if (entry.kind === "commentary") return <Glyph name="sparkle" size={14} />;
+  return <Glyph name={FAMILY_GLYPHS[toolFamily(entry.rawTool)]} size={14} />;
 }
 
-function ProcessStep({ entry, active }: { entry: ProcessLineEntry; active: boolean }) {
+/** Paths, commands and queries read as code; prose-like previews (browser, commentary, generic tools) stay in the body face. */
+function usesMonoPreview(entry: ProcessLineEntry): boolean {
+  const family = toolFamily(entry.rawTool);
+  return entry.kind === "tool" && (family === "file" || family === "terminal" || family === "search");
+}
+
+function TraceStep({ entry }: { entry: ProcessLineEntry }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
-  const family = toolFamily(entry.rawTool);
-  const mono = entry.kind === "tool" && (family === "file" || family === "terminal" || family === "search");
-  return <WorkStep
-    leading={<StateGlyph state={entry.state} />}
-    title={<>{entry.kind === "tool" && <Glyph name={FAMILY_GLYPHS[family]} size={14} className="wf-work-family" />}{entry.title}</>}
-    meta={entry.preview ? <span title={family === "file" ? entry.preview : undefined}>{entry.preview}</span> : undefined}
-    mono={mono}
-    status={<StatusMark subtle tone={entry.state === "failed" ? "danger" : entry.state === "running" ? "info" : "neutral"}>{agentStepStateText(entry.state, t)}</StatusMark>}
-    expanded={expanded}
-    onExpandedChange={setExpanded}
-  >{!active && entryHasExpandedDetail(entry) ? <>{expanded && <Evidence entry={entry} />}</> : undefined}</WorkStep>;
+  const panelId = useId();
+  const expandable = entry.state !== "running" && entryHasExpandedDetail(entry);
+  const open = expandable && expanded;
+  const disclosure = useDisclosure(open);
+  const failed = entry.kind !== "notice" && entry.state === "failed";
+  const row = <>
+    <span className="wf-trace-sign" aria-hidden="true"><StepSign entry={entry} /></span>
+    <span className="wf-trace-step-title">{entry.title}</span>
+    {entry.preview && <span className={`wf-trace-step-meta${usesMonoPreview(entry) ? " wf-mono" : ""}`} title={toolFamily(entry.rawTool) === "file" ? entry.preview : undefined}>{entry.preview}</span>}
+    {entry.kind !== "notice" && <span className={failed ? "wf-trace-step-state" : "wf-sr-only"}>{agentStepStateText(entry.state, t)}</span>}
+    {expandable && <Glyph name="chevron" size={12} className="wf-trace-chevron" />}
+  </>;
+  return <li className={`wf-trace-step wf-trace-step--${entry.kind === "notice" ? "notice" : entry.state}`}>
+    {expandable
+      ? <button ref={disclosure.triggerRef} type="button" className="wf-trace-row" aria-expanded={open} aria-controls={panelId} onClick={() => setExpanded(!open)}>{row}</button>
+      : <div className="wf-trace-row">{row}</div>}
+    {expandable && <div ref={disclosure.panelRef} id={panelId} className="wf-trace-panel" data-open={open} inert={!open || undefined} onTransitionEnd={disclosure.onTransitionEnd}>
+      <div className="wf-trace-clip">{disclosure.mounted && <Evidence entry={entry} />}</div>
+    </div>}
+  </li>;
 }
 
+/**
+ * A live record is replaced by a new instance when its run settles (MessageList swaps the live
+ * activity for the persisted message, or for the error record). Focus inside the live record would
+ * fall to <body>, so it is handed to the same run's next header in the same conversation log. A
+ * pending handoff waits briefly for a record that mounts later, and otherwise falls back to that log.
+ * Handoffs are fenced per log element and cancelled when the conversation itself changed (account,
+ * view or channel), so navigation never synthesizes focus; focus the user placed elsewhere is never taken.
+ */
+interface RunFocusRegistry {
+  headers: Map<string, Set<RefObject<HTMLButtonElement | null>>>;
+  pending: Map<string, { conversation: string; movedToLog: boolean }>;
+}
+const runFocusRegistries = new WeakMap<HTMLElement, RunFocusRegistry>();
+/** Long enough for the persisted message to arrive in a following store update; short enough not to surprise a reader later. */
+const HANDOFF_WINDOW_MS = 2000;
+
+function runFocusRegistry(log: HTMLElement): RunFocusRegistry {
+  let registry = runFocusRegistries.get(log);
+  if (!registry) {
+    registry = { headers: new Map(), pending: new Map() };
+    runFocusRegistries.set(log, registry);
+  }
+  return registry;
+}
+
+/** The conversation a log is showing; a change between render and unmount means navigation, not a settling run. */
+function conversationIdentity(state: AppState): string {
+  return `${state.user?.id ?? ""}:${state.activeView}:${state.activeChannelId ?? ""}`;
+}
+
+/** True when focus was lost with the removed record (body, nothing, or a detached node). */
+function focusWasDropped(): boolean {
+  const current = document.activeElement;
+  return !current || current === document.body || !current.isConnected;
+}
+
+function useRunFocusHandoff(runId: string, active: boolean, triggerRef: RefObject<HTMLButtonElement | null>, sectionRef: RefObject<HTMLElement | null>) {
+  const store = useStoreHandle();
+  const latest = useRef({ runId, active, conversation: "" });
+  useLayoutEffect(() => {
+    latest.current = { runId, active, conversation: conversationIdentity(store.getState()) };
+  });
+  // Index this header under its current run within its log, and claim a handoff waiting for that run.
+  useLayoutEffect(() => {
+    const log = sectionRef.current?.closest<HTMLElement>('[role="log"]');
+    if (!log) return;
+    const registry = runFocusRegistry(log);
+    const headers = registry.headers.get(runId) ?? new Set();
+    headers.add(triggerRef);
+    registry.headers.set(runId, headers);
+    const pending = registry.pending.get(runId);
+    if (pending && triggerRef.current) {
+      registry.pending.delete(runId);
+      const onOwnFallback = pending.movedToLog && document.activeElement === log;
+      if (pending.conversation === conversationIdentity(store.getState()) && (focusWasDropped() || onOwnFallback)) {
+        triggerRef.current.focus({ preventScroll: true });
+      }
+    }
+    return () => {
+      headers.delete(triggerRef);
+      if (!headers.size && registry.headers.get(runId) === headers) registry.headers.delete(runId);
+    };
+  }, [runId, sectionRef, store, triggerRef]);
+  // On unmount only: hand focus that was inside a live record to the same run's next header.
+  useLayoutEffect(() => {
+    const section = sectionRef.current;
+    const log = section?.closest<HTMLElement>('[role="log"]');
+    return () => {
+      const { runId: run, active: wasActive, conversation } = latest.current;
+      if (!wasActive || !section || !log || !section.contains(document.activeElement)) return;
+      if (conversationIdentity(store.getState()) !== conversation) return;
+      const registry = runFocusRegistry(log);
+      const successor = [...(registry.headers.get(run) ?? [])]
+        .filter((ref) => ref !== triggerRef)
+        .map((ref) => ref.current)
+        .find((header) => header?.isConnected);
+      if (successor) {
+        successor.focus({ preventScroll: true });
+        return;
+      }
+      const handoff = { conversation, movedToLog: false };
+      registry.pending.set(run, handoff);
+      window.requestAnimationFrame(() => {
+        if (registry.pending.get(run) !== handoff || !log.isConnected || !focusWasDropped()) return;
+        if (conversationIdentity(store.getState()) !== conversation) return;
+        handoff.movedToLog = true;
+        log.focus({ preventScroll: true });
+      });
+      window.setTimeout(() => {
+        if (registry.pending.get(run) === handoff) registry.pending.delete(run);
+      }, HANDOFF_WINDOW_MS);
+    };
+  }, [sectionRef, store, triggerRef]);
+}
+
+/**
+ * Live runs open by default and can be folded to a one-line summary of the current task; a settled
+ * run starts folded and remembers its disclosure per run in the store. The live choice is local, so
+ * settling collapses exactly once (in place, or by remounting as the persisted record) and later
+ * updates never re-collapse or re-open it.
+ */
 export function AgentWorkCard({ work, active }: { work: Work; active: boolean }) {
   const { t } = useI18n();
   const dispatch = useDispatch();
   const runId = work.run_id || `${work.scope_type || "agent"}:${work.scope_id || ""}:${work.started_at || ""}`;
-  const expanded = useStore((state) => state.expandedAgentRuns[runId] === true);
+  const settledOpen = useStore((state) => state.expandedAgentRuns[runId] === true);
+  const [liveDisclosure, setLiveDisclosure] = useState<{ runId: string; open: boolean } | null>(null);
+  const open = active ? (liveDisclosure?.runId === runId ? liveDisclosure.open : true) : settledOpen;
+  const disclosure = useDisclosure(open);
+  const panelId = useId();
+  const statusId = useId();
+  const sectionRef = useRef<HTMLElement>(null);
+  useRunFocusHandoff(runId, active, disclosure.triggerRef, sectionRef);
   const elapsedSeconds = useElapsedSeconds(work.started_at, active, runId);
+  if (!hasAgentProcessSteps(work)) return null;
+
   const entries = processEntries(work, t);
-  const warning = work.state === "error" || work.state === "needs_review";
+  const failed = !active && (work.state === "error" || work.state === "needs_review");
+  const approval = active && work.state === "approval";
   let current: ProcessLineEntry | undefined;
   if (active) for (let index = entries.length - 1; index >= 0; index--) {
     if (entries[index]!.state === "running") { current = entries[index]; break; }
   }
-  const title = active ? agentStatusText(work, t) || t("chat.status.processing") : warning ? t("chat.work.failed") : t("chat.work.view");
-  const status = active ? current ? t("chat.activity.currentTool", { tool: current.title, status: agentStepStateText(current.state, t) }) : t("chat.status.processing") : completedWorkSummary(entries, t);
+  const folded = active && !open ? current : undefined;
+  const summary = completedWorkSummary(entries, t);
+  const label = folded
+    ? folded.title
+    : active ? t(approval ? "chat.work.awaitingApproval" : "chat.work.working") : failed ? t("chat.work.failed") : summary;
+  const statusText = active ? agentStatusText(work, t) : "";
   const queued = Number(work.queued_count || 0);
   const waiting = active ? work.state === "replying" ? queued : Math.max(0, queued - 1) : 0;
-  if (!hasAgentProcessSteps(work)) return null;
-  return <div role="region" aria-label={t("chat.work.view")}><WorkRecord title={title} active={active} expanded={expanded}
-    leading={work.state === "approval" ? <Glyph name="lock" size={14} className="wf-work-glyph wf-tone-warning" /> : <Spinner size={14} className="wf-tone-info" />}
-    elapsed={elapsedSeconds == null ? undefined : <span aria-label={t("chat.work.elapsed", { time: formatElapsed(elapsedSeconds) })}>{formatElapsed(elapsedSeconds)}</span>}
-    onExpandedChange={(next) => dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: next } })}
-    status={<><StatusMark subtle={!warning} tone={warning ? "warning" : active ? "info" : "neutral"}>{status}</StatusMark>{waiting > 0 && <span>{t("chat.work.waitingCount", { count: waiting })}</span>}</>}
-  >{(active || expanded) && <div role="list">{entries.map((entry) => <div role="listitem" key={entry.key}><ProcessStep entry={entry} active={active} /></div>)}</div>}</WorkRecord></div>;
+  const meta: ReactNode[] = [];
+  if (active) meta.push(<span key="steps">{t("chat.work.steps", { count: entries.filter((entry) => entry.kind !== "notice").length })}</span>);
+  if (failed) meta.push(<span key="summary">{summary}</span>);
+  if (waiting > 0) meta.push(<span key="waiting">{t("chat.work.waitingCount", { count: waiting })}</span>);
+  if (elapsedSeconds != null) {
+    const time = formatElapsed(elapsedSeconds);
+    meta.push(<span key="elapsed" className="wf-trace-time"><span className="wf-sr-only">{t("chat.work.elapsed", { time })}</span><span aria-hidden="true">{time}</span></span>);
+  }
+  const tone = approval ? "approval" : active ? "live" : failed ? "failed" : "settled";
+  const toggle = () => {
+    if (active) setLiveDisclosure({ runId, open: !open });
+    else dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: !open } });
+  };
+  return <section ref={sectionRef} className={`wf-trace wf-trace--${tone}`} aria-label={t("chat.work.label")}>
+    {statusText && <span id={statusId} className="wf-sr-only">{statusText}</span>}
+    <button ref={disclosure.triggerRef} type="button" className="wf-trace-head" aria-expanded={open} aria-controls={panelId} aria-describedby={statusText ? statusId : undefined} title={statusText || undefined} onClick={toggle}>
+      <span className="wf-trace-sign" aria-hidden="true"><Glyph name={approval ? "lock" : failed ? "warning" : "sparkle"} size={14} /></span>
+      <span className="wf-trace-label">{label}</span>
+      {folded?.preview && <span className={`wf-trace-detail${usesMonoPreview(folded) ? " wf-mono" : ""}`}>{folded.preview}</span>}
+      {meta.length > 0 && <span className="wf-trace-meta">{meta}</span>}
+      <Glyph name="chevron" size={12} className="wf-trace-chevron" />
+    </button>
+    <div ref={disclosure.panelRef} id={panelId} className="wf-trace-panel" data-open={open} inert={!open || undefined} onTransitionEnd={disclosure.onTransitionEnd}>
+      <div className="wf-trace-clip">{disclosure.mounted && <ol className="wf-trace-steps" role="list">
+        {entries.map((entry) => <TraceStep key={entry.key} entry={entry} />)}
+      </ol>}</div>
+    </div>
+  </section>;
 }

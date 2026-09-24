@@ -3,15 +3,20 @@ import { useI18n } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import type { AgentStatus } from "../../types";
 import { formatElapsed } from "../../utils/format";
-import { StatusMark } from "../ui/fieldwork";
+import { Glyph } from "../ui/fieldwork";
+import "./work.css";
 
-/** Loading state before the first tool call: live ring, the real status wording, and elapsed time since the run started. */
+/** Before the first tool call: the work-trace header alone — real status wording and time since the run started. */
 export function AgentTyping({ status }: { status: AgentStatus }) {
   const { t } = useI18n();
   const waitingForApproval = status.state === "approval";
   const seconds = useElapsedSeconds(status.started_at, !waitingForApproval, status.run_id || "");
-  return <div className="wf-agent-typing">
-    <div role="status" aria-live="polite"><StatusMark subtle busy={!waitingForApproval} tone={waitingForApproval ? "warning" : "info"}>{agentStatusText(status, t) || t("chat.status.processing")}</StatusMark></div>
-    {seconds != null && <span className="wf-work-elapsed wf-mono" aria-label={t("chat.work.elapsed", { time: formatElapsed(seconds) })}>{formatElapsed(seconds)}</span>}
+  const time = seconds == null ? "" : formatElapsed(seconds);
+  return <div className={`wf-trace wf-trace--${waitingForApproval ? "approval" : "live"}`}>
+    <div className="wf-trace-head wf-trace-head--static">
+      <span className="wf-trace-sign" aria-hidden="true"><Glyph name={waitingForApproval ? "lock" : "sparkle"} size={14} /></span>
+      <span className="wf-trace-label" role="status" aria-live="polite">{agentStatusText(status, t) || t("chat.status.processing")}</span>
+      {time && <span className="wf-trace-meta"><span className="wf-trace-time"><span className="wf-sr-only">{t("chat.work.elapsed", { time })}</span><span aria-hidden="true">{time}</span></span></span>}
+    </div>
   </div>;
 }

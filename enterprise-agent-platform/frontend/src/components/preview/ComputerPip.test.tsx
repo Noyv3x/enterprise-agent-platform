@@ -436,8 +436,6 @@ describe("ComputerPip", () => {
     expect(frame).toHaveAttribute("tabindex", "-1");
     expect(frame.closest("[inert]")).toHaveAttribute("aria-hidden", "true");
     const button = screen.getByRole("button", { name: "Show the AI computer" });
-    const hide = screen.getByRole("button", { name: "Hide the AI computer" });
-    expect(screen.getAllByRole("button")).toEqual([button, hide]);
     button.focus();
     await user.keyboard("{Enter}");
     expect(openComputer).toHaveBeenCalledWith(undefined, button);

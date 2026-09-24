@@ -1,5 +1,5 @@
 import { Badge, Button, Tooltip } from 'antd';
-import { useId, useState } from 'react';
+import { useId } from 'react';
 import type { ReactNode, Ref, UIEventHandler } from 'react';
 import { Glyph } from './Fieldwork';
 
@@ -51,29 +51,6 @@ export interface ComposerFrameProps { input: ReactNode; attachments?: ReactNode;
 /** Input is controller-owned: native textarea or Ant TextArea, with existing IME/mention handlers. */
 export function ComposerFrame({ input, attachments, suggestions, startActions, submitAction, hint, status, recovery, disabled = false, label }: ComposerFrameProps) {
   return <section className={`wf-composer-area${disabled ? ' wf-composer-area--disabled' : ''}`} aria-label={label}>{recovery && <div className="wf-composer-recovery">{recovery}</div>}{suggestions && <div className="wf-composer-suggestions">{suggestions}</div>}<div className="wf-composer-frame">{attachments && <div className="wf-composer-attachments">{attachments}</div>}<div className="wf-composer-input-wrap">{input}</div><div className="wf-composer-toolbar"><div className="wf-composer-start">{startActions}</div>{status && <div className="wf-composer-status" role="status">{status}</div>}<div className="wf-composer-submit">{submitAction}</div></div></div>{hint && <div className="wf-composer-hint">{hint}</div>}</section>;
-}
-
-export interface WorkRecordProps { title: ReactNode; status?: ReactNode; active: boolean; expanded?: boolean; onExpandedChange?: (expanded: boolean) => void; children: ReactNode; leading?: ReactNode; elapsed?: ReactNode }
-/** Active work is pinned open and non-interactive; completed work collapses behind one disclosure. */
-export function WorkRecord({ title, status, active, expanded, onExpandedChange, children, leading, elapsed }: WorkRecordProps) {
-  const [localExpanded, setLocalExpanded] = useState(false);
-  const bodyId = useId();
-  const open = active || (expanded ?? localExpanded);
-  const toggle = () => {
-    const next = !open;
-    if (expanded === undefined) setLocalExpanded(next);
-    onExpandedChange?.(next);
-  };
-  return <section className={`wf-work${active ? ' wf-work--active' : ''}`}><div className="wf-work-heading">{active ? <div className="wf-work-label">{leading ?? <Glyph name="terminal" size={16} />}<strong>{title}</strong></div> : <Button type="text" className="wf-work-toggle" onClick={toggle} aria-expanded={open} aria-controls={bodyId}><Glyph name="chevron" className={open ? 'wf-rotate' : undefined} size={14} /><span>{title}</span></Button>}{status}{elapsed && <span className="wf-work-elapsed wf-mono">{elapsed}</span>}</div><div id={bodyId} className="wf-work-body" hidden={!open}>{children}</div></section>;
-}
-export interface WorkStepProps { title: ReactNode; meta?: ReactNode; status?: ReactNode; children?: ReactNode; expanded?: boolean; onExpandedChange?: (expanded: boolean) => void; leading?: ReactNode; mono?: boolean }
-/** `leading` carries the step's state glyph (spinner/check/warning); `meta` is the one-line argument such as a path or command. */
-export function WorkStep({ title, meta, status, children, expanded, onExpandedChange, leading, mono = false }: WorkStepProps) {
-  const [localExpanded, setLocalExpanded] = useState(false);
-  const bodyId = useId();
-  const open = expanded ?? localExpanded;
-  const hasDetail = Boolean(children);
-  return <div className="wf-work-step"><div className="wf-work-step-heading">{leading && <span className="wf-work-step-leading">{leading}</span>}{hasDetail ? <Button type="text" className="wf-work-step-toggle" aria-expanded={open} aria-controls={bodyId} onClick={() => { if (expanded === undefined) setLocalExpanded(!open); onExpandedChange?.(!open); }}><span>{title}</span><Glyph name="chevron" className={open ? 'wf-rotate' : undefined} size={12} /></Button> : <strong className="wf-work-step-title">{title}</strong>}{meta && <span className={`wf-work-step-meta${mono ? ' wf-mono' : ''}`}>{meta}</span>}{status}</div>{hasDetail && <div id={bodyId} className="wf-work-step-detail" hidden={!open}>{children}</div>}</div>;
 }
 
 export interface ApprovalChoice { key: string; label: ReactNode; danger?: boolean; primary?: boolean; onChoose: () => void }

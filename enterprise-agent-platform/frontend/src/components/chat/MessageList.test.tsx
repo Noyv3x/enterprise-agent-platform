@@ -60,7 +60,7 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(screen.getByText("Agent is replying to Administrator")).toBeTruthy();
-    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "AI work" })).toBeNull();
   });
 
   it("offers withdrawal only for the current user's persisted channel messages", () => {
@@ -129,7 +129,7 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Waiting for Administrator to approve access")).toBeTruthy();
     expect(screen.getByText("Access approval")).toBeTruthy();
     expect(screen.queryByText(/combining 2 messages/)).toBeNull();
-    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "AI work" })).toBeNull();
   });
 
   it("shows a normal error message instead of an empty work record", () => {
@@ -141,10 +141,10 @@ describe("MessageList Agent work records", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Agent reply failed");
     expect(screen.getByRole("alert")).toHaveTextContent("Runtime unavailable");
-    expect(screen.queryByRole("region", { name: "View AI work" })).toBeNull();
+    expect(screen.queryByRole("region", { name: "AI work" })).toBeNull();
   });
 
-  it("shows a real tool call as a compact non-interactive row", () => {
+  it("shows a real tool call as an open live record whose running row has no evidence control", () => {
     renderMessageList({
       state: "replying",
       replying_to: { username: "Administrator" },
@@ -161,13 +161,12 @@ describe("MessageList Agent work records", () => {
       ],
     });
 
-    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
-    expect(screen.getByText("Web search")).toBeVisible();
-    expect(screen.getByText("Web search · Running")).toBeVisible();
-    expect(screen.getByText("Running")).toBeVisible();
+    const record = screen.getByRole("region", { name: "AI work" });
+    expect(within(record).getAllByRole("button")[0]).toHaveAttribute("aria-expanded", "true");
     expect(screen.queryByText("Unrelated lifecycle row")).toBeNull();
-    expect(within(screen.getByRole("region", { name: "View AI work" })).getAllByRole("listitem")).toHaveLength(1);
-    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByRole("button")).toBeNull();
+    const row = within(record).getByRole("listitem");
+    expect(row).toHaveTextContent("Web search");
+    expect(within(row).queryByRole("button")).toBeNull();
   });
 
   it("shows finalized phase prose only once in the active compact timeline", () => {
@@ -198,7 +197,7 @@ describe("MessageList Agent work records", () => {
     });
 
     expect(screen.getAllByText(phase)).toHaveLength(1);
-    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
+    expect(screen.queryByRole("region", { name: "AI work" })).not.toBeNull();
   });
 
   it("deduplicates finalized commentary and prefers the live version of a repeated stream identity", () => {
@@ -220,10 +219,10 @@ describe("MessageList Agent work records", () => {
     expect(screen.getAllByText(phase)).toHaveLength(1);
     expect(screen.getAllByText("Current final answer")).toHaveLength(1);
     expect(screen.queryByText("Obsolete partial answer")).toBeNull();
-    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByText("Current final answer")).toBeNull();
+    expect(within(screen.getByRole("region", { name: "AI work" })).queryByText("Current final answer")).toBeNull();
   });
 
-  it("keeps active work non-interactive when the final response starts streaming", () => {
+  it("keeps a folded live record folded and above the answer when the final response starts streaming", () => {
     const initialStatus: AgentStatus = {
       run_id: "run-streaming",
       state: "replying",
@@ -240,9 +239,10 @@ describe("MessageList Agent work records", () => {
       ],
     };
     const view = renderMessageList(initialStatus);
-
-    expect(screen.queryByRole("region", { name: "View AI work" })).not.toBeNull();
-    expect(within(screen.getByRole("region", { name: "View AI work" })).queryByRole("button")).toBeNull();
+    const toggle = () => within(screen.getByRole("region", { name: "AI work" })).getAllByRole("button")[0]!;
+    expect(toggle()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(toggle());
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
 
     act(() => {
       view.store.dispatch({
@@ -263,12 +263,112 @@ describe("MessageList Agent work records", () => {
       });
     });
 
-    const workRecord = screen.queryByRole("region", { name: "View AI work" });
+    const workRecord = screen.getByRole("region", { name: "AI work" });
     const finalAnswer = screen.getByText("Final answer has started");
-    expect(within(workRecord!).queryByRole("button")).toBeNull();
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
     expect(
-      workRecord!.compareDocumentPosition(finalAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
+      workRecord.compareDocumentPosition(finalAnswer) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it("replaces the open live record with a collapsed persisted record when the run settles", () => {
+    const activity: AgentStatus["activity"] = [
+      { stage: "tool.completed", tool: "terminal", tool_call_id: "terminal-settle", tool_status: "completed", parameters: { command: "make report" }, result: "done" },
+    ];
+    const view = renderMessageList({ run_id: "run-settle", state: "replying", activity });
+    expect(within(screen.getByRole("region", { name: "AI work" })).getAllByRole("button")[0]).toHaveAttribute("aria-expanded", "true");
+
+    act(() => {
+      view.store.dispatch({
+        type: "SET_MESSAGES",
+        payload: [{
+          id: 43,
+          author_type: "agent",
+          username: "Agent",
+          content: "Report ready",
+          metadata: { agent_work: { run_id: "run-settle", state: "complete", activity } },
+          created_at: 101,
+        }],
+      });
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "channel", scopeId: "1", status: { run_id: "run-settle", state: "idle" } },
+      });
+    });
+
+    const records = screen.getAllByRole("region", { name: "AI work" });
+    expect(records).toHaveLength(1);
+    expect(within(records[0]!).getByRole("button")).toHaveAttribute("aria-expanded", "false");
+    expect(within(records[0]!).queryByRole("list")).toBeNull();
+    expect(screen.getByText("Report ready")).toBeVisible();
+  });
+
+  it.each([
+    { order: "in one update", steps: ["both"] },
+    { order: "status before message", steps: ["status", "message"] },
+    { order: "message before status", steps: ["message", "status"] },
+  ])("hands focus inside the live record to the persisted record's header ($order)", ({ steps }) => {
+    const activity: AgentStatus["activity"] = [
+      { stage: "tool.completed", tool: "terminal", tool_call_id: "terminal-focus", tool_status: "completed", parameters: { command: "make report" }, result: "done" },
+    ];
+    const view = renderMessageList({ run_id: "run-focus", state: "replying", activity });
+    const liveRow = within(screen.getByRole("region", { name: "AI work" })).getAllByRole("listitem")[0]!;
+    act(() => within(liveRow).getByRole("button").focus());
+
+    const persist = () => view.store.dispatch({
+      type: "SET_MESSAGES",
+      payload: [{
+        id: 44,
+        author_type: "agent",
+        username: "Agent",
+        content: "Report ready",
+        metadata: { agent_work: { run_id: "run-focus", state: "complete", activity } },
+        created_at: 101,
+      }],
+    });
+    const settle = () => view.store.dispatch({
+      type: "SET_AGENT_STATUS",
+      payload: { mode: "channel", scopeId: "1", status: { run_id: "run-focus", state: "idle" } },
+    });
+    for (const step of steps) {
+      act(() => {
+        if (step !== "status") persist();
+        if (step !== "message") settle();
+      });
+    }
+
+    const record = screen.getByRole("region", { name: "AI work" });
+    expect(within(record).getByRole("button")).toHaveAttribute("aria-expanded", "false");
+    expect(within(record).getByRole("button")).toHaveFocus();
+  });
+
+  it("leaves focus the user placed outside the live record alone when the run settles", () => {
+    const activity: AgentStatus["activity"] = [
+      { stage: "tool.completed", tool: "terminal", tool_call_id: "terminal-outside", tool_status: "completed", parameters: { command: "make report" }, result: "done" },
+    ];
+    const view = renderMessageList({ run_id: "run-outside", state: "replying", activity });
+    const log = screen.getByRole("log");
+    act(() => log.focus());
+
+    act(() => {
+      view.store.dispatch({
+        type: "SET_MESSAGES",
+        payload: [{
+          id: 45,
+          author_type: "agent",
+          username: "Agent",
+          content: "Report ready",
+          metadata: { agent_work: { run_id: "run-outside", state: "complete", activity } },
+          created_at: 101,
+        }],
+      });
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "channel", scopeId: "1", status: { run_id: "run-outside", state: "idle" } },
+      });
+    });
+
+    expect(log).toHaveFocus();
   });
 
   it("keeps persisted Agent updates inside work while the final answer stays separate", () => {
@@ -306,7 +406,7 @@ describe("MessageList Agent work records", () => {
       ],
     );
 
-    const workRecord = screen.queryByRole("region", { name: "View AI work" });
+    const workRecord = screen.queryByRole("region", { name: "AI work" });
     const finalAnswer = screen.getByText("Persisted final answer");
     expect(workRecord).not.toBeNull();
     if (!workRecord) throw new Error("Expected persisted work record");
@@ -319,9 +419,7 @@ describe("MessageList Agent work records", () => {
 
     fireEvent.click(disclosure!);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
-    const updateTitle = within(workRecord).getByText("AI update");
-    const updateRow = updateTitle.closest<HTMLElement>("[role=listitem]");
-    expect(updateRow).not.toBeNull();
+    const updateRow = within(workRecord).getAllByRole("listitem").find((item) => within(item).queryByText("AI update"));
     if (!updateRow) throw new Error("Expected persisted Agent update row");
     const updateDisclosure = within(updateRow).getByRole("button");
     expect(updateDisclosure).toHaveAttribute("aria-expanded", "false");

@@ -524,20 +524,25 @@ export const chatMessages = defineMessages({
     en: "Agent reply failed",
     "zh-TW": "Agent 回覆失敗",
   },
-  "chat.work.view": {
-    "zh-CN": "查看 AI 工作过程",
-    en: "View AI work",
-    "zh-TW": "檢視 AI 工作過程",
+  "chat.work.label": {
+    "zh-CN": "AI 工作过程",
+    en: "AI work",
+    "zh-TW": "AI 工作過程",
   },
-  "chat.work.waiting": {
-    "zh-CN": "等待 AI 运行过程",
-    en: "Waiting for AI activity",
-    "zh-TW": "等待 AI 執行過程",
+  "chat.work.working": {
+    "zh-CN": "正在处理",
+    en: "Working",
+    "zh-TW": "正在處理",
   },
-  "chat.work.records": {
-    "zh-CN": { other: "{count} 条工作记录" },
-    en: { one: "{count} work record", other: "{count} work records" },
-    "zh-TW": { other: "{count} 條工作記錄" },
+  "chat.work.awaitingApproval": {
+    "zh-CN": "等待审批",
+    en: "Awaiting approval",
+    "zh-TW": "等待核准",
+  },
+  "chat.work.steps": {
+    "zh-CN": { other: "{count} 步" },
+    en: { one: "{count} step", other: "{count} steps" },
+    "zh-TW": { other: "{count} 步" },
   },
   "chat.work.summary.fileActions": {
     "zh-CN": { other: "{count} 个文件操作" },
@@ -575,11 +580,6 @@ export const chatMessages = defineMessages({
     "zh-TW": "已用時間 {time}",
   },
   "chat.activity.toolFallback": { "zh-CN": "工具", en: "tool", "zh-TW": "工具" },
-  "chat.activity.currentTool": {
-    "zh-CN": "{tool} · {status}",
-    en: "{tool} · {status}",
-    "zh-TW": "{tool} · {status}",
-  },
   "chat.activity.state.running": { "zh-CN": "运行中", en: "Running", "zh-TW": "執行中" },
   "chat.activity.state.completed": { "zh-CN": "已完成", en: "Completed", "zh-TW": "已完成" },
   "chat.activity.state.failed": { "zh-CN": "失败", en: "Failed", "zh-TW": "失敗" },

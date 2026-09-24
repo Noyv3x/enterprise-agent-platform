@@ -100,6 +100,25 @@ describe("FileComputerView", () => {
     expect(vi.mocked(fetchPreviewFile).mock.calls[1]?.[1]).toBe("notes.md");
   });
 
+  it("rejects an uncommitted draft returned for a completed file", async () => {
+    vi.mocked(fetchPreviewFile).mockResolvedValue({
+      workspace_path: "notes.md",
+      content: "Uncommitted stopped content",
+      source: "draft",
+      draft_kind: "file",
+      revision: "draft:write-1:3",
+      truncated: false,
+      encoding: "utf-8",
+    });
+    render(view({
+      tool: "write_file", workspace_path: "notes.md", target: "sandbox",
+      status: "completed", tool_call_id: "write-1", revision: "write-1:completed",
+    }));
+    expect(await screen.findByText("The file could not be loaded.")).toBeVisible();
+    expect(screen.queryByText("Uncommitted stopped content")).not.toBeInTheDocument();
+    expect(screen.queryByText("Uncommitted file draft")).not.toBeInTheDocument();
+  });
+
   it("bounds automatic retries while a running atomic write remains unavailable", async () => {
     vi.useFakeTimers();
     vi.mocked(fetchPreviewFile).mockRejectedValue(new ApiError("not found", 404));

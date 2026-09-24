@@ -36,6 +36,10 @@ export interface ComputerSurface {
   searchHits: ComputerSearchHit[];
   searchTool: string;
   present: ComputerPresentClue | null;
+  /** Retained work can outlive the resource that supplied its preview. */
+  unavailable?: boolean;
+  /** False keeps completed terminal output local without polling expired processes. */
+  terminalPolling?: boolean;
 }
 
 const EMPTY_SURFACE: ComputerSurface = {
@@ -320,5 +324,58 @@ export function deriveComputerSurface({
     searchHits,
     searchTool,
     present,
+  };
+}
+
+/** Keep only the observed run, accepting final metadata from its own settled message. */
+export function retainComputerSurface(
+  observed: ComputerSurface,
+  runIds: readonly string[],
+  messages: Message[],
+  availability: ComputerAvailability,
+): ComputerSurface {
+  let finalSurface: ComputerSurface | null = null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const work = message.metadata?.agent_work;
+    if (message.author_type !== "agent" || message.metadata?.needs_review
+      || (work?.state !== "complete" && work?.state !== "error")
+      || !work.run_id || !runIds.includes(work.run_id)) continue;
+    finalSurface = deriveComputerSurface({
+      status: {...work, state:"replying"},
+      messages: [message],
+      availability,
+    });
+    // Completed work rows need not repeat bounded projected search results.
+    // Keep the observed results unless final metadata identifies a different call.
+    if (finalSurface.mode === "search" && observed.mode === "search" && !work.computer?.search
+      && (!finalSurface.latestStep?.tool_call_id || !observed.latestStep?.tool_call_id
+        || finalSurface.latestStep.tool_call_id === observed.latestStep.tool_call_id)) {
+      finalSurface = {...finalSurface,searchHits:observed.searchHits,searchTool:observed.searchTool};
+    }
+    break;
+  }
+  const final = finalSurface?.mode ? finalSurface : observed;
+  const finished = (status: string | undefined) => ["completed", "complete", "done", "failed", "error", "cancelled"].includes(String(status || "").toLowerCase());
+  const latestStep = finished(final.latestStep?.tool_status) ? final.latestStep : null;
+  const file = finished(final.file?.status) ? final.file : null;
+  const present = finished(final.present?.status) ? final.present : null;
+  const terminalPolling = availability.runningTerminalCount > 0;
+  const unavailable = final.mode === "browser" ? !availability.browserActive
+    : final.mode === "terminal" ? !terminalPolling && !latestStep
+    : final.mode === "present" ? !availability.presentAvailable
+    : final.mode === "file" ? !file
+    : !final.mode;
+  return {
+    ...final,
+    visible: true,
+    live: false,
+    runId: observed.runId,
+    startedAt: observed.startedAt,
+    latestStep,
+    file,
+    present,
+    unavailable,
+    terminalPolling,
   };
 }

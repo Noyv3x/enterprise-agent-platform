@@ -209,6 +209,6 @@ describe("MessageBody", () => {
     renderLocalized(<MessageBubble message={message} />);
 
     expect(screen.getByText("Answered directly.")).toBeTruthy();
-    expect(screen.queryByText("View AI work")).toBeNull();
+    expect(screen.queryByRole("region", { name: "AI work" })).toBeNull();
   });
 });

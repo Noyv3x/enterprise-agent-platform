@@ -2,7 +2,7 @@
 
 import "@testing-library/jest-dom/vitest";
 import { ConfigProvider } from "antd";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { createStore } from "../../lib/store";
@@ -35,7 +35,7 @@ describe("AgentActivity", () => {
     localStorage.clear();
   });
 
-  it("shows the actual browser work without interactive controls", () => {
+  it("shows the running browser step inside the open live record without an evidence control", () => {
     render(
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
@@ -46,7 +46,10 @@ describe("AgentActivity", () => {
       </ConfigProvider>,
     );
 
-    expect(screen.getByText("Browser")).toBeVisible();
-    expect(screen.queryByRole("button")).toBeNull();
+    const record = screen.getByRole("region", { name: "AI work" });
+    expect(within(record).getAllByRole("button")[0]).toHaveAttribute("aria-expanded", "true");
+    const row = within(record).getByRole("listitem");
+    expect(row).toHaveTextContent("Browser");
+    expect(within(row).queryByRole("button")).toBeNull();
   });
 });

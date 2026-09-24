@@ -10,8 +10,8 @@ describe("chat translations", () => {
   it("uses English plural forms for interface counts", () => {
     expect(translate("en", "nav.topbar.channelMessages", { count: 1 })).toBe("1 message");
     expect(translate("en", "nav.topbar.channelMessages", { count: 2 })).toBe("2 messages");
-    expect(translate("en", "chat.work.records", { count: 1 })).toBe("1 work record");
-    expect(translate("en", "chat.work.records", { count: 3 })).toBe("3 work records");
+    expect(translate("en", "chat.work.steps", { count: 1 })).toBe("1 step");
+    expect(translate("en", "chat.work.steps", { count: 3 })).toBe("3 steps");
   });
 
   it("localizes structured Agent state while preserving the user name", () => {

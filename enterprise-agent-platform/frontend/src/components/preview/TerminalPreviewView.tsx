@@ -188,13 +188,15 @@ function terminalTone(process: TerminalPreviewProcess): "info" | "warning" | "da
 interface CompactTerminalPreviewProps {
   scope: AgentPreviewScope;
   fallbackStep?: ActivityStep | null;
+  polling?: boolean;
 }
 
 /** A single passive consumer of the authoritative terminal tail. */
-export function CompactTerminalPreview({ scope, fallbackStep }: CompactTerminalPreviewProps) {
+export function CompactTerminalPreview({ scope, fallbackStep, polling = true }: CompactTerminalPreviewProps) {
   const { t } = useI18n();
-  const { state } = useTerminalPreviews(scope);
-  const process = terminalDisplayProcesses(state.processes, fallbackStep)[0] || null;
+  const { state } = useTerminalPreviews(polling ? scope : null);
+  const process = terminalDisplayProcesses(polling ? state.processes : [], fallbackStep)
+    .find(item => polling || !terminalProcessRunning(item)) || null;
   return (
     <div className="wf-terminal-compact">
       {process ? (
@@ -210,7 +212,7 @@ export function CompactTerminalPreview({ scope, fallbackStep }: CompactTerminalP
         </ComputerOutput>
       ) : state.error ? (
         <Notice tone="warning" title={state.error} />
-      ) : state.loading ? (
+      ) : polling && state.loading ? (
         <div role="status" aria-label={t("computer.loading")}><LoadingState label={t("computer.loading")} /></div>
       ) : (
         <EmptyState compact title={t("terminalPreview.noTerminals")} />
@@ -222,18 +224,20 @@ export function CompactTerminalPreview({ scope, fallbackStep }: CompactTerminalP
 interface TerminalPreviewViewProps {
   scope: AgentPreviewScope;
   fallbackStep?: ActivityStep | null;
+  polling?: boolean;
 }
 
-export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewViewProps) {
+export function TerminalPreviewView({ scope, fallbackStep, polling = true }: TerminalPreviewViewProps) {
   const { t, locale } = useI18n();
-  const { state, refresh } = useTerminalPreviews(scope);
+  const { state, refresh } = useTerminalPreviews(polling ? scope : null);
   const [selectedProcessId, setSelectedProcessId] = useState("");
   const terminalRef = useRef<HTMLPreElement>(null);
   const followOutput = useRef(true);
   const pinnedProcessId = useRef("");
   const processes = useMemo(
-    () => terminalDisplayProcesses(state.processes, fallbackStep),
-    [fallbackStep, state.processes],
+    () => terminalDisplayProcesses(polling ? state.processes : [], fallbackStep)
+      .filter(item => polling || !terminalProcessRunning(item)),
+    [fallbackStep, polling, state.processes],
   );
 
   const process = processes.find((item) => item.id === selectedProcessId)
@@ -313,7 +317,7 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
             >{transcript}</pre>
           </ComputerOutput>
         </div>
-      ) : state.loading ? (
+      ) : polling && state.loading ? (
         <LoadingState label={t("preview.connecting")} />
       ) : !state.error ? (
         <EmptyState title={t("terminalPreview.noTerminals")} description={t("terminalPreview.noTerminalsDetail")} />
@@ -321,11 +325,11 @@ export function TerminalPreviewView({ scope, fallbackStep }: TerminalPreviewView
       <footer className="wf-terminal-controls">
         <div className="wf-terminal-meta">
           <StatusMark>{t("preview.readOnly")}</StatusMark>
-          <PreviewStatus connection={state.connection} idle={idle && !state.error} />
+          {polling ? <PreviewStatus connection={state.connection} idle={idle && !state.error} /> : null}
           <span>{t("terminalPreview.count", { count: processes.length })}</span>
           {capturedAt ? <span>{t("preview.updatedAt", { time: capturedAt })}</span> : null}
         </div>
-        <Button onClick={refresh}>{t("preview.refresh")}</Button>
+        {polling ? <Button onClick={refresh}>{t("preview.refresh")}</Button> : null}
       </footer>
     </section>
   );

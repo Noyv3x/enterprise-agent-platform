@@ -17,6 +17,11 @@ export const previewMessages = defineMessages({
   "computer.mode.present": { "zh-CN": "呈现页", en: "Page", "zh-TW": "呈現頁" },
   "computer.loading": { "zh-CN": "正在准备 AI 的电脑", en: "Preparing the AI computer", "zh-TW": "正在準備 AI 的電腦" },
   "computer.waiting": { "zh-CN": "等待工作画面", en: "Waiting for a work preview", "zh-TW": "等待工作畫面" },
+  "computer.stoppedPreview": {
+    "zh-CN": "工作已停止，此预览已不可用。",
+    en: "Work has stopped. This preview is no longer available.",
+    "zh-TW": "工作已停止，此預覽已無法使用。",
+  },
   "computer.retry": { "zh-CN": "重试", en: "Retry", "zh-TW": "重試" },
   "computer.file.loading": { "zh-CN": "正在读取文件…", en: "Loading file…", "zh-TW": "正在讀取檔案…" },
   "computer.file.empty": { "zh-CN": "没有可显示的文件文本。", en: "No file text is available.", "zh-TW": "沒有可顯示的檔案文字。" },

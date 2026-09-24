@@ -25,7 +25,7 @@ export function ComputerPip() {
   const preview=useChatPreviewContext();
   const surface=preview?.computerSurface;
   const active=Boolean(preview?.scope && surface?.visible && !preview.computerDrawerOpen && !preview.computerPipDismissed);
-  const {state}=useBrowserPreview(active && surface?.mode === "browser" ? preview?.scope || null : null);
+  const {state}=useBrowserPreview(active && !surface?.unavailable && surface?.mode === "browser" ? preview?.scope || null : null);
   if (!active || !preview?.scope || !surface) return null;
   const modeLabel=surface.mode ? t(MODE_LABELS[surface.mode]) : t("computer.waiting");
   const activity=t(surface.live ? "computer.pip.live" : "preview.readOnly");
@@ -33,11 +33,12 @@ export function ComputerPip() {
   let content=surface.mode
     ? <LoadingState label={t("computer.loading")} />
     : <span className="wf-computer-pip-waiting">{t("computer.waiting")}</span>;
-  if (surface.mode === "file" && (surface.file?.path || surface.file?.workspace_path)) content=<FileComputerView scope={preview.scope} runId={surface.runId} file={surface.file} compact />;
+  if (surface.mode === "file" && (surface.file?.path || surface.file?.workspace_path)) content=<FileComputerView key={surface.live ? "live" : "stopped"} scope={preview.scope} runId={surface.runId} file={surface.file} compact />;
   else if (surface.mode === "browser" && state.frameUrl) content=<img className="wf-computer-thumbnail" src={state.frameUrl} alt={t("browserPreview.frameAlt")} draggable={false} />;
   else if (surface.mode === "search" && (surface.searchHits.length || !surface.live || !running)) content=<SearchComputerView hits={surface.searchHits} compact />;
   else if (surface.mode === "present") content=<PresentComputerView scope={preview.scope} present={surface.present} compact />;
-  else if (surface.mode === "terminal") content=<CompactTerminalPreview scope={preview.scope} fallbackStep={surface.latestStep} />;
+  else if (surface.mode === "terminal") content=<CompactTerminalPreview scope={preview.scope} polling={surface.terminalPolling} fallbackStep={surface.latestStep} />;
+  if (surface.unavailable) content=<span className="wf-computer-pip-waiting">{t("computer.stoppedPreview")}</span>;
   return <div className="wf-computer-compact">
     <div className="wf-computer-pip-heading"><strong>{t("computer.title")}</strong><Glyph name="expand" size={14} /></div>
     <div className="wf-computer-peek" aria-hidden="true" inert>{content}</div>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchPreviewFile } from "../../data/previewActions";
+import { t } from "../../i18n";
 import type {
   AgentPreviewFileDraftKind,
   AgentPreviewFileSource,
@@ -214,6 +215,9 @@ export function useComputerFilePreview(
       try {
         const result = await fetchPreviewFile(requestScope, workspacePath, requestController.signal);
         if (stopped || requestController.signal.aborted) return;
+        // A settled tool can only display committed workspace content, even if
+        // the preview endpoint still exposes a draft during status propagation.
+        if (!target.running && result.source === "draft") throw new Error(t("computer.file.failed"));
         const desired = pending === null && desiredRequestKeyRef.current === target.key;
         const draftRevision = result.source === "draft" ? result.revision : "";
         // A newer lifecycle revision arrived while this read was in flight. For a
