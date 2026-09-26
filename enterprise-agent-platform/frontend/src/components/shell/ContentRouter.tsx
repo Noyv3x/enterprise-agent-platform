@@ -24,7 +24,7 @@ export function ContentRouter() {
   }, [dispatch, effective, view]);
 
   return <div className="wf-route" key={effective}>
-    <Suspense fallback={<LoadingState label={t("common.loading")} />}>
+    <Suspense fallback={<div className="wf-page"><LoadingState label={t("common.loading")} /></div>}>
       {effective === "settings" ? <SettingsView /> : effective === "admin" ? <AdminPanel /> : <ChatView mode={effective === "private" ? "private" : "channel"} />}
     </Suspense>
     {effective === "private" && telegramExpanded ? <TelegramLinkPopover /> : null}

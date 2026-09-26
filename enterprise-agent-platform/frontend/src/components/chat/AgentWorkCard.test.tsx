@@ -511,4 +511,29 @@ describe("AgentWorkCard", () => {
       expect(within(detail).getByRole("region", { name: "Error" })).toHaveTextContent(evidence);
     }
   });
+
+  it("says a finished run had failed steps without expanding it", () => {
+    renderCard({
+      run_id: "run-partial",
+      state: "complete",
+      activity: [
+        activityStep({ stage: "tool", tool: "read_file", tool_call_id: "read-ok", tool_status: "completed", parameters: { path: "data/vendors.csv" } }),
+        activityStep({ stage: "tool", tool: "web", tool_call_id: "web-failed", tool_status: "failed", result: "timeout" }),
+      ],
+    }, false);
+
+    expect(traceToggle()).toHaveAttribute("aria-expanded", "false");
+    expect(traceToggle()).toHaveAccessibleName(/1 failed/);
+    expect(within(workCard()).getByText("1 failed")).toBeVisible();
+  });
+
+  it("adds no failure count when every step succeeded", () => {
+    renderCard({
+      run_id: "run-clean",
+      state: "complete",
+      activity: [activityStep({ stage: "tool", tool: "read_file", tool_call_id: "read-clean", tool_status: "completed", parameters: { path: "a.txt" } })],
+    }, false);
+
+    expect(traceToggle()).not.toHaveAccessibleName(/failed/);
+  });
 });

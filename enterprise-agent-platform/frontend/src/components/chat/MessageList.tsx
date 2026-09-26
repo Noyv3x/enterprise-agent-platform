@@ -16,6 +16,7 @@ import {AgentTyping} from "./AgentTyping";
 import {AgentWorkCard,hasAgentProcessSteps} from "./AgentWorkCard";
 import {MessageBubble} from "./MessageBubble";
 import {TypingUsers} from "./TypingUsers";
+import {useSettlingRun} from "./useSettlingRun";
 const EMPTY_TYPING:TypingUser[]=[];
 function currentTurnStreams(status: AgentStatus): StreamMsg[] {
   const active = status.stream_message?.content ? status.stream_message : null;
@@ -144,10 +145,12 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
     [scopeId, store],
   );
   const currentStreams = status ? currentTurnStreams(status) : [];
-  const streamCount = currentStreams.length;
+  const settling = useSettlingRun(scopeKey, status, currentStreams, messages);
+  const streamCount = currentStreams.length + (settling?.streams.length || 0);
   const contentRevision =
     messages.reduce((total, message) => total + (message.content?.length || 0), 0) +
     currentStreams.reduce((total, stream) => total + (stream.content?.length || 0), 0) +
+    (settling?.streams || []).reduce((total, stream) => total + (stream.content?.length || 0), 0) +
     (status?.activity || []).reduce(
       (total, step) => total + (step.label?.length || 0) + (step.detail?.length || 0) + (step.line?.length || 0),
       0,
@@ -162,8 +165,9 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   );
 
   const active=isAgentActive(status);
-  const empty=!messages.length&&!active&&status?.state!=="error";
+  const empty=!messages.length&&!active&&!settling&&status?.state!=="error";
   const streamMessages=status&&active?agentStreamingMessages(status,mode,scopeType,scopeId,t,currentStreams):[];
+  const settlingMessages=settling?agentStreamingMessages(settling.status,mode,scopeType,scopeId,t,settling.streams).map(message=>({...message,metadata:{...message.metadata,streaming:false}})):[];
   const content=noChannel?<ConversationEmpty title={t("chat.empty.noChannelTitle")} description={t("chat.empty.noAccessibleChannelText")}/>:empty?<ConversationEmpty
     title={mode==="private"?t("chat.empty.privateTitle"):t("chat.empty.channelTitle")}
     description={mode==="private"?t("chat.empty.privateText"):canChat?t("chat.empty.channelText"):t("chat.empty.readOnlyChannelText")}/>:<>
@@ -172,6 +176,10 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
       const canWithdraw=mode==="channel"&&canChat&&message.author_type==="user"&&message.user_id!=null&&currentUserId!=null&&String(message.user_id)===String(currentUserId)&&!message.metadata?.local_pending;
       return <MessageBubble key={String(message.id)} message={message} canWithdraw={canWithdraw} withdrawing={withdrawingMessageId===String(message.id)} hideAuthorName={mode==="private"} onWithdraw={canWithdraw?handleWithdraw:undefined}/>;
     })}
+    {settling&&<>
+      {hasAgentProcessSteps(settling.status)&&<AgentWorkCard work={settling.status} active={false} settling/>}
+      {settlingMessages.map(message=><MessageBubble key={String(message.id)} message={message} hideAuthorName={mode==="private"}/>)}
+    </>}
     {active&&status&&<>
       {hasAgentProcessSteps(status)?<AgentActivity status={status}/>:<AgentTyping status={status}/>}
       {status.approval&&canApprove&&<AgentApprovalPrompt approval={status.approval} mode={mode} scopeId={scopeId}/>}

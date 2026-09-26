@@ -1,5 +1,3 @@
-.wf-message-metadata{display:flex;align-items:center;gap:var(--wf-space-2) var(--wf-space-3);flex-wrap:wrap;min-width:0}
-.wf-message-metadata time{color:var(--wf-muted)}
 .wf-message--streaming .wf-message-prose>:last-child:not(ul,ol,figure,table,pre)::after,.wf-message--streaming .wf-message-prose>:is(ul,ol):last-child>li:last-child::after,.wf-message--streaming .wf-message-plaintext::after{content:"";display:inline-block;inline-size:.5em;block-size:1em;margin-inline-start:.15em;vertical-align:-.15em;border-radius:1px;background:var(--wf-accent);animation:wf-caret 1s steps(2,start) infinite}
 @keyframes wf-caret{to{visibility:hidden}}
 .wf-history-action{display:flex;justify-content:center;padding-block:8px}

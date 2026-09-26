@@ -37,10 +37,15 @@ export function ConversationEmpty({ title, description }: ConversationEmptyProps
   );
 }
 
-export interface MessageEntryProps { kind: 'user' | 'agent' | 'system'; author?: ReactNode; timestamp?: ReactNode; status?: ReactNode; actions?: ReactNode; children: ReactNode; attachments?: ReactNode; work?: ReactNode; label?: string; streaming?: boolean }
-/** `streaming` only adds a caret after the last received characters; it never fabricates text or motion beyond that mark. */
-export function MessageEntry({ kind, author, timestamp, status, actions, children, attachments, work, label, streaming = false }: MessageEntryProps) {
-  return <article className={`wf-message wf-message--${kind}${streaming ? ' wf-message--streaming' : ''}`} aria-label={label}>{(author || timestamp || status) && <header className="wf-message-meta">{author && <strong className="wf-message-author">{author}</strong>}{timestamp && <span className="wf-message-time">{timestamp}</span>}{status}</header>}{work && <div className="wf-message-work">{work}</div>}<div className="wf-message-body">{children}</div>{attachments && <div className="wf-message-attachments">{attachments}</div>}{actions && <footer className="wf-message-actions">{actions}</footer>}</article>;
+export interface MessageEntryProps { kind: 'user' | 'agent' | 'system'; header?: ReactNode; footnote?: ReactNode; actions?: ReactNode; children: ReactNode; attachments?: ReactNode; work?: ReactNode; label?: string; streaming?: boolean }
+/**
+ * `header` carries only what must precede the content (author, attention marks) and is omitted when empty.
+ * `footnote` (time or live progress) and `actions` share one footer row that exists in every state, so a
+ * live message, its settling copy and the persisted record keep the same geometry.
+ * `streaming` only adds a caret after the last received characters; it never fabricates text or motion beyond that mark.
+ */
+export function MessageEntry({ kind, header, footnote, actions, children, attachments, work, label, streaming = false }: MessageEntryProps) {
+  return <article className={`wf-message wf-message--${kind}${streaming ? ' wf-message--streaming' : ''}`} aria-label={label}>{header && <header className="wf-message-meta">{header}</header>}{work && <div className="wf-message-work">{work}</div>}<div className="wf-message-content"><div className="wf-message-body">{children}</div>{attachments && <div className="wf-message-attachments">{attachments}</div>}</div>{(footnote || actions) && <footer className="wf-message-footer">{footnote && <span className="wf-message-footnote">{footnote}</span>}{actions && <span className="wf-message-actions">{actions}</span>}</footer>}</article>;
 }
 export interface AttachmentSlotProps { name: ReactNode; meta?: ReactNode; preview?: ReactNode; actions?: ReactNode; status?: ReactNode }
 export function AttachmentSlot({ name, meta, preview, actions, status }: AttachmentSlotProps) {
@@ -61,7 +66,7 @@ export function ApprovalPanel({ title, description, detail, choices, busy = fals
   return <section className="wf-approval" aria-labelledby={headingId} aria-busy={busy}><header><span className="wf-approval-sign"><Glyph name="lock" size={16} /></span><h3 id={headingId}>{title}</h3>{subject && <span className="wf-approval-subject">{subject}</span>}{status && <span className="wf-approval-status">{status}</span>}</header>{description && <div className="wf-approval-description">{description}</div>}{detail && <div className="wf-approval-detail">{detail}</div>}<div className="wf-actions wf-approval-actions">{choices.map((choice) => <Button key={choice.key} type={choice.primary ? 'primary' : 'default'} danger={choice.danger} disabled={busy} onClick={choice.onChoose}>{choice.label}</Button>)}</div></section>;
 }
 
-export interface ContextUsageProps { label: string; usedLabel: string; limitLabel: string; used: number; max: number; percent: number; details?: ReactNode }
+export interface ContextUsageProps { label: string; usedLabel: string; limitLabel: string; used: string; max: string; percent: number; details?: ReactNode }
 export function ContextUsage({ label, usedLabel, limitLabel, used, max, percent, details }: ContextUsageProps) {
   const boundedPercent = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : 0;
   return <section className="wf-context"><div className="wf-context-heading"><strong>{label}</strong><span className="wf-mono">{percent}%</span></div><div className="wf-context-meter" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={boundedPercent} aria-valuetext={`${usedLabel}: ${used}; ${limitLabel}: ${max}`}><span style={{ width: `${boundedPercent}%` }} /></div><dl className="wf-context-values"><div><dt>{usedLabel}</dt><dd>{used}</dd></div><div><dt>{limitLabel}</dt><dd>{max}</dd></div></dl>{details && <div className="wf-context-details">{details}</div>}</section>;

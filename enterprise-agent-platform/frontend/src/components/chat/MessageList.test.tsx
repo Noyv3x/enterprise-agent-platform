@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
@@ -303,6 +303,85 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Report ready")).toBeVisible();
   });
 
+  it("keeps the finished reply on screen until its persisted message arrives", () => {
+    const activity: AgentStatus["activity"] = [
+      { stage: "tool.completed", tool: "terminal", tool_call_id: "terminal-gap", tool_status: "completed", parameters: { command: "make report" }, result: "done" },
+    ];
+    const live: AgentStatus = {
+      run_id: "run-gap",
+      state: "replying",
+      updated_at: 100,
+      activity,
+      stream_message: { id: "stream-gap", content: "Quarterly report is ready", updated_at: 100 },
+    };
+    const view = renderMessageList(live, [], "private");
+    expect(screen.getByText("Quarterly report is ready")).toBeVisible();
+
+    act(() => {
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "private", scopeId: "1", status: { run_id: "", state: "idle", updated_at: 101 } },
+      });
+    });
+    expect(screen.getByText("Quarterly report is ready")).toBeVisible();
+    expect(screen.getAllByRole("region", { name: "AI work" })).toHaveLength(1);
+
+    act(() => {
+      view.store.dispatch({
+        type: "SET_PRIVATE_MESSAGES",
+        payload: [{
+          id: 45,
+          author_type: "agent",
+          username: "Private Agent",
+          content: "Quarterly report is ready",
+          metadata: { agent_work: { run_id: "run-gap", state: "complete", activity } },
+          created_at: 101,
+        }],
+      });
+    });
+    expect(screen.getAllByText("Quarterly report is ready")).toHaveLength(1);
+    expect(screen.getAllByRole("region", { name: "AI work" })).toHaveLength(1);
+  });
+
+  it("keeps the finished reply above the next queued run until it is persisted", () => {
+    const view = renderMessageList({
+      run_id: "run-first",
+      state: "replying",
+      updated_at: 100,
+      stream_message: { id: "stream-first", content: "First answer", updated_at: 100 },
+    });
+    act(() => {
+      view.store.dispatch({
+        type: "SET_AGENT_STATUS",
+        payload: { mode: "channel", scopeId: "1", status: { run_id: "run-second", state: "queued", updated_at: 101, queued_count: 1 } },
+      });
+    });
+    expect(screen.getByText("First answer")).toBeVisible();
+  });
+
+  it("drops an unpersisted finished reply after the settle window", () => {
+    vi.useFakeTimers();
+    try {
+      const view = renderMessageList({
+        run_id: "run-lost",
+        state: "replying",
+        updated_at: 100,
+        stream_message: { id: "stream-lost", content: "Never persisted", updated_at: 100 },
+      });
+      act(() => {
+        view.store.dispatch({
+          type: "SET_AGENT_STATUS",
+          payload: { mode: "channel", scopeId: "1", status: { run_id: "", state: "idle", updated_at: 101 } },
+        });
+      });
+      expect(screen.getByText("Never persisted")).toBeVisible();
+      act(() => { vi.advanceTimersByTime(20_000); });
+      expect(screen.queryByText("Never persisted")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     { order: "in one update", steps: ["both"] },
     { order: "status before message", steps: ["status", "message"] },
@@ -431,7 +510,7 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Persisted final answer")).toBeVisible();
   });
 
-  it("hides the Personal AI author label beside agent avatars", () => {
+  it("shows no author names in Personal AI, where both sides are implied", () => {
     renderMessageList(
       { state: "idle" },
       [
@@ -459,8 +538,9 @@ describe("MessageList Agent work records", () => {
       "private",
     );
 
-    expect(screen.getByText("Administrator")).toBeVisible();
+    expect(screen.getByText("hello")).toBeVisible();
     expect(screen.getByText("here is the answer")).toBeVisible();
+    expect(screen.queryByText("Administrator")).toBeNull();
     expect(screen.queryByText("Personal AI")).toBeNull();
   });
 

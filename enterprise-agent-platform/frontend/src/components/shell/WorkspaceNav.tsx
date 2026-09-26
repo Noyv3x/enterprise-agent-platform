@@ -8,7 +8,7 @@ import { useStore, useStoreHandle } from "../../store/useStore";
 import type { Channel } from "../../types";
 import { Dialog } from "../common/Dialog";
 import { Icon } from "../common/Icon";
-import { FormFooter, Notice, WorkspaceNav as Navigation, type NavigationGroup } from "../ui/fieldwork";
+import { FormFooter, Glyph, Notice, WorkspaceNav as Navigation, type NavigationGroup } from "../ui/fieldwork";
 import { ChannelCreateForm } from "./ChannelCreateForm";
 import { preloadRoute } from "./routePreload";
 
@@ -132,15 +132,18 @@ export function WorkspaceNav({ onDelete, deleteBusy }: { onDelete: (channel: Cha
     ],
   });
   groups.push({
-    key: "channels", label: <span><Icon name="users" /> {t("nav.channels")}</span>,
+    key: "channels", label: <><Icon name="users" size={16} />{t("nav.channels")}</>,
     action: canManage ? <ChannelCreateForm /> : undefined,
     items: channels.length ? channels.map(channel => ({
-      key: `channel:${String(channel.id)}`, label: channel.name,
-      description: <span className="wf-stack-tight"><span>{t("nav.channels.memberVisible")}</span>{channel.description ? <span>{channel.description}</span> : null}</span>,
+      key: `channel:${String(channel.id)}`,
+      // One visible line; visibility stays in the accessible name and the description in the tooltip.
+      label: channel.name,
+      ariaLabel: `${channel.name} (${t("nav.channels.memberVisible")})`,
+      title: channel.description || undefined,
       icon: <Icon name="hash" />,
       trailing: canManage ? <Dropdown trigger={["click"]} disabled={deleteBusy}
         menu={{ items: [{ key: "delete", label: t("nav.channel.delete"), danger: true }], onClick: () => onDelete(channel) }}>
-        <Button type="text" icon={<Icon name="menu" />} aria-label={t("nav.channel.manage", { name: channel.name })} disabled={deleteBusy} />
+        <Button type="text" size="small" icon={<Glyph name="more" size={16} />} aria-label={t("nav.channel.manage", { name: channel.name })} disabled={deleteBusy} />
       </Dropdown> : undefined,
     })) : [{ key: "no-channels", label: t("nav.channels.empty"), description: t("nav.channels.visibility"), disabled: true }],
   });

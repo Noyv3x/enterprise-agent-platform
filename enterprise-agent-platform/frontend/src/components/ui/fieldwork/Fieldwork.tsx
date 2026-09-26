@@ -25,6 +25,8 @@ const brandForeground = { light: '#fdfefe', dark: '#030405' } as const;
 const bodyFont = '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
 const SurfaceContext = createContext<(() => HTMLElement) | undefined>(undefined);
 const NavigationCloseContext = createContext<(() => void) | undefined>(undefined);
+/** Chinese UI copy is written as intended; Ant must not insert a space into two-character labels. */
+const buttonConfig = { autoInsertSpace: false } as const;
 
 function rgb(hex: string): number[] {
   return [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16));
@@ -124,7 +126,7 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
   return (
     <div ref={root} className="wf-root" data-wf-theme={mode} style={design.variables}>
       <SurfaceContext.Provider value={getContainer}>
-        <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer}>
+        <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}>
           <MotionProvider motion={motion}>
             <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
           </MotionProvider>
@@ -196,11 +198,10 @@ export interface AppFrameProps {
   openNavigationLabel: string;
   closeNavigationLabel: string;
   skipLabel: string;
-  mobileTitle?: ReactNode;
   navigationOpen: boolean;
   onNavigationOpenChange: (open: boolean) => void;
 }
-export function AppFrame({ brand, navigation, account, utilities, children, navigationLabel, openNavigationLabel, closeNavigationLabel, skipLabel, mobileTitle, navigationOpen: open, onNavigationOpenChange: setOpen }: AppFrameProps) {
+export function AppFrame({ brand, navigation, account, utilities, children, navigationLabel, openNavigationLabel, closeNavigationLabel, skipLabel, navigationOpen: open, onNavigationOpenChange: setOpen }: AppFrameProps) {
   const getContainer = useFieldworkContainer();
   const navigationOpener = useRef<HTMLElement | null>(null);
   const closeIcon = useRef<HTMLSpanElement | null>(null);
@@ -210,7 +211,7 @@ export function AppFrame({ brand, navigation, account, utilities, children, navi
       <div className="wf-frame">
         <a className="wf-skip" href="#wf-main">{skipLabel}</a>
         <aside className="wf-index" aria-label={navigationLabel}><div className="wf-index-brand"><BrandMark {...brand} /></div>{indexBody}</aside>
-        <header className="wf-mobile-bar"><Button type="text" aria-label={openNavigationLabel} aria-expanded={open} icon={<Glyph name="menu" />} onClick={(event) => { navigationOpener.current = event.currentTarget; setOpen(true); }} /><BrandMark {...brand} compact /><span className="wf-mobile-title">{mobileTitle}</span></header>
+        <header className="wf-mobile-bar"><Button type="text" aria-label={openNavigationLabel} aria-expanded={open} icon={<Glyph name="menu" />} onClick={(event) => { navigationOpener.current = event.currentTarget; setOpen(true); }} /><BrandMark {...brand} compact /></header>
         <main id="wf-main" tabIndex={-1} className="wf-main">{children}</main>
         <Drawer title={<BrandMark {...brand} />} open={open} onClose={() => setOpen(false)} placement="left" size="min(88vw, 320px)" destroyOnHidden getContainer={getContainer}
           focusable={{ focusTriggerAfterClose: false }}
@@ -230,12 +231,12 @@ export function AppFrame({ brand, navigation, account, utilities, children, navi
   );
 }
 
-export interface NavigationItem { key: string; label: ReactNode; description?: ReactNode; icon?: ReactNode; trailing?: ReactNode; disabled?: boolean }
+export interface NavigationItem { key: string; label: ReactNode; ariaLabel?: string; description?: ReactNode; title?: string; icon?: ReactNode; trailing?: ReactNode; disabled?: boolean }
 export interface NavigationGroup { key: string; label: ReactNode; action?: ReactNode; items: NavigationItem[] }
 export interface NavigationProps { label: string; groups: NavigationGroup[]; activeKey?: string; onSelect: (key: string) => void }
 export function WorkspaceNav({ label, groups, activeKey, onSelect }: NavigationProps) {
   const closeNavigation = useContext(NavigationCloseContext);
-  return <nav aria-label={label} className="wf-navigation">{groups.map((group) => <div className="wf-nav-group" key={group.key}>{(group.label || group.action) && <div className="wf-nav-group-head">{group.label && <span className="wf-eyebrow">{group.label}</span>}{group.action}</div>}<ul className="wf-nav-list">{group.items.map((item) => <li key={item.key} className="wf-nav-row"><Button type="text" className={`wf-nav-item${activeKey === item.key ? ' wf-nav-item--active' : ''}`} aria-current={activeKey === item.key ? 'page' : undefined} disabled={item.disabled} onClick={() => { onSelect(item.key); closeNavigation?.(); }}><span className="wf-nav-icon">{item.icon}</span><span className="wf-nav-copy"><span>{item.label}</span>{item.description && <span className="wf-nav-description">{item.description}</span>}</span></Button>{item.trailing && <span className="wf-nav-trailing">{item.trailing}</span>}</li>)}</ul></div>)}</nav>;
+  return <nav aria-label={label} className="wf-navigation">{groups.map((group) => <div className="wf-nav-group" key={group.key}>{(group.label || group.action) && <div className="wf-nav-group-head">{group.label && <span className="wf-eyebrow">{group.label}</span>}{group.action}</div>}<ul className="wf-nav-list">{group.items.map((item) => <li key={item.key} className={`wf-nav-row${activeKey === item.key ? ' wf-nav-row--active' : ''}`}><Button type="text" className={`wf-nav-item${activeKey === item.key ? ' wf-nav-item--active' : ''}`} aria-current={activeKey === item.key ? 'page' : undefined} aria-label={item.ariaLabel} title={item.title} disabled={item.disabled} onClick={() => { onSelect(item.key); closeNavigation?.(); }}><span className="wf-nav-icon">{item.icon}</span><span className="wf-nav-copy"><span>{item.label}</span>{item.description && <span className="wf-nav-description">{item.description}</span>}</span></Button>{item.trailing && <span className="wf-nav-trailing">{item.trailing}</span>}</li>)}</ul></div>)}</nav>;
 }
 export function SectionIndex({ label, groups, activeKey, onSelect }: NavigationProps) {
   return <nav className="wf-section-index" aria-label={label}>{groups.map((group) => <div className="wf-section-index-group" key={group.key}>{group.label && <span className="wf-eyebrow">{group.label}</span>}<div className="wf-section-index-items">{group.items.map((item) => <Button key={item.key} type="text" className={`wf-section-index-item${activeKey === item.key ? ' wf-section-index-item--active' : ''}`} aria-current={activeKey === item.key ? 'page' : undefined} disabled={item.disabled} onClick={() => onSelect(item.key)}>{item.icon}{item.label}{item.trailing}</Button>)}</div></div>)}</nav>;
@@ -272,8 +273,9 @@ export function FormFooter({ note, children }: { note?: ReactNode; children: Rea
 export function Spinner({ size = 16, className }: { size?: number; className?: string }) {
   return <span className={`wf-spinner${className ? ` ${className}` : ''}`} style={{ inlineSize: size, blockSize: size }} aria-hidden="true" />;
 }
-export function StatusMark({ tone = 'neutral', children, subtle = false, busy = false }: { tone?: Tone; children: ReactNode; subtle?: boolean; busy?: boolean }) {
-  return <span className={`wf-status wf-tone-${tone}${subtle ? ' wf-status--subtle' : ''}`}>{busy ? <Spinner size={12} /> : <span className="wf-status-dot" aria-hidden="true" />}{children}</span>;
+/** `icon` replaces the dot when the mark names a category (e.g. public) rather than a live state. */
+export function StatusMark({ tone = 'neutral', children, subtle = false, busy = false, icon }: { tone?: Tone; children: ReactNode; subtle?: boolean; busy?: boolean; icon?: ReactNode }) {
+  return <span className={`wf-status wf-tone-${tone}${subtle ? ' wf-status--subtle' : ''}`}>{busy ? <Spinner size={12} /> : icon ?? <span className="wf-status-dot" aria-hidden="true" />}{children}</span>;
 }
 export function Notice({ tone = 'info', title, children, action }: { tone?: Tone; title: ReactNode; children?: ReactNode; action?: ReactNode }) {
   return <div className={`wf-notice wf-tone-${tone}`} role={tone === 'danger' ? 'alert' : 'status'}><span className="wf-notice-sign"><Glyph name={tone === 'danger' || tone === 'warning' ? 'warning' : tone === 'success' ? 'check' : 'file'} /></span><div className="wf-notice-copy"><strong>{title}</strong>{children && <div className="wf-notice-detail">{children}</div>}</div>{action && <div className="wf-notice-action">{action}</div>}</div>;

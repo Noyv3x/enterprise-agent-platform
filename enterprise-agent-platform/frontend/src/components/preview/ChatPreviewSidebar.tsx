@@ -5,6 +5,8 @@ import { getApiSessionGeneration } from "../../lib/api";
 import { useStore, useStoreHandle } from "../../store/useStore";
 import type { AgentPreviewScope, ComputerMode, Message } from "../../types";
 import { Glyph, LoadingState, OverlayPanel } from "../ui/fieldwork";
+import { Icon } from "../common/Icon";
+import { HeaderAction } from "../shell/HeaderAction";
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerScreen } from "./ComputerScreen";
 import { deriveComputerSurface, retainComputerSurface, type ComputerSurface } from "./computer";
@@ -140,10 +142,10 @@ function ScopedChatPreviewSidebar({scope,canManageSkills=true,children}: Sidebar
   },[]);
   const capabilityActions = useMemo(() => scope ? (
     <>
-      {computerActive ? <Button aria-label={t("computer.show")} aria-expanded={visible === "computer"} onClick={event => openComputer(undefined,event.currentTarget)}>{t("computer.title")}</Button> : null}
-      {privateScope ? <Button aria-label={t("memory.open")} aria-expanded={visible === "memory"} onClick={event => open("memory",event.currentTarget)}>{t("memory.title")}</Button> : null}
-      <Button aria-label={t("skills.open")} aria-expanded={visible === "skills"} onClick={event => open("skills",event.currentTarget)}>{t("skills.title")}</Button>
-      {privateScope ? <Button aria-label={t("scheduledTasks.open")} aria-expanded={visible === "tasks"} onClick={event => open("tasks",event.currentTarget)}>{t("scheduledTasks.title")}</Button> : null}
+      {computerActive ? <HeaderAction icon={<Icon name="computer" size={16} />} label={t("computer.title")} aria-label={t("computer.show")} aria-expanded={visible === "computer"} onClick={event => openComputer(undefined,event.currentTarget)} /> : null}
+      {privateScope ? <HeaderAction icon={<Glyph name="memory" size={16} />} label={t("memory.title")} aria-label={t("memory.open")} aria-expanded={visible === "memory"} onClick={event => open("memory",event.currentTarget)} /> : null}
+      <HeaderAction icon={<Glyph name="skill" size={16} />} label={t("skills.title")} aria-label={t("skills.open")} aria-expanded={visible === "skills"} onClick={event => open("skills",event.currentTarget)} />
+      {privateScope ? <HeaderAction icon={<Glyph name="schedule" size={16} />} label={t("scheduledTasks.title")} aria-label={t("scheduledTasks.open")} aria-expanded={visible === "tasks"} onClick={event => open("tasks",event.currentTarget)} /> : null}
     </>
   ) : null, [scope, t, computerActive, visible, openComputer, privateScope, open]);
   const computerPipDismissed=!work.observed || work.dismissed;

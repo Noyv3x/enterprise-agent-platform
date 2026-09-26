@@ -7,7 +7,7 @@ import {MessageEntry} from "../ui/fieldwork";
 import {MessageAttachments} from "../common/MessageAttachments";
 import {AgentWorkCard,hasAgentProcessSteps} from "./AgentWorkCard";
 import {MessageBody} from "./MessageBody";
-import {MessageMeta} from "./MessageMeta";
+import {MessageFootnote,MessageHeader} from "./MessageMeta";
 import {CopyButton} from "./CopyButton";
 import {WithdrawMessageButton} from "./WithdrawMessageButton";
 import {ScheduledTaskMarker} from "./ScheduledTaskMarker";
@@ -18,8 +18,13 @@ function MessageBubbleImpl({message,canWithdraw=false,withdrawing=false,hideAuth
  const pending=!!message.metadata?.local_pending;
  const upload=message.metadata?.upload;
  if(message.author_type==="system"&&message.metadata?.scheduled_task)return <ScheduledTaskMarker message={message} marker={message.metadata.scheduled_task}/>;
- return <MessageEntry kind={message.author_type==="user"?"user":message.author_type==="agent"?"agent":"system"} streaming={!!message.metadata?.streaming} status={<MessageMeta message={message} isUser={message.author_type==="user"} pending={pending} streaming={!!message.metadata?.streaming} hideAuthorName={hideAuthorName&&message.author_type==="agent"}/>}
- actions={<>{message.content&&<CopyButton value={message.content} kind="message"/>}{canWithdraw&&onWithdraw&&<WithdrawMessageButton loading={withdrawing} onConfirm={()=>onWithdraw(message.id)}/>}</>}
+ const isUser=message.author_type==="user";
+ const streaming=!!message.metadata?.streaming;
+ const showAuthor=!hideAuthorName;
+ return <MessageEntry kind={isUser?"user":message.author_type==="agent"?"agent":"system"} streaming={streaming}
+ header={showAuthor||message.metadata?.needs_review?<MessageHeader message={message} isUser={isUser} showAuthor={showAuthor}/>:undefined}
+ footnote={<MessageFootnote message={message} pending={pending} streaming={streaming}/>}
+ actions={message.content&&!streaming||canWithdraw&&onWithdraw?<>{message.content&&!streaming&&<CopyButton value={message.content} kind="message"/>}{canWithdraw&&onWithdraw&&<WithdrawMessageButton loading={withdrawing} onConfirm={()=>onWithdraw(message.id)}/>}</>:undefined}
  work={work&&hasAgentProcessSteps(work)?<AgentWorkCard work={work} active={false}/>:undefined}
  attachments={message.attachments?.length?<MessageAttachments attachments={message.attachments}/>:undefined}>
  {message.content&&<MessageBody content={message.content}/>}

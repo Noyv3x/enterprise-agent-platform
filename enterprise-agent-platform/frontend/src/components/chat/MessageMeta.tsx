@@ -1,4 +1,3 @@
-import type { ReactNode } from "react";
 import { useI18n, type Translator } from "../../i18n";
 import type { Message } from "../../types";
 import { StatusMark } from "../ui/fieldwork";
@@ -19,16 +18,20 @@ function authorName(message: Message, isUser: boolean, translate: Translator): s
   return message.username || translate("chat.agent");
 }
 
-export function MessageMeta({message,isUser,pending,streaming,hideAuthorName=false,action}: {
- message:Message; isUser:boolean; pending:boolean; streaming:boolean; hideAuthorName?:boolean; action?:ReactNode;
-}) {
- const {t,locale}=useI18n();
- return <div className="wf-message-metadata">
-   {!hideAuthorName && <strong>{authorName(message,isUser,t)}</strong>}
-   <time dateTime={message.created_at ? new Date(message.created_at * 1000).toISOString() : undefined}>{formatMessageTime(message.created_at,locale)}</time>
-   {message.metadata?.needs_review && <StatusMark tone="warning">{t("chat.message.needsReview")}</StatusMark>}
-   {pending && <StatusMark subtle busy tone="info">{t("chat.message.sending")}</StatusMark>}
-   {streaming && <StatusMark subtle busy tone="info">{t("chat.message.generating")}</StatusMark>}
-   {action}
- </div>;
+/** What must precede the content: the author (channels) and attention marks. */
+export function MessageHeader({ message, isUser, showAuthor }: { message: Message; isUser: boolean; showAuthor: boolean }) {
+  const { t } = useI18n();
+  return <>
+    {showAuthor && <strong className="wf-message-author">{authorName(message, isUser, t)}</strong>}
+    {message.metadata?.needs_review && <StatusMark tone="warning">{t("chat.message.needsReview")}</StatusMark>}
+  </>;
+}
+
+/** Live progress while sending/generating, otherwise the message time. */
+export function MessageFootnote({ message, pending, streaming }: { message: Message; pending: boolean; streaming: boolean }) {
+  const { t, locale } = useI18n();
+  if (pending) return <StatusMark subtle busy tone="info">{t("chat.message.sending")}</StatusMark>;
+  if (streaming) return <StatusMark subtle busy tone="info">{t("chat.message.generating")}</StatusMark>;
+  const time = formatMessageTime(message.created_at, locale);
+  return time ? <time className="wf-message-time" dateTime={new Date(message.created_at! * 1000).toISOString()}>{time}</time> : null;
 }

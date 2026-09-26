@@ -6,7 +6,6 @@ import { useRealtime } from "../../hooks/useRealtime";
 import { useReplyNotifications } from "../../hooks/useReplyNotifications";
 import { useI18n } from "../../i18n";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import { topbarInfo } from "../../store/selectors";
 import { AppFrame } from "../ui/fieldwork";
 import { PublicUtilities } from "../ui/PublicUtilities";
 import { ContentRouter } from "./ContentRouter";
@@ -25,7 +24,6 @@ export function AppShell() {
   const navigationOpen = useStore(state => state.sidebarOpen);
   const deletion = useChannelDeletion();
   const setNavigationOpen = useCallback((open: boolean) => store.dispatch({ type: "SET_SIDEBAR_OPEN", payload: open }), [store]);
-  const destination = useStore(state => topbarInfo(state, t).title);
   const [focusToken, setFocusToken] = useState(0);
   const requestFocus = useCallback(() => setFocusToken(token => token + 1), []);
   const connected = useRealtime();
@@ -39,7 +37,7 @@ export function AppShell() {
       navigationOpen={navigationOpen} onNavigationOpenChange={setNavigationOpen}
       navigation={<><WorkspaceNav onDelete={deletion.beginDelete} deleteBusy={deletion.busy} />{deletion.retryAction}</>} account={<UserMenu />} utilities={<PublicUtilities />}
       navigationLabel={t("shell.navigation")} openNavigationLabel={t("nav.menu.open")}
-      closeNavigationLabel={t("common.close")} skipLabel={t("shell.skipToContent")} mobileTitle={destination}>
+      closeNavigationLabel={t("common.close")} skipLabel={t("shell.skipToContent")}>
       <ContentRouter />
     </AppFrame>
     <PersonalAiGuideDialog onDraftFilled={requestFocus} />

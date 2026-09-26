@@ -4,6 +4,16 @@
 .wf-draft-files { display: flex; flex-wrap: wrap; gap: 8px; max-height: 180px; overflow: auto; list-style: none; margin: 0; padding: 0; }
 .wf-draft-files > li { min-width: 0; max-width: 100%; flex: 0 1 320px; }
 .wf-draft-hint { display: flex; flex-wrap: wrap; gap: 16px; }
+/* Keyboard shortcuts mean nothing on touch keyboards; the row disappears there. */
+@media (pointer: coarse), (max-width: 800px) {
+  .wf-chat-compose .wf-composer-hint { display: none; }
+}
+.wf-chat-compose .wf-composer-submit { display: flex; align-items: center; gap: var(--wf-space-2); }
+.wf-root .wf-context-trigger { color: var(--wf-muted); font-weight: 500; font-variant-numeric: tabular-nums; }
+.wf-root .wf-context-trigger:not(:disabled):hover { color: var(--wf-ink); }
+.wf-context-popover { inline-size: min(320px, 80vw); }
+.wf-context-popover > p { margin: 0; font-size: var(--wf-text-sm); }
+.wf-context-popover .wf-context { padding-block-end: 0; }
 .wf-draft-recovery-text { overflow-wrap: anywhere; max-height: 6em; overflow: auto; }
 .wf-draft-options { max-height: min(320px, 40dvh); overflow: auto; min-width: 0; padding: var(--wf-space-1); background: var(--wf-surface); border: 1px solid var(--wf-line); border-radius: var(--wf-radius-lg); box-shadow: var(--wf-shadow); }
 .wf-draft-options[hidden] { display: none; }

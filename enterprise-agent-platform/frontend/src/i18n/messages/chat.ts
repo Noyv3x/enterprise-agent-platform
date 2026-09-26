@@ -176,7 +176,11 @@ export const chatMessages = defineMessages({
   "chat.userFallback": { "zh-CN": "用户", en: "User", "zh-TW": "使用者" },
   "chat.you": { "zh-CN": "你", en: "You", "zh-TW": "你" },
   "chat.agent": { "zh-CN": "Agent", en: "Agent", "zh-TW": "Agent" },
-  "chat.context.button": { "zh-CN": "详细信息", en: "Details", "zh-TW": "詳細資訊" },
+  "chat.context.button": {
+    "zh-CN": "上下文使用情况 {percent}%",
+    en: "Context usage {percent}%",
+    "zh-TW": "上下文使用情況 {percent}%",
+  },
   "chat.context.title": {
     "zh-CN": "上下文使用情况",
     en: "Context usage",
@@ -190,14 +194,9 @@ export const chatMessages = defineMessages({
   "chat.context.used": { "zh-CN": "已使用", en: "Used", "zh-TW": "已使用" },
   "chat.context.limit": { "zh-CN": "上下文上限", en: "Context limit", "zh-TW": "上下文上限" },
   "chat.context.percent": {
-    "zh-CN": "{percent}%",
-    en: "{percent}%",
-    "zh-TW": "{percent}%",
-  },
-  "chat.context.tokens": {
-    "zh-CN": "{used} / {total} tokens",
-    en: "{used} / {total} tokens",
-    "zh-TW": "{used} / {total} tokens",
+    "zh-CN": "上下文 {percent}%",
+    en: "Context {percent}%",
+    "zh-TW": "上下文 {percent}%",
   },
   "chat.context.progressLabel": {
     "zh-CN": "上下文占用比例",
@@ -208,11 +207,6 @@ export const chatMessages = defineMessages({
     "zh-CN": "该数值为估算值。",
     en: "This value is estimated.",
     "zh-TW": "此數值為估算值。",
-  },
-  "chat.context.unavailable": {
-    "zh-CN": "Agent 完成一次回复后，这里会显示上下文使用情况。",
-    en: "Context usage will appear after the Agent completes a reply.",
-    "zh-TW": "Agent 完成一次回覆後，這裡會顯示上下文使用情況。",
   },
   "chat.mainAgent": { "zh-CN": "主 Agent", en: "Main Agent", "zh-TW": "主 Agent" },
   "chat.privateAgent": { "zh-CN": "个人 AI", en: "Personal AI", "zh-TW": "個人 AI" },
@@ -285,9 +279,9 @@ export const chatMessages = defineMessages({
     "zh-TW": "傳訊息給你的個人 AI…",
   },
   "chat.composer.channelPlaceholder": {
-    "zh-CN": "在公共频道 #{channel} 发消息，所有成员可见；@agent 呼叫 Agent…",
-    en: "Message public channel #{channel}; everyone can see it. Mention @agent to call the Agent…",
-    "zh-TW": "在公共頻道 #{channel} 傳送訊息，所有成員可見；@agent 呼叫 Agent…",
+    "zh-CN": "发到 #{channel}，@agent 呼叫 Agent",
+    en: "Message #{channel}, @agent to call Agent",
+    "zh-TW": "發到 #{channel}，@agent 呼叫 Agent",
   },
   "chat.composer.readOnly": {
     "zh-CN": "当前权限组只能查看内容",
@@ -538,6 +532,11 @@ export const chatMessages = defineMessages({
     "zh-CN": "等待审批",
     en: "Awaiting approval",
     "zh-TW": "等待核准",
+  },
+  "chat.work.failedSteps": {
+    "zh-CN": { other: "{count} 步失败" },
+    en: { one: "{count} failed", other: "{count} failed" },
+    "zh-TW": { other: "{count} 步失敗" },
   },
   "chat.work.steps": {
     "zh-CN": { other: "{count} 步" },

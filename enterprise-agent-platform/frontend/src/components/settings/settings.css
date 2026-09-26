@@ -1,3 +1,3 @@
-.wf-settings-sections { min-width: 0; }
+.wf-settings-sections { min-width: 0; max-inline-size: 720px; }
 .wf-settings-sections > * { scroll-margin-block-start: 1rem; }
 .wf-settings-actions { display: flex; flex-wrap: wrap; gap: .5rem; }

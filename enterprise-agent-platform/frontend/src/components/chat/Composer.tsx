@@ -16,6 +16,7 @@ import { ComposerField } from "./ComposerField";
 import { ComposerFiles } from "./ComposerFiles";
 import { FailedSendRecovery } from "./FailedSendRecovery";
 import { ComposerHint } from "./ComposerHint";
+import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import "./composer.css";
 import type { ComposerTextareaProps } from "./ComposerTextarea";
 
@@ -348,6 +349,7 @@ export function Composer({
         ) : undefined}
         attachments={selectedFiles.length > 0 ? <ComposerFiles files={selectedFiles} onRemove={removeFile} /> : undefined}
         hint={<ComposerHint />}
+        usage={<ContextUsageIndicator mode={mode} />}
       />
     </form>
   );

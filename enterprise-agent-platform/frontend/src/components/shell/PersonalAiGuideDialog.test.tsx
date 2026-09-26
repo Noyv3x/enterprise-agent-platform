@@ -208,7 +208,7 @@ describe("Personal AI onboarding and public-channel cues", () => {
     });
   });
 
-  it("keeps the guide in the sidebar and labels public channels conspicuously", async () => {
+  it("keeps the guide in the sidebar and labels public channels without per-row noise", async () => {
     const user = userEvent.setup();
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({
       messages: [],
@@ -227,8 +227,9 @@ describe("Personal AI onboarding and public-channel cues", () => {
 
     const navigation = screen.getByRole("navigation", { name: "Main navigation" });
     expect(within(navigation).getByText("Public channels")).toBeVisible();
-    expect(within(navigation).getByText("Visible to workspace members")).toBeVisible();
-    expect(within(navigation).getByText("Team planning notes")).toBeVisible();
+    const channel = within(navigation).getByRole("button", { name: "general (Visible to workspace members)" });
+    expect(channel).toHaveAttribute("title", "Team planning notes");
+    expect(within(navigation).queryByText("Team planning notes")).toBeNull();
     expect(within(screen.getByRole("main")).getByText("Public")).toBeVisible();
 
     await user.click(within(navigation).getByRole("button", { name: "Personal AI guide" }));

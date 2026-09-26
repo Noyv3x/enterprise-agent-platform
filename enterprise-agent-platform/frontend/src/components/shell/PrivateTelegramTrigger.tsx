@@ -13,7 +13,7 @@ export function PrivateTelegramTrigger() {
     : linked ? t("nav.telegram.linked") : t("nav.telegram.configure");
   return <Tooltip title={title}>
     <Badge dot={linked} status="success">
-      <Button icon={<Icon name="message" />} aria-label={t("nav.telegram.settings")}
+      <Button type="text" className="wf-header-action" icon={<Icon name="message" size={16} />} aria-label={t("nav.telegram.settings")}
         aria-expanded={expanded} aria-controls="private-telegram-popover"
         onClick={() => store.dispatch({ type: "SET_PRIVATE_TELEGRAM_EXPANDED", payload: !expanded })} />
     </Badge>

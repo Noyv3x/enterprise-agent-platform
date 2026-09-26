@@ -667,11 +667,11 @@ function focusWasDropped(): boolean {
   return !current || current === document.body || !current.isConnected;
 }
 
-function useRunFocusHandoff(runId: string, active: boolean, triggerRef: RefObject<HTMLButtonElement | null>, sectionRef: RefObject<HTMLElement | null>) {
+function useRunFocusHandoff(runId: string, replaceable: boolean, triggerRef: RefObject<HTMLButtonElement | null>, sectionRef: RefObject<HTMLElement | null>) {
   const store = useStoreHandle();
-  const latest = useRef({ runId, active, conversation: "" });
+  const latest = useRef({ runId, replaceable, conversation: "" });
   useLayoutEffect(() => {
-    latest.current = { runId, active, conversation: conversationIdentity(store.getState()) };
+    latest.current = { runId, replaceable, conversation: conversationIdentity(store.getState()) };
   });
   // Index this header under its current run within its log, and claim a handoff waiting for that run.
   useLayoutEffect(() => {
@@ -694,13 +694,13 @@ function useRunFocusHandoff(runId: string, active: boolean, triggerRef: RefObjec
       if (!headers.size && registry.headers.get(runId) === headers) registry.headers.delete(runId);
     };
   }, [runId, sectionRef, store, triggerRef]);
-  // On unmount only: hand focus that was inside a live record to the same run's next header.
+  // On unmount only: hand focus inside a live or settling record to the same run's next header.
   useLayoutEffect(() => {
     const section = sectionRef.current;
     const log = section?.closest<HTMLElement>('[role="log"]');
     return () => {
-      const { runId: run, active: wasActive, conversation } = latest.current;
-      if (!wasActive || !section || !log || !section.contains(document.activeElement)) return;
+      const { runId: run, replaceable, conversation } = latest.current;
+      if (!replaceable || !section || !log || !section.contains(document.activeElement)) return;
       if (conversationIdentity(store.getState()) !== conversation) return;
       const registry = runFocusRegistry(log);
       const successor = [...(registry.headers.get(run) ?? [])]
@@ -730,9 +730,10 @@ function useRunFocusHandoff(runId: string, active: boolean, triggerRef: RefObjec
  * Live runs open by default and can be folded to a one-line summary of the current task; a settled
  * run starts folded and remembers its disclosure per run in the store. The live choice is local, so
  * settling collapses exactly once (in place, or by remounting as the persisted record) and later
- * updates never re-collapse or re-open it.
+ * updates never re-collapse or re-open it. `settling` marks a finished run shown until its persisted
+ * record replaces it; like a live record, it hands focus to that successor.
  */
-export function AgentWorkCard({ work, active }: { work: Work; active: boolean }) {
+export function AgentWorkCard({ work, active, settling = false }: { work: Work; active: boolean; settling?: boolean }) {
   const { t } = useI18n();
   const dispatch = useDispatch();
   const runId = work.run_id || `${work.scope_type || "agent"}:${work.scope_id || ""}:${work.started_at || ""}`;
@@ -743,7 +744,7 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const panelId = useId();
   const statusId = useId();
   const sectionRef = useRef<HTMLElement>(null);
-  useRunFocusHandoff(runId, active, disclosure.triggerRef, sectionRef);
+  useRunFocusHandoff(runId, active || settling, disclosure.triggerRef, sectionRef);
   const elapsedSeconds = useElapsedSeconds(work.started_at, active, runId);
   if (!hasAgentProcessSteps(work)) return null;
 
@@ -756,6 +757,8 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   }
   const folded = active && !open ? current : undefined;
   const summary = completedWorkSummary(entries, t);
+  // A finished run can succeed overall while individual steps failed; say so without expanding.
+  const failedSteps = active || failed ? 0 : entries.filter((entry) => entry.kind !== "notice" && entry.state === "failed").length;
   const label = folded
     ? folded.title
     : active ? t(approval ? "chat.work.awaitingApproval" : "chat.work.working") : failed ? t("chat.work.failed") : summary;
@@ -765,12 +768,13 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   const meta: ReactNode[] = [];
   if (active) meta.push(<span key="steps">{t("chat.work.steps", { count: entries.filter((entry) => entry.kind !== "notice").length })}</span>);
   if (failed) meta.push(<span key="summary">{summary}</span>);
+  if (failedSteps > 0) meta.push(<span key="failed-steps" className="wf-trace-failed-steps">{t("chat.work.failedSteps", { count: failedSteps })}</span>);
   if (waiting > 0) meta.push(<span key="waiting">{t("chat.work.waitingCount", { count: waiting })}</span>);
   if (elapsedSeconds != null) {
     const time = formatElapsed(elapsedSeconds);
     meta.push(<span key="elapsed" className="wf-trace-time"><span className="wf-sr-only">{t("chat.work.elapsed", { time })}</span><span aria-hidden="true">{time}</span></span>);
   }
-  const tone = approval ? "approval" : active ? "live" : failed ? "failed" : "settled";
+  const tone = approval ? "approval" : active ? "live" : failed ? "failed" : failedSteps > 0 ? "partial" : "settled";
   const toggle = () => {
     if (active) setLiveDisclosure({ runId, open: !open });
     else dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: !open } });
@@ -778,7 +782,7 @@ export function AgentWorkCard({ work, active }: { work: Work; active: boolean })
   return <section ref={sectionRef} className={`wf-trace wf-trace--${tone}`} aria-label={t("chat.work.label")}>
     {statusText && <span id={statusId} className="wf-sr-only">{statusText}</span>}
     <button ref={disclosure.triggerRef} type="button" className="wf-trace-head" aria-expanded={open} aria-controls={panelId} aria-describedby={statusText ? statusId : undefined} title={statusText || undefined} onClick={toggle}>
-      <span className="wf-trace-sign" aria-hidden="true"><Glyph name={approval ? "lock" : failed ? "warning" : "sparkle"} size={14} /></span>
+      <span className="wf-trace-sign" aria-hidden="true"><Glyph name={approval ? "lock" : failed || failedSteps > 0 ? "warning" : "sparkle"} size={14} /></span>
       <span className="wf-trace-label">{label}</span>
       {folded?.preview && <span className={`wf-trace-detail${usesMonoPreview(folded) ? " wf-mono" : ""}`}>{folded.preview}</span>}
       {meta.length > 0 && <span className="wf-trace-meta">{meta}</span>}

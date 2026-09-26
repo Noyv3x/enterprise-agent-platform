@@ -8,7 +8,8 @@
   min-inline-size: 0; max-inline-size: 100%;
   font-size: var(--wf-text-sm); line-height: 1.5; color: var(--wf-ink);
 }
-.wf-thread-inner > .wf-trace { margin-block-end: var(--wf-space-4); }
+/* Same gap as `.wf-message-work`, so a live record settling into its persisted message does not shift. */
+.wf-thread-inner > .wf-trace { margin-block-end: var(--wf-space-3); }
 
 /* Header: fit-width disclosure — sign, quiet 13px label, adjacent 12px metadata, chevron. */
 .wf-trace-head {
@@ -43,6 +44,9 @@ button.wf-trace-head { cursor: pointer; }
 .wf-trace--approval > .wf-trace-head .wf-trace-label { color: var(--wf-ink); }
 .wf-trace--failed > .wf-trace-head .wf-trace-sign, .wf-trace--failed > .wf-trace-head .wf-trace-label { color: var(--wf-danger); }
 .wf-trace--failed > .wf-trace-head .wf-trace-label { flex-shrink: 0; }
+.wf-trace--partial > .wf-trace-head .wf-trace-sign, .wf-trace-failed-steps { color: var(--wf-danger); }
+/* The failure count is the point of a partial summary: the category counts truncate first. */
+.wf-trace--partial > .wf-trace-head .wf-trace-meta { flex-shrink: 0; }
 @keyframes wf-trace-shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 @keyframes wf-trace-breathe { from { opacity: .45; } to { opacity: 1; } }
 

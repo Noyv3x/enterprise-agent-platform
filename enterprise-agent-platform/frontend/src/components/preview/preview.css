@@ -8,6 +8,9 @@
 .wf-computer-dock-body { min-width:0; min-height:0; overflow:hidden; }
 @keyframes wf-computer-enter { from { opacity:0; transform:translateX(var(--wf-space-3)); } to { opacity:1; transform:translateX(0); } }
 .wf-computer-compact { position:relative; flex:0 1 auto; box-sizing:border-box; width:208px; max-width:100%; aspect-ratio:16 / 9; min-width:0; min-height:0; overflow:hidden; border:var(--wf-border) solid var(--wf-line); border-radius:var(--wf-radius); background:var(--wf-inset); isolation:isolate; }
+/* The PiP floats over the thread with zero flow height. Give the thread matching scroll clearance so the
+   newest message and live output can always be scrolled above it instead of being covered. */
+.wf-conversation-column:has(.wf-composer-rail .wf-computer-compact) .wf-thread-inner { padding-block-end:calc(208px * 9 / 16 + var(--wf-space-4)); }
 .wf-computer-pip-heading,.wf-computer-pip-meta { position:absolute; inset-inline:var(--wf-space-1); z-index:1; display:flex; align-items:center; justify-content:space-between; gap:var(--wf-space-1); min-width:0; min-height:0; overflow:hidden; color:var(--wf-surface); font-size:var(--wf-text-xs); line-height:1.2; pointer-events:none; }
 .wf-computer-pip-heading { inset-block-start:var(--wf-space-1); }
 .wf-computer-pip-heading > *,.wf-computer-pip-meta > span { padding:2px var(--wf-space-1); border-radius:var(--wf-radius-sm); background:color-mix(in srgb,var(--wf-ink) 78%,transparent); }

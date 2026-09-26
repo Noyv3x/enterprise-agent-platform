@@ -7,7 +7,7 @@ import { MentionMenu } from "./MentionMenu";
 import { SendButton } from "./SendButton";
 import { SlashCommandMenu } from "./SlashCommandMenu";
 
-export function ComposerField({ disabled, busy, fileInputRef, onFileChange, textarea, slashCommand, attachments, hint, recovery }: {
+export function ComposerField({ disabled, busy, fileInputRef, onFileChange, textarea, slashCommand, attachments, hint, recovery, usage }: {
   disabled: boolean;
   busy: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
@@ -17,6 +17,8 @@ export function ComposerField({ disabled, busy, fileInputRef, onFileChange, text
   attachments?: ReactNode;
   hint?: ReactNode;
   recovery?: ReactNode;
+  /** Quiet status shown before the send button (context usage). */
+  usage?: ReactNode;
 }) {
   const { t } = useI18n();
   return <ComposerFrame
@@ -28,7 +30,7 @@ export function ComposerField({ disabled, busy, fileInputRef, onFileChange, text
       <input hidden type="file" multiple disabled={disabled} ref={fileInputRef} onChange={onFileChange} tabIndex={-1} />
       <AttachButton disabled={disabled} onClick={() => fileInputRef.current?.click()} />
     </>}
-    submitAction={<SendButton disabled={disabled || (!textarea.value.trim() && !attachments)} loading={busy} />}
+    submitAction={<>{usage}<SendButton disabled={disabled || (!textarea.value.trim() && !attachments)} loading={busy} /></>}
     attachments={attachments}
     recovery={recovery}
     hint={hint}

@@ -4,7 +4,7 @@
    data-theme is pinned. Theme lives in its own context, so toggling never
    re-renders the store-subscribed tree. */
 
-import { createContext, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 export type ResolvedTheme = "light" | "dark";
 
@@ -47,6 +47,23 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, []);
+  // Theme changes are not animated: controls with color transitions would pass
+  // through mixed, disabled-looking colors. Pin transitions off for the frames
+  // in which the new tokens are applied.
+  const initialTheme = useRef(theme);
+  useLayoutEffect(() => {
+    if (initialTheme.current === theme) return;
+    initialTheme.current = theme;
+    const root = document.documentElement;
+    root.dataset.themeSwitching = "";
+    let frame = window.requestAnimationFrame(() => {
+      frame = window.requestAnimationFrame(() => delete root.dataset.themeSwitching);
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      delete root.dataset.themeSwitching;
+    };
+  }, [theme]);
 
   const value = useMemo<ThemeContextValue>(() => ({ theme, toggleTheme }), [theme, toggleTheme]);
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

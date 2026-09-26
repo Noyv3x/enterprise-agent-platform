@@ -1,4 +1,4 @@
-import { AutoComplete, Button, Form, Input } from "antd";
+import { Button, Form, Input, Select } from "antd";
 import { useEffect, useId, useMemo, useState } from "react";
 import { browserTimezone, changePassword, updateCurrentUser } from "../../data/accountActions";
 import { useI18n } from "../../i18n";
@@ -11,7 +11,7 @@ import "./settings.css";
 function timezoneOptions(current: string): string[] {
   const intl = Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] };
   let values: string[] = [];
-  try { values = intl.supportedValuesOf?.("timeZone") || []; } catch { /* Free entry remains available. */ }
+  try { values = intl.supportedValuesOf?.("timeZone") || []; } catch { /* The current zone and UTC remain selectable. */ }
   return [...new Set([current, "UTC", ...values].filter(Boolean))];
 }
 
@@ -29,7 +29,7 @@ export function SettingsView() {
   const [passwordError, setPasswordError] = useState<"mismatch" | "short" | "">("");
   const [activeSection, setActiveSection] = useState("profile");
   const id = useId();
-  const zones = useMemo(() => timezoneOptions(timezone).map((value) => ({ value })), [timezone]);
+  const zones = useMemo(() => timezoneOptions(timezone).map((value) => ({ value, label: value })), [timezone]);
   useEffect(() => {
     setDisplayName(user?.display_name || user?.username || "");
     setPosition(user?.position || "");
@@ -65,13 +65,13 @@ export function SettingsView() {
   >
     <div className="wf-settings-sections">
       <Section id={`${id}-profile`} title={t("account.profile")}>
-        <Form layout="vertical" onFinish={() => void updateCurrentUser(store, { display_name: displayName, position, timezone: timezone.trim() })} disabled={profilePending}>
+        <Form layout="vertical" onFinish={() => void updateCurrentUser(store, { display_name: displayName, position, timezone })} disabled={profilePending}>
           <FormGrid>
             <Form.Item label={t("account.displayName")} htmlFor={`${id}-name`}><Input id={`${id}-name`} value={displayName} autoComplete="name" onChange={(event) => setDisplayName(event.target.value)} /></Form.Item>
             <Form.Item label={t("account.position")} htmlFor={`${id}-position`}><Input id={`${id}-position`} value={position} maxLength={80} onChange={(event) => setPosition(event.target.value)} /></Form.Item>
-            <Form.Item label={t("account.timezone")} htmlFor={`${id}-zone`} extra={t("account.timezoneHint")}><AutoComplete id={`${id}-zone`} aria-label={t("account.timezone")} value={timezone} options={zones} onChange={setTimezone} filterOption={(input, option) => String(option?.value || "").toLowerCase().includes(input.toLowerCase())} /></Form.Item>
+            <Form.Item label={t("account.timezone")} htmlFor={`${id}-zone`} extra={t("account.timezoneHint")}><Select id={`${id}-zone`} aria-label={t("account.timezone")} value={timezone} options={zones} onChange={setTimezone} showSearch={{ optionFilterProp: "label" }} /></Form.Item>
           </FormGrid>
-          <FormFooter><Button type="primary" htmlType="submit" loading={profilePending} disabled={!profileDirty || !timezone.trim()}>{t("account.saveProfile")}</Button></FormFooter>
+          <FormFooter><Button type="primary" htmlType="submit" loading={profilePending} disabled={!profileDirty || !timezone}>{t("account.saveProfile")}</Button></FormFooter>
         </Form>
       </Section>
       <Section id={`${id}-password`} title={t("account.changePassword")}>

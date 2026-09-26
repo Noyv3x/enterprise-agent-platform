@@ -26,7 +26,7 @@ function StickyHarness({
   const state = useStickyScroll(ref, scope, force, count, revision ?? count, prepend);
   return (
     <div>
-      <div ref={ref} data-testid="scroller" />
+      <div ref={ref} data-testid="scroller"><div data-testid="content" /></div>
       <output data-testid="position">{state.atBottom ? "bottom" : "away"}</output>
       <output data-testid="unread">{state.unreadCount}</output>
       <button type="button" onClick={state.scrollToBottom}>latest</button>
@@ -35,6 +35,7 @@ function StickyHarness({
 }
 
 let resizeViewport: (() => void) | undefined;
+let observed: Element[] = [];
 
 function setScrollGeometry(element: HTMLElement) {
   Object.defineProperties(element, {
@@ -54,11 +55,12 @@ function setScrollGeometry(element: HTMLElement) {
 
 describe("useStickyScroll", () => {
   beforeEach(() => {
+    observed = [];
     vi.stubGlobal("ResizeObserver", class {
       constructor(callback: ResizeObserverCallback) {
         resizeViewport = () => callback([], this as unknown as ResizeObserver);
       }
-      observe() {}
+      observe(target: Element) { observed.push(target); }
       disconnect() {}
     });
   });
@@ -111,6 +113,27 @@ describe("useStickyScroll", () => {
 
     view.rerender(<StickyHarness revision={20} />);
     expect(scroller.scrollTop).toBe(1_100);
+  });
+
+  it("follows content that grows after commit only while the reader is following", () => {
+    render(<StickyHarness />);
+    const scroller = screen.getByTestId("scroller");
+    setScrollGeometry(scroller);
+    expect(observed).toContain(screen.getByTestId("content"));
+    scroller.scrollTop = 800;
+    fireEvent.scroll(scroller);
+
+    // An expanding work record grows the content without any new message.
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_150 });
+    act(() => resizeViewport?.());
+    expect(scroller.scrollTop).toBe(1_150);
+
+    scroller.scrollTop = 300;
+    fireEvent.scroll(scroller);
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, value: 1_300 });
+    act(() => resizeViewport?.());
+    expect(scroller.scrollTop).toBe(300);
+    expect(screen.getByTestId("position")).toHaveTextContent("away");
   });
 
   it("preserves following or reading position when the viewport changes without new messages", () => {

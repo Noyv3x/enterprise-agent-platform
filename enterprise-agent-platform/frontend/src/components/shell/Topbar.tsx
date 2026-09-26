@@ -23,6 +23,6 @@ export function Topbar() {
   return <PageHeader
     title={<span ref={titleRef} tabIndex={-1}>{info.title}</span>}
     description={info.publicChannel ? info.sub : undefined}
-    meta={info.publicChannel ? <StatusMark><Icon name="users" size={14} />{t("nav.channel.publicBadge")}</StatusMark> : undefined}
+    meta={info.publicChannel ? <StatusMark icon={<Icon name="users" size={14} />}>{t("nav.channel.publicBadge")}</StatusMark> : undefined}
     actions={<TopbarActions />} />;
 }

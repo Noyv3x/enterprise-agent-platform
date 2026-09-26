@@ -93,8 +93,10 @@ export function useStickyScroll(
     };
     onScroll();
     element.addEventListener("scroll", onScroll, { passive: true });
-    // PiP, the side pane and a growing Composer can resize the viewport without
-    // changing any messages. Follow only if the reader was already following.
+    // PiP, the side pane and a growing Composer resize the viewport; expanding
+    // work records, late Markdown/KaTeX layout and status rows grow the content
+    // after commit without changing any message. Follow only if the reader was
+    // already following.
     const observer = observesResize ? new ResizeObserver(() => {
       if (nearBottom.current) element.scrollTop = element.scrollHeight;
       viewportWidth = element.clientWidth;
@@ -102,6 +104,8 @@ export function useStickyScroll(
       onScroll();
     }) : null;
     observer?.observe(element);
+    // Border box: bottom clearance (e.g. under the computer PiP) is padding, not content size.
+    if (element.firstElementChild) observer?.observe(element.firstElementChild, { box: "border-box" });
     return () => {
       element.removeEventListener("scroll", onScroll);
       observer?.disconnect();

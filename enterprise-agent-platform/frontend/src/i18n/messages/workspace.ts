@@ -35,9 +35,9 @@ export const workspaceMessages = defineMessages({
   },
   "account.profile": { "zh-CN": "账户资料", en: "Account profile", "zh-TW": "帳戶資料" },
   "account.settingsDescription": {
-    "zh-CN": "管理个人资料和登录密码。",
-    en: "Manage your profile and sign-in password.",
-    "zh-TW": "管理個人資料和登入密碼。",
+    "zh-CN": "管理个人资料、登录密码、浏览器通知和邮件账户。",
+    en: "Manage your profile, sign-in password, browser notifications, and mail accounts.",
+    "zh-TW": "管理個人資料、登入密碼、瀏覽器通知和郵件帳戶。",
   },
   "account.identitySummary": {
     "zh-CN": "当前账户",
@@ -49,9 +49,9 @@ export const workspaceMessages = defineMessages({
   "account.position": { "zh-CN": "职位", en: "Position", "zh-TW": "職位" },
   "account.timezone": { "zh-CN": "时区", en: "Time zone", "zh-TW": "時區" },
   "account.timezoneHint": {
-    "zh-CN": "使用 IANA 时区名称，例如 Asia/Shanghai。定时任务按此时区显示。",
-    en: "Use an IANA time-zone name, such as Asia/Shanghai. Scheduled tasks use this time zone.",
-    "zh-TW": "使用 IANA 時區名稱，例如 Asia/Taipei。排程任務會依此時區顯示。",
+    "zh-CN": "输入城市或地区名搜索，例如 Shanghai。定时任务按此时区显示。",
+    en: "Search by city or region, such as Shanghai. Scheduled tasks use this time zone.",
+    "zh-TW": "輸入城市或地區名搜尋，例如 Taipei。排程任務會依此時區顯示。",
   },
   "account.saveProfile": { "zh-CN": "保存资料", en: "Save profile", "zh-TW": "儲存資料" },
   "account.saving": { "zh-CN": "保存中…", en: "Saving…", "zh-TW": "儲存中…" },

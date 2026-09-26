@@ -74,6 +74,13 @@
 .wf-nav-copy { display: grid; flex: 1; min-inline-size: 0; gap: var(--wf-space-1); overflow-wrap: anywhere; }
 .wf-nav-description { font-size: var(--wf-text-xs); color: var(--wf-muted); font-weight: 400; }
 .wf-nav-trailing { margin-inline-start: auto; font-size: var(--wf-text-xs); flex: none; }
+.wf-nav-group-head .wf-eyebrow { display: inline-flex; align-items: center; gap: var(--wf-space-1); }
+/* Row tools (channel management) appear on hover, keyboard focus (the clicked trigger keeps focus while its menu
+   is open), or on the active row; touch and no-hover devices always show them. */
+@media (hover: hover) and (pointer: fine) {
+  .wf-nav-trailing { opacity: 0; transition: opacity var(--wf-fast) ease; }
+  .wf-nav-row:hover .wf-nav-trailing, .wf-nav-row:focus-within .wf-nav-trailing, .wf-nav-row--active .wf-nav-trailing { opacity: 1; }
+}
 .wf-page { margin-inline: auto; max-inline-size: var(--wf-page-width); padding: var(--wf-space-6) var(--wf-page-gutter); }
 .wf-page-top { margin-block-end: var(--wf-space-6); }
 .wf-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--wf-space-4); flex-wrap: wrap; }
@@ -198,10 +205,11 @@
 .wf-suggestion > span { min-inline-size: 0; }
 .wf-suggestion > svg { flex: none; color: var(--wf-accent); }
 .wf-suggestion-description { display: block; margin-block-start: var(--wf-space-1); color: var(--wf-muted); font-size: var(--wf-text-sm); line-height: 1.6; }
-.wf-message { margin-block-end: var(--wf-space-6); min-inline-size: 0; }
-.wf-message--user { inline-size: fit-content; max-inline-size: min(100%, 85%); margin-inline-start: auto; padding: var(--wf-space-3) var(--wf-space-4); background: var(--wf-inset); border-radius: var(--wf-radius-lg); border-end-end-radius: var(--wf-radius-sm); }
-.wf-message--user .wf-message-meta { justify-content: flex-end; margin-block-end: var(--wf-space-1); }
-.wf-message--user .wf-message-actions { justify-content: flex-end; }
+.wf-message { margin-block-end: var(--wf-space-4); min-inline-size: 0; }
+.wf-message--user { display: flex; flex-direction: column; align-items: flex-end; }
+.wf-message--user .wf-message-content { inline-size: fit-content; max-inline-size: min(100%, 85%); padding: var(--wf-space-3) var(--wf-space-4); background: var(--wf-inset); border-radius: var(--wf-radius-lg); border-end-end-radius: var(--wf-radius-sm); }
+.wf-message--user .wf-message-meta, .wf-message--user .wf-message-footer { justify-content: flex-end; }
+.wf-message--user .wf-message-meta { margin-block-end: var(--wf-space-1); }
 .wf-message--system { padding-block: var(--wf-space-3); border-block: var(--wf-border) solid var(--wf-line); color: var(--wf-muted); }
 .wf-message--system .wf-message-body { font-size: var(--wf-text-sm); }
 .wf-message-meta { display: flex; gap: var(--wf-space-2); align-items: center; flex-wrap: wrap; color: var(--wf-muted); font-size: var(--wf-text-xs); margin-block-end: var(--wf-space-2); }
@@ -213,7 +221,16 @@
 .wf-message-body table { display: block; max-inline-size: 100%; overflow: auto; border-collapse: collapse; font-size: var(--wf-text-sm); }
 .wf-message-body th, .wf-message-body td { padding: var(--wf-space-2) var(--wf-space-3); border: var(--wf-border) solid var(--wf-line); }
 .wf-message-body blockquote { border-inline-start: var(--wf-focus-width) solid var(--wf-strong-line); margin-inline: 0; padding-inline-start: var(--wf-space-4); color: var(--wf-muted); }
-.wf-message-actions { display: flex; align-items: center; gap: var(--wf-space-1); flex-wrap: wrap; margin-block-start: var(--wf-space-1); margin-inline-start: calc(var(--wf-space-1) * -1); color: var(--wf-muted); }
+.wf-message-footer { display: flex; align-items: center; gap: var(--wf-space-2); min-block-size: var(--wf-space-6); margin-block-start: var(--wf-space-1); color: var(--wf-muted); font-size: var(--wf-text-xs); }
+.wf-message-footnote { display: inline-flex; align-items: center; min-inline-size: 0; }
+.wf-message-actions { display: flex; align-items: center; gap: var(--wf-space-1); color: var(--wf-muted); }
+.wf-message--agent .wf-message-footer, .wf-message--system .wf-message-footer { justify-content: flex-start; }
+/* Pointer users reveal message actions on hover or keyboard focus; the row keeps its height, so nothing shifts.
+   Touch and no-hover devices always show them. A copy/withdraw outcome stays visible until it resets. */
+@media (hover: hover) and (pointer: fine) {
+  .wf-message-actions { opacity: 0; transition: opacity var(--wf-fast) ease; }
+  .wf-message:hover .wf-message-actions, .wf-message:focus-within .wf-message-actions, .wf-message-actions:has(.wf-tone-success, .wf-tone-danger, [aria-expanded="true"]) { opacity: 1; }
+}
 .wf-root .wf-message-action { color: var(--wf-tone, var(--wf-muted)); }
 .wf-root .wf-message-action:not(:disabled):hover { color: var(--wf-ink); }
 .wf-message-work { margin-block-end: var(--wf-space-3); }
@@ -317,7 +334,6 @@
   .wf-mobile-bar { display: flex; align-items: center; gap: var(--wf-space-3); padding-inline: var(--wf-space-3); border-block-end: var(--wf-border) solid var(--wf-line); background: var(--wf-canvas); min-inline-size: 0; }
   .wf-mobile-bar .wf-brand { flex: 1; }
   .wf-mobile-bar .wf-brand-name { font-size: var(--wf-text-base); }
-  .wf-mobile-title { font-size: var(--wf-text-xs); color: var(--wf-muted); max-inline-size: 35%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wf-facts--4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 759px) {
@@ -347,10 +363,15 @@
   .wf-auth, .wf-recovery { padding-block: var(--wf-space-4); }
   .wf-drawer-body { padding: var(--wf-space-4); }
   .wf-drawer-header, .wf-drawer-footer { padding-inline: var(--wf-space-4); }
-  .wf-conversation-header { padding-block: var(--wf-space-3); }
-  .wf-conversation-header .wf-page-actions > * { max-inline-size: 100%; }
+  .wf-conversation-header { padding-block: var(--wf-space-2); }
+  /* One row on phones: title (with its meta line) beside icon-only actions, instead of a stacked block. */
+  .wf-conversation-header .wf-page-header { flex-direction: row; flex-wrap: nowrap; align-items: center; gap: var(--wf-space-2); }
+  .wf-conversation-header .wf-page-heading { flex: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--wf-space-2); }
+  .wf-conversation-header .wf-page-title { flex-basis: 100%; margin: 0; font-size: var(--wf-text-lg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wf-conversation-header .wf-page-description, .wf-conversation-header .wf-page-meta { margin: 0; font-size: var(--wf-text-xs); }
+  .wf-conversation-header .wf-page-actions { inline-size: auto; flex: none; flex-wrap: nowrap; gap: 0; }
   .wf-thread-inner { padding-block-start: var(--wf-space-4); }
-  .wf-message--user { max-inline-size: 92%; }
+  .wf-message--user .wf-message-content { max-inline-size: 92%; }
   .wf-composer-dock { padding-block-end: max(var(--wf-space-3), env(safe-area-inset-bottom)); }
   .wf-companion { max-block-size: 8rem; padding-block: var(--wf-space-2); }
   .wf-computer-meta { gap: var(--wf-space-1) var(--wf-space-2); }
@@ -361,6 +382,8 @@
 @media (prefers-reduced-motion: reduce) {
   .wf-root *, .wf-root *::before, .wf-root *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
+/* Set by ThemeProvider for the frames in which a new theme is applied: colors switch, they never cross-fade. */
+:root[data-theme-switching] *, :root[data-theme-switching] *::before, :root[data-theme-switching] *::after { transition: none !important; }
 @media (forced-colors: active) {
   .wf-status { border: var(--wf-border) solid currentColor; }
   .wf-root .wf-nav-item--active, .wf-root .wf-section-index-item--active { outline: var(--wf-border) solid currentColor; }

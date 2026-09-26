@@ -21,7 +21,7 @@ export function ScheduledTaskMarker({
   const name = marker.name || t("scheduledTasks.title");
 
   return <MessageEntry kind="system"
- status={<StatusMark>{t("scheduledTasks.marker")}</StatusMark>} timestamp={time ? <time dateTime={marker.scheduled_for}>{time}</time> : undefined}>
+ header={<>{time ? <time className="wf-message-time" dateTime={marker.scheduled_for}>{time}</time> : null}<StatusMark>{t("scheduledTasks.marker")}</StatusMark></>}>
  <div role="note" aria-label={t("scheduledTasks.markerLabel",{name,time})} data-schedule-id={String(marker.schedule_id)} data-schedule-run-id={String(marker.schedule_run_id)}><strong>{name}</strong></div>
  </MessageEntry>;
 }
