@@ -70,38 +70,30 @@ test("managed file and process policy auto-allows sandbox and requires one-shot 
   }
 });
 
-test("only Codex file schemas require explicit target and prepare omitted sandbox defaults", () => {
-  const fileTools = (provider: "openai-codex" | "xai-oauth") => createTools({
-    runId: `run-${provider}`,
+test("file schemas require an explicit target and prepare omitted sandbox defaults", () => {
+  const codexTools = createTools({
+    runId: "run-openai-codex",
     request: {
       scope_key: "private:1",
-      model: { provider, id: "test-model" },
+      model: { provider: "openai-codex", id: "test-model" },
     } as never,
     gateway: {} as never,
     querySession: async () => null,
     delegate: async () => "",
     markSideEffect: () => undefined,
   });
-  const codexTools = fileTools("openai-codex");
-  const otherTools = fileTools("xai-oauth");
 
   for (const [name, arguments_] of [
     ["write_file", { path: "note.txt", content: "hello" }],
     ["patch_file", { path: "note.txt", old_text: "hello", new_text: "updated" }],
   ] as const) {
     const codex = codexTools.find((tool) => tool.name === name);
-    const other = otherTools.find((tool) => tool.name === name);
-    assert.ok(codex && other);
+    assert.ok(codex);
     assert.equal(
       ((codex.parameters as { required?: string[] }).required ?? []).includes("target"),
       true,
     );
-    assert.equal(
-      ((other.parameters as { required?: string[] }).required ?? []).includes("target"),
-      false,
-    );
     assert.ok(codex.prepareArguments);
-    assert.equal(other.prepareArguments, undefined);
     assert.throws(
       () => validateToolArguments(codex, fauxToolCall(name, arguments_)),
       /target/,

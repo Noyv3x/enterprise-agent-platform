@@ -3,6 +3,9 @@
 import { t } from "../i18n";
 import type { OAuthProvider } from "../types";
 
+/** Codex OAuth is the only Agent model provider. */
+export const CODEX_PROVIDER_ID = "openai-codex";
+
 /** Secrets whose key contains "_OAUTH_" are managed by the OAuth card, not the
  *  manual secrets list. */
 export function isOAuthSecret(key: string): boolean {

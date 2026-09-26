@@ -1317,10 +1317,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             self._json(service.poll_oauth_verification(actor, m.group(1), self._body_json()))
             return
-        m = re.fullmatch(r"/api/system/oauth/([A-Za-z0-9_-]+)/complete", path)
-        if m and method == "POST":
-            self._json(service.complete_oauth_verification(actor, m.group(1), self._body_json()))
-            return
         raise ServiceError(404, "endpoint not found")
 
     def _handle_agent_tool(self, method: str, path: str, query: dict[str, list[str]]) -> None:

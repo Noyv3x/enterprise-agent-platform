@@ -55,8 +55,7 @@ test("runtime serves authenticated run creation and replayable SSE", async () =>
     assert.equal(modelBody.source, "pi-runtime");
     assert.equal(modelBody.providers["openai-codex"]?.provider, "openai-codex");
     assert.deepEqual(modelBody.providers["openai-codex"], productModelCatalogs()["openai-codex"]);
-    assert.equal(modelBody.providers["xai-oauth"]?.provider, "xai-oauth");
-    assert.deepEqual(modelBody.providers["xai-oauth"], productModelCatalogs()["xai-oauth"]);
+    assert.deepEqual(Object.keys(modelBody.providers), ["openai-codex"]);
     const modelsWithQuery = await fetch(`${base}/v1/models?provider=openai-codex`, {
       headers: { authorization: "Bearer secret" },
     });

@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
@@ -15,8 +16,8 @@ test("a simple tool-backed task runs directly without creating or prompting a to
   const faux = fauxProvider();
   faux.setResponses([
     (context) => {
-      assert.doesNotMatch(context.systemPrompt || "", /<task_execution_policy>/);
-      const todo = context.tools?.find((tool) => tool.name === "todo");
+      assert.doesNotMatch(getCurrentSystemPrompt(context.messages) || "", /<task_execution_policy>/);
+      const todo = getCurrentTools(context.messages)?.find((tool) => tool.name === "todo");
       assert.ok(todo);
       assert.match(todo.description, /at least three distinct, independently trackable steps/);
       assert.match(todo.description, /simple one- or two-step work/);
@@ -25,7 +26,7 @@ test("a simple tool-backed task runs directly without creating or prompting a to
       }), { stopReason: "toolUse" });
     },
     (context) => {
-      assert.doesNotMatch(context.systemPrompt || "", /<task_execution_policy>/);
+      assert.doesNotMatch(getCurrentSystemPrompt(context.messages) || "", /<task_execution_policy>/);
       assert.match(JSON.stringify(context.messages), /ready/);
       return fauxAssistantMessage("The status is ready.");
     },
@@ -217,9 +218,9 @@ test("turn-limit review preserves active todos for a later Runtime process to re
   let restoredId = "";
   secondFaux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt || "", /Runtime-owned active todo state from this exact session/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /Runtime-owned active todo state from this exact session/);
       const match = /"id": "(todo_[a-f0-9]{32})"[\s\S]*?"status": "pending"[\s\S]*?"content": "Resume this exact task after review"/.exec(
-        context.systemPrompt || "",
+        getCurrentSystemPrompt(context.messages) || "",
       );
       assert.ok(match?.[1]);
       restoredId = match[1];
@@ -262,7 +263,7 @@ test("context compaction keeps Runtime-owned active todos outside the summarized
   summaries.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage(
     "Current objective: preserve the active task and continue after context compaction.",
   )));
-  const streamFn: StreamFn = (model, context, options) => context.systemPrompt?.startsWith(
+  const streamFn: StreamFn = (model, context, options) => getCurrentSystemPrompt(context.messages)?.startsWith(
     "Create a concise continuation handoff",
   )
     ? summaries.provider.streamSimple(model, context, options)
@@ -277,8 +278,8 @@ test("context compaction keeps Runtime-owned active todos outside the summarized
   const activeId = state.todos[0]!.id;
   faux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt || "", new RegExp(`"id": "${activeId}"`));
-      assert.match(context.systemPrompt || "", /"content": "Complete after compacting historical context"/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", new RegExp(`"id": "${activeId}"`));
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /"content": "Complete after compacting historical context"/);
       assert.match(JSON.stringify(context.messages), /runtime_context_handoff/);
       return fauxAssistantMessage(fauxToolCall("todo", {
         action: "merge",
@@ -318,7 +319,7 @@ test("todo content stays framed as untrusted data in the system prompt and Runti
   const continuations: string[] = [];
   faux.setResponses([
     (context) => {
-      prompts.push(context.systemPrompt || "");
+      prompts.push(getCurrentSystemPrompt(context.messages) || "");
       return fauxAssistantMessage("Not done yet.");
     },
     (context) => {

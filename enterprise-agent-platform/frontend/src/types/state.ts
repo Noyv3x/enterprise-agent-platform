@@ -72,7 +72,6 @@ export interface AppState {
   securityConfig: SecurityConfigState | null;
   oauthProviders: OAuthProvidersState | null;
   oauthFlows: Record<string, OAuthFlow>;
-  oauthCallbackUrls: Record<string, string>;
 
   /* ui slice */
   sidebarOpen: boolean;
@@ -161,7 +160,6 @@ export type AdminSliceState = Pick<
   | "securityConfig"
   | "oauthProviders"
   | "oauthFlows"
-  | "oauthCallbackUrls"
 >;
 
 export type UiSliceState = Pick<
@@ -389,7 +387,6 @@ interface SetOAuthStateAction {
   payload: {
     providerId: string;
     providers: OAuthProvider[];
-    activeProvider?: string;
     flow?: OAuthFlow | null;
   };
 }
@@ -400,14 +397,6 @@ interface SetOAuthFlowAction {
 interface SetOAuthFlowsAction {
   type: "SET_OAUTH_FLOWS";
   payload: Record<string, OAuthFlow>;
-}
-interface SetOAuthCallbackUrlAction {
-  type: "SET_OAUTH_CALLBACK_URL";
-  payload: { providerId: string; value: string };
-}
-interface SetOAuthCallbackUrlsAction {
-  type: "SET_OAUTH_CALLBACK_URLS";
-  payload: Record<string, string>;
 }
 
 /* ui slice */
@@ -483,8 +472,6 @@ export type Action =
   | SetOAuthStateAction
   | SetOAuthFlowAction
   | SetOAuthFlowsAction
-  | SetOAuthCallbackUrlAction
-  | SetOAuthCallbackUrlsAction
   /* ui */
   | SetSidebarOpenAction
   | ToggleSidebarAction

@@ -1,4 +1,5 @@
 import { redactCommandForApproval } from "./approval-policy.js";
+import type { ToolCall } from "@earendil-works/pi-ai";
 import type { JsonObject } from "./types.js";
 
 const LEGACY_ACTION_ENVELOPE_TOOLS = new Set([
@@ -26,8 +27,20 @@ const MODEL_ARGUMENT_MAX_NODES = 2_000;
  * Unlike the audit journal projection, this representation must remain shaped
  * like the tool's executable schema because the model sees it again as a
  * protocol example on the next turn.
+ *
+ * Pi types replayed tool-call arguments as JSON. The projection starts from
+ * JSON-parsed arguments and only copies, removes, bounds, or replaces values
+ * with strings, so its result stays JSON.
  */
 export function redactToolArgumentsForModelHistory(
+  toolName: string,
+  args: JsonObject,
+  workspace?: string,
+): ToolCall["arguments"] {
+  return projectModelArguments(toolName, args, workspace) as ToolCall["arguments"];
+}
+
+function projectModelArguments(
   toolName: string,
   args: JsonObject,
   _workspace?: string,

@@ -1003,21 +1003,19 @@ class AgentRuntimeClientTests(unittest.TestCase):
             catalog["providers"]["openai-codex"]["default_model"],
             "",
         )
-        self.assertEqual(
-            catalog["providers"]["xai-oauth"]["default_model"],
-            "grok-4.3",
-        )
+        # An older Runtime may still list retired providers; only Codex is accepted.
+        self.assertEqual(list(catalog["providers"]), ["openai-codex"])
         request = self.runtime.request("GET", "/v1/models")
         self.assertEqual(request["authorization"], "Bearer runtime-secret")
 
     def test_model_catalog_rejects_invalid_runtime_capability_metadata(self):
         valid = self.client.model_catalog()
         invalid = json.loads(json.dumps(valid))
-        invalid["providers"]["xai-oauth"]["runtime_provider"] = "openai-codex"
+        invalid["providers"]["openai-codex"]["runtime_provider"] = "xai"
 
         with (
             mock.patch.object(self.client, "_json_request", return_value=(invalid, {})),
-            self.assertRaisesRegex(AgentRuntimeProtocolError, "no valid xai-oauth provider"),
+            self.assertRaisesRegex(AgentRuntimeProtocolError, "no valid openai-codex provider"),
         ):
             self.client.model_catalog()
 

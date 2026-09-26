@@ -623,10 +623,7 @@ class AgentRuntimeClient:
         if not isinstance(providers, dict):
             raise AgentRuntimeProtocolError("Agent runtime model catalog has no providers object")
         normalized: dict[str, dict[str, Any]] = {}
-        runtime_providers = {
-            "openai-codex": "openai-codex",
-            "xai-oauth": "xai",
-        }
+        runtime_providers = {"openai-codex": "openai-codex"}
         for provider, expected_runtime_provider in runtime_providers.items():
             entry = providers.get(provider)
             if (

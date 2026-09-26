@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import re
 import secrets
@@ -10,7 +8,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,12 +20,9 @@ CODEX_DEVICE_VERIFICATION_URL = "https://auth.openai.com/codex/device"
 OAUTH_HTTP_USER_AGENT = "agent-platform/0.2"
 MAX_OAUTH_RESPONSE_BYTES = 2 * 1024 * 1024
 
-XAI_OAUTH_DISCOVERY_URL = "https://auth.x.ai/.well-known/openid-configuration"
-XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
-XAI_OAUTH_SCOPE = "openid profile email offline_access grok-cli:access api:access"
-XAI_REDIRECT_URI = "http://127.0.0.1:56121/callback"
-
-SUPPORTED_OAUTH_PROVIDERS = ("openai-codex", "xai-oauth")
+# Codex is the only Agent model provider.
+AGENT_OAUTH_PROVIDER = "openai-codex"
+SUPPORTED_OAUTH_PROVIDERS = (AGENT_OAUTH_PROVIDER,)
 
 OAUTH_PROVIDER_INFO = {
     "openai-codex": {
@@ -36,12 +30,6 @@ OAUTH_PROVIDER_INFO = {
         "label": "Codex OAuth",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "flow": "device_code",
-    },
-    "xai-oauth": {
-        "id": "xai-oauth",
-        "label": "Grok OAuth",
-        "base_url": "https://api.x.ai/v1",
-        "flow": "manual_callback",
     },
 }
 
@@ -190,8 +178,6 @@ class OAuthFlowManager:
         self._prune_sessions()
         if provider == "openai-codex":
             return self._start_codex()
-        if provider == "xai-oauth":
-            return self._start_xai()
         raise OAuthFlowError(400, f"unsupported OAuth provider: {provider}")
 
     def poll(self, provider: str, flow_id: str) -> dict[str, Any]:
@@ -241,58 +227,6 @@ class OAuthFlowManager:
             "tokens": {"access_token": access_token, "refresh_token": refresh_token},
         }
 
-    def complete(self, provider: str, flow_id: str, callback_url: str) -> dict[str, Any]:
-        provider = normalize_oauth_provider(provider)
-        session = self._get_session(provider, flow_id)
-        if provider != "xai-oauth":
-            raise OAuthFlowError(400, "this provider does not use callback paste completion")
-        if time.time() > float(session["expires_at"]):
-            self._drop_session(flow_id)
-            raise OAuthFlowError(410, "OAuth verification timed out; start again")
-        callback = _parse_callback_url(callback_url)
-        if callback.get("error"):
-            detail = callback.get("error_description") or callback["error"]
-            raise OAuthFlowError(400, f"Grok authorization failed: {detail}")
-        if callback.get("state") != session["state"]:
-            raise OAuthFlowError(400, "Grok authorization failed: state mismatch")
-        code = str(callback.get("code") or "").strip()
-        if not code:
-            raise OAuthFlowError(400, "Grok callback URL did not contain an authorization code")
-        token_endpoint = str(session["token_endpoint"])
-        response = self.http.post_form(
-            token_endpoint,
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": session["redirect_uri"],
-                "client_id": XAI_OAUTH_CLIENT_ID,
-                "code_verifier": session["code_verifier"],
-                "code_challenge": session["code_challenge"],
-                "code_challenge_method": "S256",
-            },
-            timeout=30.0,
-        )
-        if response.status != 200:
-            raise OAuthFlowError(502, f"Grok token exchange failed with HTTP {response.status}: {response.text}")
-        access_token = str(response.data.get("access_token") or "").strip()
-        refresh_token = str(response.data.get("refresh_token") or "").strip()
-        if not access_token or not refresh_token:
-            raise OAuthFlowError(502, "Grok token exchange did not return access and refresh tokens")
-        self._drop_session(flow_id)
-        return {
-            "flow_id": flow_id,
-            "provider": provider,
-            "status": "complete",
-            "complete": True,
-            "tokens": {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "id_token": str(response.data.get("id_token") or "").strip(),
-                "token_type": str(response.data.get("token_type") or "Bearer").strip() or "Bearer",
-                "expires_in": response.data.get("expires_in"),
-            },
-        }
-
     def _start_codex(self) -> dict[str, Any]:
         response = self.http.post_json(
             CODEX_DEVICE_USER_CODE_URL,
@@ -320,48 +254,6 @@ class OAuthFlowManager:
         }
         self._store_session(session)
         return self._pending_response(session, "waiting_for_user")
-
-    def _start_xai(self) -> dict[str, Any]:
-        discovery = self.http.get_json(XAI_OAUTH_DISCOVERY_URL, timeout=20.0)
-        if discovery.status != 200:
-            raise OAuthFlowError(502, f"Grok OAuth discovery failed with HTTP {discovery.status}: {discovery.text}")
-        authorization_endpoint = str(discovery.data.get("authorization_endpoint") or "").strip()
-        token_endpoint = str(discovery.data.get("token_endpoint") or "").strip()
-        if not authorization_endpoint or not token_endpoint:
-            raise OAuthFlowError(502, "Grok OAuth discovery response was missing endpoints")
-        code_verifier = _pkce_code_verifier()
-        code_challenge = _pkce_code_challenge(code_verifier)
-        state = uuid.uuid4().hex
-        nonce = uuid.uuid4().hex
-        authorize_url = authorization_endpoint + "?" + urllib.parse.urlencode(
-            {
-                "response_type": "code",
-                "client_id": XAI_OAUTH_CLIENT_ID,
-                "redirect_uri": XAI_REDIRECT_URI,
-                "scope": XAI_OAUTH_SCOPE,
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-                "state": state,
-                "nonce": nonce,
-                "plan": "generic",
-                "referrer": "agent-platform",
-            }
-        )
-        flow_id = secrets.token_urlsafe(18)
-        session = {
-            "flow_id": flow_id,
-            "provider": "xai-oauth",
-            "kind": "manual_callback",
-            "authorize_url": authorize_url,
-            "redirect_uri": XAI_REDIRECT_URI,
-            "token_endpoint": token_endpoint,
-            "code_verifier": code_verifier,
-            "code_challenge": code_challenge,
-            "state": state,
-            "expires_at": time.time() + 900,
-        }
-        self._store_session(session)
-        return self._pending_response(session, "waiting_for_callback")
 
     def _pending_response(self, session: dict[str, Any], status: str) -> dict[str, Any]:
         response = {
@@ -415,22 +307,3 @@ def _positive_int(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
-
-
-def _pkce_code_verifier(length: int = 64) -> str:
-    return base64.urlsafe_b64encode(secrets.token_bytes(length)).decode("ascii").rstrip("=")
-
-
-def _pkce_code_challenge(code_verifier: str) -> str:
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-
-
-def _parse_callback_url(callback_url: str) -> dict[str, str]:
-    raw = callback_url.strip()
-    if not raw:
-        raise OAuthFlowError(400, "callback URL is required")
-    parsed = urllib.parse.urlparse(raw)
-    query = parsed.query or raw.lstrip("?")
-    values = urllib.parse.parse_qs(query, keep_blank_values=True)
-    return {key: vals[0] for key, vals in values.items() if vals}

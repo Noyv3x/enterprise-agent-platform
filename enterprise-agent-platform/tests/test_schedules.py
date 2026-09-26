@@ -36,7 +36,6 @@ def make_config(tmp: Path) -> PlatformConfig:
         agent_runtime_url="http://127.0.0.1:8766",
         agent_runtime_token="runtime-token",
         agent_runtime_model="gpt-5.5",
-        agent_runtime_provider="openai-codex",
         agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )

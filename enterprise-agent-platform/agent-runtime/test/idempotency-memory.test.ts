@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import fs from "node:fs";
@@ -295,7 +296,7 @@ test("RunCoordinator recalls query-matched Agent memory and the complete current
   const faux = fauxProvider();
   faux.setResponses([
     (context) => {
-      observedSystemPrompt = context.systemPrompt || "";
+      observedSystemPrompt = getCurrentSystemPrompt(context.messages) || "";
       return fauxAssistantMessage("used memory");
     },
   ]);
@@ -352,7 +353,7 @@ test("RunCoordinator does not inject or report structurally empty memory results
   const faux = fauxProvider();
   faux.setResponses([
     (context) => {
-      observedSystemPrompt = context.systemPrompt || "";
+      observedSystemPrompt = getCurrentSystemPrompt(context.messages) || "";
       return fauxAssistantMessage("no memory");
     },
   ]);

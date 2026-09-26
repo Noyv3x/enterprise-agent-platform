@@ -43,12 +43,12 @@ function assistantMessage(
 function update(
   type: DraftUpdate["type"],
   name: string,
-  arguments_: Record<string, unknown>,
+  arguments_: ToolCall["arguments"],
   options: {
     id?: string;
     provider?: string;
     api?: AssistantMessage["api"];
-    partialArguments?: Record<string, unknown>;
+    partialArguments?: ToolCall["arguments"];
   } = {},
 ): DraftUpdate {
   const toolCall: ToolCall = {

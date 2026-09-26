@@ -514,7 +514,7 @@ export async function setSecret(
    Every action routes through runBusy and updateOAuthState (the
    SET_OAUTH_STATE reducer case) and reloads the Agent runtime config. The
    start/check bodies are the literal "{}" / { flow_id }. No
-   auto-poll exists — poll/complete are user-triggered. */
+   auto-poll exists — the device-code poll is user-triggered. */
 
 /** Merge a provider verification response into OAuth state. */
 function updateOAuthState(
@@ -527,7 +527,6 @@ function updateOAuthState(
     payload: {
       providerId,
       providers: result.providers || [],
-      activeProvider: result.active_provider,
       flow: result.flow ?? null,
     },
   });
@@ -559,30 +558,6 @@ export async function pollOAuthVerification(
   });
 }
 
-export async function completeOAuthVerification(
-  store: AppStore,
-  providerId: string,
-  flowId: string,
-): Promise<void> {
-  await runBusy(store, `admin:oauth:complete:${providerId}`, async () => {
-    const callbackUrl = store.getState().oauthCallbackUrls[providerId] || "";
-    const result = await api<OAuthFlowResponse>(endpoints.completeOAuth.path(providerId), {
-      method: "POST",
-      body: JSON.stringify({ flow_id: flowId, callback_url: callbackUrl }),
-    });
-    updateOAuthState(store, providerId, result);
-    if (result.flow?.complete) {
-      store.dispatch({ type: "SET_OAUTH_CALLBACK_URL", payload: { providerId, value: "" } });
-    }
-    await loadAgentRuntimeConfig(store);
-  });
-}
-
-/** Write the in-progress Grok callback URL. */
-export function setOAuthCallbackUrl(store: AppStore, providerId: string, value: string): void {
-  store.dispatch({ type: "SET_OAUTH_CALLBACK_URL", payload: { providerId, value } });
-}
-
 /** Export OAuth credentials with GET to a client-side JSON download. */
 export async function exportOAuthCredentials(store: AppStore): Promise<void> {
   await runBusy(store, "admin:oauth:export", async () => {
@@ -605,7 +580,7 @@ export async function importOAuthCredentials(store: AppStore, file: File): Promi
       method: "POST",
       body: JSON.stringify({ credentials }),
     });
-    updateOAuthState(store, result.active_provider || "", result);
+    store.dispatch({ type: "SET_OAUTH_PROVIDERS", payload: { providers: result.providers || [] } });
     await Promise.all([loadSecrets(store), loadAgentRuntimeConfig(store)]);
     const count = result.imported?.keys?.length || 0;
     toast(t("admin.toast.oauthImported", { count }), { type: "ok", title: t("admin.toast.complete") });

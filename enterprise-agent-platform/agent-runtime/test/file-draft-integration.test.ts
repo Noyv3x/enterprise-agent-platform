@@ -50,7 +50,7 @@ function eventStream(events: AssistantMessageEvent[]): ReturnType<StreamFn> {
 function toolCallStream(
   model: Model<Api>,
   toolCall: ToolCall,
-  cumulativeArguments?: Record<string, unknown>[],
+  cumulativeArguments?: ToolCall["arguments"][],
 ): ReturnType<StreamFn> {
   const started = message(model, [{ ...toolCall, arguments: {} }], "toolUse");
   const final = message(model, [toolCall], "toolUse");

@@ -429,7 +429,6 @@ export interface SecurityConfigUpdateRequest {
 export type AgentRuntimeConfigResponse = AgentRuntimeConfigState;
 
 export interface AgentRuntimeConfigUpdateRequest {
-  provider: string;
   model: string;
   idle_timeout_seconds: string;
   max_concurrency: string;
@@ -471,17 +470,11 @@ export type OAuthProvidersResponse = OAuthProvidersState;
 
 export interface OAuthFlowResponse {
   providers?: OAuthProvider[];
-  active_provider?: string;
   flow?: OAuthFlow;
 }
 
 export interface OAuthPollRequest {
   flow_id: string;
-}
-
-export interface OAuthCompleteRequest {
-  flow_id: string;
-  callback_url: string;
 }
 
 export interface OAuthImportRequest {

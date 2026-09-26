@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
@@ -474,7 +475,7 @@ test("Manager task reconciliation repairs a crash before Runtime sidecar registr
   };
   faux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt || "", /proc_recovered/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /proc_recovered/);
       return fauxAssistantMessage(fauxToolCall("process", {
         action: "wait",
         process_id: "proc_recovered",
@@ -660,9 +661,9 @@ test("needs_review obligations survive a new coordinator and terminal evidence r
   const secondFaux = fauxProvider();
   secondFaux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt || "", /<background_task_obligations>/);
-      assert.match(context.systemPrompt || "", /"process_id": "process_managed"/);
-      assert.match(context.systemPrompt || "", /"target": "sandbox"/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /<background_task_obligations>/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /"process_id": "process_managed"/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /"target": "sandbox"/);
       return fauxAssistantMessage(fauxToolCall("process", {
         action: "wait",
         process_id: "process_managed",

@@ -30,7 +30,6 @@ describe("AgentRuntimeConfig", () => {
       type: "SET_AGENT_RUNTIME_CONFIG",
       payload: {
         config: {
-          provider: "openai-codex",
           model: "gpt-5",
           idle_timeout_seconds: 1800,
           max_concurrency: 4,
@@ -62,7 +61,6 @@ describe("AgentRuntimeConfig", () => {
     expect(actions.saveAgentRuntimeConfig).toHaveBeenCalledWith(
       store,
       {
-        provider: "openai-codex",
         model: "gpt-5",
         idle_timeout_seconds: "1800",
         max_concurrency: "8",
@@ -77,7 +75,6 @@ describe("AgentRuntimeConfig", () => {
       type: "SET_AGENT_RUNTIME_CONFIG",
       payload: {
         config: {
-          provider: "openai-codex",
           model: "",
           idle_timeout_seconds: 1800,
           max_concurrency: 4,
@@ -119,7 +116,6 @@ describe("AgentRuntimeConfig", () => {
       type: "SET_AGENT_RUNTIME_CONFIG",
       payload: {
         config: {
-          provider: "openai-codex",
           model: "",
           model_catalog: {
             "openai-codex": {
@@ -133,7 +129,6 @@ describe("AgentRuntimeConfig", () => {
     store.dispatch({
       type: "SET_OAUTH_PROVIDERS",
       payload: {
-        active_provider: "openai-codex",
         providers: [{
           id: "openai-codex",
           configured: false,
@@ -159,7 +154,7 @@ describe("AgentRuntimeConfig", () => {
     const store = createStore(rootReducer, initialAppState);
     store.dispatch({
       type: "SET_AGENT_RUNTIME_CONFIG",
-      payload: { config: { provider: "openai-codex", model: "saved-model", max_concurrency: 4 } },
+      payload: { config: { model: "saved-model", max_concurrency: 4 } },
     });
     store.dispatch({
       type: "SET_OAUTH_PROVIDERS",

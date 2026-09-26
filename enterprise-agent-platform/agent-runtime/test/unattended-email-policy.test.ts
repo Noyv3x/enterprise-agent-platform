@@ -1,3 +1,4 @@
+import { getCurrentTools } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import test from "node:test";
@@ -55,8 +56,8 @@ test("unattended email runs expose only read-only mail operations", async () => 
   let exposedMailSchema = "";
   faux.setResponses([
     (context) => {
-      exposedToolNames = context.tools?.map((tool) => tool.name) ?? [];
-      exposedMailSchema = JSON.stringify(context.tools?.find((tool) => tool.name === "mail")?.parameters);
+      exposedToolNames = getCurrentTools(context.messages)?.map((tool) => tool.name) ?? [];
+      exposedMailSchema = JSON.stringify(getCurrentTools(context.messages)?.find((tool) => tool.name === "mail")?.parameters);
       return fauxAssistantMessage(blockedEmailCalls, { stopReason: "toolUse" });
     },
     fauxAssistantMessage("Blocked unsafe email-triggered actions."),

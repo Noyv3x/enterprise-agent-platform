@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { rm } from "node:fs/promises";
 import test from "node:test";
 import { estimateTokens, type AgentMessage, type StreamFn } from "@earendil-works/pi-agent-core";
-import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { RequestContextUsage } from "../src/context-usage.js";
 import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
@@ -98,7 +98,7 @@ test("large system request triggers automatic compaction despite tiny restored u
   const workspace = await temporaryDirectory("agent-request-system-workspace-");
   let summaries = 0;
   const streamFn: StreamFn = (_model, context) => {
-    if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
       summaries += 1;
       return responseStream(measuredAnswer(1));
     }
@@ -131,7 +131,7 @@ test("post-compaction zero usage measures only the active projection without rep
   let turns = 0;
   let expectedUsage = 0;
   const streamFn: StreamFn = (_model, context) => {
-    if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
       summaries += 1;
       return responseStream(measuredAnswer(0));
     }
@@ -142,7 +142,7 @@ test("post-compaction zero usage measures only the active projection without rep
       response.stopReason = "toolUse";
     }
     const projected = [...context.messages, response];
-    expectedUsage = new RequestContextUsage(context.systemPrompt ?? "", context.tools ?? [])
+    expectedUsage = new RequestContextUsage(getCurrentSystemPrompt(context.messages) ?? "", getCurrentTools(context.messages) ?? [])
       .measure(projected, projected, 272_000)!.used_tokens;
     return responseStream(response);
   };
@@ -176,13 +176,13 @@ test("available tool schemas alone push a short request over the automatic thres
   let calibrating = true;
   const history = Array.from({ length: 9 }, () => user("short"));
   const streamFn: StreamFn = (model, context) => {
-    if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
       summaries += 1;
     } else if (calibrating) {
       const messages = [...history, ...context.messages];
-      const withoutTools = new RequestContextUsage(context.systemPrompt ?? "", [])
+      const withoutTools = new RequestContextUsage(getCurrentSystemPrompt(context.messages) ?? "", [])
         .measure(messages, messages, model.contextWindow)!.used_tokens;
-      const withTools = new RequestContextUsage(context.systemPrompt ?? "", context.tools ?? [])
+      const withTools = new RequestContextUsage(getCurrentSystemPrompt(context.messages) ?? "", getCurrentTools(context.messages) ?? [])
         .measure(messages, messages, model.contextWindow)!.used_tokens;
       assert.ok(withTools > withoutTools + 100);
       threshold = (withoutTools + withTools) / 2 / model.contextWindow;
@@ -219,7 +219,7 @@ test("each post-compaction provider response establishes a fresh exact usage anc
   let summaries = 0;
   let turns = 0;
   const streamFn: StreamFn = (_model, context) => {
-    if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
       summaries += 1;
       return responseStream(measuredAnswer(9_000));
     }

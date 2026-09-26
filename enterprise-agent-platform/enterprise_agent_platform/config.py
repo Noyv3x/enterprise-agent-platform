@@ -21,9 +21,6 @@ from .technical_profile import (
 OAUTH_SECRET_KEYS = (
     "CODEX_OAUTH_ACCESS_TOKEN",
     "CODEX_OAUTH_REFRESH_TOKEN",
-    "GROK_OAUTH_ACCESS_TOKEN",
-    "GROK_OAUTH_REFRESH_TOKEN",
-    "GROK_OAUTH_ID_TOKEN",
 )
 
 
@@ -53,7 +50,6 @@ class PlatformConfig:
     agent_runtime_url: str = "http://agent-runtime:8766"
     agent_runtime_token: str = ""
     agent_runtime_model: str = ""
-    agent_runtime_provider: str = "openai-codex"
     agent_runtime_idle_timeout_seconds: float = float(
         RUN_IDLE_TIMEOUT_DEFAULT_SECONDS
     )
@@ -225,9 +221,6 @@ class PlatformConfig:
             agent_runtime_model=os.getenv(
                 "AGENT_PLATFORM_AGENT_RUNTIME_MODEL", ""
             ).strip(),
-            agent_runtime_provider=os.getenv(
-                "AGENT_PLATFORM_AGENT_RUNTIME_PROVIDER", "openai-codex"
-            ).strip().lower() or "openai-codex",
             agent_runtime_idle_timeout_seconds=_env_float(
                 RUN_IDLE_TIMEOUT_PLATFORM_ENVIRONMENT_VARIABLE,
                 float(RUN_IDLE_TIMEOUT_DEFAULT_SECONDS),

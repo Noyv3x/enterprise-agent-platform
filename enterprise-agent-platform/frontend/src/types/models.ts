@@ -635,7 +635,6 @@ export interface OAuthProvider {
   label?: string;
   default_model?: string;
   configured?: boolean;
-  active?: boolean;
   last_refresh?: number | string;
   last_auth_error?: OAuthAuthError | null;
   model_catalog_error?: string;
@@ -644,10 +643,9 @@ export interface OAuthProvider {
 
 export interface OAuthProvidersState {
   providers: OAuthProvider[];
-  active_provider?: string;
 }
 
-export type OAuthFlowKind = "device_code" | "manual_callback";
+export type OAuthFlowKind = "device_code";
 
 interface OAuthFlowBase {
   flow_id: string;
@@ -661,13 +659,7 @@ export interface OAuthDeviceCodeFlow extends OAuthFlowBase {
   user_code: string;
 }
 
-export interface OAuthManualCallbackFlow extends OAuthFlowBase {
-  kind: "manual_callback";
-  authorize_url: string;
-  redirect_uri: string;
-}
-
-export type OAuthFlow = OAuthDeviceCodeFlow | OAuthManualCallbackFlow;
+export type OAuthFlow = OAuthDeviceCodeFlow;
 
 /* ------------------------------------------------------------ admin/config */
 
@@ -737,7 +729,6 @@ export interface AgentRuntimeConfigValues {
   managed?: boolean;
   runtime_url?: string;
   runtime_home?: string;
-  provider?: string;
   model?: string;
   idle_timeout_seconds?: number | string;
   max_concurrency?: number | string;

@@ -59,7 +59,6 @@ import type {
   MailAccountsResponse,
   MailAccountTestResponse,
   SessionBootstrapResponse,
-  OAuthCompleteRequest,
   OAuthFlowResponse,
   OAuthImportRequest,
   OAuthImportResponse,
@@ -522,10 +521,6 @@ export const endpoints = {
   pollOAuth: ep<OAuthPollRequest, OAuthFlowResponse, [string]>(
     "POST",
     (providerId) => `/api/system/oauth/${providerId}/poll`,
-  ),
-  completeOAuth: ep<OAuthCompleteRequest, OAuthFlowResponse, [string]>(
-    "POST",
-    (providerId) => `/api/system/oauth/${providerId}/complete`,
   ),
   exportOAuthCredentials: ep<void, unknown>(
     "GET",

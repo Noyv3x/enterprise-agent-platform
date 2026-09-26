@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { readFile, rm } from "node:fs/promises";
 import test from "node:test";
@@ -28,7 +29,7 @@ test("automatic compaction iteratively re-compacts a long tool loop in one Run",
     `HANDOFF_REVISION_${index + 1}\n${objective}\n${latestRequest}\nAuthorization: Bearer ${rawOutputSecret}`,
   )));
   const streamFn: StreamFn = (model, context, options) => {
-    if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
       summaryCalls += 1;
       summaryInputs.push(structuredClone(context.messages));
       return summaries.provider.streamSimple(model, context, options);
@@ -127,7 +128,7 @@ test("cancelling a repeated automatic summary preserves the last committed hando
       });
     },
   ]);
-  const streamFn: StreamFn = (model, context, options) => context.systemPrompt?.startsWith(
+  const streamFn: StreamFn = (model, context, options) => getCurrentSystemPrompt(context.messages)?.startsWith(
     "Create a concise continuation handoff",
   )
     ? summaries.provider.streamSimple(model, context, options)
@@ -278,7 +279,7 @@ for (const scenario of incompleteSummaries) {
     main.setResponses([fauxAssistantMessage("Must not continue from an incomplete handoff.")]);
     let summaryCalls = 0;
     const streamFn: StreamFn = (model, context, options) => {
-      if (context.systemPrompt?.startsWith("Create a concise continuation handoff")) {
+      if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
         summaryCalls += 1;
         return summaries.provider.streamSimple(model, context, options);
       }

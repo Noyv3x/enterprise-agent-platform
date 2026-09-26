@@ -3,9 +3,10 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelRequest, ResolvedModel, RunRequest } from "./types.js";
 import { PlatformGateway } from "./platform-gateway.js";
 
-type ProductProvider = "openai-codex" | "xai";
+// Codex (ChatGPT OAuth) is the only product model provider.
+type ProductProvider = "openai-codex";
 
-type ProductProviderId = "openai-codex" | "xai-oauth";
+type ProductProviderId = "openai-codex";
 
 interface ProductProviderDefinition {
   runtimeProvider: ProductProvider;
@@ -35,22 +36,10 @@ const PRODUCT_PROVIDERS: Readonly<Record<ProductProviderId, ProductProviderDefin
     api: "openai-codex-responses",
     baseUrl: "https://chatgpt.com/backend-api",
   },
-  "xai-oauth": {
-    runtimeProvider: "xai",
-    api: "openai-completions",
-    baseUrl: "https://api.x.ai/v1",
-  },
-};
-
-const PRODUCT_PROVIDER_RUNTIME: Readonly<Record<ProductProviderId, ProductProvider>> = {
-  "openai-codex": "openai-codex",
-  "xai-oauth": "xai",
 };
 
 function definitionForRuntimeProvider(provider: ProductProvider): ProductProviderDefinition {
-  return provider === "openai-codex"
-    ? PRODUCT_PROVIDERS["openai-codex"]
-    : PRODUCT_PROVIDERS["xai-oauth"];
+  return PRODUCT_PROVIDERS[provider];
 }
 
 function isTrustedProductModel(model: Model<Api>, definition: ProductProviderDefinition): boolean {
@@ -72,7 +61,6 @@ function trustedModels(provider: ProductProvider): Model<Api>[] {
  */
 export const PRODUCT_MODELS: Readonly<Record<ProductProvider, readonly string[]>> = Object.freeze({
   "openai-codex": Object.freeze(trustedModels("openai-codex").map((model) => model.id)),
-  xai: Object.freeze(trustedModels("xai").map((model) => model.id)),
 });
 
 function productModelCatalog(
@@ -98,7 +86,6 @@ function productModelCatalog(
 export function productModelCatalogs(): Record<ProductProviderId, ProductModelCatalog> {
   return {
     "openai-codex": productModelCatalog("openai-codex", PRODUCT_PROVIDERS["openai-codex"]),
-    "xai-oauth": productModelCatalog("xai-oauth", PRODUCT_PROVIDERS["xai-oauth"]),
   };
 }
 
@@ -120,10 +107,10 @@ export function validateProductModelRequest(model: ModelRequest): ProductProvide
   if (unknown.length > 0) {
     throw new ModelValidationError(`model accepts only provider, id, and reasoning; received ${unknown.join(", ")}`);
   }
-  const provider = PRODUCT_PROVIDER_RUNTIME[model.provider as ProductProviderId];
-  if (!provider) {
-    throw new ModelValidationError("model.provider must be openai-codex or xai-oauth");
+  if (model.provider !== "openai-codex") {
+    throw new ModelValidationError("model.provider must be openai-codex");
   }
+  const provider: ProductProvider = model.provider;
   const definition = definitionForRuntimeProvider(provider);
   const lookup = getModel as unknown as (providerId: string, modelId: string) => Model<Api> | undefined;
   const resolved = lookup(provider, model.id);

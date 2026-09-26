@@ -29,7 +29,6 @@ export const adminInitial: AdminSliceState = {
   securityConfig: null,
   oauthProviders: null,
   oauthFlows: {},
-  oauthCallbackUrls: {},
 };
 
 export function adminReducer(state: AppState, action: Action): AppState {
@@ -65,15 +64,12 @@ export function adminReducer(state: AppState, action: Action): AppState {
     case "SET_OAUTH_PROVIDERS":
       return { ...state, oauthProviders: action.payload };
     case "SET_OAUTH_STATE": {
-      // Replace oauthProviders with { providers, active_provider }, and merge the flow
+      // Replace oauthProviders with { providers }, and merge the flow
       // (keyed by providerId) only when one is present. Completed flows are
       // never deleted here — they linger (driving the "验证完成" banner) until the
       // next full loadOAuthProviders.
-      const { providerId, providers, activeProvider, flow } = action.payload;
-      const oauthProviders = {
-        providers: providers || [],
-        active_provider: activeProvider || providerId,
-      };
+      const { providerId, providers, flow } = action.payload;
+      const oauthProviders = { providers: providers || [] };
       if (flow) {
         return {
           ...state,
@@ -90,16 +86,6 @@ export function adminReducer(state: AppState, action: Action): AppState {
       };
     case "SET_OAUTH_FLOWS":
       return { ...state, oauthFlows: action.payload };
-    case "SET_OAUTH_CALLBACK_URL":
-      return {
-        ...state,
-        oauthCallbackUrls: {
-          ...state.oauthCallbackUrls,
-          [action.payload.providerId]: action.payload.value,
-        },
-      };
-    case "SET_OAUTH_CALLBACK_URLS":
-      return { ...state, oauthCallbackUrls: action.payload };
     case "RESET_SESSION":
       return { ...state, messageAudit: initialMessageAudit };
     default:

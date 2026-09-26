@@ -18,10 +18,8 @@ from enterprise_agent_platform.oauth_flows import (
     OAuthHTTPClient,
     OAuthHTTPResponse,
     OAUTH_HTTP_USER_AGENT,
-    XAI_OAUTH_DISCOVERY_URL,
 )
 from enterprise_agent_platform.model_catalog import CODEX_MODELS_URL
-from enterprise_agent_platform.runtimes import AGENT_SETTING_PROVIDER
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
 
 from test_platform import make_config, RecordingAgent
@@ -221,24 +219,15 @@ class OAuthPollTests(unittest.TestCase):
         self.assertEqual(started["user_code"], "HTTP-CODE")
         self.assertEqual(http_client.calls[0][0], "post_json")
 
-    def test_xai_flow_uses_platform_http_client(self):
-        http_client = _ScriptedOAuthHTTPClient(
-            {
-                XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
-                    200,
-                    {
-                        "authorization_endpoint": "https://xai.example/authorize",
-                        "token_endpoint": "https://xai.example/token",
-                    },
-                ),
-            }
-        )
+    def test_retired_grok_provider_cannot_start_a_flow(self):
+        http_client = _ScriptedOAuthHTTPClient({})
         manager = OAuthFlowManager(http_client)
 
-        started = manager.start("xai-oauth")
+        with self.assertRaises(OAuthFlowError) as ctx:
+            manager.start("xai-oauth")
 
-        self.assertIn("https://xai.example/authorize?", started["authorize_url"])
-        self.assertEqual(http_client.calls[0], ("get_json", XAI_OAUTH_DISCOVERY_URL))
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(http_client.calls, [])
 
     def test_poll_pending_returns_not_complete_without_dropping_session(self):
         # 403 from the device-token endpoint means the user has not yet approved.
@@ -289,48 +278,6 @@ class OAuthPollTests(unittest.TestCase):
         with self.assertRaises(OAuthFlowError) as ctx2:
             manager.poll("openai-codex", flow_id)
         self.assertEqual(ctx2.exception.status, 404)
-
-
-class OAuthGrokCompleteTests(unittest.TestCase):
-    def _started_xai_manager(self):
-        client = _ScriptedOAuthHTTPClient(
-            {
-                XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
-                    200,
-                    {
-                        "authorization_endpoint": "https://xai.example/authorize",
-                        "token_endpoint": "https://xai.example/token",
-                    },
-                ),
-                "https://xai.example/token": OAuthHTTPResponse(
-                    200, {"access_token": "grok-access", "refresh_token": "grok-refresh"}
-                ),
-            }
-        )
-        manager = OAuthFlowManager(client)
-        started = manager.start("xai-oauth")
-        return manager, client, started
-
-    def test_complete_rejects_state_mismatch(self):
-        manager, client, started = self._started_xai_manager()
-        flow_id = started["flow_id"]
-        callback = f"{started['redirect_uri']}?code=grok-code&state=not-the-real-state"
-        with self.assertRaises(OAuthFlowError) as ctx:
-            manager.complete("xai-oauth", flow_id, callback)
-        self.assertEqual(ctx.exception.status, 400)
-        self.assertIn("state mismatch", ctx.exception.message)
-        # A rejected state mismatch must NOT trigger a token exchange.
-        self.assertFalse(any(call[0] == "post_form" for call in client.calls))
-
-    def test_complete_rejects_provider_error_callback(self):
-        manager, client, started = self._started_xai_manager()
-        flow_id = started["flow_id"]
-        callback = f"{started['redirect_uri']}?error=access_denied&error_description=user+declined"
-        with self.assertRaises(OAuthFlowError) as ctx:
-            manager.complete("xai-oauth", flow_id, callback)
-        self.assertEqual(ctx.exception.status, 400)
-        self.assertIn("user declined", ctx.exception.message)
-        self.assertFalse(any(call[0] == "post_form" for call in client.calls))
 
 
 class OAuthCredentialResolutionTests(unittest.TestCase):
@@ -466,11 +413,22 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_runtime_credential_resolution_rejects_unconnected_provider(self):
+    def test_runtime_credential_resolution_rejects_unconnected_and_retired_providers(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 with self.assertRaises(ServiceError) as raised:
+                    service.resolve_agent_credentials(
+                        {
+                            "provider": "openai-codex",
+                            "model": "gpt-5.5",
+                            "scope_key": "private:1",
+                        }
+                    )
+                self.assertEqual(raised.exception.status, 409)
+                self.assertIn("not connected", raised.exception.message)
+
+                with self.assertRaises(ServiceError) as retired:
                     service.resolve_agent_credentials(
                         {
                             "provider": "xai-oauth",
@@ -478,8 +436,7 @@ class OAuthCredentialResolutionTests(unittest.TestCase):
                             "scope_key": "private:1",
                         }
                     )
-                self.assertEqual(raised.exception.status, 409)
-                self.assertIn("not connected", raised.exception.message)
+                self.assertEqual(retired.exception.status, 400)
             finally:
                 service.close()
 
@@ -508,55 +465,16 @@ class OAuthSessionPruningTests(unittest.TestCase):
         manager = OAuthFlowManager(_ScriptedOAuthHTTPClient())
         now = time.time()
         with manager._lock:
-            manager._sessions["live"] = {"flow_id": "live", "provider": "xai-oauth", "expires_at": now + 500}
-            manager._sessions["dead"] = {"flow_id": "dead", "provider": "xai-oauth", "expires_at": now - 5}
+            manager._sessions["live"] = {"flow_id": "live", "provider": "openai-codex", "expires_at": now + 500}
+            manager._sessions["dead"] = {"flow_id": "dead", "provider": "openai-codex", "expires_at": now - 5}
         manager._prune_sessions()
         with manager._lock:
             remaining = set(manager._sessions)
         self.assertEqual(remaining, {"live"})
 
 
-class OAuthLiveProviderInvariantTests(unittest.TestCase):
-    def test_start_oauth_verification_does_not_switch_live_provider(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            client = _ScriptedOAuthHTTPClient(
-                {
-                    XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
-                        200,
-                        {
-                            "authorization_endpoint": "https://xai.example/authorize",
-                            "token_endpoint": "https://xai.example/token",
-                        },
-                    )
-                }
-            )
-            service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                oauth_http_client=client,
-            )
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                # Bootstrap persists the default provider so the sidecar and UI
-                # resolve the same configuration before the first OAuth flow.
-                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "openai-codex")
-                self.assertEqual(service._active_oauth_provider(), "openai-codex")
-
-                started = service.start_oauth_verification(admin, "xai-oauth")
-                # The flow reports the in-progress target for the UI...
-                self.assertEqual(started["flow"]["target_provider"], "xai-oauth")
-                self.assertEqual(started["flow"]["kind"], "manual_callback")
-                # ...but the live provider must NOT have switched to xai-oauth and
-                # no tokens were stored, so status still reports openai-codex active.
-                self.assertEqual(started["active_provider"], "openai-codex")
-                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "openai-codex")
-                self.assertEqual(service.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "")
-                self.assertFalse(service._oauth_tokens_configured("xai-oauth"))
-            finally:
-                service.close()
-
-    def test_poll_pending_through_service_keeps_provider_unswitched(self):
+class OAuthServiceFlowTests(unittest.TestCase):
+    def test_pending_poll_through_service_stores_no_tokens(self):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             client = _ScriptedOAuthHTTPClient(
@@ -582,40 +500,6 @@ class OAuthLiveProviderInvariantTests(unittest.TestCase):
                 self.assertFalse(polled["flow"]["complete"])
                 self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "")
                 self.assertFalse(service._oauth_tokens_configured("openai-codex"))
-            finally:
-                service.close()
-
-    def test_complete_state_mismatch_through_service_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            client = _ScriptedOAuthHTTPClient(
-                {
-                    XAI_OAUTH_DISCOVERY_URL: OAuthHTTPResponse(
-                        200,
-                        {
-                            "authorization_endpoint": "https://xai.example/authorize",
-                            "token_endpoint": "https://xai.example/token",
-                        },
-                    )
-                }
-            )
-            service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                oauth_http_client=client,
-            )
-            try:
-                _, admin = service.authenticate("admin", "admin")
-                started = service.start_oauth_verification(admin, "xai-oauth")
-                flow_id = started["flow"]["flow_id"]
-                bad_callback = f"{started['flow']['redirect_uri']}?code=grok-code&state=wrong"
-                with self.assertRaises(ServiceError) as ctx:
-                    service.complete_oauth_verification(
-                        admin, "xai-oauth", {"flow_id": flow_id, "callback_url": bad_callback}
-                    )
-                self.assertEqual(ctx.exception.status, 400)
-                self.assertEqual(service.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "")
-                self.assertFalse(service._oauth_tokens_configured("xai-oauth"))
             finally:
                 service.close()
 

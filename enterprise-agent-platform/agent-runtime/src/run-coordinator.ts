@@ -7,15 +7,17 @@ import {
   type AgentTool,
   type StreamFn,
 } from "@earendil-works/pi-agent-core";
-import type {
-  Api,
-  AssistantMessage,
-  ImageContent,
-  Model,
-  TextContent,
-  ToolCall,
-  ToolResultMessage,
-  UserMessage,
+import {
+  normalizeContext,
+  type Api,
+  type AssistantMessage,
+  type ImageContent,
+  type Model,
+  type TextContent,
+  type ToolCall,
+  type ToolResultMessage,
+  type UserMessage,
+  type JsonValue as PiJsonValue,
 } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { ApprovalBroker } from "./approval-broker.js";
@@ -750,11 +752,11 @@ export class RunCoordinator {
     };
     const responseStream = await retryStream(
       resolved.model,
-      {
+      normalizeContext({
         systemPrompt: CONTEXT_COMPACTION_SYSTEM_PROMPT,
         messages: [prompt],
         tools: [],
-      },
+      }),
       streamOptions,
     );
     for await (const _event of responseStream) {
@@ -1253,7 +1255,24 @@ export class RunCoordinator {
           ? [...automaticCompactionView, ...messages.slice(automaticCompactionSource.length)]
           : messages
       );
+      const streamFn = withModelStreamRetry(this.streamFn ?? streamSimple, {
+        onRetry: (attempt, delayMs) => this.touchRunActivity(
+          record.id,
+          `retrying transient model failure (${attempt}/${MODEL_STREAM_MAX_RETRIES}) after ${delayMs} ms`,
+        ),
+        ...(this.config.runIdleTimeoutMs > 0 ? {
+          activityHeartbeatMs: Math.max(
+            1,
+            Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3)),
+          ),
+          onRetryActivity: () => this.touchRunActivity(
+            record.id,
+            "waiting to retry transient model failure",
+          ),
+        } : {}),
+      });
       const agentOptions: ConstructorParameters<typeof Agent>[0] = {
+        streamFn,
         initialState: {
           systemPrompt,
           model: resolved.model,
@@ -1276,12 +1295,18 @@ export class RunCoordinator {
         // parallel/read-only batches can overlap. Approval preflight remains
         // sequential, preserving the platform's single pending approval card.
         steeringMode: "all",
-        prepareNextTurnWithContext: async (turn) => {
+        // Runtime reviews run after every completed turn, including the one
+        // where the model would otherwise stop. Pi calls prepareNextTurn only
+        // when another turn is already scheduled, so review lives here: an
+        // enqueued follow-up asks Pi for one more request, which the follow-up
+        // itself satisfies. Error and aborted turns stay hard exits.
+        finishTurn: async (turn) => {
+          if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return undefined;
           const followUp = executionReviewFollowUp(executionReview, turn.message, turn.toolResults);
           if (followUp) {
             ephemeralMessages.add(followUp);
             agent?.followUp(followUp);
-            return undefined;
+            return { action: "continue" };
           }
           if (
             isRecurringScheduledRun(record.request.metadata)
@@ -1293,7 +1318,7 @@ export class RunCoordinator {
             const decisionFollowUp = runtimeReviewMessage(SCHEDULE_DECISION_CONTINUATION);
             ephemeralMessages.add(decisionFollowUp);
             agent?.followUp(decisionFollowUp);
-            return undefined;
+            return { action: "continue" };
           }
           if (!learningReview && executionReview.todoContinuations < MAX_TODO_CONTINUATIONS) {
             const activeTodos = await this.sessions.loadActiveTodos(identity);
@@ -1302,7 +1327,7 @@ export class RunCoordinator {
               const todoFollowUp = runtimeReviewMessage(activeTodoContinuation(activeTodos));
               ephemeralMessages.add(todoFollowUp);
               agent?.followUp(todoFollowUp);
-              return undefined;
+              return { action: "continue" };
             }
           }
           if (
@@ -1317,10 +1342,17 @@ export class RunCoordinator {
             ));
             ephemeralMessages.add(processFollowUp);
             agent?.followUp(processFollowUp);
+            return { action: "continue" };
           }
           return undefined;
         },
-        transformContext: async (messages) => {
+        transformContext: async (transcript) => {
+          // Pi carries the prompt and tool declarations as leading system
+          // messages. Runtime session history, compaction, and usage own only
+          // the conversation after them; the prefix passes through unchanged.
+          const systemPrefixLength = leadingSystemMessageCount(transcript);
+          const systemPrefix = transcript.slice(0, systemPrefixLength);
+          const messages = transcript.slice(systemPrefixLength);
           // Pi keeps the logical transcript and calls this hook again for each
           // provider turn. Reuse a semantic handoff as the base projection, but
           // continue measuring that projection plus genuinely new logical
@@ -1353,7 +1385,7 @@ export class RunCoordinator {
             || usage.used_tokens < resolved.model.contextWindow * this.config.compactionThreshold
           ) {
             contextMeter.beginRequest(projectionSourceMessages);
-            return compatibleMessages;
+            return [...systemPrefix, ...compatibleMessages];
           }
           const compaction = compactContextPlan(
             compatibleMessages,
@@ -1462,7 +1494,7 @@ export class RunCoordinator {
           // A rewritten prefix cannot inherit usage from the retained historical tail.
           const requestSource = omitted > 0 ? compactedMessages : projectionSourceMessages;
           contextMeter.beginRequest(requestSource);
-          return compactedMessages;
+          return [...systemPrefix, ...compactedMessages];
         },
         beforeToolCall: async (toolContext, signal) => {
           this.touchRunActivity(record.id, `checking tool policy: ${toolContext.toolCall.name}`);
@@ -1641,22 +1673,6 @@ export class RunCoordinator {
           signal,
         ),
       };
-      agentOptions.streamFn = withModelStreamRetry(this.streamFn ?? streamSimple, {
-        onRetry: (attempt, delayMs) => this.touchRunActivity(
-          record.id,
-          `retrying transient model failure (${attempt}/${MODEL_STREAM_MAX_RETRIES}) after ${delayMs} ms`,
-        ),
-        ...(this.config.runIdleTimeoutMs > 0 ? {
-          activityHeartbeatMs: Math.max(
-            1,
-            Math.min(10_000, Math.floor(this.config.runIdleTimeoutMs / 3)),
-          ),
-          onRetryActivity: () => this.touchRunActivity(
-            record.id,
-            "waiting to retry transient model failure",
-          ),
-        } : {}),
-      });
       if (record.controller.signal.aborted) throw abortError();
       agent = new Agent(agentOptions);
       this.agents.set(record.id, agent);
@@ -1727,7 +1743,8 @@ export class RunCoordinator {
           this.forcedReviewReasons.set(record.id, ACTIVE_TODO_REVIEW_ERROR);
         }
       }
-      const finalProjection = projectContext(agent.state.messages);
+      const conversation = agent.state.messages.slice(leadingSystemMessageCount(agent.state.messages));
+      const finalProjection = projectContext(conversation);
       const contextUsage = contextMeter.measure(
         finalProjection,
         adaptImageContentForModel(finalProjection, modelSupportsImages(resolved.model)),
@@ -1736,7 +1753,7 @@ export class RunCoordinator {
       const forcedReviewReason = this.forcedReviewReasons.get(record.id);
       if (forcedReviewReason) {
         const diagnostic = reviewDiagnosticFromMessages(
-          agent.state.messages,
+          conversation,
           resolved.model.provider,
           resolved.model.id,
           contextUsage,
@@ -1748,7 +1765,7 @@ export class RunCoordinator {
       }
       if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
       const result = resultFromMessages(
-        agent.state.messages,
+        conversation,
         resolved.model.provider,
         resolved.model.id,
         contextUsage,
@@ -2188,11 +2205,11 @@ export class RunCoordinator {
       if (auxiliaryController.signal.aborted) throw abortError();
       const responseStream = await this.visionStreamFn(
         companion.model,
-        {
+        normalizeContext({
           systemPrompt: AUXILIARY_VISION_SYSTEM_PROMPT,
           messages: [prompt],
           tools: [],
-        },
+        }),
         {
           apiKey: companion.apiKey,
           signal: auxiliaryController.signal,
@@ -3995,6 +4012,17 @@ function emptyUsage(): AssistantMessage["usage"] {
   };
 }
 
+/**
+ * Pi represents the system prompt and tool declarations as leading system
+ * messages of its transcript. Everything Runtime persists or measures (session
+ * history, compaction, run results) starts after them.
+ */
+function leadingSystemMessageCount(messages: readonly AgentMessage[]): number {
+  let count = 0;
+  while (count < messages.length && messages[count]?.role === "system") count += 1;
+  return count;
+}
+
 function resultFromMessages(
   messages: AgentMessage[],
   provider: string,
@@ -4154,6 +4182,10 @@ export function adaptImageContentForModel(messages: AgentMessage[], supportsImag
  * base64 image payload. Build a deep sanitized copy so the model-facing result
  * remains untouched while logs retain the image type, MIME type, and byte size.
  */
+// Sanitizing only replaces strings, drops image bytes, and adds numeric/boolean
+// markers, so JSON input (Pi tool-result details) stays JSON.
+export function sanitizeToolResultForJournal(value: PiJsonValue, fieldName?: string): PiJsonValue;
+export function sanitizeToolResultForJournal(value: unknown, fieldName?: string): unknown;
 export function sanitizeToolResultForJournal(value: unknown, fieldName?: string): unknown {
   if (fieldName === "command") {
     return typeof value === "string" ? redactCommandForApproval(value) : "[redacted]";
@@ -4217,14 +4249,14 @@ export function durableRunResultMessages(
         };
       }
       const hasImages = message.content.some((block) => block.type === "image");
-      const details = sanitizeToolResultForJournal(message.details);
+      const details = message.details === undefined ? undefined : sanitizeToolResultForJournal(message.details);
       if (!hasImages && details === message.details) return message;
       return {
         ...message,
         content: message.content.map((block) => block.type === "image"
           ? durableImageMarker(block)
           : block),
-        details,
+        ...(details === undefined ? {} : { details }),
       };
     }
     if (message.role === "assistant") {

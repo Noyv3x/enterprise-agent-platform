@@ -115,8 +115,7 @@ from .model_catalog import MODEL_CATALOG_CACHE_SETTING, ModelCatalogManager
 from .oauth_flows import (
     CODEX_OAUTH_CLIENT_ID,
     CODEX_TOKEN_URL,
-    XAI_OAUTH_CLIENT_ID,
-    XAI_OAUTH_DISCOVERY_URL,
+    AGENT_OAUTH_PROVIDER,
     OAuthFlowError,
     OAuthFlowManager,
     SUPPORTED_OAUTH_PROVIDERS,
@@ -128,7 +127,6 @@ from .runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
     AGENT_SETTING_MAX_CONCURRENCY,
     AGENT_SETTING_MODEL,
-    AGENT_SETTING_PROVIDER,
     AGENT_SETTING_IDLE_TIMEOUT,
     PlatformRuntimeManager,
 )
@@ -763,8 +761,18 @@ TELEGRAM_SECRET_BOT_TOKEN = "AGENT_PLATFORM_TELEGRAM_BOT_TOKEN"
 TELEGRAM_SECRET_WEBHOOK_SECRET = "AGENT_PLATFORM_TELEGRAM_WEBHOOK_SECRET"
 OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
-    "xai-oauth": ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"),
 }
+OAUTH_PROVIDER_EXPIRY_KEYS = {"openai-codex": "CODEX_OAUTH_EXPIRES_AT"}
+# Grok OAuth was retired. Its credentials, provider choice, and credential
+# revision are deleted on startup; see EnterpriseService._retire_grok_provider.
+RETIRED_AGENT_PROVIDER_SETTING = "agent_runtime_provider"
+RETIRED_GROK_SETTING_KEYS = (
+    "GROK_OAUTH_ACCESS_TOKEN",
+    "GROK_OAUTH_REFRESH_TOKEN",
+    "GROK_OAUTH_ID_TOKEN",
+    "GROK_OAUTH_EXPIRES_AT",
+    "AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:xai-oauth",
+)
 
 
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
@@ -1195,9 +1203,7 @@ class EnterpriseService:
         client_kwargs = {
             "gateway_base_url": gateway_base_url,
             "gateway_token": self.get_secret("agent_tool_token"),
-            "default_provider": str(
-                runtime.get("provider") or self.config.agent_runtime_provider
-            ),
+            "default_provider": AGENT_OAUTH_PROVIDER,
             "default_model": self._configured_agent_runtime_model(),
             "require_loopback": False,
             "managed_execution": True,
@@ -2341,8 +2347,8 @@ class EnterpriseService:
         if not self.get_setting("agent_tool_token"):
             token = self.config.agent_tool_token or secrets.token_urlsafe(32)
             self.set_setting("agent_tool_token", token, secret=True)
+        self._retire_grok_provider()
         defaults = {
-            AGENT_SETTING_PROVIDER: self.config.agent_runtime_provider,
             AGENT_SETTING_MODEL: self.config.agent_runtime_model,
             AGENT_SETTING_IDLE_TIMEOUT: str(
                 self.config.agent_runtime_idle_timeout_seconds
@@ -2354,6 +2360,28 @@ class EnterpriseService:
             if self.get_setting(key) is not None:
                 continue
             self.set_setting(key, default)
+
+    def _retire_grok_provider(self) -> None:
+        """Delete state left by the retired Grok OAuth provider.
+
+        A deployment that ran on Grok also stored Grok model ids as its
+        deployment and account model choices. Those return to automatic Codex
+        selection instead of being sent to a provider that never offered them.
+        The provider row is the marker and is deleted in the same transaction,
+        so this runs its model reset at most once and is otherwise a no-op.
+        """
+        keys = (RETIRED_AGENT_PROVIDER_SETTING, *RETIRED_GROK_SETTING_KEYS)
+        placeholders = ",".join("?" for _ in keys)
+        with self._auth_lock:
+            with self.db.transaction(immediate=True) as conn:
+                provider = conn.execute(
+                    "SELECT value FROM settings WHERE key = ?",
+                    (RETIRED_AGENT_PROVIDER_SETTING,),
+                ).fetchone()
+                if provider is not None and str(provider["value"]).strip() == "xai-oauth":
+                    self._write_setting(conn, AGENT_SETTING_MODEL, "")
+                    conn.execute("UPDATE users SET model_name = '' WHERE model_name != ''")
+                conn.execute(f"DELETE FROM settings WHERE key IN ({placeholders})", keys)
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
         configured = os.getenv(
@@ -6236,7 +6264,7 @@ class EnterpriseService:
         usage = extract_token_usage(result.raw)
         if usage is None:
             return None
-        provider = normalize_oauth_provider(str(generation.get("provider") or self._active_oauth_provider()))
+        provider = normalize_oauth_provider(str(generation.get("provider") or AGENT_OAUTH_PROVIDER))
         model = normalize_model_name(str(extract_model_name(result.raw) or generation.get("model") or ""))
         return {
             "provider": provider,
@@ -9017,7 +9045,6 @@ class EnterpriseService:
         require_admin(actor)
         with self._agent_runtime_config_lock:
             allowed = {
-                "provider",
                 "model",
                 "idle_timeout_seconds",
                 "max_concurrency",
@@ -9030,24 +9057,10 @@ class EnterpriseService:
                     f"unsupported Agent Runtime config fields: {', '.join(unknown)}",
                 )
             updates: dict[str, str] = {}
-            provider = None
-            current_provider = self._active_oauth_provider()
-            if "provider" in body:
-                provider = normalize_oauth_provider(str(body.get("provider") or ""))
-                if provider not in SUPPORTED_OAUTH_PROVIDERS:
-                    raise ServiceError(400, "Agent provider must be Codex OAuth or Grok OAuth")
-                updates[AGENT_SETTING_PROVIDER] = provider
-            active_provider = provider or self._active_oauth_provider()
             if "model" in body:
                 updates[AGENT_SETTING_MODEL] = self._resolve_oauth_model_selection(
-                    active_provider, str(body.get("model") or "")
+                    AGENT_OAUTH_PROVIDER, str(body.get("model") or "")
                 )
-            elif provider and provider != current_provider:
-                # A saved model belongs to the provider under which it was
-                # selected.  Switching providers without an explicit model
-                # returns to account-scoped automatic selection instead of
-                # persisting today's recommendation as a new preference.
-                updates[AGENT_SETTING_MODEL] = ""
             if "idle_timeout_seconds" in body:
                 try:
                     idle_timeout = float(body.get("idle_timeout_seconds"))
@@ -9117,7 +9130,6 @@ class EnterpriseService:
 
     def oauth_provider_status(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
-        active_provider = self._active_oauth_provider()
         runtime_oauth: dict[str, Any] = {}
         providers = []
         for provider in SUPPORTED_OAUTH_PROVIDERS:
@@ -9136,7 +9148,6 @@ class EnterpriseService:
                     "default_model": catalog["default_model"],
                     "model_catalog_error": catalog["error"],
                     "configured": (configured or bool(runtime_status.get("configured"))) and not relogin_required,
-                    "active": active_provider == provider,
                     # The platform database is the sole OAuth credential store.
                     "last_refresh": self._oauth_display_last_refresh(
                         provider,
@@ -9145,7 +9156,7 @@ class EnterpriseService:
                     "last_auth_error": dict(last_auth_error) if last_auth_error else None,
                 }
             )
-        return {"providers": providers, "active_provider": active_provider}
+        return {"providers": providers}
 
     def export_oauth_credentials(self, actor: dict[str, Any]) -> dict[str, Any]:
         require_admin(actor)
@@ -9169,7 +9180,6 @@ class EnterpriseService:
             "kind": OAUTH_CREDENTIAL_EXPORT_KIND,
             "version": OAUTH_CREDENTIAL_EXPORT_VERSION,
             "exported_at": now_ts(),
-            "active_provider": self._active_oauth_provider(),
             "providers": providers,
         }
 
@@ -9190,7 +9200,7 @@ class EnterpriseService:
             raise ServiceError(400, "OAuth credential resolution requires a provider")
         provider = normalize_oauth_provider(raw_provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
-            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+            raise ServiceError(400, "OAuth provider must be Codex OAuth")
         model = normalize_model_name(str(body.get("model") or ""))
         if not model or model == "agent":
             raise ServiceError(400, "OAuth credential resolution requires a model")
@@ -9248,19 +9258,9 @@ class EnterpriseService:
 
         provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
-            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
-        access_key, refresh_key, expires_key = {
-            "openai-codex": (
-                "CODEX_OAUTH_ACCESS_TOKEN",
-                "CODEX_OAUTH_REFRESH_TOKEN",
-                "CODEX_OAUTH_EXPIRES_AT",
-            ),
-            "xai-oauth": (
-                "GROK_OAUTH_ACCESS_TOKEN",
-                "GROK_OAUTH_REFRESH_TOKEN",
-                "GROK_OAUTH_EXPIRES_AT",
-            ),
-        }[provider]
+            raise ServiceError(400, "OAuth provider must be Codex OAuth")
+        access_key, refresh_key = OAUTH_PROVIDER_SECRET_KEYS[provider]
+        expires_key = OAUTH_PROVIDER_EXPIRY_KEYS[provider]
         with self._auth_lock:
             access_token = self.get_secret(access_key)
             refresh_token = self.get_secret(refresh_key)
@@ -9284,8 +9284,6 @@ class EnterpriseService:
                     raise ServiceError(502, "OAuth refresh expiry is invalid") from exc
                 expires_at = now_ts() + expires_in
                 values[expires_key] = str(expires_at)
-                if provider == "xai-oauth":
-                    values["GROK_OAUTH_ID_TOKEN"] = response.get("id_token") or ""
                 self._commit_oauth_credentials(provider, values)
             if not access_token:
                 raise ServiceError(409, f"{oauth_provider_info(provider)['label']} is not connected")
@@ -9299,32 +9297,17 @@ class EnterpriseService:
             return access_token, self._oauth_credential_revision(provider)
 
     def _refresh_oauth_access_token(self, provider: str, refresh_token: str) -> dict[str, Any]:
-        if provider == "openai-codex":
-            response = self.oauth_flows.http.post_form(
-                CODEX_TOKEN_URL,
-                {
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": CODEX_OAUTH_CLIENT_ID,
-                },
-                timeout=30.0,
-            )
-        else:
-            discovery = self.oauth_flows.http.get_json(XAI_OAUTH_DISCOVERY_URL, timeout=20.0)
-            if discovery.status != 200:
-                raise ServiceError(502, f"Grok OAuth discovery failed with HTTP {discovery.status}")
-            token_endpoint = str(discovery.data.get("token_endpoint") or "").strip()
-            if not token_endpoint:
-                raise ServiceError(502, "Grok OAuth discovery did not return a token endpoint")
-            response = self.oauth_flows.http.post_form(
-                token_endpoint,
-                {
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": XAI_OAUTH_CLIENT_ID,
-                },
-                timeout=30.0,
-            )
+        if provider != AGENT_OAUTH_PROVIDER:
+            raise ServiceError(400, "OAuth provider must be Codex OAuth")
+        response = self.oauth_flows.http.post_form(
+            CODEX_TOKEN_URL,
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": CODEX_OAUTH_CLIENT_ID,
+            },
+            timeout=30.0,
+        )
         if response.status != 200:
             raise ServiceError(502, f"OAuth token refresh failed with HTTP {response.status}: {response.text}")
         return dict(response.data)
@@ -9352,11 +9335,6 @@ class EnterpriseService:
             imported_keys.extend(secrets_by_key)
         if not imported_keys:
             raise ServiceError(400, "no supported OAuth credentials found in import file")
-
-        active_raw = payload.get("active_provider")
-        active_provider = normalize_oauth_provider(str(active_raw)) if active_raw else ""
-        if active_provider in SUPPORTED_OAUTH_PROVIDERS and self._oauth_tokens_configured(active_provider):
-            self._select_oauth_provider(active_provider, actor=actor)
         return {
             "imported": {
                 "providers": imported_providers,
@@ -9369,7 +9347,7 @@ class EnterpriseService:
         require_admin(actor)
         provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
-            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+            raise ServiceError(400, "OAuth provider must be Codex OAuth")
         # Do not switch the live provider here: authentication has not yet
         # completed and no tokens exist. Switching now would point the running
         # agent at a token-less provider if the admin abandons the flow. The
@@ -9390,7 +9368,7 @@ class EnterpriseService:
         require_admin(actor)
         provider = normalize_oauth_provider(provider)
         if provider not in SUPPORTED_OAUTH_PROVIDERS:
-            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
+            raise ServiceError(400, "OAuth provider must be Codex OAuth")
         flow_id = str(body.get("flow_id", "")).strip()
         with self.db.transaction(immediate=True):
             require_admin(self._fresh_active_actor(actor))
@@ -9400,23 +9378,6 @@ class EnterpriseService:
             raise ServiceError(exc.status, exc.message) from exc
         self._store_oauth_flow_result(provider, flow, actor=actor)
         return {"flow": flow, **self.oauth_provider_status(actor)}
-
-    def complete_oauth_verification(self, actor: dict[str, Any], provider: str, body: dict[str, Any]) -> dict[str, Any]:
-        require_admin(actor)
-        provider = normalize_oauth_provider(provider)
-        if provider not in SUPPORTED_OAUTH_PROVIDERS:
-            raise ServiceError(400, "OAuth provider must be Codex OAuth or Grok OAuth")
-        flow_id = str(body.get("flow_id", "")).strip()
-        callback_url = str(body.get("callback_url", "")).strip()
-        with self.db.transaction(immediate=True):
-            require_admin(self._fresh_active_actor(actor))
-        try:
-            flow = self.oauth_flows.complete(provider, flow_id, callback_url)
-        except OAuthFlowError as exc:
-            raise ServiceError(exc.status, exc.message) from exc
-        self._store_oauth_flow_result(provider, flow, actor=actor)
-        return {"flow": flow, **self.oauth_provider_status(actor)}
-
 
     def agent_memory_search(self, body: dict[str, Any]) -> dict[str, Any]:
         scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
@@ -14491,7 +14452,7 @@ class EnterpriseService:
     def set_setting(self, key: str, value: str, *, secret: bool = False) -> None:
         provider = next((
             provider for provider, keys in OAUTH_PROVIDER_SECRET_KEYS.items()
-            if key in keys or key == ("CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT")
+            if key in keys or key == OAUTH_PROVIDER_EXPIRY_KEYS[provider]
         ), None)
         if provider is None:
             with self.db.transaction() as conn:
@@ -14509,7 +14470,7 @@ class EnterpriseService:
         return ""
 
     def account_generation_config(self, actor: dict[str, Any]) -> dict[str, Any]:
-        provider = self._active_oauth_provider()
+        provider = AGENT_OAUTH_PROVIDER
         runtime_model = self._configured_agent_runtime_model()
         model = normalize_model_name(str(actor.get("model_name") or "")) or runtime_model
         model = (
@@ -14594,13 +14555,6 @@ class EnterpriseService:
                     self.model_catalogs.invalidate_oauth(provider)
                     break
 
-    def _active_oauth_provider(self) -> str:
-        active_provider = normalize_oauth_provider(
-            self.get_setting(AGENT_SETTING_PROVIDER)
-            or self.config.agent_runtime_provider
-        )
-        return active_provider if active_provider in SUPPORTED_OAUTH_PROVIDERS else "openai-codex"
-
     def _configured_agent_runtime_model(self) -> str:
         """Return the persisted model while preserving an explicit empty value."""
 
@@ -14645,7 +14599,7 @@ class EnterpriseService:
         provider: str,
         source: dict[str, Any],
     ) -> None:
-        expires_key = "CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT"
+        expires_key = OAUTH_PROVIDER_EXPIRY_KEYS[provider]
         for key in (*OAUTH_PROVIDER_SECRET_KEYS[provider], expires_key):
             value = source.get(key)
             if value is None:
@@ -14655,32 +14609,6 @@ class EnterpriseService:
             clean = value.strip()
             if clean:
                 by_provider[provider][key] = clean
-
-    def _select_oauth_provider(self, provider: str, *, actor: dict[str, Any]) -> None:
-        with self._agent_runtime_config_lock:
-            previous_provider = self._active_oauth_provider()
-            updates = {AGENT_SETTING_PROVIDER: provider}
-            if provider != previous_provider:
-                # OAuth completion selects the provider, not a concrete model.
-                # A model saved for another provider cannot be carried across;
-                # re-verifying the same provider preserves both an explicit
-                # selection and an intentionally empty automatic setting.
-                updates[AGENT_SETTING_MODEL] = ""
-            timestamp = now_ts()
-            with self.db.transaction(immediate=True) as connection:
-                require_admin(self._fresh_active_actor(actor))
-                for key, value in updates.items():
-                    connection.execute(
-                        """
-                        INSERT INTO settings(key, value, secret, updated_at)
-                        VALUES (?, ?, 0, ?)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value=excluded.value,
-                            secret=0,
-                            updated_at=excluded.updated_at
-                        """,
-                        (key, value, timestamp),
-                    )
 
     def _oauth_model_catalogs(self) -> dict[str, dict[str, Any]]:
         return self.model_catalogs.catalogs()
@@ -14737,7 +14665,7 @@ class EnterpriseService:
         clean = normalize_model_name(model)
         if clean in {"", "agent"}:
             return ""
-        provider = self._active_oauth_provider()
+        provider = AGENT_OAUTH_PROVIDER
         catalog = self._oauth_model_catalog(provider)
         models = catalog["models"]
         label = oauth_provider_info(provider)["label"]
@@ -14751,7 +14679,7 @@ class EnterpriseService:
     def _validated_generation_model(self, model: str, *, fallback_model: str = "") -> str:
         clean = normalize_model_name(model)
         fallback = normalize_model_name(fallback_model)
-        provider = self._active_oauth_provider()
+        provider = AGENT_OAUTH_PROVIDER
         catalog = self._oauth_model_catalog(provider)
         models = catalog["models"]
         if not models:
@@ -14785,7 +14713,7 @@ class EnterpriseService:
         self, provider: str, values: dict[str, str], *, actor: dict[str, Any] | None = None,
     ) -> None:
         keys = OAUTH_PROVIDER_SECRET_KEYS[provider]
-        expires_key = "CODEX_OAUTH_EXPIRES_AT" if provider == "openai-codex" else "GROK_OAUTH_EXPIRES_AT"
+        expires_key = OAUTH_PROVIDER_EXPIRY_KEYS[provider]
         if any(key not in (*keys, expires_key) or not isinstance(value, str) for key, value in values.items()):
             raise ServiceError(400, "OAuth credential group is invalid")
         if any(not isinstance(values.get(key), str) or not values[key].strip() for key in keys[:2]):
@@ -14798,8 +14726,6 @@ class EnterpriseService:
             raise ServiceError(400, "OAuth credential expiry is invalid") from exc
         group = dict(values)
         group[expires_key] = str(expiry)
-        if provider == "xai-oauth":
-            group.setdefault("GROK_OAUTH_ID_TOKEN", "")
         with self._auth_lock:
             with self.db.transaction(immediate=True) as conn:
                 if actor is not None:
@@ -14823,33 +14749,26 @@ class EnterpriseService:
             expires_in = max(60, int(tokens.get("expires_in") or 3600))
         except (TypeError, ValueError) as exc:
             raise ServiceError(502, "OAuth flow expiry is invalid") from exc
-        prefix = "CODEX" if provider == "openai-codex" else "GROK"
+        access_key, refresh_key = OAUTH_PROVIDER_SECRET_KEYS[provider]
         values = {
-            f"{prefix}_OAUTH_ACCESS_TOKEN": tokens.get("access_token", ""),
-            f"{prefix}_OAUTH_REFRESH_TOKEN": tokens.get("refresh_token", ""),
-            f"{prefix}_OAUTH_EXPIRES_AT": str(now_ts() + expires_in),
+            access_key: tokens.get("access_token", ""),
+            refresh_key: tokens.get("refresh_token", ""),
+            OAUTH_PROVIDER_EXPIRY_KEYS[provider]: str(now_ts() + expires_in),
         }
-        if provider == "xai-oauth":
-            values["GROK_OAUTH_ID_TOKEN"] = tokens.get("id_token") or ""
         self._commit_oauth_credentials(provider, values, actor=actor)
-        self._select_oauth_provider(provider, actor=actor)
 
     def _oauth_tokens_configured(self, provider: str) -> bool:
+        keys = OAUTH_PROVIDER_SECRET_KEYS.get(provider)
+        if not keys:
+            return False
         with self._auth_lock:
-            if provider == "openai-codex":
-                return bool(self.get_secret("CODEX_OAUTH_ACCESS_TOKEN") and self.get_secret("CODEX_OAUTH_REFRESH_TOKEN"))
-            if provider == "xai-oauth":
-                return bool(self.get_secret("GROK_OAUTH_ACCESS_TOKEN") and self.get_secret("GROK_OAUTH_REFRESH_TOKEN"))
-        return False
+            return all(self.get_secret(key) for key in keys)
 
     def _oauth_last_refresh(self, provider: str) -> int | None:
-        keys = {
-            "openai-codex": "CODEX_OAUTH_ACCESS_TOKEN",
-            "xai-oauth": "GROK_OAUTH_ACCESS_TOKEN",
-        }
-        key = keys.get(provider)
-        if not key:
+        keys = OAUTH_PROVIDER_SECRET_KEYS.get(provider)
+        if not keys:
             return None
+        key = keys[0]
         row = self.db.query_one("SELECT updated_at FROM settings WHERE key = ? AND secret = 1", (key,))
         return int(row["updated_at"]) if row and row.get("updated_at") else None
 

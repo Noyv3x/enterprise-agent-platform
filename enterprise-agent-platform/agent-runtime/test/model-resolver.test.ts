@@ -19,12 +19,6 @@ test("all Runtime catalog models resolve only to fixed OAuth provider endpoints"
     assert.equal(resolved.model.api, "openai-codex-responses");
     assert.equal(resolved.model.baseUrl, "https://chatgpt.com/backend-api");
   }
-  for (const id of PRODUCT_MODELS.xai) {
-    const resolved = resolveModel(request({ provider: "xai-oauth", id }), gateway);
-    assert.equal(resolved.model.provider, "xai");
-    assert.equal(resolved.model.api, "openai-completions");
-    assert.equal(resolved.model.baseUrl, "https://api.x.ai/v1");
-  }
 });
 
 test("public model catalogs are generated from the same trusted Runtime models", () => {
@@ -34,14 +28,10 @@ test("public model catalogs are generated from the same trusted Runtime models",
     catalogs["openai-codex"].models.map((model) => model.id),
     PRODUCT_MODELS["openai-codex"],
   );
-  assert.deepEqual(
-    catalogs["xai-oauth"].models.map((model) => model.id),
-    PRODUCT_MODELS.xai,
-  );
   assert.equal(catalogs["openai-codex"].default_model, "");
-  assert.equal(catalogs["xai-oauth"].default_model, "");
   assert.ok(catalogs["openai-codex"].models.every((model) => model.context_window > 0));
-  assert.ok(catalogs["xai-oauth"].models.every((model) => model.max_tokens > 0));
+  assert.ok(catalogs["openai-codex"].models.every((model) => model.max_tokens > 0));
+  assert.deepEqual(Object.keys(catalogs), ["openai-codex"]);
 });
 
 test("only canonical product provider ids resolve", () => {
@@ -50,11 +40,7 @@ test("only canonical product provider ids resolve", () => {
     resolveModel(request({ provider: "openai-codex", id: catalogModelId("openai-codex") }), gateway).model.provider,
     "openai-codex",
   );
-  assert.equal(
-    resolveModel(request({ provider: "xai-oauth", id: catalogModelId("xai-oauth") }), gateway).model.provider,
-    "xai",
-  );
-  for (const provider of ["codex", "grok", "openai", "xai", "faux", "openrouter"]) {
+  for (const provider of ["codex", "grok", "openai", "xai", "xai-oauth", "faux", "openrouter"]) {
     assert.throws(
       () => validateProductModelRequest({ provider, id: "catalog-model" }),
       /model\.provider must be/,
@@ -87,7 +73,7 @@ test("caller-controlled model API and base URL are rejected before token resolut
 });
 
 test("OAuth token lookup keeps the canonical product provider on the fixed endpoint", async () => {
-  const xaiModelId = catalogModelId("xai-oauth");
+  const codexModelId = catalogModelId("openai-codex");
   const seen: Array<{ model: string; provider: string }> = [];
   const gateway = {
     token: async (candidateRequest: RunRequest, provider: string) => {
@@ -95,11 +81,11 @@ test("OAuth token lookup keeps the canonical product provider on the fixed endpo
       return "short-lived-oauth-token";
     },
   } as unknown as PlatformGateway;
-  const run = request({ provider: "xai-oauth", id: xaiModelId });
+  const run = request({ provider: "openai-codex", id: codexModelId });
   const resolved = resolveModel(run, gateway);
   assert.equal(await resolved.getApiKey(resolved.model.provider), "short-lived-oauth-token");
-  assert.deepEqual(seen, [{ model: xaiModelId, provider: "xai-oauth" }]);
-  assert.equal(resolved.model.baseUrl, "https://api.x.ai/v1");
+  assert.deepEqual(seen, [{ model: codexModelId, provider: "openai-codex" }]);
+  assert.equal(resolved.model.baseUrl, "https://chatgpt.com/backend-api");
 });
 
 test("image support follows locked model metadata without overriding Codex OAuth models", () => {
@@ -174,40 +160,8 @@ test("text-only Codex has no auxiliary companion when the account authorizes no 
   );
 });
 
-test("xAI auxiliary authorization binds the product provider, candidate model, and original scope", async () => {
-  const textOnlyModelId = catalogModelId("xai-oauth", (model) => !model.input.includes("image"));
-  const imageModelId = catalogModelId("xai-oauth", (model) => model.input.includes("image"));
-  const seen: Array<{ provider: string; requestProvider: string; model: string; scopeKey: string }> = [];
-  const gateway = {
-    token: async (candidateRequest: RunRequest, provider: string) => {
-      seen.push({
-        provider,
-        requestProvider: candidateRequest.model.provider,
-        model: candidateRequest.model.id,
-        scopeKey: candidateRequest.scope_key,
-      });
-      return candidateRequest.model.id === imageModelId ? "xai-image-token" : undefined;
-    },
-  } as unknown as PlatformGateway;
-  const candidateRequest = request({ provider: "xai-oauth", id: textOnlyModelId });
-  candidateRequest.scope_key = "private:42";
-
-  const companion = await resolveAuxiliaryVisionModel(candidateRequest, gateway);
-
-  assert.ok(companion);
-  assert.equal(companion.model.id, imageModelId);
-  assert.equal(companion.apiKey, "xai-image-token");
-  assert.deepEqual(seen, [{
-    provider: "xai-oauth",
-    requestProvider: "xai-oauth",
-    model: imageModelId,
-    scopeKey: "private:42",
-  }]);
-  assert.notEqual(seen[0]?.model, textOnlyModelId, "the primary model authorization must not be reused");
-});
-
 function catalogModelId(
-  provider: "openai-codex" | "xai-oauth",
+  provider: "openai-codex",
   predicate: (model: ReturnType<typeof productModelCatalogs>[typeof provider]["models"][number]) => boolean = () => true,
 ): string {
   const model = productModelCatalogs()[provider].models.find(predicate);

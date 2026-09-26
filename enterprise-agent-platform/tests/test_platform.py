@@ -31,7 +31,6 @@ from enterprise_agent_platform.runtimes import (
     AGENT_SETTING_COMPACTION_THRESHOLD,
     AGENT_SETTING_MAX_CONCURRENCY,
     AGENT_SETTING_MODEL,
-    AGENT_SETTING_PROVIDER,
     AGENT_SETTING_IDLE_TIMEOUT,
 )
 from enterprise_agent_platform.server import serve_in_thread
@@ -149,12 +148,6 @@ class RecordingAgent:
                         model("gpt-5.6-sol"),
                         model("gpt-5.6-terra"),
                     ],
-                },
-                "xai-oauth": {
-                    "provider": "xai-oauth",
-                    "runtime_provider": "xai",
-                    "default_model": "grok-4.3",
-                    "models": [model("grok-4.3"), model("grok-4.5")],
                 },
             },
         }
@@ -628,16 +621,6 @@ class FakeOAuthHTTPClient:
     def __init__(self):
         self.calls = []
 
-    def get_json(self, url, *, timeout=20.0):
-        self.calls.append(("get_json", url, {}))
-        return OAuthHTTPResponse(
-            200,
-            {
-                "authorization_endpoint": "https://xai.example/authorize",
-                "token_endpoint": "https://xai.example/token",
-            },
-        )
-
     def get_bearer_json(
         self,
         url,
@@ -663,8 +646,6 @@ class FakeOAuthHTTPClient:
                     ]
                 },
             )
-        if "api.x.ai/v1/models" in url:
-            return OAuthHTTPResponse(200, {"data": [{"id": "grok-4.5"}]})
         return OAuthHTTPResponse(404, {}, "not found")
 
     def post_json(self, url, body, *, timeout=20.0):
@@ -687,17 +668,6 @@ class FakeOAuthHTTPClient:
         self.calls.append(("post_form", url, dict(body)))
         if url == "https://auth.openai.com/oauth/token":
             return OAuthHTTPResponse(200, {"access_token": "codex-access", "refresh_token": "codex-refresh"})
-        if url == "https://xai.example/token":
-            return OAuthHTTPResponse(
-                200,
-                {
-                    "access_token": "grok-access",
-                    "refresh_token": "grok-refresh",
-                    "id_token": "grok-id",
-                    "token_type": "Bearer",
-                    "expires_in": 3600,
-                },
-            )
         return OAuthHTTPResponse(404, {}, "not found")
 
 
@@ -708,13 +678,6 @@ def configure_test_codex(service: EnterpriseService, admin: dict) -> None:
     service.set_secret(admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
     service.set_setting("CODEX_OAUTH_EXPIRES_AT", str(int(time.time()) + 3600))
 
-
-def configure_test_grok(service: EnterpriseService, admin: dict) -> None:
-    """Connect the deterministic Grok account catalog used by config tests."""
-
-    service.set_secret(admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
-    service.set_secret(admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
-    service.set_setting("GROK_OAUTH_EXPIRES_AT", str(int(time.time()) + 3600))
 
 
 def make_config(tmp: Path) -> PlatformConfig:
@@ -733,7 +696,6 @@ def make_config(tmp: Path) -> PlatformConfig:
         agent_runtime_url="http://127.0.0.1:8766",
         agent_runtime_token="runtime-token",
         agent_runtime_model="gpt-5.5",
-        agent_runtime_provider="openai-codex",
         agent_runtime_idle_timeout_seconds=2,
         allow_insecure_bootstrap_password=True,
     )
@@ -5486,13 +5448,9 @@ class PlatformServiceTests(unittest.TestCase):
 
                 self.assertIn("CODEX_OAUTH_ACCESS_TOKEN", keys)
                 self.assertIn("CODEX_OAUTH_REFRESH_TOKEN", keys)
-                self.assertIn("GROK_OAUTH_ACCESS_TOKEN", keys)
-                self.assertIn("GROK_OAUTH_REFRESH_TOKEN", keys)
-                self.assertIn("GROK_OAUTH_ID_TOKEN", keys)
                 self.assertIn("FIRECRAWL_API_KEY", keys)
                 self.assertNotIn("OPENAI_API_KEY", keys)
-                self.assertNotIn("XAI_API_KEY", keys)
-                self.assertNotIn("XAI_OAUTH_REFRESH_TOKEN", keys)
+                self.assertNotIn("GROK_OAUTH_ACCESS_TOKEN", keys)
 
                 service.set_secret(admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
                 service.set_secret(admin, "FIRECRAWL_API_KEY", "firecrawl-secret")
@@ -5613,22 +5571,32 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_api_providers_are_limited_to_codex_and_grok_oauth(self):
+    def test_codex_oauth_is_the_only_api_provider(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            service = EnterpriseService(
+                make_config(Path(td)),
+                agent_client=RecordingAgent(),
+                oauth_http_client=FakeOAuthHTTPClient(),
+            )
             try:
                 _, admin = service.authenticate("admin", "admin")
                 status = service.oauth_provider_status(admin)
-                self.assertEqual([item["id"] for item in status["providers"]], ["openai-codex", "xai-oauth"])
-                self.assertEqual(status["active_provider"], "openai-codex")
+                self.assertEqual([item["id"] for item in status["providers"]], ["openai-codex"])
 
-                with self.assertRaises(ServiceError) as update_error:
-                    service.update_agent_runtime_config(admin, {"provider": "openrouter"})
-                self.assertEqual(update_error.exception.status, 400)
+                # The provider is no longer a runtime setting at all.
+                for body in ({"provider": "openai-codex"}, {"provider": "xai-oauth"}):
+                    with self.subTest(body=body), self.assertRaises(ServiceError) as update_error:
+                        service.update_agent_runtime_config(admin, body)
+                    self.assertEqual(update_error.exception.status, 400)
 
-                with self.assertRaises(ServiceError) as key_error:
-                    service.set_secret(admin, "XAI_API_KEY", "xai-key")
-                self.assertEqual(key_error.exception.status, 400)
+                for key in ("XAI_API_KEY", "GROK_OAUTH_ACCESS_TOKEN"):
+                    with self.subTest(key=key), self.assertRaises(ServiceError) as key_error:
+                        service.set_secret(admin, key, "retired")
+                    self.assertEqual(key_error.exception.status, 400)
+
+                with self.assertRaises(ServiceError) as start_error:
+                    service.start_oauth_verification(admin, "xai-oauth")
+                self.assertEqual(start_error.exception.status, 400)
             finally:
                 service.close()
 
@@ -5641,29 +5609,23 @@ class PlatformServiceTests(unittest.TestCase):
             )
             try:
                 _, admin = service.authenticate("admin", "admin")
-                configure_test_grok(service, admin)
+                configure_test_codex(service, admin)
                 updated = service.update_agent_runtime_config(
                     admin,
                     {
-                        "provider": "xai-oauth",
-                        "model": "grok-4.5",
+                        "model": "gpt-5.6-sol",
                         "idle_timeout_seconds": 321,
                         "max_concurrency": 4,
                         "compaction_threshold": 0.75,
                     },
                 )["config"]
 
-                self.assertEqual(updated["provider"], "xai-oauth")
-                self.assertEqual(updated["model"], "grok-4.5")
+                self.assertNotIn("provider", updated)
+                self.assertEqual(updated["model"], "gpt-5.6-sol")
                 self.assertEqual(updated["idle_timeout_seconds"], 321)
                 self.assertEqual(updated["max_concurrency"], 4)
                 self.assertEqual(updated["compaction_threshold"], 0.75)
-                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
-
-                with self.assertRaises(ServiceError) as alias_error:
-                    service.update_agent_runtime_config(admin, {"provider": "grok-oauth"})
-                self.assertEqual(alias_error.exception.status, 400)
-                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "grok-4.5")
+                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.6-sol")
                 self.assertEqual(
                     service.get_setting(AGENT_SETTING_IDLE_TIMEOUT), "321.0"
                 )
@@ -5672,7 +5634,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(service._agent_run_gate.limit, 4)
 
                 invalid_updates = (
-                    {"provider": "openrouter"},
+                    {"provider": "openai-codex"},
                     {"model": "not-in-catalog"},
                     {"idle_timeout_seconds": -1},
                     {"idle_timeout_seconds": 86401},
@@ -5697,7 +5659,6 @@ class PlatformServiceTests(unittest.TestCase):
                 before = {
                     key: service.get_setting(key)
                     for key in (
-                        AGENT_SETTING_PROVIDER,
                         AGENT_SETTING_MODEL,
                         AGENT_SETTING_MAX_CONCURRENCY,
                     )
@@ -5706,7 +5667,6 @@ class PlatformServiceTests(unittest.TestCase):
                     service.update_agent_runtime_config(
                         admin,
                         {
-                            "provider": "openai-codex",
                             "model": "not-in-catalog",
                             "max_concurrency": 7,
                         },
@@ -5715,7 +5675,6 @@ class PlatformServiceTests(unittest.TestCase):
                     {
                         key: service.get_setting(key)
                         for key in (
-                            AGENT_SETTING_PROVIDER,
                             AGENT_SETTING_MODEL,
                             AGENT_SETTING_MAX_CONCURRENCY,
                         )
@@ -5726,17 +5685,14 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_runtime_model_auto_setting_and_provider_switch_are_not_materialized(self):
+    def test_runtime_model_auto_setting_is_not_materialized(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
 
-                service.update_agent_runtime_config(
-                    admin,
-                    {"provider": "openai-codex"},
-                )
+                service.update_agent_runtime_config(admin, {"max_concurrency": 3})
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
 
                 cleared = service.update_agent_runtime_config(
@@ -5746,38 +5702,79 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertEqual(cleared["model"], "")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
 
-                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
-                switched = service.update_agent_runtime_config(
-                    admin,
-                    {"provider": "xai-oauth"},
-                )["config"]
-                self.assertEqual(switched["provider"], "xai-oauth")
-                self.assertEqual(switched["model"], "")
+                unchanged = service.update_agent_runtime_config(admin, {"max_concurrency": 4})["config"]
+                self.assertEqual(unchanged["model"], "")
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
             finally:
                 service.close()
 
-    def test_oauth_reverification_preserves_same_provider_model_and_switch_clears_it(self):
+    def test_startup_retires_grok_provider_state_and_its_model_choices(self):
         with tempfile.TemporaryDirectory() as td:
-            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            tmp = Path(td)
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
             try:
                 _, admin = service.authenticate("admin", "admin")
-                service.set_setting(AGENT_SETTING_PROVIDER, "openai-codex")
-                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
-
-                service._select_oauth_provider("openai-codex", actor=admin)
-                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
-
-                service.set_setting(AGENT_SETTING_MODEL, "")
-                service._select_oauth_provider("openai-codex", actor=admin)
-                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
-
-                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.5")
-                service._select_oauth_provider("xai-oauth", actor=admin)
-                self.assertEqual(service.get_setting(AGENT_SETTING_PROVIDER), "xai-oauth")
-                self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "")
+                alice = service.create_user(
+                    username="alice", password="alice-password", display_name="Alice", actor=admin,
+                )
+                # State written by a release that still offered Grok OAuth.
+                service.set_setting("agent_runtime_provider", "xai-oauth")
+                service.set_setting(AGENT_SETTING_MODEL, "grok-4.5")
+                service.db.execute("UPDATE users SET model_name = 'grok-4.5' WHERE id = ?", (alice["id"],))
+                for key in ("GROK_OAUTH_ACCESS_TOKEN", "GROK_OAUTH_REFRESH_TOKEN", "GROK_OAUTH_ID_TOKEN"):
+                    service.db.execute(
+                        "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, 'retired', 1, 0)",
+                        (key,),
+                    )
+                service.set_setting("GROK_OAUTH_EXPIRES_AT", "123")
+                service.set_setting("AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:xai-oauth", "7")
+                service.set_setting(AGENT_SETTING_MAX_CONCURRENCY, "3")
             finally:
                 service.close()
+
+            restarted = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                for key in (
+                    "agent_runtime_provider",
+                    "GROK_OAUTH_ACCESS_TOKEN",
+                    "GROK_OAUTH_REFRESH_TOKEN",
+                    "GROK_OAUTH_ID_TOKEN",
+                    "GROK_OAUTH_EXPIRES_AT",
+                    "AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:xai-oauth",
+                ):
+                    with self.subTest(key=key):
+                        self.assertIsNone(restarted.db.query_one("SELECT key FROM settings WHERE key = ?", (key,)))
+                # Grok model ids return to automatic Codex selection; unrelated settings stay.
+                self.assertEqual(restarted.get_setting(AGENT_SETTING_MODEL), "")
+                self.assertEqual(restarted.get_user(alice["id"])["model_name"], "")
+                self.assertEqual(restarted.get_setting(AGENT_SETTING_MAX_CONCURRENCY), "3")
+            finally:
+                restarted.close()
+
+    def test_startup_drops_codex_provider_row_without_touching_model_choices(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            service = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                alice = service.create_user(
+                    username="alice", password="alice-password", display_name="Alice", actor=admin,
+                )
+                service.set_setting("agent_runtime_provider", "openai-codex")
+                service.set_setting(AGENT_SETTING_MODEL, "gpt-5.4")
+                service.db.execute("UPDATE users SET model_name = 'gpt-5.6-sol' WHERE id = ?", (alice["id"],))
+            finally:
+                service.close()
+
+            restarted = EnterpriseService(make_config(tmp), agent_client=RecordingAgent())
+            try:
+                self.assertIsNone(
+                    restarted.db.query_one("SELECT key FROM settings WHERE key = 'agent_runtime_provider'")
+                )
+                self.assertEqual(restarted.get_setting(AGENT_SETTING_MODEL), "gpt-5.4")
+                self.assertEqual(restarted.get_user(alice["id"])["model_name"], "gpt-5.6-sol")
+            finally:
+                restarted.close()
 
     def test_agent_run_gate_resizes_up_and_down_without_interrupting_active_runs(self):
         gate = _ResizableConcurrencyGate(1)
@@ -5900,7 +5897,6 @@ class PlatformServiceTests(unittest.TestCase):
                 flow = started["flow"]
                 self.assertEqual(flow["kind"], "device_code")
                 self.assertEqual(flow["user_code"], "CODE-1234")
-                self.assertEqual(started["active_provider"], "openai-codex")
 
                 completed = service.poll_oauth_verification(
                     admin,
@@ -5910,7 +5906,7 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertTrue(completed["flow"]["complete"])
                 self.assertEqual(service.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
                 self.assertEqual(service.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
-                self.assertEqual(service._active_oauth_provider(), "openai-codex")
+                # Verification stores credentials only; the explicit model choice is preserved.
                 self.assertEqual(service.get_setting(AGENT_SETTING_MODEL), "gpt-5.5")
                 self.assertTrue(
                     next(
@@ -5942,39 +5938,6 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_grok_guided_oauth_flow_accepts_pasted_callback_url(self):
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            service = EnterpriseService(
-                make_config(tmp),
-                agent_client=RecordingAgent(),
-                oauth_http_client=FakeOAuthHTTPClient(),
-            )
-            try:
-                _, admin = service.authenticate("admin", "admin")
-
-                started = service.start_oauth_verification(admin, "xai-oauth")
-                flow = started["flow"]
-                self.assertEqual(flow["kind"], "manual_callback")
-                query = urllib.parse.parse_qs(urllib.parse.urlparse(flow["authorize_url"]).query)
-                self.assertEqual(query["referrer"], ["agent-platform"])
-                callback_url = f"{flow['redirect_uri']}?code=grok-code&state={query['state'][0]}"
-
-                completed = service.complete_oauth_verification(
-                    admin,
-                    "xai-oauth",
-                    {"flow_id": flow["flow_id"], "callback_url": callback_url},
-                )
-                self.assertTrue(completed["flow"]["complete"])
-                self.assertEqual(service.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "grok-access")
-                self.assertEqual(service.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
-                self.assertEqual(service.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
-
-                self.assertEqual(service._active_oauth_provider(), "xai-oauth")
-                self.assertTrue(next(item for item in completed["providers"] if item["id"] == "xai-oauth")["configured"])
-            finally:
-                service.close()
-
     def test_oauth_credentials_export_import_roundtrip_restores_managed_state(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -5992,37 +5955,37 @@ class PlatformServiceTests(unittest.TestCase):
                 _, source_admin = source.authenticate("admin", "admin")
                 source.set_secret(source_admin, "CODEX_OAUTH_ACCESS_TOKEN", "codex-access")
                 source.set_secret(source_admin, "CODEX_OAUTH_REFRESH_TOKEN", "codex-refresh")
-                source.set_secret(source_admin, "GROK_OAUTH_ACCESS_TOKEN", "grok-access")
-                source.set_secret(source_admin, "GROK_OAUTH_REFRESH_TOKEN", "grok-refresh")
-                source.set_secret(source_admin, "GROK_OAUTH_ID_TOKEN", "grok-id")
-                source.update_agent_runtime_config(source_admin, {"provider": "xai-oauth"})
 
                 exported = source.export_oauth_credentials(source_admin)
                 self.assertEqual(exported["kind"], "agent-platform.oauth-credentials")
                 self.assertEqual(exported["version"], 1)
-                self.assertEqual(exported["active_provider"], "xai-oauth")
+                self.assertEqual(list(exported["providers"]), ["openai-codex"])
                 self.assertEqual(
                     exported["providers"]["openai-codex"]["credentials"]["CODEX_OAUTH_ACCESS_TOKEN"],
                     "codex-access",
                 )
-                self.assertEqual(
-                    exported["providers"]["xai-oauth"]["credentials"]["GROK_OAUTH_ID_TOKEN"],
-                    "grok-id",
-                )
                 self.assertNotIn("API_SERVER_KEY", json.dumps(exported))
 
                 _, target_admin = target.authenticate("admin", "admin")
-                imported = target.import_oauth_credentials(target_admin, {"credentials": exported})
+                # An export from a Grok-era release still carries Grok credentials and an
+                # active_provider marker; import takes the Codex group and ignores the rest.
+                legacy_export = {
+                    **exported,
+                    "active_provider": "xai-oauth",
+                    "providers": {
+                        **exported["providers"],
+                        "xai-oauth": {"credentials": {
+                            "GROK_OAUTH_ACCESS_TOKEN": "grok-access",
+                            "GROK_OAUTH_REFRESH_TOKEN": "grok-refresh",
+                        }},
+                    },
+                }
+                imported = target.import_oauth_credentials(target_admin, {"credentials": legacy_export})
 
-                self.assertCountEqual(imported["imported"]["providers"], ["openai-codex", "xai-oauth"])
-                self.assertEqual(imported["active_provider"], "xai-oauth")
+                self.assertEqual(imported["imported"]["providers"], ["openai-codex"])
                 self.assertEqual(target.get_secret("CODEX_OAUTH_ACCESS_TOKEN"), "codex-access")
                 self.assertEqual(target.get_secret("CODEX_OAUTH_REFRESH_TOKEN"), "codex-refresh")
-                self.assertEqual(target.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "grok-access")
-                self.assertEqual(target.get_secret("GROK_OAUTH_REFRESH_TOKEN"), "grok-refresh")
-                self.assertEqual(target.get_secret("GROK_OAUTH_ID_TOKEN"), "grok-id")
-
-                self.assertEqual(target._active_oauth_provider(), "xai-oauth")
+                self.assertEqual(target.get_secret("GROK_OAUTH_ACCESS_TOKEN"), "")
             finally:
                 source.close()
                 target.close()
@@ -8671,7 +8634,8 @@ class PlatformHTTPTests(unittest.TestCase):
                 agent_config = json.loads(res.read().decode("utf-8"))
                 self.assertEqual(res.status, 200)
                 self.assertIn("config", agent_config)
-                self.assertEqual(agent_config["config"]["provider"], "openai-codex")
+                self.assertNotIn("provider", agent_config["config"])
+                self.assertEqual(list(agent_config["config"]["model_catalog"]), ["openai-codex"])
 
                 conn.request("GET", "/api/permission-groups", headers={"Cookie": cookie})
                 res = conn.getresponse()

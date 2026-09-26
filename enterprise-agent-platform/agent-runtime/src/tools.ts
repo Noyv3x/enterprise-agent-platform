@@ -1077,7 +1077,6 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     context.request.metadata?.trigger === "email"
     && context.request.metadata.unattended === true
   );
-  const codexFileTargetRequired = context.request.model?.provider === "openai-codex";
   const todoState = context.todoState;
   const loadedSkillIds = new Set<string>();
   const memoryParameters = learningReview
@@ -1227,14 +1226,10 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "write_file",
     label: "Write file",
     description: "Create or replace a complete UTF-8 file atomically. Prefer patch_file for localized edits; do not create files by terminal heredoc.",
-    parameters: codexFileTargetRequired
-      ? codexWriteFileSchema as unknown as typeof writeFileSchema
-      : writeFileSchema,
-    ...(codexFileTargetRequired ? {
-      prepareArguments: (arguments_: unknown) => (
-        withDefaultSandboxTarget(arguments_) as Static<typeof writeFileSchema>
-      ),
-    } : {}),
+    parameters: codexWriteFileSchema as unknown as typeof writeFileSchema,
+    prepareArguments: (arguments_: unknown) => (
+      withDefaultSandboxTarget(arguments_) as Static<typeof writeFileSchema>
+    ),
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
@@ -1254,14 +1249,10 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "patch_file",
     label: "Patch file",
     description: "Replace exact text in a workspace file, refusing ambiguous replacement counts. If a patch fails, re-read the current file before retrying.",
-    parameters: codexFileTargetRequired
-      ? codexPatchFileSchema as unknown as typeof patchFileSchema
-      : patchFileSchema,
-    ...(codexFileTargetRequired ? {
-      prepareArguments: (arguments_: unknown) => (
-        withDefaultSandboxTarget(arguments_) as Static<typeof patchFileSchema>
-      ),
-    } : {}),
+    parameters: codexPatchFileSchema as unknown as typeof patchFileSchema,
+    prepareArguments: (arguments_: unknown) => (
+      withDefaultSandboxTarget(arguments_) as Static<typeof patchFileSchema>
+    ),
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);

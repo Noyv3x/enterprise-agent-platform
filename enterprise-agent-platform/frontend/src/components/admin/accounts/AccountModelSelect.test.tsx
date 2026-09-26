@@ -13,7 +13,6 @@ import { AccountModelSelect } from "./AccountModelSelect";
 function runtimeConfig(model: string, recommendedModel: string): AgentRuntimeConfigState {
   return {
     config: {
-      provider: "openai-codex",
       model,
       model_catalog: {
         "openai-codex": {
@@ -91,7 +90,6 @@ describe("AccountModelSelect", () => {
     store.dispatch({
       type: "SET_OAUTH_PROVIDERS",
       payload: {
-        active_provider: "openai-codex",
         providers: [{
           id: "openai-codex",
           configured: true,

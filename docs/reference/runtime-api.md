@@ -31,9 +31,9 @@
 
 ## 模型目录
 
-响应为 `{version:1,source:"pi-runtime",providers:{"openai-codex":Provider,"xai-oauth":Provider}}`。Provider 为 `{provider:string,runtime_provider:string,default_model:string,models:Model[]}`；Model 为 `{id:string,name:string,reasoning:boolean,input:string[],context_window:number,max_tokens:number}`。
+响应为 `{version:1,source:"pi-runtime",providers:{"openai-codex":Provider}}`。Provider 为 `{provider:string,runtime_provider:string,default_model:string,models:Model[]}`；Model 为 `{id:string,name:string,reasoning:boolean,input:string[],context_window:number,max_tokens:number}`。
 
-只接受规范 provider，无别名；runtime_provider 分别为 openai-codex/xai，OAuth default_model 固定为空串而非 null。锁定 Pi 目录与账号目录的交集、推荐、stale 和空目录规则由[集成](../design/integrations.md)定义；不在此固定模型 ID，也不能从 Runtime 首项推默认。
+只接受规范 provider `openai-codex`，无别名；runtime_provider 为 openai-codex，OAuth default_model 固定为空串而非 null。锁定 Pi 目录与账号目录的交集、推荐、stale 和空目录规则由[集成](../design/integrations.md)定义；不在此固定模型 ID，也不能从 Runtime 首项推默认。
 
 ## 创建 Run
 

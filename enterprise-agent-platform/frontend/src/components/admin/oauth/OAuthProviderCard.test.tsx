@@ -32,7 +32,6 @@ describe("OAuthProviderCard", () => {
     renderProvider({
       id: "openai-codex",
       configured: true,
-      active: true,
       default_model: "gpt-future-test",
       models: ["gpt-existing-test", "gpt-future-test", "gpt-compact-test"],
     });
@@ -56,7 +55,7 @@ describe("OAuthProviderCard", () => {
 
   it("shows an empty configured catalog without inventing a recommendation", () => {
     renderProvider({
-      id: "xai-oauth",
+      id: "openai-codex",
       configured: true,
       default_model: "stale-runtime-candidate",
       models: [],

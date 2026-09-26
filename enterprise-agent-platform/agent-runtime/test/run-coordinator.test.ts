@@ -1,3 +1,4 @@
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
 import { readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
@@ -444,17 +445,17 @@ test("RunCoordinator appends skill policy and the sanitized index to root and cu
   let childPrompt = "";
   faux.setResponses([
     (context) => {
-      rootPrompt = context.systemPrompt || "";
-      assert.equal(context.tools?.some((tool) => tool.name === "skill"), true);
-      assert.equal(context.tools?.some((tool) => tool.name === "delegate_task"), true);
+      rootPrompt = getCurrentSystemPrompt(context.messages) || "";
+      assert.equal(getCurrentTools(context.messages)?.some((tool) => tool.name === "skill"), true);
+      assert.equal(getCurrentTools(context.messages)?.some((tool) => tool.name === "delegate_task"), true);
       return fauxAssistantMessage(fauxToolCall("delegate_task", {
         prompt: "review this",
       }), { stopReason: "toolUse" });
     },
     (context) => {
-      childPrompt = context.systemPrompt || "";
-      assert.equal(context.tools?.some((tool) => tool.name === "skill"), true);
-      assert.equal(context.tools?.some((tool) => tool.name === "delegate_task"), false);
+      childPrompt = getCurrentSystemPrompt(context.messages) || "";
+      assert.equal(getCurrentTools(context.messages)?.some((tool) => tool.name === "skill"), true);
+      assert.equal(getCurrentTools(context.messages)?.some((tool) => tool.name === "delegate_task"), false);
       return fauxAssistantMessage("child done");
     },
     fauxAssistantMessage("parent done"),
@@ -516,15 +517,15 @@ test("RunCoordinator isolates learning review tools, approvals, prompt, and term
   const observedPrompts: string[] = [];
   faux.setResponses([
     (context) => {
-      observedTools.push(context.tools?.map((tool) => tool.name) ?? []);
-      observedPrompts.push(context.systemPrompt || "");
+      observedTools.push(getCurrentTools(context.messages)?.map((tool) => tool.name) ?? []);
+      observedPrompts.push(getCurrentSystemPrompt(context.messages) || "");
       return fauxAssistantMessage(fauxToolCall("skill", {
         action: "load",
         arguments: { id: "code-review" },
       }), { stopReason: "toolUse" });
     },
     (context) => {
-      observedTools.push(context.tools?.map((tool) => tool.name) ?? []);
+      observedTools.push(getCurrentTools(context.messages)?.map((tool) => tool.name) ?? []);
       return fauxAssistantMessage(fauxToolCall("skill", {
         action: "patch",
         arguments: {
@@ -893,7 +894,7 @@ test("RunCoordinator retries promise-only final responses at most once", async (
   const faux = fauxProvider();
   faux.setResponses([
     (context) => {
-      assert.match(context.systemPrompt || "", /<execution_discipline>/);
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /<execution_discipline>/);
       return fauxAssistantMessage("好的，我现在开始检查并修改。");
     },
     (context) => {
@@ -1104,7 +1105,7 @@ test("execution-review messages remain ephemeral across context compaction", asy
   summaries.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage(
     "Current objective\n- Inspect the existing state and continue concrete work.",
   )));
-  const streamFn: StreamFn = (model, context, options) => context.systemPrompt?.startsWith(
+  const streamFn: StreamFn = (model, context, options) => getCurrentSystemPrompt(context.messages)?.startsWith(
     "Create a concise continuation handoff",
   )
     ? summaries.provider.streamSimple(model, context, options)
@@ -2313,7 +2314,7 @@ test("a top-level scheduled occurrence can complete only its current schedule wi
   const faux = fauxProvider();
   faux.setResponses([
     (context) => {
-      const prompt = context.systemPrompt || "";
+      const prompt = getCurrentSystemPrompt(context.messages) || "";
       assert.match(prompt, /<scheduled_run_policy>/);
       assert.match(prompt, /\{"action":"complete_current","arguments":\{\}\}/);
       assert.match(prompt, /Do not create a cron or interval schedule/);
@@ -2929,7 +2930,7 @@ test("an invisible overload after a mutation retries only the next model turn", 
   }
 });
 
-test("RunCoordinator replaces only the Codex OAuth payload cache key and preserves provider session identity", async () => {
+test("RunCoordinator replaces the Codex OAuth payload cache key and preserves provider session identity", async () => {
   const home = await temporaryDirectory("agent-prompt-cache-key-");
   const workspace = await temporaryDirectory("agent-prompt-cache-key-workspace-");
   const faux = fauxProvider();
@@ -2946,10 +2947,10 @@ test("RunCoordinator replaces only the Codex OAuth payload cache key and preserv
     fauxAssistantMessage("Non-Codex payload inspected."),
   ]);
   const streamFn: StreamFn = async (model, context, options) => {
-    const normalizedTools = convertResponsesTools(context.tools ?? [], { strict: null });
+    const normalizedTools = convertResponsesTools(getCurrentTools(context.messages) ?? [], { strict: null });
     assert.ok(normalizedTools.every((tool) => tool.type === "function" && typeof tool.name === "string"));
     const payload: Record<string, unknown> = {
-      instructions: context.systemPrompt,
+      instructions: getCurrentSystemPrompt(context.messages),
       prompt_cache_key: options?.sessionId,
       tools: normalizedTools,
     };
@@ -2984,22 +2985,7 @@ test("RunCoordinator replaces only the Codex OAuth payload cache key and preserv
     });
     const codexCompleted = await coordinator.wait(codex.id);
     assert.equal(codexCompleted.status, "completed", codexCompleted.error);
-
-    const xaiModelId = productModelCatalogs()["xai-oauth"].models[0]?.id;
-    assert.ok(xaiModelId, "locked Pi catalog must include an xAI model");
-    const xai = coordinator.createRun({
-      scope_key: "cache-key-scope-xai",
-      lifecycle_id: "life-xai",
-      session_id: "xai-session",
-      workspace,
-      system_prompt: "Other provider context.",
-      input: "inspect non-Codex payload wiring",
-      model: { provider: "xai-oauth", id: xaiModelId },
-    });
-    const xaiCompleted = await coordinator.wait(xai.id);
-    assert.equal(xaiCompleted.status, "completed", xaiCompleted.error);
-
-    assert.equal(observations.length, 2);
+    assert.equal(observations.length, 1);
     const codexObservation = observations.find((entry) => entry.provider === "openai-codex");
     assert.ok(codexObservation);
     assert.equal(codexObservation.api, "openai-codex-responses");
@@ -3031,14 +3017,6 @@ test("RunCoordinator replaces only the Codex OAuth payload cache key and preserv
     assert.doesNotMatch(String(replacedPayload.prompt_cache_key), /cache-key-scope-codex|session-remains/);
     assert.equal(replacedPayload.instructions, codexObservation.payload.instructions);
     assert.deepEqual(replacedPayload.tools, codexObservation.payload.tools);
-
-    const xaiObservation = observations.find((entry) => entry.provider === "xai");
-    assert.ok(xaiObservation);
-    assert.equal(xaiObservation.api, "openai-completions");
-    assert.equal(xaiObservation.sessionId, "xai-session");
-    assert.equal(xaiObservation.hasOnPayload, false);
-    assert.equal(xaiObservation.replaced, undefined);
-    assert.equal(xaiObservation.payload.prompt_cache_key, "xai-session");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

@@ -8,12 +8,11 @@ import threading
 import time
 from typing import Any, Callable
 
-from .oauth_flows import OAuthHTTPClient
+from .oauth_flows import SUPPORTED_OAUTH_PROVIDERS, OAuthHTTPClient
 
 
 MODEL_CATALOG_CACHE_SETTING = "agent_model_catalog_cache_v1"
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0"
-XAI_MODELS_URL = "https://api.x.ai/v1/models"
 RUNTIME_CATALOG_TTL_SECONDS = 5 * 60
 OAUTH_CATALOG_TTL_SECONDS = 10 * 60
 FAILED_REFRESH_RETRY_SECONDS = 60
@@ -57,12 +56,12 @@ class ModelCatalogManager:
         self._runtime_failure_error = ""
         self._oauth_conditions = {
             provider: threading.Condition(self._lock)
-            for provider in ("openai-codex", "xai-oauth")
+            for provider in SUPPORTED_OAUTH_PROVIDERS
         }
         self._oauth_refreshing: set[str] = set()
         self._oauth_generations = {
             provider: 0
-            for provider in ("openai-codex", "xai-oauth")
+            for provider in SUPPORTED_OAUTH_PROVIDERS
         }
         self._oauth_failures: dict[str, tuple[int, int, str]] = {}
         try:
@@ -74,11 +73,11 @@ class ModelCatalogManager:
     def catalogs(self) -> dict[str, dict[str, Any]]:
         return {
             provider: self.catalog(provider)
-            for provider in ("openai-codex", "xai-oauth")
+            for provider in SUPPORTED_OAUTH_PROVIDERS
         }
 
     def catalog(self, provider: str) -> dict[str, Any]:
-        if provider not in {"openai-codex", "xai-oauth"}:
+        if provider not in SUPPORTED_OAUTH_PROVIDERS:
             return {
                 "provider": provider,
                 "models": [],
@@ -312,25 +311,19 @@ class ModelCatalogManager:
                     raise RuntimeError("OAuth credential loader returned an invalid snapshot")
                 access_token = credential_snapshot[0]
                 active_revision = _nonnegative_integer(credential_snapshot[1])
-                url = CODEX_MODELS_URL if provider == "openai-codex" else XAI_MODELS_URL
                 additional_headers: dict[str, str] = {}
-                if provider == "openai-codex":
-                    account_id = _codex_account_id(access_token)
-                    if account_id:
-                        additional_headers["ChatGPT-Account-Id"] = account_id
+                account_id = _codex_account_id(access_token)
+                if account_id:
+                    additional_headers["ChatGPT-Account-Id"] = account_id
                 response = self._http.get_bearer_json(
-                    url,
+                    CODEX_MODELS_URL,
                     access_token,
                     additional_headers=additional_headers,
                     timeout=15.0,
                 )
                 if response.status != 200:
                     raise RuntimeError(f"OAuth model discovery returned HTTP {response.status}")
-                models = (
-                    _parse_codex_models(response.data)
-                    if provider == "openai-codex"
-                    else _parse_xai_models(response.data)
-                )
+                models = _parse_codex_models(response.data)
                 if not models:
                     raise RuntimeError("OAuth model discovery returned no models")
                 final_revision = _nonnegative_integer(self._credential_revision(provider))
@@ -452,7 +445,7 @@ class ModelCatalogManager:
                 }
         oauth = value.get("oauth")
         if isinstance(oauth, dict):
-            for provider in ("openai-codex", "xai-oauth"):
+            for provider in SUPPORTED_OAUTH_PROVIDERS:
                 entry = oauth.get(provider)
                 if not isinstance(entry, dict):
                     continue
@@ -491,7 +484,7 @@ def _normalize_runtime_providers(value: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(value, dict):
         return {}
     normalized: dict[str, dict[str, Any]] = {}
-    for provider in ("openai-codex", "xai-oauth"):
+    for provider in SUPPORTED_OAUTH_PROVIDERS:
         raw = value.get(provider)
         if not isinstance(raw, dict):
             continue
@@ -535,24 +528,6 @@ def _parse_codex_models(payload: Any) -> list[str]:
         sortable.append((rank, index, model_id))
     sortable.sort(key=lambda item: (item[0], item[1]))
     return _clean_model_ids([model_id for _, _, model_id in sortable])
-
-
-def _parse_xai_models(payload: Any) -> list[str]:
-    entries = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        entries = payload.get("models") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        return []
-    models: list[Any] = []
-    for item in entries:
-        if not isinstance(item, dict):
-            models.append(item)
-            continue
-        models.append(item.get("id"))
-        aliases = item.get("aliases")
-        if isinstance(aliases, list):
-            models.extend(aliases)
-    return _clean_model_ids(models)
 
 
 def _clean_model_ids(value: Any) -> list[str]:

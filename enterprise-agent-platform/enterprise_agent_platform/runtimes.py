@@ -28,7 +28,6 @@ from .loopback_http import (
 
 
 AGENT_SETTING_MODEL = "agent_runtime_model"
-AGENT_SETTING_PROVIDER = "agent_runtime_provider"
 AGENT_SETTING_IDLE_TIMEOUT = "agent_runtime_idle_timeout_seconds"
 AGENT_SETTING_MAX_CONCURRENCY = "agent_runtime_max_concurrency"
 AGENT_SETTING_COMPACTION_THRESHOLD = "agent_runtime_compaction_threshold"
@@ -202,8 +201,6 @@ class PlatformRuntimeManager:
     def agent_runtime_config(self) -> dict[str, Any]:
         return {
             "runtime_url": self._effective_agent_runtime_url(),
-            "provider": self._runtime_setting(AGENT_SETTING_PROVIDER)
-            or self.config.agent_runtime_provider,
             "model": self._runtime_setting(AGENT_SETTING_MODEL)
             or self.config.agent_runtime_model,
             "idle_timeout_seconds": self._effective_agent_idle_timeout_seconds(),

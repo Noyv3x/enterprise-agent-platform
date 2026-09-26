@@ -36,7 +36,6 @@ export function rootReducer(state: AppState, action: Action): AppState {
         privateTotal: 0,
       },
       oauthFlows: {},
-      oauthCallbackUrls: {},
       pendingOperations: [],
     };
   }

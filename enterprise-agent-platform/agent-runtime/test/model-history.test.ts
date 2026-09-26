@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ToolCall } from "@earendil-works/pi-ai";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { redactToolArgumentsForJournal } from "../src/approval-policy.js";
@@ -16,15 +17,16 @@ test("model-history redaction preserves executable tool schemas and keeps audit 
     delegate: async () => "",
     markSideEffect: () => undefined,
   });
-  const cases: Array<[string, Record<string, unknown>]> = [
+  const cases: Array<[string, ToolCall["arguments"]]> = [
     ["terminal", { command: `API_TOKEN=${secret} printf ok`, cwd: "." }],
     ["process", {
       tool: "process",
       action: "write",
       arguments: { process_id: "shell", input: `API_TOKEN=${secret} printf ok` },
     }],
-    ["write_file", { path: "report.txt", content: secret }],
-    ["patch_file", { path: "report.txt", old_text: secret, new_text: `${secret}-new` }],
+    // Codex file tools normalize an omitted target before arguments reach model history.
+    ["write_file", { path: "report.txt", content: secret, target: "sandbox" }],
+    ["patch_file", { path: "report.txt", old_text: secret, new_text: `${secret}-new`, target: "sandbox" }],
     ["browser", {
       tool: "browser",
       action: "type",
@@ -205,7 +207,7 @@ test("model-history bounds arbitrary browser extraction schemas without changing
   });
   const browser = tools.find((candidate) => candidate.name === "browser");
   assert.ok(browser);
-  let nested: Record<string, unknown> = { type: "string" };
+  let nested: ToolCall["arguments"] = { type: "string" };
   for (let index = 0; index < 100; index += 1) nested = { child: nested };
   const args = {
     action: "extract",

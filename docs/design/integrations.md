@@ -29,12 +29,12 @@ Manager 独占固定服务 URL／启动／重试／重启，Platform 无安装�
 
 ## 模型 OAuth
 
-Codex 设备码，Grok 浏览器授权后粘贴 callback URL；Platform 负责会话／state/PKCE／交换／刷新／导入导出／持久化。产品凭据只读 secret 行，OAuth／Telegram／邮箱凭据与浏览器 Cookie 不互代续期／过期。
+Codex（ChatGPT OAuth）是唯一模型供应商，使用设备码授权；Platform 负责会话／交换／刷新／导入导出／持久化。Grok OAuth 已退役：启动时删除其凭据、provider 选择和凭据 revision，曾以 Grok 运行的部署把部署及账号模型选择恢复为自动；旧导出文件中的 Grok 凭据和 `active_provider` 在导入时忽略。产品凭据只读 secret 行，OAuth／Telegram／邮箱凭据与浏览器 Cookie 不互代续期／过期。
 
 - 同 provider 的 access token／refresh token／expiry／可选身份 token 完整验证后同一 SQLite 事务提交，刷新／导入／交互完成共用原子边界；失败留原组，不混写、不盲重试已消费授权码。
 - 可执行集合只来自锁定 Pi 的 provider／API／endpoint／模型能力，可用集合只来自供应商账号，必须求交。当前凭据从未成功发现目录即不可用，仅同凭据最近成功目录可 stale；无硬编码 ID／退役表／版本／辅助优先级。视觉辅助按同 provider 输入能力枚举，以自己的 model ID 复验。
 - 单调凭据 generation 绑定返回 Token 与放行目录，换号／刷新后重取一致快照；不拼旧 Token／新目录，不持有 auth lock 等待需该锁的目录 single-flight，Token 不进 session／metadata／事件。
-- Codex 按 priority、Grok 按响应／alias 顺序，交集首项推荐，Runtime 不重排。自动／显式值见[配置](../reference/configuration.md#runtime-与模型)；OAuth 卡分别标推荐模型／可用数量。
+- Codex 按 priority 顺序，交集首项推荐，Runtime 不重排。自动／显式值见[配置](../reference/configuration.md#runtime-与模型)；OAuth 卡分别标推荐模型／可用数量。
 
 Codex 草稿与 `prompt_cache_key` 见 [Runtime](agent-runtime.md)：不扩 OAuth scope／凭据／目录／连接，不增部署持久状态，不以缓存命中作为 readiness。
 

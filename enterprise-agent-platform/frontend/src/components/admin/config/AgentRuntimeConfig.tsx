@@ -5,11 +5,11 @@ import { RUN_IDLE_TIMEOUT_DEFAULT_SECONDS, RUN_IDLE_TIMEOUT_MAXIMUM_SECONDS, RUN
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { AgentRuntimeConfigValues } from "../../../types";
+import { CODEX_PROVIDER_ID } from "../../../utils/oauth";
 import { FormFooter, FormGrid, Notice, Section } from "../../ui/fieldwork";
 
-const PROVIDERS = ["openai-codex", "xai-oauth"];
 function seed(config: AgentRuntimeConfigValues) {
-  return { provider: config.provider || "openai-codex", model: config.model || "", idle: String(config.idle_timeout_seconds ?? RUN_IDLE_TIMEOUT_DEFAULT_SECONDS), concurrency: String(config.max_concurrency ?? 4), compaction: String(config.compaction_threshold ?? 0.8) };
+  return { model: config.model || "", idle: String(config.idle_timeout_seconds ?? RUN_IDLE_TIMEOUT_DEFAULT_SECONDS), concurrency: String(config.max_concurrency ?? 4), compaction: String(config.compaction_threshold ?? 0.8) };
 }
 
 export function AgentRuntimeConfig() {
@@ -22,23 +22,22 @@ export function AgentRuntimeConfig() {
   useEffect(() => setDraft(seed(runtime?.config || {})), [runtime]);
   const catalog = useMemo(() => {
     if (oauth) {
-      const provider = oauth.providers.find((item) => item.id === draft.provider);
+      const provider = oauth.providers.find((item) => item.id === CODEX_PROVIDER_ID);
       return { models: provider?.configured ? provider.models || [] : [], default_model: provider?.default_model || "", error: provider?.model_catalog_error || "" };
     }
-    return runtime?.config.model_catalog?.[draft.provider] || { models: [] };
-  }, [oauth, runtime, draft.provider]);
+    return runtime?.config.model_catalog?.[CODEX_PROVIDER_ID] || { models: [] };
+  }, [oauth, runtime]);
   const models = catalog.models || [];
   const recommended = models.includes(catalog.default_model || "") ? catalog.default_model! : models[0] || "";
   const unavailable = !!draft.model && !models.includes(draft.model);
   const dirty = JSON.stringify(draft) !== JSON.stringify(seed(runtime?.config || {}));
   const save = () => {
     if (!dirty || saving) return;
-    void saveAgentRuntimeConfig(store, { provider: draft.provider, model: draft.model, idle_timeout_seconds: draft.idle, max_concurrency: draft.concurrency, compaction_threshold: draft.compaction });
+    void saveAgentRuntimeConfig(store, { model: draft.model, idle_timeout_seconds: draft.idle, max_concurrency: draft.concurrency, compaction_threshold: draft.compaction });
   };
   return <Section title={t("admin.agentRuntime.title")} description={t("admin.agentRuntime.description")}>
     <Form layout="vertical" onFinish={save} disabled={saving}>
       <FormGrid>
-        <Form.Item label={t("admin.agentRuntime.provider")}><Select aria-label={t("admin.agentRuntime.provider")} value={draft.provider} options={PROVIDERS.map((value) => ({ value, label: value === "openai-codex" ? t("admin.oauth.provider.codex") : t("admin.oauth.provider.grok") }))} onChange={(provider) => setDraft({ ...draft, provider, model: "" })} /></Form.Item>
         <Form.Item label={t("admin.agentRuntime.model")} extra={models.length ? t("admin.model.count", { count: models.length }) : t("admin.agentRuntime.modelUnavailableHint")}>
           <Select aria-label={t("admin.agentRuntime.model")} value={draft.model} disabled={saving || !models.length} onChange={(model) => setDraft({ ...draft, model })} options={[
             { value: "", label: recommended ? t("admin.model.autoOption", { model: recommended }) : t("admin.agentRuntime.modelUnavailable") },

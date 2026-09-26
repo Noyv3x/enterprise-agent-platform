@@ -65,9 +65,9 @@ Platform 独占非 secret `ui_branding_v1`（schema／revision／名称／主色
 
 ### Runtime 与模型
 
-`agent_runtime_provider`、`agent_runtime_model`、`agent_runtime_idle_timeout_seconds`、`agent_runtime_max_concurrency`、`agent_runtime_compaction_threshold` 同事务更新，仅后续 Run 生效、不重启 Runtime。
+`agent_runtime_model`、`agent_runtime_idle_timeout_seconds`、`agent_runtime_max_concurrency`、`agent_runtime_compaction_threshold` 同事务更新，仅后续 Run 生效、不重启 Runtime。
 
-provider／model 受[OAuth 安全交集](../design/integrations.md#模型-oauth)约束。部署 `agent_runtime_model=""` 为自动推荐，账号 `model_name=""` 为继承部署策略；执行时依供应商顺序求候选、不反写。显式选择不因目录、新模型、重验或其它字段更新改写，执行仍复验；换 provider 未明确 model 则清空旧值。
+供应商固定为 Codex，不是配置项；model 受[OAuth 安全交集](../design/integrations.md#模型-oauth)约束。部署 `agent_runtime_model=""` 为自动推荐，账号 `model_name=""` 为继承部署策略；执行时依供应商顺序求候选、不反写。显式选择不因目录、新模型、重验或其它字段更新改写，执行仍复验。
 
 ### 集成
 

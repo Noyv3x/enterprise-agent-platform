@@ -1,6 +1,7 @@
 import { chmod, type FileHandle, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { JsonValue as PiJsonValue } from "@earendil-works/pi-ai";
 import { redactCommandForApproval } from "./approval-policy.js";
 import {
   BackgroundTaskStore,
@@ -821,7 +822,7 @@ function durableSessionMessage(message: AgentMessage): AgentMessage {
           text: `[Tool result image (${block.mimeType}) was available to the live Agent and omitted from durable session history.]`,
         }
       : block),
-    details: durableToolDetails(message.details),
+    ...(message.details === undefined ? {} : { details: durableToolDetails(message.details) }),
   };
 }
 
@@ -831,6 +832,9 @@ function objectValue(value: unknown): Record<string, unknown> {
     : {};
 }
 
+// Same JSON-preserving projection as the journal sanitizer: Pi details in, JSON out.
+function durableToolDetails(value: PiJsonValue, fieldName?: string): PiJsonValue;
+function durableToolDetails(value: unknown, fieldName?: string): unknown;
 function durableToolDetails(value: unknown, fieldName?: string): unknown {
   if (fieldName === "command") {
     return typeof value === "string" ? redactCommandForApproval(value) : "[redacted]";

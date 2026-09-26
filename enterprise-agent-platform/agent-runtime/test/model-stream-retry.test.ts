@@ -3,6 +3,7 @@ import test from "node:test";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
   createAssistantMessageEventStream,
+  normalizeContext,
   type AssistantMessage,
   type AssistantMessageEvent,
 } from "@earendil-works/pi-ai";
@@ -20,7 +21,7 @@ const model = {
   contextWindow: 128_000,
   maxTokens: 8_192,
 };
-const context = { messages: [] };
+const context = normalizeContext({ messages: [] });
 
 function message(stopReason: AssistantMessage["stopReason"], errorMessage?: string, text = ""): AssistantMessage {
   return {
