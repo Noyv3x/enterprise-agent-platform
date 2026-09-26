@@ -1,43 +1,44 @@
+import { StyleProvider } from '@ant-design/cssinjs';
 import { Provider as MotionProvider } from '@rc-component/motion';
 import { App, Button, ConfigProvider, Drawer, theme as antTheme } from 'antd';
 import type { ConfigProviderProps, ThemeConfig } from 'antd';
 import { createContext, useContext, useId, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
+import GlideMenu from '../beautiful/GlideMenu';
+import { LoaderGrid } from '../beautiful/Loading';
 
 export type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 export type BrandIdentity = { productName: string; logoUrl?: string | null };
 export type FieldworkMode = 'light' | 'dark';
 
 /**
- * Neutral, cool, low-chroma palette after Beautiful UI (beautifului.dev). Separation comes from
- * tone steps and soft ring shadows rather than drawn borders:
- * canvas = app/sidebar ground, surface = reading area, raised = cards/popovers/composer,
- * inset = filled fields, code, user bubbles; hover/hoverStrong = interactive washes;
- * ink/muted/faint = the three text levels; line/strongLine = hairlines.
+ * Beautiful UI (beautifului.dev) neutrals, converted from its oklch tokens; the Beautiful UI semantic
+ * variables (`--page`, `--surface`, `--ink-2`, …) are mapped onto these in beautiful/foundation.css.
+ * canvas = app/sidebar ground (BUI page), surface = reading area, raised = cards/panels/popovers (BUI surface),
+ * stage = grey stage (BUI canvas), well = quiet secondary fill (BUI inset), inset = input fills, code,
+ * user bubbles (BUI field); hover/hoverStrong = interactive washes; line/strongLine/lineSoft = hairlines.
+ * Deviations for the 4.5:1 text contract: faint (BUI ink-3 is 2.7:1) and the status colors are deepened.
+ * Elevation shadows are Beautiful UI's smooth ring stacks, defined in CSS (`--shadow-card|raised|overlay`).
  */
 const palettes = {
   light: {
-    canvas: '#fafafb', surface: '#ffffff', raised: '#ffffff', inset: '#f2f2f3', hover: '#f4f5f6', hoverStrong: '#e7e9eb',
-    ink: '#1f2124', muted: '#5a5d63', faint: '#6b6e74', line: '#ecedef', strongLine: '#e0e2e5',
+    canvas: '#fafafb', surface: '#ffffff', raised: '#ffffff', stage: '#f1f2f3', well: '#f7f8f9', inset: '#f2f2f3',
+    hover: '#f4f5f6', hoverStrong: '#e7e9eb',
+    ink: '#1f2124', muted: '#5a5d63', faint: '#6b6e74', line: '#ecedef', strongLine: '#e0e2e5', lineSoft: '#f3f4f5',
     success: '#136c33', warning: '#9c4806', danger: '#b8252b', info: '#0861bb', tooltip: '#25272b',
-    shadowCard: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 1px 2px rgba(15, 17, 20, 0.04), 0 2px 8px rgba(15, 17, 20, 0.04)',
-    shadowRaised: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 4px 16px rgba(15, 17, 20, 0.08)',
-    shadowOverlay: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 12px 32px rgba(15, 17, 20, 0.14)',
   },
   dark: {
-    canvas: '#17181a', surface: '#1c1d1f', raised: '#232427', inset: '#2b2c2f', hover: '#2a2b2e', hoverStrong: '#313236',
-    ink: '#f2f3f4', muted: '#a5a8ad', faint: '#95989e', line: '#2e3033', strongLine: '#3a3c40',
+    canvas: '#17181a', surface: '#1c1d1f', raised: '#232427', stage: '#1c1d1f', well: '#1f2022', inset: '#2b2c2f',
+    hover: '#2a2b2e', hoverStrong: '#313236',
+    ink: '#f2f3f4', muted: '#a5a8ad', faint: '#95989e', line: '#2e3033', strongLine: '#3a3c40', lineSoft: '#27282b',
     success: '#3cbb72', warning: '#f68f3c', danger: '#f47b7f', info: '#7ec0ff', tooltip: '#111214',
-    shadowCard: '0 0 0 1px rgba(255, 255, 255, 0.09), 0 1px 2px rgba(0, 0, 0, 0.2), 0 2px 6px rgba(0, 0, 0, 0.2)',
-    shadowRaised: '0 0 0 1px rgba(255, 255, 255, 0.11), 0 2px 10px rgba(0, 0, 0, 0.24)',
-    shadowOverlay: '0 0 0 1px rgba(255, 255, 255, 0.13), 0 8px 28px rgba(0, 0, 0, 0.36)',
   },
 } as const;
 const fallbackBrand = '#52606d';
 const brandForeground = { light: '#fdfefe', dark: '#030405' } as const;
-// Local fonts only: Inter/JetBrains Mono are used when installed, never downloaded.
-const bodyFont = '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif';
-const monoFont = '"JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace';
+// Self-hosted latin faces (beautiful/foundation.css); CJK falls through to the system faces.
+const bodyFont = '"BUI Inter", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif';
+const monoFont = '"BUI JetBrains Mono", "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace';
 const SurfaceContext = createContext<(() => HTMLElement) | undefined>(undefined);
 const NavigationCloseContext = createContext<(() => void) | undefined>(undefined);
 /** Chinese UI copy is written as intended; Ant must not insert a space into two-character labels. */
@@ -127,29 +128,32 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
         fontWeightStrong: 600,
         controlHeight: control, controlHeightLG: touch ? 44 : 36, controlHeightSM: touch ? 44 : 28,
         lineWidth: 1, padding: 16, paddingLG: 24, paddingSM: 12,
-        boxShadow: palette.shadowRaised, boxShadowSecondary: palette.shadowOverlay, boxShadowTertiary: palette.shadowCard,
+        boxShadow: 'var(--shadow-raised)', boxShadowSecondary: 'var(--shadow-overlay)', boxShadowTertiary: 'var(--shadow-card)',
         controlOutline: accentWash, controlOutlineWidth: 3, colorBgMask: mode === 'dark' ? 'rgba(0, 0, 0, 0.5)' : 'rgba(15, 17, 20, 0.28)',
         motionDurationFast: '0.14s', motionDurationMid: '0.22s', motionEaseInOut: 'cubic-bezier(.25,1,.5,1)',
       },
       components: {
+        // Beautiful UI Button: pill actions; secondary = surface + hairline ring (shadow-btn), hover = inset wash.
         Button: {
           primaryColor: onBrand, dangerColor: mode === 'dark' ? palette.canvas : palette.surface,
-          primaryShadow: 'none', dangerShadow: 'none', defaultShadow: '0 1px 2px rgba(15, 17, 20, 0.04)',
-          defaultBorderColor: palette.strongLine, defaultHoverBorderColor: palette.strongLine, defaultHoverColor: palette.ink,
-          defaultHoverBg: palette.hover, defaultActiveBg: palette.hoverStrong, defaultActiveBorderColor: palette.strongLine, defaultActiveColor: palette.ink,
+          primaryShadow: 'none', dangerShadow: 'none', defaultShadow: 'var(--shadow-btn)',
+          defaultBg: palette.raised, defaultBorderColor: 'transparent', defaultHoverBorderColor: 'transparent', defaultHoverColor: palette.ink,
+          defaultHoverBg: palette.well, defaultActiveBg: palette.hover, defaultActiveBorderColor: 'transparent', defaultActiveColor: palette.ink,
           textHoverBg: palette.hover, textTextColor: palette.ink, textTextHoverColor: palette.ink, textTextActiveColor: palette.ink,
-          colorBgTextActive: palette.hoverStrong, fontWeight: 500, contentFontSize: 13, paddingInline: 12,
+          colorBgTextActive: palette.hoverStrong, fontWeight: 500, contentFontSize: 13, paddingInline: 14, paddingInlineSM: 10,
+          borderRadius: 999, borderRadiusSM: 999, borderRadiusLG: 999,
         },
         Input: { activeBg: palette.raised, hoverBg: palette.hoverStrong, activeShadow: `0 0 0 3px ${accentWash}` },
         InputNumber: { activeBg: palette.raised, hoverBg: palette.hoverStrong, activeShadow: `0 0 0 3px ${accentWash}` },
         Select: {
           optionHeight: touch ? 44 : 32, optionPadding: touch ? '12px' : '6px 10px', activeOutlineColor: accentWash,
-          optionSelectedBg: palette.hover, optionActiveBg: palette.hover, optionSelectedFontWeight: 500,
+          optionSelectedBg: palette.hover, optionActiveBg: palette.hover, optionSelectedFontWeight: 500, borderRadiusLG: 10, borderRadiusSM: 6,
         },
         Table: { headerBg: 'transparent', headerColor: palette.muted, headerSplitColor: 'transparent', rowHoverBg: palette.hover, borderColor: palette.line, cellPaddingBlock: 10, cellPaddingInline: 12 },
         Tabs: { horizontalItemGutter: 20, titleFontSize: 14 },
         Menu: { itemHeight: touch ? 44 : 32, itemBorderRadius: 6, itemSelectedBg: palette.hover, itemHoverBg: palette.hover, itemSelectedColor: palette.ink },
-        Dropdown: { paddingBlock: 6, controlItemBgHover: palette.hover },
+        // Beautiful UI menus: 10px panel, 6px rows, hover fill, overlay ring.
+        Dropdown: { paddingBlock: 6, controlItemBgHover: palette.hover, borderRadiusLG: 10, borderRadiusSM: 6, fontSize: 13 },
         Segmented: { trackBg: palette.inset, itemSelectedBg: palette.raised, itemColor: palette.muted, itemHoverColor: palette.ink, itemHoverBg: 'transparent' },
         Form: { labelColor: palette.ink, labelFontSize: 13, verticalLabelPadding: '0 0 6px', itemMarginBottom: 16 },
         Drawer: { footerPaddingBlock: 12, footerPaddingInline: 20 },
@@ -169,12 +173,14 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
   return (
     <div ref={root} className="wf-root" data-wf-theme={mode} style={design.variables}>
       <SurfaceContext.Provider value={getContainer}>
-        <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}
-          input={filledVariant} textArea={filledVariant} select={filledVariant} inputNumber={filledVariant}>
-          <MotionProvider motion={motion}>
-            <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
-          </MotionProvider>
-        </ConfigProvider>
+        <StyleProvider layer>
+          <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}
+            input={filledVariant} textArea={filledVariant} select={filledVariant} inputNumber={filledVariant}>
+            <MotionProvider motion={motion}>
+              <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
+            </MotionProvider>
+          </ConfigProvider>
+        </StyleProvider>
       </SurfaceContext.Provider>
     </div>
   );
@@ -278,12 +284,49 @@ export function AppFrame({ brand, navigation, account, utilities, children, navi
 export interface NavigationItem { key: string; label: ReactNode; ariaLabel?: string; description?: ReactNode; title?: string; icon?: ReactNode; trailing?: ReactNode; disabled?: boolean }
 export interface NavigationGroup { key: string; label: ReactNode; action?: ReactNode; items: NavigationItem[] }
 export interface NavigationProps { label: string; groups: NavigationGroup[]; activeKey?: string; onSelect: (key: string) => void }
+/**
+ * Beautiful UI Sidebar Nav (primitives/SidebarNav.tsx): 32px rows with an 18px glyph and 14px medium label, one
+ * gliding hover layer per group, and the active row held on the same neutral fill. Group heads are quiet 12.5px
+ * labels with their action at the end; row tools sit over the row's trailing edge.
+ */
 export function WorkspaceNav({ label, groups, activeKey, onSelect }: NavigationProps) {
   const closeNavigation = useContext(NavigationCloseContext);
-  return <nav aria-label={label} className="wf-navigation">{groups.map((group) => <div className="wf-nav-group" key={group.key}>{(group.label || group.action) && <div className="wf-nav-group-head">{group.label && <span className="wf-eyebrow">{group.label}</span>}{group.action}</div>}<ul className="wf-nav-list">{group.items.map((item) => <li key={item.key} className={`wf-nav-row${activeKey === item.key ? ' wf-nav-row--active' : ''}`}><Button type="text" className={`wf-nav-item${activeKey === item.key ? ' wf-nav-item--active' : ''}`} aria-current={activeKey === item.key ? 'page' : undefined} aria-label={item.ariaLabel} title={item.title} disabled={item.disabled} onClick={() => { onSelect(item.key); closeNavigation?.(); }}><span className="wf-nav-icon">{item.icon}</span><span className="wf-nav-copy"><span>{item.label}</span>{item.description && <span className="wf-nav-description">{item.description}</span>}</span></Button>{item.trailing && <span className="wf-nav-trailing">{item.trailing}</span>}</li>)}</ul></div>)}</nav>;
+  return <nav aria-label={label} className="flex flex-col gap-3">{groups.map((group) => <div key={group.key} className="min-w-0">
+    {(group.label || group.action) && <div className="mb-px flex h-8 items-center justify-between gap-1.5 pl-2 text-[12.5px] font-medium text-ink-3">
+      <span className="flex min-w-0 items-center gap-1.5 truncate">{group.label}</span>{group.action}
+    </div>}
+    <GlideMenu rowSelector="[data-row]" highlightClassName="inset-x-0 rounded-[8px] bg-hover-2" className="group/glide">
+      <ul className="m-0 flex list-none flex-col gap-px p-0">{group.items.map((item) => {
+        const active = activeKey === item.key;
+        return <li key={item.key} className={`wf-nav-row relative flex min-w-0 items-center${active ? ' wf-nav-row--active' : ''}`}>
+          <button type="button" data-row={item.disabled ? undefined : ''}
+            className={`relative z-10 flex min-h-8 w-full min-w-0 items-center rounded-[8px] px-2 py-1 text-left transition-[background-color,color,transform] duration-150 enabled:active:scale-[0.98] disabled:cursor-default ${active ? 'bg-hover-2 group-hover/glide:bg-transparent' : ''}${item.trailing ? ' pr-9' : ''}`}
+            aria-current={active ? 'page' : undefined} aria-label={item.ariaLabel} title={item.title} disabled={item.disabled}
+            onClick={() => { onSelect(item.key); closeNavigation?.(); }}>
+            {item.icon && <span className={`flex size-5 shrink-0 items-center justify-center [&_svg]:size-[18px] ${active ? 'text-ink' : 'text-ink-2'}`}>{item.icon}</span>}
+            <span className={`flex min-w-0 flex-1 flex-col${item.icon ? ' ml-1.5' : ''}`}>
+              <span className={`truncate text-[14px] font-medium ${active ? 'text-ink' : 'text-ink-2'}`}>{item.label}</span>
+              {item.description && <span className="text-[12px] leading-[1.45] font-normal whitespace-normal text-ink-3">{item.description}</span>}
+            </span>
+          </button>
+          {item.trailing && <span className="wf-nav-trailing absolute right-1 z-20 flex items-center">{item.trailing}</span>}
+        </li>;
+      })}</ul>
+    </GlideMenu>
+  </div>)}</nav>;
 }
+/** Beautiful UI panel tabs (ChatComposer header): 13px labels, the current one on a field chip. */
 export function SectionIndex({ label, groups, activeKey, onSelect }: NavigationProps) {
-  return <nav className="wf-section-index" aria-label={label}>{groups.map((group) => <div className="wf-section-index-group" key={group.key}>{group.label && <span className="wf-eyebrow">{group.label}</span>}<div className="wf-section-index-items">{group.items.map((item) => <Button key={item.key} type="text" className={`wf-section-index-item${activeKey === item.key ? ' wf-section-index-item--active' : ''}`} aria-current={activeKey === item.key ? 'page' : undefined} disabled={item.disabled} onClick={() => onSelect(item.key)}>{item.icon}{item.label}{item.trailing}</Button>)}</div></div>)}</nav>;
+  return <nav className="wf-section-index" aria-label={label}>{groups.map((group) => <div className="wf-section-index-group" key={group.key}>
+    {group.label && <span className="wf-eyebrow">{group.label}</span>}
+    <div className="flex flex-wrap items-center gap-0.5">{group.items.map((item) => {
+      const active = activeKey === item.key;
+      return <button key={item.key} type="button" aria-current={active ? 'page' : undefined} disabled={item.disabled} onClick={() => onSelect(item.key)}
+        className={`inline-flex min-h-7 items-center gap-1.5 rounded-[6px] px-2 py-[3px] text-left text-[13px] transition-[background-color,color] duration-100 disabled:opacity-50 ${active ? 'bg-field font-medium text-ink shadow-hairline' : 'text-ink-2 hover:bg-hover hover:text-ink'}`}>
+        {item.icon}{item.label}{item.trailing}
+      </button>;
+    })}</div>
+  </div>)}</nav>;
 }
 
 export interface PageHeaderProps { eyebrow?: ReactNode; title: ReactNode; description?: ReactNode; meta?: ReactNode; actions?: ReactNode }
@@ -327,9 +370,9 @@ export function Notice({ tone = 'info', title, children, action }: { tone?: Tone
 export function EmptyState({ eyebrow, title, description, action, compact = false }: { eyebrow?: ReactNode; title: ReactNode; description?: ReactNode; action?: ReactNode; compact?: boolean }) {
   return <div className={`wf-empty${compact ? ' wf-empty--compact' : ''}`}>{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h2>{title}</h2>{description && <div className="wf-empty-description">{description}</div>}{action && <div className="wf-empty-action">{action}</div>}</div>;
 }
-/** Shared loading language: the same ring as live work rows, the real label, optional detail. */
+/** Shared loading language: Beautiful UI's pixel-grid loader, the real label, optional detail. */
 export function LoadingState({ label, detail }: { label: ReactNode; detail?: ReactNode }) {
-  return <div className="wf-loading" role="status" aria-live="polite"><Spinner size={16} /><strong>{label}</strong>{detail && <span className="wf-muted">{detail}</span>}</div>;
+  return <div className="wf-loading" role="status" aria-live="polite"><LoaderGrid /><strong>{label}</strong>{detail && <span>{detail}</span>}</div>;
 }
 export interface DataRegionProps { state: 'loading' | 'error' | 'empty' | 'ready'; loadingLabel: ReactNode; error?: ReactNode; empty?: ReactNode; retry?: ReactNode; refreshing?: boolean; refreshingLabel?: ReactNode; children?: ReactNode }
 export function DataRegion({ state, loadingLabel, error, empty, retry, refreshing = false, refreshingLabel, children }: DataRegionProps) {

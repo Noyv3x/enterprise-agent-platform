@@ -41,7 +41,7 @@ export function AgentApprovalPrompt({ approval, mode, scopeId }: {
   return <ApprovalPanel
     title={t("chat.approval.title")}
     description={approval.description || t("chat.approval.fallbackDescription")}
-    detail={approval.command ? <pre className="wf-work-approval-command" tabIndex={0}>{approval.command}</pre> : undefined}
+    detail={approval.command ? <pre tabIndex={0}>{approval.command}</pre> : undefined}
     busy={submitting !== null}
     status={submitting ? <span role="status">{t("chat.approval.submitting")}</span> : currentOutcome ? <span role={currentOutcome.ok ? "status" : "alert"}>{t(currentOutcome.ok ? "chat.approvalSubmitted" : "chat.approvalFailed")}</span> : undefined}
     choices={ACTIONS.filter(({ choice }) => allowed.has(choice)).map(({ choice, label }) => ({

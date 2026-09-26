@@ -441,6 +441,7 @@ export const chatMessages = defineMessages({
   "chat.copy.message": { "zh-CN": "复制消息", en: "Copy message", "zh-TW": "複製訊息" },
   "chat.copy.code": { "zh-CN": "复制代码", en: "Copy code", "zh-TW": "複製程式碼" },
   "chat.copy.copied": { "zh-CN": "已复制", en: "Copied", "zh-TW": "已複製" },
+  "chat.copy.short": { "zh-CN": "复制", en: "Copy", "zh-TW": "複製" },
   "chat.copy.failed": { "zh-CN": "复制失败", en: "Copy failed", "zh-TW": "複製失敗" },
   "chat.markdown.codeLabel": { "zh-CN": "代码", en: "Code", "zh-TW": "程式碼" },
   "chat.markdown.tableLabel": {

@@ -1,2 +1,5 @@
+/* Domain styles sit in the `app` cascade layer (see src/app.css). */
+@layer app {
 .wf-skills { min-width: 0; }
 .wf-skill-instructions { overflow-wrap: anywhere; }
+}

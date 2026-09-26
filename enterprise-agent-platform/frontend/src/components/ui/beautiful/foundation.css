@@ -1,0 +1,283 @@
+/* Beautiful UI foundation (https://www.beautifului.dev, MIT — see ./LICENSE and ./NOTICE), adapted:
+ * - the semantic tokens read the Fieldwork palette (FieldworkProvider owns light/dark, brand accent and the
+ *   4.5:1 text contract), so Ant controls, domain CSS and Beautiful UI components share one set of values;
+ * - `dark:` follows `data-wf-theme` instead of a `.dark` class;
+ * - fonts are self-hosted latin subsets; CJK text and CJK punctuation fall through to system CJK faces;
+ * - site-only rules (striped page background, showcase gestures, docs nav) are omitted. */
+
+@custom-variant dark (&:where([data-wf-theme="dark"], [data-wf-theme="dark"] *));
+
+/* Latin-only faces. General punctuation (U+2000–206F: “ ” … —) is left to the CJK fallback so Chinese
+   quotes, ellipses and dashes keep their full-width shapes. */
+@font-face {
+  font-family: "BUI Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2013, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "BUI Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-ext-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+1E00-1E9F, U+1EF2-1EFF, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "BUI JetBrains Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 800;
+  src: url("@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2013, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ── semantic tokens ─────────────────────────────────────
+ * Names and roles follow Beautiful UI: page (app ground), canvas (stage), surface (cards, panels,
+ * popovers), inset (quiet secondary fill), field (inputs), hover/hover-2, ink ramp, hairlines,
+ * accent + semantic colors used sparingly. */
+.wf-root {
+  --page: var(--wf-canvas);
+  --canvas: var(--wf-stage);
+  --surface: var(--wf-raised);
+  --inset: var(--wf-well);
+  --hover: var(--wf-hover);
+  --hover-2: var(--wf-hover-strong);
+  --ink: var(--wf-ink);
+  --ink-2: var(--wf-muted);
+  --ink-3: var(--wf-faint);
+  --line: var(--wf-line);
+  --line-strong: var(--wf-strong-line);
+  --line-soft: var(--wf-line-soft);
+  --grid-line: color-mix(in srgb, var(--line) 78%, transparent);
+  --field: var(--wf-inset);
+  --accent: var(--wf-brand-raw);
+  --accent-ink: var(--wf-accent);
+  --accent-tint: var(--wf-accent-wash);
+  --on-accent: var(--wf-on-brand);
+  --green: var(--wf-success);
+  --green-tint: color-mix(in srgb, var(--wf-success) 10%, transparent);
+  --orange: var(--wf-warning);
+  --orange-tint: color-mix(in srgb, var(--wf-warning) 10%, transparent);
+  --red: var(--wf-danger);
+  --red-tint: color-mix(in srgb, var(--wf-danger) 10%, transparent);
+  --tooltip-bg: var(--wf-tooltip);
+  --tooltip-fg: #f6f7f8;
+  --tooltip-muted: #a5a8ad;
+  --tooltip-border: #3a3c40;
+
+  --shadow-hairline: 0 0 0 1px var(--line);
+  --shadow-btn: 0 0 0 1px var(--line-strong), var(--shadow-xs);
+  --shadow-card: 0 0 0 1px var(--line), var(--shadow-sm);
+  --shadow-raised: 0 0 0 1px var(--line), var(--shadow-md);
+  --shadow-overlay: 0 0 0 1px var(--line), var(--shadow-lg);
+  --shadow-inset-field: inset 0 1px 2px oklch(0 0 0 / 0.12);
+
+  /* Fieldwork aliases: domain CSS keeps its names, the values are Beautiful UI's. */
+  --wf-shadow-card: var(--shadow-card);
+  --wf-shadow-raised: var(--shadow-raised);
+  --wf-shadow-overlay: var(--shadow-overlay);
+  --wf-shadow-btn: var(--shadow-btn);
+}
+
+.wf-root[data-wf-theme="dark"] {
+  --tooltip-border: #2e3033;
+  /* Elevation rings become a faint light hairline in dark mode, graduated by elevation. */
+  --shadow-btn: 0 0 0 1px oklch(1 0 0 / 0.1), 0 1px 2px oklch(0 0 0 / 0.3);
+  --shadow-card: 0 0 0 1px oklch(1 0 0 / 0.11), 0 1px 2px oklch(0 0 0 / 0.2), 0 2px 6px oklch(0 0 0 / 0.2);
+  --shadow-raised: 0 0 0 1px oklch(1 0 0 / 0.13), 0 2px 10px oklch(0 0 0 / 0.22);
+  --shadow-overlay: 0 0 0 1px oklch(1 0 0 / 0.15), 0 8px 28px oklch(0 0 0 / 0.34);
+  --shadow-inset-field: inset 0 1px 2px oklch(0 0 0 / 0.4);
+  --green-tint: color-mix(in srgb, var(--wf-success) 14%, transparent);
+  --orange-tint: color-mix(in srgb, var(--wf-warning) 14%, transparent);
+  --red-tint: color-mix(in srgb, var(--wf-danger) 14%, transparent);
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-inset: var(--inset);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-hover: var(--hover);
+  --color-hover-2: var(--hover-2);
+  --color-field: var(--field);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-line-soft: var(--line-soft);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-tint: var(--accent-tint);
+  --color-on-accent: var(--on-accent);
+  --color-green: var(--green);
+  --color-green-tint: var(--green-tint);
+  --color-orange: var(--orange);
+  --color-orange-tint: var(--orange-tint);
+  --color-red: var(--red);
+  --color-red-tint: var(--red-tint);
+
+  --shadow-hairline: var(--shadow-hairline);
+  --shadow-btn: var(--shadow-btn);
+  --shadow-inset-field: var(--shadow-inset-field);
+  --shadow-card: var(--shadow-card);
+  --shadow-raised: var(--shadow-raised);
+  --shadow-overlay: var(--shadow-overlay);
+
+  --font-sans: var(--wf-font-body);
+  --font-mono: var(--wf-font-mono);
+
+  /* radii — chips 6, controls 8, cards 10, windows 14, pills 999 */
+  --radius-chip: 6px;
+  --radius-control: 8px;
+  --radius-card: 10px;
+  --radius-window: 14px;
+
+  --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out-strong: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-link: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* The smooth shadow stacks are referenced through var() above, so keep them emitted. */
+@theme static {
+  --shadow-xs: 0 0 4px 0 rgba(0, 0, 0, 0.04);
+  --shadow-sm: 0 18px 47px 0 rgba(0, 0, 0, 0.03), 0 7.5px 19px 0 rgba(0, 0, 0, 0.02),
+    0 4px 10.5px 0 rgba(0, 0, 0, 0.02), 0 2.3px 5.8px 0 rgba(0, 0, 0, 0.01),
+    0 1.2px 3.1px 0 rgba(0, 0, 0, 0.01), 0 0.5px 1.3px 0 rgba(0, 0, 0, 0.01);
+  --shadow-md: 0 17.54px 23.39px 0 rgba(0, 0, 0, 0.04), 0 9.4px 12.5px 0 rgba(0, 0, 0, 0.03),
+    0 5.25px 7px 0 rgba(0, 0, 0, 0.02), 0 2.79px 3.72px -2px rgba(0, 0, 0, 0.01),
+    0 1.16px 1.5px 0 rgba(0, 0, 0, 0.01);
+  --shadow-lg: 0 25px 50px 0 rgba(0, 0, 0, 0.05), 0 12px 24px 0 rgba(0, 0, 0, 0.04),
+    0 6px 12px 0 rgba(0, 0, 0, 0.03), 0 3px 6px 0 rgba(0, 0, 0, 0.02),
+    0 1.5px 3px 0 rgba(0, 0, 0, 0.02);
+}
+
+/* Shared optical offsets for small cards (Beautiful UI primitive spacing system). */
+@utility primitive-card-pad { padding: 12px; }
+@utility primitive-card-bar { padding: 10px 12px; }
+@utility primitive-card-footer { padding: 10px; }
+@utility primitive-table-cell { padding: 10px 12px; }
+@utility primitive-icon-button {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-control);
+}
+
+/* Beautiful UI separates surfaces with ring shadows, which forced-colors mode drops: give them a real edge there. */
+@utility bui-edge {
+  @media (forced-colors: active) { outline: 1px solid CanvasText; }
+}
+
+/* ── base ─────────────────────────────────────────────
+ * The part of Tailwind's preflight the Beautiful UI markup depends on, in the lowest layer: Ant (antd
+ * layer) and the design system (app layer) still set their own element styles on top. Borders default
+ * to `0 solid` so `border-*` utilities draw; native buttons/fields drop their UA chrome. */
+@layer base {
+  .wf-root *, .wf-root ::before, .wf-root ::after { border: 0 solid; }
+  .wf-root :where(hr) { block-size: 0; color: inherit; border-block-start-width: 1px; }
+  .wf-root :where(button, input, select, optgroup, textarea), .wf-root ::file-selector-button {
+    font: inherit; font-feature-settings: inherit; letter-spacing: inherit; color: inherit;
+    border-radius: 0; background-color: transparent; opacity: 1;
+  }
+  .wf-root :where(button) { margin: 0; padding: 0; text-align: inherit; }
+  .wf-root { font-feature-settings: "cv11", "ss01"; }
+  .wf-root :where(h1, h2, h3, h4) { text-wrap: balance; }
+  .wf-root :where(p) { text-wrap: pretty; }
+  .wf-root :where(a) { text-underline-position: from-font; text-decoration-skip-ink: auto; }
+  .wf-root :where(button:not(:disabled), [role="button"]:not([aria-disabled="true"]), label:has(input)) { cursor: pointer; }
+}
+
+/* Touch and narrow layouts guarantee 44px targets. Unlayered on purpose: it must outrank the utilities that give
+   Beautiful UI controls their compact 27–32px desktop sizes. */
+@media (pointer: coarse), (max-width: 639px) {
+  .wf-root :where(button:not([role="switch"])) { min-block-size: var(--wf-control); min-inline-size: var(--wf-control); }
+}
+
+/* ── shared keyframes ─────────────────────────────────── */
+@keyframes shimmer-text {
+  from { background-position: 150% center; }
+  to { background-position: -50% center; }
+}
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.95); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+/* pixel-grid loader — brighten plateau, staggered per cell */
+@keyframes pixel-on {
+  0%, 100% { opacity: 0.15; }
+  18%, 42% { opacity: 1; }
+  62% { opacity: 0.15; }
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ── StreamText caret + tail ──────────────────────────── */
+.stream-tail {
+  filter: blur(1.6px);
+  -webkit-mask-image: linear-gradient(to right, oklch(0 0 0) 20%, oklch(0 0 0 / 0.2));
+  mask-image: linear-gradient(to right, oklch(0 0 0) 20%, oklch(0 0 0 / 0.2));
+}
+.stream-caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.05em;
+  margin-left: 1.5px;
+  translate: 0 -0.5px;
+  border-radius: 1px;
+  background: var(--ink);
+  vertical-align: text-bottom;
+  animation: caret-blink 1s step-end infinite;
+}
+.stream-caret.is-streaming { animation: none; }
+
+/* ── source avatars (StreamingText / ContextCards) ────── */
+.source-avatar { box-shadow: 0 0 0 1px oklch(0.21 0.034 263.436 / 0.1); }
+.wf-root[data-wf-theme="dark"] .source-avatar { box-shadow: 0 0 0 1px oklch(1 0 0 / 0.08); }
+
+/* ── status pills (FilterTable) ───────────────────────── */
+.filter-status-todo { --tag-base: oklch(0.757 0.153 66.401); }
+.filter-status-progress { --tag-base: oklch(0.671 0.118 219.351); }
+.filter-status-done { --tag-base: oklch(0.652 0.131 162.865); }
+.filter-status-todo,
+.filter-status-progress,
+.filter-status-done {
+  border: 1px solid transparent;
+  color: color-mix(in srgb, var(--tag-base) 92%, var(--ink));
+  background: color-mix(in srgb, var(--tag-base) 20%, var(--surface));
+  border-color: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+}
+.wf-root[data-wf-theme="dark"] :is(.filter-status-todo, .filter-status-progress, .filter-status-done) {
+  color: color-mix(in srgb, var(--tag-base) 86%, white);
+  background: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+  border-color: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .stream-caret { animation: none; }
+  .stream-tail { filter: none; -webkit-mask-image: none; mask-image: none; }
+  /* A frozen gradient would leave part of the label near-invisible; show plain text instead. */
+  .bui-shimmer { background: none !important; color: var(--ink-2) !important; }
+}
+
+@media (forced-colors: active) {
+  .bui-shimmer { background: none !important; color: CanvasText !important; }
+}

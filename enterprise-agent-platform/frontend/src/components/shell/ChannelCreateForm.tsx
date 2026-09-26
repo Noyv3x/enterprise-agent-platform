@@ -16,8 +16,9 @@ export function ChannelCreateForm() {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   return <>
-    <Tooltip title={t("nav.channel.create")}><Button type="text" icon={<Icon name="plus" />}
-      aria-label={t("nav.channel.create")} onClick={() => setOpen(true)} /></Tooltip>
+    <Tooltip title={t("nav.channel.create")}><button type="button" aria-label={t("nav.channel.create")} onClick={() => setOpen(true)}
+      className="flex size-8 shrink-0 items-center justify-center rounded-[8px] text-ink-3 transition-[background-color,color,transform] duration-150 hover:bg-hover-2 hover:text-ink active:scale-[0.96]">
+      <Icon name="plus" size={16} /></button></Tooltip>
     <Dialog open={open} onClose={() => { if (!creating) setOpen(false); }} title={t("nav.channel.create")} description={t("nav.channels.visibility")}>
       <Form layout="vertical" onFinish={() => {
         if (creating || !name.trim()) return;

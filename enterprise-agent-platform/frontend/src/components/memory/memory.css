@@ -1,3 +1,5 @@
+/* Domain styles sit in the `app` cascade layer (see src/app.css). */
+@layer app {
 .wf-memory {
   display: grid;
   gap: var(--wf-space-4, 16px);
@@ -21,4 +23,5 @@
   overflow-wrap: anywhere;
   font-weight: 400;
   line-height: 1.6;
+}
 }

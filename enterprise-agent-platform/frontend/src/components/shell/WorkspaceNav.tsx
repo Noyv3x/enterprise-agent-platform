@@ -143,7 +143,9 @@ export function WorkspaceNav({ onDelete, deleteBusy }: { onDelete: (channel: Cha
       icon: <Icon name="hash" />,
       trailing: canManage ? <Dropdown trigger={["click"]} disabled={deleteBusy}
         menu={{ items: [{ key: "delete", label: t("nav.channel.delete"), danger: true }], onClick: () => onDelete(channel) }}>
-        <Button type="text" size="small" icon={<Glyph name="more" size={16} />} aria-label={t("nav.channel.manage", { name: channel.name })} disabled={deleteBusy} />
+        <button type="button" aria-label={t("nav.channel.manage", { name: channel.name })} disabled={deleteBusy}
+          className="flex size-7 items-center justify-center rounded-[7px] text-ink-3 transition-colors duration-150 hover:bg-line-strong hover:text-ink aria-expanded:bg-line-strong aria-expanded:text-ink disabled:opacity-50">
+          <Glyph name="more" size={16} /></button>
       </Dropdown> : undefined,
     })) : [{ key: "no-channels", label: t("nav.channels.empty"), description: t("nav.channels.visibility"), disabled: true }],
   });

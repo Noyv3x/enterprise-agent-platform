@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- Cascade layer order (see src/app.css), declared before any stylesheet so Ant's runtime `antd` layer can never
+         be registered first: base resets < Ant < design system < Tailwind utilities. -->
+    <style>@layer properties, theme, base, antd, app, components, utilities;</style>
     <title>Agent Platform</title>
     <meta name="description" content="Agent Platform - 公共频道、个人 AI 与运行时管理。" />
     <meta name="color-scheme" content="light dark" />

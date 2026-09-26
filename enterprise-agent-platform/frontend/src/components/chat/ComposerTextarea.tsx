@@ -41,7 +41,7 @@ export function ComposerTextarea({ textareaRef, pendingCaretRef, isComposingRef,
     if (focusToken > 0) textareaRef.current?.focus();
   }, [focusToken, textareaRef]);
 
-  return <textarea className="wf-composer-input" data-composer-input
+  return <textarea className="wf-composer-input block max-h-[min(24dvh,16rem)] min-h-11 w-full min-w-0 resize-none overflow-y-hidden bg-transparent py-1 text-[14px] leading-[22px] text-ink outline-none [overflow-wrap:anywhere] placeholder:text-ink-3 disabled:cursor-not-allowed [&.is-scrollable]:overflow-y-auto" data-composer-input
     ref={textareaRef} value={value} disabled={disabled} placeholder={placeholder} rows={1}
     aria-label={t("chat.composer.inputLabel")}
     role={hasPopup ? "combobox" : undefined}

@@ -1,5 +1,7 @@
-.wf-message--streaming .wf-message-prose>:last-child:not(ul,ol,figure,table,pre)::after,.wf-message--streaming .wf-message-prose>:is(ul,ol):last-child>li:last-child::after,.wf-message--streaming .wf-message-plaintext::after{content:"";display:inline-block;inline-size:.5em;block-size:1em;margin-inline-start:.15em;vertical-align:-.15em;border-radius:1px;background:var(--wf-accent);animation:wf-caret 1s steps(2,start) infinite}
-@keyframes wf-caret{to{visibility:hidden}}
+/* Domain styles sit in the `app` cascade layer (see src/app.css). */
+@layer app {
+/* Beautiful UI StreamText caret: a slim ink bar after the last received characters, solid while streaming. */
+.wf-message--streaming .wf-message-prose>:last-child:not(ul,ol,figure,table,pre)::after,.wf-message--streaming .wf-message-prose>:is(ul,ol):last-child>li:last-child::after,.wf-message--streaming .wf-message-plaintext::after{content:"";display:inline-block;inline-size:2px;block-size:1.05em;margin-inline-start:1.5px;vertical-align:text-bottom;translate:0 -.5px;border-radius:1px;background:var(--ink);animation:fade-in 150ms ease-out both}
 .wf-history-action{display:flex;justify-content:center;padding-block:8px}
 .wf-message-prose{min-width:0;overflow-wrap:anywhere;white-space:normal}
 .wf-message-prose>:first-child{margin-block-start:0}
@@ -7,15 +9,15 @@
 .wf-message-prose :is(p,ul,ol,blockquote,figure,pre,table){margin-block:12px}
 .wf-message-prose :is(h1,h2,h3,h4,h5,h6){margin-block:20px 8px}
 .wf-message-prose li>p{margin-block:4px}
-.wf-message-prose pre{white-space:pre;overflow:auto;max-width:100%;padding:14px 16px;background:var(--wf-inset);border-radius:var(--wf-radius-md)}
-.wf-message-prose :not(pre)>code{padding:.125em .375em;border-radius:var(--wf-radius-sm);background:var(--wf-inset);font-size:.875em}
+/* Inline code: Beautiful UI's mono token on a field chip. Fenced code renders through MarkdownContent's Code Block. */
+.wf-message-prose :not(pre)>code{padding:.0625em .375em;border-radius:5px;background:var(--field);box-shadow:var(--shadow-hairline);font-size:.8125em;color:var(--ink)}
 .wf-message-plaintext{white-space:pre-wrap}
-.wf-code-block{margin-inline:0;min-width:0;border-radius:var(--wf-radius-md);background:var(--wf-inset);overflow:hidden}
-.wf-code-block figcaption{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:var(--wf-space-1) var(--wf-space-2) var(--wf-space-1) var(--wf-space-3);box-shadow:inset 0 -1px 0 var(--wf-line);color:var(--wf-muted);font-family:var(--wf-font-mono);font-size:var(--wf-text-xs)}
-.wf-code-block pre{margin:0;background:transparent;border-radius:0}
-.wf-markdown-table{overflow:auto;max-width:100%}
-.wf-markdown-table table{border-collapse:collapse;min-width:100%}
-.wf-markdown-table :is(th,td){text-align:start;padding:8px 12px;border-bottom:1px solid var(--wf-line)}
-.wf-markdown-table th{color:var(--wf-muted);font-weight:500}
+/* Tables: Beautiful UI table card — hairline rows, quiet header, 10px radius. */
+.wf-markdown-table{overflow:auto;max-width:100%;border-radius:var(--radius-card);background:var(--surface);box-shadow:var(--shadow-card)}
+.wf-markdown-table table{border-collapse:collapse;min-width:100%;font-size:13px}
+.wf-markdown-table :is(th,td){text-align:start;padding:9px 12px;border:0;border-bottom:1px solid var(--line)}
+.wf-markdown-table tr:last-child>td{border-bottom:0}
+.wf-markdown-table th{background:var(--inset);color:var(--ink-2);font-size:12px;font-weight:500;white-space:nowrap}
 .wf-message-prose .katex-display{display:block;overflow:auto;max-width:100%;padding-block:4px}
 .wf-telegram-command{max-width:100%;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+}

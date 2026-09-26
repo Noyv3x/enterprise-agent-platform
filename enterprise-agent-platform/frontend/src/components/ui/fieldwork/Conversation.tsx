@@ -1,6 +1,7 @@
 import { Badge, Button, Tooltip } from 'antd';
 import { useId } from 'react';
 import type { ReactNode, Ref, UIEventHandler } from 'react';
+import { Button as BuiButton } from '../beautiful/Button';
 import { Glyph } from './Fieldwork';
 
 export interface ConversationLayoutProps {
@@ -53,23 +54,77 @@ export function AttachmentSlot({ name, meta, preview, actions, status }: Attachm
 }
 
 export interface ComposerFrameProps { input: ReactNode; attachments?: ReactNode; suggestions?: ReactNode; startActions?: ReactNode; submitAction: ReactNode; hint?: ReactNode; status?: ReactNode; recovery?: ReactNode; disabled?: boolean; label: string }
-/** Input is controller-owned: native textarea or Ant TextArea, with existing IME/mention handlers. */
+/**
+ * Beautiful UI Prompt Bar (primitives/PromptBar.tsx, "tall" rounded layout): a raised card whose hairline deepens on
+ * focus, attachments as chips above a full-width input, and a quiet control row (add · status · usage · send).
+ * Menus grow up from the bar's top edge. Input is controller-owned (native textarea with IME/mention handlers).
+ */
 export function ComposerFrame({ input, attachments, suggestions, startActions, submitAction, hint, status, recovery, disabled = false, label }: ComposerFrameProps) {
-  return <section className={`wf-composer-area${disabled ? ' wf-composer-area--disabled' : ''}`} aria-label={label}>{recovery && <div className="wf-composer-recovery">{recovery}</div>}{suggestions && <div className="wf-composer-suggestions">{suggestions}</div>}<div className="wf-composer-frame">{attachments && <div className="wf-composer-attachments">{attachments}</div>}<div className="wf-composer-input-wrap">{input}</div><div className="wf-composer-toolbar"><div className="wf-composer-start">{startActions}</div>{status && <div className="wf-composer-status" role="status">{status}</div>}<div className="wf-composer-submit">{submitAction}</div></div></div>{hint && <div className="wf-composer-hint">{hint}</div>}</section>;
+  return <section className="relative min-w-0" aria-label={label}>
+    {recovery && <div className="mb-2 max-h-40 overflow-auto">{recovery}</div>}
+    {suggestions && <div className="absolute inset-x-0 bottom-full z-10 mb-2">{suggestions}</div>}
+    <div className={`wf-composer-frame relative isolate flex flex-col gap-2 overflow-hidden rounded-[18px] border p-2.5 transition-[border-color,box-shadow,background-color] duration-150 ${disabled
+      ? 'border-line bg-inset'
+      : 'border-line bg-surface shadow-card focus-within:border-line-strong focus-within:shadow-raised'}`}>
+      {attachments && <div className="max-h-32 overflow-auto px-0.5 pt-0.5">{attachments}</div>}
+      <div className="px-1.5 pt-0.5">{input}</div>
+      <div className="flex min-w-0 items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">{startActions}</div>
+        {status && <div className="min-w-0 truncate text-[12px] text-ink-3" role="status">{status}</div>}
+        <div className="ml-auto flex shrink-0 items-center gap-1">{submitAction}</div>
+      </div>
+    </div>
+    {/* Keyboard shortcuts mean nothing on touch keyboards; the row disappears there. */}
+    {hint && <div className="mt-1.5 flex flex-wrap justify-between gap-3 px-2 text-[11.5px] text-ink-3 pointer-coarse:hidden max-[800px]:hidden">{hint}</div>}
+  </section>;
 }
 
 export interface ApprovalChoice { key: string; label: ReactNode; danger?: boolean; primary?: boolean; onChoose: () => void }
 export interface ApprovalPanelProps { title: ReactNode; description?: ReactNode; detail?: ReactNode; choices: ApprovalChoice[]; busy?: boolean; status?: ReactNode; subject?: ReactNode }
-/** Human-in-the-loop card: what the agent wants to do (`subject` + `detail`), why (`description`), and the allowed decisions. */
+/**
+ * Beautiful UI Approval Card (primitives/ApprovalCard.tsx): the request is the heading, the exact command sits on a
+ * field chip, and the footer carries status on the left and pill decisions on the right (accent = the primary one).
+ */
 export function ApprovalPanel({ title, description, detail, choices, busy = false, status, subject }: ApprovalPanelProps) {
   const headingId = useId();
-  return <section className="wf-approval" aria-labelledby={headingId} aria-busy={busy}><header><span className="wf-approval-sign"><Glyph name="lock" size={16} /></span><h3 id={headingId}>{title}</h3>{subject && <span className="wf-approval-subject">{subject}</span>}{status && <span className="wf-approval-status">{status}</span>}</header>{description && <div className="wf-approval-description">{description}</div>}{detail && <div className="wf-approval-detail">{detail}</div>}<div className="wf-actions wf-approval-actions">{choices.map((choice) => <Button key={choice.key} type={choice.primary ? 'primary' : 'default'} danger={choice.danger} disabled={busy} onClick={choice.onChoose}>{choice.label}</Button>)}</div></section>;
+  return <section className="bui-edge my-4 w-full max-w-[35rem] overflow-hidden rounded-card bg-surface shadow-card" aria-labelledby={headingId} aria-busy={busy}
+    style={{ animation: 'fade-up 380ms cubic-bezier(0.23,1,0.32,1) both' }}>
+    <div className="primitive-card-pad">
+      <header className="flex items-start gap-2">
+        <span className="mt-px flex size-5 shrink-0 items-center justify-center rounded-full bg-orange-tint text-orange" aria-hidden="true"><Glyph name="lock" size={12} /></span>
+        <div className="min-w-0 flex-1">
+          <h3 id={headingId} className="m-0 text-[14px] leading-5 font-medium text-ink">{title}</h3>
+          {subject && <div className="mt-0.5 text-[12px] text-ink-3">{subject}</div>}
+        </div>
+      </header>
+      {description && <div className="mt-1.5 pl-7 text-[13px] leading-[1.6] text-ink-2">{description}</div>}
+      {detail && <div className="mt-2.5 pl-7 [&_pre]:m-0 [&_pre]:max-h-80 [&_pre]:overflow-auto [&_pre]:rounded-control [&_pre]:bg-field [&_pre]:px-2.5 [&_pre]:py-2 [&_pre]:font-mono [&_pre]:text-[12px] [&_pre]:leading-[1.6] [&_pre]:text-ink [&_pre]:whitespace-pre-wrap [&_pre]:[overflow-wrap:anywhere] [&_pre]:shadow-hairline">{detail}</div>}
+    </div>
+    <div className="primitive-card-footer flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t border-line-soft">
+      <div className="min-w-0 pl-1 text-[12px] font-medium text-ink-3">{status}</div>
+      <div className="flex flex-wrap items-center justify-end gap-1.5">
+        {choices.map((choice) => <BuiButton key={choice.key} type="button" size="sm" variant={choice.primary ? 'accent' : choice.danger ? 'ghost' : 'secondary'}
+          className={choice.danger ? 'text-red' : undefined} disabled={busy} onClick={choice.onChoose}>{choice.label}</BuiButton>)}
+      </div>
+    </div>
+  </section>;
 }
 
 export interface ContextUsageProps { label: string; usedLabel: string; limitLabel: string; used: string; max: string; percent: number; details?: ReactNode }
+/** Context usage: a hairline meter with mono tabular figures (Beautiful UI value styling). */
 export function ContextUsage({ label, usedLabel, limitLabel, used, max, percent, details }: ContextUsageProps) {
   const boundedPercent = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : 0;
-  return <section className="wf-context"><div className="wf-context-heading"><strong>{label}</strong><span className="wf-mono">{percent}%</span></div><div className="wf-context-meter" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={boundedPercent} aria-valuetext={`${usedLabel}: ${used}; ${limitLabel}: ${max}`}><span style={{ width: `${boundedPercent}%` }} /></div><dl className="wf-context-values"><div><dt>{usedLabel}</dt><dd>{used}</dd></div><div><dt>{limitLabel}</dt><dd>{max}</dd></div></dl>{details && <div className="wf-context-details">{details}</div>}</section>;
+  return <section className="min-w-0 pt-3">
+    <div className="mb-2 flex items-baseline justify-between gap-3 text-[12.5px]"><strong className="font-medium text-ink">{label}</strong><span className="font-mono text-[12px] text-ink-2 tabular-nums">{percent}%</span></div>
+    <div className="h-1.5 overflow-hidden rounded-full bg-field shadow-hairline forced-colors:outline forced-colors:outline-1" role="meter" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={boundedPercent} aria-valuetext={`${usedLabel}: ${used}; ${limitLabel}: ${max}`}>
+      <span className="block h-full rounded-full bg-accent forced-colors:bg-[CanvasText]" style={{ width: `${boundedPercent}%` }} />
+    </div>
+    <dl className="m-0 mt-3 flex flex-wrap gap-6">
+      <div><dt className="text-[11.5px] text-ink-3">{usedLabel}</dt><dd className="m-0 mt-0.5 font-mono text-[12.5px] text-ink tabular-nums">{used}</dd></div>
+      <div><dt className="text-[11.5px] text-ink-3">{limitLabel}</dt><dd className="m-0 mt-0.5 font-mono text-[12.5px] text-ink tabular-nums">{max}</dd></div>
+    </dl>
+    {details && <div className="mt-3 text-[12px] text-ink-3">{details}</div>}
+  </section>;
 }
 
 export interface ComputerPanelProps { title: ReactNode; modeLabel: ReactNode; status?: ReactNode; elapsed?: ReactNode; actions?: ReactNode; children: ReactNode; footer?: ReactNode; expanded?: boolean }

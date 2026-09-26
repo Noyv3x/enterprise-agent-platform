@@ -1,13 +1,13 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject, type TransitionEvent } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject, type TransitionEvent } from "react";
 import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n, type MessageKey, type Translator } from "../../i18n";
 import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
 import type { ActivityStep, AgentStatus, AgentWork, AppState } from "../../types";
 import { formatElapsed } from "../../utils/format";
-import { Glyph, Spinner, type GlyphName } from "../ui/fieldwork";
+import { Shimmer } from "../ui/beautiful";
+import { Glyph, type GlyphName } from "../ui/fieldwork";
 import { MessageBody } from "./MessageBody";
-import "./work.css";
 
 type Work = AgentWork | AgentStatus;
 type ProcessState = "running" | "completed" | "failed";
@@ -502,11 +502,25 @@ function completedWorkSummary(entries: ProcessLineEntry[], translate: Translator
     : translate("chat.work.steps", { count: entries.filter((entry) => entry.kind !== "notice").length });
 }
 
+/* Evidence follows Beautiful UI ToolChips' expanded detail: a hairline-led column under the row, code on
+   field chips. It shows the real command, output and parameters. */
+const EVIDENCE_HEADING = "m-0 text-[11.5px] leading-[1.5] font-medium text-ink-3";
+const EVIDENCE_CODE = "m-0 max-h-80 max-w-full overflow-auto rounded-control bg-field px-2.5 py-2 font-mono text-[11.5px] leading-[1.6] text-ink shadow-hairline whitespace-pre-wrap [overflow-wrap:anywhere] [tab-size:2]";
+const EVIDENCE_DANGER_CODE = "bg-red-tint text-ink shadow-[0_0_0_1px_color-mix(in_srgb,var(--red)_24%,transparent)]";
+
+function EvidenceSection({ label, danger = false, children }: { label: string; danger?: boolean; children: ReactNode }) {
+  return <section aria-label={label} className="grid min-w-0 gap-1">
+    <h4 className={`${EVIDENCE_HEADING}${danger ? " text-red" : ""}`}>{label}</h4>
+    {children}
+  </section>;
+}
+
 function Evidence({ entry }: { entry: ProcessLineEntry }) {
   const { t, locale } = useI18n();
-  if (entry.kind === "commentary") return <div className="wf-trace-evidence wf-trace-evidence--prose" role="group" aria-label={entry.title}>
+  const column = "mt-0.5 mb-2 ml-[11px] flex min-w-0 flex-col gap-2.5 border-l border-line py-1 pl-3.5";
+  if (entry.kind === "commentary") return <div className={`${column} text-[13px] leading-[1.6] text-ink-2`} role="group" aria-label={entry.title}>
     {entry.detail && <MessageBody content={entry.detail} />}
-    {entry.detailNotice && <p className="wf-trace-note" role="note">{entry.detailNotice}</p>}
+    {entry.detailNotice && <p className="m-0 text-[11.5px] text-orange" role="note">{entry.detailNotice}</p>}
   </div>;
   const command = terminalCommand(entry);
   const summary = semanticDetail(entry);
@@ -516,31 +530,32 @@ function Evidence({ entry }: { entry: ProcessLineEntry }) {
   const completed = formatWorkInstant(entry.completedAt, locale);
   const time = started && completed && started !== completed ? `${started} – ${completed}` : started || completed;
   const resultLabel = t(resultSectionKey(entry));
-  const result = entry.result ? <section aria-label={resultLabel} data-tone={failed ? "danger" : undefined}>
-    <h4>{resultLabel}</h4>
-    <pre tabIndex={0}><code>{entry.result}</code></pre>
-  </section> : null;
+  const result = entry.result ? <EvidenceSection label={resultLabel} danger={failed}>
+    <pre tabIndex={0} className={`${EVIDENCE_CODE}${failed ? ` ${EVIDENCE_DANGER_CODE}` : ""}`}><code>{entry.result}</code></pre>
+  </EvidenceSection> : null;
   const contextLabel = t(parameterSectionKey(entry));
-  const context = parameters.length ? <section aria-label={contextLabel}>
-    <h4>{contextLabel}</h4>
-    <dl>{parameters.map(([key, value]) => <div key={key}>
-      <dt>{parameterLabel(key, t)}</dt><dd>{formatParameterValue(value)}</dd>
-    </div>)}</dl>
-  </section> : null;
+  const context = parameters.length ? <EvidenceSection label={contextLabel}>
+    <dl className="m-0 grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-[11.5px] leading-[1.6]">
+      {parameters.map(([key, value]) => <div key={key} className="contents">
+        <dt className="text-ink-3">{parameterLabel(key, t)}</dt>
+        <dd className="m-0 min-w-0 font-mono text-ink [overflow-wrap:anywhere]">{formatParameterValue(value)}</dd>
+      </div>)}
+    </dl>
+  </EvidenceSection> : null;
   const summaryIsError = failed && !entry.result;
-  return <div className="wf-trace-evidence" role="group" aria-label={entry.title}>
-    {command && <section>
-      <h4>{t("chat.activity.commandPreview")}</h4>
-      <pre className="wf-trace-command" aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code>{command}</code></pre>
+  return <div className={column} role="group" aria-label={entry.title}>
+    {command && <section className="grid min-w-0 gap-1">
+      <h4 className={EVIDENCE_HEADING}>{t("chat.activity.commandPreview")}</h4>
+      <pre className={EVIDENCE_CODE} aria-label={t("chat.activity.commandPreview")} tabIndex={0}><code className="before:text-ink-3 before:content-['$_'] before:select-none">{command}</code></pre>
     </section>}
     {toolFamily(entry.rawTool) === "file" || entry.rawTool === "terminal" ? <>{result}{context}</> : <>{context}{result}</>}
-    {summary && <section data-tone={summaryIsError ? "danger" : undefined}>
-      <h4>{t(summaryIsError ? "chat.work.detail.error" : "chat.work.detail.summary")}</h4>
-      <pre tabIndex={0}>{summary}</pre>
+    {summary && <section className="grid min-w-0 gap-1">
+      <h4 className={`${EVIDENCE_HEADING}${summaryIsError ? " text-red" : ""}`}>{t(summaryIsError ? "chat.work.detail.error" : "chat.work.detail.summary")}</h4>
+      <pre tabIndex={0} className={`${EVIDENCE_CODE} font-sans${summaryIsError ? ` ${EVIDENCE_DANGER_CODE}` : ""}`}>{summary}</pre>
     </section>}
-    {entry.detailNotice && <p className="wf-trace-note" role="note">{entry.detailNotice}</p>}
-    {entry.resultNotice && <p className="wf-trace-note" role="note">{entry.resultNotice}</p>}
-    {time && <p className="wf-trace-instant">{t("chat.work.detail.time")} <time>{time}</time></p>}
+    {entry.detailNotice && <p className="m-0 text-[11.5px] text-orange" role="note">{entry.detailNotice}</p>}
+    {entry.resultNotice && <p className="m-0 text-[11.5px] text-orange" role="note">{entry.resultNotice}</p>}
+    {time && <p className="m-0 text-[11.5px] text-ink-3">{t("chat.work.detail.time")} <time className="font-mono tabular-nums">{time}</time></p>}
   </div>;
 }
 
@@ -564,7 +579,15 @@ function transitionMilliseconds(element: HTMLElement): number {
  * the closing transition. Closing a panel that holds focus returns focus to its trigger first,
  * including the one automatic collapse when a live run settles.
  */
-function useDisclosure(open: boolean) {
+interface Disclosure {
+  /** true while open and through the closing transition */
+  mounted: boolean;
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  panelRef: RefObject<HTMLDivElement | null>;
+  onTransitionEnd: (event: TransitionEvent<HTMLDivElement>) => void;
+}
+
+function useDisclosure(open: boolean): Disclosure {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const [closing, setClosing] = useState(false);
@@ -592,12 +615,33 @@ function useDisclosure(open: boolean) {
 
 const FAMILY_GLYPHS: Record<ToolFamily, GlyphName> = { file: "file", terminal: "terminal", search: "search", browser: "browser", generic: "sparkle" };
 
+/* Beautiful UI glyphs: the Thinking sparkle and the disclosure chevron. */
+function SparkleMark({ size = 16 }: { size?: number }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" /></svg>;
+}
+function ChevronDown({ size = 14, className, style }: { size?: number; className?: string; style?: CSSProperties }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={className} style={style}><path d="M6 9l6 6 6-6" /></svg>;
+}
+/** Beautiful UI's step spinner: a hairline ring with an ink arc. */
+function StepSpinner() {
+  return <span className="size-3 shrink-0 rounded-full border-[1.5px] border-line-strong border-t-ink-2" style={{ animation: "spin 700ms linear infinite" }} />;
+}
+
+/** The collapsible body shared by the trace and its rows: grid rows 0fr↔1fr with an opacity fade. */
+function DisclosurePanel({ id, open, disclosure, children }: { id: string; open: boolean; disclosure: Disclosure; children: ReactNode }) {
+  return <div ref={disclosure.panelRef} id={id} className="wf-trace-panel grid min-w-0 transition-[grid-template-rows,opacity] duration-300 ease-out-strong"
+    style={{ gridTemplateRows: open ? "1fr" : "0fr", opacity: open ? 1 : 0 }} data-open={open} inert={!open || undefined} onTransitionEnd={disclosure.onTransitionEnd}>
+    <div className="min-h-0 min-w-0 overflow-hidden">{disclosure.mounted && children}</div>
+  </div>;
+}
+
 /** One sign per row: running rows spin, failures warn, settled rows show what kind of work they were. */
 function StepSign({ entry }: { entry: ProcessLineEntry }) {
-  if (entry.kind === "notice" || entry.state === "failed") return <Glyph name="warning" size={14} />;
-  if (entry.state === "running") return <Spinner size={14} />;
-  if (entry.kind === "commentary") return <Glyph name="sparkle" size={14} />;
-  return <Glyph name={FAMILY_GLYPHS[toolFamily(entry.rawTool)]} size={14} />;
+  if (entry.kind === "notice") return <span className="flex text-orange"><Glyph name="warning" size={13} /></span>;
+  if (entry.state === "failed") return <span className="flex text-red"><Glyph name="warning" size={13} /></span>;
+  if (entry.state === "running") return <StepSpinner />;
+  if (entry.kind === "commentary") return <SparkleMark size={12} />;
+  return <Glyph name={FAMILY_GLYPHS[toolFamily(entry.rawTool)]} size={13} />;
 }
 
 /** Paths, commands and queries read as code; prose-like previews (browser, commentary, generic tools) stay in the body face. */
@@ -606,6 +650,7 @@ function usesMonoPreview(entry: ProcessLineEntry): boolean {
   return entry.kind === "tool" && (family === "file" || family === "terminal" || family === "search");
 }
 
+/** A Beautiful UI tool chip row: sign (swapping to a chevron on hover/open), label, value chip, and the evidence below. */
 function TraceStep({ entry }: { entry: ProcessLineEntry }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -613,21 +658,25 @@ function TraceStep({ entry }: { entry: ProcessLineEntry }) {
   const expandable = entry.state !== "running" && entryHasExpandedDetail(entry);
   const open = expandable && expanded;
   const disclosure = useDisclosure(open);
-  const failed = entry.kind !== "notice" && entry.state === "failed";
+  const notice = entry.kind === "notice";
+  const failed = !notice && entry.state === "failed";
   const row = <>
-    <span className="wf-trace-sign" aria-hidden="true"><StepSign entry={entry} /></span>
-    <span className="wf-trace-step-title">{entry.title}</span>
-    {entry.preview && <span className={`wf-trace-step-meta${usesMonoPreview(entry) ? " wf-mono" : ""}`} title={toolFamily(entry.rawTool) === "file" ? entry.preview : undefined}>{entry.preview}</span>}
-    {entry.kind !== "notice" && <span className={failed ? "wf-trace-step-state" : "wf-sr-only"}>{agentStepStateText(entry.state, t)}</span>}
-    {expandable && <Glyph name="chevron" size={12} className="wf-trace-chevron" />}
+    <span className="relative flex size-4 shrink-0 items-center justify-center text-ink-3" aria-hidden="true">
+      <span className={`flex transition-opacity duration-100${expandable ? ` group-hover/row:opacity-0${open ? " opacity-0" : ""}` : ""}`}><StepSign entry={entry} /></span>
+      {expandable && <ChevronDown size={12} className={`absolute transition-[opacity,transform] duration-150 group-hover/row:opacity-100 ${open ? "opacity-100" : "opacity-0"}`} style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)" }} />}
+    </span>
+    <span className={`max-w-[60%] shrink-0 truncate text-[12.5px] ${notice ? "font-normal text-ink-2" : "font-medium text-ink"}`}>{entry.title}</span>
+    {entry.preview && (notice
+      ? <span className="min-w-0 basis-full pl-6 text-[11.5px] leading-[1.6] text-ink-2 [overflow-wrap:anywhere]">{entry.preview}</span>
+      : <span className={`inline-block h-5.5 min-w-0 truncate rounded-chip bg-field px-1.5 text-[11.5px] leading-[22px] text-ink-2 shadow-hairline${usesMonoPreview(entry) ? " font-mono" : ""}`} title={toolFamily(entry.rawTool) === "file" ? entry.preview : undefined}>{entry.preview}</span>)}
+    {!notice && <span className={failed ? "shrink-0 text-[11.5px] font-medium text-red" : "wf-sr-only"}>{agentStepStateText(entry.state, t)}</span>}
   </>;
-  return <li className={`wf-trace-step wf-trace-step--${entry.kind === "notice" ? "notice" : entry.state}`}>
+  const rowClass = `flex w-full min-w-0 items-center gap-2 rounded-control px-1.5 text-left${notice ? " flex-wrap py-1" : " min-h-7"}`;
+  return <li className="min-w-0" style={{ animation: "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" }}>
     {expandable
-      ? <button ref={disclosure.triggerRef} type="button" className="wf-trace-row" aria-expanded={open} aria-controls={panelId} onClick={() => setExpanded(!open)}>{row}</button>
-      : <div className="wf-trace-row">{row}</div>}
-    {expandable && <div ref={disclosure.panelRef} id={panelId} className="wf-trace-panel" data-open={open} inert={!open || undefined} onTransitionEnd={disclosure.onTransitionEnd}>
-      <div className="wf-trace-clip">{disclosure.mounted && <Evidence entry={entry} />}</div>
-    </div>}
+      ? <button ref={disclosure.triggerRef} type="button" className={`group/row ${rowClass} transition-colors duration-100 hover:bg-hover-2${open ? " bg-hover" : ""}`} aria-expanded={open} aria-controls={panelId} onClick={() => setExpanded(!open)}>{row}</button>
+      : <div className={rowClass}>{row}</div>}
+    {expandable && <DisclosurePanel id={panelId} open={open} disclosure={disclosure}><Evidence entry={entry} /></DisclosurePanel>}
   </li>;
 }
 
@@ -768,30 +817,44 @@ export function AgentWorkCard({ work, active, settling = false }: { work: Work; 
   const meta: ReactNode[] = [];
   if (active) meta.push(<span key="steps">{t("chat.work.steps", { count: entries.filter((entry) => entry.kind !== "notice").length })}</span>);
   if (failed) meta.push(<span key="summary">{summary}</span>);
-  if (failedSteps > 0) meta.push(<span key="failed-steps" className="wf-trace-failed-steps">{t("chat.work.failedSteps", { count: failedSteps })}</span>);
+  if (failedSteps > 0) meta.push(<span key="failed-steps" className="shrink-0 text-red">{t("chat.work.failedSteps", { count: failedSteps })}</span>);
   if (waiting > 0) meta.push(<span key="waiting">{t("chat.work.waitingCount", { count: waiting })}</span>);
   if (elapsedSeconds != null) {
     const time = formatElapsed(elapsedSeconds);
-    meta.push(<span key="elapsed" className="wf-trace-time"><span className="wf-sr-only">{t("chat.work.elapsed", { time })}</span><span aria-hidden="true">{time}</span></span>);
+    meta.push(<span key="elapsed" className="font-mono"><span className="wf-sr-only">{t("chat.work.elapsed", { time })}</span><span aria-hidden="true">{time}</span></span>);
   }
-  const tone = approval ? "approval" : active ? "live" : failed ? "failed" : failedSteps > 0 ? "partial" : "settled";
+  const live = active && !approval;
   const toggle = () => {
     if (active) setLiveDisclosure({ runId, open: !open });
     else dispatch({ type: "TOGGLE_AGENT_RUN", payload: { runId, expanded: !open } });
   };
-  return <section ref={sectionRef} className={`wf-trace wf-trace--${tone}`} aria-label={t("chat.work.label")}>
+  const sign = approval
+    ? <span className="flex text-orange"><Glyph name="lock" size={14} /></span>
+    : failed || failedSteps > 0
+      ? <span className="flex text-red"><Glyph name="warning" size={14} /></span>
+      : <span className={`flex transition-colors duration-200 ${live ? "text-ink-2" : "text-ink-3"}`}><SparkleMark /></span>;
+  const labelClass = "min-w-0 truncate text-[13px] font-medium";
+  // Beautiful UI Thinking: sparkle, shimmering label while working, quiet summary once settled, rotating chevron.
+  return <section ref={sectionRef} className="wf-trace mb-3 min-w-0 max-w-full" aria-label={t("chat.work.label")}>
     {statusText && <span id={statusId} className="wf-sr-only">{statusText}</span>}
-    <button ref={disclosure.triggerRef} type="button" className="wf-trace-head" aria-expanded={open} aria-controls={panelId} aria-describedby={statusText ? statusId : undefined} title={statusText || undefined} onClick={toggle}>
-      <span className="wf-trace-sign" aria-hidden="true"><Glyph name={approval ? "lock" : failed || failedSteps > 0 ? "warning" : "sparkle"} size={14} /></span>
-      <span className="wf-trace-label">{label}</span>
-      {folded?.preview && <span className={`wf-trace-detail${usesMonoPreview(folded) ? " wf-mono" : ""}`}>{folded.preview}</span>}
-      {meta.length > 0 && <span className="wf-trace-meta">{meta}</span>}
-      <Glyph name="chevron" size={12} className="wf-trace-chevron" />
+    <button ref={disclosure.triggerRef} type="button"
+      className="-mx-1.5 flex w-fit max-w-[calc(100%+12px)] min-w-0 items-center gap-2 rounded-control px-1.5 py-1 text-left transition-colors duration-100 hover:bg-hover-2"
+      aria-expanded={open} aria-controls={panelId} aria-describedby={statusText ? statusId : undefined} title={statusText || undefined} onClick={toggle}>
+      <span className="flex shrink-0" aria-hidden="true">{sign}</span>
+      {live
+        ? <Shimmer className={labelClass}>{label}</Shimmer>
+        : <span className={`${labelClass} ${failed ? "text-red" : approval ? "text-ink" : "text-ink-2"}`}>{label}</span>}
+      {folded?.preview && <span className={`inline-block h-5.5 min-w-0 max-w-96 shrink-[1000] truncate rounded-chip bg-field px-1.5 text-[11.5px] leading-[22px] text-ink-2 shadow-hairline${usesMonoPreview(folded) ? " font-mono" : ""}`}>{folded.preview}</span>}
+      {meta.length > 0 && <span className="flex min-w-0 shrink items-center gap-1.5 truncate text-[12px] text-ink-3 tabular-nums [&>*+*]:before:mr-1.5 [&>*+*]:before:content-['·']">{meta}</span>}
+      <ChevronDown className="shrink-0 text-ink-3 transition-transform duration-300" style={{ transform: open ? "rotate(180deg)" : "rotate(0)" }} />
     </button>
-    <div ref={disclosure.panelRef} id={panelId} className="wf-trace-panel" data-open={open} inert={!open || undefined} onTransitionEnd={disclosure.onTransitionEnd}>
-      <div className="wf-trace-clip">{disclosure.mounted && <ol className="wf-trace-steps" role="list">
-        {entries.map((entry) => <TraceStep key={entry.key} entry={entry} />)}
-      </ol>}</div>
-    </div>
+    <DisclosurePanel id={panelId} open={open} disclosure={disclosure}>
+      <div className="relative mt-1 ml-[5px] pl-4">
+        <span aria-hidden="true" className="absolute top-0 bottom-2 left-[3px] w-px bg-line forced-colors:bg-[CanvasText]" />
+        <ol className="m-0 flex list-none flex-col gap-0.5 p-0 py-1" role="list">
+          {entries.map((entry) => <TraceStep key={entry.key} entry={entry} />)}
+        </ol>
+      </div>
+    </DisclosurePanel>
   </section>;
 }

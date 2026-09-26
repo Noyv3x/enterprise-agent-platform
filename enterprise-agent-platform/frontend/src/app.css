@@ -1,0 +1,14 @@
+/* Stylesheet entry. Cascade order, lowest first (also declared inline at the top of index.html so it holds even if
+ * Ant's runtime styles are inserted before this sheet):
+ *   properties/theme/base — Tailwind internals and Beautiful UI base rules
+ *   antd        — Ant Design's runtime styles (StyleProvider layer in FieldworkProvider)
+ *   app         — Fieldwork design system and domain CSS (they refine Ant without specificity fights)
+ *   utilities   — Tailwind utilities used by the Beautiful UI components (always win, as upstream expects)
+ * Tailwind's preflight reset is intentionally not imported: Ant and the design system own element defaults. */
+@layer properties, theme, base, antd, app, components, utilities;
+
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+@import "./components/ui/beautiful/foundation.css";
+@import "./components/ui/platform-components.css" layer(app);
+@import "./design-system.css" layer(app);

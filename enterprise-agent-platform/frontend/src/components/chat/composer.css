@@ -1,28 +1,6 @@
+/* Domain styles sit in the `app` cascade layer (see src/app.css). The composer itself is the Beautiful UI Prompt Bar
+   (ComposerFrame, Tailwind utilities); only the form shell and the failed-send summary live here. */
+@layer app {
 .wf-chat-compose { min-width: 0; flex: 0 0 auto; margin: 0; }
-.wf-chat-compose .wf-composer-input { min-width: 0; overflow-y: hidden; }
-.wf-chat-compose .wf-composer-input.is-scrollable { overflow-y: auto; }
-.wf-draft-files { display: flex; flex-wrap: wrap; gap: 8px; max-height: 180px; overflow: auto; list-style: none; margin: 0; padding: 0; }
-.wf-draft-files > li { min-width: 0; max-width: 100%; flex: 0 1 320px; }
-.wf-draft-hint { display: flex; flex-wrap: wrap; gap: 16px; }
-/* Keyboard shortcuts mean nothing on touch keyboards; the row disappears there. */
-@media (pointer: coarse), (max-width: 800px) {
-  .wf-chat-compose .wf-composer-hint { display: none; }
-}
-.wf-chat-compose .wf-composer-submit { display: flex; align-items: center; gap: var(--wf-space-2); }
-.wf-root .wf-context-trigger { color: var(--wf-muted); font-weight: 500; font-variant-numeric: tabular-nums; }
-.wf-root .wf-context-trigger:not(:disabled):hover { color: var(--wf-ink); }
-.wf-context-popover { inline-size: min(320px, 80vw); }
-.wf-context-popover > p { margin: 0; font-size: var(--wf-text-sm); }
-.wf-context-popover .wf-context { padding-block-end: 0; }
 .wf-draft-recovery-text { overflow-wrap: anywhere; max-height: 6em; overflow: auto; }
-.wf-draft-options { max-height: min(320px, 40dvh); overflow: auto; min-width: 0; padding: var(--wf-space-1); background: var(--wf-raised); border-radius: var(--wf-radius-lg); box-shadow: var(--wf-shadow-overlay); }
-.wf-draft-options[hidden] { display: none; }
-.wf-draft-option { width: 100%; min-height: var(--wf-control); display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 12px; text-align: start; font: inherit; color: var(--wf-ink); background: transparent; border: 0; border-radius: var(--wf-radius); cursor: pointer; overflow-wrap: anywhere; }
-.wf-draft-option:hover { background: var(--wf-hover); }
-.wf-draft-option[aria-selected="true"] { background: var(--wf-hover-strong); }
-.wf-draft-option-meta { margin-inline-start: 8px; color: var(--wf-muted); }
-.wf-draft-option-description { color: var(--wf-muted); font-size: var(--wf-text-sm); }
-@media (max-width: 640px) {
-  .wf-draft-option { align-items: flex-start; flex-direction: column; gap: 4px; }
-  .wf-draft-files > li { flex-basis: 100%; }
 }
