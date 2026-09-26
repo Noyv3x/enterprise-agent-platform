@@ -1,137 +1,212 @@
 # 数据、记忆与会话
 
-本页定义权威状态、事务、CAS、任务与学习生命周期。精确路径/marker/迁移见[数据布局](../reference/data-layout.md)，认证/文件安全见[安全设计](security-and-trust.md)，Run/压缩算法见 [Runtime](agent-runtime.md)，wire 字段见 [Runtime API](../reference/runtime-api.md)。
+本文定义谁拥有哪些权威数据，以及事务、任务、记忆和学习的生命周期。精确路径、数据库标记和迁移见[数据布局](../reference/data-layout.md)；认证和文件安全见[安全设计](security-and-trust.md)；Run 和压缩算法见 [Runtime](agent-runtime.md)；接口字段见 [Runtime API](../reference/runtime-api.md)。
 
 ## 数据所有者
 
-| 所有者 | 权威状态 |
+| 所有者 | 权威数据 |
 | --- | --- |
-| Platform SQLite | 账号/权限、频道/产品消息、附件元数据、token 用量、scope、memory、settings、外部身份/凭据、Telegram/mail、durable job、追加输入、schedule occurrence。 |
-| Runtime | 模型 JSONL/archive、approval/idempotency、todo/有限进程责任；不替代产品消息库。 |
-| 主 Agent workspace | 用户文件、Skill 包、MCP 清单/server/用户环境值，不另存 DB 配置；Skill 授权在 Platform-only 状态。 |
-| Manager journal | generation、预约、更新/恢复编排。Platform 仅按匹配 operation id 取得/释放准入，不从容器/DB/文件消失猜测完成。 |
+| Platform SQLite | 账号与权限、频道与产品消息、附件元数据、token 用量、Agent 对话范围、记忆、设置、外部身份与凭据、Telegram 与邮件、持久任务、追加输入、计划执行记录 |
+| Runtime | 模型 JSONL 会话与归档、审批与幂等记录、todo 和有限后台进程责任。它不替代产品消息库 |
+| 主 Agent 工作区 | 用户文件、Skill 包、MCP 清单和服务、用户环境变量值；这些不另存到数据库。Skill 的授权状态只在 Platform |
+| Manager 日志 | 版本（generation）、更新预约、更新与恢复的编排。Platform 只按匹配的操作 ID 取得或释放准入，不从容器、数据库或文件消失来推断完成 |
 
-SQLite 使用 WAL、外键、按线程连接。事务正文或 commit 失败（含 insert）后，复用连接前必须尝试 rollback；已报错写入不能由后续请求提交。文件+DB 组成可恢复逻辑事务，启动清未完成附件/孤立文件。
+**SQLite 规则**
 
-全部业务表是原子 baseline：空库建当前结构，非空库精确验 marker、表/列、约束、索引、外键；未知/缺失/退役结构先拒，不允许 store 启动补表。仅[受控迁移](../reference/data-layout.md#受控迁移)接受直接前版本；可重建 FTS 例外不是业务修复。
+- 使用 WAL 和外键，每个线程一个连接。
+- 事务执行或提交失败（包括 insert 失败）后，复用连接前必须回滚；已经报错的写入不能被后续请求顺带提交。
+- 文件加数据库组成一个可恢复的逻辑事务；启动时清理未完成的附件和孤立文件。
 
-凭据、HMAC 登录失败窗口、session secret、工作记录随同一 SQLite 快照/提交/回滚，禁止两 generation 同时写；更新不能清失败计数，沿用 secret 不使未过期/未吊销 Cookie 失效。Cookie 不入 DB/JSONL；窗口只存有界不可逆主体/时间戳，详细认证由安全设计拥有。listen host/port 不属业务设置，环境不是第二份 secret 库。
+**结构版本**
+
+- 全部业务表是一个原子的基线：空库直接建立当前结构；非空库必须精确匹配标记、表、列、约束、索引和外键。未知、缺失或已退役的结构一律拒绝启动，不允许在启动时补表。
+- 只有[受控迁移](../reference/data-layout.md#受控迁移)接受紧邻的上一版本。可重建的全文索引是例外，但这不算业务修复。
+
+**凭据与登录状态**
+
+- 凭据、登录失败计数窗口（HMAC）、会话密钥和工作记录都跟随同一份 SQLite 快照、提交和回滚，禁止两个版本同时写入。
+- 更新不会清零登录失败计数；沿用的会话密钥不会让未过期、未吊销的 Cookie 失效。
+- Cookie 本身不写入数据库或 JSONL；失败窗口只存有上限、不可逆的主体标识和时间戳。认证细节见安全设计。
+- 监听地址和端口不属于业务设置；环境变量不是第二份密钥库。
 
 ## Agent scope
 
-- 私人 `private:<user-id>`；频道 `channel:<channel-id>:main-agent`。logical `agent_scopes.lifecycle_id` 与当前 conversation 的 Runtime lifecycle 可独立轮换，**不要求相等**；marker 绑定 logical key/type/id 与 Runtime lifecycle。
-- session 映射仅由 `agent_runtime_scopes` / `agent_runtime_scope_sessions` 承载，alias 保留历史 lifecycle/session；委派继承父 sandbox/workspace。新建/轮换 session 前缀固定 `agent-platform-private-u<id>` / `agent-platform-channel-<id>-main-agent`，品牌不重写历史。
-- logical 身份可先于执行登记，但当前已登记 workspace 的规范目录、marker、alias 在启动前必须存在且一致；启动/普通更新/缓存不补缺失或漂移。每次验证相对身份及路径，详见[布局](../reference/data-layout.md#workspace附件与-skill)。
-- 停用保留 workspace/session/memory；产品隐藏不销毁上下文。真正 reset 必须显式 lifecycle/session rotation+scope cleanup，不能从消息可见性推断。
+- 个人 AI 的范围是 `private:<user-id>`，频道 Agent 是 `channel:<channel-id>:main-agent`。
+- 逻辑生命周期（`agent_scopes.lifecycle_id`）与当前会话的 Runtime 生命周期可以各自轮换，**不要求相等**。工作区标记同时绑定逻辑身份和 Runtime 生命周期。
+- 会话映射只保存在 `agent_runtime_scopes` 和 `agent_runtime_scope_sessions` 两张表，别名保留历史生命周期和会话。委派继承父 Agent 的沙箱和工作区。
+- 新建或轮换的会话前缀固定为 `agent-platform-private-u<id>` 或 `agent-platform-channel-<id>-main-agent`；品牌变化不改写历史。
+- 逻辑身份可以先于执行登记；但已经登记的工作区，其规范目录、标记和别名在启动前必须存在且一致。启动、普通更新和缓存都不会补齐缺失或修正漂移，每次都验证相对身份和路径，详见[数据布局 · 工作区](../reference/data-layout.md#workspace附件与-skill)。
+- 停用账号保留工作区、会话和记忆；产品里隐藏也不销毁上下文。真正的重置必须显式轮换生命周期或会话并清理对话范围，不能从消息是否可见来推断。
 
 ## 产品消息与 Runtime 会话
 
-产品消息用于界面/审计/投递/搜索/回复关联，Runtime history 用于模型上下文/工具配对/压缩；只能通过 source message、Run、scope、lifecycle、session 关联，不能匹配正文猜身份。
+- 产品消息用于界面、审计、投递、搜索和回复关联；Runtime 历史用于模型上下文、工具配对和压缩。两者只通过来源消息、Run、对话范围、生命周期和会话关联，不靠匹配正文来猜。
 
-管理单删/时间删/清空和本人频道撤回都是**逻辑隐藏**，不轮换 session、不清 Runtime/memory/附件/workspace、不取消已排队/运行回复。撤回仅本人可见持久用户消息，乐观临时行无服务端语义；[授权](security-and-trust.md#认证与权限)单独复验。当前无物理 purge；未来须以版本化操作共同设计消息、附件、job、scope，不能复用隐藏。
+**隐藏消息**
 
-**删除频道**不同于隐藏消息：使用既有 `channels.archived` 持久阻断访问与新任务，同时终结排队/运行任务，等待 Runtime/Manager 的 scope cleanup 确认，不删除 session、workspace、附件或审计，不轮换身份。管理员/经理的 `manage_channels` 在串行提交边界复验；发送、入队、恢复和迟到发布都须拒绝已归档频道。清理失败返回错误且频道保持不可用；同频道删除可重试清理，不能伪报成功或重新开放。无需新 schema、物理 purge 或恢复协议。
+- 管理员单条删除、按时间删除、清空，以及用户撤回自己的频道消息，都是**逻辑隐藏**：不轮换会话，不清理 Runtime、记忆、附件或工作区，也不取消已排队或运行中的回复。
+- 撤回只针对本人可见的已保存用户消息；前端的乐观临时行没有服务端含义；[授权](security-and-trust.md#认证与权限)单独复验。
+- 目前没有物理清除。将来如果要做，必须对消息、附件、任务和对话范围共同设计一个带版本的操作，不能复用隐藏。
 
-`DELETE /api/channels/{id}` 成功返回 `200 {"deleted":true,"channel_id":<id>}`；无对应记录为 404，无管理权限为 403，未确认清理为 503。已归档记录允许同权限重试并返回相同成功结构；保留名称唯一性。
+**删除频道**
 
-`/compact` 是控制操作，不写产品消息/伪用户输入；只归档并原子改写当前上下文，产品消息/附件/memory/workspace 不删。内部 handoff 用 Runtime-owned entry 顶层标记识别；无标记的同文真实用户消息仍须归档。
+- 与隐藏消息不同：用已有的 `channels.archived` 字段持久阻止访问和新任务，同时结束排队和运行中的任务，并等待 Runtime 和 Manager 确认对话范围清理完成。
+- 不删除会话、工作区、附件或审计记录，不轮换身份。
+- 管理员和经理的 `manage_channels` 权限在串行提交边界内复验；发送、入队、恢复以及迟到的发布都必须拒绝已归档的频道。
+- 清理失败时返回错误，频道保持不可用；可以对同一频道重试清理，不能谎报成功或重新开放。不需要新的数据结构、物理清除或恢复协议。
+- `DELETE /api/channels/{id}`：成功返回 `200 {"deleted":true,"channel_id":<id>}`；频道不存在返回 404；没有管理权限返回 403；清理未确认返回 503。已归档的频道可以用同样权限重试，返回相同的成功结构。频道名称继续保持唯一。
+
+**`/compact`**
+
+- 这是控制操作，不写产品消息或伪造用户输入。它只归档并原子改写当前上下文，不删除产品消息、附件、记忆或工作区。
+- 内部交接摘要靠 Runtime 自己生成的条目标记识别；内容相同但没有标记的真实用户消息仍然要归档。
 
 ### Journal 提交
 
-| 边界 | 不变量 |
+| 边界 | 规则 |
 | --- | --- |
-| 串行 | 同 canonical journal 的初始化/header/seed/尾修复/追加/manifest/压缩提交/删除共用一条 mutation queue，不嵌套；session admission、archive、approval 保持独立所有权。 |
-| 尾修复 | 健康尾仅查末字节；缺换行才有界反向查最后验证边界。完整 JSON 补换行，非法/不完整尾截断再追加，不拼残片、不每条全扫历史。 |
-| archive-first | 去重并 fsync 被省略持久消息，再原子换 journal。先按写后 UTF-8 字节验 archive 上限；缺稳定 entry id 不压缩。摘要失败不改原上下文。 |
-| 历史安全 | 参数始终符合当前 schema，展示 envelope 仅安全内存归一，不改 JSONL、不放宽身份/未知字段；见[审计](security-and-trust.md#工具执行与审计)。 |
+| 串行 | 同一个会话日志的初始化、头部、种子、尾部修复、追加、清单、压缩提交和删除共用一条修改队列，不嵌套。会话准入、归档和审批各自独立管理。 |
+| 尾部修复 | 健康的尾部只检查最后一个字节；缺少换行时，才在有限范围内反向查找最后一个有效边界。完整的 JSON 补上换行；非法或不完整的尾部截掉后再追加。不拼接残片，也不每次都全量扫描历史。 |
+| 先归档 | 被省略的持久消息先去重并落盘到归档，再原子替换日志。先按写入后的 UTF-8 字节数检查归档上限；没有稳定条目 ID 就不压缩。摘要失败不改变原上下文。 |
+| 历史安全 | 参数始终符合当前 schema。展示用的信封只做安全的内存归一化，不改写 JSONL，也不放宽身份或未知字段的校验，见[审计](security-and-trust.md#工具执行与审计)。 |
 
-`metadata.agent_work.activity` 仅真实工具 Run 的消息级工作记录，与消息分页/隐藏/备份，不另建 history/memory。detail+脱敏允许 parameters+真实有界 result 共用单项 **32 KiB**、总 **512 KiB**；正常 Run 完整保留，仅超过 **512项**/详情硬界时显式报省略项/字符数。不得复制最终答案、write/patch/mail 正文、memory/跨会话搜索结果/secret。sequence、工具原位更新、文本一次展示与 stream 缓冲由[实时对话](frontend.md#实时对话)拥有。
+**工作记录（`metadata.agent_work.activity`）**
+
+- 只来自真实的工具 Run，是消息级的记录，随消息一起分页、隐藏和备份，不另建历史或记忆。
+- 详情经过脱敏后，参数和真实结果共享每项 **32 KiB**、总计 **512 KiB** 的上限。正常 Run 完整保留；只有超过 **512 项**或详情上限时才截断，并明确标注省略了多少项和字符。
+- 不复制最终回复、写入/修改文件或邮件的正文、记忆或跨会话搜索结果、密钥。
+- 顺序号、工具原位更新、文本只展示一次、流式缓冲由[前端 · 实时对话](frontend.md#实时对话)定义。
 
 ## 模型选择状态
 
-部署模型空字符串为“自动”，账号空字符串为“继承部署策略”，均为持久意图；非空显式选择不因 OAuth/目录刷新/更新被覆盖，换 provider 未选新模型才清旧值。自动 Run 从可信 Runtime 能力∩账号实时目录取推荐，不猜首项、不回写，无安全推荐拒绝。目录不可用时明确值仅保留意图，不重入可选列表；实际 Token 仍实时复验，主/辅助各用自己的 provider+model+scope。目录并发见[集成](integrations.md#模型-oauth)；Token、复验结果、prompt_cache_key 不入持久会话/消息/备份，不替代身份/恢复依据。
+- 部署级模型为空字符串表示"自动"；账号级为空字符串表示"继承部署策略"。两者都是持久保存的意图。
+- 非空的显式选择不会因为 OAuth、目录刷新或更新而被覆盖；只有更换供应商且没有选新模型时才清除旧值。
+- "自动"的 Run 从可信的 Runtime 能力与账号实时目录的交集中取推荐模型，不猜第一个，也不回写。没有安全的推荐就拒绝。
+- 目录不可用时，已有的明确选择只保留为意图，不会重新出现在可选列表里；实际使用时 token 仍实时复验。主模型和辅助模型各自使用自己的供应商、模型和授权范围。
+- 目录并发规则见[集成 · 模型 OAuth](integrations.md#模型-oauth)。token、复验结果、缓存 key 不写入持久会话、消息或备份，也不作为身份或恢复依据。
 
 ## Runtime sidecar
 
-todo 与有限进程责任是同 session 目录中两个独立 schema、owner-only 原子状态，精确绑定 scope/lifecycle/session；拒 symlink/hardlink、owner/权限/字段/JSON/身份异常。seed、用户正文、模型摘要不能创建权威状态；cleanup 与 JSONL/archive 一并清理，失败不能解释为空。
+todo 和有限后台进程责任是同一会话目录里的两个独立状态文件：只有属主可访问、原子写入，并精确绑定对话范围、生命周期和会话。遇到符号链接、硬链接、属主或权限异常、字段或 JSON 错误、身份不符都拒绝。种子、用户正文和模型摘要都不能创建权威状态；清理时与 JSONL 和归档一起删除，删除失败不能被当成"空"。
 
-- todo 结果可写 JSONL，但 sidecar 权威；不是业务任务/长期记忆。压缩/重启只注入 pending/in_progress，完成/取消留审计；needs_review 不伪造完成/删除，后续同 session 继续。
-- 进程责任仅 Manager id、canonical target、登记/更新时间，不存命令/输出/模型文。task 成功 terminal 先登记；同 session、匹配 id/target 的 wait/read/kill 观察权威 completed/failed/cancelled 后原子解除。timeout/running/orphaned、Run 终止/重启保留，service 不登记；活动责任可信注入，延续耗尽 needs_review。intent/evidence/cleanup 协议见[Runtime](agent-runtime.md)。
+- **todo**：结果可以写进 JSONL，但以状态文件为准；它不是业务任务，也不是长期记忆。压缩或重启后只注入 pending 和 in_progress，完成和取消的留作审计。`needs_review` 时不伪造完成或删除，同一会话的后续 Run 可以继续。
+- **进程责任**：只记录 Manager 进程 ID、规范目标和登记/更新时间，不存命令、输出或模型文字。task 在命令成功启动前登记；同一会话中、ID 和目标都匹配的 wait/read/kill 观察到权威的 completed/failed/cancelled 后原子解除。超时、running、orphaned、Run 结束或重启都保留责任；service 不登记。完整协议见 [Runtime](agent-runtime.md)。
 
 ## 持久任务与追加输入
 
-消息持久化后建 durable_jobs，每会话一 FIFO worker，全局并发仅限制进入 Runtime。领取/root 建账失败必须保留恢复所有权或明确结算反馈，不能消费唯一唤醒留下无人负责 queued/running。已提交结果不明不自动重做。
+- 消息保存后建立持久任务（durable_jobs）。每个会话一个先进先出的处理者，全局并发只限制进入 Runtime 的数量。
+- 领取任务或建立根账目失败时，必须保留恢复所有权或明确记录结算结果，不能消费掉唯一的唤醒却留下没人负责的 queued/running。
+- 已提交但结果不明的任务不会自动重做。
 
-| 状态 | 不变量 |
+| 方面 | 规则 |
 | --- | --- |
-| payload | 用户消息可存快照；mail 唤醒仅类型+source_message_id。唤醒/恢复/复核/补偿先验 job scope 与源归属，再从消息/可信 metadata 重建；缺失/不匹配拒绝，不猜去重键/正文。 |
-| 启动恢复 | Agent 消息 metadata 至多顺扫一次建本轮 job/完成集合，不每 job 全扫；索引不替代 DB。消息高水位空库0、普通启动只验读，缺失/坏值拒绝，不静默设最大id跳任务。 |
-| joined input | 每新消息独立 job；首次 FIFO claim 与 agent_run_inputs reservation 同事务，不留无任务所有权 reservation。账本区分 reserved/submitting/accepted/injected/unconsumed/终态。 |
-| 重启 | 未提交 reserved/unconsumed 可重排；提交/注入后终态未知，输入和父 job → needs_review；确定回复只幂等核对，不再生成。 |
+| 任务内容 | 用户消息可以存快照；邮件唤醒只存类型和 source_message_id。唤醒、恢复、复核或补偿时，先验证任务的对话范围和来源归属，再从消息和可信元数据重建内容；缺失或不匹配就拒绝，不猜去重键或正文。 |
+| 启动恢复 | Agent 消息元数据最多顺序扫描一次，建立本轮的任务和完成集合，不为每个任务全量扫描；索引不能替代数据库。消息高水位在空库为 0，普通启动只验证读取；缺失或非法值直接拒绝，不能静默设成最大 ID 而跳过任务。 |
+| 追加输入 | 每条新消息都有独立任务；首次领取与 `agent_run_inputs` 预留在同一事务中完成，不留下没有任务归属的预留。账目区分 reserved、submitting、accepted、injected、unconsumed 和终态。 |
+| 重启 | 尚未提交的 reserved 和 unconsumed 可以重新排队；已经提交或注入但终态未知的输入及其父任务标为 needs_review；结果确定的回复只做幂等核对，不再生成。 |
 
 ### 计划 occurrence
 
-SQLite 拥有定义/revision/occurrence；Platform 派生可信 schedule 身份。recurring 仅空参数无目标 id 的 continue_current/complete_current：同事务复验 owner、revision、当前 run/job/source；continue 不改定义，complete 置 completed、禁用、清 next run。旧/重复观察不获得其它计划能力。
-
-needs_review/blocked 与 occurrence 终态同事务：仅 **last_run_id+revision仍匹配** 的计划置 paused、enabled=0、next_run_at=NULL；迟到/重复不暂停新 revision、不重开。重叠唤醒仅追加 skipped/推进到期，不换活动 last_run_id/决策revision；用户改计划推进 revision 作废旧身份。schedule 不充当当前 Run 本地进程 watcher。
+- SQLite 保存计划定义、版本号（revision）和每次执行（occurrence）；Platform 派生可信的计划身份。
+- 周期计划只能用空参数、无目标 ID 的 `continue_current` 或 `complete_current`，在同一事务中复验所有者、版本号、当前 Run、任务和来源。continue 不改定义；complete 把计划标为已完成、停用并清除下次执行时间。过期或重复的观察不能获得其它计划的能力。
+- `needs_review` 或阻塞与本次执行的终态在同一事务提交：只有 **last_run_id 和 revision 仍然匹配**时，才把计划暂停（paused、enabled=0、next_run_at=NULL）。迟到或重复的结果不能暂停新版本，也不能重新开启。
+- 重叠的唤醒只追加 skipped 并推进到期时间，不替换活动中的 last_run_id 或决策版本。用户修改计划会推进版本号，使旧身份失效。
+- 计划不能充当当前 Run 里本地进程的监视器。
 
 ## 记忆模型
 
-memory（事实/规则/偏好）与 user（当前用户资料）仅同 Agent 语义分区；查询、召回、人工维护、复盘均以完整 scope 隔离，同用户另一 Agent 也不可读。共享资料进入用户选择的外部系统/频道文件。
+- **memory**（事实、规则、偏好）和 **user**（当前用户资料）只是同一个 Agent 内的两个语义分区。查询、召回、人工维护和复盘都按完整的对话范围隔离——同一个用户的另一个 Agent 也读不到。需要共享的资料放到用户选择的外部系统或频道文件里。
+- 每条记录包含标签、来源（手动或自动）、Run 与消息、哈希和时间；所有者和写入权限来自可信上下文。
+- 写入有配额、长度限制、去重和扫描。只存稳定的跨会话事实，冲突时优先合并或替换；不存密钥、未确认的推断、临时任务或 TODO、路径和错误。
 
-记录含 tags、manual/automatic 来源、Run/message、hash、时间；owner/写权来自可信 context。写入有配额/长度/去重/扫描，只存稳定跨会话事实，优先合并替换冲突，不存 secret、未确认推断、临时任务/TODO/路径/错误。
+**自动写入的授权**
 
-只有私人顶层交互 Run 免审自动写，频道/计划/mail/委派只召回。写持 lifecycle barrier，单个 **BEGIN IMMEDIATE** 复验 canonical private scope/current lifecycle、active/私人权限、来源用户消息、runtime_run_id 对应 running 父 agent job，再变更/返快照；reset/撤权/job终结据此线性化，预检不是持久授权。
+- 只有个人 AI 的顶层交互 Run 可以免审批自动写入；频道、计划、邮件和委派只能召回。
+- 写入时持有生命周期屏障，在单个 **BEGIN IMMEDIATE** 事务里复验：规范的个人范围和当前生命周期、账号启用和个人权限、来源用户消息、runtime_run_id 对应一个正在运行的父任务，然后再修改并返回快照。重置、撤权和任务结束据此线性化；预检不构成持久授权。
 
-FTS5 agent_memory_fts 仅派生自 agent_memories：列 content,tags_json、content_rowid='id'。启动验真实列/SQL/三个触发器，错误只重建该表/触发器并源表 rebuild；正确同步者不重复 DDL，契约错不能当“不支持FTS5”永久降级。
+**全文索引**
+
+- `agent_memory_fts` 完全派生自 `agent_memories`：列为 content 和 tags_json，`content_rowid='id'`。
+- 启动时验证真实的列、SQL 和三个触发器；有错时只重建这张表和触发器，并从源表重建数据。结构正确时不重复执行 DDL；结构错误不能被当成"不支持 FTS5"而永久降级。
 
 ## 学习复盘
 
-私人顶层交互的最终回复与主 job **均成功**才累计；回合或成功工具任一达十次，以 source message+lifecycle 幂等建低优先级 agent_learning_review。同源一 job，计数在 settings、任务/预算在 job，rotation归零；频道/计划/mail/委派/失败/中断/review自身不计数或递归触发。
+**触发条件**
 
-近期消息与安全工具轨迹不可信；轨迹只保校验的 Skill load/read id、可选安全相对路径，无正文/patch/结果。持久信号为用户流程/风格纠正、可复用技巧、已用 Skill 缺漏；先 patch 已读合格包，无目标才建一类任务 Skill，临时环境故障不固化，无信号可不写。
+- 个人 AI 顶层交互的最终回复和主任务**都成功**才计数。轮次或成功工具调用数任一累计到十次，就以"来源消息 + 生命周期"为幂等键建立一个低优先级的 `agent_learning_review` 任务。
+- 同一来源只有一个任务；计数存在设置里，任务和预算存在任务里，生命周期轮换时计数归零。
+- 频道、计划、邮件、委派、失败、中断以及复盘本身都不计数，也不会递归触发。
+
+**复盘的输入与目标**
+
+- 近期消息和安全的工具轨迹都视为不可信。轨迹只保留经过校验的 Skill load/read ID 和可选的安全相对路径，不含正文、修改内容或结果。
+- 值得记下的信号：用户对流程或风格的纠正、可复用的技巧、已用 Skill 的缺漏。优先修改已读取且符合条件的技能包；没有合适目标时才新建一个针对某类任务的 Skill。临时的环境故障不固化；没有信号可以什么都不写。
 
 ### 授权与提交
 
-完整主体由 Platform 派生：owner、canonical private scope/current lifecycle、source、running review job、mode/trigger/unattended、无 parent/delegation。Runtime 在排队/初始化前验专用 session/idempotency 命名空间并逐调用透传；[API](../reference/runtime-api.md)拥有精确字段。Gateway 每次访问前从 SQLite 复验全部主体及 active/权限，延迟旧请求先拒。
+- 完整的主体由 Platform 派生：所有者、规范的个人范围和当前生命周期、来源、运行中的复盘任务、模式/触发方式/无人值守标记，以及"没有父 Run、不是委派"。
+- Runtime 在排队和初始化之前验证专用的会话和幂等命名空间，并在每次调用时透传这些字段（精确字段见 [API](../reference/runtime-api.md)）。网关每次访问前都从 SQLite 复验完整主体、账号状态和权限，延迟到达的旧请求先被拒绝。
+- 加锁顺序固定为 **会话门 → 范围启动屏障**，不能反向等待；压缩和清理也用同样顺序。组装、提交和失败共用同一个释放边界，提交前复验并持有屏障直到明确 accepted。
+- 停用、撤权或重置时，经过同一道门结束排队和运行中的复盘，清除已 accepted 的 Run；迟到的 accept 发现已失效，也要结束任务并取消。
 
-锁序 **conversation gate→scope start barrier**，不反向等待；compact/cleanup同序。组装/提交/失败共用释放边界，提交前复验且持 barrier至明确 accepted。停用/撤权/reset同门结 queued/running review、清已accepted Run；迟到 accept发现失效仍结job并取消。
-
-| 操作 | 持续到操作结束的边界 |
+| 操作 | 保持到操作结束的边界 |
 | --- | --- |
-| memory读 | lifecycle/review门+同一SQLite快照，复验后查询。 |
-| memory写/reconcile | 同门+单BEGIN IMMEDIATE：复验、扣预算、全部变更、返回快照，失败全回滚；reconcile≤20个store/replace/forget，无clear。 |
-| Skill list/load/read | 同门+BEGIN IMMEDIATE：复验、读文件、read-ledger登记，读免费。 |
-| Skill create/patch | 同门先独立写事务持久预扣，再另一BEGIN IMMEDIATE复验主体，持至scope lock内文件提交结束；失败也可能收费，不能文件成功而计费回滚。 |
+| 读记忆 | 生命周期和复盘门，加同一个 SQLite 快照，复验后查询 |
+| 写记忆 / reconcile | 同一道门，加单个 BEGIN IMMEDIATE：复验、扣预算、执行全部变更、返回快照，失败则全部回滚。reconcile 最多 20 个 store/replace/forget，不允许 clear |
+| Skill list/load/read | 同一道门，加 BEGIN IMMEDIATE：复验、读文件、记录到读取账本；读取免费 |
+| Skill create/patch | 同一道门，先用独立写事务持久预扣预算，再用另一个 BEGIN IMMEDIATE 复验主体，并持有到对话范围锁内的文件提交结束。失败也可能已扣费；不能出现"文件写成功但扣费回滚" |
 
-每 review job 跨重启/重领/重试共享 **20单位**：memory每动作（含reconcile子动作）、Skill create/patch各1，读免费，耗尽拒写；独立模型硬界 min(16,全局turn上限)，不能互代。
+**预算**
 
-worker在业务回复外串行，领取/重排/终态存储短错有界退避，不能静默永久退出。已领终态不明仍阻更新，关闭交启动恢复；预约后不领新review，活动者结束/受控取消重排才切换。不产生产品消息/工作记录/通知、不改已交付回复；Runtime拥有tool白名单/临时session精确清理。
+- 每个复盘任务跨重启、重新领取和重试共享 **20 个单位**：记忆的每个动作（包括 reconcile 的每个子动作）、Skill 的每次 create 或 patch 各计 1，读取免费，用完后拒绝写入。
+- 模型轮次另有独立上限 `min(16, 全局轮次上限)`，两个上限不能互相替代。
+
+**执行者**
+
+- 复盘在业务回复之外串行执行；领取、重排和终态写入遇到短暂存储错误时有限次退避，不能静默永久退出。
+- 已领取但终态不明的任务仍会阻止更新，关闭时交给启动恢复处理；预约更新后不再领取新的复盘，正在进行的结束或被受控取消并重排后才切换版本。
+- 复盘不产生产品消息、工作记录或通知，也不改变已交付的回复。工具白名单和临时会话的精确清理由 Runtime 负责。
 
 ## 召回与搜索
 
-顶层仅当前scope query recall与用户资料；空不注入，失败不阻Run；独立字符预算按完整记录裁剪，包不可信边界。session搜当前JSONL/archive；session_search仅canonical私人/频道主Agent、统一字符预算，产品行须有session_id或reply关系明确归属，不合成兼容session。
+- 顶层 Run 只召回当前范围的相关记忆和用户资料；没有结果时不注入，召回失败不阻止 Run。有独立的字符预算，按完整记录裁剪，并包在"不可信内容"边界内。
+- `session` 搜索当前会话的 JSONL 和归档。
+- `session_search` 只搜索规范的个人和频道主 Agent，使用统一的字符预算；产品消息必须有 session_id 或明确的回复关系才能归属，不合成兼容会话。
 
 ### 即时派生预览
 
-附件原件/metadata归消息scope；Office/PDF预览仅有界即时JSON，不入DB/模型/备份，坏/加密/无文本PDF失败，无OCR、不改下载；HTML单独单页呈现。解析授权见[安全设计](security-and-trust.md#文件与附件)。
-
-帧/租约/sequence、文件/搜索/HTML都是有界scope派生结果。草稿仅Runtime有界事件journal、Python当前SSE闭包、Platform当前Run内存；诊断副本去正文，公共状态/SSE仅路径/种类/revision，正文端点区分workspace/draft。无消息/agent_work、DB、Runtime session、workspace、memory、搜索、备份/release副本。
-
-工具结束/失败、Run替换、lifecycle/generation切换、进程重启均丢草稿；成功后从真实workspace重建，HTML也可从已交付授权附件重建。preview只观察、不建workspace/启动服务/写文件，不新增service/port/持久目录/config/migration。拖拽finally抬键，无持久半手势；UX fence见[前端](frontend.md)。
+- 附件原件和元数据归属于消息所在的对话范围。Office 和 PDF 预览只是即时生成、有长度上限的 JSON，不写入数据库、不给模型、不备份。损坏、加密或没有文字层的 PDF 直接失败；不做 OCR，不影响下载。HTML 单独作为单页呈现。解析授权见[安全 · 文件与附件](security-and-trust.md#文件与附件)。
+- 浏览器画面、接管租约和顺序号、文件、搜索和 HTML 预览，都是有长度上限、按对话范围派生的结果。
+- **写作草稿**只存在于三处：Runtime 有上限的事件日志、Python 当前的 SSE 连接、Platform 当前 Run 的内存。诊断副本去掉正文；公共状态和 SSE 只带路径、种类和版本号；读取正文的接口区分工作区和草稿。草稿不会进入消息或工作记录、数据库、Runtime 会话、工作区、记忆、搜索、备份或发布副本。
+- 工具结束或失败、Run 被替换、生命周期或版本切换、进程重启都会丢弃草稿；成功后从真实工作区重建内容，HTML 也可以从已交付的授权附件重建。
+- 预览只观察：不创建工作区、不启动服务、不写文件，也不新增服务、端口、持久目录、配置或迁移。浏览器拖拽结束时一定松开按键，不存在持久的"半个手势"。前端的并发屏障见[前端](frontend.md)。
 
 ## 技能数据
 
-可移植包与Platform-only状态分离，[布局](../reference/data-layout.md#workspace附件与-skill)定义路径。合法外来包初扫原子补user-owned/active/enabled；缺状态安全解释user+active，不授自动权。正文/列表每次读workspace，下次调用生效；Run精简索引下Run重建。
+- 可移植的技能包与只在 Platform 保存的状态分开存放，路径见[数据布局 · 工作区](../reference/data-layout.md#workspace附件与-skill)。
+- 首次扫描到合法的外来包时，原子补上"用户所有、活动、启用"的状态；缺少状态时按"用户所有、活动"解释，但不授予自动维护权限。
+- 正文和列表每次都从工作区读取，下次调用即生效；Run 内的精简索引在下一个 Run 时重建。
 
-状态以不可变skill id记录enabled、来源/时间、usage/patch、active/stale/archived、pin/归档，绑定包device/inode/ctime；删除重建/换链旧状态降user-owned。workspace sidecar/同UID模式不授权，前台/界面创建属user，只有可信review创建属agent。
+**状态记录**
 
-- bundled全局只读；用户可同id或大小写不敏感名称遮蔽，升级不覆盖用户包。自动create/patch在提交前按id+重新解析frontmatter name拒bundled冲突，包含此前改名/本次改名。
-- patch同scope lock内对单文件精确字符串+预期次数原子替换，不模糊匹配；主指令重验frontmatter/配额/注入，全部写扫描凭据。不改来源/state/pin/enabled。load记使用、patch记维护；非授权telemetry可能滞后，失败先重读正文，不盲重放。
-- 自动patch仅本Run已load/read的agent-owned+active+unpinned包，锁内重读包/usage复验立即提交；bundled/user/pinned/archived不可改，锁外预检不穿越撤权/reset/重建。review不删/禁用/移动/执行shell；未来curator仅可恢复逻辑stale/archive，不永久删除。
+- 按不可变的 skill ID 记录：是否启用、来源和时间、使用和修改记录、状态（active/stale/archived）、是否固定、归档信息，并绑定包的设备号、inode 和 ctime。包被删除重建或替换链接后，旧状态降为"用户所有"。
+- 工作区里的附属文件或同 UID 的文件权限都不构成授权。前台和界面创建的属于用户；只有可信的复盘创建的属于 Agent。
 
-扫描/锁/读写/发布固定nofollow fd，正文/支持文件单硬链普通文件。MCP每次list/call重读、短命stdio无跨Run连接，用户环境随workspace备份，不投影其它Agent/提示/消息/工作记录。交付、文档视觉基线及安装重定向由[集成](integrations.md#skill-学习边界)拥有。
+**修改规则**
+
+- 预置（bundled）技能全局只读。用户可以用相同 ID 或大小写不敏感的同名技能覆盖显示，升级不会覆盖用户包。自动的 create/patch 在提交前按 ID 和重新解析的 frontmatter 名称检查，拒绝与预置技能冲突（包括之前改过名或本次改名的情况）。
+- patch 在同一范围锁内对单个文件做精确字符串、预期次数的原子替换，不做模糊匹配。修改主指令时重新验证 frontmatter、配额和注入风险，所有写入都扫描凭据。patch 不改变来源、状态、固定或启用。
+- load 记录使用，patch 记录维护。这些非授权统计可能滞后；失败时先重新读取正文，不盲目重放。
+- 自动 patch 只能修改本 Run 已 load 或 read 过的、Agent 自建、活动、未固定的包，并在锁内重新读取包和使用记录复验后立即提交。预置、用户、固定和已归档的包都不能改；锁外的预检不能跨越撤权、重置或重建。
+- 复盘不删除、不停用、不移动技能，也不执行 shell。将来的整理工具只能在逻辑上把技能标为 stale 或 archived，并可恢复，不做永久删除。
+
+**文件安全**
+
+- 扫描、加锁、读写和发布都通过不跟随链接的固定文件描述符进行；正文和支持文件必须是只有一个硬链接的普通文件。
+- MCP 每次 list 或 call 都重新读取配置，使用短生命周期的 stdio 进程，不跨 Run 保持连接。用户环境变量随工作区备份，不投影给其它 Agent，也不进入提示词、消息或工作记录。
+- 交付、文档视觉基线和安装重定向见[集成 · Skill 学习边界](integrations.md#skill-学习边界)。
 
 ## 备份与迁移
 
-[布局备份集合](../reference/data-layout.md#备份与恢复)是一个恢复点，不能跨scope配workspace；[受控迁移](../reference/data-layout.md#受控迁移)独占来源资格、旧Skill保护、root例外、文件耐久/DB提交规则。缺失对象不授普通启动修复权限。
+- [备份集合](../reference/data-layout.md#备份与恢复)是一个整体的恢复点，不能把不同范围的工作区混搭恢复。
+- [受控迁移](../reference/data-layout.md#受控迁移)独占定义：来源资格、旧 Skill 的保护、根目录例外、文件持久化和数据库提交规则。缺失的对象不会给普通启动授予修复权限。

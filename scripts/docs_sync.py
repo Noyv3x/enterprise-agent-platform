@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Keep canonical design documents, executable contracts, and code in sync.
+"""Keep machine contracts, their generated consumers, and documentation links in sync.
 
 The checker deliberately uses only the Python standard library so it can run
 before project dependencies are installed.  ``sync`` writes deterministic
-generated contract modules; ``check`` validates the current tree.
+generated contract modules; ``check`` validates the current tree: every
+contract parses and matches its generated targets byte for byte, and every
+local Markdown link (including heading anchors) resolves.
 """
 
 from __future__ import annotations
@@ -12,21 +14,16 @@ import argparse
 import datetime as dt
 import json
 import os
-import posixpath
 import re
 import stat
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 from urllib.parse import unquote, urlsplit
 
 
-MANIFEST_PATH = PurePosixPath("docs/domains.json")
-ROOT_DOCUMENT_PATHS = {"AGENTS.md"}
 REQUIRED_RUNTIME_POLICIES = {
     "run_idle_timeout",
     "max_turns_per_run",
@@ -34,76 +31,19 @@ REQUIRED_RUNTIME_POLICIES = {
     "process_wait_timeout",
 }
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-DOMAIN_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t#]*$")
 JAVASCRIPT_MAX_SAFE_INTEGER = (1 << 53) - 1
 NODE_MAX_TIMER_MILLISECONDS = 2_147_483_647
 ENTRY_MARKDOWN_PATHS = (
+    "AGENTS.md",
     "README.md",
     "enterprise-agent-platform/README.md",
     "enterprise-agent-platform/agent-runtime/README.md",
 )
-REQUIRED_RUNTIME_POLICY_SOURCE = "docs/contracts/runtime-policy.json"
-REQUIRED_RUNTIME_POLICY_DOMAINS = frozenset(
-    {"deployment", "security-and-trust", "platform", "agent-runtime", "frontend"}
-)
-REQUIRED_RUNTIME_POLICY_TARGETS = {
-    "manager/internal/executor/runtime_policy_generated.go": "go-runtime-policy",
-    "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py": "python-runtime-policy",
-    "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts": "typescript-runtime-policy",
-    "enterprise-agent-platform/frontend/src/design-contract.generated.ts": "typescript-runtime-policy",
-}
-REQUIRED_UPSTREAM_SOURCES_SOURCE = "docs/contracts/upstream-sources.json"
-REQUIRED_UPSTREAM_SOURCES_DOMAINS = frozenset({"integrations", "platform"})
-REQUIRED_UPSTREAM_SOURCES_TARGETS: dict[str, str] = {}
-REQUIRED_TECHNICAL_PROFILES_SOURCE = "docs/contracts/technical-profiles.json"
-REQUIRED_TECHNICAL_PROFILES_DOMAINS = frozenset(
-    {"deployment", "platform", "agent-runtime"}
-)
-REQUIRED_TECHNICAL_PROFILES_TARGETS = {
-    "manager/internal/identity/technical_profiles_generated.go": "go-technical-profiles",
-    "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py": "python-technical-profiles",
-    "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts": "typescript-technical-profile",
-}
-REQUIRED_CONTAINER_PLATFORM_SOURCE = "docs/contracts/container-platform.json"
-REQUIRED_CONTAINER_PLATFORM_DOMAINS = frozenset(
-    {"deployment", "platform", "agent-runtime", "frontend"}
-)
-REQUIRED_CONTAINER_PLATFORM_TARGETS = {
-    "manager/internal/contract/generated.go": "go-container-platform",
-    "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py": "python-container-platform",
-    "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts": "typescript-container-platform",
-    "enterprise-agent-platform/frontend/src/container-contract.generated.ts": "typescript-container-platform",
-}
-REQUIRED_OWNED_CODE_PROBES = {
-    ".gitignore": frozenset({"repository-development"}),
-    ".github/workflows/quality.yml": frozenset({"repository-development"}),
-    "scripts/docs_sync.py": frozenset({"documentation-governance"}),
-    "enterprise-agent-platform/pyproject.toml": frozenset({"platform"}),
-    "enterprise-agent-platform/enterprise_agent_platform/service.py": frozenset({"platform"}),
-    "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/example/scripts/helper.py": frozenset({"integrations"}),
-    "enterprise-agent-platform/agent-runtime/package-lock.json": frozenset({"agent-runtime"}),
-    "enterprise-agent-platform/agent-runtime/tsconfig.json": frozenset({"agent-runtime"}),
-    "enterprise-agent-platform/agent-runtime/src/index.ts": frozenset({"agent-runtime"}),
-    "enterprise-agent-platform/camofox-runtime/package-lock.json": frozenset({"integrations"}),
-    "enterprise-agent-platform/camofox-runtime/patch-runtime.cjs": frozenset({"integrations"}),
-    "enterprise-agent-platform/frontend/package-lock.json": frozenset({"frontend"}),
-    "enterprise-agent-platform/frontend/tsconfig.json": frozenset({"frontend"}),
-    "enterprise-agent-platform/frontend/vite.config.ts": frozenset({"frontend"}),
-    "enterprise-agent-platform/frontend/public/theme-init.js": frozenset({"frontend"}),
-    "enterprise-agent-platform/frontend/src/main.tsx": frozenset({"frontend"}),
-}
 
 
 class DocsSyncError(RuntimeError):
     """Raised when the documentation contract is malformed or out of sync."""
-
-
-@dataclass(frozen=True)
-class Domain:
-    identifier: str
-    documents: tuple[str, ...]
-    code: tuple[str, ...]
-    tests: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -116,26 +56,52 @@ class ContractTarget:
 class Contract:
     identifier: str
     source: str
-    domains: tuple[str, ...]
     targets: tuple[ContractTarget, ...]
 
 
-@dataclass(frozen=True)
-class Coverage:
-    code_include: tuple[str, ...]
-    code_exclude: tuple[str, ...]
-    document_include: tuple[str, ...]
-    document_exclude: tuple[str, ...]
+def _targets(*pairs: tuple[str, str]) -> tuple[ContractTarget, ...]:
+    return tuple(ContractTarget(path=path, format=target_format) for path, target_format in pairs)
 
 
-@dataclass(frozen=True)
-class Manifest:
-    version: int
-    coverage: Coverage
-    domains: tuple[Domain, ...]
-    contracts: tuple[Contract, ...]
-
-
+# The complete, closed set of machine contracts. Each source lives under
+# docs/contracts/ and is rendered byte-for-byte into every listed consumer.
+CONTRACTS: tuple[Contract, ...] = (
+    Contract(
+        identifier="container-platform",
+        source="docs/contracts/container-platform.json",
+        targets=_targets(
+            ("manager/internal/contract/generated.go", "go-container-platform"),
+            ("enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py", "python-container-platform"),
+            ("enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts", "typescript-container-platform"),
+            ("enterprise-agent-platform/frontend/src/container-contract.generated.ts", "typescript-container-platform"),
+        ),
+    ),
+    # Direct consumers read the validated JSON; nothing is generated.
+    Contract(
+        identifier="upstream-sources",
+        source="docs/contracts/upstream-sources.json",
+        targets=(),
+    ),
+    Contract(
+        identifier="technical-profiles",
+        source="docs/contracts/technical-profiles.json",
+        targets=_targets(
+            ("manager/internal/identity/technical_profiles_generated.go", "go-technical-profiles"),
+            ("enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py", "python-technical-profiles"),
+            ("enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts", "typescript-technical-profile"),
+        ),
+    ),
+    Contract(
+        identifier="runtime-policy",
+        source="docs/contracts/runtime-policy.json",
+        targets=_targets(
+            ("manager/internal/executor/runtime_policy_generated.go", "go-runtime-policy"),
+            ("enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py", "python-runtime-policy"),
+            ("enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts", "typescript-runtime-policy"),
+            ("enterprise-agent-platform/frontend/src/design-contract.generated.ts", "typescript-runtime-policy"),
+        ),
+    ),
+)
 
 
 def _repo_root_from_script() -> Path:
@@ -194,12 +160,6 @@ def _require_regular_file(path: Path, label: str, relative: str) -> None:
         raise DocsSyncError(f"{label} is missing: {relative}") from exc
     if not stat.S_ISREG(path_stat.st_mode):
         raise DocsSyncError(f"{label} must be a regular file: {relative}")
-
-
-def _is_beneath(relative: str, parent: str) -> bool:
-    parts = PurePosixPath(relative).parts
-    parent_parts = PurePosixPath(parent).parts
-    return len(parts) > len(parent_parts) and parts[: len(parent_parts)] == parent_parts
 
 
 def _read_json(path: Path, label: str) -> Any:
@@ -337,474 +297,6 @@ def _reject_unknown_keys(value: dict[str, Any], allowed: set[str], label: str) -
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise DocsSyncError(f"{label} contains unknown keys: {', '.join(unknown)}")
-
-
-def load_manifest(root: Path) -> Manifest:
-    manifest_path = _reject_symlink_chain(
-        root,
-        MANIFEST_PATH.as_posix(),
-        "documentation manifest",
-    )
-    _require_regular_file(
-        manifest_path,
-        "documentation manifest",
-        MANIFEST_PATH.as_posix(),
-    )
-    raw = _expect_object(
-        _read_json(manifest_path, "documentation manifest"),
-        "documentation manifest",
-    )
-    _reject_unknown_keys(
-        raw,
-        {"version", "coverage", "domains", "contracts"},
-        "documentation manifest",
-    )
-    if raw.get("version") != 3:
-        raise DocsSyncError("documentation manifest version must be 3")
-
-    coverage_raw = _expect_object(raw.get("coverage"), "coverage")
-    _reject_unknown_keys(
-        coverage_raw,
-        {"code_include", "code_exclude", "document_include", "document_exclude"},
-        "coverage",
-    )
-    coverage = Coverage(
-        code_include=_expect_string_list(coverage_raw.get("code_include"), "coverage.code_include"),
-        code_exclude=_expect_string_list(
-            coverage_raw.get("code_exclude", []),
-            "coverage.code_exclude",
-            allow_empty=True,
-        ),
-        document_include=_expect_string_list(
-            coverage_raw.get("document_include"),
-            "coverage.document_include",
-        ),
-        document_exclude=_expect_string_list(
-            coverage_raw.get("document_exclude", []),
-            "coverage.document_exclude",
-            allow_empty=True,
-        ),
-    )
-    for label, patterns in (
-        ("coverage.code_include", coverage.code_include),
-        ("coverage.code_exclude", coverage.code_exclude),
-        ("coverage.document_include", coverage.document_include),
-        ("coverage.document_exclude", coverage.document_exclude),
-    ):
-        for pattern in patterns:
-            try:
-                _glob_regex(pattern)
-            except DocsSyncError as exc:
-                raise DocsSyncError(f"{label}: {exc}") from exc
-    uncovered_probes = [
-        path
-        for path in REQUIRED_OWNED_CODE_PROBES
-        if not path_matches(path, coverage.code_include)
-        or path_matches(path, coverage.code_exclude)
-    ]
-    if uncovered_probes:
-        raise DocsSyncError(
-            "coverage must include owned production probes without excluding them: "
-            + ", ".join(uncovered_probes)
-        )
-
-    domains_raw = raw.get("domains")
-    if not isinstance(domains_raw, list) or not domains_raw:
-        raise DocsSyncError("domains must be a non-empty JSON array")
-    domains: list[Domain] = []
-    seen_domain_ids: set[str] = set()
-    for index, item in enumerate(domains_raw):
-        label = f"domains[{index}]"
-        domain_raw = _expect_object(item, label)
-        _reject_unknown_keys(domain_raw, {"id", "documents", "code", "tests"}, label)
-        identifier = domain_raw.get("id")
-        if not isinstance(identifier, str) or not DOMAIN_ID_RE.fullmatch(identifier):
-            raise DocsSyncError(f"{label}.id must match {DOMAIN_ID_RE.pattern}")
-        if identifier in seen_domain_ids:
-            raise DocsSyncError(f"duplicate domain id: {identifier}")
-        seen_domain_ids.add(identifier)
-        documents = _expect_string_list(domain_raw.get("documents"), f"{label}.documents")
-        code = _expect_string_list(domain_raw.get("code"), f"{label}.code")
-        tests = _expect_string_list(
-            domain_raw.get("tests", []),
-            f"{label}.tests",
-            allow_empty=True,
-        )
-        for document in documents:
-            _reject_symlink_chain(root, document, f"{label}.document")
-            if document not in ROOT_DOCUMENT_PATHS and not _is_beneath(document, "docs"):
-                raise DocsSyncError(
-                    f"{label}.documents must stay under docs/ (except governed root instruction entries): {document}"
-                )
-        for pattern in (*code, *tests):
-            _glob_regex(pattern)
-        domains.append(
-            Domain(
-                identifier=identifier,
-                documents=documents,
-                code=code,
-                tests=tests,
-            )
-        )
-
-    contracts_raw = raw.get("contracts")
-    if not isinstance(contracts_raw, list) or not contracts_raw:
-        raise DocsSyncError("contracts must be a non-empty JSON array")
-    contracts: list[Contract] = []
-    seen_contract_ids: set[str] = set()
-    for index, item in enumerate(contracts_raw):
-        label = f"contracts[{index}]"
-        contract_raw = _expect_object(item, label)
-        _reject_unknown_keys(contract_raw, {"id", "source", "domains", "targets"}, label)
-        identifier = contract_raw.get("id")
-        if not isinstance(identifier, str) or not DOMAIN_ID_RE.fullmatch(identifier):
-            raise DocsSyncError(f"{label}.id must match {DOMAIN_ID_RE.pattern}")
-        if identifier in seen_contract_ids:
-            raise DocsSyncError(f"duplicate contract id: {identifier}")
-        seen_contract_ids.add(identifier)
-        source = contract_raw.get("source")
-        if not isinstance(source, str) or not source:
-            raise DocsSyncError(f"{label}.source must be a non-empty string")
-        source_path = _reject_symlink_chain(root, source, f"{label}.source")
-        if not _is_beneath(source, "docs/contracts"):
-            raise DocsSyncError(f"{label}.source must stay under docs/contracts/: {source}")
-        _require_regular_file(source_path, f"{label}.source", source)
-        domain_ids = _expect_string_list(contract_raw.get("domains"), f"{label}.domains")
-        # All domains are available in seen_domain_ids only if the manifest is
-        # ordered. Re-check against the complete set after parsing as well.
-        targets_raw = contract_raw.get("targets")
-        if not isinstance(targets_raw, list):
-            raise DocsSyncError(f"{label}.targets must be a JSON array")
-        targets: list[ContractTarget] = []
-        for target_index, target_item in enumerate(targets_raw):
-            target_label = f"{label}.targets[{target_index}]"
-            target_raw = _expect_object(target_item, target_label)
-            _reject_unknown_keys(target_raw, {"path", "format"}, target_label)
-            target_path = target_raw.get("path")
-            target_format = target_raw.get("format")
-            if not isinstance(target_path, str) or not target_path:
-                raise DocsSyncError(f"{target_label}.path must be a non-empty string")
-            if target_format not in {
-                "python-runtime-policy",
-                "typescript-runtime-policy",
-                "go-runtime-policy",
-                "python-container-platform",
-                "typescript-container-platform",
-                "go-container-platform",
-                "go-technical-profiles",
-                "python-technical-profiles",
-                "typescript-technical-profile",
-            }:
-                raise DocsSyncError(f"{target_label}.format is unsupported: {target_format!r}")
-            _reject_symlink_chain(root, target_path, f"{target_label}.path")
-            targets.append(ContractTarget(path=target_path, format=target_format))
-        contracts.append(
-            Contract(
-                identifier=identifier,
-                source=source,
-                domains=domain_ids,
-                targets=tuple(targets),
-            )
-        )
-
-    all_domain_ids = {domain.identifier for domain in domains}
-    for contract in contracts:
-        missing = sorted(set(contract.domains) - all_domain_ids)
-        if missing:
-            raise DocsSyncError(
-                f"contract {contract.identifier} references unknown domains: {', '.join(missing)}"
-            )
-
-    manifest = Manifest(
-        version=3,
-        coverage=coverage,
-        domains=tuple(domains),
-        contracts=tuple(contracts),
-    )
-
-    for probe, required_domains in REQUIRED_OWNED_CODE_PROBES.items():
-        owners = {domain.identifier for domain in domains_for_code(manifest, probe)}
-        missing_owners = sorted(required_domains - owners)
-        if missing_owners:
-            raise DocsSyncError(
-                f"owned production probe {probe} must belong to: "
-                + ", ".join(missing_owners)
-            )
-
-    canonical_documents = {
-        document for domain in manifest.domains for document in domain.documents
-    } | {contract.source for contract in manifest.contracts}
-    for document in sorted(canonical_documents):
-        code_domains = domains_for_code(manifest, document)
-        test_domains = domains_for_test(manifest, document)
-        if code_domains or test_domains:
-            categories = [
-                *(f"code:{domain.identifier}" for domain in code_domains),
-                *(f"test:{domain.identifier}" for domain in test_domains),
-            ]
-            raise DocsSyncError(
-                f"canonical document cannot masquerade as code or a test: {document} "
-                f"({', '.join(categories)})"
-            )
-
-    runtime_contracts = [
-        contract for contract in manifest.contracts if contract.identifier == "runtime-policy"
-    ]
-    if len(runtime_contracts) != 1:
-        raise DocsSyncError("manifest must define exactly one runtime-policy contract")
-    runtime_contract = runtime_contracts[0]
-    if runtime_contract.source != REQUIRED_RUNTIME_POLICY_SOURCE:
-        raise DocsSyncError(
-            f"runtime-policy source must be {REQUIRED_RUNTIME_POLICY_SOURCE}"
-        )
-    if set(runtime_contract.domains) != REQUIRED_RUNTIME_POLICY_DOMAINS:
-        raise DocsSyncError(
-            "runtime-policy domains must be exactly: "
-            + ", ".join(sorted(REQUIRED_RUNTIME_POLICY_DOMAINS))
-        )
-    runtime_targets = {target.path: target.format for target in runtime_contract.targets}
-    if len(runtime_targets) != len(runtime_contract.targets) or runtime_targets != REQUIRED_RUNTIME_POLICY_TARGETS:
-        raise DocsSyncError("runtime-policy targets and formats must match the required platform, runtime, and frontend targets")
-
-    upstream_contracts = [
-        contract for contract in manifest.contracts if contract.identifier == "upstream-sources"
-    ]
-    if len(upstream_contracts) != 1:
-        raise DocsSyncError("manifest must define exactly one upstream-sources contract")
-    upstream_contract = upstream_contracts[0]
-    if upstream_contract.source != REQUIRED_UPSTREAM_SOURCES_SOURCE:
-        raise DocsSyncError(
-            f"upstream-sources source must be {REQUIRED_UPSTREAM_SOURCES_SOURCE}"
-        )
-    if set(upstream_contract.domains) != REQUIRED_UPSTREAM_SOURCES_DOMAINS:
-        raise DocsSyncError(
-            "upstream-sources domains must be exactly: integrations, platform"
-        )
-    upstream_targets = {
-        target.path: target.format for target in upstream_contract.targets
-    }
-    if (
-        len(upstream_targets) != len(upstream_contract.targets)
-        or upstream_targets != REQUIRED_UPSTREAM_SOURCES_TARGETS
-    ):
-        raise DocsSyncError(
-            "upstream-sources must not define generated targets; direct consumers read its validated JSON"
-        )
-
-    technical_contracts = [
-        contract
-        for contract in manifest.contracts
-        if contract.identifier == "technical-profiles"
-    ]
-    if len(technical_contracts) != 1:
-        raise DocsSyncError("manifest must define exactly one technical-profiles contract")
-    technical_contract = technical_contracts[0]
-    if technical_contract.source != REQUIRED_TECHNICAL_PROFILES_SOURCE:
-        raise DocsSyncError(
-            f"technical-profiles source must be {REQUIRED_TECHNICAL_PROFILES_SOURCE}"
-        )
-    if set(technical_contract.domains) != REQUIRED_TECHNICAL_PROFILES_DOMAINS:
-        raise DocsSyncError(
-            "technical-profiles domains must be exactly: "
-            + ", ".join(sorted(REQUIRED_TECHNICAL_PROFILES_DOMAINS))
-        )
-    technical_targets = {
-        target.path: target.format for target in technical_contract.targets
-    }
-    if (
-        len(technical_targets) != len(technical_contract.targets)
-        or technical_targets != REQUIRED_TECHNICAL_PROFILES_TARGETS
-    ):
-        raise DocsSyncError(
-            "technical-profiles targets and formats must match the required Go, Python, and Agent Runtime projections"
-        )
-
-    container_contracts = [
-        contract
-        for contract in manifest.contracts
-        if contract.identifier == "container-platform"
-    ]
-    if len(container_contracts) != 1:
-        raise DocsSyncError("manifest must define exactly one container-platform contract")
-    container_contract = container_contracts[0]
-    if container_contract.source != REQUIRED_CONTAINER_PLATFORM_SOURCE:
-        raise DocsSyncError(
-            f"container-platform source must be {REQUIRED_CONTAINER_PLATFORM_SOURCE}"
-        )
-    if set(container_contract.domains) != REQUIRED_CONTAINER_PLATFORM_DOMAINS:
-        raise DocsSyncError(
-            "container-platform domains must be exactly: "
-            + ", ".join(sorted(REQUIRED_CONTAINER_PLATFORM_DOMAINS))
-        )
-    container_targets = {
-        target.path: target.format for target in container_contract.targets
-    }
-    if (
-        len(container_targets) != len(container_contract.targets)
-        or container_targets != REQUIRED_CONTAINER_PLATFORM_TARGETS
-    ):
-        raise DocsSyncError(
-            "container-platform targets and formats must match the required Go, Python, Runtime and frontend targets"
-        )
-
-    for contract in manifest.contracts:
-        if not _is_covered_document(manifest, contract.source):
-            raise DocsSyncError(
-                f"contract source must be covered as canonical documentation: {contract.source}"
-            )
-        for target in contract.targets:
-            if not _is_covered_code(manifest, target.path):
-                raise DocsSyncError(
-                    f"contract target must be covered production code: {target.path}"
-                )
-            owners = domains_for_code(manifest, target.path)
-            if not owners:
-                raise DocsSyncError(
-                    f"contract target has no documentation domain: {target.path}"
-                )
-            outside_domains = sorted(
-                domain.identifier
-                for domain in owners
-                if domain.identifier not in contract.domains
-            )
-            if outside_domains:
-                raise DocsSyncError(
-                    f"contract target {target.path} is owned outside contract {contract.identifier}: "
-                    + ", ".join(outside_domains)
-                )
-    return manifest
-
-
-
-
-@lru_cache(maxsize=None)
-def _glob_regex(pattern: str) -> re.Pattern[str]:
-    if not pattern or pattern.startswith("/") or "\\" in pattern or ".." in PurePosixPath(pattern).parts:
-        raise DocsSyncError(f"unsafe or invalid path pattern: {pattern!r}")
-    pieces: list[str] = ["^"]
-    index = 0
-    while index < len(pattern):
-        character = pattern[index]
-        if character == "*":
-            if index + 1 < len(pattern) and pattern[index + 1] == "*":
-                index += 2
-                if index < len(pattern) and pattern[index] == "/":
-                    pieces.append("(?:.*/)?")
-                    index += 1
-                else:
-                    pieces.append(".*")
-                continue
-            pieces.append("[^/]*")
-        elif character == "?":
-            pieces.append("[^/]")
-        else:
-            pieces.append(re.escape(character))
-        index += 1
-    pieces.append("$")
-    return re.compile("".join(pieces))
-
-
-def path_matches(path: str, patterns: Iterable[str]) -> bool:
-    return any(_glob_regex(pattern).fullmatch(path) is not None for pattern in patterns)
-
-
-def _git(root: Path, arguments: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[bytes]:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(root), *arguments],
-            check=check,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise DocsSyncError("git is required for repository file enumeration") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode("utf-8", errors="replace").strip()
-        raise DocsSyncError(f"git {' '.join(arguments)} failed: {detail or exc.returncode}") from exc
-
-
-
-
-def list_repository_files(root: Path) -> tuple[str, ...]:
-    result = _git(root, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], check=False)
-    if result.returncode == 0:
-        deleted_result = _git(root, ["ls-files", "--deleted", "-z"], check=False)
-        deleted = {
-            item.decode("utf-8", errors="surrogateescape")
-            for item in deleted_result.stdout.split(b"\0")
-            if item
-        } if deleted_result.returncode == 0 else set()
-        return tuple(
-            sorted(
-                item.decode("utf-8", errors="surrogateescape")
-                for item in result.stdout.split(b"\0")
-                if item and item.decode("utf-8", errors="surrogateescape") not in deleted
-            )
-        )
-
-    ignored_directories = {
-        ".git",
-        ".venv",
-        "__pycache__",
-        "build",
-        "data",
-        "dist",
-        "node_modules",
-    }
-    files: list[str] = []
-    for current, directories, names in os.walk(root):
-        directories[:] = sorted(name for name in directories if name not in ignored_directories)
-        current_path = Path(current)
-        for name in sorted(names):
-            files.append((current_path / name).relative_to(root).as_posix())
-    return tuple(files)
-
-
-def domains_for_code(manifest: Manifest, path: str) -> tuple[Domain, ...]:
-    return tuple(domain for domain in manifest.domains if path_matches(path, domain.code))
-
-
-def domains_for_test(manifest: Manifest, path: str) -> tuple[Domain, ...]:
-    explicit = {
-        domain.identifier: domain
-        for domain in manifest.domains
-        if path_matches(path, domain.tests)
-    }
-    if _is_language_native_test(path):
-        explicit.update(
-            {domain.identifier: domain for domain in domains_for_code(manifest, path)}
-        )
-    return tuple(explicit[identifier] for identifier in sorted(explicit))
-
-
-def domains_for_document(manifest: Manifest, path: str) -> set[str]:
-    identifiers = {
-        domain.identifier
-        for domain in manifest.domains
-        if path in domain.documents
-    }
-    for contract in manifest.contracts:
-        if path == contract.source:
-            identifiers.update(contract.domains)
-    return identifiers
-
-
-def _is_covered_code(manifest: Manifest, path: str) -> bool:
-    coverage = manifest.coverage
-    return (
-        not _is_language_native_test(path)
-        and path_matches(path, coverage.code_include)
-        and not path_matches(path, coverage.code_exclude)
-    )
-
-
-def _is_language_native_test(path: str) -> bool:
-    return path.endswith("_test.go")
-
-
-def _is_covered_document(manifest: Manifest, path: str) -> bool:
-    coverage = manifest.coverage
-    return path_matches(path, coverage.document_include) and not path_matches(path, coverage.document_exclude)
 
 
 def _validate_runtime_contract(raw: Any, label: str) -> dict[str, Any]:
@@ -1840,8 +1332,14 @@ def _validate_upstream_sources_contract(raw: Any, label: str) -> dict[str, Any]:
     return contract
 
 
+def _contract_source(root: Path, contract: Contract) -> Path:
+    path = _reject_symlink_chain(root, contract.source, f"contract {contract.identifier} source")
+    _require_regular_file(path, f"contract {contract.identifier} source", contract.source)
+    return path
+
+
 def render_contract(root: Path, contract: Contract) -> dict[str, str]:
-    raw = _read_json(_safe_path(root, contract.source), f"contract {contract.identifier}")
+    raw = _read_json(_contract_source(root, contract), f"contract {contract.identifier}")
     if contract.identifier == "runtime-policy":
         parsed = _validate_runtime_contract(raw, f"contract {contract.identifier}")
     elif contract.identifier == "container-platform":
@@ -1878,7 +1376,7 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
             content = _render_python_technical_profiles(parsed, contract.source)
         elif target.format == "typescript-technical-profile":
             content = _render_typescript_technical_profile(parsed, contract.source)
-        else:  # Protected by manifest validation; keep defense in depth.
+        else:  # CONTRACTS is closed; keep defense in depth.
             raise DocsSyncError(f"unsupported target format: {target.format}")
         rendered[target.path] = content
     return rendered
@@ -1904,10 +1402,10 @@ def _atomic_write(root: Path, relative: str, content: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def sync_contracts(root: Path, manifest: Manifest) -> tuple[str, ...]:
+def sync_contracts(root: Path) -> tuple[str, ...]:
     written: list[str] = []
     seen_targets: set[str] = set()
-    for contract in manifest.contracts:
+    for contract in CONTRACTS:
         for relative, content in render_contract(root, contract).items():
             if relative in seen_targets:
                 raise DocsSyncError(f"multiple contracts generate the same target: {relative}")
@@ -1942,7 +1440,23 @@ def _markdown_without_fenced_code(text: str) -> str:
     return "\n".join(kept)
 
 
-def _link_path(raw_target: str) -> str | None:
+def _heading_anchors(text: str) -> set[str]:
+    """GitHub-style heading anchors: lowercase, drop punctuation, spaces become hyphens, duplicates get -N."""
+    anchors: set[str] = set()
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        match = MARKDOWN_HEADING_RE.match(line)
+        if match is None:
+            continue
+        slug = re.sub(r"[^\w\- ]", "", match.group(2).strip().lower()).replace(" ", "-")
+        seen = counts.get(slug, 0)
+        counts[slug] = seen + 1
+        anchors.add(slug if seen == 0 else f"{slug}-{seen}")
+    return anchors
+
+
+def _link_parts(raw_target: str) -> tuple[str | None, str | None] | None:
+    """Split a Markdown link target into (local path or None for same file, fragment); None when not local."""
     target = raw_target.strip()
     if not target:
         return None
@@ -1951,12 +1465,12 @@ def _link_path(raw_target: str) -> str | None:
     else:
         target = target.split(maxsplit=1)[0]
     target = unquote(target)
-    if not target or target.startswith("#") or target.startswith("//"):
+    if not target or target.startswith("//"):
         return None
     parsed = urlsplit(target)
     if parsed.scheme:
         return None
-    return parsed.path or None
+    return (parsed.path or None, parsed.fragment or None)
 
 
 def validate_markdown_links(root: Path) -> list[str]:
@@ -1971,100 +1485,45 @@ def validate_markdown_links(root: Path) -> list[str]:
             errors.append(f"documentation entry point is missing: {relative}")
         else:
             documents.add(entry)
+    resolved_root = root.resolve()
+    anchor_cache: dict[Path, set[str]] = {}
+
+    def anchors_of(path: Path) -> set[str]:
+        if path not in anchor_cache:
+            anchor_cache[path] = _heading_anchors(_markdown_without_fenced_code(path.read_text(encoding="utf-8")))
+        return anchor_cache[path]
+
     for document in sorted(documents):
+        label = _display_path(document, root)
         if document.is_symlink():
-            errors.append(f"documentation file must not be a symlink: {_display_path(document, root)}")
+            errors.append(f"documentation file must not be a symlink: {label}")
             continue
         text = _markdown_without_fenced_code(document.read_text(encoding="utf-8"))
         for match in MARKDOWN_LINK_RE.finditer(text):
-            linked = _link_path(match.group(1))
-            if linked is None:
+            parts = _link_parts(match.group(1))
+            if parts is None:
                 continue
-            if linked.startswith("/"):
+            linked, fragment = parts
+            if linked is None:
+                target = document
+            elif linked.startswith("/"):
                 target = root / linked.lstrip("/")
             else:
                 target = document.parent / linked
             resolved = target.resolve()
-            resolved_root = root.resolve()
             if resolved != resolved_root and resolved_root not in resolved.parents:
-                errors.append(
-                    f"{_display_path(document, root)} links outside the repository: {match.group(1)}"
-                )
+                errors.append(f"{label} links outside the repository: {match.group(1)}")
             elif not resolved.exists():
-                errors.append(
-                    f"{_display_path(document, root)} has a broken relative link: {match.group(1)}"
-                )
+                errors.append(f"{label} has a broken relative link: {match.group(1)}")
+            elif fragment and resolved.suffix == ".md" and resolved.is_file() and fragment.lower() not in anchors_of(resolved):
+                errors.append(f"{label} links to a missing heading anchor: {match.group(1)}")
     return errors
 
 
-def validate_current_tree(
-    root: Path,
-    manifest: Manifest,
-) -> list[str]:
+def validate_current_tree(root: Path) -> list[str]:
     errors: list[str] = []
-    files = list_repository_files(root)
-    document_owners: dict[str, set[str]] = {}
-    for domain in manifest.domains:
-        for document in domain.documents:
-            try:
-                _safe_path(root, document)
-            except DocsSyncError as exc:
-                errors.append(str(exc))
-                continue
-            if document in document_owners:
-                errors.append(
-                    f"canonical document {document} belongs to multiple domains: "
-                    + ", ".join(sorted(document_owners[document] | {domain.identifier}))
-                )
-            document_owners.setdefault(document, set()).add(domain.identifier)
-            if not _is_covered_document(manifest, document):
-                errors.append(f"canonical document is outside document coverage: {document}")
-            document_path = _safe_path(root, document)
-            if not document_path.exists():
-                errors.append(f"canonical document for {domain.identifier} is missing: {document}")
-            elif not stat.S_ISREG(document_path.lstat().st_mode):
-                errors.append(f"canonical document must be a regular file: {document}")
-
-    for contract in manifest.contracts:
-        document_owners.setdefault(contract.source, set()).update(contract.domains)
-
-    for domain in manifest.domains:
-        for code_pattern in domain.code:
-            if not any(
-                _is_covered_code(manifest, path)
-                and path_matches(path, (code_pattern,))
-                for path in files
-            ):
-                errors.append(
-                    f"domain {domain.identifier} code pattern matches no covered production files: {code_pattern}"
-                )
-        for test_pattern in domain.tests:
-            if not any(path_matches(path, (test_pattern,)) for path in files):
-                errors.append(f"domain {domain.identifier} test pattern matches no files: {test_pattern}")
-
-    for path in files:
-        code_domains = domains_for_code(manifest, path) if _is_covered_code(manifest, path) else ()
-        test_domains = domains_for_test(manifest, path)
-        document_domains = domains_for_document(manifest, path)
-        if _is_covered_code(manifest, path) and not code_domains:
-            errors.append(f"covered production path has no documentation domain: {path}")
-        if _is_covered_document(manifest, path) and not document_domains:
-            errors.append(f"canonical document has no code domain: {path}")
-        categories = sum(
-            (
-                bool(code_domains),
-                bool(test_domains),
-                bool(document_domains) or _is_covered_document(manifest, path),
-            )
-        )
-        if categories > 1:
-            errors.append(f"repository path cannot be both code, test, or documentation: {path}")
-
     seen_targets: set[str] = set()
-    for contract in manifest.contracts:
-        if not _safe_path(root, contract.source).is_file():
-            errors.append(f"contract source is missing: {contract.source}")
-            continue
+    for contract in CONTRACTS:
         try:
             rendered = render_contract(root, contract)
         except DocsSyncError as exc:
@@ -2075,7 +1534,11 @@ def validate_current_tree(
                 errors.append(f"multiple contracts generate the same target: {target_path}")
                 continue
             seen_targets.add(target_path)
-            target = _safe_path(root, target_path)
+            try:
+                target = _reject_symlink_chain(root, target_path, "generated contract target")
+            except DocsSyncError as exc:
+                errors.append(str(exc))
+                continue
             try:
                 target_stat = target.lstat()
             except FileNotFoundError:
@@ -2096,8 +1559,6 @@ def validate_current_tree(
     return errors
 
 
-
-
 def _print_errors(errors: Sequence[str]) -> None:
     print("documentation sync check failed:", file=sys.stderr)
     for error in errors:
@@ -2106,8 +1567,7 @@ def _print_errors(errors: Sequence[str]) -> None:
 
 def command_sync(root: Path) -> int:
     try:
-        manifest = load_manifest(root)
-        written = sync_contracts(root, manifest)
+        written = sync_contracts(root)
     except DocsSyncError as exc:
         _print_errors([str(exc)])
         return 1
@@ -2122,14 +1582,13 @@ def command_sync(root: Path) -> int:
 
 def command_check(root: Path) -> int:
     try:
-        manifest = load_manifest(root)
-        errors = validate_current_tree(root, manifest)
+        errors = validate_current_tree(root)
     except DocsSyncError as exc:
         errors = [str(exc)]
     if errors:
         _print_errors(errors)
         return 1
-    print("documentation tree and generated contracts are in sync")
+    print("generated contracts and documentation links are in sync")
     return 0
 
 

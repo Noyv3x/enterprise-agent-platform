@@ -1,33 +1,36 @@
 # 部署
 
-生产只支持宿主 Manager + 受管 Docker；[自动更新](auto-update.md)定义切换，[数据布局](../reference/data-layout.md)定义路径／迁移，[安全设计](../design/security-and-trust.md)定义鉴权／文件边界。
+生产环境只支持"宿主机 Manager + 受管 Docker"这一种方式。版本切换见[自动更新](auto-update.md)，路径和迁移见[数据布局](../reference/data-layout.md)，鉴权和文件边界见[安全设计](../design/security-and-trust.md)。
 
 ## 唯一拓扑
 
-宿主只常驻 user-systemd `agent-platform-manager`，独占公共入口、维护页、Docker socket、operation、宿主执行与恢复。Platform（含前端）、Runtime、Camoufox、SearXNG、Firecrawl、按需 Sandbox 按不可变 digest 管理；业务容器禁止访问／代理 Docker socket。
-
-Platform backend 仅宿主回环，sidecar 仅私有 bridge；固定 Compose 使用 Manager 预建 external network，切换不删网络或中断 Sandbox。权威数据显式 bind mount，禁匿名 volume。部署机不需源码、Git、Python venv、Node/npm、上游 checkout；不支持源码启动、第二 Compose 栈或旧技术身份转换。
+- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。它独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。
+- Platform（含前端）、Runtime、Camoufox、SearXNG、Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。业务容器禁止访问或代理 Docker socket。
+- Platform 后端只发布到宿主机回环地址，其它服务只在私有网络里。固定的 Compose 使用 Manager 预先创建的外部网络，切换版本时不删除网络，也不中断沙箱。
+- 权威数据用显式的目录挂载，禁止匿名卷。
+- 部署机不需要源码、Git、Python 虚拟环境、Node/npm 或上游源码。不支持从源码启动、第二套 Compose 栈或旧技术身份的转换。
 
 ## 全新安装
 
-**前提：** Linux、Docker Engine、Compose v2、user-systemd、可使用 Docker 的部署用户。OS 账户 home 必须已有、可执行、无 symlink、当前 UID 所有且组／其他用户不可写；`/tmp`／`TMPDIR` 可 `noexec`。精确路径与环境变量规则见[唯一根目录](../reference/data-layout.md#唯一根目录)。
+**前提**：Linux、Docker Engine、Compose v2、用户级 systemd、一个能使用 Docker 的部署用户。操作系统账户的 home 目录必须已存在、可进入、不是符号链接、属于当前 UID，并且组和其他用户不可写。`/tmp` 或 `TMPDIR` 可以是 `noexec`。精确路径和环境变量规则见[唯一根目录](../reference/data-layout.md#唯一根目录)。
 
 ```bash
 curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/install.sh | bash -s -- --yes
 ```
 
-| 步骤 | 必须满足 |
+| 步骤 | 做什么 |
 | --- | --- |
-| 验证 | home 随机 owner-only 临时目录中，从固定受信源取得当前架构 Manager／SHA-256 sidecar，核对文件名／摘要；运行 `inspect-release --manifest <path> --architecture <arch>` 验整份闭世界清单（含其它架构）。只输出目标 URL/SHA-256，不读配置、开 socket、建正式路径或启动服务。 |
-| 锁定 | 正式副作用前取得单实例锁、确认 fresh root；清单拒绝在建路径前，竞争失败在目标清理前。 |
-| 激活 | 原子写配置、已验证 Manager、unit、owner-only secret，启动首次 `install` operation；核心健康才开放入口。初始 Current 见[自更新](auto-update.md#manager-自更新)。 |
+| 验证 | 在 home 下一个随机的、只有属主可访问的临时目录里，从固定的可信来源下载当前架构的 Manager 及其 SHA-256 文件，核对文件名和摘要；运行 `inspect-release --manifest <path> --architecture <arch>` 验证完整的发布清单（包括其它架构）。这一步只输出目标地址和 SHA-256，不读配置、不开 socket、不建正式路径，也不启动服务。 |
+| 锁定 | 在产生正式副作用之前取得单实例锁，并确认是全新的根目录。清单被拒绝时，在建路径之前就停止；竞争失败时，在清理目标之前就停止。 |
+| 激活 | 原子写入配置、已验证的 Manager、systemd unit 和只有属主可访问的密钥，启动首次的 `install` 操作；核心服务健康后才开放入口。初始的当前版本见 [Manager 自更新](auto-update.md#manager-自更新)。 |
 
-脚本不复制 JSON/schema 校验器。自定义 manifest 只改目标，不改 bootstrap 信任源；相同字节复用，否则按验证结果下载验摘要。未验证字节不进正式路径，不增 helper／资产协议；临时目录成功失败都清理。
+- 安装脚本不复制 JSON/schema 校验逻辑。自定义清单只改变下载目标，不改变初始的信任来源；本地已有相同字节就复用，否则按验证结果下载并核对摘要。
+- 未验证的字节不会进入正式路径，也不增加辅助程序或资产协议。临时目录无论成功还是失败都会清理。
 
-| 失败点 | 恢复 |
+| 失败发生在 | 如何恢复 |
 | --- | --- |
-| 激活前 | 只删本进程创建且身份仍匹配的对象，可重试同命令；校验失败只清私有临时文件。 |
-| 激活后 | journal 接管；用 Manager 恢复，不重跑安装器／手删数据根。 |
+| 激活之前 | 只删除本进程创建且身份仍匹配的对象，可以重新运行同一条命令；校验失败只清理私有临时文件。 |
+| 激活之后 | 由操作日志接管；用 Manager 恢复，不要重新运行安装器或手动删除数据根目录。 |
 
 ## 日常管理
 
@@ -42,28 +45,31 @@ agent-platform-manager repair
 agent-platform-manager logs
 ```
 
-CLI 走 owner-only Unix socket，请求结束释放不复用的 transport 闲置连接。mutation 的幂等／generation／唯一 owner 见[排队与维护](auto-update.md#排队与维护)；`check` 可存 Candidate，不开始更新。
+- 命令行通过只有属主可访问的 Unix socket 通信，每次请求结束后释放连接。
+- 修改类命令的幂等、版本和唯一持有者规则见[排队与维护](auto-update.md#排队与维护)。`check` 可以保存候选版本，但不会开始更新。
 
-| 现象 | 恢复 |
+| 现象 | 怎么处理 |
 | --- | --- |
-| 等待、空间不足、degraded | `status`／`logs`／`preflight`；Manager 自动等待重试，不手改 state、journal、activation、Compose 或 mutable tag。 |
-| 提交前迁移／核心失败 | 同 operation 恢复快照和 Previous；[状态机](auto-update.md#提交回滚与能力降级)自行收敛。Platform 不可用时使用宿主 CLI。 |
-| Manager 启动缺陷，socket 持续不可达 | 才允许同一不可变 release 的 `recover-current`；显式 SHA-256、配置、unit、运行 inode、Platform generation 完整绑定。只替换登记 Manager Current，不改 Platform 数据／generation／容器；见[恢复身份](auto-update.md#恢复身份)。 |
+| 等待中、空间不足、降级 | 用 `status`、`logs`、`preflight` 查看；Manager 会自动等待和重试。不要手动修改状态文件、操作日志、激活记录、Compose 或可变 tag。 |
+| 提交前迁移或核心服务失败 | 同一个操作会恢复快照和上一版本，[状态机](auto-update.md#提交回滚与能力降级)会自行收敛。Platform 不可用时使用宿主机命令行。 |
+| Manager 自身启动有缺陷、socket 一直连不上 | 只有这种情况才允许对同一个不可变发布执行 `recover-current`，需要显式提供 SHA-256，并完整绑定配置、unit、运行中的 inode 和 Platform 版本。它只替换登记的当前 Manager，不改 Platform 的数据、版本或容器；见[恢复身份](auto-update.md#恢复身份)。 |
 
 ## 公共入口与维护
 
-Manager 始终持有监听，正常代理 Current，更新／回滚／Platform 不可用时给中性维护页。默认回环；LAN 须显式启用、限制 CIDR，推荐 TLS 代理接回环。按真实远端准入并重建转发头，不信任客户端 `Forwarded`／`X-Forwarded-*`。
+- Manager 始终持有监听端口：正常时代理当前版本；更新、回滚或 Platform 不可用时显示中性的维护页。
+- 默认只监听回环地址。局域网访问需要显式开启并限制 CIDR；推荐用 TLS 反向代理接到回环地址。
+- 按真实的远端地址准入并重建转发头，不信任客户端发来的 `Forwarded` 或 `X-Forwarded-*`。
 
 ## 发布物、启动与健康
 
-八资产／十镜像、readiness／degraded 见[更新协议](auto-update.md)。其余部署约束：
+发布的八个资产、十个镜像以及就绪和降级规则见[更新协议](auto-update.md)。其它部署约束：
 
 | 对象 | 约束 |
 | --- | --- |
-| 镜像 | Platform／Runtime／Camoufox HEALTHCHECK 只在 Dockerfile 定义，Compose 继承；上游检查由 Compose 声明。Platform 只用本次 frontend stage 资产，context 排除本地 `enterprise_agent_platform/static/`。 |
-| SearXNG | 部署 UID/GID 读写 `0600` settings、`0700` config/cache；完整 config 根只读挂 `/etc/searxng`，不用单文件挂载制造匿名卷，不依赖上游 root／递归 chown。 |
-| Firecrawl | PostgreSQL 队列、Redis、RabbitMQ、Playwright，禁 FoundationDB；精确 project label、bind mount、私网。Compose 后仍 HTTP 探测，停旧 generation 时移除其受管容器。 |
-| 迁移 | 无 writer preflight → 停唯一 current writer → 验证快照 → 固定命令 → 成功才启候选。失败同 operation 回滚；版本资格、旧 Skill 源保护、root 例外仅见[受控迁移](../reference/data-layout.md#受控迁移)。 |
+| 镜像 | Platform、Runtime、Camoufox 的 HEALTHCHECK 只在 Dockerfile 里定义，由 Compose 继承；上游服务的检查在 Compose 里声明。Platform 镜像只使用本次构建的前端产物，构建上下文排除本地的 `enterprise_agent_platform/static/`。 |
+| SearXNG | 以部署 UID/GID 读写 `0600` 的 settings，`0700` 的 config 和 cache 目录；完整的 config 目录以只读方式挂载到 `/etc/searxng`。不用单文件挂载（会产生匿名卷），也不依赖上游的 root 或递归 chown。 |
+| Firecrawl | 使用 PostgreSQL 队列、Redis、RabbitMQ 和 Playwright，禁止 FoundationDB；使用精确的项目标签、目录挂载和私有网络。Compose 启动后仍做 HTTP 探测；停止旧版本时移除它的受管容器。 |
+| 迁移 | 不启动写入者的预检 → 停止唯一的当前写入者 → 验证快照 → 运行固定命令 → 成功后才启动候选版本。失败时由同一个操作回滚。版本资格、旧 Skill 源的保护和 root 例外只在[受控迁移](../reference/data-layout.md#受控迁移)中定义。 |
 
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
@@ -71,10 +77,12 @@ enterprise-agent-platform migrate --data /var/lib/agent-platform
 
 ## Agent Sandbox
 
-个人 AI／频道主 Agent 独立，委派共享父 Sandbox；首次调用创建，无任务／后台进程达到空闲期限后只停止、不删数据。挂载见[数据布局](../reference/data-layout.md)；entrypoint 仅为 UID/GID 映射短暂 root 后降权，不递归改挂载树。
-
-不可变镜像预装固定版本 XLSX/DOCX/PPTX/PDF 生成库和仅 `tools/list|tools/call` 的一次性 stdio MCP 客户端，不含第三方 server，不依赖临时联网／用户 HOME 缓存。部署、reset、目录回收、停止必须等待进程／控制器／持久输出的 cleanup 屏障；完整契约见 Runtime [停止与恢复](../design/agent-runtime.md#停止与恢复)及[有限后台任务](../design/agent-runtime.md#有限后台任务)。
+- 个人 AI 和每个频道主 Agent 各有独立的沙箱，委派共用父 Agent 的沙箱。首次调用时创建；没有任务和后台进程、达到空闲期限后只停止，不删除数据。
+- 挂载见[数据布局](../reference/data-layout.md)。入口程序只在 UID/GID 映射阶段短暂以 root 运行，随后降权，不递归修改挂载的目录树。
+- 不可变镜像预装了固定版本的 XLSX/DOCX/PPTX/PDF 生成库，以及只支持 `tools/list` 和 `tools/call` 的一次性 stdio MCP 客户端；不包含第三方 MCP 服务，不依赖临时联网或用户 HOME 里的缓存。
+- 部署、重置、目录回收和停止都必须等进程、控制器和持久输出的清理屏障完成；完整规则见 Runtime 的[停止与恢复](../design/agent-runtime.md#停止与恢复)和[有限后台任务](../design/agent-runtime.md#有限后台任务)。
 
 ## 验收
 
-执行[部署与冒烟](../development/testing.md#部署与冒烟)的真实 Compose、user-systemd、鉴权交互、恢复门，静态／单元不能替代。生产只通过 Manager operation、快照、Current/Previous 恢复。
+- 按[部署与冒烟](../development/testing.md#部署与冒烟)执行真实的 Compose、用户级 systemd、鉴权交互和恢复门检查；静态检查和单元测试不能替代。
+- 生产环境只通过 Manager 的操作、快照和当前/上一版本来恢复。

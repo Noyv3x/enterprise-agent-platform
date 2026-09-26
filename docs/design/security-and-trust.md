@@ -1,162 +1,213 @@
 # 安全与信任边界
 
-本页拥有认证、审批、secret、网络与文件规则；[数据设计](data-memory-sessions.md)拥有持久事务，[数据布局](../reference/data-layout.md)拥有路径/marker与直接迁移例外，[Runtime](agent-runtime.md)拥有执行协议，[自动更新](../operations/auto-update.md)拥有 generation/recovery 状态机。
+本文定义认证、审批、密钥、网络和文件规则。持久事务见[数据设计](data-memory-sessions.md)；路径、数据库标记和迁移例外见[数据布局](../reference/data-layout.md)；执行协议见 [Runtime](agent-runtime.md)；版本与恢复状态机见[自动更新](../operations/auto-update.md)。
 
 ## 信任模型
 
-部署面向可信内部成员，不抵抗同部署恶意租户。私人/频道主 Agent 各有 Sandbox、workspace、HOME、session、memory、Skill/MCP、浏览器 Profile；委派继承父环境。这是防误操作/污染的隔离，不是恶意模型或提示词注入安全边界。
-
-Sandbox 默认免审但受 hard-block。模型显式选择的单次 host 调用须用户逐次批准，才由 Manager 以部署用户执行；terminal 可用其已有免密 sudo，等同授予本次部署用户乃至 root 权限。不得变成 Run 默认或永久授权；部署方负责成员、宿主及网络权限。
+- 部署面向可信的内部成员，不防御同一部署内的恶意租户。
+- 每个个人或频道主 Agent 各有沙箱、工作区、HOME、会话、记忆、Skill/MCP 和浏览器 Profile；委派继承父环境。这种隔离是为了防误操作和互相污染，不是防御恶意模型或提示词注入的安全边界。
+- 沙箱内执行默认不需要审批，但受硬性拦截。模型显式选择的宿主机调用必须由用户逐次批准，然后由 Manager 以部署用户身份执行；终端可以使用该用户已有的免密 sudo，相当于把本次调用授予部署用户乃至 root 权限。这不能变成 Run 的默认行为或永久授权。成员、宿主机和网络权限由部署方负责。
 
 ## 认证与权限
 
-| 对象 | 不变量 |
+| 对象 | 规则 |
 | --- | --- |
-| 密码 | PBKDF2-SHA256+随机盐。全部写入口/登录最多1024 Unicode字符，超限不改 hash/token version。登录闭世界 JSON ≤16 KiB，拒重复/未知字段，用户名限长；字符检查先于哈希。 |
-| 防爆破 | 固定窗口三桶：账号×真实客户端、账号跨客户端、客户端跨用户名。客户端桶先保护 CPU；仅账号跨客户端桶不阻止正确密码，账号×客户端及客户端准入仍适用。未知账号用固定 dummy hash，错密码验证现有 hash，执行等价 PBKDF2并返回统一错误；限流有稳定码/Retry-After。 |
-| 窗口状态 | session secret 派生 HMAC主体标识存 secret settings，不存用户名/IP/密码；时间/键数有界，成功/过期/容量回收清桶，重启不清零。不引入永久封号、验证码、外部风控。 |
-| 撤权 / 改密 | 停用、改密、权限变化、吊销推进 token version。本人改密可事务外验密，但提交 CAS 旧 hash+version+active，仅用本次版本签发；不得覆盖先提交操作或借新版本续命。 |
-| 管理写 | Python 在短串行/事务提交边界重验当前 active、权限、认证版本；先提交撤权必须挡住旧请求。正文前 actor、前端按钮/角色不授权；长网络等待不占全局 conversation gate。 |
-| 本人撤回 | 同频道消息锁重读账号/权限，验可读、聊天权、消息可见、author_type=user、user_id=本人；admin 不绕所有权，代删走管理审计。 |
+| 密码 | PBKDF2-SHA256 加随机盐。所有写入口和登录的密码最多 1024 个 Unicode 字符，超限时不改哈希或 token 版本。登录请求是闭合的 JSON（≤16 KiB），拒绝重复或未知字段，用户名限长；字符检查先于哈希计算。 |
+| 防爆破 | 固定窗口、三个计数桶：账号×真实客户端、账号跨所有客户端、客户端跨所有用户名。客户端桶优先保护 CPU。"账号跨客户端"桶不阻止正确的密码，但其它两个桶仍然生效。未知账号用固定的假哈希做等价计算，返回统一的错误；限流返回稳定的错误码和 Retry-After。 |
+| 计数状态 | 用会话密钥派生的 HMAC 主体标识，存在密钥设置里，不存用户名、IP 或密码；时间和键数量都有上限。成功、过期或容量回收时清除计数，重启不清零。不引入永久封号、验证码或外部风控。 |
+| 撤权与改密 | 停用、改密、权限变化和吊销都会推进 token 版本。本人改密可以在事务外验证旧密码，但提交时用"旧哈希 + 版本 + 启用状态"做比较交换，只用本次的新版本签发；不能覆盖先提交的操作，也不能借新版本延长旧会话。 |
+| 管理写入 | Python 在短暂的串行或事务提交边界内重新验证当前账号是否启用、权限和认证版本；先提交的撤权必须挡住旧请求。请求开始时的身份、前端按钮或角色都不构成授权。长时间的网络等待不占用全局会话门。 |
+| 本人撤回 | 在频道消息锁内重新读取账号和权限，验证：可读、有聊天权限、消息可见、author_type=user、user_id 是本人。管理员也不能绕过所有权；代为删除走管理审计。 |
 
-浏览器 HMAC token 的 Cookie 为 HttpOnly、SameSite=Lax；TTL=Max-Age，默认7天、可调60秒至30天，关浏览器不失效。签发时计算绝对 exp；有效 Cookie 剩余寿命低于当前 TTL一半时以同 version续签；bearer、过期、停用、版本失效不续。
+**登录 Cookie**
 
-可信代理开启时 Secure 取 Manager 清洗重建的本次 scheme，HTTPS加、LAN HTTP不加；关闭时忽略伪造 Forwarded/X-Forwarded-*，以公共 URL scheme回退。Cookie写需允许的 Origin/Referer；真实客户端仅信 Manager重建头，否则 TCP peer。
+- 浏览器 token 是 HMAC 签名的，Cookie 为 HttpOnly、SameSite=Lax。有效期等于 Max-Age，默认 7 天，可调范围 60 秒到 30 天；关闭浏览器不会失效。
+- 签发时计算绝对过期时间。有效 Cookie 的剩余寿命低于当前有效期的一半时，以同一版本续签；bearer 方式、已过期、已停用或版本失效的不续签。
+- 开启可信代理时，Secure 标志取 Manager 清洗重建后的本次协议：HTTPS 加、局域网 HTTP 不加。关闭可信代理时忽略伪造的 Forwarded/X-Forwarded-* 头，按公共 URL 的协议判断。
+- 写 Cookie 的请求需要允许的 Origin 或 Referer。真实客户端地址只信任 Manager 重建的头，否则用 TCP 对端地址。
 
 ## 容器与网络边界
 
-| 边界 | 不变量 |
+| 边界 | 规则 |
 | --- | --- |
-| Docker / network | 只有 Manager访问 Docker socket，其它服务不得挂载/代理。Manager持有持久私有 bridge，Compose仅引用 external network；仅接管契约 managed label/driver，不覆盖同名未知网络。只将 Platform backend发布宿主回环，sidecar不公开。 |
-| 技术身份 | schema 2 target-only manifest精确闭合十现役镜像；无 helper/历史解码/额外描述符、mutable tag、任意 shell。编译期 profile固定机器身份，品牌/CLI/manifest不能选另一套。 |
-| Sandbox root | 仅PID1映射阶段：正整数UID/GID、无其它账号UID冲突；workspace/HOME/env三挂载根非symlink，只改根owner/mode，不递归、不碰只读附件。随后exec部署agent身份，docker exec显式同UID/GID，无root业务进程。 |
-| Platform root | 仅entrypoint/固定健康dropper。serve/init-admin/print-agent-token/__healthcheck在建目录、读secret、加载业务前清附加组、no-new-privs并降部署UID/GID；其它root命令拒绝。root Python仅镜像绝对解释器+isolated+root-owned cwd，不从数据/环境导入。migrate唯一例外见[受控迁移](../reference/data-layout.md#受控迁移)。 |
-| 内部认证 | Platform/Runtime内部HTTP（含内部健康）需独立token，浏览器session不替代。Manager socket同时验同UID peer及严格Bearer；路径、地址、scope、容器名不授权。 |
-| capability | manager-token供Platform/CLI/回调控制；manager-executor-token仅Runtime `/v1/executor/*`，不可互换/交叉挂载。只读挂独立control目录而非socket inode或整个状态根，允许socket重建但不暴露其它状态。 |
+| Docker 与网络 | 只有 Manager 能访问 Docker socket，其它服务不能挂载或代理它。Manager 持有一个持久的私有网络，Compose 只引用这个外部网络；Manager 只接管带契约标签和驱动的网络，不覆盖同名的未知网络。只有 Platform 后端发布到宿主机回环地址，其它服务都不公开。 |
+| 技术身份 | 发布清单精确列出十个现役镜像，没有辅助镜像、历史解码、额外描述、可变 tag 或任意 shell。机器身份在编译时固定，品牌、命令行参数或清单都不能换成另一套。 |
+| 沙箱的 root 阶段 | 只在 PID 1 的映射阶段使用 root：检查 UID/GID 为正整数且不与其它账号冲突；工作区、HOME、环境三个挂载根不能是符号链接；只修改根目录的属主和权限，不递归，不碰只读附件。之后切换为部署的 agent 身份，`docker exec` 也显式使用同一 UID/GID，没有以 root 运行的业务进程。 |
+| Platform 的 root 阶段 | 只有入口脚本和固定的健康检查降权程序以 root 运行。serve、init-admin、print-agent-token、健康检查在创建目录、读取密钥、加载业务之前清除附加组、设置 no-new-privs 并降为部署 UID/GID；其它以 root 执行的命令一律拒绝。root 下的 Python 只能用镜像内的绝对路径解释器、隔离模式和 root 所有的工作目录，不从数据目录或环境导入代码。migrate 是唯一例外，见[受控迁移](../reference/data-layout.md#受控迁移)。 |
+| 内部认证 | Platform 和 Runtime 的内部 HTTP（包括内部健康检查）需要独立 token，浏览器会话不能替代。Manager socket 同时验证同 UID 的对端和严格的 Bearer；路径、地址、对话范围或容器名都不构成授权。 |
+| 权限令牌 | manager-token 用于 Platform 和命令行控制及回调；manager-executor-token 只能访问 Runtime 用的 `/v1/executor/*`。两者不能互换，也不能交叉挂载。只读挂载独立的 control 目录，而不是 socket 文件本身或整个状态根目录；这样 socket 可以重建，又不暴露其它状态。 |
 
-Manager每次启动验control/secrets真实目录与token：部署UID、非symlink，目录0700、普通文件0600；仅安全对象可收紧，owner/type/path异常不修复。只读挂载/SO_PEERCRED不能代替路由capability。
+- Manager 每次启动都验证 control 和 secrets 目录及其中的 token：属于部署 UID、不是符号链接、目录权限 0700、普通文件 0600。只会收紧安全对象的权限；属主、类型或路径异常时不自动修复。只读挂载或对端凭据检查都不能代替路由级的权限令牌。
 
-网络能力有不同准入：
+**不同的网络访问规则**
 
-- 搜索/Firecrawl仅公开HTTP(S)，拒userinfo、回环/私网/链路本地、metadata、敏感query；结果轻过滤不能代替提取前DNS-aware SSRF复验。
-- 浏览器可访问普通回环/内网HTTP(S)，拒userinfo、metadata、链路本地、多播/保留/不可路由，操作前后复验。
-- release/工件仅HTTPS或精确127.0.0.1/::1 HTTP，逐redirect复验；策略拒绝是确定失败，不按网络错误重试。
-- 更新webhook验签，Telegram webhook用不可猜secret path；边界代理覆盖客户端转发头。
+- 搜索和 Firecrawl：只能访问公开的 HTTP(S)，拒绝带用户信息的网址、回环/私网/链路本地地址、云元数据地址和敏感查询参数。结果的轻度过滤不能代替提取前基于 DNS 的 SSRF 复验。
+- 浏览器：可以访问普通的回环和内网 HTTP(S)，但拒绝带用户信息的网址、云元数据、链路本地、多播、保留和不可路由地址；操作前后都复验。
+- 发布和工件下载：只允许 HTTPS，或精确的 127.0.0.1/::1 上的 HTTP；每次重定向都复验。被策略拒绝是确定性失败，不按网络错误重试。
+- 更新 webhook 验证签名；Telegram webhook 使用不可猜测的密钥路径；边界代理会覆盖客户端伪造的转发头。
 
 ## 工具执行与审计
 
-Runtime生产执行统一Manager，无本地terminal/process/文件fallback；开放服务前bearer非空且Unix路径确为socket。测试fake不得改变同接口审批/身份语义。
+- Runtime 的生产执行统一经过 Manager，没有本地的终端、进程或文件备用路径。开始服务前确认 bearer 非空、Unix 路径确实是 socket。测试用的假实现不能改变同一接口的审批和身份语义。
+- 所有目标在执行前都要规范化参数和路径、限制大小、脱敏并做硬性拦截：Docker、编排、Manager 状态、宿主机凭据和进程内存、云元数据、块设备和危险的伪文件、格式化或删除系统根目录、fork 炸弹、无边界的 kill-all、含隐形或双向控制字符的命令、无法完整展示的命令，一律拒绝。模型、历史和目标都不能覆盖这些拦截。
 
-所有目标在执行前canonical参数/路径、限大、脱敏及hard-block：Docker/编排/Manager状态、宿主凭据/进程内存、metadata、块设备/危险伪文件、格式化/删系统根、fork bomb/无界kill-all、隐形/双向字符、无法完整展示的命令均拒绝，模型/历史/目标不能覆盖。
-
-| 授权 | 不变量 |
+| 授权 | 规则 |
 | --- | --- |
-| Sandbox | 默认/workspace，仅主Agent workspace/HOME/env；附件映射优先且只读，后台登记参与空闲生命周期。 |
-| host | 只once/deny；未批、超时、通知失败不调用Manager。批准绑定工具名、规范原参数、target、canonical路径、主sandbox identity；Manager最终绑定根映射，仅消费一次，路径漂移后批准不可复用。 |
-| 业务审批 | 浏览器/Skill/MCP/计划策略独立。MCP call 逐次审批；邮件发送/回复/移动/标记/存附件逐次审批且记录隐藏正文/凭据。unattended 拒绝这些动作。 |
-| call id | 同assistant provider id唯一；任一预检/审批/并行前整批拒重复。每个被拒occurrence独立保留/消费authorization标记，不能按id覆盖成普通错误。 |
-| grant | durable查询/提交、缓存、scope/lifecycle清理线性化；cleanup返回后旧查询/追加不能复活授权。 |
-| 审计 | 批准后、执行前持久化并发聊天：完整实际argv/canonical cwd/目标/前后台/有效超时或完整文件、进程参数；执行后记结果/副作用。脱敏不能隐藏普通语义参数。 |
+| 沙箱 | 默认在 /workspace，只能访问主 Agent 的工作区、HOME 和环境；附件映射优先且只读；登记的后台进程参与空闲生命周期计算。 |
+| 宿主机 | 只有"允许一次"和"拒绝"。未批准、超时或通知失败时不调用 Manager。批准绑定工具名、规范化的原始参数、目标、规范路径和主沙箱身份；Manager 最终绑定根映射，批准只能用一次，路径发生漂移后不能复用。 |
+| 业务审批 | 浏览器、Skill、MCP 和计划有各自的策略。MCP 每次调用单独审批；邮件的发送、回复、移动、标记和保存附件也逐次审批，记录时隐藏正文和凭据。无人值守的 Run 拒绝这些动作。 |
+| 调用 ID | 同一条助手消息里供应商给的调用 ID 必须唯一。在任何预检、审批或并行执行之前，只要有重复就整批拒绝。每个被拒的调用都单独保留和消费自己的授权标记，不能按 ID 覆盖成普通错误。 |
+| 授权记录 | 持久化的查询和提交、缓存、对话范围和生命周期清理是线性化的；清理返回后，旧的查询或追加不能让授权复活。 |
+| 审计 | 批准后、执行前持久化审计并通知聊天：完整的实际参数、规范的工作目录、目标、前台或后台、实际超时，或者完整的文件和进程参数。执行后记录结果和副作用。脱敏不能隐藏普通的语义参数。 |
 
-审计与模型历史序列化分离。tool参数始终符合活动schema，脱敏占位也符合enum/regex/path；任意JSON限制深度/条目/节点/字符串字节。历史展示envelope仅工具名匹配且字段已知时内存归一；错名、身份/未知字段失败，不删除后放行，不重写JSONL。
+**审计与模型历史**
 
-token/Cookie/Authorization/userinfo/secret变量值在离开执行器前脱敏，支持紧凑/等号/分离argv；嵌套shell无法安全解析则拒绝。原secret只在当前闭包，无journal/session/错误/预览副本。命令保留来自已消费审计投影；输出在入缓冲/process JSON/快照前脱敏再裁剪，不可只保护audit或隐藏全部普通输出。
+- 审计和模型历史的序列化分开处理。工具参数始终符合当前 schema，脱敏的占位符也要符合枚举、正则和路径约束；任意 JSON 限制深度、条目数、节点数和字符串字节。
+- 历史展示用的信封只在工具名匹配且字段已知时才在内存中归一化；工具名错误、身份或未知字段一律失败，不能删掉字段后放行，也不重写 JSONL。
 
-Go/Python共享脱敏规则和必要条件预筛；优化不能改变匹配/最早起点/同点顺序或让普通文本直通。筛完整待定窗口，保持512字节尾窗、跨chunk、secret/URL/PEM/引号、EOF及非消费Preview，两端无独立白名单。
+**脱敏**
 
-进程终止确认涵盖controller输出快照、持久登记、Sandbox计数/终态裁剪，返回后watch/wait不再写scope。取消/cleanup尽力终止前台；后台跨Run须登记、有界输出、admin可见。停Sandbox杀容器进程但保留挂载；责任协议见[Runtime](agent-runtime.md)。
+- token、Cookie、Authorization、网址里的用户信息和密钥变量值，在离开执行器前脱敏，支持紧凑写法、等号写法和分开的参数写法；嵌套 shell 无法安全解析时直接拒绝。
+- 原始密钥只存在于当前执行闭包，不在日志、会话、错误或预览中留副本。审计里保留的命令来自已经消费过的审计投影；输出在进入缓冲、进程 JSON 或快照之前先脱敏再裁剪。不能只保护审计，也不能为了安全把普通输出全部隐藏。
+- Go 和 Python 共用同一套脱敏规则。性能优化不能改变匹配结果、最早起点或同位置的顺序，也不能让普通文本跳过检查。流式脱敏保留 512 字节的尾部窗口，正确处理跨数据块、密钥、网址、PEM、引号和文件结尾；两端都没有独立的白名单。
+
+**进程终止**
+
+- 终止确认涵盖控制器输出快照、持久登记、沙箱计数和终态清理；返回之后，观察和等待不能再写入该对话范围。
+- 取消或清理尽力终止前台进程；跨 Run 的后台进程必须登记、输出有上限，并且管理员可见。停止沙箱会杀死容器内的进程，但保留挂载。完整协议见 [Runtime](agent-runtime.md)。
 
 ## 管理器与更新
 
-配置/control/manifest/journal/registry凭据owner-only，完整身份及请求资格先于副作用：
+配置、control、发布清单、日志和登记表中的凭据只有属主可访问。在产生任何副作用之前，先验证完整身份和请求资格：
 
-- 静态命令表先解析完整argv，未知/重复参数或locator、相对/非规范路径在读状态前拒绝。config规范绝对、当前UID控制、非symlink普通文件，只开一次固定inode/字节供paths/锁/watchdog/application共享；运行/proc/self/exe、stable inode、登记摘要不一致拒绝，不按basename/环境重推。home规则见[布局](../reference/data-layout.md#唯一根目录)。
-- takeover journal持久化即启动边界，不等unit禁用。任何写application/ack/recovery/listener前非阻塞协调recovery flock、安全枚举owner-only无symlink recoveries；未知/坏/不安全、多非终态、身份/配置漂移零副作用拒绝。空闲lease持至listener及pending activation结算。
-- pending Candidate在watchdog原子commit前仅不可变、control认证的/v1/identity，之后原子切full API；external recovery probe同样仅身份。完整idempotency、Gate、checkpoint、takeover/terminal证明见[自动更新](../operations/auto-update.md)，不能凭锁忙/历史路径扩大能力。
+- **命令行**：静态命令表先解析完整参数，未知或重复的参数和定位符、相对或非规范路径在读取状态之前就拒绝。配置文件必须是当前 UID 控制的、规范绝对路径的普通文件，不是符号链接；只打开一次，同一个 inode 和字节内容供路径解析、加锁、看门狗和应用程序共享。运行中的程序路径、稳定 inode 或登记摘要不一致时拒绝，不按文件名或环境重新推断。HOME 规则见[数据布局 · 唯一根目录](../reference/data-layout.md#唯一根目录)。
+- **接管**：接管日志一旦持久化就是启动边界，不必等系统服务被禁用。任何写入应用程序、确认、恢复或监听之前，都要非阻塞地协调恢复锁，并安全枚举只有属主可访问、没有符号链接的恢复记录；遇到未知、损坏、不安全、多个非终态或身份/配置漂移时，零副作用地拒绝。空闲租约一直保持到监听建立和待处理的激活完成结算。
+- **候选版本**：在看门狗原子提交之前，待定的候选版本只开放不可变的、经过 control 认证的 `/v1/identity`，之后才原子切换到完整 API；外部恢复探测同样只看身份。完整的幂等、准入门、检查点、接管和终态证明见[自动更新](../operations/auto-update.md)，不能凭锁忙或历史路径扩大能力。
 
 ### 锁与 socket 所有权
 
-| 锁 | 边界 |
+| 锁 | 规则 |
 | --- | --- |
-| Platform实例 | SQLite/worker/副作用前取得并持生命周期，精确inode/link/权限规则见[布局](../reference/data-layout.md#权威数据与文件安全)。 |
-| serve.lock | binary root内owner-only、当前UID普通文件严格权限、NOFOLLOW/CLOEXEC、非阻塞独占，application前至完整服务结束。第二serve不能降为probe；新root安全建0700，既有state root仅同UID/无symlink/他人不可写时可收紧。 |
-| 锁序 | serve.lock→recovery.lock→plan lock；外部recover-current不取serve锁，可停旧owner后保持recovery锁启动精确probe。 |
-| `<socket>.lock` | 同验证 control 目录，目录 fd+openat(CREAT/RDWR/NOFOLLOW/CLOEXEC,0600)，path/fd inode 一致、当前 UID、严格权限、普通/nlink=1、非阻塞独占。跨 Manager root 也串行；从 probe 持至自身 unlink 及 listener close，锁文件不删。 |
+| Platform 实例锁 | 在打开 SQLite、启动后台处理或产生任何副作用之前取得，并在整个生命周期内持有。inode、链接和权限规则见[数据布局](../reference/data-layout.md#权威数据与文件安全)。 |
+| serve.lock | 位于程序根目录内，是只有属主可访问、当前 UID 的普通文件，权限严格；用不跟随链接、执行时关闭、非阻塞独占的方式打开。在启动应用前取得，一直持有到服务完全结束。第二个 serve 不能降级为探测。新的根目录安全地以 0700 创建；已有的状态根目录只有在同 UID、没有符号链接且他人不可写时才收紧权限。 |
+| 加锁顺序 | serve.lock → recovery.lock → plan lock。外部的"恢复当前版本"命令不取 serve 锁：它可以停止旧的持有者，然后保持恢复锁启动精确的探测。 |
+| `<socket>.lock` | 在同一个经过验证的 control 目录里，通过目录描述符以"创建/读写/不跟随链接/执行时关闭、0600"打开；路径和描述符的 inode 必须一致，属于当前 UID、权限严格、普通文件且只有一个硬链接，非阻塞独占。跨 Manager 根目录也串行。从探测开始持有，直到自己删除 socket 并关闭监听；锁文件本身不删除。 |
 
-有bind锁后才探测同UID既有socket：有界连接成功=live，只有ECONNREFUSED可删除；unlink前再验device/inode/type/uid。超时/权限/模糊错误拒绝，teardown只删自身inode，不删继任者。
+- 取得绑定锁后，才探测同 UID 下已有的 socket：有限时间内能连上说明它在用；只有"连接被拒绝"时才可以删除，删除前再次验证设备号、inode、类型和 UID。超时、权限或含义不明的错误一律拒绝；关闭时只删除自己的 inode，不删继任者的。
 
-原子tmp清理仅写入器精确安全名称，不泛认前缀。根从已验config+固定子目录派生，拒根外version；父/叶path与fd一致、当前UID、普通非symlink/nlink=1、无持久引用才fd-rooted单文件unlink，异常留证报错。无覆盖全部writer的独占证明须等宽限，recovery锁不能排斥不取它的watchdog。启动只扫随后严格验证的operation/recovery/引用version，新鲜无关项留维护；正式身份仍拒tmp引用及缺失/坏/未知工件。
+**临时文件清理**
+
+- 只清理写入器确切的安全文件名，不按前缀泛化匹配。根目录从已验证的配置加固定子目录派生，拒绝根目录外的版本。
+- 父目录和文件的路径与描述符一致、属于当前 UID、是普通文件、不是符号链接、只有一个硬链接且没有持久引用时，才通过目录描述符删除单个文件；异常时保留证据并报错。
+- 没有覆盖所有写入者的独占证明时，必须等待宽限期；恢复锁不能排斥不取它的看门狗。启动时只扫描随后会被严格验证的操作、恢复和被引用的版本；新鲜的无关项留给维护处理。正式身份仍然拒绝引用临时文件，也拒绝缺失、损坏或未知的工件。
 
 ## 文件与附件
 
-共同读取规则：逐段固定可信根/父fd，不重解析可换链字符串；普通文件用**NOFOLLOW+NONBLOCK打开，同fd验类型/身份后读**，FIFO不能在拒绝前挂死，任一初始化失败释放已持FD。数据/workspace/Runtime/env根属部署UID、无symlink、权限收紧，每次复验，缓存不豁免。
+**共同的读取规则**
 
-DB/WAL/SHM、实例/bind 锁、Runtime todo/process sidecar、Skill 正文/支持文件、MEDIA 来源、可删 tmp、迁移源明确要求单链接；其它对象遵循各自契约，不能泛化所有 workspace 文件的硬链接策略。
+- 逐段固定可信的根目录和父目录描述符，不重复解析可能被替换链接的路径字符串。
+- 普通文件以**不跟随链接 + 非阻塞**方式打开，用同一个描述符验证类型和身份后再读取；FIFO 不能在被拒绝之前卡住进程；初始化任何一步失败都要释放已经持有的描述符。
+- 数据、工作区、Runtime 和环境的根目录属于部署 UID，不是符号链接，权限收紧，每次都复验，缓存不能豁免。
+- 数据库及其 WAL/SHM、实例锁和绑定锁、Runtime 的 todo 和进程记录、Skill 正文和支持文件、MEDIA 来源、可删除的临时文件、迁移源，明确要求只有一个硬链接。其它对象遵循各自的约定，不能把这条规则泛化到所有工作区文件。
 
 | 操作 | 附加规则 |
 | --- | --- |
-| Sandbox枚举/搜索 | 从固定fd读名称、相对父fd逐项打开，据fd元数据读/递归，不按显示名重解析，不跟symlink/读特殊文件；最低与当前Go行为一致。 |
-| host | 先绑定批准路径的可信根/相对路径，禁Docker、Manager状态/标准config/run/凭据及操作禁区；祖先搜索跳保护子树。patch同父fd读/临时写/原子换，terminal从固定cwd fd切换。 |
-| patch分配 | 先防溢出计算结果大小再分配，不能小请求放大成超界中间结果。 |
-| mail附件创建 | workspace fd逐段DIRECTORY/NOFOLLOW；mkdirat后重开验owner/type；叶CREAT/EXCL/NOFOLLOW、普通/owner复验、0600、持久化。失败只清同父本次inode，拒lstat后按全路径open。 |
+| 沙箱内枚举和搜索 | 从固定描述符读取文件名，相对父目录描述符逐项打开，根据描述符的元数据读取或递归；不按显示名重新解析，不跟随符号链接，不读特殊文件。 |
+| 宿主机 | 先把批准的路径绑定到可信根目录加相对路径；禁止访问 Docker、Manager 状态、标准配置和运行目录、凭据以及其它操作禁区；向上搜索祖先目录时跳过受保护的子树。patch 在同一父目录描述符下读取、写临时文件、原子替换；终端从固定的工作目录描述符切换目录。 |
+| patch 的内存分配 | 先防溢出地计算结果大小再分配，不能让一个小请求放大成超出上限的中间结果。 |
+| 保存邮件附件 | 从工作区描述符逐段以"必须是目录 + 不跟随链接"打开；创建目录后重新打开验证属主和类型；最后以"独占创建 + 不跟随链接"创建文件，复验普通文件和属主，权限 0600 并持久化。失败时只清理同一父目录下本次创建的 inode，不允许先检查再按完整路径打开。 |
 
 ### 原子发布
 
-私有目录rename和exact-final重试均fsync **child→staging/source parent→destination parent**，staging消失/空residue清理不省略。只有final仍预期inode且missing→rename或已建立的空目录恢复身份仍为空，屏障失败才可判committed-but-not-durable；重试全屏障。内容/type/mode/inode漂移不算提交、不删证据、不继续DB。
-
-普通私有文件发布/重放同样重固定目标并fsync文件/父；相同字节或只读验证不能替代marker/sidecar曾失败的耐久屏障。Camoufox fresh资格见[布局](../reference/data-layout.md#runtime-与集成服务)。
+- 私有目录的重命名和"精确最终态"的重试都要依次落盘：**子项 → 暂存/源父目录 → 目标父目录**；暂存目录消失或只剩空残留时，也不能省略清理。
+- 只有当最终位置仍是预期的 inode（从不存在到重命名完成），或者已建立的空目录经恢复后仍为空时，落盘屏障失败才能判定为"已提交但未持久"；重试时要走完全部屏障。内容、类型、权限或 inode 漂移不算提交，不删除证据，也不继续数据库操作。
+- 私有普通文件的发布和重放同样重新固定目标，并落盘文件和父目录。内容相同或只读验证不能替代标记文件或附属文件曾经失败的持久化屏障。Camoufox 全新状态的资格见[数据布局](../reference/data-layout.md#runtime-与集成服务)。
 
 ### 上传、交付与预览
 
-| 边界 | 不变量 |
+| 边界 | 规则 |
 | --- | --- |
-| 上传 | 数量/单文件/总量/账号/全局配额，名称/MIME规范化；multipart增量owner-only staging，仅边界小缓冲，完整类型/摘要/配额验证后流式提交，所有终态清理。独立有界并发，超额拒绝；接收不持写准入，仅最终验证/复制/消息+job短持，更新先预约可中断。无墙钟总超时，字节空闲/断线/取消/更新/越界终止；慢滴流不能挡更新，进度只示实际发送量。 |
-| 附件权限 | 仅允许位图内联模型，其余只读当前scope挂载；文件名仅显示/下载头，不是路径，Platform数据路径不入普通metadata。 |
-| MEDIA | 仅 run.completed 可复制/建附件，failed/cancelled/needs_review 标记仅诊断。Platform 不挂 Sandbox `/workspace`：逻辑后代由服务端当前 scope 映射至其可见 workspace，来源限此根/受管媒体/显式媒体根，拒猜 owner/其它 scope/偶然路径/穿越/控制符。逐段目录 fd+NOFOLLOW、单链接普通叶、大小与读取同 fd，并发置换拒绝；文件/HTML 预览复用。标记保留见 Runtime。 |
-| 下载 | 同源鉴权、attachment disposition、nosniff，不内联HTML/SVG/Office。空/octet-stream MIME仅确定性允许后缀映射，不依赖mime.types、不覆盖其它明确类型、不替代内容验证。 |
-| 文档解析 | 仅XLSX/DOCX/PPTX/PDF。Office验后缀/MIME/ZIP身份、加密、条目路径/数量/单项与总展开界，拒绝对/穿越/symlink条目；PDF验%PDF-、拒加密。仅有界表格/段落/幻灯片可见文本/已有PDF文字，无OCR、公式/宏/脚本执行、外链/字体/关系/嵌入加载，不交浏览器原生查看器。 |
-| 预览响应 | 私有nosniff JSON，kind、分页/分表、截断标记；坏/加密/无文本返回有界通用错误，无载荷/内部路径/解析诊断，不改下载。HTML/HTM单独沙箱呈现，不当Office JSON。 |
+| 上传 | 有数量、单文件、总量、账号和全局配额；文件名和 MIME 规范化。multipart 以增量方式写入只有属主可访问的暂存区，只用很小的边界缓冲；完整验证类型、摘要和配额后流式提交，所有结束路径都清理。上传有独立的并发上限，超额拒绝。接收期间不持有写准入，只有最终的验证、复制和写入消息与任务时短暂持有；更新预约后可以被中断。没有固定的总时长上限；按字节空闲、断线、取消、更新或越界终止。慢速涓流不能挡住更新；进度只显示实际发送的量。 |
+| 附件权限 | 只有允许的位图格式可以内联给模型，其余都以只读方式挂载到当前对话范围。文件名只用于显示和下载头，不是路径；Platform 的数据路径不写入普通元数据。 |
+| MEDIA | 只有 `run.completed` 才能复制文件并建立附件；failed、cancelled、needs_review 中的标记只用于诊断。Platform 不挂载沙箱的 `/workspace`：服务端把逻辑路径映射到当前对话范围的可见工作区，来源只能是这个根、受管的媒体目录或显式的媒体根；拒绝猜测所有者、其它对话范围、偶然碰到的路径、路径穿越和控制字符。逐段用目录描述符加不跟随链接打开，叶子必须是只有一个硬链接的普通文件，大小检查和读取使用同一个描述符，被并发替换时拒绝。文件和 HTML 预览复用这套逻辑。标记的保留规则见 Runtime。 |
+| 下载 | 同源鉴权，以 attachment 方式下载并设置 nosniff；HTML、SVG 和 Office 文件不内联显示。空的或 octet-stream 的 MIME 只按确定的后缀白名单映射，不依赖系统的 mime.types，不覆盖其它明确的类型，也不能代替内容验证。 |
+| 文档解析 | 只支持 XLSX、DOCX、PPTX 和 PDF。Office 文件验证后缀、MIME、ZIP 格式和加密状态，检查条目路径、数量、单项和总解压大小，拒绝绝对路径、路径穿越和符号链接条目。PDF 验证 `%PDF-` 头并拒绝加密文件。只提取有上限的表格、段落、幻灯片可见文字和 PDF 已有的文字层；不做 OCR，不执行公式、宏或脚本，不加载外链、字体、关系或嵌入对象，也不交给浏览器原生查看器。 |
+| 预览响应 | 私有的 nosniff JSON，包含类型、分页或分表以及截断标记。损坏、加密或没有文字的文件返回有上限的通用错误，不包含文件内容、内部路径或解析诊断，也不影响下载。HTML/HTM 单独在沙箱中呈现，不当作 Office JSON。 |
 
 ## 凭据与敏感数据
 
-Platform secret store 拥有 OAuth、session、Agent-tool、Runtime、Firecrawl、Telegram，邮箱密码另在凭据行；Manager 文件拥有 registry 与独立 control/executor token，二者不整库互注。API 仅“已配置”；**无应用层静态加密**，靠宿主权限，不得宣称加密存储。产品 secret 不回退环境；fresh 可一次存 Manager 注入 session secret，之后只认持久值。secret 禁入文档、日志、Run metadata、release manifest、operation journal、Git。
+- Platform 的密钥库保存 OAuth、会话、Agent 工具、Runtime、Firecrawl 和 Telegram 的密钥；邮箱密码另存在凭据行里。Manager 的文件保存镜像仓库凭据和独立的 control/executor token。两边不互相整体注入。
+- API 只返回"是否已配置"。**没有应用层的静态加密**，依靠宿主机的文件权限，不能宣称"加密存储"。
+- 产品密钥不回退到环境变量；全新安装时可以一次性保存 Manager 注入的会话密钥，之后只认持久值。
+- 密钥不能出现在文档、日志、Run 元数据、发布清单、操作日志或 Git 中。
 
-OAuth账户目录∩Runtime锁定Pi的provider/API/endpoint/模型能力才可执行，推荐用交集账号顺序，不硬编码旧模型/退役名单或放行未知ID。取Token绑定provider+model+scope并实时复验，辅助独立复验；无session/metadata/事件/错误副本。容器仅所需secret，Sandbox不继承平台/Manager/registry/宿主环境；子进程最小环境，不整体透传。
+**模型 token**
 
-MCP环境值是用户选择的workspace数据，用户/Agent可读，Platform不当托管secret、不复制其它存储/提示/日志。有限JSON、argv无shell、当前workspace cwd、环境仅本次短命子进程；缺配置为空，坏/越界/协议/超时/输出越界失败，不找HOME/.claude。call审批脱敏后完整展示，禁深度/数量截断；键/值隐形/双向或超展示界先拒。Manager审计/保留/预览与Platform工作记录仅action/server/tool，不存可逆客户端载荷/原输出；server描述/annotations/结果/错误不授后续权限。
+- 只有"OAuth 账户目录"与"Runtime 锁定的 Pi 的供应商、API、端点和模型能力"的交集才可以执行；推荐模型按交集中账户给出的顺序，不硬编码旧模型或退役名单，也不放行未知 ID。
+- 取 token 时绑定供应商、模型和对话范围并实时复验，辅助模型独立复验；token 没有会话、元数据、事件或错误里的副本。
+- 容器只拿到它需要的密钥；沙箱不继承 Platform、Manager、镜像仓库或宿主机的环境；子进程使用最小环境，不整体透传。
+
+**MCP 环境变量**
+
+- 这是用户选择放在工作区里的数据，用户和 Agent 都能读到；Platform 不把它当作托管密钥，也不复制到其它存储、提示词或日志。
+- 使用有上限的 JSON 清单、不经 shell 的参数、当前工作区的工作目录，环境变量只给本次短生命周期的子进程。没有配置视为空；损坏、越界、协议错误、超时或输出超限都失败，不去 HOME 或 `.claude` 找配置。
+- 调用审批展示的是脱敏后的完整内容，禁止按深度或数量截断；键或值含隐形/双向字符、或超过展示上限时先拒绝。Manager 的审计、保留、预览和 Platform 的工作记录只保存 action/server/tool，不保存可逆的客户端载荷或原始输出。服务端的描述、注解、结果和错误不授予后续权限。
 
 ## 品牌输入与公开读取
 
-admin写+单调revision；公开仅名称、Agent名、规范主色、同源Logo URL、revision，无通用settings/时间/admin/路径/secret。名称限长、拒控制及Unicode行段分隔，入提示为闭合数据。
+- 只有管理员可以写入，版本号单调递增。公开读取只包含名称、Agent 名、规范的主色、同源 Logo 地址和版本号，不包含通用设置、时间、管理员、路径或密钥。
+- 名称限长，拒绝控制字符以及 Unicode 的行分隔和段分隔符；进入提示词时作为封闭的数据。
 
-Logo仅单张PNG/WebP：admin PUT持久化前完整解码，读正文/开解码器/解码后复验256 KiB、单边4096、总16,777,216像素。拒SVG/URL、截断/header-only/无IDAT、动画/多帧/重复bitstream、声明错/尾随/零尺寸/超界。匿名GET不解像素，仅严格base64、1..256 KiB、大小/SHA-256对metadata；损坏报服务端错误，白名单MIME+nosniff+ETag/公开缓存。Logo/revision同事务，公开快照不混版本。
+**Logo**
+
+- 只接受单张 PNG 或 WebP。管理员上传时，持久化之前完整解码，并在读取正文、打开解码器和解码之后都复验：不超过 256 KiB、单边不超过 4096、总像素不超过 16,777,216。
+- 拒绝 SVG 或网址、截断的文件、只有头部或没有 IDAT 的 PNG、动画或多帧、重复的比特流、声明错误、尾随数据、零尺寸和超出上限的图片。
+- 匿名读取时不解码像素，只检查严格的 base64、大小在 1 到 256 KiB 之间，并比对元数据里的大小和 SHA-256；损坏时报服务端错误。响应使用白名单 MIME、nosniff、ETag 和公开缓存。
+- Logo 和版本号在同一事务中写入，公开快照不会混用不同版本。
 
 ## 不可信内容与提示词注入
 
-用户/频道/品牌、网页/浏览器/HTML、邮件/MCP、记忆/历史/计划、Skill附件均不可信。Runtime统一重建文本块、闭合防伪边界/中和伪token，保留图片；短文/成功/错误/历史无豁免。旧web/browser/memory/mcp/session/session_search/search_files/schedule/skill结果缺envelope时仅内存重建，不改JSONL；仅Runtime当前标记Skill主指令有受控低优先级流程语义。
+- 以下内容都不可信：用户、频道和品牌信息，网页、浏览器和 HTML，邮件和 MCP，记忆、历史和计划，Skill 附件。
+- Runtime 统一重建文本块，用防伪造的边界封闭、中和伪造的标记，保留图片；短文本、成功结果、错误和历史都没有豁免。旧的工具结果缺少信封时，只在内存里重建，不改写 JSONL。只有 Runtime 当前标记的 Skill 主指令，具有受控的、低优先级的流程语义。
+- 系统提示词的分层只决定顺序、缓存和格式，不构成授权。对话范围、生命周期、目标和审批都来自闭合的结构和权威状态。
+- 缓存 key 只是"带版本的策略 + 工具 schema + 对话范围分片"的单向摘要，线上不含原始的账号、对话范围、会话、路径、正文或密钥，材料也不写日志；它不是身份、隔离、授权或完整性边界。
+- todo 的正文不可信，也不是密钥库；只有 Runtime 的 ID 和状态可以用作机械守卫。
 
-系统提示分层只决定顺序/cache/framing，不授权；scope/lifecycle/target/审批来自闭世界结构和权威状态。prompt_cache_key仅版本化策略+tool schema+scope分片单向摘要，线上无原账号/scope/session/path/正文/secret，材料不写日志；不是身份/隔离/授权/完整性边界。todo正文不可信、非secret store，仅Runtime id/state可作机械守卫。
+**写入和加载时的扫描**
 
-memory/Skill主指令/schedule prompt在写与加载/执行双边扫描：有界NFKC、隐形/双向、明确覆盖/角色劫持/提示泄露/凭据外传，不宣称全检。Skill全部内容写拒真实token/PAT、完整PEM私钥/实际Bearer，不能因说明/占位/无密钥示例误拒。
+- 记忆、Skill 主指令和计划提示词在写入时和加载/执行时都会扫描：有上限的 NFKC 规范化、隐形和双向字符、明确的指令覆盖、角色劫持、提示词泄露和凭据外传。扫描不宣称能发现所有问题。
+- Skill 的全部内容在写入时拒绝真实的 token/PAT、完整的 PEM 私钥和实际的 Bearer，但不能因为说明文字、占位符或不含密钥的示例而误拒。
 
-邮件唤醒仅只读mail账户/目录/搜索/正文及汇报，其余执行、文件、网络、浏览器、Skill、schedule、delegate、MCP、mail修改/附件保存调用前拒。review唯一Skill免审路径，Runtime tool+Platform action双白名单；完整主体、私有provenance、先读、lifecycle事务及预算见[学习复盘](data-memory-sessions.md#学习复盘)，文本不能伪造或取得其它执行/网络/凭据能力。
+**无人值守的限制**
+
+- 邮件唤醒的 Run 只能读取邮件账户、目录、搜索和正文并汇报；其它执行、文件、网络、浏览器、Skill、计划、委派、MCP、修改邮件和保存附件的调用都在执行前被拒绝。
+- 复盘是 Skill 唯一的免审批路径，同时受 Runtime 工具白名单和 Platform 动作白名单约束。完整主体、私有来源、"先读后改"、生命周期事务和预算见[学习复盘](data-memory-sessions.md#学习复盘)；文本内容不能伪造身份，也不能获得其它执行、网络或凭据能力。
 
 ## 电脑画面与呈现页
 
-只读scope投影非执行入口；文件/搜索有界脱敏纯文本，host正文/草稿不进预览。Codex草稿仅解析后累计参数，不转原始JSON fragment；未终结版统一脱敏+安全尾窗，Platform再脱敏/限大。登录派生scope并匹配当前Run/sandbox call/相对路径；[数据设计](data-memory-sessions.md#即时派生预览)定义寿命/禁持久化。
-
-HTML仅当前scope成功落盘HTML/HTM或授权附件，认证nosniff `/api/agent-previews/present` 单页返回，文件用 `/file`。iframe sandbox **无allow-same-origin**，无产品Cookie/父DOM；CSP禁父连接/表单/网络，仅data/blob及必要内联脚本样式。无workspace静态资源服务，相对外链失败预期；不授Camoufox接管/剪贴板/任意地址栏。
+- 电脑画面是只读的对话范围投影，不是执行入口。文件和搜索以有上限、脱敏的纯文本显示；宿主机的正文和草稿不进入预览。
+- Codex 草稿只使用解析后累计的参数，不转发原始 JSON 片段；未完成的版本统一脱敏并保留安全尾窗，Platform 再脱敏和限制大小。登录派生对话范围，并与当前 Run、沙箱调用和相对路径匹配。寿命和禁止持久化见[数据设计 · 即时派生预览](data-memory-sessions.md#即时派生预览)。
+- HTML 只来自当前对话范围里成功落盘的 HTML/HTM 或授权附件，通过认证、nosniff 的 `/api/agent-previews/present` 单页返回；文件内容用 `/file`。
+- iframe 的 sandbox **不带 allow-same-origin**，拿不到产品 Cookie 或父页面 DOM。CSP 禁止连接父页面、提交表单和网络请求，只允许 data/blob 以及必要的内联脚本和样式。没有工作区静态资源服务，相对路径的外链失败是预期行为。呈现页不授予 Camoufox 接管、剪贴板或任意地址栏。
 
 ## 浏览器接管与局域网
 
-租约仅当前scope/tab，登录派生Camoufox身份；客户端无user id/selector/脚本/内部URL，仅限幅鼠标/滚动/文本/按键。拖拽点数/时长有界、时间单调、CSS坐标，单sequence原子校验执行、重复不重放、异常finally mouse.up。
+**接管租约**
 
-root scope租约取得/释放、人工输入、Agent修改同串行门覆盖真实Camoufox调用；租约中Agent修改返回可重试冲突。触发Agent的新消息先等前端输入队列，再同门**入队前仅撤发送者本人的匹配root租约**；普通频道消息/他人租约无此能力。
+- 租约只针对当前对话范围和标签页，Camoufox 身份由登录派生。客户端不能指定用户 ID、选择器、脚本或内部网址，只能发送有幅度限制的鼠标、滚动、文本和按键。
+- 拖拽的点数和时长有上限，时间单调递增，使用 CSS 坐标；以单个顺序号原子地校验和执行，重复的不重放，出现异常时在 finally 中松开鼠标。
+- 根对话范围的租约取得和释放、人工输入、Agent 的修改，都在同一个串行门里覆盖真实的 Camoufox 调用；租约期间 Agent 的修改返回可重试的冲突。
+- 会触发 Agent 的新消息，先等待前端的输入队列清空，再在同一道门里**入队之前只撤销发送者本人对应的根租约**；普通频道消息和其他人的租约没有这个能力。
+- 结束、失焦、页面隐藏、到期、标签页变化或关闭、409 冲突时，立即回到只读并尽力取消和释放；服务端的到期和清理兜底。
+- 画面是逐次鉴权、经过维护门、有大小上限的同源二进制 GET，不增加绕过 Manager 的长连接；共享的 X 显示禁止 VNC 或 noVNC。
 
-结束/失焦/隐藏/到期/tab变化关闭/409立即只读并尽力取消释放，服务端到期/cleanup兜底。画面逐请求鉴权/维护门/大小界同源二进制GET，不增绕Manager长连接；共享X display禁VNC/noVNC。
+**局域网访问**
 
-LAN默认关，仅明确私网/回环IP，拒通配/公网；RemoteAddr+显式CIDR准入，丢不可信转发头后重建。推荐DNS/TLS反代Manager回环；显式明文显示风险、不声称secure-context通知。
+- 默认关闭；只接受明确的私网或回环 IP，拒绝通配地址和公网地址。
+- 准入依据 RemoteAddr 加显式的 CIDR 列表；丢弃不可信的转发头后重建。
+- 推荐用带 DNS 和 TLS 的反向代理指向 Manager 的回环地址。显式开启明文访问时要显示风险，不能声称满足安全上下文（例如浏览器通知的要求）。
 
 ## 安全变更要求
 
-安全边界变更先更新对应规范并保留真实滥用/恢复验证。跨层值引用[runtime-policy.json](../contracts/runtime-policy.json)、[container-platform.json](../contracts/container-platform.json)，验证入口见[测试](../development/testing.md)。
+- 修改安全边界时先更新对应的规范，并保留真实的滥用和恢复验证。
+- 跨层的数值引用 [runtime-policy.json](../contracts/runtime-policy.json) 和 [container-platform.json](../contracts/container-platform.json)；验证入口见[测试](../development/testing.md)。

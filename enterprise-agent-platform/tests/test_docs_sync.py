@@ -45,178 +45,6 @@ class DocsSyncTests(unittest.TestCase):
         self.git("init", "--quiet")
 
     @staticmethod
-    def manifest() -> dict[str, object]:
-        return {
-            "version": 3,
-            "coverage": {
-                "code_include": [
-                    ".gitignore",
-                    ".github/**",
-                    "manager/**",
-                    "scripts/**",
-                    "src/*.py",
-                    "enterprise-agent-platform/pyproject.toml",
-                    "enterprise-agent-platform/enterprise_agent_platform/**",
-                    "enterprise-agent-platform/agent-runtime/**",
-                    "enterprise-agent-platform/camofox-runtime/**",
-                    "enterprise-agent-platform/frontend/**",
-                ],
-                "code_exclude": [
-                    "enterprise-agent-platform/agent-runtime/test/**",
-                    "enterprise-agent-platform/frontend/src/**/*.test.ts",
-                    "enterprise-agent-platform/frontend/src/**/*.test.tsx",
-                ],
-                "document_include": [
-                    "docs/design/*.md",
-                    "docs/contracts/*.json",
-                    "docs/domains.json",
-                ],
-                "document_exclude": [],
-            },
-            "domains": [
-                {
-                    "id": "documentation-governance",
-                    "documents": ["docs/design/governance.md", "docs/domains.json"],
-                    "code": ["scripts/**"],
-                    "tests": [],
-                },
-                {
-                    "id": "repository-development",
-                    "documents": ["docs/design/repository.md"],
-                    "code": [".gitignore", ".github/**"],
-                    "tests": [],
-                },
-                {
-                    "id": "deployment",
-                    "documents": ["docs/design/deployment.md"],
-                    "code": ["manager/**"],
-                    "tests": [],
-                },
-                {
-                    "id": "security-and-trust",
-                    "documents": ["docs/design/security.md"],
-                    "code": ["manager/internal/executor/runtime_policy_generated.go"],
-                    "tests": [],
-                },
-                {
-                    "id": "integrations",
-                    "documents": ["docs/design/integrations.md"],
-                    "code": [
-                        "enterprise-agent-platform/enterprise_agent_platform/bundled_skills/**",
-                        "enterprise-agent-platform/camofox-runtime/**",
-                    ],
-                    "tests": [],
-                },
-                {
-                    "id": "platform",
-                    "documents": ["docs/design/feature.md"],
-                    "code": [
-                        "enterprise-agent-platform/pyproject.toml",
-                        "src/*.py",
-                        "enterprise-agent-platform/enterprise_agent_platform/**/*.py",
-                    ],
-                    "tests": ["tests/test_feature.py"],
-                },
-                {
-                    "id": "agent-runtime",
-                    "documents": ["docs/design/runtime.md"],
-                    "code": ["enterprise-agent-platform/agent-runtime/**"],
-                    "tests": [],
-                },
-                {
-                    "id": "frontend",
-                    "documents": ["docs/design/frontend.md"],
-                    "code": ["enterprise-agent-platform/frontend/**"],
-                    "tests": [],
-                },
-            ],
-            "contracts": [
-                {
-                    "id": "container-platform",
-                    "source": "docs/contracts/container-platform.json",
-                    "domains": [
-                        "deployment",
-                        "platform",
-                        "agent-runtime",
-                        "frontend",
-                    ],
-                    "targets": [
-                        {
-                            "path": "manager/internal/contract/generated.go",
-                            "format": "go-container-platform",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py",
-                            "format": "python-container-platform",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts",
-                            "format": "typescript-container-platform",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/frontend/src/container-contract.generated.ts",
-                            "format": "typescript-container-platform",
-                        },
-                    ],
-                },
-                {
-                    "id": "upstream-sources",
-                    "source": "docs/contracts/upstream-sources.json",
-                    "domains": ["integrations", "platform"],
-                    "targets": [],
-                },
-                {
-                    "id": "technical-profiles",
-                    "source": "docs/contracts/technical-profiles.json",
-                    "domains": ["deployment", "platform", "agent-runtime"],
-                    "targets": [
-                        {
-                            "path": "manager/internal/identity/technical_profiles_generated.go",
-                            "format": "go-technical-profiles",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py",
-                            "format": "python-technical-profiles",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts",
-                            "format": "typescript-technical-profile",
-                        },
-                    ],
-                },
-                {
-                    "id": "runtime-policy",
-                    "source": "docs/contracts/runtime-policy.json",
-                    "domains": [
-                        "deployment",
-                        "security-and-trust",
-                        "platform",
-                        "agent-runtime",
-                        "frontend",
-                    ],
-                    "targets": [
-                        {
-                            "path": "manager/internal/executor/runtime_policy_generated.go",
-                            "format": "go-runtime-policy",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py",
-                            "format": "python-runtime-policy",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts",
-                            "format": "typescript-runtime-policy",
-                        },
-                        {
-                            "path": "enterprise-agent-platform/frontend/src/design-contract.generated.ts",
-                            "format": "typescript-runtime-policy",
-                        },
-                    ],
-                }
-            ],
-        }
-
-    @staticmethod
     def contract() -> dict[str, object]:
         return {
             "schema_version": 1,
@@ -251,25 +79,8 @@ class DocsSyncTests(unittest.TestCase):
             },
         }
 
-    @staticmethod
-    def manifest_domain(manifest: dict[str, object], identifier: str) -> dict[str, object]:
-        return next(
-            domain
-            for domain in manifest["domains"]  # type: ignore[index]
-            if domain["id"] == identifier
-        )
-
-    @staticmethod
-    def manifest_contract(manifest: dict[str, object], identifier: str) -> dict[str, object]:
-        return next(
-            contract
-            for contract in manifest["contracts"]  # type: ignore[index]
-            if contract["id"] == identifier
-        )
-
-    def write_fixture(self, manifest: dict[str, object] | None = None) -> None:
+    def write_fixture(self) -> None:
         files: dict[str, str] = {
-            "docs/domains.json": json.dumps(manifest or self.manifest(), indent=2) + "\n",
             "docs/contracts/runtime-policy.json": json.dumps(self.contract(), indent=2) + "\n",
             "docs/contracts/technical-profiles.json": (
                 REPOSITORY_ROOT / "docs/contracts/technical-profiles.json"
@@ -389,14 +200,14 @@ class DocsSyncTests(unittest.TestCase):
             )
             + "\n",
             "docs/design/feature.md": "# Feature\n\nThe current feature design.\n",
-            "docs/design/governance.md": "# Governance\n\nThe documentation policy.\n",
-            "docs/design/repository.md": "# Repository\n\nThe repository policy.\n",
+                        "docs/design/repository.md": "# Repository\n\nThe repository policy.\n",
             "docs/design/deployment.md": "# Deployment\n\nThe deployment policy.\n",
             "docs/design/security.md": "# Security\n\nThe security policy.\n",
             "docs/design/integrations.md": "# Integrations\n\nThe integration policy.\n",
             "docs/design/runtime.md": "# Runtime\n\nThe current runtime design.\n",
             "docs/design/frontend.md": "# Frontend\n\nThe current frontend design.\n",
             "docs/README.md": "# Docs\n\n[Feature](design/feature.md)\n",
+            "AGENTS.md": "# Agents\n\n[Docs](docs/README.md)\n",
             "README.md": "# Project\n\n[Docs](docs/README.md)\n",
             "enterprise-agent-platform/README.md": "# Platform\n\n[Docs](../docs/README.md)\n",
             "enterprise-agent-platform/agent-runtime/README.md": "# Runtime\n\n[Docs](../../docs/README.md)\n",
@@ -461,7 +272,7 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("target must not be executable", executable.stderr)
         self.run_command("sync", expect=0)
 
-    def test_check_rejects_broken_link_and_unmapped_code(self) -> None:
+    def test_check_rejects_broken_links_and_missing_heading_anchors(self) -> None:
         self.initialize_git()
         self.write_fixture()
         self.run_command("sync", expect=0)
@@ -470,15 +281,27 @@ class DocsSyncTests(unittest.TestCase):
         feature.write_text("# Feature\n\n[Missing](missing.md)\n", encoding="utf-8")
         broken = self.run_command("check", expect=1)
         self.assertIn("broken relative link", broken.stderr)
-        feature.write_text("# Feature\n", encoding="utf-8")
 
-        manifest = self.manifest()
-        manifest["coverage"]["code_include"].append("unowned/*.py")  # type: ignore[index,union-attr]
-        (self.root / "docs/domains.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        (self.root / "unowned").mkdir()
-        (self.root / "unowned/new.py").write_text("VALUE = 2\n", encoding="utf-8")
-        unmapped = self.run_command("check", expect=1)
-        self.assertIn("covered production path has no documentation domain", unmapped.stderr)
+        runtime = self.root / "docs/design/runtime.md"
+        runtime.write_text("# Runtime\n\n## 会话与压缩\n\n## Run 状态机\n\n## Run 状态机\n", encoding="utf-8")
+        feature.write_text(
+            "# Feature\n\n"
+            "[ok](runtime.md#会话与压缩) [ok](runtime.md#run-状态机) [dup](runtime.md#run-状态机-1) "
+            "[self](#feature) [code](runtime.md)\n",
+            encoding="utf-8",
+        )
+        self.run_command("check", expect=0)
+
+        feature.write_text("# Feature\n\n[gone](runtime.md#会话压缩)\n", encoding="utf-8")
+        missing = self.run_command("check", expect=1)
+        self.assertIn("missing heading anchor: runtime.md#会话压缩", missing.stderr)
+
+        feature.write_text("# Feature\n\n[self](#nowhere)\n", encoding="utf-8")
+        self_missing = self.run_command("check", expect=1)
+        self.assertIn("missing heading anchor: #nowhere", self_missing.stderr)
+
+        feature.write_text("# Feature\n\n```md\n[fenced](runtime.md#nowhere)\n```\n", encoding="utf-8")
+        self.run_command("check", expect=0)
 
     def test_check_rejects_invalid_contract_bounds(self) -> None:
         self.initialize_git()
@@ -627,33 +450,6 @@ class DocsSyncTests(unittest.TestCase):
         self.run_command("check", expect=0)
 
 
-    def test_native_go_tests_do_not_satisfy_production_code_coverage(self) -> None:
-        self.ready_repository()
-        fixture = self.root / "manager/internal/example/helper_test.go"
-        fixture.parent.mkdir(parents=True)
-        fixture.write_text("package example\n\nconst fixture = 1\n", encoding="utf-8")
-        self.run_command("check", expect=0)
-
-        manifest_path = self.root / "docs/domains.json"
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.manifest_domain(manifest, "deployment")["code"].append("manager/internal/example/*")
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        result = self.run_command("check", expect=1)
-        self.assertIn(
-            "code pattern matches no covered production files: manager/internal/example/*",
-            result.stderr,
-        )
-
-    def test_current_tree_does_not_count_deleted_code_or_test_files(self) -> None:
-        self.ready_repository()
-        (self.root / "src/main.py").unlink()
-        (self.root / "src/keep.py").unlink()
-        (self.root / "tests/test_feature.py").unlink()
-
-        result = self.run_command("check", expect=1)
-        self.assertIn("code pattern matches no covered production files: src/*.py", result.stderr)
-        self.assertIn("test pattern matches no files: tests/test_feature.py", result.stderr)
-
     def test_entry_readmes_are_link_checked(self) -> None:
         self.ready_repository()
         (self.root / "README.md").write_text("# Project\n\n[Missing](missing.md)\n", encoding="utf-8")
@@ -661,25 +457,25 @@ class DocsSyncTests(unittest.TestCase):
         result = self.run_command("check", expect=1)
         self.assertIn("README.md has a broken relative link", result.stderr)
 
-    def test_manifest_and_canonical_documents_reject_symlinks(self) -> None:
+    def test_contract_sources_and_documents_reject_symlinks(self) -> None:
         self.ready_repository()
-        manifest_path = self.root / "docs/domains.json"
-        manifest_copy = self.root / "manifest-copy.json"
-        manifest_copy.write_text(manifest_path.read_text(encoding="utf-8"), encoding="utf-8")
-        manifest_path.unlink()
-        manifest_path.symlink_to(manifest_copy)
-        manifest_result = self.run_command("check", expect=1)
-        self.assertIn("documentation manifest must not use symlinks", manifest_result.stderr)
+        source = self.root / "docs/contracts/runtime-policy.json"
+        source_copy = self.root / "runtime-policy-copy.json"
+        source_copy.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        source.unlink()
+        source.symlink_to(source_copy)
+        source_result = self.run_command("check", expect=1)
+        self.assertIn("source must not use symlinks", source_result.stderr)
 
-        manifest_path.unlink()
-        manifest_path.write_text(manifest_copy.read_text(encoding="utf-8"), encoding="utf-8")
+        source.unlink()
+        source.write_text(source_copy.read_text(encoding="utf-8"), encoding="utf-8")
         document = self.root / "docs/design/feature.md"
         document_copy = self.root / "feature-copy.md"
         document_copy.write_text(document.read_text(encoding="utf-8"), encoding="utf-8")
         document.unlink()
         document.symlink_to(document_copy)
         document_result = self.run_command("check", expect=1)
-        self.assertIn("document must not use symlinks", document_result.stderr)
+        self.assertIn("documentation file must not be a symlink", document_result.stderr)
 
     def test_sync_never_overwrites_a_generated_target_symlink(self) -> None:
         self.ready_repository()
@@ -729,98 +525,6 @@ class DocsSyncTests(unittest.TestCase):
         self.assertIn("must not use symlinks", parent_result.stderr)
         self.assertFalse((redirected_parent / frontend_target.name).exists())
 
-    def test_manifest_requires_minimum_owned_coverage(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        manifest["coverage"]["code_include"].remove(".gitignore")  # type: ignore[index]
-        self.write_fixture(manifest)
-
-        result = self.run_command("sync", expect=1)
-        self.assertIn("coverage must include owned production probes", result.stderr)
-        self.assertIn(".gitignore", result.stderr)
-
-
-    def test_manifest_probes_require_their_design_domain_owners(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        runtime = self.manifest_domain(manifest, "agent-runtime")
-        runtime["code"] = [
-            "enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts"
-        ]
-        self.write_fixture(manifest)
-
-        result = self.run_command("sync", expect=1)
-        self.assertIn("owned production probe", result.stderr)
-        self.assertIn("agent-runtime/package-lock.json", result.stderr)
-        self.assertIn("agent-runtime", result.stderr)
-
-    def test_manifest_keeps_documents_sources_and_targets_in_their_categories(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        platform = self.manifest_domain(manifest, "platform")
-        platform["documents"][0] = "README.md"  # type: ignore[index]
-        self.write_fixture(manifest)
-        outside_docs = self.run_command("sync", expect=1)
-        self.assertIn("documents must stay under docs/", outside_docs.stderr)
-
-        manifest = self.manifest()
-        self.manifest_contract(manifest, "runtime-policy")["source"] = "docs/runtime-policy.json"
-        self.write_fixture(manifest)
-        outside_contracts = self.run_command("sync", expect=1)
-        self.assertIn("source must stay under docs/contracts/", outside_contracts.stderr)
-
-        manifest = self.manifest()
-        manifest["coverage"]["code_exclude"].append(  # type: ignore[index]
-            "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py"
-        )
-        self.write_fixture(manifest)
-        uncovered_target = self.run_command("sync", expect=1)
-        self.assertIn("contract target must be covered production code", uncovered_target.stderr)
-
-        manifest = self.manifest()
-        platform = self.manifest_domain(manifest, "platform")
-        platform["tests"].append("docs/design/feature.md")  # type: ignore[union-attr]
-        self.write_fixture(manifest)
-        masquerading_document = self.run_command("sync", expect=1)
-        self.assertIn("canonical document cannot masquerade", masquerading_document.stderr)
-
-    def test_contract_target_owner_and_document_coverage_are_enforced(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        manifest["domains"].append(  # type: ignore[union-attr]
-            {
-                "id": "observer",
-                "documents": ["docs/design/observer.md"],
-                "code": [
-                    "enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py"
-                ],
-                "tests": [],
-            }
-        )
-        self.write_fixture(manifest)
-        outside_owner = self.run_command("sync", expect=1)
-        self.assertIn("is owned outside contract runtime-policy", outside_owner.stderr)
-
-        manifest = self.manifest()
-        manifest["coverage"]["document_include"].remove("docs/contracts/*.json")  # type: ignore[index]
-        self.write_fixture(manifest)
-        uncovered_source = self.run_command("sync", expect=1)
-        self.assertIn("contract source must be covered", uncovered_source.stderr)
-
-    def test_runtime_policy_domains_and_targets_are_fixed(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        self.manifest_contract(manifest, "runtime-policy")["domains"] = ["platform", "agent-runtime"]
-        self.write_fixture(manifest)
-        domains = self.run_command("sync", expect=1)
-        self.assertIn("runtime-policy domains must be exactly", domains.stderr)
-
-        manifest = self.manifest()
-        self.manifest_contract(manifest, "runtime-policy")["targets"][0]["path"] = "src/generated.py"  # type: ignore[index]
-        self.write_fixture(manifest)
-        targets = self.run_command("sync", expect=1)
-        self.assertIn("runtime-policy targets and formats must match", targets.stderr)
-
     def test_upstream_source_contract_rejects_floating_or_credentialed_sources(self) -> None:
         self.initialize_git()
         self.write_fixture()
@@ -868,34 +572,6 @@ class DocsSyncTests(unittest.TestCase):
 
         invalid = self.run_command("sync", expect=1)
         self.assertIn("sources must be exactly: firecrawl", invalid.stderr)
-
-    def test_upstream_source_contract_rejects_generated_targets(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        self.manifest_contract(manifest, "upstream-sources")["targets"] = [
-            {
-                "path": "src/generated.py",
-                "format": "python-runtime-policy",
-            }
-        ]
-        self.write_fixture(manifest)
-
-        result = self.run_command("sync", expect=1)
-
-        self.assertIn("must not define generated targets", result.stderr)
-
-    def test_each_code_and_test_pattern_must_match_a_real_corresponding_file(self) -> None:
-        self.initialize_git()
-        manifest = self.manifest()
-        platform = self.manifest_domain(manifest, "platform")
-        platform["code"].append("src/missing.py")  # type: ignore[union-attr]
-        platform["tests"].append("tests/test_missing.py")  # type: ignore[union-attr]
-        self.write_fixture(manifest)
-        self.run_command("sync", expect=0)
-
-        result = self.run_command("check", expect=1)
-        self.assertIn("code pattern matches no covered production files: src/missing.py", result.stderr)
-        self.assertIn("test pattern matches no files: tests/test_missing.py", result.stderr)
 
     def test_runtime_contract_requires_positive_guards_and_safe_milliseconds(self) -> None:
         self.initialize_git()

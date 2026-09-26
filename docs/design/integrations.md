@@ -1,106 +1,169 @@
 # 外部集成
 
-配置入口见[配置参考](../reference/configuration.md)，wire 形状见 [Runtime API](../reference/runtime-api.md)。
+配置入口见[配置参考](../reference/configuration.md)，接口字段见 [Runtime API](../reference/runtime-api.md)。
 
 ## 能力与调用边界
 
-| 能力 | 所有者 | 输入 → 输出 | 权限 | 失败 |
+| 能力 | 负责方 | 输入 → 输出 | 权限 | 失败时 |
 |---|---|---|---|---|
-| OAuth | Platform／Runtime | 授权 → 模型／Token | 同代交集 | 拒绝回退 |
-| 搜索／提取 | Platform／SearXNG／Firecrawl | query／URL → 搜索项／正文 | 公开 HTTP(S) | warning／error |
-| 浏览器 | Platform／Camoufox | scope/tab → 页面／交互 | 内网信任、租约互斥 | degraded |
-| Telegram | Platform Gateway | 私聊 ↔ 消息／投递 | 绑定用户 | 去重／复核 |
-| 邮箱 | Platform | IMAP/SMTP ↔ mail／唤醒 | 私人主 Agent | checkpoint／幂等 |
-| 计划 | Platform | 时间定义 → occurrence | 私人主 Agent | 原子暂停 |
-| Skill | Platform | 工作区包 → 索引／正文 | 来源／生命周期 | 越权拒绝 |
-| MCP | Runtime／Manager／Sandbox | stdio → 结果 | call 逐次审批 | 不 fallback |
+| 模型 OAuth | Platform、Runtime | 授权 → 模型和 token | 同一代凭据下的目录交集 | 拒绝，不回退 |
+| 搜索与提取 | Platform、SearXNG、Firecrawl | 查询或网址 → 搜索结果或正文 | 仅公开 HTTP(S) | 返回警告或错误 |
+| 浏览器 | Platform、Camoufox | 对话与标签页 → 页面和交互 | 内网按信任策略，人工接管与 Agent 互斥 | 降级 |
+| Telegram | Platform 网关 | 私聊 ↔ 消息和投递 | 已绑定的用户 | 去重，结果未知时复核 |
+| 邮箱 | Platform | IMAP/SMTP ↔ 邮件和唤醒 | 个人主 Agent | 检查点、幂等 |
+| 计划 | Platform | 时间定义 → 每次执行 | 个人主 Agent | 原子暂停 |
+| Skill | Platform | 工作区的包 → 索引和正文 | 按来源和生命周期 | 越权则拒绝 |
+| MCP | Runtime、Manager、沙箱 | stdio → 结果 | 每次调用单独审批 | 不找备用路径 |
 
-Gateway 身份、owner、scope、lifecycle、来源消息只取可信 Run context，模型不能覆盖；MCP 不走 Python Gateway。root／delegate／scheduled／email／review 准入见 [Runtime](agent-runtime.md)。计划支持 once／interval／cron，不替代进程等待；无人值守 recurring Run 仅以空参数 `continue_current/complete_current` 决定本 occurrence，不能任意改计划，原子暂停见[数据设计](data-memory-sessions.md)。
+- 网关里的身份、所有者、对话范围、生命周期和来源消息只从可信的 Run 上下文取得，模型不能覆盖。MCP 不经过 Python 网关。
+- 顶层、委派、计划、邮件和复盘 Run 的准入见 [Runtime](agent-runtime.md)。
+- 计划支持一次性、间隔和 cron，不能替代进程等待。无人值守的周期 Run 只能用空参数的 `continue_current` 或 `complete_current` 决定本次执行，不能随意修改计划；原子暂停见[数据设计](data-memory-sessions.md)。
 
 ## 发布与通用原则
 
-Manager 独占固定服务 URL／启动／重试／重启，Platform 无安装／重启 API，只消费注入 URL 和实际健康探测；SQLite manage／URL／command／repo 不参与解析。开发同用外部 Compose/Manager，HTTP 替身不建第二生命周期。
-
-[上游契约](../contracts/upstream-sources.json)锁定 URL/revision，CI 隔离验证构建，部署机只拉 digest、不留 checkout。无 Firecrawl gitlink／vendored tree／镜像副本，临时 checkout 不承载修改；适配属 Platform／Runtime／Manager，浏览器补丁属 `camofox-runtime/`，升级先改契约并验证镜像。Docker socket／bind mount／中性身份／镜像闭集见[部署](../operations/deployment.md)，迁移例外见[数据布局](../reference/data-layout.md)。
-
-集成包描述、OCI/release 元数据、HTTP User-Agent 与审计前缀使用固定中性技术名称，不含源码维护方／部署方品牌，也不从管理员展示品牌派生。
-
-失败只降级该能力，不损坏消息／任务／工作区；撤回不撤销已提交输入。更新预约阻止邮件、Telegram、计划、学习、恢复 Agent job；候选只读检查不解锁，匹配 operation 的 Gate 释放后才从 checkpoint 恢复。
+- 固定服务的地址、启动、重试和重启全部由 Manager 负责。Platform 没有安装或重启服务的 API，只使用注入的地址和真实的健康探测；数据库里的管理项、地址、命令或仓库都不参与解析。开发环境也使用同样的外部 Compose 和 Manager；HTTP 替身不另建一套生命周期。
+- [上游契约](../contracts/upstream-sources.json)锁定每个上游的地址和版本。CI 在隔离环境中验证并构建镜像；部署机只按摘要拉取镜像，不保留源码。
+- 仓库里没有 Firecrawl 的子模块、内置源码或镜像副本，临时源码不承载修改。适配代码属于 Platform、Runtime 或 Manager；浏览器补丁放在 `camofox-runtime/`。升级上游先改契约，再验证镜像。
+- Docker 访问、目录挂载、中性身份和固定镜像集合见[部署](../operations/deployment.md)；迁移例外见[数据布局](../reference/data-layout.md)。
+- 集成包描述、镜像和发布元数据、HTTP User-Agent 和审计前缀都使用固定的中性技术名称，不带源码维护方或部署方的品牌，也不从管理员设置的品牌派生。
+- 集成失败只降级该项能力，不损坏消息、任务或工作区。撤回消息不会撤销已经提交给 AI 的输入。
+- 更新预约生效后，邮件、Telegram、计划、学习和恢复中的 Agent 任务都暂停；候选版本的只读检查不解锁，只有与本次操作匹配的准入释放后，才从检查点恢复。
 
 ## 模型 OAuth
 
-Codex（ChatGPT OAuth）是唯一模型供应商，使用设备码授权；Platform 负责会话／交换／刷新／导入导出／持久化。Grok OAuth 已退役：启动时删除其凭据、provider 选择和凭据 revision，曾以 Grok 运行的部署把部署及账号模型选择恢复为自动；旧导出文件中的 Grok 凭据和 `active_provider` 在导入时忽略。产品凭据只读 secret 行，OAuth／Telegram／邮箱凭据与浏览器 Cookie 不互代续期／过期。
+- Codex（ChatGPT OAuth）是唯一的模型供应商，使用设备码授权。Platform 负责授权会话、兑换、刷新、导入导出和持久化。
+- Grok OAuth 已退役：启动时删除它的凭据、供应商选择和凭据版本号；曾经使用 Grok 的部署，部署级和账号级的模型选择恢复为"自动"。旧导出文件里的 Grok 凭据和 `active_provider` 在导入时被忽略。
+- 产品凭据只从密钥表读取。OAuth、Telegram、邮箱凭据和浏览器 Cookie 各自独立，不互相代替续期或过期。
 
-- 同 provider 的 access token／refresh token／expiry／可选身份 token 完整验证后同一 SQLite 事务提交，刷新／导入／交互完成共用原子边界；失败留原组，不混写、不盲重试已消费授权码。
-- 可执行集合只来自锁定 Pi 的 provider／API／endpoint／模型能力，可用集合只来自供应商账号，必须求交。当前凭据从未成功发现目录即不可用，仅同凭据最近成功目录可 stale；无硬编码 ID／退役表／版本／辅助优先级。视觉辅助按同 provider 输入能力枚举，以自己的 model ID 复验。
-- 单调凭据 generation 绑定返回 Token 与放行目录，换号／刷新后重取一致快照；不拼旧 Token／新目录，不持有 auth lock 等待需该锁的目录 single-flight，Token 不进 session／metadata／事件。
-- Codex 按 priority 顺序，交集首项推荐，Runtime 不重排。自动／显式值见[配置](../reference/configuration.md#runtime-与模型)；OAuth 卡分别标推荐模型／可用数量。
+**凭据提交**
 
-Codex 草稿与 `prompt_cache_key` 见 [Runtime](agent-runtime.md)：不扩 OAuth scope／凭据／目录／连接，不增部署持久状态，不以缓存命中作为 readiness。
+- 同一供应商的 access token、refresh token、过期时间和可选的身份 token 全部验证通过后，在同一个 SQLite 事务中提交。刷新、导入和交互授权完成共用这个原子边界。失败时保留原来的整组凭据，不混写，也不盲目重试已经用过的授权码。
+
+**可用模型**
+
+- "可执行的模型"只来自锁定版本 Pi 的供应商、API、端点和模型能力；"可用的模型"只来自供应商账号。两者必须取交集。
+- 当前凭据从未成功获取过目录时，视为不可用；只有同一凭据最近一次成功获取的目录可以作为过期数据继续使用。代码里不硬编码模型 ID、退役列表、版本或辅助模型优先级。
+- 视觉辅助模型按同一供应商的输入能力选择，并用它自己的模型 ID 复验。
+- 凭据有单调递增的代号（generation），返回的 token 和放行的目录都绑定这个代号。换号或刷新后重新取一致的快照，不能把旧 token 和新目录拼在一起。等待目录请求时不能持有它需要的认证锁。token 不写入会话、元数据或事件。
+- Codex 按供应商给出的优先级排序，交集中的第一个是推荐模型，Runtime 不重新排序。"自动"和显式选择见[配置 · Runtime 与模型](../reference/configuration.md#runtime-与模型)；OAuth 卡片分别显示推荐模型和可用数量。
+- Codex 草稿和提示词缓存见 [Runtime](agent-runtime.md)：它们不扩大 OAuth 权限、凭据、目录或连接，不增加部署的持久状态，缓存命中也不是就绪条件。
 
 ## SearXNG 搜索
 
-直连受管 JSON `/search`，不经 Firecrawl；固定 general，可带语言／页码。预算内翻页，过滤重复／格式错误／本地／敏感参数 URL。输出标题／URL／描述／稳定位置，不自动抓正文；部分源失败保留结果＋warning。镜像、部署 UID/GID、完整只读配置挂载见[部署](../operations/deployment.md)。
+- 直接请求受管的 JSON `/search` 接口，不经过 Firecrawl。固定使用 general 类别，可以带语言和页码。
+- 在预算内翻页；过滤重复、格式错误、本地地址和带敏感参数的网址。
+- 输出标题、网址、描述和稳定的位置，不自动抓取正文。部分搜索源失败时保留已有结果并附带警告。
+- 镜像、部署用户的 UID/GID、只读配置挂载见[部署](../operations/deployment.md)。
 
 ## Firecrawl 提取
 
-`web extract` 请求 `/v1/scrape` 的 markdown／HTML，优先 markdown，按预算裁剪。原始／最终 URL 均做公开 URL＋DNS SSRF 校验；带 Platform secret key 的请求拒绝重定向，key 不进 URL／Compose／journal。仅 PostgreSQL 队列，无 FoundationDB；服务集／镜像／HTTP readiness 见[部署](../operations/deployment.md)。
+- `web extract` 请求 `/v1/scrape` 的 markdown 和 HTML，优先使用 markdown，并按预算裁剪。
+- 原始网址和最终网址都要经过公开网址和 DNS 的 SSRF 校验。带有 Platform 密钥的请求禁止跟随重定向；密钥不出现在网址、Compose 或日志里。
+- 只使用 PostgreSQL 队列，不使用 FoundationDB。服务集、镜像和 HTTP 就绪检查见[部署](../operations/deployment.md)。
 
 ## Camoufox 浏览器
 
-镜像含平台补丁、Playwright Core、锁定浏览器、Xvfb/headless，不读宿主 `DISPLAY`。`version.json` 记录真实锁定 release，不用资产名 `alpha.*`；server／camoufox-js 共用持久 cache。Profile／Cookie／下载／trace 按 scope 哈希隔离，模型不能指定 user id／profile／session key。
-
-私有 API 可 `0.0.0.0`，pinning proxy 仅 loopback、不得复用 bind host。采用[安全设计](security-and-trust.md)的内网策略：字面地址／DNS／子资源同分类，mapped IPv6 先还原 IPv4，未指定／多播／保留／不可路由目标拒绝，普通 loopback／私网／ULA 不变；响应后取消仍终止上游流、释放 socket。
-
-支持 tab／导航／snapshot／截图/vision／链接／图片／下载列表／提取／交互，console 无任意 JS。预览不启动／建 tab／导航／切 tab，无新增端口／WS／共享 X/VNC。人工租约与 Agent 变更按 root scope 互斥，冲突可重试、截图继续；身份／sequence／轨迹最终抬键见安全设计，JPEG／发送／退出见[前端](frontend.md#浏览器接管与发送)。Office/PDF／沙箱 HTML 是 Platform 本地派生，不是外部转换服务。
+- 镜像包含平台补丁、Playwright Core、锁定版本的浏览器和虚拟显示，不读取宿主机的 `DISPLAY`。`version.json` 记录真实锁定的发布版本，不用资产名里的 `alpha.*`；服务端和客户端共用持久缓存。
+- Profile、Cookie、下载和追踪记录按对话范围的哈希隔离；模型不能指定用户 ID、Profile 或会话 key。
+- 私有 API 可以监听 `0.0.0.0`；地址固定代理只监听本机回环，不能复用监听地址。
+- 采用[安全设计](security-and-trust.md)的内网策略：直接地址、DNS 解析结果和页面子资源按同样规则分类；IPv4 映射的 IPv6 地址先还原；未指定、多播、保留和不可路由的地址拒绝；普通的本机、私网和 ULA 地址不受影响。响应开始后取消请求，仍要终止上游流并释放连接。
+- 支持标签页、导航、页面快照、截图和视觉识别、链接、图片、下载列表、提取和交互；控制台不能执行任意 JS。
+- 预览不会启动浏览器、创建、导航或切换标签页，也没有新增端口、WebSocket 或共享的显示/VNC。
+- 人工接管和 Agent 的修改按根对话范围互斥：冲突时可以重试，截图照常进行。身份、顺序号和"轨迹结束一定松开按键"见安全设计；画面刷新、发送和退出见[前端 · 浏览器接管](frontend.md#浏览器接管与发送)。
+- Office/PDF 预览和沙箱中的 HTML 是 Platform 在本地派生的，不是外部转换服务。
 
 ## 不可信内容
 
-外部成功／错误文本均进防伪闭合 `untrusted_tool_result`，中和假标签、保留图片。长期指令双边界扫描／NFKC／Unicode／最小 secret 注入见[安全设计](security-and-trust.md)，不以扫描替代结构化边界或按关键词删普通网页。
+- 外部工具返回的成功和错误文本，都放进防伪造的 `untrusted_tool_result` 边界内：中和伪造的标签，保留图片。
+- 长期指令的双边界扫描、NFKC 和 Unicode 处理、最小化注入密钥的规则见[安全设计](security-and-trust.md)。扫描不能替代结构化边界，也不能按关键词删除普通网页内容。
 
 ## Skill 学习边界
 
-Run 只见有界索引，正文／附件须显式 `load/read`。用户包在 `/workspace/.agent-platform/skills/<skill-id>/`；合法 `SKILL.md`＋支持目录通过路径／大小／frontmatter／注入／凭据校验后，首次扫描原子登记 `user-owned + active + enabled`，不因缺私有 sidecar 拒绝。每次读盘，索引下一 Run 重建，不半轮改已发送 schema／提示前缀。
+**读取**
 
-预置层只读；复盘仅新建私有 Skill 或同次已读后精确 patch 自建、未置顶、active/enabled Skill，不删除／停用。非 Sandbox 可信来源、缺失旧状态按 user 失败关闭和提交时 lifecycle／账号／job／预算复验由[数据设计](data-memory-sessions.md#技能数据)定义，用户／预置／归档／停用 Skill 不得自动改写。
+- Run 只看得到有长度上限的索引；正文和附件必须显式 `load` 或 `read`。
+- 用户包放在 `/workspace/.agent-platform/skills/<skill-id>/`。合法的 `SKILL.md` 加上支持目录，通过路径、大小、frontmatter、注入和凭据校验后，首次扫描时原子登记为"用户所有、活动、启用"；不会因为缺少私有附属文件而拒绝。
+- 每次都从磁盘读取；索引在下一个 Run 重建，不在一轮中途改变已发送的 schema 或提示前缀。
 
-spreadsheet／document／presentation／PDF Skill 对明确交付意图主动用 Sandbox 固定库在 `/workspace` 产出原生文件、格式专属复验后 `MEDIA: /workspace/<relative-path>` 交付。成品可直接使用：按受众／用途统一字体层级、留白、对齐、克制配色，兼顾可读／可编辑／无障碍；检查截断／越界／拥挤表格／小字号／失真／装饰噪声，无品牌用中性专业主题、有模板遵循。表格默认 XLSX，除非明确其它格式或聊天小 Markdown 表；不临时联网装包、外部转换、在线 Office 或执行不可信文档。保留成品，只清理自己确认无用的中间文件，不删用户／上传／含义不明文件。Runtime 成功复验清除相关变更后保留 MEDIA，失败不恢复；Platform 按当前 scope 校验保存附件。
+**自动维护**
 
-预置 Skill 保存脚本、计划或中间文件的示例必须使用工作区内固定的 `.agent-platform/`；不提供双路径回退，也不根据管理员品牌选择辅助路径。
+- 预置层只读。复盘只能新建私有 Skill，或精确修改本次已经读过的、Agent 自建、未固定、活动且启用的 Skill；不删除，不停用。
+- 非沙箱的可信来源、缺少旧状态时按"用户所有"处理、提交时复验生命周期/账号/任务/预算，这些规则见[数据设计 · 技能数据](data-memory-sessions.md#技能数据)。用户、预置、已归档和已停用的 Skill 不能被自动改写。
+
+**文档交付类 Skill**（表格、文档、演示、PDF）
+
+- 用户有明确的交付意图时，主动使用沙箱里的固定库在 `/workspace` 生成原生文件，做针对格式的复验，然后用 `MEDIA: /workspace/<相对路径>` 交付。
+- 成品应当可以直接使用：按受众和用途统一字体层级、留白、对齐和克制的配色，兼顾可读、可编辑和无障碍。检查截断、越界、拥挤的表格、过小的字号、失真和装饰噪声。没有品牌时用中性专业的主题；有模板时遵循模板。
+- 表格默认生成 XLSX，除非用户明确要其它格式，或只是聊天里的小型 Markdown 表格。
+- 不临时联网安装包，不使用外部转换或在线 Office，不执行不可信文档。
+- 保留成品；只清理自己确认无用的中间文件，不删除用户的、上传的或含义不明的文件。
+- Runtime 复验成功并清除相关变更后才保留 MEDIA 标记，失败则不恢复；Platform 按当前对话范围校验并保存附件。
+- 预置 Skill 中保存脚本、计划或中间文件的示例，一律使用工作区内固定的 `.agent-platform/` 目录；不提供第二条备用路径，也不按管理员品牌选择路径。
 
 ## 工作区 MCP
 
-无内置业务连接器。私人／频道主 Agent 独享 Skill 路径、`/workspace/.agent-platform/mcp.json`、`/workspace/.agent-platform/mcp/<server-id>/`；包／配置／凭据不共享，委派继承父配置。`.claude/skills`、`.claude/skill`、`.mcp.json`／HOME 安装只取可移植内容并重定向，不留影子配置。
+**位置与隔离**
 
-清单仅 `mcpServers`，每项 `command`、可选字符串数组 `args`、字符串对象 `env`、工作区内 `cwd`。list/call 每次重读校验，无 watcher／reload／数据库副本。Manager 在当前 Sandbox 运行固定客户端，以 argv 启 server，`initialize → notifications/initialized → tools/list|tools/call` 后退出；仅接受 `2025-06-18`，其它版本在 initialized／调用前拒绝。
+- 平台没有内置业务连接器。每个个人或频道主 Agent 独享 Skill 目录、`/workspace/.agent-platform/mcp.json` 和 `/workspace/.agent-platform/mcp/<server-id>/`；包、配置和凭据不共享，委派继承父 Agent 的配置。
+- 发现 `.claude/skills`、`.claude/skill`、`.mcp.json` 或安装到 HOME 的内容时，只取可移植的部分并重定向到上述位置，不留影子配置。
 
-仅接受与请求 id 匹配的 JSON-RPC result/error；server 主动请求以 method-not-supported 回应，通知忽略。stderr、单行长度、消息数量、总输出与墙钟时限均有界，超限失败关闭。
+**清单与执行**
 
-缺配置为空；损坏／越界／命令或协议错误／超时／超限失败，无兼容搜索。config／cwd／工作区 command 打开后同 fd 验界、启动，不重解路径；普通文件非阻塞打开后验类型、及时拒 FIFO，大小限制覆盖实际读取。server 仅获声明环境和现有 Sandbox 权限。
+- 清单只有 `mcpServers`，每项包含 `command`、可选的字符串数组 `args`、字符串对象 `env`、工作区内的 `cwd`。
+- 每次 list 或 call 都重新读取和校验，没有文件监听、重载或数据库副本。
+- Manager 在当前沙箱里运行固定的客户端：以参数数组启动服务，完成 `initialize → notifications/initialized → tools/list 或 tools/call` 后退出。只接受协议版本 `2025-06-18`，其它版本在初始化完成或调用前拒绝。
+- 只接受 ID 与请求匹配的 JSON-RPC result/error；服务端主动发来的请求回复"方法不支持"，通知忽略。stderr、单行长度、消息数量、总输出和总时长都有上限，超限直接失败。
 
-call 逐次审批，普通参数完整展示、仅敏感字段值占位；隐形／双向字符或完整脱敏展示超限直接拒绝，不能截断后求批准。Runtime 事件及持久审计／快照／预览／工作记录仅 `action/server/tool`，可逆请求和原始 stdout/stderr 仅在执行闭包／Manager→Runtime 响应。描述／结果／错误以防伪不可信边界返回模型；凭据不得复制到其它 scope／提示词／日志，最小注入规则见[安全设计](security-and-trust.md)。
+**失败处理**
 
-仅 stdio list/call；无 Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接／后台 server／动态顶层工具。远程需用户装本地 stdio 适配器；Sylver Lining 等服务商维护包／API／origin／Token／动作，平台不锁定。
+- 没有配置等同于空列表。配置损坏、越界、命令或协议错误、超时、超限都直接失败，不去别处兼容搜索。
+- 配置文件、cwd 和工作区里的命令打开后，用同一个文件描述符验证边界并启动，不重新解析路径。普通文件以非阻塞方式打开后验证类型，及时拒绝 FIFO；大小限制覆盖实际读取的字节。
+- MCP 服务只获得声明的环境变量和沙箱已有的权限。
+
+**审批与记录**
+
+- 每次 call 单独审批：普通参数完整展示，只有敏感字段的值用占位符。含隐形或双向控制字符、或完整脱敏展示超过上限时直接拒绝，不能截断后请求批准。
+- Runtime 事件以及持久的审计、快照、预览和工作记录只保存 `action/server/tool`。可逆的请求内容和原始 stdout/stderr 只存在于执行闭包和 Manager 到 Runtime 的响应中。
+- 描述、结果和错误以防伪造的不可信边界返回给模型。凭据不能复制到其它对话范围、提示词或日志；最小化注入规则见[安全设计](security-and-trust.md)。
+
+**不支持**
+
+- 只支持 stdio 的 list 和 call。不支持 Streamable HTTP、OAuth、resources、prompts、sampling、elicitation、持久连接、后台服务或动态顶层工具。
+- 远程服务需要用户自行安装本地的 stdio 适配器。Sylver Lining 等服务商自己维护包、API、来源、token 和动作，平台不绑定。
 
 ## Telegram
 
-仅私聊，群组／超级群组／频道忽略。个人 AI 生成短时码，以 `/link CODE` 或 `/start CODE` 绑定。入站按 update id 去重，未确认重启可重领；offset 只确认连续成功前缀，批内失败停批，不能以较大 update 越过失败项和不可恢复原载荷。
-
-出站持久 delivery job，已开始但结果未知为 `needs_review`、不盲重发；停用／轮换 bot 先吊销旧 sender generation 再停 transport。
+- 只支持私聊；群组、超级群组和频道消息一律忽略。
+- 个人 AI 生成短时效的绑定码，用户发送 `/link CODE` 或 `/start CODE` 完成绑定。
+- 入站消息按 update ID 去重，重启前未确认的可以重新领取。offset 只确认连续成功的前缀；批内有失败就停止这一批，不能用更大的 update 越过失败项而丢失无法恢复的原始数据。
+- 出站消息是持久的投递任务；已经开始但结果未知的标为 `needs_review`，不盲目重发。
+- 停用或轮换 bot 时，先吊销旧的发送者代号，再停止传输。
 
 ## 邮箱
 
-私人 AI 管理 IMAP/SMTP 应用密码、连接测试、立即检查／唤醒，不建邮件容器／完整客户端。系统 CA 验 IMAPS／SMTPS／STARTTLS，密码不进 Runtime／Sandbox／日志／工具结果。每用户最多二十账户，配额检查与新增同一写事务；频道／委派／他人不可访问。
+**范围**
 
-mail 支持账户／文件夹／搜索／读取／发送／回复／移动／标记／保存附件。搜索先用 `UIDNEXT` 限最近有界 UID 窗口，不 `SEARCH ALL`；保留查询字符、转义反斜线／双引号，非 ASCII 显式 UTF-8 SEARCH。正文前取 `RFC822.SIZE`，缺失／超限拒绝；头部／正文／附件名不可信、不进工作记录 result。附件按[安全设计](security-and-trust.md) fd-rooted workspace 保存；删除仅移 Trash、不 expunge。投递持久幂等：确定成功完成，明确失败可新请求重试，未知 `needs_review`、不重发。
+- 个人 AI 管理 IMAP/SMTP 应用专用密码、连接测试、立即检查和唤醒。不建邮件容器，也不做完整的邮件客户端。
+- 用系统 CA 验证 IMAPS、SMTPS 和 STARTTLS。密码不进入 Runtime、沙箱、日志或工具结果。
+- 每个用户最多二十个账户，配额检查和新增在同一个写事务中完成。频道、委派和其他用户都不能访问。
 
-| 唤醒阶段 | 必须保持的边界 |
+**邮件工具**
+
+- 支持账户、文件夹、搜索、读取、发送、回复、移动、标记和保存附件。
+- 搜索先用 `UIDNEXT` 限定最近一个有上限的 UID 窗口，不做 `SEARCH ALL`；保留查询字符，转义反斜线和双引号，非 ASCII 显式使用 UTF-8 SEARCH。
+- 读取正文前先取 `RFC822.SIZE`，缺失或超限就拒绝。头部、正文和附件名都不可信，不写入工作记录的结果。
+- 附件按[安全设计](security-and-trust.md)的方式保存到工作区；删除只是移到 Trash，不执行 expunge。
+- 发送是持久幂等的：确定成功就完成，明确失败可以发起新请求重试，结果未知标为 `needs_review`，不重发。
+
+**收信唤醒**
+
+| 阶段 | 规则 |
 |---|---|
-| 初始化 | `UIDVALIDITY + UID` checkpoint／去重；首次或 validity 变更用有效 `UIDNEXT` 建历史高水位，不扫描全邮箱，缺值拒绝。已初始化 `last_uid=0` 合法，不漏随后首信 |
-| 增量 | 有界 UID 数值窗口＋更小批量上限；完整成功才进扫描边界，批满只到最后选中 UID，失败不越过 UID |
-| 公平追赶 | 积压下一调度秒到期，持久到期时间严格前进、排其它到期账户之后，跨循环／重启保持公平 |
-| 背压 | IMAP 前检查 queued/running 唤醒 job：账户 `4`、私人 scope `8`；满额不连／不读／不推进，按正常周期退避。同 scope 手工／后台共串行门、事务再核容量，释放后原 UID 续跑，不丢信／重复调用 |
-| 预览 | 主题／发件人／收件人／抄送／日期／Message-ID 各≤`512` 字符，正文≤`4096`，附件仅数量；明确要求 `mail/read`＋可信 account/folder/uid 取全文 |
-| 持久化 | 预览只存产品消息；job 仅类型＋`source_message_id`，调度／恢复／补偿从权威消息重建，不重复存正文。system trigger／job／checkpoint 同事务 |
-| 更新 | 网络读取不占写准入；checkpoint／状态／触发落库前取短准入，预约已生效丢弃未提交结果，新 generation 原 checkpoint 重试 |
-| unattended | email Run 仅读账户／目录／搜索／正文并汇报；其它工具、邮件副作用、附件保存、记忆修改、宿主命令均机械拒绝 |
+| 初始化 | 用 `UIDVALIDITY + UID` 做检查点和去重。首次或 validity 变化时，用有效的 `UIDNEXT` 建立历史高水位，不扫描整个邮箱；缺少该值就拒绝。已初始化且 `last_uid=0` 是合法的，不会漏掉之后的第一封信 |
+| 增量 | 在有上限的 UID 数值窗口内、以更小的批量读取。只有完整成功才推进扫描边界；批次满时只推进到最后选中的 UID，失败时不越过该 UID |
+| 公平追赶 | 有积压时在下一个调度秒再次到期；持久的到期时间严格前进，并排在其它到期账户之后，跨循环和重启都保持公平 |
+| 背压 | 连接 IMAP 前先检查排队和运行中的唤醒任务：每个账户最多 `4` 个，每个个人对话范围最多 `8` 个。满额时不连接、不读取、不推进，按正常周期退避。同一对话范围的手动和后台检查共用串行门，在事务中再次核对容量；释放后从原 UID 继续，不丢信也不重复调用 |
+| 预览 | 主题、发件人、收件人、抄送、日期、Message-ID 各不超过 `512` 字符，正文不超过 `4096` 字符，附件只给数量。需要全文时，用 `mail/read` 加可信的账户、文件夹和 UID 读取 |
+| 持久化 | 预览只存在产品消息里；任务只存类型和 `source_message_id`，调度、恢复和补偿都从权威消息重建，不重复存正文。系统触发、任务和检查点在同一事务中提交 |
+| 更新期间 | 网络读取不占用写准入；写入检查点、状态和触发前才取短暂的准入。如果更新预约已生效，丢弃未提交的结果，新版本从原检查点重试 |
+| 无人值守 | 邮件唤醒的 Run 只能读取账户、目录、搜索和正文并汇报；其它工具、发邮件等副作用、保存附件、修改记忆和宿主机命令都被机械拒绝 |

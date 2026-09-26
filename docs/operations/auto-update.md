@@ -1,128 +1,182 @@
 # 自动更新
 
-唯一当前 schema／技术 profile／main 通道，无历史解码、部署回执、第二提升协议或跨 generation 拼装。Manager 自动检测、切换和恢复，不依赖部署机 Git、中心推送或 webhook secret。安装见[部署](deployment.md)，持久边界见[数据布局](../reference/data-layout.md)。
+- 只有一套当前的 schema、技术身份和 main 通道：没有历史格式解码、部署回执、第二套晋升协议，也不跨版本拼装。
+- Manager 自动检测、切换和恢复，不依赖部署机上的 Git、中心推送或 webhook 密钥。
+- 安装见[部署](deployment.md)，持久边界见[数据布局](../reference/data-layout.md)。
 
 ## 发布通道
 
 ### 发布资格
 
-所有候选先通过**完整 Quality**（当前树文档、Python、Runtime、前端、Manager、容器），跳过发布也保留证据。
+所有候选版本都要先通过**完整的 Quality 检查**（当前树的文档、Python、Runtime、前端、Manager、容器）；即使最终跳过发布，也保留检查证据。
 
-自动跳过只允许相对**当前已公开 generation**的累计差异为空，或全部为下列未打包、非可执行的普通说明文件：
+**可以自动跳过发布的情况**，只有相对**当前已公开的版本**的累计差异为空，或者全部改动都是下列不打包、不可执行的普通说明文件：
 
-- 根 `AGENTS.md`、根 `README.md`、`docs/README.md`；
-- `docs/design/`、`docs/reference/`、`docs/operations/`、`docs/development/`、`docs/decisions/` 下**直接**的普通 `.md` 文件。
+- 根目录的 `AGENTS.md`、`README.md`，以及 `docs/README.md`；
+- `docs/design/`、`docs/reference/`、`docs/operations/`、`docs/development/`、`docs/decisions/` 下**直接**存放的普通 `.md` 文件。
 
-不能按最近 push／相邻提交判断，不能泛化为 `*.md`／`docs/**`。新增、删除、rename 两端都参与；symlink、类型／异常 mode 变化、控制字符等歧义路径不能跳过。其它路径一律完整发布，包括未知合法路径、JSON／机器契约／域映射、代码、脚本、工作流、测试、产品工作区 README、bundled Skill。
+规则细节：
 
-Git 差异失败、缺历史、非法身份、非祖先关系必须失败。prepare／publisher 必须取得经认证的**现有公开 generation**；缺失、无效、查询失败即拒绝，无首发 bootstrap／API 错误回退。跳过不建 release/tag、不构建上传、不改 latest。
-
-手工强制发布／重放不受自动跳过限制，但必须经身份验证：Quality 对当前 `origin/main` 精确 HEAD 显式触发，准备和通道提交前复验仍为远端 HEAD。
+- 不能按最近一次 push 或相邻提交判断，也不能泛化成 `*.md` 或 `docs/**`。
+- 新增、删除以及重命名的两端都计入；符号链接、类型或异常权限变化、含控制字符等含义不明的路径不能跳过。
+- 其它所有路径都要完整发布，包括未知的合法路径、JSON 和机器契约、代码、脚本、工作流、测试、产品工作区的 README 和预置 Skill。
+- Git 差异计算失败、缺少历史、身份非法或不是祖先关系时，必须失败。
+- 准备和发布步骤必须取得经过认证的**现有公开版本**；缺失、无效或查询失败就拒绝，没有首发引导或 API 出错时的回退。
+- 跳过时不创建 release 或 tag，不构建上传，也不改变 latest。
+- 手动强制发布或重放不受自动跳过限制，但必须经过身份验证：Quality 针对当前 `origin/main` 的精确 HEAD 显式触发，在准备和通道提交之前都复验它仍是远端 HEAD。
 
 ### 构建与工件封存
 
-| 边界 | 证据 |
+| 环节 | 证据 |
 | --- | --- |
-| 来源 | GitHub API 的精确 repository、commit、Quality run/attempt、Container run/attempt。自动仅同仓库 `main` push 的成功 Quality；候选绑定上游 Quality／prepare 输出，不用 `workflow_run` 自身 head。手工入口 head 等于候选；提交中的 Container run 为 `in_progress`、无 conclusion。 |
-| 目录 | 四自有镜像一次收敛成闭世界 `managed-images`，双架构门、Compose、manifest 共用，不重拼 `image-*`。artifact 下载限定当前 repository/run、必需镜像／Manager family；禁全量 `*`／`.dockerbuild`，缺 family 失败。同 run 重跑可覆盖中间物，不授权跨 run。 |
-| 门禁 | Manager／镜像构建后，并行通过 AMD64、ARM64 匿名按 digest 拉取及压缩／展开容量门、真实 AMD64 Compose；发布等同一目录和三门汇合。真实 Compose／user-systemd 与本地全量门禁不可互替，命令见[部署与冒烟](../development/testing.md#部署与冒烟)。 |
-| 清单 | 固定 commit、数据库版本、Manager/Compose SHA-256、全部镜像 digest；资产按名称排序绑定 SHA-256／字节数及 Actions provenance。不执行 manifest shell、不用 mutable tag。 |
+| 来源 | 通过 GitHub API 取得的精确仓库、commit、Quality 的 run 和 attempt、Container 的 run 和 attempt。自动发布只针对同一仓库 `main` 分支 push 触发的成功 Quality；候选绑定上游 Quality 和准备步骤的输出，不使用 `workflow_run` 自身的 head。手动入口的 head 必须等于候选；提交时 Container run 处于 `in_progress`，还没有结论。 |
+| 镜像目录 | 四个自有镜像一次汇总成封闭的 `managed-images` 目录，由双架构检查、Compose 和发布清单共用，不重新拼接。只下载当前仓库和 run 中必需的镜像与 Manager 工件；禁止全量 `*` 或 `.dockerbuild`，缺少任何一类就失败。同一 run 的重跑可以覆盖中间产物，但不授权跨 run 使用。 |
+| 检查 | Manager 和镜像构建完成后，并行执行：AMD64 和 ARM64 的匿名按摘要拉取与压缩/展开容量检查、真实的 AMD64 Compose 启动。发布必须等同一目录和这三项检查都完成。真实的 Compose/用户级 systemd 检查与本地全量检查不能互相替代，命令见[部署与冒烟](../development/testing.md#部署与冒烟)。 |
+| 发布清单 | 固定 commit、数据库版本、Manager 和 Compose 的 SHA-256、全部镜像摘要；资产按名称排序，绑定 SHA-256、字节数和 Actions 来源证明。不执行清单里的 shell，不使用可变 tag。 |
 
-**八公开资产：** `release.json`、`agent-platform-compose.yaml`、`install.sh`、`install.sh.sha256`、`agent-platform-manager-linux-amd64`、`agent-platform-manager-linux-amd64.sha256`、`agent-platform-manager-linux-arm64`、`agent-platform-manager-linux-arm64.sha256`。
+**八个公开资产**：`release.json`、`agent-platform-compose.yaml`、`install.sh`、`install.sh.sha256`、`agent-platform-manager-linux-amd64`、`agent-platform-manager-linux-amd64.sha256`、`agent-platform-manager-linux-arm64`、`agent-platform-manager-linux-arm64.sha256`。
 
-**十镜像身份：** `platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`、`firecrawl-api`、`firecrawl-playwright`、`firecrawl-postgres`、`firecrawl-redis`、`firecrawl-rabbitmq`。缺项、重复、额外／退役镜像、迁移描述符、profile 错配均拒绝；残留对象／journal 不能复活退役服务。
+**十个镜像**：`platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`、`firecrawl-api`、`firecrawl-playwright`、`firecrawl-postgres`、`firecrawl-redis`、`firecrawl-rabbitmq`。缺少、重复、多出或已退役的镜像、迁移描述、身份不匹配都会被拒绝；残留的对象或日志不能让退役的服务复活。
 
-Firecrawl 构建直接读取[上游契约](../contracts/upstream-sources.json)的 URL、revision、全部 `required_paths`，缺项失败。GHCR 登录限同一最小权限 `GITHUB_TOKEN`、最多三次短退避；失败关闭，不扩权／漏镜像。
+- Firecrawl 构建直接读取[上游契约](../contracts/upstream-sources.json)里的地址、版本和全部 `required_paths`，缺一项就失败。
+- 登录 GHCR 只使用同一个最小权限的 `GITHUB_TOKEN`，最多重试三次、短退避；失败即停止，不扩大权限，也不遗漏镜像。
 
 ### 通道提交
 
-1. 候选锁仅去重同完整 commit；`publish` 独占全局 `container-channel-main`，只有该 workflow 改 visibility/latest。
-2. draft 按认证 identity／数字 release ID 读取、上传、复验，公开按 tag REST 只查已可见 release。lightweight tag 必须精确指向候选；创建后 ref 暂缺只允许该次写后读取的秒级有界退避，超时／对象或 commit 不符拒绝。
-3. 封存绑定 release ID、asset ID/digest/size、tag、commit。重放逐项比较本地／重新下载字节和 API identity；漂移、未知／重名资产拒绝，禁 `--clobber`。
-4. 公开前匿名复验全部镜像，复读 release/tag/target commit、draft/latest、资产身份。耗时检查后、公开**紧前**再核同 release 资产身份／摘要、commit、成功 Quality run/attempt、本次 Container run/attempt；漂移必须在公开前拒绝，不能靠事后复验。
-5. 确认候选为当前公开 generation 的 Git 后代后，最后公开 manifest 并原子推进 `container-<40-hex-commit>` 的 latest，不暴露半套资产。公开后再次匿名复验全部镜像并复读 release/tag/target commit、draft/latest、资产身份；失败必须报“已可见事故”。
-6. 旧 workflow 后完成不能降级 latest。可略过中间部署，但队列收敛后最新合格且含未发布产品变更的候选必须成为 latest；纯说明后代可保留原 latest。
+1. 候选锁只对完全相同的 commit 去重；`publish` 独占全局的 `container-channel-main`，只有这个工作流能修改可见性和 latest。
+2. 草稿按经过认证的身份和数字 release ID 读取、上传、复验；公开的 release 按 tag 通过 REST 只查已可见的。轻量 tag 必须精确指向候选；刚创建后 ref 暂时查不到时，只允许针对这次写入做秒级的有限退避，超时、对象或 commit 不符都拒绝。
+3. 封存时绑定 release ID、资产 ID、摘要和大小、tag、commit。重放时逐项比较本地和重新下载的字节以及 API 身份；有漂移、未知或重名的资产就拒绝，禁止 `--clobber`。
+4. 公开之前，匿名复验全部镜像，并重新读取 release、tag、目标 commit、草稿/latest 状态和资产身份。耗时检查结束后、公开**紧前**，再核对一次同一 release 的资产身份和摘要、commit、成功的 Quality run/attempt、本次的 Container run/attempt；发现漂移必须在公开前拒绝，不能靠事后复验。
+5. 确认候选是当前公开版本在 Git 上的后代之后，最后才公开发布清单，并原子地把 `container-<40 位十六进制 commit>` 推进为 latest，不暴露半套资产。公开后再次匿名复验全部镜像并重新读取各项身份；失败必须报告为"已可见的事故"。
+6. 较早启动但较晚完成的旧工作流不能把 latest 降级。可以跳过中间版本不部署，但队列收敛后，最新的、合格的、含有未发布产品变更的候选必须成为 latest；只改说明文件的后代可以保留原 latest。
 
-品牌不改 URL、commit、digest、Manager 路径、幂等键。安装器只运行同 release 已校验 Manager；更新不下载执行网络脚本。
+- 品牌不影响网址、commit、摘要、Manager 路径或幂等键。
+- 安装器只运行同一 release 中已校验的 Manager；更新过程不下载执行网络脚本。
 
 ## 检测与预拉取
 
-轮询见[配置](../reference/configuration.md)。仅同 manifest URL／通道／profile 复用成功响应的 `ETag`／`Last-Modified`；配置变更、无验证器响应、网络失败不表示未变化。`304` 只免解码落盘：目标未提交且异于 Current，仍同目标有界幂等重试；仅 Current 相等、明确不可重试或新合法 manifest 清除旧目标。“上次更新成功时间”只投影 Current 的 `activated_at`，回滚保留原值。
+**轮询与缓存**
 
-候选接受前及预拉取／Manager 准备／维护前均复验：当前 schema/protocol/profile／镜像闭集；40 位小写 hex commit 不降级；Manager/Compose URL 仅 HTTPS／精确回环 HTTP，无凭据/query/fragment；Manager version=commit，basename/SHA-256/只读 `version` 一致，Compose 校验和／镜像 digest 固定。DB schema 不低于 Current；同 schema 顺序由发布通道证明，不猜字符串／时间；显式 rollback 走验证快照。
+- 轮询设置见[配置](../reference/configuration.md)。只有发布清单网址、通道和技术身份都相同时，才复用上次成功响应的 `ETag`/`Last-Modified`；配置变化、响应没有验证器或网络失败，都不代表"没有变化"。
+- `304` 只省去解码和落盘：如果目标还没提交且与当前版本不同，仍然对同一目标做有限次的幂等重试；只有与当前版本相同、明确不可重试或收到新的合法清单时，才清除旧目标。
+- "上次更新成功时间"只显示当前版本的 `activated_at`；回滚后保留原值。
 
-`/v1/check` **可保存 manifest／持久 Candidate，不建 update operation、不安装／切换**。容量有界的内存缓存仅在条目保留期间绑定 key→精确 `manifest_url`：命中复用结果，异 URL `409`；缓存判定、Candidate 刷新、结果选择共用串行边界，命中／冲突／并发同键不重复变更。淘汰／重启后同键是新检查，`reused` 仅实际命中；无持久 check journal、无限 key／tombstone，不替代 operation 耐久幂等。
+**候选校验**（接受候选前，以及预拉取、准备 Manager、进入维护前都要复验）
 
-维护前仅预拉 Platform／Runtime，精确本地 RepoDigest 命中不访问 registry。拉取同时受无进展期限／较大绝对上限约束，持续进展不被固定短墙钟截断；原始输出只刷新内存进展，长期 state／日志仅有界脱敏诊断。能力／Sandbox 另走受限拉取路径。预拉取前／切换前查空间和 inode；不足或超时可重试，不开维护、保留 Current，条件恢复后重试。
+- 当前的 schema、协议、技术身份和镜像集合完全匹配；
+- 40 位小写十六进制的 commit，不能降级；
+- Manager 和 Compose 的网址只能是 HTTPS 或精确的回环 HTTP，不含凭据、查询或片段；
+- Manager 的 version 等于 commit，文件名、SHA-256 和只读的 `version` 一致；Compose 的校验和与镜像摘要固定；
+- 数据库 schema 不低于当前版本；相同 schema 的先后由发布通道证明，不按字符串或时间猜测。显式回滚走经过验证的快照。
+
+**`/v1/check`**
+
+- **可以保存发布清单和持久的候选版本，但不创建更新操作，也不安装或切换。**
+- 有一个容量有上限的内存缓存，条目保留期间把 key 绑定到精确的 `manifest_url`：命中时复用结果，网址不同返回 `409`。缓存判定、候选刷新和结果选择共用一个串行边界，命中、冲突或同键并发都不会重复修改。
+- 条目被淘汰或重启后，同一个 key 算作新的检查，`reused` 只在实际命中时为真。没有持久的检查日志，也不会无限积累 key 或墓碑；它不能替代操作的持久幂等。
+
+**预拉取**
+
+- 进入维护前只预拉取 Platform 和 Runtime 镜像；本地已有精确的 RepoDigest 时不访问镜像仓库。
+- 拉取同时受"无进展期限"和较大的绝对上限约束，一直有进展的拉取不会被固定的短时限截断。原始输出只刷新内存里的进度；长期状态和日志只保存有上限的脱敏诊断。能力服务和沙箱另走受限的拉取路径。
+- 预拉取前和切换前检查磁盘空间和 inode。不足或超时可以重试：不进入维护、保留当前版本，条件恢复后再试。
 
 ## 排队与维护
 
-所有 install/update/restart/rollback/repair 带 key、expected generation、耐久 phase。先核不可变请求指纹再判 generation：原样重放只观察原 operation，同键异请求拒绝，永不产生第二 owner。空／截断／超限／非法 2xx 以原 key／journal 对账，不能当成功或认定 mutation 未执行。
+**操作的幂等**
 
-先存 operation 再发 state 所有权；中间崩溃仅以完整请求、精确 expected/next generation、唯一 pending、尚无副作用的闭合证据补同一 owner。冲突／未知孤立记录拒绝，不删证据、不留无人执行 pending、不重做副作用。
+- 所有 install、update、restart、rollback、repair 都带有 key、期望的版本号和持久化的阶段。
+- 先核对不可变的请求指纹，再判断版本号：原样重放只观察原来的操作；同一个 key 但请求不同就拒绝；永远不会出现第二个持有者。
+- 响应为空、被截断、超限或非法的 2xx，要用原 key 和日志对账，不能当作成功，也不能认定修改没有执行。
+- 先保存操作，再发布状态所有权。如果在两者之间崩溃，只有在完整请求、精确的期望/下一个版本号、唯一的待处理项、尚无副作用这几项证据都闭合时，才补上同一个持有者。有冲突或来历不明的孤立记录就拒绝，不删除证据，不留下没人执行的待处理项，也不重做副作用。
 
-运行／排队 job、审批、文件提交、浏览器接管、后台学习等副作用存在时保持 `waiting_for_tasks`，不停服务／另取 owner。自然空闲后：
+**进入维护**
 
-1. 同 id reserve → 耐久 `maintenance=true` → 同 id 再 reserve；关新准入、入口维护、等短操作退出后才破坏性操作。不确定响应仅明确 release 可解除；Manager 不可达／身份不符则管理写失败关闭。
-2. 停 current writer／需切固定服务，验证 generation 快照，再[固定迁移](deployment.md#发布物启动与健康)。只有[受控迁移](../reference/data-layout.md#受控迁移)例外，普通 operation 不搜历史库存／扩大读写。
-3. 启候选、纯读核心探测、必要时激活 Manager；原子提交 Current、结算 reservation 才恢复入口。Platform 先恢复持久预约再启副作用 worker，候选全部后台 worker 冻结到明确 release。
-4. 后台恢复能力、安全清理。
+- 只要还有运行或排队中的任务、审批、文件提交、浏览器接管、后台学习等副作用，就保持 `waiting_for_tasks`，不停服务，也不另找持有者。自然空闲后：
 
-始终最多一个可写 Platform；maintenance、phase、Current/Candidate、快照身份耐久。重启按同 journal／精确 ownership label 对账，不猜容器名或新开更新。
+1. 用同一个 ID 预约 → 持久写入 `maintenance=true` → 再用同一个 ID 预约一次。关闭新准入、入口切到维护页、等短操作退出后，才开始破坏性的操作。响应不确定时，只有明确的释放才能解除；Manager 不可达或身份不符时，管理写入一律失败关闭。
+2. 停止当前写入者和需要切换的固定服务，验证版本快照，再执行[固定迁移](deployment.md#发布物启动与健康)。只有[受控迁移](../reference/data-layout.md#受控迁移)是例外，普通操作不查找历史库存，也不扩大读写范围。
+3. 启动候选版本，做只读的核心探测，必要时激活新的 Manager；原子提交当前版本并结算预约后，才恢复入口。Platform 先恢复持久的预约，再启动有副作用的后台处理；候选版本的全部后台处理冻结，直到明确释放。
+4. 在后台恢复能力服务，做安全清理。
+
+- 任何时候最多只有一个可写的 Platform；维护标志、阶段、当前/候选版本和快照身份都持久保存。
+- 重启后按同一份日志和精确的归属标签对账，不猜容器名，也不另开新的更新。
 
 ## 提交、回滚与能力降级
 
-核心仅 Manager 控制面、Platform、Runtime、公共入口。Camoufox／SearXNG／Firecrawl 失败 degraded、指数退避恢复，不拖住健康核心；workspace MCP 不参与。候选纯读验证 workspace／marker／Runtime alias／Camoufox sidecar 从启动即满足 current schema；缺失、未物化、旧格式、漂移拒绝，普通更新不修复。
+**核心与非核心**
 
-快照验证、核心 readiness、必要 watchdog 提交和 reservation release 全部完成才开放业务：
+- 核心只有：Manager 控制面、Platform、Runtime 和公共入口。
+- Camoufox、SearXNG、Firecrawl 失败时标为降级并指数退避恢复，不拖住健康的核心；工作区 MCP 不参与。
+- 候选版本只读地验证：工作区、标记文件、Runtime 别名、Camoufox 附属文件从启动起就符合当前 schema；缺失、未物化、旧格式或漂移都拒绝，普通更新不做修复。
 
-- `commit-release`／`abort-release` 独立认证，JSON 限大并拒绝重复／未知字段／尾随值。commit 仅普通更新 watchdog 耐久确认候选后；abort 只恢复准入，失败／取消／restart／repair／rollback 无 schema commit。
-- 首次 Gate action 与 `Finalized=true` 同写；install/update 仅 watchdog 确認候选才记 commit，无 SelfUpdate 记实际 abort，非 generation 不记 commit。
-- `gate_settlement` 只投影同锁 state/finalize 快照；缺失／损坏／错位拒绝，不猜 Current／maintenance／旧 journal。Gate 成功未清 state 时先重放同种幂等结算再清引用，不重复 SelfUpdate。
+**开放业务的前提**：快照验证、核心就绪、必要的看门狗提交和预约释放全部完成。
 
-| 失败点 | 收敛 |
+- `commit-release` 和 `abort-release` 各自独立认证，JSON 有大小上限，拒绝重复、未知字段和尾随内容。commit 只在普通更新的看门狗持久确认候选之后使用；abort 只恢复准入。失败、取消、restart、repair、rollback 都没有 schema 提交。
+- 第一次准入门动作与 `Finalized=true` 同时写入；install 和 update 只有在看门狗确认候选之后才记录 commit，没有自更新时记录实际的 abort，非版本类操作不记录 commit。
+- `gate_settlement` 只反映同一把锁下的状态和收尾快照；缺失、损坏或错位就拒绝，不猜测当前版本、维护状态或旧日志。准入门成功但状态没清理时，先重放同类的幂等结算再清引用，不重复自更新。
+
+| 失败发生在 | 如何收敛 |
 | --- | --- |
-| 提交前迁移／核心失败 | 停候选、恢复快照／Previous、结算预约，记可重试失败；旧 mountpoint 收紧不反向放宽，其它 DB／sidecar 按快照，见受控迁移。 |
-| Current 已提交、未 finalize | 保持维护，重试核心探针／Gate；新业务可能分叉，不自动倒退 previous 数据，后续恢复须新快照 operation。 |
-| failed 已存、active id 未清 | 只补失败收尾。 |
-| finalized 已存、pending 未清 | 重放原 Gate 再清引用。 |
-| 不可恢复 | control／维护页保持在线，不 systemd 崩溃循环。 |
+| 提交前的迁移或核心失败 | 停止候选、恢复快照和上一版本、结算预约，记录为可重试的失败。旧挂载点的权限收紧不会反向放宽，其它数据库和附属文件按快照恢复（见受控迁移）。 |
+| 当前版本已提交、未收尾 | 保持维护，重试核心探测和准入门。新业务可能已经产生分叉，不自动退回上一版本的数据；之后的恢复必须走新的快照操作。 |
+| 已保存失败、活动 ID 未清理 | 只补做失败的收尾。 |
+| 已保存收尾、待处理未清理 | 重放原来的准入门动作，再清除引用。 |
+| 无法恢复 | control 和维护页保持在线，不让 systemd 陷入崩溃循环。 |
 
-readiness 失败在删候选前依次取 healthcheck／有界日志；替换精确 Manager capability／通用凭据后截断，采集失败不阻回滚。外部错误入 state／operation／activation 前限大，重试仅替换最近失败、不递归拼接；control 仅有界诊断。
+**诊断信息**
 
-`/v1/status` 不得投影 manifest、快照或任何其它宿主绝对路径。
+- 就绪检查失败时，在删除候选之前依次收集 healthcheck 和有上限的日志；替换掉精确的 Manager 权限令牌和通用凭据后再截断。收集失败不阻止回滚。
+- 外部错误在写入状态、操作或激活记录之前限制大小；重试只替换最近一次失败，不递归拼接。control 只保存有上限的诊断。
+- `/v1/status` 不能输出发布清单、快照或任何其它宿主机绝对路径。
 
-模型目录／推荐不迁移：逐字保留非空明确选择／空字符串自动状态；旧 Runtime 历史缓存 OAuth 默认仅重载目录时归一化，不改生产设置／账号／会话、不需人工修数。
+**模型设置不迁移**
+
+- 逐字保留非空的明确选择和表示"自动"的空字符串。旧 Runtime 历史里缓存的 OAuth 默认值只在重新加载目录时归一化，不改动生产设置、账号或会话，也不需要人工修数据。
 
 ## Manager 自更新
 
-不可变版本、Candidate/Activation、原子 Current/Previous 由**主 unit cgroup 外的 user-systemd watchdog**唯一持久拥有。它验候选 inode／认证 identity，成功提交；失败恢复 previous stable、清自动激活 Candidate，原 Platform operation 回滚／收尾。
-
-fresh stable 与 manifest version/SHA-256 一致即登记初始 Current，不造同字节 Candidate／Activation、不跑 watchdog／重启 unit。普通更新仅 SHA 改变才建 plan；首写绑定 candidate path、SHA、version、Platform commit、previous path、unit、socket。
-
-`candidate_path`／`platform_commit` 在启动／回滚／接管／终态均匹配已验证 Candidate／Activation／Platform generation；缺失、漂移、推断补写、历史格式拒绝，终态删字段仍篡改。接管／watchdog／回滚／recovery 保留原 plan 字节哈希／完整身份链。watchdog 原子提交前只开认证 `/v1/identity`，status／executor／mutation 关闭，提交后完整 API。
+- 不可变的版本、候选与激活、原子的当前/上一版本，由**主 unit 的 cgroup 之外的用户级 systemd 看门狗**唯一持久拥有。它验证候选的 inode 和认证身份，成功就提交；失败就恢复上一个稳定版本、清除自动激活的候选，原来的 Platform 操作回滚或收尾。
+- 全新安装时，稳定版本与发布清单的版本和 SHA-256 一致，就直接登记为初始的当前版本；不伪造相同字节的候选或激活，不运行看门狗，也不重启 unit。
+- 普通更新只有 SHA 变化时才建立计划。首次写入时绑定候选路径、SHA、版本、Platform commit、上一版本路径、unit 和 socket。
+- `candidate_path` 和 `platform_commit` 在启动、回滚、接管和终态时，都必须匹配已验证的候选、激活记录和 Platform 版本；缺失、漂移、靠推断补写或历史格式都拒绝，终态删掉字段也算篡改。接管、看门狗、回滚和恢复都保留原计划的字节哈希和完整身份链。
+- 看门狗原子提交之前，只开放经过认证的 `/v1/identity`，status、executor 和修改类接口都关闭；提交后才开放完整 API。
 
 ## 恢复身份
 
-`recover-current` 仅用于[部署故障表](deployment.md#日常管理)的控制器不可用；release 不能自动修复无法运行的 Manager。锁、零副作用检查、socket、probe 权限见[安全设计](../design/security-and-trust.md)。以下证据必须闭合，否则拒绝：
+`recover-current` 只用于[部署故障表](deployment.md#日常管理)中"控制器不可用"的情况；发布本身不能自动修复一个无法运行的 Manager。锁、零副作用检查、socket 和探测权限见[安全设计](../design/security-and-trust.md)。下列证据必须全部闭合，否则拒绝：
 
-| 边界 | 条件 |
+| 场景 | 条件 |
 | --- | --- |
-| takeover 耐久 | 即使 unit 未禁用也生效。`watchdog_owned` 前归外部恢复；之后仅 journal／recovery plan／state／stable／运行 inode 同事务 Candidate 可完整 acknowledge，重启与外部持锁规则相同。有效终态 journal 不永久依赖已合法清理的旧 version／operation／manifest。 |
-| 终态 finalize 证明 | manifest commit + 当前架构完整 Manager SHA 唯一确定 journal；transaction、受管路径、manifest/operation 原始摘要、原 Candidate、superseded 普通 plan、committed recovery plan 双向闭合，只读验证。 |
-| 健康 Current 接力 | 仅同一未结算 finalize，且 Current／stable／运行 inode／metadata 一致、Previous 精确为 journal 提交的 recovery Current；否则停服务前拒绝，不改历史证据。 |
-| stable 先于 state | 仅外部 recovery lock 忙、旧 state 匹配 committed journal、新 stable／运行 inode／受管 recovery 工件／metadata 同 SHA/version 时进入 identity-only probe；锁空闲、rolled-back、身份缺口拒绝。 |
-| 外部锁忙、无非终态 journal | 仅精确匹配 stable 的登记 Current／受管 recovery 工件可进入 `external_recovery_probe`。外部锁释放后重新取得 lease，证明运行 inode 已是原子登记、无 Candidate/Activation 的 Current；未登记 recovery 必须退出。 |
-| journal 竞争 | mutation flock 不等待；只有外部全局锁仍持有时，才用稳定双快照处理短暂竞争。 |
-| 无 journal Candidate-only | 当前 Platform state、唯一 live install/update、不可变 manifest、非终态 plan 完整证明本代 Prepare/Mark checkpoint；ownerless／终态拒绝。 |
-| 普通半 checkpoint | rollback plan-first／commit state-first 仅完整反向绑定可补齐，不凭路径／单一 SHA。rollback 逐项验证 Candidate version/source/SHA/verified/platform-commit、精确受管 binary path、精确 activation plan path；格式无效但 hash 可读的工件也不能补写终态。 |
+| 接管持久化 | 即使 unit 还没被禁用也生效。在 `watchdog_owned` 之前归外部恢复处理；之后只有日志、恢复计划、状态、稳定版本和运行中的 inode 属于同一事务的候选，才能完整确认。重启与外部持锁规则相同。有效的终态日志不永久依赖已被合法清理的旧版本、操作或清单。 |
+| 终态收尾证明 | 发布清单的 commit 加上当前架构完整的 Manager SHA，唯一确定一份日志；事务、受管路径、清单和操作的原始摘要、原候选、被取代的普通计划、已提交的恢复计划双向闭合，只读验证。 |
+| 健康的当前版本接力 | 只有同一个未结算的收尾，并且当前版本、稳定版本、运行中的 inode 和元数据一致，上一版本精确等于日志提交的恢复版本时才行；否则在停服务之前就拒绝，不修改历史证据。 |
+| 稳定版本先于状态 | 只有外部恢复锁忙、旧状态匹配已提交的日志、新的稳定版本/运行中的 inode/受管恢复工件/元数据的 SHA 和版本都相同时，才进入只看身份的探测；锁空闲、已回滚或身份有缺口都拒绝。 |
+| 外部锁忙、没有非终态日志 | 只有精确匹配稳定版本的已登记当前版本或受管恢复工件，才能进入 `external_recovery_probe`。外部锁释放后重新取得租约，证明运行中的 inode 已经是原子登记、没有候选和激活的当前版本；未登记的恢复必须退出。 |
+| 日志竞争 | 修改锁不等待；只有外部全局锁仍被持有时，才用稳定的双快照处理短暂竞争。 |
+| 没有日志、只有候选 | 当前 Platform 状态、唯一的活动 install/update、不可变的发布清单和非终态计划，完整证明本版本的 Prepare/Mark 检查点；没有持有者或已是终态就拒绝。 |
+| 普通的半个检查点 | 回滚的"先计划"和提交的"先状态"，只有完整的反向绑定才能补齐，不能凭路径或单个 SHA。回滚逐项验证候选的版本、来源、SHA、已验证标记、Platform commit、精确的受管程序路径和精确的激活计划路径；格式无效但哈希可读的工件也不能补写终态。 |
 
 ## 自动清理
 
-仅 `idle`、非维护、无 active/finalize operation；保护集来自 Current/Previous/Candidate、operation／快照、Sandbox registry、容器、activation/recovery journal。只清未引用过期 release／staging／Manager version／终态 operation／普通快照、过宽限安全原子临时文件、无消费者且精确受管 label 的旧镜像、过期已停容器／空网络。
+**前提与范围**
 
-operation 须超过七天且保留最新 `128` 条；pending/running、未 finalized、无有效 `completed_at`、active/finalize 引用保护，不读写／删除 recovery/activation 审计。未知项、坏 JSON、身份／权限／inode 异常、父目录 fsync 失败关闭。
+- 只在 `idle`、非维护、没有活动或正在收尾的操作时进行。
+- 保护集合来自：当前/上一/候选版本、操作和快照、沙箱登记表、容器、激活和恢复日志。
+- 只清理：没有引用的过期发布、暂存目录、Manager 版本、终态操作、普通快照；超过宽限期的安全原子临时文件；没有使用者且带精确受管标签的旧镜像；过期的已停止容器和空网络。
 
-删除点复核 owner、类型、link count、路径、inode、label、digest、保护 epoch。递归清理保留发现身份，在 removal guard 内用固定父／候选 fd 复验并相对 fd 删除；禁重新按路径 `RemoveAll`，新对象／未知项／漂移保留。小批次、有界错误，一域失败不跳独立域；禁全局 prune、通配或归属不明删除。
+**操作记录的保留**
 
-空间预警先安全清理，仍不足保留 Current、报可重试错误；日志按大小／数量轮转。其余阈值见[容器契约](../contracts/container-platform.json)，验收见[测试与验证](../development/testing.md#部署与冒烟)。
+- 操作记录必须超过七天，并且始终保留最新的 `128` 条。pending/running、未收尾、没有有效 `completed_at`、被活动操作或收尾引用的都受保护；恢复和激活的审计记录不读、不写、不删除。
+- 未知项、损坏的 JSON、身份/权限/inode 异常、父目录落盘失败时，一律失败关闭。
+
+**删除方式**
+
+- 每个删除点都复核属主、类型、硬链接数、路径、inode、标签、摘要和保护纪元。
+- 递归清理保留发现时的身份，在删除保护内用固定的父目录和候选描述符复验，并相对描述符删除；禁止重新按路径 `RemoveAll`。新出现的对象、未知项或漂移都保留。
+- 小批量进行，错误数有上限；一个领域失败不影响其它独立领域。禁止全局 prune、通配符或归属不明的删除。
+
+**空间与日志**
+
+- 空间预警时先安全清理；仍然不足就保留当前版本，报告可重试的错误。日志按大小和数量轮转。
+- 其余阈值见[容器契约](../contracts/container-platform.json)，验收见[测试与验证](../development/testing.md#部署与冒烟)。

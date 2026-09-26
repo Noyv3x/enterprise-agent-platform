@@ -37,7 +37,7 @@ select_path() {
   case "$path" in
     AGENTS.md|README.md|docs/README.md)
       ;;
-    docs/contracts/*|docs/domains.json|.github/*|scripts/*|containers/*|install.sh|.gitignore|enterprise-agent-platform/README.md)
+    docs/contracts/*|.github/*|scripts/*|containers/*|install.sh|.gitignore|enterprise-agent-platform/README.md)
       select_full
       ;;
     manager/*)

@@ -10,7 +10,7 @@ Follow the [architecture](docs/design/system-architecture.md) and [trust boundar
 
 ## Key Directories
 
-Use the [ownership guide](docs/development/repository.md) and [domain manifest](docs/domains.json), not guessed layouts. Keep credentials, runtime data, generated output, and temporary upstream checkouts out of source changes. Regenerate artifacts through their owners.
+Use the [ownership guide](docs/development/repository.md), not guessed layouts. Keep credentials, runtime data, generated output, and temporary upstream checkouts out of source changes. Regenerate artifacts through their owners.
 
 ## Development Commands
 

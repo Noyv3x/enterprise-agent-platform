@@ -1,43 +1,49 @@
 # 测试与验证
 
-本页定义最低证据，不复制各设计契约。静态／单元通过不得报告成真实模型、浏览器、服务或发布通过。
-
+本文定义最低的证据要求，不复制各设计文档的规则。静态检查或单元测试通过，不能报告成真实的模型、浏览器、服务或发布验证通过。
 
 ## 顶层检查
 
-仓库根：
+在仓库根目录：
 
 ```sh
-./scripts/test.sh affected  # 迭代
-./scripts/test.sh full      # 交付／push 前
+./scripts/test.sh affected  # 开发迭代时
+./scripts/test.sh full      # 交付、push 之前
 ```
 
-两者先跑一次当前树 check。affected 合并 staged／unstaged／untracked，禁用 rename 合并、保留两端及暂存后还原的路径；Git 错误失败。共享契约、脚本、容器、安装器、workflow、选择器及未知路径选 full，无豁免。
+- 两种模式都会先对当前文件树运行一次文档检查。
+- `affected` 合并已暂存、未暂存和未跟踪的改动；不把重命名合并处理，保留两端的路径以及暂存后又还原的路径；Git 出错就失败。
+- 改动涉及共享契约、脚本、容器、安装器、工作流、选择器本身或未知路径时，自动升级为 full，没有豁免。
 
-| 门 | 必需证据 |
+| 门禁 | 必须包含 |
 | --- | --- |
-| full | 并行 scripts、Manager、全部 Python 分片、Runtime、Camoufox、前端、完整 container smoke；缺 Docker Compose 失败，渲染不代 smoke |
-| Quality | Documentation 当前树 check；container-definitions 跑 scripts 一次再 smoke；Manager 全量 -count=1 一次；Python 3.11 聚合门仅全片成功才通过 |
-| release | 同候选双架构匿名镜像／容量、真实 Compose／user-systemd、资产／通道；不由 full 代证 |
+| full | 并行运行 scripts、Manager、全部 Python 分片、Runtime、Camoufox、前端，以及完整的容器冒烟测试。缺少 Docker Compose 就失败；只渲染配置不能代替冒烟测试 |
+| Quality（CI） | 当前文件树的文档检查；container-definitions 先跑一次 scripts 再做冒烟；Manager 全量以 `-count=1` 运行一次；Python 3.11 的汇总门只有全部分片成功才通过 |
+| 发布 | 同一个候选的双架构匿名镜像拉取和容量检查、真实的 Compose 和用户级 systemd、资产和通道检查。不能用 full 代替 |
 
-[test.sh](../../scripts/test.sh)／[Quality](../../.github/workflows/quality.yml)：scripts 只顶层一次，smoke 不嵌套；Python 四片确定性、互斥完整、不空，全跑 0–3、compileall 一次，失败／取消／未完成均失败。每组严格失败退出，计时 trap 不覆盖退出码；温热目标 affected 3／full 10 分钟，回归不靠扩超时。
+[test.sh](../../scripts/test.sh) 和 [Quality 工作流](../../.github/workflows/quality.yml)的约定：
 
-Node 只在 lock 摘要匹配且 node_modules 存在时复用，npm ci 成功才存摘要；CI／无缓存干净安装，Quality high 审计、最小 lock diff。Go 缓存绑定 go.sum、不代执行；发布 binary job 只交叉编译／校验和，不重跑 suite。
+- scripts 只在顶层跑一次，冒烟测试不嵌套。
+- Python 分成四片，分片确定、互斥、完整且不为空；CI 跑 0–3 全部分片，compileall 只跑一次。失败、取消或未完成都算失败。
+- 每组测试严格按失败退出，计时逻辑不能覆盖退出码。在缓存温热时，affected 的目标时长约 3 分钟、full 约 10 分钟；变慢时不能靠加大超时解决。
+- Node 依赖只有在 lock 摘要匹配且 node_modules 存在时才复用，`npm ci` 成功后才保存摘要；CI 或无缓存时干净安装，Quality 做高危级别的审计，lock 文件的差异要尽量小。Go 缓存绑定 go.sum，但不能代替执行测试；发布的二进制任务只做交叉编译和校验和，不重跑测试。
 
 ## 风险矩阵
 
-沿用 Go、unittest、Node runner、Vitest／Testing Library。按影响域和风险验证可观察的成功、拒绝、恢复及竞态行为；涉及竞争的状态转换覆盖两种顺序。使用临时数据、确定性 fake、可控时钟和同步点，不靠睡眠、放宽超时、删断言或生产回退掩盖失败。
+- 沿用现有的测试框架：Go、unittest、Node 测试运行器、Vitest 和 Testing Library。
+- 按影响的领域和风险，验证可以观察到的成功、拒绝、恢复和竞态行为；涉及竞争的状态转换，两种先后顺序都要覆盖。
+- 使用临时数据、确定性的替身、可控的时钟和同步点。不靠 sleep、放宽超时、删除断言或生产代码里的后备路径来掩盖失败。
 
-| 风险 | 最低负例／不变量 |
+| 风险 | 至少要覆盖的反例或不变量 |
 | --- | --- |
-| 行为 | 真实内容／副作用、预算、硬责任／软恢复、部分结果；不钉文案／内部结构／生产默认值 |
-| 授权 | 未登录／停用／撤权、Cookie 缺 Origin/Referer／跨源、未批／伪造 approval／无人值守绕过、内网／回环／云元数据及重定向 |
-| 身份 | owner/account/scope/provider/Run/tool/browser/lifecycle 注入，旧身份／迟到结果不污染继任者 |
-| 竞态 | 授权／提交、领取／终态、reset／分页、admission／cleanup 两序；无锁反转，取消仍隔离迟到结果／释放容量 |
-| 恢复 | phase／commit／ack 幂等，未知不伪成功／重放；保留引用／审计，独立清理域不互相跳过 |
-| 文件系统 | traversal、软／硬链接、owner/type/mode、inode／父目录置换、受保护目录／Docker socket、超限；拒绝先于写入，失败字节不变 |
-| UI | 真实 Store／typed action／Provider，输入／权限／内容隔离／焦点／媒体偏好；jsdom 不代原生浏览器 |
-| 集成 | 协议／超时／限额／降级恢复；隔离真实网络／凭据，不伪健康 |
+| 行为 | 真实的内容和副作用、预算、硬责任和有限的软恢复、部分结果；不要把文案、内部结构或生产默认值写死在测试里 |
+| 授权 | 未登录、已停用、已撤权；Cookie 缺少 Origin/Referer 或跨源；未批准或伪造的审批、绕过无人值守限制；内网、回环、云元数据地址及重定向 |
+| 身份 | 注入伪造的所有者、账号、对话范围、供应商、Run、工具、浏览器或生命周期；旧身份或迟到的结果不能污染继任者 |
+| 竞态 | 授权与提交、领取与终态、重置与分页、准入与清理的两种顺序；不出现锁反转；取消后仍然隔离迟到的结果并释放容量 |
+| 恢复 | 阶段、提交和确认的幂等；结果未知时不能假装成功或重放；保留引用和审计；独立的清理领域不能互相跳过 |
+| 文件系统 | 路径穿越、软链接和硬链接、属主/类型/权限、inode 或父目录被替换、受保护目录和 Docker socket、超限；拒绝发生在写入之前，失败时字节不变 |
+| 界面 | 真实的 Store、带类型的 action 和 Provider；输入、权限、内容隔离、焦点、媒体偏好；jsdom 不能代替真实浏览器 |
+| 集成 | 协议、超时、限额、降级与恢复；隔离真实网络和凭据，不能伪装健康 |
 
 ## Manager 与容器
 
@@ -49,11 +55,13 @@ go vet ./...
 go build -buildvcs=false ./cmd/agent-platform-manager
 ```
 
-dispatcher 可缓存测试，Quality 用 -count=1；候选 API 切换另需 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`，full 未含 race。
-
-场景：[control](../../manager/internal/control/)／[selfupdate](../../manager/internal/selfupdate/) 的身份、socket／锁、check 缓存及恢复；[原子清理](../../manager/internal/atomicfile/cleanup_test.go)须真实进程 rename 前退出；[裁剪](../../manager/internal/journal/terminal_cleanup_test.go)测引用／inode／fsync／审计。合法 fixture 用 releasetest builder，decoder 坏输入不修正。
-
-根目录 `./scripts/container-smoke.sh` 隔离 .env、不可变占位镜像／临时挂载、不连产品容器。Platform stub 真实监听 socket、验 token、完整能力键（空 null）；fresh workspace 由正确所有者创建。
+- 本地运行可以使用测试缓存，Quality 使用 `-count=1`。修改候选版本的 API 切换时，另外运行 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`；full 不包含 race 检测。
+- 重点场景：
+  - [control](../../manager/internal/control/) 和 [selfupdate](../../manager/internal/selfupdate/)：身份、socket 和锁、check 缓存、恢复；
+  - [原子清理](../../manager/internal/atomicfile/cleanup_test.go)：必须用真实进程在重命名前退出来测试；
+  - [终态清理](../../manager/internal/journal/terminal_cleanup_test.go)：引用、inode、落盘和审计。
+- 合法的测试数据用 releasetest 构建器生成；解码器的坏输入测试不要去"修正"输入。
+- 根目录的 `./scripts/container-smoke.sh` 使用隔离的 .env、不可变的占位镜像和临时挂载，不连接产品容器。Platform 的替身真实监听 socket、验证 token、提供完整的能力键（空值为 null）；全新的工作区由正确的属主创建。
 
 ## Python 平台
 
@@ -64,9 +72,11 @@ python3 -m unittest discover -s tests
 python3 -m compileall enterprise_agent_platform tests
 ```
 
-根目录 `python3 scripts/python_test_shard.py --shard-index 0 --shard-count 4 --list` 只列一片，去 --list 只跑该片。
-
-[用例入口](../../enterprise-agent-platform/tests/)：schedules、learning_review／skills、db／platform_storage_safety、computer_previews／attachment_previews（文件均为 test_*.py）。手动领取隔离自动调度、保留真实 dispatcher；学习预算／授权／终态按风险矩阵验证。SQLite 正文／commit 异常后连接仍可复用，启动拒绝先于写入；预览测 workspace-only／禁 host、隔离／上限、Office/PDF 及 PPTX 页序。
+- 在根目录运行 `python3 scripts/python_test_shard.py --shard-index 0 --shard-count 4 --list` 只列出一个分片的测试；去掉 `--list` 就只运行该分片。
+- 主要[用例](../../enterprise-agent-platform/tests/)（都是 `test_*.py`）：schedules、learning_review 和 skills、db 和 platform_storage_safety、computer_previews 和 attachment_previews。
+- 手动领取任务的测试要与自动调度隔离，并保留真实的调度器；学习的预算、授权和终态按风险矩阵验证。
+- SQLite 执行或提交出错后，连接仍然可以复用；启动时的拒绝发生在任何写入之前。
+- 预览测试覆盖：只能读工作区、禁止宿主机、隔离和上限、Office/PDF，以及 PPTX 的页序。
 
 ## Agent Runtime
 
@@ -79,18 +89,21 @@ npm run build
 npm run test:compiled
 ```
 
-build 清空 dist；一轮只编译一次再串行 test:compiled，不追加 npm test 重编译／分类 suite。包含 [MCP stdio](../../containers/agent-sandbox-mcp-client.test.mjs)：隔离、协议、审批、脱敏限额、不可信结果、fd 固定到启动，持久记录不泄露可逆请求／原始结果。
+- build 会清空 dist。一轮只编译一次，然后串行运行 `test:compiled`；不要再追加会重新编译的 `npm test` 或分类的测试套件。
+- 包含 [MCP stdio 客户端测试](../../containers/agent-sandbox-mcp-client.test.mjs)：隔离、协议、审批、脱敏和限额、不可信结果、启动前固定文件描述符，以及持久记录中不泄露可逆请求或原始结果。
 
-[用例入口](../../enterprise-agent-platform/agent-runtime/test/)（均为 .test.ts）：
+主要[用例](../../enterprise-agent-platform/agent-runtime/test/)（都是 `.test.ts`）：
 
 | 场景 | 文件 |
 | --- | --- |
-| 硬责任与有界软恢复，needs_review 内容／error、禁 MEDIA／完成通知、ephemeral 不持久／重放 | run-coordinator、todo-run-guard、scheduled-run-decision |
-| task/service、wait、恢复／ack、review／取消、精确 cleanup fence | background-task-guard、background-task-store、managed-execution |
-| journal mutation、压缩失败原字节、去敏／计量／archive 限额 | session-store、repeated-compaction、request-context-usage |
-| 父子责任／预算／取消、动态上下文与稳定缓存 | concurrency、prompt-cache-key、prompt-assembly |
+| 硬责任和有限的软恢复；needs_review 的内容和错误；禁止 MEDIA 和完成通知；临时内容不持久化、不重放 | run-coordinator、todo-run-guard、scheduled-run-decision |
+| task/service、wait、恢复和确认、复盘和取消、精确的清理屏障 | background-task-guard、background-task-store、managed-execution |
+| 日志修改、压缩失败时保持原字节、脱敏、计量、归档限额 | session-store、repeated-compaction、request-context-usage |
+| 父子责任、预算和取消；动态上下文与稳定缓存 | concurrency、prompt-cache-key、prompt-assembly |
 
-deterministic stream 和完整 reconcile/ack 的 ExecutionManager fake 不代真实模型 eval。时间取 canonical helper；活动／idle、轮次限额和容量释放用可控同步、容量一的后续 Run 证明，不看 runner 延迟。临时 session ENOTEMPTY 有界重试耗尽仍失败。
+- 确定性的模型流和实现了完整对账/确认的执行器替身，不能代替真实模型的评估。
+- 时间统一使用规范的辅助函数。活动时间和空闲检测、轮次上限、容量释放，用可控的同步和"容量为一时的后续 Run"来证明，不依赖测试机器的延迟。
+- 临时会话遇到 ENOTEMPTY 时有限次重试，用完后仍然失败。
 
 ## 前端
 
@@ -103,59 +116,73 @@ npm test
 npm run build
 ```
 
-生产主题／品牌／i18n、真实 Store／typed action，最多两 worker，非动效走 reduced-motion。前置文本可粘贴，键盘／IME／发送逐键交互。用组件库语义 API，不用 selector mock、CSS／类名／固定像素／结构断言。
+**组件测试**
 
-入口：[chatActions](../../enterprise-agent-platform/frontend/src/data/chatActions.test.ts)、[preview](../../enterprise-agent-platform/frontend/src/components/preview/)、[overlay](../../enterprise-agent-platform/frontend/src/components/admin/admin-layout.test.tsx)。分别维护身份／发送／历史、真实 draft／租约、Escape／焦点／草稿场景；品牌／通知走正式 Store action。
+- 使用生产的主题、品牌和 i18n，以及真实的 Store 和带类型的 action；最多两个 worker；与动效无关的测试在"减少动态效果"下运行。
+- 前置文本可以直接粘贴，但键盘、输入法和发送要逐键交互。
+- 使用组件库的语义 API（按角色、名称查询），不要 mock 选择器，也不要断言 CSS、类名、固定像素或 DOM 结构。
+- 主要入口：[chatActions](../../enterprise-agent-platform/frontend/src/data/chatActions.test.ts)（身份、发送、历史）、[preview](../../enterprise-agent-platform/frontend/src/components/preview/)（真实草稿和租约）、[overlay](../../enterprise-agent-platform/frontend/src/components/admin/admin-layout.test.tsx)（Escape、焦点、草稿）。品牌和通知通过正式的 Store action 测试。
 
-真实浏览器按[前端契约](../design/frontend.md)覆盖登录／导航／对话／能力／设置／全部管理资源，桌面／手机、浅／深色、加载／空／错误／可用；缺真实能力须说明。必须实看：
+**真实浏览器检查**
 
-- 长对话离底、短窗、长输入／代码／表格、动态视口／等效缩放：浮动 PiP／跳转零 flow 高度、无白条／透明滚轮遮挡，展开恒右侧 50vw、聊天可用。
-- 单消费者、缩放不重挂载／抢租约，收起／scope／发送前释放和焦点恢复；真实时序／内容，HTML 完成后挂载且无同源能力。
-- 原生 inert、键盘／子控件先 Escape／过渡；动态媒体偏好保留输入／展开／焦点；scroll 先于 resize 不丢阅读意图／增未读。
+按[前端设计](../design/frontend.md)覆盖：登录、导航、对话、电脑和各种能力、设置、全部管理页面；桌面和手机、浅色和深色；加载中、空、错误和正常状态。缺少真实能力（例如没有可用模型）时要说明。以下几项必须亲眼确认：
 
-[static](../../enterprise-agent-platform/frontend/scripts/build-static.test.mjs)测 identity/gzip/Brotli 原子发布、旧依赖／陈旧资产含 Logo、preload／慢链路；忽略产物也须构建／验可重现，生产重复构建后打包。Camoufox 自目录 `npm ci && npm test`，不属 Runtime suite。
+- 长对话离开底部、窗口很矮、长输入、长代码和表格、动态视口或等效缩放下：画中画和"回到最新"按钮不占布局高度，没有白条，透明区域不挡滚轮；展开后始终在右侧一半，聊天仍然可用。
+- 同一时刻只有一个画面在读取；缩放不重新挂载或抢租约；收起、切换对话和发送前释放接管并恢复焦点；时序和内容是真实的，HTML 写完后才挂载且没有同源能力。
+- 原生 inert、键盘和子控件优先处理 Escape、过渡效果；动态切换媒体偏好时保留输入、展开状态和焦点；scroll 先于 resize 时不丢失阅读意图，也不增加未读。
+
+**构建产物**
+
+- [静态发布测试](../../enterprise-agent-platform/frontend/scripts/build-static.test.mjs)覆盖：identity/gzip/Brotli 的原子发布、旧依赖和陈旧资产（包括 Logo）的清理、预加载和慢速链路。被 Git 忽略的产物也必须能构建并验证可重现；生产环境重复构建后再打包。
+- Camoufox 在它自己的目录里运行 `npm ci && npm test`，不属于 Runtime 的测试套件。
 
 ## 部署与冒烟
 
-高风险 Manager、容器、Runtime packaging／static 变更须临时数据根真实安装／更新。VM、Compose、user-systemd 分别留证，静态 smoke／QEMU 构建不能冒充 VM 安装。真实入口：[container-release](../../.github/workflows/container-release.yml)。
+- 高风险的 Manager、容器、Runtime 打包或前端静态资源变更，必须用临时数据根做一次真实的安装或更新。
+- 虚拟机、Compose、用户级 systemd 的证据分别保留；静态冒烟或 QEMU 构建不能冒充虚拟机安装。真实入口是 [container-release 工作流](../../.github/workflows/container-release.yml)。
 
 ### 安装、恢复与真实服务
 
 | 证据 | 必测场景 |
 | --- | --- |
-| 安装 | fresh／stdin --yes、同摘要直接 Current；preflight 精确清理／原路径重试；恶意 HOME/XDG、runtime 根拒绝 |
-| 迁移 | [唯一例外](../reference/data-layout.md#受控迁移)的危险残留、shadow Python/sitecustomize、半转换重试、真实降权／空 capability、任意 root 命令拒绝；fresh/current 无兼容副作用，Docker 前安全建 attachments |
-| 就绪 | Manager active/enabled、无未完成更新；Platform／Runtime／公共 health、bearer/models、登录／消息／SSE／附件／搜索、同 generation 多端撤回 |
-| 恢复 | 排空／维护、所有持久 phase、迁移／外键失败、Current/Previous 快照与 SQLite/journal 一致；registry 无进展、ENOSPC、核心 readiness、响应丢失，能力降级后恢复；预拉取不占栈锁，Sandbox 保 workspace、保护／过期对象清理 |
-| Firecrawl | 真实 Compose 冷启动写 PostgreSQL 哨兵、保留 bind 重建：新容器 ID、精确读回、liveness／真实 scrape；create／一次空库不算 |
-| SearXNG | 真实 Mounts 的受管只读 config bind、无匿名 volume |
-| 浏览器／Sandbox | [control smoke](../../scripts/browser-control-compose-smoke.py)：真实 Platform 登录／同源 Gateway、临时 core 页，acquire→原子拖拽→text/key/wheel→CSS-pixel screenshot/snapshot→release；不重放、finally 抬键、Agent 租约冲突／恢复；固定依赖离线生成可打开 Office/PDF 并真实附件交付，验证 MCP；凭据不入 argv／输出 |
+| 安装 | 全新安装和通过 stdin 传 `--yes`；相同摘要直接成为当前版本；预检失败后精确清理并可在原路径重试；恶意的 HOME/XDG 和运行时根目录被拒绝 |
+| 迁移 | [唯一例外](../reference/data-layout.md#受控迁移)的危险残留、伪造的 Python 或 sitecustomize、半途转换后的重试、真实的降权和空能力集、任意 root 命令被拒绝；全新或当前版本没有兼容性副作用；在调用 Docker 前安全创建 attachments |
+| 就绪 | Manager 为 active/enabled 且没有未完成的更新；Platform、Runtime 和公共入口健康；bearer 和模型列表；登录、消息、SSE、附件、搜索；同一版本下多端撤回 |
+| 恢复 | 排空与维护、所有持久化阶段、迁移或外键失败、当前/上一版本的快照与 SQLite 和日志一致；镜像仓库无进展、磁盘满、核心就绪失败、响应丢失；能力降级后恢复；预拉取不占用服务栈锁；沙箱保留工作区；受保护和过期对象的清理 |
+| Firecrawl | 用真实 Compose 冷启动，写入 PostgreSQL 哨兵数据，保留目录挂载后重建：新的容器 ID、精确读回、存活检查和真实的抓取。只 create 或只用一次空库不算 |
+| SearXNG | 真实挂载中存在受管的只读 config 目录挂载，没有匿名卷 |
+| 浏览器与沙箱 | [控制冒烟测试](../../scripts/browser-control-compose-smoke.py)：真实的 Platform 登录和同源网关、临时的核心页面，依次执行接管 → 原子拖拽 → 文本/按键/滚轮 → CSS 像素截图和快照 → 释放；不重放、finally 中松开按键、与 Agent 的租约冲突及恢复；用固定依赖离线生成可以打开的 Office/PDF 并作为真实附件交付；验证 MCP；凭据不出现在参数或输出中 |
 
-Firecrawl 用同一 Manager 启动方式：`docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api`。
+- Firecrawl 使用与 Manager 相同的启动方式：`docker compose -f containers/compose.yaml up --detach --wait --wait-timeout 600 firecrawl-api`。
 
-user-systemd 需 user manager／linger、正确 XDG_RUNTIME_DIR／DBUS_SESSION_BUS_ADDRESS，先证明 systemd-run --user 可用、无产品 watchdog。在 `manager/`：
+**用户级 systemd**
+
+- 需要用户级的 systemd 管理器和 linger，以及正确的 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；先证明 `systemd-run --user` 可用，并且没有产品的看门狗在运行。在 `manager/`：
 
 ```sh
 AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -run '^Test(RecoverySystemdQuiescenceIntegration|OrdinarySystemdActivationRestartIntegration)$' ./internal/selfupdate
 ```
 
-启用后缺前提失败。观察独立 watchdog restart --no-block、候选 inode／ack／commit、失败回滚、主 unit 停止不杀 watchdog、单次重启／精确清瞬态 unit；ExecStart argv／WorkingDirectory 转义分测。
+- 开启后缺少前提条件就失败。要观察到：独立的看门狗以 `restart --no-block` 重启、候选 inode 的确认和提交、失败回滚、主 unit 停止时不杀看门狗、只重启一次并精确清理临时 unit。ExecStart 参数和 WorkingDirectory 的转义单独测试。
 
 ### 发布资格、资产与通道
 
-以[完整发布协议](../operations/auto-update.md#发布通道)为验收表，不另复制准入规则：
+以[完整的发布协议](../operations/auto-update.md#发布通道)作为验收表，这里不重复准入规则：
 
-- [eligibility](../../scripts/tests/test_release_eligibility.py)用真实 Git 覆盖累计差异、产品后追加说明、白名单／空差异、增删／rename／模式／类型／歧义／未知路径、坏历史／身份；缺有效公开基线失败，无首发回退，手工 force 仍验身份，noop 无发布物／latest 副作用，Quality 完整。
-- [governance](../../scripts/tests/test_governance.py)注入缺／混 artifact family、通配／跨 run、错误 tag／资产／Quality／字节／digest；下载后、公开紧前再验，公开后失败报告已可见事故；重试／合法重跑不放宽身份。
-- 默认 head／候选、手工 HEAD、in_progress 分开；三个线性后代证明乱序不降级、最新产品收敛、说明后代不动 latest、分叉拒绝、候选锁不代 channel 锁。GHCR 三次内恢复／耗尽失败、不扩权限。
-- 真 assembler→fresh installer 测正负时区转 UTC Z；无时区、坏日期／偏移、非 RFC3339 拒绝。
+- [发布资格测试](../../scripts/tests/test_release_eligibility.py)用真实 Git 覆盖：累计差异、产品改动之后又追加说明、白名单和空差异、增删和重命名、权限/类型变化、含义不明和未知的路径、损坏的历史和身份。缺少有效的公开基线就失败，没有首发回退；手动强制发布仍验证身份；跳过时没有发布物或 latest 的副作用；Quality 完整运行。
+- [治理测试](../../scripts/tests/test_governance.py)注入：缺少或混杂的工件类别、通配或跨 run 下载、错误的 tag/资产/Quality/字节/摘要。下载后和公开紧前都要再验证；公开后失败要报告为"已可见的事故"；重试和合法的重跑不放宽身份要求。
+- 默认的 head 与候选、手动的 HEAD、`in_progress` 状态分开测试。用三个线性的后代版本证明：乱序完成不会降级、最终收敛到最新的产品版本、只改说明的后代不动 latest、分叉被拒绝、候选锁不能代替通道锁。GHCR 在三次以内恢复或耗尽后失败，不扩大权限。
+- 用真实的组装器加全新的安装器，测试正负时区都转换为 UTC 的 Z 格式；没有时区、日期或偏移非法、不是 RFC3339 的都拒绝。
 
 ### 静态边界与隔离清理
 
-按 job 查权限／依赖／锁／artifact 来源与实际入口，静态不代执行。测试 canonical 上游输入、构建排除本地 static／开发产物、generation 仅最后文件系统指令后作 label、Camoufox 禁整树跨阶段复制、bind 不遮入口／脚本／配置根、容量与镜像键精确相等。
-
-先移容器，再受控提权仅删 RUNNER_TEMP 下 mktemp 的固定产品前缀单树；拒绝无约束路径，异 UID 挂载不普通递归删，失败不吞。镜像只删刚观察的精确 ID，漂移／缺失／Docker 不可读失败关闭，禁 prune。部署 deadline 不借 Runtime 策略；生产恢复遵守[部署](../operations/deployment.md)。
+- 按 job 检查权限、依赖、锁、工件来源和实际入口；静态检查不能代替执行。
+- 测试规范的上游输入；构建排除本地的 static 和开发产物；版本号只在最后一条文件系统指令之后作为标签；Camoufox 禁止跨阶段复制整个目录树；目录挂载不遮住入口、脚本或配置根目录；容量与镜像的键集合精确相等。
+- 清理时先移除容器，再受控提权，只删除 RUNNER_TEMP 下由 mktemp 创建、带固定产品前缀的单个目录树；拒绝不受约束的路径，其它 UID 的挂载不做普通递归删除，失败不能被吞掉。
+- 镜像只删除刚观察到的精确 ID；漂移、缺失或 Docker 不可读时失败关闭，禁止 prune。部署的截止时间不借用 Runtime 的策略；生产恢复遵守[部署](../operations/deployment.md)。
 
 ## 文档同步检查
 
-命令归[文档工作流](documentation-workflow.md)，顶层／CI 只查一次当前树。回归驱动全部语言消费者，拒绝缺／旧目标、不安全／可执行路径、未知字段、非法边界、无消费者，不锁生产值／owner 清单／措辞。锚点／语义人工审查；安全检查不依赖可选搜索工具。
+- 命令见[文档工作流](documentation-workflow.md)。顶层和 CI 都只对当前文件树检查一次。
+- 回归测试要驱动全部语言的生成代码，拒绝缺失或过期的目标、不安全或可执行的路径、未知字段、非法边界；不把生产值或文字措辞写死在测试里。
+- 文档的语义正确性靠人工审查；安全检查不依赖可选的搜索工具。
