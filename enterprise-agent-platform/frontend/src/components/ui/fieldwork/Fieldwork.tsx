@@ -8,25 +8,42 @@ export type Tone = 'neutral' | 'info' | 'success' | 'warning' | 'danger';
 export type BrandIdentity = { productName: string; logoUrl?: string | null };
 export type FieldworkMode = 'light' | 'dark';
 
+/**
+ * Neutral, cool, low-chroma palette after Beautiful UI (beautifului.dev). Separation comes from
+ * tone steps and soft ring shadows rather than drawn borders:
+ * canvas = app/sidebar ground, surface = reading area, raised = cards/popovers/composer,
+ * inset = filled fields, code, user bubbles; hover/hoverStrong = interactive washes;
+ * ink/muted/faint = the three text levels; line/strongLine = hairlines.
+ */
 const palettes = {
   light: {
-    canvas: '#f3f4f6', surface: '#fdfdfd', inset: '#ecedef', ink: '#25272b',
-    muted: '#60656d', faint: '#646b75', line: '#dce0e5', strongLine: '#adb3bd',
-    success: '#466343', warning: '#805c22', danger: '#a44436', info: '#3d617c',
+    canvas: '#fafafb', surface: '#ffffff', raised: '#ffffff', inset: '#f2f2f3', hover: '#f4f5f6', hoverStrong: '#e7e9eb',
+    ink: '#1f2124', muted: '#5a5d63', faint: '#6b6e74', line: '#ecedef', strongLine: '#e0e2e5',
+    success: '#136c33', warning: '#9c4806', danger: '#b8252b', info: '#0861bb', tooltip: '#25272b',
+    shadowCard: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 1px 2px rgba(15, 17, 20, 0.04), 0 2px 8px rgba(15, 17, 20, 0.04)',
+    shadowRaised: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 4px 16px rgba(15, 17, 20, 0.08)',
+    shadowOverlay: '0 0 0 1px rgba(15, 17, 20, 0.06), 0 12px 32px rgba(15, 17, 20, 0.14)',
   },
   dark: {
-    canvas: '#1d1f22', surface: '#25272b', inset: '#303338', ink: '#edeef0',
-    muted: '#b7bbc3', faint: '#a7adb7', line: '#41454c', strongLine: '#646c77',
-    success: '#b1c9a1', warning: '#e5c486', danger: '#f0aaa0', info: '#aecbdf',
+    canvas: '#17181a', surface: '#1c1d1f', raised: '#232427', inset: '#2b2c2f', hover: '#2a2b2e', hoverStrong: '#313236',
+    ink: '#f2f3f4', muted: '#a5a8ad', faint: '#95989e', line: '#2e3033', strongLine: '#3a3c40',
+    success: '#3cbb72', warning: '#f68f3c', danger: '#f47b7f', info: '#7ec0ff', tooltip: '#111214',
+    shadowCard: '0 0 0 1px rgba(255, 255, 255, 0.09), 0 1px 2px rgba(0, 0, 0, 0.2), 0 2px 6px rgba(0, 0, 0, 0.2)',
+    shadowRaised: '0 0 0 1px rgba(255, 255, 255, 0.11), 0 2px 10px rgba(0, 0, 0, 0.24)',
+    shadowOverlay: '0 0 0 1px rgba(255, 255, 255, 0.13), 0 8px 28px rgba(0, 0, 0, 0.36)',
   },
 } as const;
 const fallbackBrand = '#52606d';
 const brandForeground = { light: '#fdfefe', dark: '#030405' } as const;
-const bodyFont = '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
+// Local fonts only: Inter/JetBrains Mono are used when installed, never downloaded.
+const bodyFont = '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif';
+const monoFont = '"JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace';
 const SurfaceContext = createContext<(() => HTMLElement) | undefined>(undefined);
 const NavigationCloseContext = createContext<(() => void) | undefined>(undefined);
 /** Chinese UI copy is written as intended; Ant must not insert a space into two-character labels. */
 const buttonConfig = { autoInsertSpace: false } as const;
+// Fields are quiet tonal fills (Beautiful UI) instead of outlined boxes.
+const filledVariant = { variant: 'filled' } as const;
 
 function rgb(hex: string): number[] {
   return [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16));
@@ -92,31 +109,57 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
     const variables = Object.fromEntries(Object.entries({ ...palette, brandRaw, accent, accentWash, onBrand }).map(([key, value]) => [
       `--wf-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`, value,
     ])) as CSSProperties;
+    const control = touch ? 44 : 32;
     const config: ThemeConfig = {
       algorithm: mode === 'dark' ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
       token: {
         colorPrimary: brandRaw, colorPrimaryText: accent, colorLink: accent, colorTextLightSolid: onBrand,
         colorBgBase: palette.surface, colorBgLayout: palette.canvas, colorBgContainer: palette.surface,
-        colorBgElevated: palette.surface, colorFillAlter: palette.inset,
-        colorText: palette.ink, colorTextSecondary: palette.muted, colorTextTertiary: palette.faint,
-        colorBorder: palette.strongLine, colorBorderSecondary: palette.line,
+        colorBgElevated: palette.raised, colorBgSpotlight: palette.tooltip, colorFillAlter: palette.inset,
+        colorFillTertiary: palette.inset, colorFillSecondary: palette.hoverStrong, colorFillQuaternary: palette.hover,
+        colorText: palette.ink, colorTextSecondary: palette.muted, colorTextTertiary: palette.faint, colorTextQuaternary: palette.faint,
+        colorTextPlaceholder: palette.faint,
+        colorBorder: palette.strongLine, colorBorderSecondary: palette.line, colorSplit: palette.line,
         colorSuccess: palette.success, colorWarning: palette.warning, colorError: palette.danger,
-        colorInfo: palette.info, borderRadius: 8, borderRadiusSM: 4, borderRadiusLG: 12,
-        fontFamily: bodyFont, fontSize: 14, fontSizeSM: 13, fontSizeLG: 14,
-        fontSizeHeading1: 20, fontSizeHeading2: 18, fontSizeHeading3: 16, fontSizeHeading4: 14, fontSizeHeading5: 14,
-        controlHeight: touch ? 44 : 36, controlHeightLG: touch ? 44 : 40, controlHeightSM: touch ? 44 : 36,
+        colorInfo: palette.info, borderRadius: 8, borderRadiusSM: 6, borderRadiusLG: 14, borderRadiusXS: 4,
+        fontFamily: bodyFont, fontFamilyCode: monoFont, fontSize: 14, fontSizeSM: 13, fontSizeLG: 14,
+        fontSizeHeading1: 18, fontSizeHeading2: 16, fontSizeHeading3: 15, fontSizeHeading4: 14, fontSizeHeading5: 14,
+        fontWeightStrong: 600,
+        controlHeight: control, controlHeightLG: touch ? 44 : 36, controlHeightSM: touch ? 44 : 28,
         lineWidth: 1, padding: 16, paddingLG: 24, paddingSM: 12,
+        boxShadow: palette.shadowRaised, boxShadowSecondary: palette.shadowOverlay, boxShadowTertiary: palette.shadowCard,
+        controlOutline: accentWash, controlOutlineWidth: 3, colorBgMask: mode === 'dark' ? 'rgba(0, 0, 0, 0.5)' : 'rgba(15, 17, 20, 0.28)',
         motionDurationFast: '0.14s', motionDurationMid: '0.22s', motionEaseInOut: 'cubic-bezier(.25,1,.5,1)',
       },
       components: {
-        Button: { primaryColor: onBrand, dangerColor: mode === 'dark' ? palette.canvas : palette.surface, primaryShadow: 'none', defaultShadow: 'none', dangerShadow: 'none', fontWeight: 600 },
-        Table: { headerBg: palette.inset, headerColor: palette.muted, cellPaddingBlock: 12, cellPaddingInline: 12 },
+        Button: {
+          primaryColor: onBrand, dangerColor: mode === 'dark' ? palette.canvas : palette.surface,
+          primaryShadow: 'none', dangerShadow: 'none', defaultShadow: '0 1px 2px rgba(15, 17, 20, 0.04)',
+          defaultBorderColor: palette.strongLine, defaultHoverBorderColor: palette.strongLine, defaultHoverColor: palette.ink,
+          defaultHoverBg: palette.hover, defaultActiveBg: palette.hoverStrong, defaultActiveBorderColor: palette.strongLine, defaultActiveColor: palette.ink,
+          textHoverBg: palette.hover, textTextColor: palette.ink, textTextHoverColor: palette.ink, textTextActiveColor: palette.ink,
+          colorBgTextActive: palette.hoverStrong, fontWeight: 500, contentFontSize: 13, paddingInline: 12,
+        },
+        Input: { activeBg: palette.raised, hoverBg: palette.hoverStrong, activeShadow: `0 0 0 3px ${accentWash}` },
+        InputNumber: { activeBg: palette.raised, hoverBg: palette.hoverStrong, activeShadow: `0 0 0 3px ${accentWash}` },
+        Select: {
+          optionHeight: touch ? 44 : 32, optionPadding: touch ? '12px' : '6px 10px', activeOutlineColor: accentWash,
+          optionSelectedBg: palette.hover, optionActiveBg: palette.hover, optionSelectedFontWeight: 500,
+        },
+        Table: { headerBg: 'transparent', headerColor: palette.muted, headerSplitColor: 'transparent', rowHoverBg: palette.hover, borderColor: palette.line, cellPaddingBlock: 10, cellPaddingInline: 12 },
         Tabs: { horizontalItemGutter: 20, titleFontSize: 14 },
-        Menu: { itemHeight: touch ? 44 : 36 },
-        Select: { optionHeight: touch ? 44 : 36, optionPadding: touch ? '12px' : '8px 12px' },
-        Segmented: { trackBg: palette.inset, itemSelectedBg: palette.surface },
-        Form: { labelColor: palette.ink, labelFontSize: 14, verticalLabelPadding: '0 0 4px', itemMarginBottom: 16 },
+        Menu: { itemHeight: touch ? 44 : 32, itemBorderRadius: 6, itemSelectedBg: palette.hover, itemHoverBg: palette.hover, itemSelectedColor: palette.ink },
+        Dropdown: { paddingBlock: 6, controlItemBgHover: palette.hover },
+        Segmented: { trackBg: palette.inset, itemSelectedBg: palette.raised, itemColor: palette.muted, itemHoverColor: palette.ink, itemHoverBg: 'transparent' },
+        Form: { labelColor: palette.ink, labelFontSize: 13, verticalLabelPadding: '0 0 6px', itemMarginBottom: 16 },
         Drawer: { footerPaddingBlock: 12, footerPaddingInline: 20 },
+        Modal: { contentBg: palette.raised, headerBg: palette.raised, footerBg: palette.raised, titleFontSize: 15 },
+        Popover: { titleMinWidth: 160 },
+        // Tooltips are always dark; their text must not follow the brand-dependent onBrand color.
+        Tooltip: { fontSize: 12, paddingSM: 8, paddingXS: 6, borderRadius: 6, colorTextLightSolid: '#f7f8f9' },
+        Switch: { trackHeight: 20, trackMinWidth: 36, handleSize: 16 },
+        Tag: { defaultBg: palette.inset, defaultColor: palette.muted },
+        Badge: { dotSize: 6 },
       },
     };
     return { variables, config };
@@ -126,7 +169,8 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
   return (
     <div ref={root} className="wf-root" data-wf-theme={mode} style={design.variables}>
       <SurfaceContext.Provider value={getContainer}>
-        <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}>
+        <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}
+          input={filledVariant} textArea={filledVariant} select={filledVariant} inputNumber={filledVariant}>
           <MotionProvider motion={motion}>
             <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
           </MotionProvider>
@@ -225,7 +269,7 @@ export function AppFrame({ brand, navigation, account, utilities, children, navi
               navigationOpener.current = null;
             }
           }}
-          closeIcon={<span ref={closeIcon}><Glyph name="close" /></span>} closable={{ 'aria-label': closeNavigationLabel }} classNames={{ root: 'wf-drawer', body: 'wf-drawer-nav-body', header: 'wf-drawer-header' }}>{indexBody}</Drawer>
+          closeIcon={<span ref={closeIcon}><Glyph name="close" /></span>} closable={{ 'aria-label': closeNavigationLabel }} classNames={{ root: 'wf-drawer wf-nav-drawer', body: 'wf-drawer-nav-body', header: 'wf-drawer-header' }}>{indexBody}</Drawer>
       </div>
     </NavigationCloseContext.Provider>
   );

@@ -3,8 +3,8 @@
   --wf-trace-duration: 300ms;
   --wf-trace-ease: cubic-bezier(.23, 1, .32, 1);
   --wf-trace-sign: var(--wf-space-4);
-  --wf-trace-rail: color-mix(in srgb, var(--wf-muted) 24%, transparent);
-  --wf-trace-hover: color-mix(in srgb, var(--wf-inset) 72%, transparent);
+  --wf-trace-rail: var(--wf-strong-line);
+  --wf-trace-hover: var(--wf-hover);
   min-inline-size: 0; max-inline-size: 100%;
   font-size: var(--wf-text-sm); line-height: 1.5; color: var(--wf-ink);
 }
@@ -104,7 +104,7 @@ button.wf-trace-head { cursor: pointer; }
 .wf-trace-evidence h4 { margin: 0; font-size: var(--wf-text-xs); font-weight: 500; line-height: 1.5; color: var(--wf-muted); }
 .wf-trace-evidence pre {
   margin: 0; max-inline-size: 100%; max-block-size: 20rem; overflow: auto;
-  padding: var(--wf-space-2) var(--wf-space-3); border-radius: var(--wf-radius); background: var(--wf-inset);
+  padding: var(--wf-space-2) var(--wf-space-3); border-radius: var(--wf-radius-md); background: var(--wf-inset);
   font-size: var(--wf-text-xs); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2;
 }
 .wf-trace-command code::before { content: "$ " / ""; color: var(--wf-muted); user-select: none; }

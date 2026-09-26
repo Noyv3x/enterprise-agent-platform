@@ -13,4 +13,4 @@
 /* Page-header actions are secondary to the conversation: quiet text buttons, emphasized only while their panel is open. */
 .wf-root .wf-header-action { color: var(--wf-muted); font-weight: 500; gap: var(--wf-space-1); padding-inline: var(--wf-space-2); }
 .wf-root .wf-header-action:not(:disabled):hover { color: var(--wf-ink); }
-.wf-root .wf-header-action[aria-expanded="true"] { color: var(--wf-ink); background: var(--wf-inset); }
+.wf-root .wf-header-action[aria-expanded="true"] { color: var(--wf-ink); background: var(--wf-hover-strong); }
