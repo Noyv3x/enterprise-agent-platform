@@ -113,7 +113,7 @@ function SkillEditorForm({ editor, busy, error, onChange, onCancel, onSubmit }: 
     <Form layout="vertical" onFinish={onSubmit}>
       {error ? <Notice tone="danger" title={error}/> : null}
       {preset ? <Notice tone="info" title={t("skills.preset")} >{t("skills.presetHint")}</Notice> : null}
-      {editor.mode !== "create" && editor.source ? <p>{t("skills.source")}: {t(editor.source === "bundled" ? "skills.source.bundled" : "skills.source.user")}</p> : null}
+      {editor.mode !== "create" && editor.source ? <p className="mb-3 text-[13px] text-ink-2">{t("skills.source")}: {t(editor.source === "bundled" ? "skills.source.bundled" : "skills.source.user")}</p> : null}
       <FormGrid>{fields.map(([key, limit]) => <Form.Item key={key} label={t(`skills.form.${key}`)} required={key === "name" || key === "description" || key === "instructions"}
         extra={key === "tags" ? t("skills.form.tagsHint") : key === "instructions" ? t("skills.form.instructionsHint") : undefined}>
         {key === "instructions" ? <Input.TextArea className="wf-skill-instructions" aria-label={t(`skills.form.${key}`)} value={draft[key]} maxLength={limit} readOnly={readOnly} disabled={busy} autoSize={{minRows:10,maxRows:22}} onChange={event => onChange({...draft,[key]:event.target.value})} />
@@ -417,7 +417,7 @@ export function SkillsPanel({
       {query ? <Button onClick={() => {queryRef.current="";setQuery("");setQueryDraft("");}}>{t("skills.clearSearch")}</Button> : null}</Space.Compact>
     </Form>} />
     {mutationError ? <Notice tone="danger" title={mutationError}/> : null}
-    {busyKey.startsWith("detail:") ? <p role="status">{t("skills.loadingDetail")}</p> : null}
+    {busyKey.startsWith("detail:") ? <p role="status" className="my-2 text-[13px] text-ink-2">{t("skills.loadingDetail")}</p> : null}
     <DataRegion state={skills.length ? "ready" : loading ? "loading" : loadError ? "error" : "empty"} loadingLabel={t("skills.loading")} refreshing={loading && !!skills.length} refreshingLabel={t("skills.loading")} error={loadError} retry={<Button onClick={() => void refreshSkills()}>{t("common.retry")}</Button>} empty={<EmptyState title={emptyTitle} description={emptyDetail}/>}>
       <ResourceList label={t("skills.count",{count:skills.length})}>{skills.map(item => {
         const readOnly = item.read_only === true || item.source === "bundled";

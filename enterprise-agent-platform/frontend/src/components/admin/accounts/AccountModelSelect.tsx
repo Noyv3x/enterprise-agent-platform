@@ -25,6 +25,6 @@ export function AccountModelSelect({ id, value, onChange }: AccountModelSelectPr
     ]} />
     {unavailable && <Notice tone="warning" title={t("admin.model.savedUnavailable", { model: value })} />}
     {catalog?.error && <Notice tone="warning" title={t("admin.model.catalogError", { error: catalog.error })} />}
-    <p>{models.length ? t("admin.model.count", { count: models.length }) : t("admin.model.defaultOnly")}</p>
+    <p className="mt-1.5 text-[12.5px] text-ink-3">{models.length ? t("admin.model.count", { count: models.length }) : t("admin.model.defaultOnly")}</p>
   </>;
 }

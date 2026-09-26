@@ -24,7 +24,7 @@ export function AccountManagement({ createOpen, onCloseCreate }: { createOpen: b
     void impersonateAccount(store, user.id);
   };
   return <section aria-label={t("admin.accounts.title")}>{dialog}
-    <p>{t("admin.accounts.count", { count: users.length })}</p>
+    <p className="mb-3 text-[13px] text-ink-2">{t("admin.accounts.count", { count: users.length })}</p>
     <DataRegion state={users.length ? "ready" : "empty"} loadingLabel={t("common.loading")} empty={<EmptyState title={t("admin.accounts.empty")} compact />}>
       <ResourceList label={t("admin.accounts.title")}>{users.map((user) => <ResourceRow key={user.id}
         title={user.display_name || user.username} description={`@${user.username}${user.position?.trim() ? ` · ${user.position.trim()}` : ""}`}

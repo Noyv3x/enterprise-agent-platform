@@ -36,9 +36,9 @@ const palettes = {
 } as const;
 const fallbackBrand = '#52606d';
 const brandForeground = { light: '#fdfefe', dark: '#030405' } as const;
-// Self-hosted latin faces (beautiful/foundation.css); CJK falls through to the system faces.
-const bodyFont = '"BUI Inter", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif';
-const monoFont = '"BUI JetBrains Mono", "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace';
+// Font stacks are owned by beautiful/foundation.css (@theme --font-sans / --font-mono).
+const bodyFont = 'var(--font-sans)';
+const monoFont = 'var(--font-mono)';
 const SurfaceContext = createContext<(() => HTMLElement) | undefined>(undefined);
 const NavigationCloseContext = createContext<(() => void) | undefined>(undefined);
 /** Chinese UI copy is written as intended; Ant must not insert a space into two-character labels. */
@@ -120,6 +120,8 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
         colorFillTertiary: palette.inset, colorFillSecondary: palette.hoverStrong, colorFillQuaternary: palette.hover,
         colorText: palette.ink, colorTextSecondary: palette.muted, colorTextTertiary: palette.faint, colorTextQuaternary: palette.faint,
         colorTextPlaceholder: palette.faint,
+        // Menu, select and list selection is a neutral fill (Beautiful UI), never a brand-tinted wash.
+        controlItemBgHover: palette.hover, controlItemBgActive: palette.hover, controlItemBgActiveHover: palette.hoverStrong,
         colorBorder: palette.strongLine, colorBorderSecondary: palette.line, colorSplit: palette.line,
         colorSuccess: palette.success, colorWarning: palette.warning, colorError: palette.danger,
         colorInfo: palette.info, borderRadius: 8, borderRadiusSM: 6, borderRadiusLG: 14, borderRadiusXS: 4,

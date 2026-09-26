@@ -6,7 +6,7 @@
 
 | 范围 | 契约 |
 | --- | --- |
-| 构建 | 使用 React、TypeScript、Vite、Ant Design 6 与 Tailwind CSS 4（仅为 Beautiful UI 组件生成 utilities，不引入 preflight）。样式按 cascade layer 排序：base 重置 < Ant 运行时（`antd` 层）< 设计系统与领域 CSS（`app` 层）< utilities，层序在 `index.html` 头部先行声明。frontend 为源，`enterprise_agent_platform/static/` 为不入 Git 的可重现产物；容器 frontend stage 的完整输出覆盖 wheel。同文件系统暂存、验证、压缩，先安装 hash 依赖，最后提交 identity/gzip/Brotli 入口；全部入口提交前保留旧依赖，之后删除清单外受管资产，不留旧 bundle 或跨 generation 兼容层。 |
+| 构建 | 使用 React、TypeScript、Vite、Ant Design 6 与 Tailwind CSS 4（含 preflight：清空浏览器默认样式，每个元素的外观只由显式样式决定；Markdown 长文由聊天正文排版单独负责）。样式按 cascade layer 排序：preflight 与 base 规则 < Ant 运行时（`antd` 层）< 设计系统与领域 CSS（`app` 层）< utilities，层序在 `index.html` 头部先行声明。frontend 为源，`enterprise_agent_platform/static/` 为不入 Git 的可重现产物；容器 frontend stage 的完整输出覆盖 wheel。同文件系统暂存、验证、压缩，先安装 hash 依赖，最后提交 identity/gzip/Brotli 入口；全部入口提交前保留旧依赖，之后删除清单外受管资产，不留旧 bundle 或跨 generation 兼容层。 |
 | 加载/类型 | 未登录和恢复界面不静态引入聊天、电脑、浏览器或终端；bootstrap 确认用户后懒载 Shell，慢链路沿用启动反馈。组件、路由及 CSS 按需加载，不聚合未用模块。公开类型随当前 API 实体同改，不留旧 alias。 |
 
 ## 品牌与部署定制

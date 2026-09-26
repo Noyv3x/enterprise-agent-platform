@@ -1,8 +1,8 @@
 /* FIELDWORK. Palette values (colors, ring shadows) arrive from FieldworkProvider; domain styles consume these tokens.
    Visual language after Beautiful UI: tone steps and soft rings instead of drawn borders, 13–15px text, quiet fills. */
 .wf-root {
-  --wf-font-body: "BUI Inter", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, sans-serif;
-  --wf-font-mono: "BUI JetBrains Mono", "JetBrains Mono", ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Code", Menlo, Consolas, "Liberation Mono", monospace;
+  --wf-font-body: var(--font-sans);
+  --wf-font-mono: var(--font-mono);
   --wf-text-xs: .75rem; --wf-text-sm: .8125rem; --wf-text-base: .875rem;
   --wf-text-reading: .9375rem; --wf-text-lg: 1rem; --wf-text-title: 1.125rem;
   --wf-space-1: .25rem; --wf-space-2: .5rem; --wf-space-3: .75rem;
@@ -28,16 +28,16 @@
 .wf-root ::selection { background: color-mix(in srgb, var(--wf-brand-raw) 22%, transparent); }
 .wf-root :where(.wf-message-body, .wf-reading, pre, code, kbd, textarea) { letter-spacing: normal; }
 .wf-root[data-wf-theme="dark"] { color-scheme: dark; }
-.wf-root *, .wf-root *::before, .wf-root *::after { box-sizing: border-box; }
-.wf-root [hidden] { display: none; }
 .wf-root :where(button, input, textarea, select, a, [tabindex]):focus-visible {
   outline: var(--wf-focus-width) solid var(--wf-accent); outline-offset: var(--wf-focus-offset);
 }
-.wf-root :where(a) { color: var(--wf-accent); text-underline-offset: var(--wf-space-1); }
-.wf-root :where(img, video, canvas) { max-inline-size: 100%; }
-.wf-root :where(h1, h2, h3, h4, p, pre) { margin-block-start: 0; }
-.wf-root :where(button, input, textarea, select) { font-family: inherit; }
+/* Preflight leaves links as plain text; they read as links again: accent ink, a quiet underline that firms on hover. */
+.wf-root :where(a) { color: var(--wf-accent); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 35%, transparent); text-decoration-thickness: 1px; text-underline-offset: 3px; transition: text-decoration-color var(--wf-fast) var(--wf-ease); }
+.wf-root :where(a:hover) { text-decoration-color: currentColor; }
+.wf-root :where(a.wf-skip) { text-decoration-line: none; }
 .wf-root :where(pre, code, kbd) { font-family: var(--wf-font-mono); }
+/* Consecutive paragraphs in interface copy (dialogs, panels, previews) sit a half-line apart. */
+.wf-root :where(p + p) { margin-block-start: var(--wf-space-2); }
 .wf-app { min-block-size: 100%; color: inherit; }
 .wf-actions, .wf-utilities { display: flex; align-items: center; gap: var(--wf-space-2); flex-wrap: wrap; }
 .wf-actions > *, .wf-utilities > * { max-inline-size: 100%; }
@@ -216,7 +216,6 @@
 .wf-message-time { font-variant-numeric: tabular-nums; }
 .wf-message-body { font-size: var(--wf-text-reading); line-height: 1.6; overflow-wrap: anywhere; min-inline-size: 0; }
 .wf-message-body > :last-child { margin-block-end: 0; }
-.wf-message-body blockquote { border-inline-start: 2px solid var(--line-strong); margin-inline: 0; padding-inline-start: var(--wf-space-4); color: var(--ink-2); }
 .wf-message-footer { display: flex; align-items: center; gap: var(--wf-space-2); min-block-size: var(--wf-space-6); margin-block-start: var(--wf-space-1); color: var(--wf-muted); font-size: var(--wf-text-xs); }
 .wf-message-footnote { display: inline-flex; align-items: center; min-inline-size: 0; }
 .wf-message-actions { display: flex; align-items: center; gap: 2px; }
