@@ -90,7 +90,7 @@ export function AutoUpdateConfig() {
         <Button loading={checking} disabled={blocked} onClick={() => { if (!blocked) void checkAutoUpdateNow(store); }}>{t("admin.updates.checkNow")}</Button>
         <Button type="primary" disabled={blocked || !status.update_available} onClick={() => void operate("update")}>{t("admin.updates.updateNow")}</Button>
         <Button disabled={blocked} onClick={() => void operate("restart")}>{t("admin.updates.restart")}</Button>
-        <Button danger disabled={blocked || !status.previous_generation} onClick={() => void operate("rollback")}>{t("admin.updates.rollback")}</Button>
+        <Button color="danger" variant="filled" disabled={blocked || !status.previous_generation} onClick={() => void operate("rollback")}>{t("admin.updates.rollback")}</Button>
         {status.state === "failed" && <Button disabled={blocked} onClick={() => void operate("repair")}>{t("admin.updates.repair")}</Button>}
       </Space>
     </Section>

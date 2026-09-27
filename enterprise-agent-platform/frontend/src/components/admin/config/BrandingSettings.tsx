@@ -6,6 +6,7 @@ import { useConfirm } from "../../../hooks/useConfirm";
 import { useI18n } from "../../../i18n";
 import { useStore, useStoreHandle } from "../../../store/useStore";
 import type { BrandingSnapshot } from "../../../types";
+import { BUI_PATHS, BuiIcon } from "../../ui/beautiful";
 import { BrandMark, FieldworkProvider, FormFooter, FormGrid, Notice, PageHeader, Section, StatusMark } from "../../ui/fieldwork";
 
 const COLOR = /^#[0-9a-f]{6}$/i;
@@ -67,7 +68,10 @@ export function BrandingSettings() {
           <StatusMark tone="neutral">{t("admin.branding.preview")}{dirty ? ` · ${t("admin.branding.unsaved")}` : ""}</StatusMark>
           <Segmented aria-label={t("admin.branding.preview")} value={previewMode} options={[{ value: "light", label: t("admin.branding.preview.light") }, { value: "dark", label: t("admin.branding.preview.dark") }]} onChange={(value) => setPreviewMode(value as "light" | "dark")} />
           <FieldworkProvider mode={previewMode} primaryColor={validColor ? draft.color : DEFAULT_BRANDING.primary_color}>
-            <Section tone="inset"><BrandMark productName={draft.product.trim() || DEFAULT_BRANDING.product_name} logoUrl={snapshot.logo_url} /><PageHeader title={draft.agent.trim() || DEFAULT_BRANDING.agent_name} /></Section>
+            <Section tone="inset"><BrandMark productName={draft.product.trim() || DEFAULT_BRANDING.product_name} logoUrl={snapshot.logo_url} /><PageHeader title={draft.agent.trim() || DEFAULT_BRANDING.agent_name} />
+              {/* The brand color's main surface: the composer's send control. */}
+              <div className="mt-3 flex items-center gap-2" aria-hidden="true"><span className="h-8 flex-1 rounded-[10px] bg-surface shadow-card" /><span className="flex size-7 items-center justify-center rounded-[8px] bg-accent text-on-accent"><BuiIcon size={16} strokeWidth={2.4}>{BUI_PATHS.arrowUp}</BuiIcon></span></div>
+            </Section>
           </FieldworkProvider>
         </div>
       </FormGrid>
@@ -78,7 +82,7 @@ export function BrandingSettings() {
       {logoError && <Notice tone="danger" title={logoError} />}
       <FormFooter>
         <Upload accept="image/png,image/webp" multiple={false} showUploadList={false} disabled={dirty || saving} beforeUpload={(file) => { void upload(file); return false; }}><Button disabled={dirty || saving} loading={saving}>{t(snapshot.logo_url ? "admin.branding.logoReplace" : "admin.branding.logoUpload")}</Button></Upload>
-        {snapshot.logo_url && <Button danger disabled={dirty || saving} onClick={() => void remove()}>{t("admin.branding.logoDelete")}</Button>}
+        {snapshot.logo_url && <Button color="danger" variant="filled" disabled={dirty || saving} onClick={() => void remove()}>{t("admin.branding.logoDelete")}</Button>}
       </FormFooter>
     </Section>
   </>;

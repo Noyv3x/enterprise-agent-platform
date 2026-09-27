@@ -41,6 +41,8 @@ const bodyFont = 'var(--font-sans)';
 const monoFont = 'var(--font-mono)';
 const SurfaceContext = createContext<(() => HTMLElement) | undefined>(undefined);
 const NavigationCloseContext = createContext<(() => void) | undefined>(undefined);
+/** Inside an overlay panel the panel header already names the view, so page headers keep their title for assistive tech only. */
+const OverlayContext = createContext(false);
 /** Chinese UI copy is written as intended; Ant must not insert a space into two-character labels. */
 const buttonConfig = { autoInsertSpace: false } as const;
 // Fields are quiet tonal fills (Beautiful UI) instead of outlined boxes.
@@ -48,6 +50,11 @@ const filledVariant = { variant: 'filled' } as const;
 
 function rgb(hex: string): number[] {
   return [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16));
+}
+/** `amount` of `to` mixed into `from`, as #rrggbb. */
+function mix(from: string, to: string, amount: number): string {
+  const target = rgb(to);
+  return `#${rgb(from).map((value, index) => Math.round(value + (target[index]! - value) * amount).toString(16).padStart(2, '0')).join('')}`;
 }
 function luminance(values: number[]): number {
   const linear = values.map((value) => {
@@ -111,6 +118,8 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
       `--wf-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`, value,
     ])) as CSSProperties;
     const control = touch ? 44 : 32;
+    // Beautiful UI's primary action and "on" state are ink, not the brand: the brand stays for send, links and focus.
+    const inkSolid = { base: palette.ink, hover: mix(palette.ink, palette.surface, 0.12), active: mix(palette.ink, palette.surface, 0.2), text: mode === 'dark' ? palette.canvas : palette.surface };
     const config: ThemeConfig = {
       algorithm: mode === 'dark' ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm,
       token: {
@@ -135,9 +144,11 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
         motionDurationFast: '0.14s', motionDurationMid: '0.22s', motionEaseInOut: 'cubic-bezier(.25,1,.5,1)',
       },
       components: {
-        // Beautiful UI Button: pill actions; secondary = surface + hairline ring (shadow-btn), hover = inset wash.
+        // Beautiful UI Button: pill actions; primary = ink pill, secondary = surface + hairline ring (shadow-btn),
+        // hover = inset wash; destructive actions use the soft danger fill (color="danger" variant="filled").
         Button: {
-          primaryColor: onBrand, dangerColor: mode === 'dark' ? palette.canvas : palette.surface,
+          colorPrimary: inkSolid.base, colorPrimaryHover: inkSolid.hover, colorPrimaryActive: inkSolid.active, primaryColor: inkSolid.text,
+          dangerColor: mode === 'dark' ? palette.canvas : palette.surface,
           primaryShadow: 'none', dangerShadow: 'none', defaultShadow: 'var(--shadow-btn)',
           defaultBg: palette.raised, defaultBorderColor: 'transparent', defaultHoverBorderColor: 'transparent', defaultHoverColor: palette.ink,
           defaultHoverBg: palette.well, defaultActiveBg: palette.hover, defaultActiveBorderColor: 'transparent', defaultActiveColor: palette.ink,
@@ -151,20 +162,30 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
           optionHeight: touch ? 44 : 32, optionPadding: touch ? '12px' : '6px 10px', activeOutlineColor: accentWash,
           optionSelectedBg: palette.hover, optionActiveBg: palette.hover, optionSelectedFontWeight: 500, borderRadiusLG: 10, borderRadiusSM: 6,
         },
-        Table: { headerBg: 'transparent', headerColor: palette.muted, headerSplitColor: 'transparent', rowHoverBg: palette.hover, borderColor: palette.line, cellPaddingBlock: 10, cellPaddingInline: 12 },
-        Tabs: { horizontalItemGutter: 20, titleFontSize: 14 },
+        // Beautiful UI Records Table: quiet 12.5px headers, 13px cells, hairline rows that wash on hover.
+        Table: { headerBg: 'transparent', headerColor: palette.faint, headerSplitColor: 'transparent', rowHoverBg: palette.hover, borderColor: palette.line, cellPaddingBlock: 10, cellPaddingInline: 12, cellFontSize: 13, fontWeightStrong: 500 },
+        // Panel tabs read as ink on neutral: the active bar and label are ink, idle labels muted.
+        Tabs: { horizontalItemGutter: 20, titleFontSize: 13, inkBarColor: palette.ink, itemColor: palette.muted, itemSelectedColor: palette.ink, itemHoverColor: palette.ink, itemActiveColor: palette.ink },
         Menu: { itemHeight: touch ? 44 : 32, itemBorderRadius: 6, itemSelectedBg: palette.hover, itemHoverBg: palette.hover, itemSelectedColor: palette.ink },
         // Beautiful UI menus: 10px panel, 6px rows, hover fill, overlay ring.
         Dropdown: { paddingBlock: 6, controlItemBgHover: palette.hover, borderRadiusLG: 10, borderRadiusSM: 6, fontSize: 13 },
-        Segmented: { trackBg: palette.inset, itemSelectedBg: palette.raised, itemColor: palette.muted, itemHoverColor: palette.ink, itemHoverBg: 'transparent' },
+        // Beautiful UI SegmentedControl: pill track, pill thumb on the surface.
+        Segmented: { trackBg: palette.inset, itemSelectedBg: palette.raised, itemColor: palette.muted, itemHoverColor: palette.ink, itemHoverBg: 'transparent', trackPadding: 2, borderRadius: 999, borderRadiusSM: 999, borderRadiusXS: 999, borderRadiusLG: 999 },
         Form: { labelColor: palette.ink, labelFontSize: 13, verticalLabelPadding: '0 0 6px', itemMarginBottom: 16 },
         Drawer: { footerPaddingBlock: 12, footerPaddingInline: 20 },
         Modal: { contentBg: palette.raised, headerBg: palette.raised, footerBg: palette.raised, titleFontSize: 15 },
         Popover: { titleMinWidth: 160 },
         // Tooltips are always dark; their text must not follow the brand-dependent onBrand color.
         Tooltip: { fontSize: 12, paddingSM: 8, paddingXS: 6, borderRadius: 6, colorTextLightSolid: '#f7f8f9' },
-        Switch: { trackHeight: 20, trackMinWidth: 36, handleSize: 16 },
-        Tag: { defaultBg: palette.inset, defaultColor: palette.muted },
+        // Beautiful UI Switch: 40×24 track, 20px handle, ink when on.
+        Switch: {
+          trackHeight: 24, trackMinWidth: 40, handleSize: 20, trackPadding: 2,
+          colorPrimary: inkSolid.base, colorPrimaryHover: inkSolid.hover,
+          colorTextQuaternary: mode === 'dark' ? '#55585d' : '#cfd2d6', colorTextTertiary: mode === 'dark' ? '#63666b' : '#c2c5ca',
+          handleBg: mode === 'dark' ? palette.canvas : '#ffffff',
+        },
+        // Beautiful UI Chip: quiet field fill, 6px corners, no outline.
+        Tag: { defaultBg: palette.inset, defaultColor: palette.muted, borderRadiusSM: 6 },
         Badge: { dotSize: 6 },
       },
     };
@@ -177,7 +198,7 @@ export function FieldworkProvider({ mode, primaryColor, locale, prefixCls, motio
       <SurfaceContext.Provider value={getContainer}>
         <StyleProvider layer>
           <ConfigProvider locale={locale} prefixCls={prefixCls} theme={design.config} getPopupContainer={getContainer} button={buttonConfig}
-            input={filledVariant} textArea={filledVariant} select={filledVariant} inputNumber={filledVariant}>
+            input={filledVariant} textArea={filledVariant} select={filledVariant} inputNumber={filledVariant} tag={filledVariant}>
             <MotionProvider motion={motion}>
               <App className="wf-app" message={{ getContainer }} notification={{ getContainer }}>{children}</App>
             </MotionProvider>
@@ -332,8 +353,13 @@ export function SectionIndex({ label, groups, activeKey, onSelect }: NavigationP
 }
 
 export interface PageHeaderProps { eyebrow?: ReactNode; title: ReactNode; description?: ReactNode; meta?: ReactNode; actions?: ReactNode }
+/** True inside an OverlayPanel, whose header already names the view. */
+export function useInOverlay(): boolean {
+  return useContext(OverlayContext);
+}
 export function PageHeader({ eyebrow, title, description, meta, actions }: PageHeaderProps) {
-  return <header className="wf-page-header"><div className="wf-page-heading">{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h1 className="wf-page-title">{title}</h1>{description && <div className="wf-page-description">{description}</div>}{meta && <div className="wf-page-meta">{meta}</div>}</div>{actions && <div className="wf-page-actions">{actions}</div>}</header>;
+  const inOverlay = useInOverlay();
+  return <header className="wf-page-header"><div className="wf-page-heading">{eyebrow && <div className={inOverlay ? 'wf-sr-only' : 'wf-eyebrow'}>{eyebrow}</div>}<h1 className={inOverlay ? 'wf-sr-only' : 'wf-page-title'}>{title}</h1>{description && <div className="wf-page-description">{description}</div>}{meta && <div className="wf-page-meta">{meta}</div>}</div>{actions && <div className="wf-page-actions">{actions}</div>}</header>;
 }
 export function PageLayout({ header, navigation, children }: { header: ReactNode; navigation?: ReactNode; children: ReactNode }) {
   return (
@@ -369,8 +395,9 @@ export function StatusMark({ tone = 'neutral', children, subtle = false, busy = 
 export function Notice({ tone = 'info', title, children, action }: { tone?: Tone; title: ReactNode; children?: ReactNode; action?: ReactNode }) {
   return <div className={`wf-notice wf-tone-${tone}`} role={tone === 'danger' ? 'alert' : 'status'}><span className="wf-notice-sign"><Glyph name={tone === 'danger' || tone === 'warning' ? 'warning' : tone === 'success' ? 'check' : 'file'} /></span><div className="wf-notice-copy"><strong>{title}</strong>{children && <div className="wf-notice-detail">{children}</div>}</div>{action && <div className="wf-notice-action">{action}</div>}</div>;
 }
+/** Beautiful UI empty state (SearchList): a hairline glyph tile, a 13px title and a quiet hint, centered in the region. */
 export function EmptyState({ eyebrow, title, description, action, compact = false }: { eyebrow?: ReactNode; title: ReactNode; description?: ReactNode; action?: ReactNode; compact?: boolean }) {
-  return <div className={`wf-empty${compact ? ' wf-empty--compact' : ''}`}>{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h2>{title}</h2>{description && <div className="wf-empty-description">{description}</div>}{action && <div className="wf-empty-action">{action}</div>}</div>;
+  return <div className={`wf-empty${compact ? ' wf-empty--compact' : ''}`}><span className="wf-empty-sign" aria-hidden="true"><Glyph name="file" size={16} /></span>{eyebrow && <div className="wf-eyebrow">{eyebrow}</div>}<h2>{title}</h2>{description && <div className="wf-empty-description">{description}</div>}{action && <div className="wf-empty-action">{action}</div>}</div>;
 }
 /** Shared loading language: Beautiful UI's pixel-grid loader, the real label, optional detail. */
 export function LoadingState({ label, detail }: { label: ReactNode; detail?: ReactNode }) {
@@ -417,5 +444,5 @@ export function OverlayPanel({ open, onClose, title, description, children, foot
         if (dialog && !dialog.contains(document.activeElement)) target?.focus({ preventScroll: true });
       }
     }}
-    closeIcon={<span ref={closeIcon}><Glyph name="close" /></span>} closable={{ 'aria-label': closeLabel }} classNames={{ root: 'wf-drawer', header: 'wf-drawer-header', body: 'wf-drawer-body', footer: 'wf-drawer-footer' }}>{children}</Drawer>;
+    closeIcon={<span ref={closeIcon}><Glyph name="close" /></span>} closable={{ 'aria-label': closeLabel }} classNames={{ root: 'wf-drawer', header: 'wf-drawer-header', body: 'wf-drawer-body', footer: 'wf-drawer-footer' }}><OverlayContext.Provider value>{children}</OverlayContext.Provider></Drawer>;
 }

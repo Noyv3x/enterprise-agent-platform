@@ -90,7 +90,7 @@ export function useChannelDeletion() {
     retryAction: <div className="wf-stack-tight">{failedTargets.filter(item => canManage
       && item.actor === String(userId) && item.generation === generation
       && !(open && target && String(target.id) === String(item.id))).map(item =>
-      <Button key={String(item.id)} className="wf-channel-delete-retry" danger disabled={busy} onClick={() => {
+      <Button key={String(item.id)} className="wf-channel-delete-retry" color="danger" variant="filled" disabled={busy} onClick={() => {
         if (pending.current) return;
         setTarget(item);
         setFailed(true);

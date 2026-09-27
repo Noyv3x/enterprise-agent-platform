@@ -289,7 +289,7 @@ export function MemoryPanel() {
         onChange={(value) => switchTarget(value as AgentMemoryTarget)}
       />
       <SearchToolbar search={
-        <Form className="wf-memory-search" role="search" aria-label={t("memory.searchLabel")} onFinish={() => submitQuery(queryDraft)}>
+        <Form className="wf-field-row" role="search" aria-label={t("memory.searchLabel")} onFinish={() => submitQuery(queryDraft)}>
           <Input type="search" maxLength={4000} aria-label={t("memory.searchLabel")} placeholder={t("memory.searchPlaceholder")} value={queryDraft} onChange={(event) => setQueryDraft(event.target.value)} />
           <Button htmlType="submit">{t("memory.search")}</Button>
           <Button disabled={!query && !queryDraft} onClick={() => { setQueryDraft(""); submitQuery(""); }}>{t("memory.clearSearch")}</Button>
@@ -315,7 +315,7 @@ export function MemoryPanel() {
               description={memory.tags?.length ? <Space wrap aria-label={t("memory.tags")}>{memory.tags.map((tag) => <Tag key={tag}>{tag}</Tag>)}</Space> : undefined}
               actions={<Space wrap>
                 <Button disabled={loading} onClick={() => { editorRevision.current += 1; setEditorMemory(memory); setEditContent(memory.content); setMutationError(""); }}>{t("memory.edit")}</Button>
-                <Button danger disabled={busy || loading} onClick={() => setConfirmation({ kind: "delete", memory })}>{t("memory.delete")}</Button>
+                <Button color="danger" variant="filled" disabled={busy || loading} onClick={() => setConfirmation({ kind: "delete", memory })}>{t("memory.delete")}</Button>
               </Space>}
             >
               {memory.blocked ? <Notice tone="warning" title={t("memory.blockedTitle")}>{t("memory.blockedMessage")}</Notice> : null}
@@ -323,7 +323,7 @@ export function MemoryPanel() {
           ))}
         </ResourceList>
       </DataRegion>
-      <Section tone="danger"><Button danger disabled={busy || loading} onClick={() => setConfirmation({ kind: "clear", target })}>{clearLabel}</Button></Section>
+      <Section tone="danger"><Button color="danger" variant="filled" disabled={busy || loading} onClick={() => setConfirmation({ kind: "clear", target })}>{clearLabel}</Button></Section>
       <OverlayPanel
         open={createOpen || editorMemory !== null}
         onClose={closeEditor}

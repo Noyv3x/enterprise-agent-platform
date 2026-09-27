@@ -77,14 +77,14 @@ export function AuditThread({ kind, scopeId, scopeName, messages, total, loading
       <FormGrid>
         <Form layout="vertical" onFinish={() => { void remove("id"); }}>
           <Form.Item label={t("admin.audit.messageId")}><Input aria-label={t("admin.audit.messageId")} type="number" min={1} step={1} value={messageId} disabled={disabled} onChange={(event) => setMessageId(event.target.value)} /></Form.Item>
-          <Button danger htmlType="submit" disabled={disabled}>{t("admin.audit.deleteId")}</Button>
+          <Button color="danger" variant="filled" htmlType="submit" disabled={disabled}>{t("admin.audit.deleteId")}</Button>
         </Form>
         <Form layout="vertical" onFinish={() => { void remove("before"); }}>
           <Form.Item label={t("admin.audit.deleteBeforeLabel")}><Input aria-label={t("admin.audit.deleteBeforeLabel")} type="datetime-local" value={beforeTime} disabled={disabled} onChange={(event) => setBeforeTime(event.target.value)} /></Form.Item>
-          <Button danger htmlType="submit" disabled={disabled}>{t("admin.audit.deleteBefore")}</Button>
+          <Button color="danger" variant="filled" htmlType="submit" disabled={disabled}>{t("admin.audit.deleteBefore")}</Button>
         </Form>
       </FormGrid>
-      <Button danger disabled={disabled} onClick={() => { void remove("clear"); }}>{t(kind === "channel" ? "admin.audit.channel.clear" : "admin.audit.private.clear")}</Button>
+      <Button color="danger" variant="filled" disabled={disabled} onClick={() => { void remove("clear"); }}>{t(kind === "channel" ? "admin.audit.channel.clear" : "admin.audit.private.clear")}</Button>
     </Section>
   </>;
 }

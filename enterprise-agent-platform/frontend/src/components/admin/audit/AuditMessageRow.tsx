@@ -20,7 +20,7 @@ export function AuditMessageRow({ message, deletable = false, onDelete }: AuditM
         title={message.username || authorType}
         meta={<Space wrap><span>#{message.id}</span><span>{formatTimestamp(message.created_at)}</span></Space>}
         status={<StatusMark>{authorType}</StatusMark>}
-        actions={onDelete ? <Button danger disabled={!deletable} onClick={onDelete}>{t("admin.audit.deleteMessage")}</Button> : undefined}
+        actions={onDelete ? <Button color="danger" variant="filled" disabled={!deletable} onClick={onDelete}>{t("admin.audit.deleteMessage")}</Button> : undefined}
       >
         <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{message.content}</div>
         {message.attachments?.length ? <MessageAttachments attachments={message.attachments} /> : null}

@@ -24,6 +24,11 @@ scripted output, remote artwork or commercial icons):
   SidebarNav                 -> fieldwork WorkspaceNav (Central Icons replaced by platform glyphs)
   ChatComposer header tabs   -> fieldwork SectionIndex
   TaskRows "List"            -> resource lists and status pills (design-system.css)
+  SearchList empty state     -> fieldwork EmptyState
+  InsightCards               -> fieldwork FactGrid stat tiles
+  atoms Button/Switch/SegmentedControl/Chip -> Ant Design Button, Switch, Segmented and Tag theme values
+                                (ink primary and "on" state, soft danger fill, pill track, filled chip)
+  app layout                 -> floating work panel beside the sidebar (design-system.css .wf-frame/.wf-main)
 
 Fonts: Inter and JetBrains Mono latin subsets are self-hosted from @fontsource-variable packages
 (SIL Open Font License 1.1: public/licenses/inter-OFL.txt, public/licenses/jetbrains-mono-OFL.txt);

@@ -412,9 +412,9 @@ export function SkillsPanel({
       <Button disabled={!!busyKey || loading} onClick={() => void refreshSkills()}>{t("skills.refresh")}</Button>
       {canManage ? <Button type="primary" disabled={!!busyKey || loading} onClick={openCreate}>{t("skills.create")}</Button> : null}
     </Space>} />
-    <SearchToolbar search={<Form role="search" aria-label={t("skills.searchLabel")} onFinish={() => { const next = queryDraft.trim(); queryRef.current = next; setQuery(next); }}>
-      <Space.Compact block><Input type="search" aria-label={t("skills.searchLabel")} value={queryDraft} maxLength={4000} placeholder={t("skills.searchPlaceholder")} onChange={event => setQueryDraft(event.target.value)}/><Button htmlType="submit">{t("skills.search")}</Button>
-      {query ? <Button onClick={() => {queryRef.current="";setQuery("");setQueryDraft("");}}>{t("skills.clearSearch")}</Button> : null}</Space.Compact>
+    <SearchToolbar search={<Form className="wf-field-row" role="search" aria-label={t("skills.searchLabel")} onFinish={() => { const next = queryDraft.trim(); queryRef.current = next; setQuery(next); }}>
+      <Input type="search" aria-label={t("skills.searchLabel")} value={queryDraft} maxLength={4000} placeholder={t("skills.searchPlaceholder")} onChange={event => setQueryDraft(event.target.value)}/><Button htmlType="submit">{t("skills.search")}</Button>
+      {query ? <Button onClick={() => {queryRef.current="";setQuery("");setQueryDraft("");}}>{t("skills.clearSearch")}</Button> : null}
     </Form>} />
     {mutationError ? <Notice tone="danger" title={mutationError}/> : null}
     {busyKey.startsWith("detail:") ? <p role="status" className="my-2 text-[13px] text-ink-2">{t("skills.loadingDetail")}</p> : null}
@@ -426,7 +426,7 @@ export function SkillsPanel({
           status={<Space wrap><StatusMark tone={item.enabled ? "success" : "neutral"}>{t(item.enabled ? "skills.enabled" : "skills.disabled")}</StatusMark>{readOnly ? <StatusMark tone="info">{t("skills.preset")}</StatusMark> : null}</Space>}
           actions={<Space wrap>{canManage && !readOnly ? <Switch checked={item.enabled} disabled={!!busyKey || loading} aria-label={`${t(item.enabled ? "skills.disable" : "skills.enable")} ${item.name}`} onChange={() => void toggleSkill(item)}/> : null}
             {canManage || readOnly ? <Button disabled={!!busyKey || loading} aria-label={readOnly ? t("skills.viewNamed",{name:item.name}) : undefined} onClick={event => void openEdit(item,event.currentTarget)}>{t(readOnly ? "skills.view" : "skills.edit")}</Button> : null}
-            {canManage && !readOnly ? <Button danger disabled={!!busyKey || loading} onClick={() => setConfirmation({skill:item,scope:{...scopeRef.current}})}>{t("skills.delete")}</Button> : null}</Space>}/>;
+            {canManage && !readOnly ? <Button color="danger" variant="filled" disabled={!!busyKey || loading} onClick={() => setConfirmation({skill:item,scope:{...scopeRef.current}})}>{t("skills.delete")}</Button> : null}</Space>}/>;
       })}</ResourceList>
     </DataRegion>
     {editor ? <SkillEditorForm editor={editor} busy={!!busyKey} error={mutationError} onChange={draft => setEditor(current => current ? {...current,draft} : current)} onCancel={() => {if(busyRef.current)return;const trigger=detailTriggerRef.current;detailTriggerRef.current=null;setEditor(null);setMutationError("");if(trigger?.isConnected)trigger.focus();}} onSubmit={() => void saveEditor()}/> : null}

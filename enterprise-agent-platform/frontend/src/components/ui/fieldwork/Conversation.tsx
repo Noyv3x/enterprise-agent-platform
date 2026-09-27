@@ -2,7 +2,7 @@ import { Badge, Button, Tooltip } from 'antd';
 import { useId } from 'react';
 import type { ReactNode, Ref, UIEventHandler } from 'react';
 import { Button as BuiButton } from '../beautiful/Button';
-import { Glyph } from './Fieldwork';
+import { Glyph, useInOverlay } from './Fieldwork';
 
 export interface ConversationLayoutProps {
   header: ReactNode;
@@ -141,7 +141,8 @@ export function BrowserControlBar({ status, description, action, danger = false 
 }
 
 export function CapabilityHeader({ title, description, scope, actions }: { title: ReactNode; description?: ReactNode; scope?: ReactNode; actions?: ReactNode }) {
-  return <header className="wf-capability-header"><div>{scope && <div className="wf-eyebrow">{scope}</div>}<h2>{title}</h2>{description && <div className="wf-capability-description">{description}</div>}</div>{actions && <div className="wf-actions">{actions}</div>}</header>;
+  const inOverlay = useInOverlay();
+  return <header className="wf-capability-header"><div>{scope && <div className={inOverlay ? 'wf-sr-only' : 'wf-eyebrow'}>{scope}</div>}<h2 className={inOverlay ? 'wf-sr-only' : undefined}>{title}</h2>{description && <div className="wf-capability-description">{description}</div>}</div>{actions && <div className="wf-actions">{actions}</div>}</header>;
 }
 export function SearchToolbar({ search }: { search: ReactNode }) {
   return (

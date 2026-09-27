@@ -25,6 +25,8 @@
 /* Latin interface text is set slightly tight (Beautiful UI's -0.01em); CJK glyphs keep their full-width rhythm,
    and long-form reading keeps the font's natural spacing. */
 .wf-root:lang(en) { --wf-tracking: -.01em; }
+/* A nested provider (the branding preview) only rescopes tokens; its own surfaces paint, not the root. */
+.wf-root .wf-root { background: transparent; min-block-size: 0; }
 .wf-root ::selection { background: color-mix(in srgb, var(--wf-brand-raw) 22%, transparent); }
 .wf-root :where(.wf-message-body, .wf-reading, pre, code, kbd, textarea) { letter-spacing: normal; }
 .wf-root[data-wf-theme="dark"] { color-scheme: dark; }
@@ -55,10 +57,12 @@
 .wf-brand { display: flex; align-items: center; gap: var(--wf-space-2); min-inline-size: 0; }
 .wf-brand-name { font-size: 14px; font-weight: 600; line-height: 1.35; color: var(--ink); overflow-wrap: anywhere; }
 .wf-brand-logo { object-fit: contain; inline-size: 1.5rem; block-size: 1.5rem; border-radius: 6px; flex: none; }
-.wf-frame { display: grid; grid-template-columns: var(--wf-index-width) minmax(0, 1fr); block-size: 100vh; block-size: 100dvh; overflow: hidden; }
+/* Beautiful UI app layout: the sidebar sits on the page ground and the working area floats beside it as one
+   rounded surface with a card ring. Narrow layouts drop the float (see the 1039px query). */
+.wf-frame { display: grid; grid-template-columns: var(--wf-index-width) minmax(0, 1fr); block-size: 100vh; block-size: 100dvh; overflow: hidden; background: var(--page); }
 .wf-skip { position: fixed; z-index: 2000; inset-block-start: var(--wf-space-3); inset-inline-start: var(--wf-space-3); padding: var(--wf-space-3) var(--wf-space-4); background: var(--wf-surface); border: var(--wf-border) solid var(--wf-accent); transform: translateY(-200%); }
 .wf-skip:focus { transform: none; }
-.wf-index { display: flex; flex-direction: column; min-block-size: 0; background: var(--wf-canvas); border-inline-end: var(--wf-border) solid var(--wf-line); }
+.wf-index { display: flex; flex-direction: column; min-block-size: 0; }
 .wf-index-brand { display: flex; align-items: center; min-block-size: 3.5rem; padding: var(--wf-space-3) var(--wf-space-4); }
 .wf-index-scroll { flex: 1; min-block-size: 0; overflow: auto; padding: var(--wf-space-2); scrollbar-gutter: stable; }
 /* Beautiful UI sidebar footer: a hairline-led block, 12.5px account text, quiet utilities. */
@@ -66,7 +70,7 @@
 .wf-account { min-inline-size: 0; color: var(--wf-ink); }
 .wf-account-name { font-weight: 500; font-size: 13px; color: var(--ink); overflow-wrap: anywhere; }
 .wf-account-detail { color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
-.wf-main { min-inline-size: 0; min-block-size: 0; overflow: auto; background: var(--wf-surface); }
+.wf-main { min-inline-size: 0; min-block-size: 0; overflow: auto; background: var(--wf-surface); margin: var(--wf-space-2) var(--wf-space-2) var(--wf-space-2) 0; border-radius: var(--radius-window); box-shadow: var(--shadow-card); }
 .wf-mobile-bar { display: none; }
 /* Row tools (channel management) appear on hover, keyboard focus (the clicked trigger keeps focus while its menu
    is open), or on the active row; touch and no-hover devices always show them. */
@@ -93,7 +97,7 @@
 .wf-section-description { color: var(--wf-muted); max-inline-size: var(--wf-reading-width); margin-block-start: var(--wf-space-1); font-size: var(--wf-text-sm); line-height: 1.6; }
 .wf-section-body { min-inline-size: 0; }
 .wf-section--inset { background: var(--wf-inset); padding: var(--wf-space-4); border-radius: var(--wf-radius-lg); border: 0; margin-block: var(--wf-space-3); }
-.wf-section--danger { border-block-start-color: var(--wf-danger); }
+/* Destructive groups are named by their red title; the group itself keeps the ordinary hairline. */
 .wf-section--danger .wf-section-title { color: var(--wf-danger); }
 .wf-form-grid { display: grid; gap: 0 var(--wf-space-4); align-items: start; min-inline-size: 0; }
 .wf-form-grid--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -115,18 +119,24 @@
 /* Beautiful UI step spinner: a hairline ring with an ink arc. */
 .wf-spinner { display: inline-block; flex: none; box-sizing: border-box; border-radius: 50%; border: 1.5px solid var(--line-strong); border-block-start-color: var(--wf-tone, var(--ink-2)); animation: wf-spin .7s linear infinite; }
 @keyframes wf-spin { to { transform: rotate(360deg); } }
-.wf-notice { display: flex; align-items: flex-start; gap: var(--wf-space-3); padding: var(--wf-space-3) var(--wf-space-4); border-radius: var(--wf-radius-md); background: color-mix(in srgb, var(--wf-tone) 8%, var(--wf-surface)); box-shadow: inset 0 0 0 var(--wf-border) color-mix(in srgb, var(--wf-tone) 14%, transparent); color: var(--wf-tone); margin-block: var(--wf-space-3); }
-.wf-notice-sign { display: flex; padding-block-start: var(--wf-space-1); flex: none; }
+/* Beautiful UI callout: ink copy on a quiet inset card; the tone lives in the glyph. Warnings and errors add a
+   faint tint of their tone so they still stand out in a long form. */
+.wf-notice { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: var(--radius-card); background: var(--inset); box-shadow: var(--shadow-hairline); color: var(--ink); font-size: 13px; line-height: 1.55; margin-block: var(--wf-space-3); }
+.wf-notice:is(.wf-tone-warning, .wf-tone-danger) { background: color-mix(in srgb, var(--wf-tone) 6%, var(--surface)); box-shadow: inset 0 0 0 var(--wf-border) color-mix(in srgb, var(--wf-tone) 16%, transparent); }
+.wf-notice-sign { display: flex; padding-block-start: 1px; flex: none; color: var(--wf-tone); }
+.wf-notice-sign > svg { inline-size: 18px; block-size: 18px; }
 .wf-notice-copy { flex: 1; min-inline-size: 0; overflow-wrap: anywhere; }
-.wf-notice-detail { margin-block-start: var(--wf-space-1); font-size: var(--wf-text-sm); line-height: 1.6; }
+.wf-notice-copy > strong { font-weight: 500; }
+.wf-notice-detail { margin-block-start: 2px; color: var(--ink-2); font-size: 12.5px; line-height: 1.6; }
 .wf-notice-action { flex: none; max-inline-size: 100%; }
-.wf-empty { max-inline-size: var(--wf-reading-width); padding: var(--wf-space-6) 0; }
-.wf-empty h2 { font-size: var(--wf-text-lg); font-weight: 600; line-height: 1.5; margin-block: 0 var(--wf-space-2); }
-.wf-empty-description { color: var(--wf-muted); max-inline-size: var(--wf-detail-width); line-height: 1.6; }
-.wf-empty-action { margin-block-start: var(--wf-space-4); }
-.wf-empty--compact { padding-block: var(--wf-space-4); }
+/* Beautiful UI empty state (SearchList). */
+.wf-empty { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: var(--wf-space-8) var(--wf-space-4); text-align: center; animation: fade-in 250ms ease-out both; }
+.wf-empty-sign { display: flex; align-items: center; justify-content: center; inline-size: 2rem; block-size: 2rem; margin-block-end: 6px; border-radius: var(--radius-control); background: var(--inset); box-shadow: var(--shadow-hairline); color: var(--ink-3); }
+.wf-empty h2 { font-size: 13px; font-weight: 500; line-height: 1.5; margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.wf-empty-description { color: var(--ink-3); max-inline-size: var(--wf-detail-width); font-size: 12.5px; line-height: 1.6; }
+.wf-empty-action { margin-block-start: var(--wf-space-3); }
+.wf-empty--compact { padding-block: var(--wf-space-5); }
 .wf-loading { display: flex; align-items: center; gap: 10px; padding-block: var(--wf-space-4); color: var(--ink-3); font-size: 12.5px; }
-
 .wf-loading > strong { font-size: 13px; font-weight: 500; color: var(--ink-2); }
 .wf-data-region { min-inline-size: 0; position: relative; }
 /* Horizontal scrolling clips overflow on both axes; the inset/outset pair leaves card ring shadows visible. */
@@ -151,14 +161,15 @@
 .wf-resource-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-block-start: 6px; color: var(--ink-3); font-size: 12px; overflow-wrap: anywhere; }
 .wf-resource-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; max-inline-size: 45%; }
 .wf-resource-detail { margin-block-start: 12px; padding-block-start: 12px; border-block-start: var(--wf-border) solid var(--line); min-inline-size: 0; }
-.wf-facts { display: grid; margin: 0; border-block: var(--wf-border) solid var(--wf-line); }
+/* Beautiful UI stat tiles (InsightCards): each fact is a small card, the value set large and tabular. */
+.wf-facts { display: grid; gap: var(--wf-space-2); margin: 0 0 var(--wf-space-4); }
 .wf-facts--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .wf-facts--3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .wf-facts--4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-.wf-fact { padding: var(--wf-space-3) var(--wf-space-4) var(--wf-space-3) 0; min-inline-size: 0; }
-.wf-fact dt { color: var(--wf-muted); font-size: var(--wf-text-xs); margin-block-end: var(--wf-space-2); }
-.wf-fact dd { margin: 0; font-size: var(--wf-text-reading); font-variant-numeric: tabular-nums; color: var(--wf-tone, var(--wf-ink)); overflow-wrap: anywhere; }
-.wf-fact .wf-fact-hint { font-size: var(--wf-text-xs); color: var(--wf-muted); margin-block-start: var(--wf-space-1); }
+.wf-fact { padding: 12px 14px; min-inline-size: 0; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow-card); }
+.wf-fact dt { color: var(--ink-3); font-size: 12.5px; margin-block-end: 6px; }
+.wf-fact dd { margin: 0; font-size: 1rem; font-weight: 600; line-height: 1.4; font-variant-numeric: tabular-nums; color: var(--wf-tone, var(--ink)); overflow-wrap: anywhere; }
+.wf-fact .wf-fact-hint { font-size: 12px; font-weight: 400; color: var(--ink-3); margin-block-start: 2px; }
 .wf-split { display: grid; grid-template-columns: minmax(14rem, .4fr) minmax(0, 1fr); gap: var(--wf-space-4); min-inline-size: 0; }
 .wf-split-list, .wf-split-detail { min-inline-size: 0; }
 .wf-split-detail { border-inline-start: var(--wf-border) solid var(--wf-line); padding-inline-start: var(--wf-space-4); }
@@ -174,9 +185,10 @@
 .wf-auth-form .wf-form-footer { border-block-start: 0; padding-block-start: 0; }
 .wf-auth-form .wf-form-footer .wf-actions { inline-size: 100%; }
 .wf-auth-form button[type="submit"] { inline-size: 100%; }
-.wf-recovery { min-block-size: 100vh; min-block-size: 100dvh; padding: var(--wf-space-6) var(--wf-page-gutter); background: var(--wf-surface); }
+/* Recovery and maintenance reuse the sign-in composition: the message sits in a window card on the page ground. */
+.wf-recovery { min-block-size: 100vh; min-block-size: 100dvh; padding: var(--wf-space-6) var(--wf-page-gutter); background: var(--page); }
 .wf-recovery-top, .wf-recovery-content { max-inline-size: var(--wf-detail-width); margin-inline: auto; }
-.wf-recovery-content { margin-block-start: var(--wf-space-6); min-inline-size: 0; }
+.wf-recovery-content { margin-block-start: var(--wf-space-4); min-inline-size: 0; padding: var(--wf-space-6); border-radius: var(--radius-window); background: var(--surface); box-shadow: var(--shadow-card); }
 .wf-recovery-content h1 { font-size: var(--wf-text-title); font-weight: 600; line-height: 1.4; margin-block: 0 var(--wf-space-3); overflow-wrap: anywhere; }
 .wf-recovery-description { font-size: var(--wf-text-base); line-height: 1.6; color: var(--wf-muted); margin-block-end: var(--wf-space-4); }
 .wf-recovery-detail { border-block: var(--wf-border) solid var(--wf-line); margin-block: var(--wf-space-4); padding-block: var(--wf-space-3); overflow-wrap: anywhere; }
@@ -269,6 +281,9 @@
 .wf-capability-description { font-size: var(--wf-text-sm); color: var(--wf-muted); line-height: 1.65; }
 .wf-search-toolbar { display: flex; align-items: center; gap: var(--wf-space-3); flex-wrap: wrap; padding-block: var(--wf-space-3); margin-block-end: var(--wf-space-3); border-block-end: var(--wf-border) solid var(--wf-line); }
 .wf-search-input { flex: 1 1 16rem; min-inline-size: 0; }
+/* A field and its actions as separate pills (Beautiful UI never fuses a button onto a field). */
+.wf-field-row { display: flex; flex-wrap: wrap; gap: var(--wf-space-2); min-inline-size: 0; }
+.wf-field-row > input { flex: 1 1 180px; min-inline-size: 0; }
 .wf-guide > header h2 { font-size: var(--wf-text-lg); font-weight: 600; margin-block-end: var(--wf-space-3); }
 .wf-guide-intro { font-size: var(--wf-text-base); line-height: 1.6; color: var(--wf-muted); max-inline-size: var(--wf-reading-width); }
 .wf-guide-sections { list-style: none; padding: 0; margin: var(--wf-space-4) 0; }
@@ -286,6 +301,7 @@
   .wf-root { --wf-page-gutter: var(--wf-space-5); }
   .wf-frame { grid-template-columns: minmax(0, 1fr); grid-template-rows: var(--wf-masthead) minmax(0, 1fr); }
   .wf-index { display: none; }
+  .wf-main { margin: 0; border-radius: 0; box-shadow: none; }
   .wf-mobile-bar { display: flex; align-items: center; gap: var(--wf-space-3); padding-inline: var(--wf-space-3); border-block-end: var(--wf-border) solid var(--wf-line); background: var(--wf-canvas); min-inline-size: 0; }
   .wf-mobile-bar .wf-brand { flex: 1; }
   .wf-mobile-bar .wf-brand-name { font-size: var(--wf-text-base); }
@@ -315,7 +331,7 @@
   .wf-notice { flex-wrap: wrap; }
   .wf-notice-action { margin-inline-start: var(--wf-space-8); }
   .wf-auth, .wf-recovery { padding-block: var(--wf-space-4); }
-  .wf-auth-form { padding: var(--wf-space-5) var(--wf-space-4); }
+  .wf-auth-form, .wf-recovery-content { padding: var(--wf-space-5) var(--wf-space-4); }
   .wf-drawer-body { padding: var(--wf-space-4); }
   .wf-drawer-header, .wf-drawer-footer { padding-inline: var(--wf-space-4); }
   .wf-conversation-header { padding-block: var(--wf-space-2); }
@@ -345,5 +361,5 @@
   .wf-status-dot { background: CanvasText; }
   .wf-spinner { border-color: CanvasText; border-block-start-color: Highlight; }
   /* Ring shadows vanish in forced colors; give the borderless surfaces a real edge there. */
-  .wf-resource-row, .wf-composer-frame, .wf-attachment, .wf-computer, .wf-notice { outline: var(--wf-border) solid CanvasText; }
+  .wf-main, .wf-fact, .wf-auth-form, .wf-recovery-content, .wf-resource-row, .wf-composer-frame, .wf-attachment, .wf-computer, .wf-notice { outline: var(--wf-border) solid CanvasText; }
 }

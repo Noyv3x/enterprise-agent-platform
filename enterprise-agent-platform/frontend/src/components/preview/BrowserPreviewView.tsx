@@ -615,10 +615,10 @@ export function BrowserPreviewView({
       {controlError ? <Notice tone="warning" title={controlError} /> : null}
       {controlling ? <div className="wf-browser-inputs">
         <Space wrap>{(["back", "forward", "refresh"] as const).map(action => <Button key={action} onClick={() => void sendInput({action})}>{t(action === "refresh" ? "browserPreview.reload" : action === "back" ? "browserPreview.back" : "browserPreview.forward")}</Button>)}</Space>
-        <Space.Compact block><Input aria-label={t("browserPreview.typePlaceholder")} value={textInput} maxLength={4096} placeholder={t("browserPreview.typePlaceholder")} onChange={event => setTextInput(event.target.value)} onPressEnter={event => {
+        <div className="wf-field-row"><Input aria-label={t("browserPreview.typePlaceholder")} value={textInput} maxLength={4096} placeholder={t("browserPreview.typePlaceholder")} onChange={event => setTextInput(event.target.value)} onPressEnter={event => {
           if (event.nativeEvent.isComposing || !textInput) return;
           void sendInput({action: "text", text: textInput}); setTextInput("");
-        }} /><Button disabled={!textInput} onClick={() => { if (!textInput) return; void sendInput({action: "text", text: textInput}); setTextInput(""); }}>{t("browserPreview.typeSend")}</Button></Space.Compact>
+        }} /><Button disabled={!textInput} onClick={() => { if (!textInput) return; void sendInput({action: "text", text: textInput}); setTextInput(""); }}>{t("browserPreview.typeSend")}</Button></div>
       </div> : null}
       <div className="wf-browser-frame" data-controlling={controlling || undefined}
         tabIndex={controlling ? 0 : -1} role={controlling ? "application" : undefined}

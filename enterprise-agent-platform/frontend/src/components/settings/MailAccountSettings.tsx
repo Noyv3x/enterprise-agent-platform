@@ -133,7 +133,7 @@ export function MailAccountSettings() {
             <Button disabled={busy || loading} onClick={() => openEditor(account)}>{t("mail.edit")}</Button>
             <Button disabled={busy || loading} loading={actionKey === `test:${account.id}`} onClick={() => void runAction(account, "test")}>{t("mail.test")}</Button>
             <Button disabled={busy || loading} loading={actionKey === `check:${account.id}`} onClick={() => void runAction(account, "check")}>{t("mail.check")}</Button>
-            <Button danger disabled={busy || loading} onClick={() => setDeleting(account)}>{t("mail.delete")}</Button>
+            <Button color="danger" variant="filled" disabled={busy || loading} onClick={() => setDeleting(account)}>{t("mail.delete")}</Button>
           </div>}>
           {account.last_error ? <Notice tone="warning" title={t("mail.lastError", { error: account.last_error })} /> : null}
         </ResourceRow>)}

@@ -170,7 +170,7 @@ export function TelegramLinkPopover() {
   return <OverlayPanel open onClose={()=>dispatch({type:"SET_PRIVATE_TELEGRAM_EXPANDED",payload:false})} title={t("chat.telegram.title")} description={status} closeLabel={t("common.close")}
  footer={<Button disabled={busy} loading={pendingOperations.includes("telegram:refresh")} onClick={()=>void runBusy(store,"telegram:refresh",()=>loadPrivateTelegram(store))}>{t("chat.telegram.refresh")}</Button>}>
  <StatusMark tone={linked?"success":gateway.enabled?"info":"warning"}>{status}</StatusMark>
- {view==="disabled"?<Notice tone="warning" title={t("chat.telegram.disabledNotice")}/>:view==="linked"?<Section actions={<Button danger disabled={busy} loading={unlinkBusy} onClick={()=>void onUnbind()}>{t("chat.telegram.unbind")}</Button>}>
+ {view==="disabled"?<Notice tone="warning" title={t("chat.telegram.disabledNotice")}/>:view==="linked"?<Section actions={<Button color="danger" variant="filled" disabled={busy} loading={unlinkBusy} onClick={()=>void onUnbind()}>{t("chat.telegram.unbind")}</Button>}>
  <FactGrid items={[{key:"account",label:t("chat.telegram.accountFallback"),value:link.telegram_username?`@${link.telegram_username}`:t("chat.telegram.accountFallback")},{key:"id",label:"ID",value:String(link.telegram_user_id)}]}/>
  </Section>:<Section description={t("chat.telegram.instructions",{bot:botName})}>
  {challengeVisible?<Section tone="inset" title={t("chat.telegram.code")} actions={<Button onClick={()=>void onCopy()}>{copied?t("chat.telegram.copied"):t("chat.telegram.copyCommand")}</Button>}>
