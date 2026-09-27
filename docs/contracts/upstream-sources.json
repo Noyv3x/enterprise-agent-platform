@@ -3,7 +3,7 @@
   "sources": {
     "firecrawl": {
       "repository_url": "https://github.com/firecrawl/firecrawl.git",
-      "revision": "9b8225fac843a5f3832a68d7e26024fd4844bd94",
+      "revision": "f75a8d40b103129f56f947418bfa06a04a9ad5b0",
       "required_paths": [
         "docker-compose.yaml"
       ],
