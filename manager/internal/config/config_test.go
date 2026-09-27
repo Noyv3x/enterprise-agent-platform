@@ -17,11 +17,13 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	defer os.RemoveAll(runtimeRoot)
 	if err := os.Setenv("XDG_RUNTIME_DIR", runtimeRoot); err != nil {
 		panic(err)
 	}
-	os.Exit(m.Run())
+	// os.Exit skips deferred calls, so the directory is removed explicitly before exiting.
+	code := m.Run()
+	os.RemoveAll(runtimeRoot)
+	os.Exit(code)
 }
 
 func TestDefaultsKeepLANClosedOnLoopback(t *testing.T) {
