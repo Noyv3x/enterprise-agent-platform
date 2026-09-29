@@ -1155,7 +1155,9 @@ jobs:
           } catch (error) {
             throw new Error(`Firecrawl ${phase} scrape returned non-JSON: ${response.status} ${text.slice(0, 2000)}`, {cause: error});
           }
-          if (!response.ok || body.success !== true || !body.data?.markdown?.includes('Example Domain')) {
+          // example.com's wording changes upstream; prove a real page was
+          // fetched and converted rather than pinning its exact text.
+          if (!response.ok || body.success !== true || !/\bdomain\b/i.test(body.data?.markdown ?? '')) {
             throw new Error(`Firecrawl ${phase} scrape failed: ${response.status} ${text.slice(0, 2000)}`);
           }
           NODE
