@@ -884,13 +884,13 @@ class EnterpriseService:
         self.schedules = AgentScheduleStore(self.db)
         self.mail_accounts = MailAccountStore(self.db)
         self.mail_transport = MailTransport()
-        # Agent runs and Telegram sends can have external side effects. An
-        # interrupted running record is quarantined rather than blindly
-        # repeated; queued work remains recoverable and is claimed at least
-        # once after its exact Agent reply becomes available.
+        # Agent runs (including learning reviews) and deliveries can have
+        # external side effects. Quarantine interrupted running records rather
+        # than replaying uncertain submissions; unsubmitted queued work remains
+        # recoverable.
         self.agent_inputs.recover_reserved_jobs()
         self.jobs.recover_interrupted(
-            unsafe_kinds={"agent", TELEGRAM_DELIVERY_JOB_KIND, MAIL_DELIVERY_JOB_KIND}
+            unsafe_kinds={"agent", LEARNING_REVIEW_JOB_KIND, TELEGRAM_DELIVERY_JOB_KIND, MAIL_DELIVERY_JOB_KIND}
         )
         # Telegram updates interrupted before acknowledgement are made
         # claimable again. Telegram will redeliver an unacknowledged webhook or
@@ -5020,8 +5020,8 @@ class EnterpriseService:
                     # A transient SQLite/filesystem failure must not permanently
                     # kill the only review worker. No job was returned to this
                     # loop, so retry discovery with capped backoff; an ambiguous
-                    # running claim remains durable and startup recovery can
-                    # reclaim it if this process is shut down meanwhile.
+                    # running claim remains durable and startup recovery will
+                    # quarantine it if this process is shut down meanwhile.
                     print(
                         f"Could not claim Agent learning review: {exc}",
                         file=sys.stderr,
@@ -5042,7 +5042,7 @@ class EnterpriseService:
                 except AgentRuntimeRunError as exc:
                     # A terminal needs_review/cancelled result can already have
                     # durable effects. Never submit it under a new identity.
-                    settlement = "failed"
+                    settlement = "failed" if exc.state == "failed" else "needs_review"
                     settlement_error = str(exc)
                     print(f"Agent learning review {job.id} failed: {exc}", file=sys.stderr)
                 except Exception as exc:
@@ -5098,7 +5098,7 @@ class EnterpriseService:
         the running row is deliberately left for normal startup recovery.
         """
 
-        if status not in {"succeeded", "failed", "queued"}:
+        if status not in {"succeeded", "failed", "needs_review", "queued"}:
             raise ValueError("learning review settlement status is invalid")
         backoff_seconds = 0.25
         while True:
@@ -5115,7 +5115,9 @@ class EnterpriseService:
                         error=error,
                     )
                 else:
-                    transitioned = self.jobs.mark_failed(job.id, error)
+                    transitioned = self.jobs.mark_failed(
+                        job.id, error, needs_review=status == "needs_review"
+                    )
                 if transitioned:
                     return True
                 current = self.jobs.get(job.id)
@@ -5296,7 +5298,6 @@ class EnterpriseService:
                 session_id=session_id,
                 session_key=scope_key,
                 metadata={
-                    "idempotency_key": f"agent-learning-review:{job.id}",
                     "source_message_id": source_message_id,
                     "review_job_id": job.id,
                     "review_mode": "memory_skill",
@@ -6375,7 +6376,6 @@ class EnterpriseService:
             session_id=session_id,
             session_key=f"channel:{scope_id}:main-agent",
             metadata={
-                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "source_message_id": int(user_msg["id"]),
                 "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(task["actor"]),
@@ -6418,7 +6418,6 @@ class EnterpriseService:
                 "degraded": result.degraded,
                 "execution": execution,
                 "generation": generation,
-                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "reply_to": self._reply_target(task),
             }
             if task.get("_job_id"):
@@ -6661,7 +6660,6 @@ class EnterpriseService:
             session_id=agent_scope.session_id,
             session_key=agent_scope.scope_key,
             metadata={
-                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "source_message_id": int(user_msg["id"]),
                 "provider": generation["provider"],
                 "actor": self._agent_actor_metadata(actor),
@@ -6725,7 +6723,6 @@ class EnterpriseService:
                 "degraded": result.degraded,
                 "execution": execution,
                 "generation": generation,
-                "idempotency_key": f"agent-job:{int(task.get('_job_id') or user_msg['id'])}",
                 "reply_to": self._reply_target(task),
                 **self._input_group_metadata(task),
             }

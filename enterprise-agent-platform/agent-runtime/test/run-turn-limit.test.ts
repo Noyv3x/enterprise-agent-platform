@@ -161,7 +161,6 @@ test("learning reviews stop before their seventeenth model request", async () =>
         review_mode: "memory_skill",
         review_job_id: 7,
         source_message_id: 88,
-        idempotency_key: "agent-learning-review:7",
         unattended: true,
         delegation_depth: 0,
       },

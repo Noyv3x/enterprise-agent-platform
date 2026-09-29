@@ -41,6 +41,7 @@ export function createRuntimeServer(config: RuntimeConfig, providedCoordinator?:
     coordinator,
     async listen() {
       await mkdir(config.home, { recursive: true, mode: 0o700 });
+      await coordinator.sessions.initialize();
       return await new Promise((resolvePromise, reject) => {
         server.once("error", reject);
         server.listen(config.port, config.host, () => {
@@ -151,7 +152,7 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
         throw httpError(400, "Cancel request accepts only an empty object");
       }
       const cancelled = coordinator.cancel(runId);
-      json(response, 202, { run_id: runId, status: cancelled.status });
+      json(response, 202, { run_id: runId, status: cancelled.status, side_effects_started: cancelled.sideEffectsStarted });
       return;
     }
     throw httpError(404, "Not found");
@@ -442,6 +443,7 @@ function publicRun(run: NonNullable<ReturnType<RunCoordinator["getRun"]>>): Reco
   return {
     run_id: run.id,
     status: run.status,
+    side_effects_started: run.sideEffectsStarted,
     created_at: new Date(run.createdAt).toISOString(),
     updated_at: new Date(run.updatedAt).toISOString(),
     session_id: run.request.session_id,

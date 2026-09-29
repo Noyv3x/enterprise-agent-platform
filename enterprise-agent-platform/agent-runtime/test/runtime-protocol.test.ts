@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import { access, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { request as httpRequest, type ClientRequest, type ServerResponse } from "node:http";
 import { createConnection, type Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai/providers/faux";
 import { createRuntimeServer, type RuntimeServer } from "../src/server.js";
-import type { SessionIdentity } from "../src/session-store.js";
 import { fakeExecutionManager, temporaryDirectory, testConfig, TestRunCoordinator } from "./helpers.js";
 
 function event() {
@@ -58,6 +57,10 @@ async function fixture() {
 test("closed-world HTTP contracts reject before run/cancel/subscription effects", { timeout: 30_000 }, async (t) => {
   const f = await fixture();
   try {
+    for (const session of ["learning-review-7", "learning-review-invalid"]) {
+      const invalidReview = await f.request("/v1/runs", "POST", f.body(session));
+      assert.equal(invalidReview.status, 400, "reserved review sessions require a complete trusted identity");
+    }
     const positive = await f.request("/v1/runs", "POST", f.body());
     assert.equal(positive.status, 202);
     const created: unknown = JSON.parse(positive.text);
@@ -220,7 +223,7 @@ test("paused SSE reader has a bounded network queue while another client and Age
   }
 });
 
-for (const pauseAt of ["model-response", "commit-snapshot"] as const) {
+for (const pauseAt of ["model-response", "commit"] as const) {
   test(`manual compact versus lifecycle cleanup at ${pauseAt}`, { timeout: 20_000 }, async (t) => {
     const f = await fixture();
     const entered = event();
@@ -235,16 +238,13 @@ for (const pauseAt of ["model-response", "commit-snapshot"] as const) {
         if (pauseAt === "model-response") { entered.release(); await release.promise; }
         return fauxAssistantMessage("Current objective\n- Preserve the conversation.");
       }]);
-      if (pauseAt === "commit-snapshot") {
-        // Delay completion of the actual archive snapshot read, inside the real
-        // mutation queue, after currentById was captured. No fabricated entries.
-        const store = f.coordinator.sessions as unknown as { readArchiveEntries(identity: SessionIdentity): Promise<unknown[]> };
-        const readArchive = store.readArchiveEntries.bind(store);
-        let once = true;
-        store.readArchiveEntries = async (...args) => {
-          const entries = await readArchive(...args);
-          if (once) { once = false; entered.release(); await release.promise; }
-          return entries;
+      if (pauseAt === "commit") {
+        const store = f.coordinator.sessions;
+        const rewrite = store.rewriteCompacted.bind(store);
+        store.rewriteCompacted = async (...args) => {
+          entered.release();
+          await release.promise;
+          return rewrite(...args);
         };
       }
       pending = f.coordinator.compactSession(identity.scope_key, identity.lifecycle_id, identity.session_id,
@@ -268,8 +268,8 @@ for (const pauseAt of ["model-response", "commit-snapshot"] as const) {
       const outcome = await deadline(pending, "compaction settle");
       await deadline(cleanup, "cleanup settle");
       t.diagnostic(JSON.stringify({ pauseAt, cleanedWhilePaused, outcome }));
-      await assert.rejects(access(f.coordinator.sessions.path(identity)), { code: "ENOENT" }, "cleanup must not be followed by a resurrected session journal");
-      await assert.rejects(access(f.coordinator.sessions.archivePath(identity)), { code: "ENOENT" }, "cleanup must not be followed by resurrected archived messages");
+      assert.deepEqual(await f.coordinator.sessions.load(identity), [], "cleanup must not be followed by a resurrected session");
+      assert.deepEqual(await f.coordinator.sessions.loadSearchable(identity), [], "cleanup must remove searchable history");
     } finally {
       release.release();
       controller.abort();
@@ -279,19 +279,17 @@ for (const pauseAt of ["model-response", "commit-snapshot"] as const) {
   });
 }
 
-test("restarted idempotent run restores trusted context for process preview endpoints", { timeout: 20_000 }, async () => {
+test("completed run retains trusted context for process preview endpoints", { timeout: 20_000 }, async () => {
   const home = await temporaryDirectory("runtime-restarted-preview-");
   const config = testConfig(home);
   const faux = fauxProvider();
   faux.setResponses([fauxAssistantMessage("persisted completion")]);
-  const initial = new TestRunCoordinator({ config, streamFn: faux.provider.streamSimple });
   const executionContext = { sandbox_id: "sandbox_restored", workspace_id: "workspace_restored" };
   const request = {
     scope_key: "private:restored", lifecycle_id: "life", session_id: "session",
     workspace: "/workspace", execution_context: executionContext,
     system_prompt: "Answer directly.", input: "hello",
     model: { provider: "openai-codex", id: "gpt-5.5" },
-    metadata: { idempotency_key: "restored-preview" },
   };
   const previewCalls: string[] = [];
   const manager = fakeExecutionManager({
@@ -306,17 +304,12 @@ test("restarted idempotent run restores trusted context for process preview endp
       return { running_terminal_count: 2 };
     },
   });
+  const coordinator = new TestRunCoordinator({ config, executor: manager, streamFn: faux.provider.streamSimple });
   let runtime: RuntimeServer | undefined;
   try {
-    const first = initial.createRun(request);
-    assert.equal((await initial.wait(first.id)).status, "completed");
-    initial.shutdown();
-    const restarted = new TestRunCoordinator({ config, executor: manager, streamFn: faux.provider.streamSimple });
-    runtime = createRuntimeServer(config, restarted);
-    const reused = restarted.createRun(structuredClone(request));
-    assert.equal(reused.id, first.id);
-    assert.equal(reused.status, "completed");
-    assert.equal(faux.state.callCount, 1, "replaying a completed run must not call the model again");
+    const run = coordinator.createRun(request);
+    assert.equal((await coordinator.wait(run.id)).status, "completed");
+    runtime = createRuntimeServer(config, coordinator);
     const address = await runtime.listen();
     const query = new URLSearchParams({ scope_key: request.scope_key, lifecycle_id: request.lifecycle_id });
     for (const endpoint of ["processes", "process-summary"]) {
@@ -332,7 +325,7 @@ test("restarted idempotent run restores trusted context for process preview endp
     }
     assert.deepEqual(previewCalls, ["processes", "process-summary"]);
   } finally {
-    initial.shutdown();
+    coordinator.shutdown();
     runtime?.server.closeAllConnections();
     await runtime?.close();
     await rm(home, { recursive: true, force: true });

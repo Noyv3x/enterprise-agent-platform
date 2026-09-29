@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { ApprovalBroker } from "../src/approval-broker.js";
@@ -139,7 +138,7 @@ test("always and session approvals survive broker restart and cleanup clears ses
     await sessionBroker.respond(sessionContext.runId, (await waitForRequest(sessionRequests)).id, "session");
     assert.deepEqual(await sessionPending, { allowed: true, outcome: "approved" });
     assert.equal(sessionBroker.hasPersistentAlways("scope", sessionContext.approvalKey), false);
-    const sessionFile = await stat(`${home}/sessions/${hash("scope")}/${hash("life")}/approvals.jsonl`);
+    const sessionFile = await stat(persistence().sessions.approvalPath({ scope_key: "scope", lifecycle_id: "life" }));
     assert.equal(sessionFile.mode & 0o777, 0o600);
 
     const restartedSession = new ApprovalBroker(1_000, () => assert.fail("persisted session grant should not prompt"), () => undefined, persistence());
@@ -331,10 +330,6 @@ async function waitForRequest(requests: ApprovalRequest[], index = 0): Promise<A
   throw new Error("Timed out waiting for approval request");
 }
 
-function hash(value: string): string {
-  // Keep the test independent of SessionStore internals beyond its documented SHA-256 layout.
-  return createHash("sha256").update(value).digest("hex");
-}
 
 test("ApprovalBroker cancels pending run approvals", async () => {
   const requests: ApprovalRequest[] = [];

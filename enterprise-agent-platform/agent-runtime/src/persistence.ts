@@ -11,8 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import type { JsonObject, RunResult, RunStatus } from "./types.js";
-import { id, nowIso, stableHash } from "./utils.js";
+import { id, nowIso } from "./utils.js";
 
 interface AlwaysGrant {
   scope_key: string;
@@ -95,147 +94,6 @@ function isAlwaysGrantFile(value: unknown): value is AlwaysGrantFile {
     });
 }
 
-export interface PersistentIdempotencyRecord {
-  lookup_hash: string;
-  run_id: string;
-  session_id: string;
-  status: RunStatus;
-  created_at: number;
-  updated_at: number;
-  expires_at: number;
-  result?: Pick<
-    RunResult,
-    "content" | "model" | "usage" | "context_usage" | "input_message_ids" | "unconsumed_input_message_ids"
-  >;
-  inputs?: Record<string, { fingerprint: string; state: "accepted" | "injected" | "unconsumed" }>;
-  error?: string;
-}
-
-interface IdempotencyFile {
-  version: 1;
-  records: PersistentIdempotencyRecord[];
-}
-
-export class IdempotencyStore {
-  private readonly file: string;
-  private records = new Map<string, PersistentIdempotencyRecord>();
-  private commitError?: Error;
-
-  constructor(home: string) {
-    this.file = join(home, "idempotency", "index.json");
-    const stored = readJsonFile<IdempotencyFile>(this.file, { version: 1, records: [] });
-    const now = Date.now();
-    const candidate = new Map<string, PersistentIdempotencyRecord>();
-    for (const record of stored.records) {
-      if (record.lookup_hash && record.run_id && !recordExpired(record, now)) candidate.set(record.lookup_hash, record);
-    }
-    if (candidate.size !== stored.records.length) this.flush(candidate);
-    else this.records = candidate;
-  }
-
-  find(scopeKey: string, idempotencyKey: string): PersistentIdempotencyRecord | undefined {
-    if (this.commitError) throw this.commitError;
-    const hash = this.hash(scopeKey, idempotencyKey);
-    const record = this.records.get(hash);
-    if (!record) return undefined;
-    if (recordExpired(record, Date.now())) {
-      const candidate = new Map(this.records);
-      candidate.delete(hash);
-      this.flush(candidate);
-      return undefined;
-    }
-    return structuredClone(record);
-  }
-
-  create(scopeKey: string, idempotencyKey: string, runId: string, sessionId: string, retentionMs: number): void {
-    if (this.commitError) throw this.commitError;
-    const timestamp = Date.now();
-    const record: PersistentIdempotencyRecord = {
-      lookup_hash: this.hash(scopeKey, idempotencyKey),
-      run_id: runId,
-      session_id: sessionId,
-      status: "queued",
-      created_at: timestamp,
-      updated_at: timestamp,
-      expires_at: timestamp + retentionMs,
-    };
-    const candidate = new Map(this.records);
-    candidate.set(record.lookup_hash, record);
-    this.flush(candidate);
-  }
-
-  update(
-    scopeKey: string,
-    idempotencyKey: string,
-    patch: {
-      status: RunStatus;
-      retentionMs: number;
-      result?: RunResult;
-      inputs?: PersistentIdempotencyRecord["inputs"];
-      error?: string;
-    },
-  ): void {
-    if (this.commitError) throw this.commitError;
-    const hash = this.hash(scopeKey, idempotencyKey);
-    const current = this.records.get(hash);
-    if (!current) return;
-    const timestamp = Date.now();
-    const next: PersistentIdempotencyRecord = {
-      ...current,
-      status: patch.status,
-      updated_at: timestamp,
-      expires_at: timestamp + patch.retentionMs,
-    };
-    if (patch.result) {
-      next.result = structuredClone({
-        content: patch.result.content,
-        model: patch.result.model,
-        ...(patch.result.usage ? { usage: patch.result.usage } : {}),
-        ...(patch.result.context_usage ? { context_usage: patch.result.context_usage } : {}),
-        ...(patch.result.input_message_ids
-          ? { input_message_ids: patch.result.input_message_ids }
-          : {}),
-        ...(patch.result.unconsumed_input_message_ids
-          ? { unconsumed_input_message_ids: patch.result.unconsumed_input_message_ids }
-          : {}),
-      });
-    }
-    if (patch.inputs) next.inputs = structuredClone(patch.inputs);
-    if (patch.error) next.error = patch.error;
-    const candidate = new Map(this.records);
-    candidate.set(hash, next);
-    this.flush(candidate);
-  }
-
-  delete(scopeKey: string, idempotencyKey: string, runId: string): void {
-    if (this.commitError) throw this.commitError;
-    const hash = this.hash(scopeKey, idempotencyKey);
-    if (this.records.get(hash)?.run_id !== runId) return;
-    const candidate = new Map(this.records);
-    candidate.delete(hash);
-    this.flush(candidate);
-  }
-
-  private hash(scopeKey: string, idempotencyKey: string): string {
-    return stableHash(`${scopeKey}\0${idempotencyKey}`);
-  }
-
-  private flush(candidate: Map<string, PersistentIdempotencyRecord>): void {
-    if (this.commitError) throw this.commitError;
-    try {
-      writeJsonAtomic(this.file, { version: 1, records: [...candidate.values()] } satisfies IdempotencyFile);
-    } catch (error) {
-      if (error instanceof UncertainCommitError) this.commitError = error;
-      throw error;
-    }
-    this.records = candidate;
-  }
-}
-
-function recordExpired(record: PersistentIdempotencyRecord, now: number): boolean {
-  return record.status !== "queued" && record.status !== "running" && record.expires_at <= now;
-}
-
 // After rename the disk may contain the candidate despite a failed directory
 // sync. Fence the store until restart rather than overwrite evidence from a
 // stale in-memory snapshot or authorize an unconfirmed grant.
@@ -250,7 +108,7 @@ function readJsonFile<T>(file: string, fallback: T): T {
   }
 }
 
-function writeJsonAtomic(file: string, value: JsonObject | AlwaysGrantFile | IdempotencyFile): void {
+function writeJsonAtomic(file: string, value: AlwaysGrantFile): void {
   const directory = dirname(file);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);

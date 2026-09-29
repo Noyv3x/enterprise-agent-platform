@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import test from "node:test";
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -93,9 +93,9 @@ test("automatic compaction iteratively re-compacts a long tool loop in one Run",
     const active = JSON.stringify(tracked);
     assert.match(active, new RegExp(`HANDOFF_REVISION_${summaryCalls}`));
     assert.doesNotMatch(active, new RegExp(rawOutputSecret));
-    const archive = await readFile(coordinator.sessions.archivePath(identity), "utf8");
-    assert.doesNotMatch(archive, /HANDOFF_REVISION_/);
-    assert.match(archive, new RegExp(rawInputSecret), "the owner-scoped archive retains original history");
+    const history = JSON.stringify(await coordinator.sessions.loadSearchable(identity));
+    assert.doesNotMatch(history, /HANDOFF_REVISION_/);
+    assert.match(history, new RegExp(rawInputSecret), "owner-scoped history retains original messages");
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -156,7 +156,7 @@ test("cancelling a repeated automatic summary preserves the last committed hando
 
     await secondSummaryStarted;
     const trackedBeforeCancel = await coordinator.sessions.loadTracked(identity);
-    const archiveBeforeCancel = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    const historyBeforeCancel = await coordinator.sessions.loadSearchable(identity);
     assert.equal(
       trackedBeforeCancel.filter((entry) => entry.synthetic_kind === "context_compaction_notice").length,
       1,
@@ -177,7 +177,7 @@ test("cancelling a repeated automatic summary preserves the last committed hando
       1,
     );
     assert.doesNotMatch(JSON.stringify(trackedAfterCancel), /SECOND_/);
-    assert.equal(await readFile(coordinator.sessions.archivePath(identity), "utf8"), archiveBeforeCancel);
+    assert.deepEqual((await coordinator.sessions.loadSearchable(identity)).slice(0, historyBeforeCancel.length), historyBeforeCancel);
     assert.equal(
       coordinator.getJournal(run.id)?.list().filter((event) => event.type === "context.compacted").length,
       1,
@@ -248,19 +248,19 @@ for (const scenario of incompleteSummaries) {
           timestamp: index + 20,
         });
       }
-      const beforeJournal = await readFile(coordinator.sessions.path(identity));
-      const beforeArchive = await readFile(coordinator.sessions.archivePath(identity));
+      const beforeJournal = await coordinator.sessions.loadTracked(identity);
+      const beforeHistory = await coordinator.sessions.loadSearchable(identity);
 
       await assert.rejects(compact());
 
-      assert.deepEqual(await readFile(coordinator.sessions.path(identity)), beforeJournal);
-      assert.deepEqual(await readFile(coordinator.sessions.archivePath(identity)), beforeArchive);
+      assert.deepEqual(await coordinator.sessions.loadTracked(identity), beforeJournal);
+      assert.deepEqual(await coordinator.sessions.loadSearchable(identity), beforeHistory);
       assert.equal((await compact()).compacted, true, "a failed summary must release the session fence");
       const recovered = await coordinator.sessions.loadTracked(identity);
       assert.equal(recovered.filter((entry) => entry.synthetic_kind === "context_compaction_notice").length, 1);
       assert.match(JSON.stringify(recovered), /RECOVERED_COMPLETE_HANDOFF/);
       assert.doesNotMatch(JSON.stringify(recovered), /REJECTED_PARTIAL_HANDOFF/);
-      assert.doesNotMatch(await readFile(coordinator.sessions.archivePath(identity), "utf8"), /REJECTED_PARTIAL_HANDOFF/);
+      assert.doesNotMatch(JSON.stringify(await coordinator.sessions.loadSearchable(identity)), /REJECTED_PARTIAL_HANDOFF/);
     } finally {
       coordinator.shutdown();
       await rm(home, { recursive: true, force: true, maxRetries: 3 });
@@ -314,8 +314,7 @@ for (const scenario of incompleteSummaries) {
       assert.ok(retained.some((entry) => entry.message.role === "user"
         && entry.message.content === "Continue the original objective."));
       assert.equal(retained.filter((entry) => entry.synthetic_kind === "context_compaction_notice").length, 0);
-      assert.doesNotMatch(await readFile(coordinator.sessions.path(identity), "utf8"), /REJECTED_PARTIAL_HANDOFF/);
-      await assert.rejects(readFile(coordinator.sessions.archivePath(identity)), { code: "ENOENT" });
+      assert.doesNotMatch(JSON.stringify(await coordinator.sessions.loadSearchable(identity)), /REJECTED_PARTIAL_HANDOFF/);
     } finally {
       coordinator.shutdown();
       await rm(home, { recursive: true, force: true, maxRetries: 3 });

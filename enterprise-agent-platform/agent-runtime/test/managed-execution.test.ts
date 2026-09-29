@@ -389,9 +389,10 @@ test("managed execution skips sandbox approval, requires one-shot host approval,
     const cleanupIdentity = { scope_key: "private:42", lifecycle_id: "life-42", session_id: "session-42" };
     await coordinator.sessions.backgroundTaskState(cleanupIdentity).register("process_cleanup", "sandbox");
     await stat(coordinator.sessions.backgroundTaskPath(cleanupIdentity));
+    const historyBeforeCleanup = await coordinator.sessions.load(cleanupIdentity);
     assert.equal(await coordinator.cleanupScope("private:42", "life-42"), 0);
     await assert.rejects(stat(coordinator.sessions.backgroundTaskPath(cleanupIdentity)), { code: "ENOENT" });
-    await stat(coordinator.sessions.path(cleanupIdentity));
+    assert.deepEqual(await coordinator.sessions.load(cleanupIdentity), historyBeforeCleanup);
     assert.equal(
       manager.requests.filter((request) => request.path === "/v1/executor/scopes/cleanup").length,
       1,

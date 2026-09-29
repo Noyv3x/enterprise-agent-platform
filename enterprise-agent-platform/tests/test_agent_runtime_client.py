@@ -847,7 +847,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(cancel["body"], {})
         self.assertEqual(cancel["authorization"], "Bearer runtime-secret")
 
-    def test_uncertain_run_submission_retries_by_idempotency_key_then_needs_review(self):
+    def test_uncertain_run_submission_is_never_repeated(self):
         calls: list[dict[str, Any]] = []
 
         def fail_submission(method, path, body, *, timeout):
@@ -862,18 +862,43 @@ class AgentRuntimeClientTests(unittest.TestCase):
                     history=[],
                     session_id="session-1",
                     session_key="private:7",
-                    metadata={"idempotency_key": "agent-job:42"},
                 )
 
         error = raised.exception
-        self.assertEqual(error.run_id, "idempotency:agent-job:42")
+        self.assertEqual(error.run_id, "unknown")
         self.assertEqual(error.state, "needs_review")
         self.assertIn("outcome is unknown", str(error))
-        self.assertEqual(len(calls), 2)
-        for call in calls:
-            self.assertEqual(call["method"], "POST")
-            self.assertEqual(call["path"], "/v1/runs")
-            self.assertEqual(call["body"]["metadata"]["idempotency_key"], "agent-job:42")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["method"], "POST")
+        self.assertEqual(calls[0]["path"], "/v1/runs")
+        self.assertEqual(error.session_id, "session-1")
+
+    def test_lost_run_requires_review_unless_settled_without_side_effects(self):
+        cases = (
+            (404, {"error": "run not found"}, "needs_review"),
+            (200, {"status": "cancelled", "side_effects_started": True}, "needs_review"),
+            (200, {"status": "cancelled"}, "needs_review"),
+            (200, {"status": "running", "side_effects_started": False}, "needs_review"),
+            (200, {"status": "cancelled", "side_effects_started": False}, "failed"),
+        )
+        for stream_lost in (True, False):
+            for status, cancellation, expected in cases:
+                with self.subTest(stream_lost=stream_lost, cancellation=cancellation):
+                    self.runtime.requests.clear()
+                    self.runtime.errors.clear()
+                    self.runtime.events = [_event(1, "run.started", {"side_effects_started": False})]
+                    if stream_lost:
+                        self.runtime.errors["/v1/runs/run-1/events"] = (404, {"error": "run not found"})
+                    self.runtime.errors["/v1/runs/run-1/cancel"] = (status, cancellation)
+                    with self.assertRaises(AgentRuntimeRunError) as raised:
+                        self.client.generate(
+                            system_prompt="system", user_message="run once", history=[],
+                            session_id="session-1", session_key="private:7",
+                        )
+                    self.assertEqual(raised.exception.state, expected)
+                    self.assertEqual(
+                        sum(request["path"] == "/v1/runs" for request in self.runtime.requests), 1
+                    )
 
     def test_progress_callback_receives_file_drafts_without_retaining_their_content(self):
         self.runtime.events = [

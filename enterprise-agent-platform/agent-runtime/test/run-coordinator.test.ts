@@ -22,7 +22,7 @@ import {
   appendSkillPolicy,
   availableSkillIndex,
 } from "../src/system-prompt/prompt-assembly.js";
-import { CURRENT_MODEL_CONTENT_SECURITY_VERSION, SessionStore } from "../src/session-store.js";
+import { CURRENT_MODEL_CONTENT_SECURITY_VERSION } from "../src/session-store.js";
 import { AlwaysApprovalStore } from "../src/persistence.js";
 import { classifyToolCall } from "../src/tools.js";
 import { fakeExecutionManager, temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
@@ -215,52 +215,29 @@ test("unmarked imported assistant tool-call arguments are redacted in the model 
   );
 });
 
-test("current model history canonicalizes legacy display envelopes without rewriting JSONL", async () => {
-  const home = await temporaryDirectory("agent-current-model-history-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "session" };
-    await store.initializeTracked(identity);
-    await store.appendMessage(
-      identity,
-      fauxAssistantMessage(fauxToolCall("browser", {
-        action: "type",
-        arguments: { tab_id: "tab", ref: "e1", text: "[input omitted: 17 UTF-8 bytes]" },
-      }), { stopReason: "toolUse" }),
-      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
-    );
-    await store.appendMessage(
-      identity,
-      fauxAssistantMessage(fauxToolCall("process", {
-        action: "write",
-        process_id: "shell",
-        input: "printf [redacted]",
-      }), { stopReason: "toolUse" }),
-      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
-    );
-
-    const path = store.path(identity);
-    const lines = (await readFile(path, "utf8")).trimEnd().split("\n");
-    for (let index = 1; index < lines.length; index += 1) {
-      const entry = JSON.parse(lines[index] ?? "{}") as Record<string, unknown>;
-      const payload = entry.payload as { role?: string; content?: Array<Record<string, unknown>> } | undefined;
-      const call = payload?.role === "assistant"
-        ? payload.content?.find((block) => block.type === "toolCall")
-        : undefined;
-      if (!call || typeof call.name !== "string") continue;
-      const args = call.arguments as Record<string, unknown>;
-      if (call.name === "process") {
-        const { action, ...arguments_ } = args;
-        call.arguments = { tool: "process", action, arguments: arguments_ };
-      } else if (call.name === "browser") {
-        call.arguments = { tool: "browser", ...args };
-      }
-      lines[index] = JSON.stringify(entry);
-    }
-    await writeFile(path, `${lines.join("\n")}\n`);
-    const before = await readFile(path, "utf8");
-
-    const prepared = prepareSessionHistoryForModel(await store.initializeTracked(identity));
+test("model history canonicalizes legacy display envelopes without mutating imported history", () => {
+    const history = [
+      {
+        entry_id: "browser",
+        model_content_security_version: CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+        message: fauxAssistantMessage(fauxToolCall("browser", {
+          tool: "browser",
+          action: "type",
+          arguments: { tab_id: "tab", ref: "e1", text: "[input omitted: 17 UTF-8 bytes]" },
+        }), { stopReason: "toolUse" }),
+      },
+      {
+        entry_id: "process",
+        model_content_security_version: CURRENT_MODEL_CONTENT_SECURITY_VERSION,
+        message: fauxAssistantMessage(fauxToolCall("process", {
+          tool: "process",
+          action: "write",
+          arguments: { process_id: "shell", input: "printf [redacted]" },
+        }), { stopReason: "toolUse" }),
+      },
+    ];
+    const before = structuredClone(history);
+    const prepared = prepareSessionHistoryForModel(history);
     const browser = prepared[0]?.message;
     const process = prepared[1]?.message;
     assert.equal(browser?.role, "assistant");
@@ -277,14 +254,7 @@ test("current model history canonicalizes legacy display envelopes without rewri
       process_id: "shell",
       input: "printf [redacted]",
     });
-    assert.equal(
-      await readFile(path, "utf8"),
-      before,
-      "model-facing canonicalization must not rewrite durable JSONL",
-    );
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
+    assert.deepEqual(history, before, "model-facing canonicalization must not mutate imported history");
 });
 
 test("available skill policy validates, escapes, and bounds metadata without injecting instructions", () => {
@@ -555,7 +525,6 @@ test("RunCoordinator isolates learning review tools, approvals, prompt, and term
       review_mode: "memory_skill",
       review_job_id: 7,
       source_message_id: 88,
-      idempotency_key: "agent-learning-review:7",
       unattended: true,
       delegation_depth: 0,
       available_skills: [{ id: "code-review", name: "Code review" }],
@@ -587,10 +556,6 @@ test("RunCoordinator isolates learning review tools, approvals, prompt, and term
       session_id: request.session_id,
     };
     assert.deepEqual(await coordinator.sessions.load(identity), []);
-    await assert.rejects(
-      readFile(coordinator.sessions.path(identity), "utf8"),
-      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
-    );
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -614,7 +579,7 @@ test("RunCoordinator rejects partial, delegated, or mismatched learning-review i
     model: { provider: "openai-codex", id: "gpt-5.5" },
   };
   try {
-    await coordinator.sessions.initialize(ordinaryIdentity, [
+    await coordinator.sessions.initializeTracked(ordinaryIdentity, [
       { role: "user", content: "keep this ordinary session", timestamp: 1 },
     ]);
     for (const metadata of [
@@ -637,7 +602,7 @@ test("RunCoordinator rejects partial, delegated, or mismatched learning-review i
       },
     ]) {
       assert.throws(
-        () => coordinator.createRun({ ...base, metadata } as never),
+        () => coordinator.createRun({ ...base, session_id: "learning-review-7", metadata } as never),
         (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
       );
     }
@@ -646,12 +611,11 @@ test("RunCoordinator rejects partial, delegated, or mismatched learning-review i
       review_mode: "memory_skill",
       review_job_id: 7,
       source_message_id: 8,
-      idempotency_key: "agent-learning-review:7",
       unattended: true,
       delegation_depth: 0,
     } as const;
     assert.throws(
-      () => coordinator.createRun({ ...base, metadata: completeMetadata } as never),
+      () => coordinator.createRun({ ...base, session_id: "learning-review-8", metadata: completeMetadata } as never),
       (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
     );
     assert.throws(
@@ -664,15 +628,8 @@ test("RunCoordinator rejects partial, delegated, or mismatched learning-review i
     assert.throws(
       () => coordinator.createRun({
         ...base,
-        metadata: { idempotency_key: "agent-learning-review:7" },
-      } as never),
-      (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
-    );
-    assert.throws(
-      () => coordinator.createRun({
-        ...base,
         session_id: "learning-review-7",
-        metadata: { ...completeMetadata, idempotency_key: "agent-learning-review:8" },
+        metadata: { ...completeMetadata, parent_run_id: "parent", delegation_depth: 1 },
       } as never),
       (error: Error) => error instanceof RunValidationError && /learning review requires/.test(error.message),
     );
@@ -1061,7 +1018,6 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
       system_prompt: "You are an Agent.",
       input: "start the task",
       model: { provider: "openai-codex", id: "gpt-5.5" },
-      metadata: { idempotency_key: "steering-run" },
     };
     const run = coordinator.createRun(request);
     const approval = await waitUntil(
@@ -1085,7 +1041,6 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
       coordinator.submitInput(run.id, requestWithUnknownField as never),
       /unsupported fields/,
     );
-    const executionEquivalentRetry = { ...first, attachments: [] };
     assert.deepEqual(
       await coordinator.submitInput(run.id, {
         input: first.input,
@@ -1144,30 +1099,6 @@ test("RunCoordinator injects idempotent active-run inputs and returns only the c
     const completedEvent = events.find((event) => event.type === "run.completed");
     assert.deepEqual(completedEvent?.data.input_message_ids, ["message-2", "message-3"]);
     assert.deepEqual(completedEvent?.data.context_usage, completed.result?.context_usage);
-
-    coordinator.shutdown();
-    const restartedFaux = fauxProvider();
-    restartedFaux.setResponses([fauxAssistantMessage("must not execute")]);
-    const restarted = new RunCoordinator({
-      config: testConfig(home),
-      streamFn: restartedFaux.provider.streamSimple,
-    });
-    const reused = restarted.createRun(structuredClone(request));
-    assert.equal(reused.id, run.id);
-    assert.equal(reused.status, "completed");
-    assert.deepEqual(reused.result?.context_usage, completed.result?.context_usage);
-    assert.deepEqual(await restarted.submitInput(reused.id, executionEquivalentRetry), {
-      run_id: run.id,
-      message_id: first.message_id,
-      state: "injected",
-    });
-    const restoredTerminal = restarted.getJournal(reused.id)?.list().find(
-      (event) => event.type === "run.completed",
-    );
-    assert.deepEqual(restoredTerminal?.data.input_message_ids, ["message-2", "message-3"]);
-    assert.deepEqual(restoredTerminal?.data.unconsumed_input_message_ids, []);
-    assert.equal(restartedFaux.state.callCount, 0);
-    restarted.shutdown();
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
@@ -2180,7 +2111,6 @@ test("text-only Codex receives browser vision text fallback while work records o
       system_prompt: "You are an Agent.",
       input: "Inspect the page",
       model: { provider: "openai-codex", id: textOnlyModelId },
-      metadata: { idempotency_key: "text-vision-once" },
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
@@ -2205,8 +2135,6 @@ test("text-only Codex receives browser vision text fallback while work records o
     assert.doesNotMatch(publicResult, new RegExp(encoded));
     assert.match(publicResult, /Image content omitted from retained run result/);
     assert.equal(completed.result?.content, "The Submit button is visible from the accessibility snapshot.");
-    const idempotency = await readFile(`${home}/idempotency/index.json`, "utf8");
-    assert.doesNotMatch(idempotency, new RegExp(encoded));
 
     const toolEvent = coordinator.getJournal(run.id)?.list().find((event) => event.type === "tool.completed");
     assert.ok(toolEvent);

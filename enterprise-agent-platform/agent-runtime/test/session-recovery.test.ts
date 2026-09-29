@@ -1,133 +1,98 @@
 import assert from "node:assert/strict";
-import { readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import type { RunRequest } from "../src/types.js";
-import { temporaryDirectory, testConfig, TestRunCoordinator as RunCoordinator } from "./helpers.js";
+import type { UserMessage } from "@earendil-works/pi-ai";
+import { SessionStore } from "../src/session-store.js";
+import { stableHash } from "../src/utils.js";
+import { temporaryDirectory } from "./helpers.js";
 
-test("RunCoordinator repairs a durable assistant tool call with no result", async () => {
-  const home = await temporaryDirectory("agent-session-recovery-");
-  const workspace = await temporaryDirectory("agent-session-recovery-workspace-");
-  const faux = fauxProvider();
-  faux.setResponses([
-    async (context) => {
-      const assistant = context.messages.find((message) => message.role === "assistant");
-      assert.ok(assistant?.role === "assistant");
-      assert.equal(assistant.content.some((block) => block.type === "toolCall"), false);
-      assert.match(
-        assistant.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"),
-        /outcome is unknown/,
-      );
-      return fauxAssistantMessage("recovered safely");
-    },
-  ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  const request: RunRequest = {
-    scope_key: "scope",
-    lifecycle_id: "life",
-    session_id: "session",
-    workspace,
-    system_prompt: "You are an Agent.",
-    input: "continue",
-    model: { provider: "openai-codex", id: "gpt-5.5" },
-  };
-  try {
-    const identity = {
-      scope_key: request.scope_key,
-      lifecycle_id: request.lifecycle_id,
-      session_id: request.session_id,
-    };
-    await coordinator.sessions.initialize(identity, []);
-    await coordinator.sessions.appendMessage(
-      identity,
-      fauxAssistantMessage(fauxToolCall("terminal", { command: "touch unknown" }), { stopReason: "toolUse" }),
-    );
-    const run = coordinator.createRun(request);
-    const completed = await coordinator.wait(run.id);
-    assert.equal(completed.status, "completed");
-    assert.equal(completed.result?.content, "recovered safely");
-    assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "session.repaired"));
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
+const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "session" };
+const message = (content: string): UserMessage => ({ role: "user", content, timestamp: 1 });
+
+async function legacyFixture(home: string): Promise<{ journal: string; archive: string; path: string }> {
+  const scope = join(home, "sessions", stableHash(identity.scope_key));
+  const path = join(scope, stableHash(identity.lifecycle_id), `${stableHash(identity.session_id)}.jsonl`);
+  await mkdir(dirname(path), { recursive: true });
+  const entry = (id: string, type: string, payload: unknown) => ({ id, type, ...identity, timestamp: "2026-01-01T00:00:00.000Z", payload });
+  const recent = entry("recent", "message", message("retained fact"));
+  const journal = [entry("header", "header", { version: 1, ...identity }), { ...entry("notice", "message", message("compaction summary")), synthetic_kind: "context_compaction_notice" }, recent, entry("compaction", "compaction", { reason: "threshold" })].map((row) => JSON.stringify(row)).join("\n") + "\n";
+  // A retained entry also in the archive models archive-first interruption.
+  const archive = [entry("old", "message", message("searchable compacted fact")), recent].map((row) => JSON.stringify(row)).join("\n") + "\n";
+  await writeFile(join(scope, "scope.json"), JSON.stringify({ scope_key: identity.scope_key }));
+  await writeFile(path, journal);
+  await writeFile(path.replace(/\.jsonl$/, ".archive.jsonl"), archive);
+  await writeFile(join(dirname(path), "approvals.jsonl"), JSON.stringify({ id: "grant", type: "grant", timestamp: "2026-01-01", session_id: identity.session_id, approval_key: "v2:migrated", tool_name: "skill" }) + "\n");
+  return { journal, archive, path };
+}
+
+async function tree(root: string): Promise<Record<string, string>> {
+  const result: Record<string, string> = {};
+  for (const item of await readdir(root, { recursive: true, withFileTypes: true })) {
+    if (item.isFile()) {
+      const path = join(item.parentPath, item.name);
+      result[path.slice(root.length)] = await readFile(path, "utf8");
+    }
   }
+  return result;
+}
+
+test("startup converts legacy model and search history, preserves backup bytes, and reruns without writes", async () => {
+  const home = await temporaryDirectory("native-migration-");
+  try {
+    const fixture = await legacyFixture(home);
+    const before = await tree(join(home, "sessions"));
+    const store = new SessionStore(home);
+    await store.initialize();
+    assert.deepEqual(await store.load(identity), [message("compaction summary"), message("retained fact")]);
+    assert.deepEqual(await store.loadSearchable(identity), [message("searchable compacted fact"), message("retained fact")]);
+    assert.equal(await store.hasSessionApproval(identity, "v2:migrated"), true);
+    assert.deepEqual(await tree(join(home, "sessions.pre-pi")), before);
+    assert.equal(await readFile(fixture.path.replace("/sessions/", "/sessions.pre-pi/"), "utf8"), fixture.journal);
+    await store.appendMessage(identity, message("after migration"));
+    const active = await tree(join(home, "sessions"));
+    const restarted = new SessionStore(home);
+    await restarted.initialize();
+    assert.deepEqual(await tree(join(home, "sessions")), active);
+    assert.deepEqual(await restarted.load(identity), [message("compaction summary"), message("retained fact"), message("after migration")]);
+    assert.deepEqual(await tree(join(home, "sessions.pre-pi")), before);
+    await restarted.deleteScopeFamily(identity.scope_key);
+    assert.deepEqual(await restarted.loadSearchable(identity), []);
+    assert.deepEqual(await tree(join(home, "sessions.pre-pi")), before);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("compaction archives the exact durable entries when recovery removes an orphan tool result", async () => {
-  const home = await temporaryDirectory("agent-session-orphan-compaction-");
-  const workspace = await temporaryDirectory("agent-session-orphan-compaction-workspace-");
-  const faux = fauxProvider();
-  faux.setResponses([
-    async () => fauxAssistantMessage("Current objective\n- Continue after repairing the interrupted history."),
-    async () => fauxAssistantMessage("compaction completed safely"),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { compactionThreshold: 0.000001 }),
-    streamFn: faux.provider.streamSimple,
+for (const partialStage of [false, true]) {
+  test(`startup resumes after backup rename${partialStage ? " and incomplete staging" : ""}`, async () => {
+    const home = await temporaryDirectory("native-resume-");
+    try {
+      await legacyFixture(home);
+      const before = await tree(join(home, "sessions"));
+      await rename(join(home, "sessions"), join(home, "sessions.pre-pi"));
+      if (partialStage) {
+        const stage = join(home, "sessions.pi-staging", "sessions");
+        await mkdir(stage, { recursive: true });
+        await writeFile(join(stage, ".pi-native"), "4\n");
+        await writeFile(join(stage, "partial.jsonl"), '{"incomplete":');
+      }
+      const store = new SessionStore(home);
+      await store.initialize();
+      assert.deepEqual(await store.load(identity), [message("compaction summary"), message("retained fact")]);
+      assert.deepEqual(await store.loadSearchable(identity), [message("searchable compacted fact"), message("retained fact")]);
+      assert.deepEqual(await tree(join(home, "sessions.pre-pi")), before);
+      assert.equal((await readdir(home)).includes("sessions.pi-staging"), false);
+    } finally { await rm(home, { recursive: true, force: true }); }
   });
-  const request: RunRequest = {
-    scope_key: "scope",
-    lifecycle_id: "life",
-    session_id: "session",
-    workspace,
-    system_prompt: "You are an Agent.",
-    input: "continue after recovery",
-    model: { provider: "openai-codex", id: "gpt-5.5" },
-  };
-  const identity = {
-    scope_key: request.scope_key,
-    lifecycle_id: request.lifecycle_id,
-    session_id: request.session_id,
-  };
-  const history: AgentMessage[] = [
-    {
-      role: "toolResult",
-      toolCallId: "missing-call",
-      toolName: "terminal",
-      content: [{ type: "text", text: "orphan-raw-marker" }],
-      isError: false,
-      timestamp: 0,
-    },
-    { role: "user", content: "omitted-user-one", timestamp: 1 },
-    { ...fauxAssistantMessage("omitted-assistant-two"), timestamp: 2 },
-    { role: "user", content: "omitted-user-three", timestamp: 3 },
-    { ...fauxAssistantMessage("last-exact-omitted-marker"), timestamp: 4 },
-    { role: "user", content: "first-retained-marker", timestamp: 5 },
-    { ...fauxAssistantMessage("retained-assistant"), timestamp: 6 },
-    { role: "user", content: "retained-user", timestamp: 7 },
-    { ...fauxAssistantMessage("most-recent-retained"), timestamp: 8 },
-  ];
+}
+
+test("invalid legacy interior records fail startup without publishing a partial native tree", async () => {
+  const home = await temporaryDirectory("native-invalid-");
   try {
-    await coordinator.sessions.initialize(identity, history);
-    const run = coordinator.createRun(request);
-    const completed = await coordinator.wait(run.id);
-    assert.equal(completed.status, "completed");
-    assert.ok(coordinator.getJournal(run.id)?.list().some((event) => event.type === "context.compacted"));
-
-    const archive = await readFile(coordinator.sessions.archivePath(identity), "utf8");
-    assert.match(archive, /orphan-raw-marker/);
-    assert.match(archive, /last-exact-omitted-marker/);
-    assert.doesNotMatch(archive, /first-retained-marker/);
-
-    const active = JSON.stringify(await coordinator.sessions.load(identity));
-    assert.doesNotMatch(active, /orphan-raw-marker/);
-    assert.doesNotMatch(active, /last-exact-omitted-marker/);
-    assert.match(active, /first-retained-marker/);
-
-    const searchable = JSON.stringify(await coordinator.sessions.loadSearchable(identity));
-    for (const marker of [
-      "orphan-raw-marker",
-      "last-exact-omitted-marker",
-      "first-retained-marker",
-      "compaction completed safely",
-    ]) {
-      assert.match(searchable, new RegExp(marker));
-    }
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
+    const fixture = await legacyFixture(home);
+    await writeFile(fixture.path, `not json\n${fixture.journal}`);
+    const before = await tree(join(home, "sessions"));
+    await assert.rejects(new SessionStore(home).initialize(), /Corrupt legacy session/);
+    assert.equal((await readdir(home)).includes("sessions"), false);
+    assert.deepEqual(await tree(join(home, "sessions.pre-pi")), before);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });

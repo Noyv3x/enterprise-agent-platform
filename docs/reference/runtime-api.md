@@ -47,14 +47,14 @@
 | `GET /v1/runs/{run_id}/events` | 查询参数 `after?` → 200 SSE |
 | `POST /v1/runs/{run_id}/input` | 追加输入的正文 → accepted 时 202，injected 时 200 |
 | `POST /v1/runs/{run_id}/approval` | 审批正文 → 200 `{run_id,approval_id:string\|null,decision,resolved:true}` |
-| `POST /v1/runs/{run_id}/cancel` | 空正文或 `{}` → 202 `{run_id,status}`；这不代表清理已完成 |
+| `POST /v1/runs/{run_id}/cancel` | 空正文或 `{}` → 202 `{run_id,status,side_effects_started:boolean}`；这不代表清理已完成 |
 | `POST /v1/sessions/compact` | 压缩正文 → 200 压缩结果 |
 | `POST /v1/scopes/cleanup` | 清理正文 → 200 `{scope_key,cancelled_runs:number,sessions_deleted:boolean}` |
 | `GET /v1/scopes/processes` | 查询参数 `scope_key,lifecycle_id,since_revision?` → 200 进程预览 |
 | `GET /v1/scopes/process-summary` | 查询参数 `scope_key,lifecycle_id` → 200 `{running_terminal_count:number}` |
 
 - 没标类型的 run_id、scope_key、decision 都是字符串。
-- `RunStatus = queued | running | completed | failed | cancelled | needs_review`，后四个是终态；幂等创建可能直接返回终态。
+- `RunStatus = queued | running | completed | failed | cancelled | needs_review`，后四个是终态；Run 状态与结果仅在当前进程内可用。
 - 产品里的"撤回消息"不是 Runtime 的 cancel。
 
 ## 模型目录
@@ -99,7 +99,7 @@
 
 | 字段 | 类型 |
 |---|---|
-| `parent_run_id`、`approval_owner_run_id`、`approval_scope_key`、`approval_session_id`、`idempotency_key`、`trigger`、`review_mode`、`schedule_id`、`schedule_run_id`、`scheduled_for` | 字符串 |
+| `parent_run_id`、`approval_owner_run_id`、`approval_scope_key`、`approval_session_id`、`trigger`、`review_mode`、`schedule_id`、`schedule_run_id`、`scheduled_for` | 字符串 |
 | `delegation_depth` / `delegation_role` | 数字 / `"leaf" \| "orchestrator"` |
 | `source_message_id`、`review_job_id` | 正的安全整数 |
 | `unattended`、`schedule_recurring` | 布尔；recurring 由权威的 interval/cron 派生为 true，一次性计划为 false |
@@ -107,19 +107,20 @@
 
 **学习复盘 Run 的固定组合**
 
-- 规范的 `private:<正整数>` 对话范围；正的 `source_message_id` 和 `review_job_id`；没有父 Run（省略或空字符串）且深度为 0（或省略）；`review_mode=memory_skill`、`trigger=learning_review`、`unattended=true`；`session_id=learning-review-<job>`；`idempotency_key=agent-learning-review:<job>`。
-- 在排队和初始化会话之前校验。这两个命名空间是保留的，普通 Run 不能占用。能力和生命周期见[学习复盘 Run](../design/agent-runtime.md#学习复盘-run)。
+- 规范的 `private:<正整数>` 对话范围；正的 `source_message_id` 和 `review_job_id`；没有父 Run（省略或空字符串）且深度为 0（或省略）；`review_mode=memory_skill`、`trigger=learning_review`、`unattended=true`；`session_id=learning-review-<job>`。
+- 在排队和初始化会话之前校验。该会话命名空间是保留的，普通 Run 不能占用。能力和生命周期见[学习复盘 Run](../design/agent-runtime.md#学习复盘-run)。
 
-**幂等**
+**进程内创建**
 
-- 非空的幂等键在对话范围内唯一，重复创建会复用原 Run。重启时被中断的 Run 标为 needs_review，不重做；已持久化的终态只合成重放事件。保留和提交规则见 [Run 状态机](../design/agent-runtime.md#run-状态机)。
+- 创建不接受 `idempotency_key`，不复用旧 Run，也不持久化预留、终态或恢复事件。重启后旧 Run 不可查询；Platform 不重新提交结果未知的请求，可能已有副作用的任务标为 `needs_review`，能确认没有副作用的标为 `failed`。规则见 [Run 状态机](../design/agent-runtime.md#run-状态机)。
 
 **Run 快照**
 
-- `{run_id,status,created_at,updated_at,session_id,scope_key,result?:RunResult,error?:string}`，除 status 和 result 外都是字符串。
+- `{run_id,status,created_at,updated_at,session_id,scope_key,side_effects_started:boolean,result?:RunResult,error?:string}`；除 status、side_effects_started 和 result 外都是字符串。
 - `RunResult = {content:string,messages:AgentMessage[],model:{provider:string,id:string},usage?:object,context_usage?:ContextUsage,input_message_ids?:string[],unconsumed_input_message_ids?:string[]}`。
 - `content` 是本 Run 最后一条助手回复的正文；不拼接中间回答，不扣留或恢复 MEDIA 标记。
-- 没有值的可选字段直接省略。持久化的 messages 经过脱敏，不保存实时图片的 base64；恢复时 messages 为空数组，不恢复原消息流。
+- 没有值的可选字段直接省略。返回的 messages 经过脱敏，不包含实时图片的 base64；Run 结果不持久化，重启后不提供恢复结果或原消息流。
+- GET 快照与 cancel 响应的 `side_effects_started` 来自当前 Run 的权威执行记录。只有终态同时返回 false 才能证明该 Run 没有副作用；仍在运行的取消响应即使为 false，也不是安全结算的证据。进程内 Run 不存在时的 404 表示结果未知，不能据此判定无副作用或重新提交。创建响应不增加此字段。
 
 **ContextUsage**
 
@@ -142,7 +143,7 @@
 - 200 响应：`{compacted:boolean,omitted_messages:number,retained_messages:number}`。
   - omitted_messages 只计真实消息；实际发生压缩时，retained_messages 包含当前的摘要。
   - 没有可省略的历史时 compacted 为 false；重复调用不会让文件增长。
-- 这是控制操作：不创建 Run 或命令消息，不删除归档。Platform 的读取时限为五分钟；取消、提交与删除的边界见[压缩规则](../design/agent-runtime.md#会话与压缩)。
+- 这是控制操作：不创建 Run 或命令消息，不删除原生会话历史。Platform 的读取时限为五分钟；取消、提交与删除的边界见[压缩规则](../design/agent-runtime.md#会话与压缩)。
 
 ## SSE journal
 
@@ -156,7 +157,7 @@
 - 先记录再广播；同一个 journal 的 sequence 单调递增。
 - `Last-Event-ID` 和 `after` 必须是完整的、非负的安全整数十进制表示；两者都有时取较大值，只发送之后的事件。尾随字符、负数、溢出或重复的 after 在订阅之前就拒绝。
 - 只能补读**当前内存中保留的后缀**：没有缺口标记、没有永久历史、没有跨重启稳定的游标，也不保证恰好一次。超出保留窗口的就补不回来。
-- 幂等 Run 重启后的恢复，是一个新 journal 里的 reused 加终态事件，不复原旧的消息和工具流；运行中重复创建不发 reused。
+- 重启后没有旧 Run 的 journal 或合成恢复事件；不得用重新创建 Run 代替补读。
 - 每个 journal 同时受事件数和 JSON 字节数限制；发布时生成一次独立的 JSON 快照并移除内部审批 key，之后的补读和广播共用该快照。生产者后续修改原始对象不会改变已发布事件。
 
 **背压**
@@ -172,7 +173,6 @@
 | 事件 | data |
 |---|---|
 | `run.queued` / `run.started` | `status:"queued"` / `status:"running"` |
-| `run.reused` | `status,persisted:true` |
 | `message.delta` / `thinking.delta` | `delta:string,content_index:number,...T` |
 | `message.final` | `content,stop_reason:string,usage:object,...T`；可能多次出现，不是唯一的终稿 |
 | `tool.arguments.delta` | `content_index:number,...T`，可以附带下文的文件草稿，不含原始增量 |
@@ -188,7 +188,7 @@
 | `delegation.started` | `child_run_id,depth:number` |
 | `delegation.completed` | `child_run_id,content,side_effects_started:boolean` |
 | `delegation.failed` | `child_run_id,status,error,side_effects_started:boolean` |
-| `context.compacted` / `session.repaired` | `omitted_messages:number,retained_messages:number` / `interrupted_tool_messages:number` |
+| `context.compacted` | `omitted_messages:number,retained_messages:number` |
 | `run.idle_timeout` | `timeout_ms:number,idle_ms:number,last_activity:string,last_activity_at:string` |
 | `run.turn_limit` / `run.cleanup_timeout` | `max_turns:number,completed_turns:number,blocked_turn:number` / `cleanup_grace_ms:number` |
 
@@ -197,8 +197,8 @@
 **终态事件**
 
 - `run.completed | run.failed | run.cancelled | run.needs_review` 的 data 包含 `status,input_message_ids:string[],unconsumed_input_message_ids:string[],error?:string`。
-- 有结果时再加 `output:string,content:string,session_id:string,model:{provider:string,id:string},usage:object,context_usage?:ContextUsage`，其中 output 和 content 相同。没有结果时省略这些字段；恢复时另加 `reused:true`。
-- needs_review 的正文只是真实的、有上限的阶段诊断，error 单独给出阻塞原因；在 Python 中是 `AgentRuntimeRunError.partial_content`。幂等重放后仍然不是成功。非成功的 Run 中的 MEDIA 不解析、不复制、不发布为附件。
+- 有结果时再加 `output:string,content:string,session_id:string,model:{provider:string,id:string},usage:object,context_usage?:ContextUsage`，其中 output 和 content 相同。没有结果时省略这些字段。
+- needs_review 的正文只是真实的、有上限的阶段诊断，error 单独给出阻塞原因；在 Python 中是 `AgentRuntimeRunError.partial_content`。非成功的 Run 中的 MEDIA 不解析、不复制、不发布为附件。
 - 成功的 output 直接保留最终助手回复；其中的 MEDIA 标记仍须经 Platform 授权，不执行 Runtime 的中间回复标记恢复。
 - [模型重试](../design/agent-runtime.md#run-状态机)只针对还没有可见增量的请求，不新增 Run、会话或工具记录；Platform 不根据错误文字重新提交 Run。
 

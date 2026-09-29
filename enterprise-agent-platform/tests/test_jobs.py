@@ -82,6 +82,18 @@ class DurableJobStoreTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(retryable.id).status, "queued")
         self.assertEqual(self.jobs.get(telegram.id).status, "needs_review")
 
+    def test_restart_quarantines_claimed_reviews_but_preserves_unsubmitted_work(self):
+        for kind in ("agent", "agent_learning_review"):
+            with self.subTest(kind=kind):
+                submitted, _ = self.jobs.enqueue(kind=kind, dedupe_key="submitted", payload={})
+                queued, _ = self.jobs.enqueue(kind=kind, dedupe_key="unsubmitted", payload={})
+                self.jobs.mark_running(submitted.id, lease_seconds=60)
+                self.jobs.recover_interrupted(unsafe_kinds={kind})
+                self.assertEqual(self.jobs.get(submitted.id).status, "needs_review")
+                self.assertIsNone(self.jobs.mark_running(submitted.id, lease_seconds=60))
+                self.assertEqual(self.jobs.get(queued.id).status, "queued")
+                self.assertIsNotNone(self.jobs.mark_running(queued.id, lease_seconds=60))
+
     def test_queued_includes_delayed_retry_and_counts_can_be_scoped(self):
         first, _ = self.jobs.enqueue(
             kind="retryable",

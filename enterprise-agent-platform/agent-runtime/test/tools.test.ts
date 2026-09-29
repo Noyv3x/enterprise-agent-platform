@@ -897,7 +897,6 @@ test("learning review exposes only memory and skill and requires inspection befo
         review_mode: "memory_skill",
         review_job_id: 7,
         source_message_id: 88,
-        idempotency_key: "agent-learning-review:7",
         unattended: true,
         delegation_depth: 0,
       },

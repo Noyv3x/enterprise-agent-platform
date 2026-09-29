@@ -141,8 +141,8 @@ test("session and scope cleanup delete background task obligations without touch
     const store = new SessionStore(home);
     const identity = { scope_key: "private:3", lifecycle_id: "life", session_id: "one" };
     const sibling = { ...identity, session_id: "two" };
-    await store.initialize(identity);
-    await store.initialize(sibling);
+    await store.initializeTracked(identity);
+    await store.initializeTracked(sibling);
     await store.backgroundTaskState(identity).register("process_one", "sandbox");
     await store.backgroundTaskState(sibling).register("process_two", "sandbox");
 
@@ -166,7 +166,7 @@ test("transient scope-family cleanup removes only task responsibility sidecars",
     const otherLifecycle = { ...root, lifecycle_id: "life-b", session_id: "other-life" };
     const unrelated = { scope_key: "private:40", lifecycle_id: "life-a", session_id: "other-scope" };
     for (const identity of [root, delegated, otherLifecycle, unrelated]) {
-      await store.initialize(identity);
+      await store.initializeTracked(identity, [{ role: "user", content: identity.session_id, timestamp: 1 }]);
       await store.backgroundTaskState(identity).register(`process_${identity.session_id}`, "sandbox");
     }
 
@@ -174,8 +174,8 @@ test("transient scope-family cleanup removes only task responsibility sidecars",
 
     await assert.rejects(stat(store.backgroundTaskPath(root)), { code: "ENOENT" });
     await assert.rejects(stat(store.backgroundTaskPath(delegated)), { code: "ENOENT" });
-    await stat(store.path(root));
-    await stat(store.path(delegated));
+    assert.deepEqual(await store.load(root), [{ role: "user", content: root.session_id, timestamp: 1 }]);
+    assert.deepEqual(await store.load(delegated), [{ role: "user", content: delegated.session_id, timestamp: 1 }]);
     assert.equal((await store.loadActiveBackgroundTasks(otherLifecycle)).length, 1);
     assert.equal((await store.loadActiveBackgroundTasks(unrelated)).length, 1);
   } finally {

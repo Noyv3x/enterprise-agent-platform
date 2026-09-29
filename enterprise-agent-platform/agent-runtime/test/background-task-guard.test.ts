@@ -1,7 +1,6 @@
 import { getCurrentSystemPrompt } from "@earendil-works/pi-ai";
 import assert from "node:assert/strict";
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { rm, stat, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { validateToolArguments } from "@earendil-works/pi-ai/compat";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -833,15 +832,16 @@ test("scope cleanup retries after local responsibility commit fails and retains 
     });
     assert.equal((await coordinator.wait(run.id)).status, "completed");
     await coordinator.sessions.backgroundTaskState(taskIdentity).register("process_cleanup_retry", "sandbox");
-    const scopeManifest = dirname(dirname(coordinator.sessions.path(taskIdentity))) + "/scope.json";
-    const validManifest = await readFile(scopeManifest, "utf8");
-    await writeFile(scopeManifest, "{broken", "utf8");
+    const deleteTasks = coordinator.sessions.deleteBackgroundTaskScopeFamily.bind(coordinator.sessions);
+    coordinator.sessions.deleteBackgroundTaskScopeFamily = async () => {
+      throw new Error("local responsibility commit failed");
+    };
 
-    await assert.rejects(coordinator.cleanupScope("private:1", "life"));
+    await assert.rejects(coordinator.cleanupScope("private:1", "life"), /local responsibility commit failed/);
     assert.equal(acknowledgeCalls, 0, "Manager evidence must stay unacknowledged before local commit");
     await coordinator.previewProcesses("private:1", "life");
 
-    await writeFile(scopeManifest, validManifest, "utf8");
+    coordinator.sessions.deleteBackgroundTaskScopeFamily = deleteTasks;
     assert.equal(await coordinator.cleanupScope("private:1", "life"), 0);
     assert.equal(acknowledgeCalls, 1);
     await assert.rejects(stat(coordinator.sessions.backgroundTaskPath(taskIdentity)), { code: "ENOENT" });
@@ -893,7 +893,7 @@ test("permanent scope cleanup retries acknowledgement after local session commit
       coordinator.cleanupScope("private:1", "life", true),
       /did not acknowledge/,
     );
-    await assert.rejects(stat(coordinator.sessions.path(taskIdentity)), { code: "ENOENT" });
+    assert.deepEqual(await coordinator.sessions.load(taskIdentity), []);
     await coordinator.previewProcesses("private:1", "life");
 
     assert.equal(await coordinator.cleanupScope("private:1", "life", true), 0);

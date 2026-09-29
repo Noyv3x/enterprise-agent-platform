@@ -59,7 +59,6 @@ export interface RunMetadata extends JsonObject {
   parent_run_id?: string;
   delegation_depth?: number;
   delegation_role?: "leaf" | "orchestrator";
-  idempotency_key?: string;
   source_message_id?: number;
   approval_owner_run_id?: string;
   approval_scope_key?: string;
@@ -95,7 +94,6 @@ export function isLearningReviewRun(request: Pick<RunRequest, "scope_key" | "ses
     && Number.isSafeInteger(reviewJobId)
     && reviewJobId > 0
     && request.session_id === `learning-review-${reviewJobId}`
-    && metadata.idempotency_key === `agent-learning-review:${reviewJobId}`
     && typeof metadata.source_message_id === "number"
     && Number.isSafeInteger(metadata.source_message_id)
     && metadata.source_message_id > 0
@@ -104,11 +102,11 @@ export function isLearningReviewRun(request: Pick<RunRequest, "scope_key" | "ses
 }
 
 export function hasLearningReviewMetadata(
-  request: Pick<RunRequest, "metadata">,
+  request: Pick<RunRequest, "session_id" | "metadata">,
 ): boolean {
   const metadata = request.metadata;
   return Boolean(
-    metadata
+    request.session_id.startsWith("learning-review-") || metadata
     && (
       metadata.review_mode !== undefined
       || metadata.review_job_id !== undefined

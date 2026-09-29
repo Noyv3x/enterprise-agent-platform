@@ -240,7 +240,6 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
       model: { provider: "openai-codex", id: "gpt-5" },
       metadata: {
         actor: { id: 42 },
-        idempotency_key: "agent-job:77",
         source_message_id: 88,
       },
     };
@@ -268,7 +267,7 @@ test("PlatformGateway preserves memory actions and recursively enforces trusted 
     });
     const actorless = {
       ...request,
-      metadata: { idempotency_key: "agent-job:999" },
+      metadata: {},
     };
     await gateway.invoke(actorless, "run-no-owner", "memory", "store", {
       owner_user_id: 999,
@@ -357,7 +356,6 @@ test("PlatformGateway forwards trusted learning-review context and normalizes re
         trigger: "learning_review",
         review_mode: "memory_skill",
         review_job_id: 7,
-        idempotency_key: "agent-learning-review:7",
         unattended: true,
         delegation_depth: 0,
       },

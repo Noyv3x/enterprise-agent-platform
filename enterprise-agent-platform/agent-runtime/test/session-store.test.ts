@@ -1,772 +1,118 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { rm } from "node:fs/promises";
 import test from "node:test";
-import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { UserMessage } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import {
-  CURRENT_MODEL_CONTENT_SECURITY_VERSION,
-  SessionStore,
-} from "../src/session-store.js";
+import { SessionStore, CURRENT_MODEL_CONTENT_SECURITY_VERSION } from "../src/session-store.js";
 import { temporaryDirectory } from "./helpers.js";
 
-test("SessionStore serializes same-session initialization without blocking adjacent sessions", async (context) => {
-  const home = await temporaryDirectory("agent-session-");
-  let releaseRead = (): void => {};
-  const pending: Promise<unknown>[] = [];
+const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "session" };
+const message = (content: string): UserMessage => ({ role: "user", content, timestamp: 1 });
+
+test("native initialization is serialized, preserves identity fences and never reseeds", async () => {
+  const home = await temporaryDirectory("native-session-");
   try {
     const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const sibling = { ...identity, session_id: "other" };
-    const seed: UserMessage = { role: "user", content: "seed", timestamp: 1 };
-    const otherSeed: UserMessage = { ...seed, content: "independent session" };
-    const readEntries = store.readEntries.bind(store);
-    let readReached = (): void => {};
-    const reachedRead = new Promise<void>((resolve) => { readReached = resolve; });
-    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
-    let intercepted = false;
-    context.mock.method(store, "readEntries", async (candidate: Parameters<SessionStore["readEntries"]>[0]) => {
-      const entries = await readEntries(candidate);
-      if (!intercepted && candidate.session_id === identity.session_id) {
-        intercepted = true;
-        readReached();
-        await readGate;
-      }
-      return entries;
-    });
-
-    const first = store.initializeTracked(identity, [seed]);
-    pending.push(first);
-    await reachedRead;
-    const second = store.initializeTracked(identity, [{ ...seed, content: "must-not-reseed" }]);
-    pending.push(second);
-    assert.deepEqual(await store.initialize(sibling, [otherSeed]), [otherSeed]);
-
-    releaseRead();
-    const [firstTracked, secondTracked] = await Promise.all([first, second]);
-    assert.deepEqual(firstTracked.map((entry) => entry.message), [seed]);
-    assert.deepEqual(secondTracked, firstTracked, "concurrent callers must receive the same durable entry ids");
-    assert.deepEqual(await store.initialize(identity, [otherSeed]), [seed]);
-    assert.equal((await store.readEntries(identity)).filter((entry) => entry.type === "header").length, 1);
-    const reloaded = new SessionStore(home);
-    assert.deepEqual(await reloaded.loadTracked(identity), firstTracked);
-    assert.deepEqual(await reloaded.load(sibling), [otherSeed]);
-  } finally {
-    releaseRead();
-    await Promise.allSettled(pending);
-    await rm(home, { recursive: true, force: true });
-  }
+    const [first, second] = await Promise.all([
+      store.initializeTracked(identity, [message("first")]),
+      store.initializeTracked(identity, [message("must not replay")]),
+    ]);
+    assert.deepEqual(second, first);
+    const other = { ...identity, lifecycle_id: "other" };
+    await store.initialize(other, [message("isolated")]);
+    const restarted = new SessionStore(home);
+    assert.deepEqual(await restarted.loadTracked(identity), first);
+    assert.deepEqual(await restarted.load(other), [message("isolated")]);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("SessionStore releases a failed initialization so the repaired journal can be retried", async () => {
-  const home = await temporaryDirectory("agent-session-initialize-retry-");
+test("native compaction keeps exact tracked projection and searchable history without duplicate replay", async () => {
+  const home = await temporaryDirectory("native-compaction-");
   try {
     const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const seed: UserMessage = { role: "user", content: "retry seed", timestamp: 1 };
-    await mkdir(store.path(identity), { recursive: true, mode: 0o700 });
-    await assert.rejects(store.initializeTracked(identity, [seed]), /not a regular file/);
-
-    await rm(store.path(identity), { recursive: true });
-    const tracked = await store.initializeTracked(identity, [seed]);
-    assert.deepEqual(tracked.map((entry) => entry.message), [seed]);
-    assert.deepEqual(await new SessionStore(home).loadTracked(identity), tracked);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
+    const original = await store.initializeTracked(identity, [message("old searchable fact"), message("recent")]);
+    const summary = { message: message("summary of old fact"), synthetic_kind: "context_compaction_notice" as const };
+    const ids = await store.rewriteCompacted(identity, [summary, original[1]!], { reason: "manual" }, [original[0]!.entry_id]);
+    await store.appendMessage(identity, message("next"), CURRENT_MODEL_CONTENT_SECURITY_VERSION);
+    const restarted = new SessionStore(home);
+    const current = await restarted.loadTracked(identity);
+    assert.deepEqual(current.map((entry) => entry.message), [summary.message, message("recent"), message("next")]);
+    assert.deepEqual(current.slice(0, 2).map((entry) => entry.entry_id), ids);
+    assert.equal(current[0]!.synthetic_kind, "context_compaction_notice");
+    assert.equal(current[2]!.model_content_security_version, CURRENT_MODEL_CONTENT_SECURITY_VERSION);
+    assert.deepEqual(await restarted.loadSearchable(identity), [message("old searchable fact"), message("recent"), message("next")]);
+    await restarted.rewriteCompacted(identity, [current[2]!], {}, [current[1]!.entry_id], [current[0]!.entry_id]);
+    assert.deepEqual(await restarted.load(identity), [message("next")]);
+    assert.deepEqual(await restarted.loadSearchable(identity), [message("old searchable fact"), message("recent"), message("next")]);
+    await assert.rejects(restarted.rewriteCompacted(identity, [current[2]!, current[2]!], {}), /duplicate/);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("SessionStore deletes exactly one transient session and preserves lifecycle approvals", async () => {
-  const home = await temporaryDirectory("agent-session-delete-");
+test("family deletion fences lifecycle and scope and includes sidecar-only sessions", async () => {
+  const home = await temporaryDirectory("native-delete-");
   try {
     const store = new SessionStore(home);
-    const identity = { scope_key: "private:1", lifecycle_id: "life", session_id: "review" };
-    const sibling = { ...identity, session_id: "ordinary" };
-    const message: UserMessage = { role: "user", content: "temporary", timestamp: 1 };
-    await store.initialize(identity, [message]);
-    await store.initialize(sibling, [{ ...message, content: "preserved" }]);
-    await store.appendSessionApproval(identity, "v2:test:key", "skill");
-    await writeFile(store.archivePath(identity), `${JSON.stringify({
-      id: "archive-entry",
-      type: "message",
-      timestamp: "2026-01-01T00:00:00.000Z",
-      ...identity,
-      payload: message,
-    })}\n`, { mode: 0o600 });
+    const child = { ...identity, scope_key: "private:1/delegate/one" };
+    const otherLife = { ...child, lifecycle_id: "other" };
+    const neighbor = { ...identity, scope_key: "private:10" };
+    for (const candidate of [identity, child, otherLife, neighbor]) await store.initialize(candidate, [message(candidate.scope_key)]);
+    await store.appendSessionApproval(identity, "v2:key", "skill");
+    await store.todoState(child).replace([{ content: "child task" }]);
+    await store.todoState(otherLife).replace([{ content: "preserved task" }]);
+    await store.deleteScopeFamily(identity.scope_key, identity.lifecycle_id);
+    assert.deepEqual(await store.load(identity), []);
+    assert.deepEqual(await store.load(child), []);
+    assert.deepEqual(await store.load(otherLife), [message(child.scope_key)]);
+    assert.deepEqual(await store.load(neighbor), [message(neighbor.scope_key)]);
+    assert.equal(await store.hasSessionApproval(identity, "v2:key"), false);
+    assert.deepEqual(await store.loadActiveTodos(child), []);
+    assert.equal((await store.loadActiveTodos(otherLife))[0]!.content, "preserved task");
+    const sidecarOnly = { ...identity, scope_key: "private:1/delegate/sidecar" };
+    await store.todoState(sidecarOnly).replace([{ content: "sidecar-only" }]);
+    await store.deleteScopeFamily(identity.scope_key);
+    assert.deepEqual(await store.loadActiveTodos(sidecarOnly), []);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
 
+test("deleting a single native session preserves sibling history and lifecycle approvals", async () => {
+  const home = await temporaryDirectory("native-single-delete-");
+  try {
+    const store = new SessionStore(home);
+    const sibling = { ...identity, session_id: "sibling" };
+    await store.initialize(identity, [message("discard")]);
+    await store.initialize(sibling, [message("keep")]);
+    await store.appendSessionApproval(sibling, "v2:keep", "skill");
     await store.deleteSession(identity);
     await store.deleteSession(identity);
-
-    for (const path of [
-      store.path(identity),
-      store.archivePath(identity),
-      store.path(identity).replace(/\.jsonl$/, ".manifest.json"),
-    ]) {
-      await assert.rejects(stat(path), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
-    }
-    const [preserved] = await store.load(sibling);
-    assert.equal(preserved?.role, "user");
-    assert.equal(preserved?.role === "user" ? preserved.content : undefined, "preserved");
-    assert.equal(await store.hasSessionApproval(identity, "v2:test:key"), true);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
+    assert.deepEqual(await store.load(identity), []);
+    assert.deepEqual(await store.load(sibling), [message("keep")]);
+    assert.equal(await store.hasSessionApproval(sibling, "v2:keep"), true);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("SessionStore ignores an incomplete final JSONL record", async () => {
-  const home = await temporaryDirectory("agent-session-tail-");
+test("native messages redact tool secrets and omit image bytes across restart", async () => {
+  const home = await temporaryDirectory("native-redaction-");
   try {
     const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const message: UserMessage = { role: "user", content: "kept", timestamp: 1 };
-    await store.initialize(identity, [message]);
-    await appendFile(store.path(identity), "{\"incomplete\":");
-    assert.deepEqual(await store.load(identity), [message]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore preserves a complete active record without a newline before later appends", async () => {
-  const home = await temporaryDirectory("agent-session-active-complete-tail-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const beforeCrash: UserMessage = { role: "user", content: "complete-before-crash", timestamp: 1 };
-    const afterCrashOne: UserMessage = { role: "user", content: "after-crash-one", timestamp: 2 };
-    const afterCrashTwo: UserMessage = { role: "user", content: "after-crash-two", timestamp: 3 };
-    await store.initialize(identity, [beforeCrash]);
-    const journalPath = store.path(identity);
-    await writeFile(journalPath, (await readFile(journalPath, "utf8")).trimEnd(), { mode: 0o600 });
-
-    await store.appendMessage(identity, afterCrashOne);
-    await store.appendMessage(identity, afterCrashTwo);
-
-    const journal = await readFile(journalPath, "utf8");
-    assert.equal(journal.endsWith("\n"), true);
-    assert.doesNotThrow(() => journal.trimEnd().split("\n").map((line) => JSON.parse(line)));
-    assert.equal((journal.match(/complete-before-crash/g) ?? []).length, 1);
-    assert.deepEqual(await new SessionStore(home).load(identity), [beforeCrash, afterCrashOne, afterCrashTwo]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore truncates a partial active record before two later appends and reload", async () => {
-  const home = await temporaryDirectory("agent-session-active-partial-tail-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const beforeCrash: UserMessage = { role: "user", content: "valid-before-partial", timestamp: 1 };
-    const afterCrashOne: UserMessage = { role: "user", content: "after-partial-one", timestamp: 2 };
-    const afterCrashTwo: UserMessage = { role: "user", content: "after-partial-two", timestamp: 3 };
-    await store.initialize(identity, [beforeCrash]);
-    const journalPath = store.path(identity);
-    await appendFile(journalPath, "{\"id\":\"partial");
-
-    await store.appendMessage(identity, afterCrashOne);
-    await store.appendMessage(identity, afterCrashTwo);
-
-    const journal = await readFile(journalPath, "utf8");
-    assert.doesNotMatch(journal, /\"id\":\"partial/);
-    assert.doesNotThrow(() => journal.trimEnd().split("\n").map((line) => JSON.parse(line)));
-    assert.deepEqual(await new SessionStore(home).load(identity), [beforeCrash, afterCrashOne, afterCrashTwo]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore checks only the final byte of a healthy large journal before append", async (context) => {
-  const home = await temporaryDirectory("agent-session-active-tail-fast-path-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const large: UserMessage = { role: "user", content: "x".repeat(2 * 1024 * 1024), timestamp: 1 };
-    await store.initialize(identity, [large]);
-    const journalPath = store.path(identity);
-    const journalSize = (await stat(journalPath)).size;
-    const probe = await open(journalPath, "r");
-    const fileHandlePrototype = Object.getPrototypeOf(probe) as typeof probe;
-    await probe.close();
-    const read = context.mock.method(fileHandlePrototype, "read");
-
-    await store.appendMessage(identity, { role: "user", content: "later", timestamp: 2 });
-
-    const requestedLengths = read.mock.calls.map((call) => (call.arguments as unknown[])[2]);
-    assert.deepEqual(requestedLengths, [1]);
-    assert.ok(requestedLengths.every((length) => typeof length === "number" && length < journalSize));
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore reads an existing journal with unknown header metadata without rewriting it", async () => {
-  const home = await temporaryDirectory("agent-session-header-metadata-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const message: UserMessage = { role: "user", content: "existing history", timestamp: 1 };
-    const entries = [
-      {
-        id: "existing-header",
-        type: "header",
-        timestamp: "2026-01-01T00:00:00.000Z",
-        ...identity,
-        payload: {
-          version: 1,
-          unknown_extension: {
-            owner: "external-importer",
-            version: 7,
-            digest: "opaque-metadata",
-          },
-        },
-      },
-      {
-        id: "existing-message",
-        type: "message",
-        timestamp: "2026-01-01T00:00:01.000Z",
-        ...identity,
-        payload: message,
-      },
-    ];
-    const journal = store.path(identity);
-    await mkdir(dirname(journal), { recursive: true, mode: 0o700 });
-    const original = `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`;
-    await writeFile(journal, original, { mode: 0o600 });
-
-    const replacementSeed: UserMessage = { role: "user", content: "must-not-reseed", timestamp: 2 };
-    assert.deepEqual(await store.initialize(identity, [replacementSeed]), [message]);
-    assert.equal(await readFile(journal, "utf8"), original);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore distinguishes unmarked imported messages from runtime-secured messages", async () => {
-  const home = await temporaryDirectory("agent-session-content-security-version-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const imported: ToolResultMessage = {
-      role: "toolResult",
-      toolCallId: "imported-web-call",
-      toolName: "web",
-      content: [{ type: "text", text: "imported search result" }],
-      details: null,
-      isError: false,
-      timestamp: 1,
-    };
-    const current: ToolResultMessage = {
-      ...imported,
-      toolCallId: "current-web-call",
-      content: [{ type: "text", text: "current framed search result" }],
-      timestamp: 2,
-    };
-    const [importedTracked] = await store.initializeTracked(identity, [imported]);
-    const currentEntryId = await store.appendMessage(
-      identity,
-      current,
-      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
-    );
-    const beforeReload = await readFile(store.path(identity), "utf8");
-
-    const reloaded = await store.initializeTracked(identity);
-
-    assert.equal(importedTracked?.model_content_security_version, undefined);
-    assert.equal(reloaded.find((entry) => entry.entry_id === importedTracked?.entry_id)?.model_content_security_version, undefined);
-    assert.equal(
-      reloaded.find((entry) => entry.entry_id === currentEntryId)?.model_content_security_version,
-      CURRENT_MODEL_CONTENT_SECURITY_VERSION,
-    );
-    assert.equal(
-      await readFile(store.path(identity), "utf8"),
-      beforeReload,
-      "loading version metadata must not rewrite imported JSONL",
-    );
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore atomically replaces compacted history instead of growing forever", async () => {
-  const home = await temporaryDirectory("agent-session-compact-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "discard-this-old-message", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retain-this-message", timestamp: 2 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-
-    await store.rewriteCompacted(identity, [{ entry_id: retainedEntryId, message: retained }], {
-      omitted_messages: 1,
-      retained_messages: 1,
-    }, [oldEntry.entry_id]);
-
-    assert.deepEqual(await store.load(identity), [retained]);
-    assert.deepEqual(await store.loadSearchable(identity), [old, retained]);
-    const raw = await readFile(store.path(identity), "utf8");
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.doesNotMatch(raw, /discard-this-old-message/);
-    assert.match(raw, /retain-this-message/);
-    assert.match(archive, /discard-this-old-message/);
-    assert.doesNotMatch(archive, /retain-this-message/);
-    assert.equal((await stat(store.archivePath(identity))).mode & 0o777, 0o600);
-    assert.equal((raw.match(/"type":"header"/g) ?? []).length, 1);
-    assert.equal((raw.match(/"type":"compaction"/g) ?? []).length, 1);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore archive is idempotent when compaction resumes after archive fsync", async () => {
-  const home = await temporaryDirectory("agent-session-archive-recovery-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "archive-exactly-once", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "still-current", timestamp: 2 };
-    const [retainedEntry] = await store.initializeTracked(identity, [retained]);
-    const oldEntryId = await store.appendMessage(identity, old);
-    assert.ok(retainedEntry);
-    const beforeCompaction = await readFile(store.path(identity), "utf8");
-
-    const compacted = [{ entry_id: retainedEntry.entry_id, message: retained }];
-    await store.rewriteCompacted(identity, compacted, { omitted_messages: 1 }, [oldEntryId]);
-    await writeFile(store.path(identity), beforeCompaction, { mode: 0o600 });
-    await store.rewriteCompacted(identity, compacted, { omitted_messages: 1 }, [oldEntryId]);
-
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.equal((archive.match(/archive-exactly-once/g) ?? []).length, 1);
-    assert.doesNotMatch(archive, /still-current/);
-    assert.deepEqual(await store.loadSearchable(identity), [old, retained]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore serializes a concurrent append behind the complete compaction rewrite", async () => {
-  const home = await temporaryDirectory("agent-session-compaction-append-race-");
-  let releaseReplace = (): void => {};
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "archive-before-race", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retained-before-race", timestamp: 2 };
-    const concurrent: UserMessage = { role: "user", content: "concurrent-append-must-survive", timestamp: 3 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-
-    const internals = store as unknown as {
-      replaceRaw(file: string, entries: object[]): Promise<void>;
-    };
-    const originalReplaceRaw = internals.replaceRaw.bind(store);
-    let replaceReached = (): void => {};
-    const reachedReplace = new Promise<void>((resolve) => { replaceReached = resolve; });
-    const replaceGate = new Promise<void>((resolve) => { releaseReplace = resolve; });
-    let intercepted = false;
-    internals.replaceRaw = async (file, entries) => {
-      if (!intercepted && file === store.path(identity)) {
-        intercepted = true;
-        replaceReached();
-        await replaceGate;
-      }
-      await originalReplaceRaw(file, entries);
-    };
-
-    const rewrite = store.rewriteCompacted(
-      identity,
-      [{ entry_id: retainedEntryId, message: retained }],
-      { omitted_messages: 1, retained_messages: 1 },
-      [oldEntry.entry_id],
-    );
-    await reachedReplace;
-    let appendSettled = false;
-    const append = store.appendMessage(identity, concurrent).finally(() => { appendSettled = true; });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    const appendSettledBeforeRewrite = appendSettled;
-    releaseReplace();
-    await Promise.all([rewrite, append]);
-
-    assert.equal(appendSettledBeforeRewrite, false, "append must wait for the logical rewrite transaction");
-    assert.deepEqual(await store.load(identity), [retained, concurrent]);
-    assert.deepEqual(await store.loadSearchable(identity), [old, retained, concurrent]);
-  } finally {
-    releaseReplace();
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore rejects a stale compaction snapshot before archiving or replacing current messages", async () => {
-  const home = await temporaryDirectory("agent-session-stale-compaction-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "old-stale-snapshot-message", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retained-stale-snapshot-message", timestamp: 2 };
-    const newer: UserMessage = { role: "user", content: "newer-message-outside-stale-snapshot", timestamp: 3 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    await store.appendMessage(identity, newer);
-    assert.ok(oldEntry);
-
-    await assert.rejects(
-      store.rewriteCompacted(
-        identity,
-        [{ entry_id: retainedEntryId, message: retained }],
-        { omitted_messages: 1, retained_messages: 1 },
-        [oldEntry.entry_id],
-      ),
-      /Cannot compact unclassified current session entry/,
-    );
-
-    assert.deepEqual(await store.load(identity), [old, retained, newer]);
-    await assert.rejects(readFile(store.archivePath(identity), "utf8"), { code: "ENOENT" });
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore explicitly discards the prior synthetic notice during repeated compaction", async () => {
-  const home = await temporaryDirectory("agent-session-repeated-compaction-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "first-archived-message", timestamp: 1 };
-    const middle: UserMessage = { role: "user", content: "second-archived-message", timestamp: 2 };
-    const retained: UserMessage = { role: "user", content: "finally-retained-message", timestamp: 3 };
-    const firstNotice: UserMessage = { role: "user", content: "first-synthetic-notice", timestamp: 4 };
-    const secondNotice: UserMessage = { role: "user", content: "second-synthetic-notice", timestamp: 5 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const middleEntryId = await store.appendMessage(identity, middle);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-
-    const firstRewriteIds = await store.rewriteCompacted(
-      identity,
-      [
-        { message: firstNotice },
-        { entry_id: middleEntryId, message: middle },
-        { entry_id: retainedEntryId, message: retained },
-      ],
-      { omitted_messages: 1, retained_messages: 3 },
-      [oldEntry.entry_id],
-    );
-    const firstNoticeEntryId = firstRewriteIds[0];
-    assert.ok(firstNoticeEntryId);
-
-    await store.rewriteCompacted(
-      identity,
-      [
-        { message: secondNotice },
-        { entry_id: retainedEntryId, message: retained },
-      ],
-      { omitted_messages: 1, retained_messages: 2 },
-      [middleEntryId],
-      [firstNoticeEntryId],
-    );
-
-    assert.deepEqual(await store.load(identity), [secondNotice, retained]);
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.match(archive, /first-archived-message/);
-    assert.match(archive, /second-archived-message/);
-    assert.doesNotMatch(archive, /first-synthetic-notice/);
-    assert.doesNotMatch(archive, /second-synthetic-notice/);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore repairs an invalid partial archive tail before retrying compaction", async () => {
-  const home = await temporaryDirectory("agent-session-archive-partial-tail-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "recover-after-partial-tail", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retained-after-partial-tail", timestamp: 2 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-    await writeFile(store.archivePath(identity), "{\"id\":\"partial", { mode: 0o600 });
-
-    await store.rewriteCompacted(
-      identity,
-      [{ entry_id: retainedEntryId, message: retained }],
-      { omitted_messages: 1, retained_messages: 1 },
-      [oldEntry.entry_id],
-    );
-
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.equal((archive.match(/recover-after-partial-tail/g) ?? []).length, 1);
-    assert.doesNotMatch(archive, /\"id\":\"partial/);
-    assert.doesNotThrow(() => archive.trimEnd().split("\n").map((line) => JSON.parse(line)));
-    assert.deepEqual(await store.loadSearchable(identity), [old, retained]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore preserves a complete archive record whose trailing newline was not durable", async () => {
-  const home = await temporaryDirectory("agent-session-archive-missing-newline-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: "complete-record-without-newline", timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retained-after-complete-record", timestamp: 2 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-    const oldLine = (await readFile(store.path(identity), "utf8"))
-      .trimEnd()
-      .split("\n")
-      .find((line) => (JSON.parse(line) as { id?: string }).id === oldEntry.entry_id);
-    assert.ok(oldLine);
-    await writeFile(store.archivePath(identity), oldLine, { mode: 0o600 });
-
-    await store.rewriteCompacted(
-      identity,
-      [{ entry_id: retainedEntryId, message: retained }],
-      { omitted_messages: 1, retained_messages: 1 },
-      [oldEntry.entry_id],
-    );
-
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.equal(archive.endsWith("\n"), true);
-    assert.equal((archive.match(/complete-record-without-newline/g) ?? []).length, 1);
-    assert.deepEqual(await store.loadSearchable(identity), [old, retained]);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore rejects an archive batch before writing any entry past the total byte limit", async () => {
-  const home = await temporaryDirectory("agent-session-archive-limit-");
-  try {
-    const store = new SessionStore(home, 900);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const old: UserMessage = { role: "user", content: `oversized-${"x".repeat(900)}`, timestamp: 1 };
-    const retained: UserMessage = { role: "user", content: "retained-after-limit", timestamp: 2 };
-    const [oldEntry] = await store.initializeTracked(identity, [old]);
-    const retainedEntryId = await store.appendMessage(identity, retained);
-    assert.ok(oldEntry);
-
-    await assert.rejects(
-      store.rewriteCompacted(
-        identity,
-        [{ entry_id: retainedEntryId, message: retained }],
-        { omitted_messages: 1, retained_messages: 1 },
-        [oldEntry.entry_id],
-      ),
-      /archive exceeds 900 bytes/,
-    );
-    assert.deepEqual(await store.load(identity), [old, retained]);
-    await assert.rejects(readFile(store.archivePath(identity), "utf8"), { code: "ENOENT" });
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore keeps live tool images out of durable journals", async () => {
-  const home = await temporaryDirectory("agent-session-tool-image-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const encoded = Buffer.alloc(2 * 1024 * 1024, 0x5a).toString("base64");
-    const result: ToolResultMessage = {
-      role: "toolResult",
-      toolCallId: "browser-call",
-      toolName: "browser",
-      content: [
-        { type: "text", text: "Captured browser screenshot" },
-        { type: "image", data: encoded, mimeType: "image/png" },
-      ],
-      details: {
-        screenshot: { data: encoded, mimeType: "image/png" },
-        nested: [{ type: "image", data: encoded, mimeType: "image/webp", bytes: 2 * 1024 * 1024 }],
-        safe: { data: "ordinary structured data", mimeType: "text/plain" },
-        process: {
-          command: `API_TOKEN=ghp_${"S".repeat(36)} printf ok`,
-          authorization: "Bearer secret-value",
-        },
-        tokens: ["array-secret-value"],
-        api_key: { value: "object-secret-value" },
-      },
-      isError: false,
-      timestamp: 1,
-    };
     await store.initialize(identity);
-    const resultEntryId = await store.appendMessage(identity, result);
-
-    assert.equal(result.content[1]?.type, "image", "persistence must not mutate the live tool result");
-    const loaded = await store.load(identity);
-    assert.equal(loaded.length, 1);
-    const persisted = loaded[0];
-    assert.equal(persisted?.role, "toolResult");
-    assert.equal(persisted?.role === "toolResult" ? persisted.content.some((block) => block.type === "image") : true, false);
-    assert.match(
-      persisted?.role === "toolResult" ? persisted.content.map((block) => block.type === "text" ? block.text : "").join("\n") : "",
-      /omitted from durable session history/,
-    );
-    const persistedDetails = persisted?.role === "toolResult"
-      ? persisted.details as {
-          screenshot: { data?: string; mimeType: string; bytes: number; omitted: boolean };
-          nested: Array<{ data?: string; type: string; mimeType: string; bytes: number; omitted: boolean }>;
-          safe: { data: string; mimeType: string };
-          process: { command: string; authorization: string };
-          tokens: string;
-          api_key: string;
-        }
-      : undefined;
-    assert.equal(persistedDetails?.screenshot.data, undefined);
-    assert.equal(persistedDetails?.screenshot.mimeType, "image/png");
-    assert.equal(persistedDetails?.screenshot.bytes, 2 * 1024 * 1024);
-    assert.equal(persistedDetails?.screenshot.omitted, true);
-    assert.equal(persistedDetails?.nested[0]?.data, undefined);
-    assert.equal(persistedDetails?.nested[0]?.type, "image");
-    assert.equal(persistedDetails?.nested[0]?.mimeType, "image/webp");
-    assert.equal(persistedDetails?.nested[0]?.bytes, 2 * 1024 * 1024);
-    assert.equal(persistedDetails?.nested[0]?.omitted, true);
-    assert.equal(persistedDetails?.safe.data, "ordinary structured data");
-    assert.match(persistedDetails?.process.command ?? "", /API_TOKEN=\[redacted\]/);
-    assert.equal(persistedDetails?.process.authorization, "[redacted]");
-    assert.equal(persistedDetails?.tokens, "[redacted]");
-    assert.equal(persistedDetails?.api_key, "[redacted]");
-    const liveDetails = result.details as {
-      screenshot: { data: string };
-      nested: Array<{ data: string }>;
-      tokens: string[];
-      api_key: { value: string };
-    };
-    assert.equal(liveDetails.screenshot.data, encoded, "persistence must not mutate live details");
-    assert.equal(liveDetails.nested[0]?.data, encoded, "nested live details must remain unchanged");
-    assert.deepEqual(liveDetails.tokens, ["array-secret-value"]);
-    assert.deepEqual(liveDetails.api_key, { value: "object-secret-value" });
-    const raw = await readFile(store.path(identity), "utf8");
-    assert.doesNotMatch(raw, new RegExp(encoded.slice(0, 100)));
-    assert.doesNotMatch(raw, /ghp_S{20}/);
-    assert.doesNotMatch(raw, /secret-value/);
-    assert.doesNotMatch(raw, /array-secret-value|object-secret-value/);
-    assert.ok(Buffer.byteLength(raw) < 10_000, `durable journal unexpectedly used ${Buffer.byteLength(raw)} bytes`);
-
-    await store.rewriteCompacted(identity, [{ entry_id: resultEntryId, message: result }], {
-      omitted_messages: 0,
-      retained_messages: 1,
-    });
-    const compactedRaw = await readFile(store.path(identity), "utf8");
-    assert.doesNotMatch(compactedRaw, new RegExp(encoded.slice(0, 100)));
-    assert.doesNotMatch(compactedRaw, /ghp_S{20}/);
-    assert.doesNotMatch(compactedRaw, /secret-value/);
-    assert.doesNotMatch(compactedRaw, /array-secret-value|object-secret-value/);
-    assert.ok(Buffer.byteLength(compactedRaw) < 10_000);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
+    await store.appendMessage(identity, { role: "user", timestamp: 1, content: [{ type: "image", data: "c2VjcmV0", mimeType: "image/png" }] });
+    await store.appendMessage(identity, fauxAssistantMessage(fauxToolCall("skill", { password: "secret-value", name: "safe" })));
+    const durable = JSON.stringify(await new SessionStore(home).loadSearchable(identity));
+    assert.equal(durable.includes("c2VjcmV0"), false);
+    assert.equal(durable.includes("secret-value"), false);
+    assert.match(durable, /omitted/);
+  } finally { await rm(home, { recursive: true, force: true }); }
 });
 
-test("SessionStore redacts assistant tool-call payloads in journals and archives", async () => {
-  const home = await temporaryDirectory("agent-session-tool-arguments-");
+test("sidecar scope names cannot traverse sibling scope directories", async () => {
+  const home = await temporaryDirectory("native-scope-path-");
   try {
     const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const token = `ghp_${"S".repeat(36)}`;
-    const headerSecret = "compact-header-secret";
-    const processSecret = "process-header-secret";
-    const typedText = "unstructured private browser form value";
-    const terminalMessage = fauxAssistantMessage(fauxToolCall("terminal", {
-      command: `API_TOKEN=${token} curl -HAuthorization:${headerSecret} left\u202eright`,
-      cwd: ".",
-    }), { stopReason: "toolUse" });
-    const processMessage = fauxAssistantMessage(fauxToolCall("process", {
-      action: "write",
-      process_id: "shell",
-      input: `curl --header=X-API-Key:${processSecret} left\u2066right\n`,
-    }), { stopReason: "toolUse" });
-    const browserMessage = fauxAssistantMessage(fauxToolCall("browser", {
-      action: "type",
-      arguments: { tab_id: "tab", ref: "e1", text: typedText },
-    }), { stopReason: "toolUse" });
-    const tracked = await store.initializeTracked(identity, [terminalMessage, processMessage, browserMessage]);
-    const retained: UserMessage = { role: "user", content: "retain", timestamp: 3 };
-    const retainedEntryId = await store.appendMessage(identity, retained);
-
-    const journal = await readFile(store.path(identity), "utf8");
-    assert.doesNotMatch(journal, new RegExp(token));
-    assert.doesNotMatch(journal, new RegExp(headerSecret));
-    assert.doesNotMatch(journal, new RegExp(processSecret));
-    assert.doesNotMatch(journal, /[\u202e\u2066]/u);
-    assert.doesNotMatch(journal, new RegExp(typedText));
-    assert.match(journal, /\[redacted\]/);
-    assert.match(journal, /input omitted/);
-    assert.doesNotMatch(journal, /"tool":"(?:process|browser)"/);
-    assert.match(journal, /"name":"process","arguments":\{"action":"write","process_id":"shell","input":/);
-    assert.match(journal, /"name":"browser","arguments":\{"action":"type","arguments":\{/);
-    assert.match(
-      JSON.stringify(terminalMessage),
-      new RegExp(token),
-      "durable redaction must not mutate the live assistant message",
-    );
-    assert.match(JSON.stringify(processMessage), new RegExp(processSecret));
-    assert.match(JSON.stringify(browserMessage), new RegExp(typedText));
-
-    await store.rewriteCompacted(
-      identity,
-      [{ entry_id: retainedEntryId, message: retained }],
-      { omitted_messages: 3, retained_messages: 1 },
-      tracked.map((entry) => entry.entry_id),
-    );
-    const archive = await readFile(store.archivePath(identity), "utf8");
-    assert.doesNotMatch(archive, new RegExp(token));
-    assert.doesNotMatch(archive, new RegExp(headerSecret));
-    assert.doesNotMatch(archive, new RegExp(processSecret));
-    assert.doesNotMatch(archive, /[\u202e\u2066]/u);
-    assert.doesNotMatch(archive, new RegExp(typedText));
-    assert.match(archive, /\[redacted\]/);
-    assert.match(archive, /input omitted/);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
-});
-
-test("SessionStore replaces user images without mutating the live user message", async () => {
-  const home = await temporaryDirectory("agent-session-user-image-");
-  try {
-    const store = new SessionStore(home);
-    const identity = { scope_key: "user:1", lifecycle_id: "life", session_id: "session" };
-    const encoded = Buffer.alloc(512 * 1024, 0x31).toString("base64");
-    const message: UserMessage = {
-      role: "user",
-      content: [
-        { type: "text", text: "Please inspect this image" },
-        { type: "image", data: encoded, mimeType: "image/png" },
-      ],
-      timestamp: 1,
-    };
-
-    await store.initialize(identity);
-    await store.appendMessage(identity, message);
-
-    assert.equal(Array.isArray(message.content) ? message.content[1]?.type : undefined, "image");
-    assert.equal(
-      Array.isArray(message.content) && message.content[1]?.type === "image" ? message.content[1].data : undefined,
-      encoded,
-      "persistence must not mutate the live user image",
-    );
-    const loaded = await store.load(identity);
-    const persisted = loaded[0];
-    assert.equal(persisted?.role, "user");
-    assert.equal(
-      persisted?.role === "user" && Array.isArray(persisted.content)
-        ? persisted.content.some((block) => block.type === "image")
-        : true,
-      false,
-    );
-    assert.match(JSON.stringify(persisted), /User image \(image\/png\).*omitted from durable session history/);
-    const raw = await readFile(store.path(identity), "utf8");
-    assert.doesNotMatch(raw, new RegExp(encoded.slice(0, 100)));
-    assert.ok(Buffer.byteLength(raw) < 10_000);
-  } finally {
-    await rm(home, { recursive: true, force: true });
-  }
+    const dotScope = { ...identity, scope_key: ".." };
+    await store.todoState(dotScope).replace([{ content: "dot scope task" }]);
+    await store.todoState(identity).replace([{ content: "ordinary task" }]);
+    await store.deleteScopeFamily(dotScope.scope_key);
+    assert.deepEqual(await store.loadActiveTodos(dotScope), []);
+    assert.equal((await store.loadActiveTodos(identity))[0]!.content, "ordinary task");
+  } finally { await rm(home, { recursive: true, force: true }); }
 });

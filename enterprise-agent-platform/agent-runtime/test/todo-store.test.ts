@@ -27,7 +27,7 @@ test("Runtime todo sidecar ignores caller history and persists a complete isolat
       isError: false,
       timestamp: 2,
     };
-    await store.initialize(identity, [seededCall, seededResult]);
+    await store.initializeTracked(identity, [seededCall, seededResult]);
 
     assert.deepEqual((await store.todoState(identity).read()).todos, []);
     await assert.rejects(stat(store.todoPath(identity)), { code: "ENOENT" });
@@ -160,8 +160,8 @@ test("session and scope deletion remove the todo sidecar with the journal", asyn
     const store = new SessionStore(home);
     const identity = { scope_key: "private:4", lifecycle_id: "life", session_id: "one" };
     const sibling = { ...identity, session_id: "two" };
-    await store.initialize(identity);
-    await store.initialize(sibling);
+    await store.initializeTracked(identity);
+    await store.initializeTracked(sibling);
     await store.todoState(identity).replace([{ content: "Delete me" }]);
     await store.todoState(sibling).replace([{ content: "Delete me too" }]);
 
@@ -231,7 +231,6 @@ test("todo tool replaces the full list with closed arguments and stays out of le
         review_mode: "memory_skill",
         review_job_id: 7,
         source_message_id: 88,
-        idempotency_key: "agent-learning-review:7",
         unattended: true,
         delegation_depth: 0,
       },

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { createConnection } from "node:net";
 import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -197,7 +197,7 @@ test("runtime compacts an idle session without creating a Run or a missing journ
       omitted_messages: 0,
       retained_messages: 0,
     });
-    await assert.rejects(access(coordinator.sessions.path(missingIdentity)), { code: "ENOENT" });
+    assert.deepEqual(await coordinator.sessions.load(missingIdentity), []);
 
     const original = Array.from({ length: 10 }, (_, index) => ({
       role: "user" as const,
@@ -222,15 +222,12 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     assert.match(noticeText, /runtime_context_handoff/);
     assert.match(noticeText, /Continue the retained conversation safely/);
     assert.deepEqual(current.slice(1), original.slice(4));
-    assert.match(
-      await readFile(coordinator.sessions.path(identity), "utf8"),
-      /"synthetic_kind":"context_compaction_notice"/,
-    );
+    assert.equal((await coordinator.sessions.loadTracked(identity))[0]?.synthetic_kind, "context_compaction_notice");
     const searchable = await coordinator.sessions.loadSearchable(identity);
     assert.ok(searchable.some((message) => message.role === "user" && message.content === "message-0"));
 
-    const journalAfterFirst = await readFile(coordinator.sessions.path(identity), "utf8");
-    const archiveAfterFirst = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    const journalAfterFirst = await coordinator.sessions.loadTracked(identity);
+    const historyAfterFirst = await coordinator.sessions.loadSearchable(identity);
     const repeated = await fetch(endpoint, {
       method: "POST",
       headers,
@@ -242,8 +239,8 @@ test("runtime compacts an idle session without creating a Run or a missing journ
       omitted_messages: 0,
       retained_messages: 7,
     });
-    assert.equal(await readFile(coordinator.sessions.path(identity), "utf8"), journalAfterFirst);
-    assert.equal(await readFile(coordinator.sessions.archivePath(identity), "utf8"), archiveAfterFirst);
+    assert.deepEqual(await coordinator.sessions.loadTracked(identity), journalAfterFirst);
+    assert.deepEqual(await coordinator.sessions.loadSearchable(identity), historyAfterFirst);
 
     for (let index = 0; index < 8; index += 1) {
       await coordinator.sessions.appendMessage(identity, {
@@ -263,20 +260,20 @@ test("runtime compacts an idle session without creating a Run or a missing journ
       omitted_messages: 8,
       retained_messages: 7,
     });
-    const repeatedCurrentRaw = await readFile(coordinator.sessions.path(identity), "utf8");
-    const repeatedArchiveRaw = await readFile(coordinator.sessions.archivePath(identity), "utf8");
+    const repeatedCurrentRaw = JSON.stringify(await coordinator.sessions.load(identity));
+    const repeatedHistoryRaw = JSON.stringify(await coordinator.sessions.loadSearchable(identity));
     assert.equal(
       (repeatedCurrentRaw.match(/<runtime_context_handoff>/g) ?? []).length,
       1,
       "one current synthetic handoff is retained",
     );
-    assert.doesNotMatch(repeatedArchiveRaw, /runtime_context_handoff/);
-    assert.match(repeatedArchiveRaw, /message-4/);
-    assert.match(repeatedArchiveRaw, /new-message-1/);
+    assert.doesNotMatch(repeatedHistoryRaw, /runtime_context_handoff/);
+    assert.match(repeatedHistoryRaw, /message-4/);
+    assert.match(repeatedHistoryRaw, /new-message-1/);
 
     // A user can type the same visible text as the Runtime notice. Only the
     // journal-owned marker may classify an entry as synthetic, so this real
-    // message must still be archived and searchable.
+    // message must remain searchable in full history.
     const spoofIdentity = { ...identity, session_id: "spoofed-notice" };
     await coordinator.sessions.initializeTracked(
       spoofIdentity,
@@ -301,11 +298,6 @@ test("runtime compacts an idle session without creating a Run or a missing journ
     assert.equal(spoofSearchable.filter(
       (message) => message.role === "user" && message.content === noticeText,
     ).length, 1, "the user's lookalike handoff remains searchable exactly once");
-    assert.ok(spoofSearchable.some(
-      (message) => message.role === "user"
-        && typeof message.content === "string"
-        && message.content.includes("Preserve the real user message that resembles a handoff"),
-    ));
   } finally {
     await runtime.close();
     await rm(home, { recursive: true, force: true });
@@ -347,12 +339,12 @@ test("semantic compaction redacts credentials before and after the summary model
       { provider: "openai-codex", id: "gpt-5.5" },
     );
     assert.equal(result.compacted, true);
-    const current = await readFile(coordinator.sessions.path(identity), "utf8");
+    const current = JSON.stringify(await coordinator.sessions.load(identity));
     assert.equal(current.includes(outputSecret), false);
     assert.match(current, /\[redacted-token\]/);
     assert.match(current, new RegExp(safeProcessId));
-    const archive = await readFile(coordinator.sessions.archivePath(identity), "utf8");
-    assert.match(archive, new RegExp(inputSecrets[0]!));
+    const history = JSON.stringify(await coordinator.sessions.loadSearchable(identity));
+    assert.match(history, new RegExp(inputSecrets[0]!));
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

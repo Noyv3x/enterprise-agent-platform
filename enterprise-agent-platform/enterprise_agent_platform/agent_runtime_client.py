@@ -352,47 +352,46 @@ class AgentRuntimeClient:
                 "token": self.gateway_token,
             }
 
-        idempotency_key = str(clean_metadata.get("idempotency_key") or "").strip()
-        attempts = 2 if idempotency_key else 1
-        for attempt in range(attempts):
-            try:
-                start, headers = self._json_request(
-                    "POST", "/v1/runs", body, timeout=self.request_timeout_seconds
-                )
-                break
-            except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError) as exc:
-                if attempt + 1 < attempts:
-                    continue
-                # The server may have durably accepted the request before its
-                # response was lost. An idempotent retry closes the common
-                # window; if it still fails, quarantine instead of reporting a
-                # safe failure or submitting the same side effects again.
-                raise AgentRuntimeRunError(
-                    f"idempotency:{idempotency_key}" if idempotency_key else "unknown",
-                    "needs_review",
-                    f"run submission outcome is unknown: {exc}",
-                ) from exc
+        try:
+            start, headers = self._json_request(
+                "POST", "/v1/runs", body, timeout=self.request_timeout_seconds
+            )
+        except AgentRuntimeHTTPError as exc:
+            if exc.status_code < 500:
+                raise
+            raise AgentRuntimeRunError(
+                "unknown", "needs_review", f"run submission outcome is unknown: {exc}",
+                session_id=clean_session_id,
+            ) from exc
+        except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError, AgentRuntimeProtocolError) as exc:
+            # A lost acknowledgement cannot prove the runtime rejected the
+            # request. Run state is process-local: never replay an unknown POST.
+            raise AgentRuntimeRunError(
+                "unknown",
+                "needs_review",
+                f"run submission outcome is unknown: {exc}",
+                session_id=clean_session_id,
+            ) from exc
         run_id = str(start.get("run_id") or "").strip()
         if not run_id:
             raise AgentRuntimeRunError(
-                f"idempotency:{idempotency_key}" if idempotency_key else "unknown",
+                "unknown",
                 "needs_review",
                 "POST /v1/runs returned without a run_id after accepting the request",
                 raw={"start": start},
             )
-        if run_started_callback is not None:
-            # This is the exact submission boundary used by the platform's
-            # lifecycle barrier: the runtime has returned a durable run id, so
-            # a concurrent scope cleanup can now discover and cancel the run.
-            run_started_callback(run_id)
         response_session = str(start.get("session_id") or headers.get("X-Agent-Session-Id") or clean_session_id)
-        events_path = self._events_path(start.get("events_url"), run_id)
-        request = urllib.request.Request(
-            self._url(events_path),
-            headers=self._headers(accept="text/event-stream"),
-            method="GET",
-        )
         try:
+            if run_started_callback is not None:
+                # The process-local run id lets lifecycle cleanup cancel this
+                # accepted submission. Callback failure must not cause replay.
+                run_started_callback(run_id)
+            events_path = self._events_path(start.get("events_url"), run_id)
+            request = urllib.request.Request(
+                self._url(events_path),
+                headers=self._headers(accept="text/event-stream"),
+                method="GET",
+            )
             response = self._open(request, timeout=self.event_timeout_seconds)
             try:
                 content_type = str(response.headers.get("Content-Type") or "")
@@ -413,30 +412,14 @@ class AgentRuntimeClient:
                 response.close()
         except AgentRuntimeRunError:
             raise
-        except (AgentRuntimeTimeoutError, AgentRuntimeConnectionError) as exc:
-            self._cancel_after_stream_failure(run_id)
+        except Exception as exc:
+            state = self._cancel_after_stream_failure(run_id)
             raise AgentRuntimeRunError(
                 run_id,
-                "needs_review",
+                state,
                 f"event stream became unavailable and cancellation was requested: {exc}",
+                session_id=response_session,
             ) from exc
-        except (socket.timeout, TimeoutError) as exc:
-            self._cancel_after_stream_failure(run_id)
-            raise AgentRuntimeRunError(
-                run_id,
-                "needs_review",
-                f"event stream timed out after {self.event_timeout_seconds:g} seconds; cancellation was requested",
-            ) from exc
-        except OSError as exc:
-            self._cancel_after_stream_failure(run_id)
-            raise AgentRuntimeRunError(
-                run_id,
-                "needs_review",
-                f"event stream failed and cancellation was requested: {exc}",
-            ) from exc
-        except Exception:
-            self._cancel_after_stream_failure(run_id)
-            raise
 
     def respond_approval(
         self,
@@ -490,19 +473,12 @@ class AgentRuntimeClient:
             "attachments": runtime_attachments,
         }
         path = f"/v1/runs/{urllib.parse.quote(clean_run_id, safe='')}/input"
-        for attempt in range(2):
-            try:
-                result, _ = self._json_request(
-                    "POST",
-                    path,
-                    body,
-                    timeout=min(self.request_timeout_seconds, 15.0),
-                )
-                break
-            except (AgentRuntimeConnectionError, AgentRuntimeTimeoutError):
-                if attempt == 0:
-                    continue
-                raise
+        result, _ = self._json_request(
+            "POST",
+            path,
+            body,
+            timeout=min(self.request_timeout_seconds, 15.0),
+        )
         state = str(result.get("state") or "").strip()
         if (
             str(result.get("run_id") or "") != clean_run_id
@@ -812,13 +788,19 @@ class AgentRuntimeClient:
             )
         return {"running_terminal_count": count}
 
-    def _cancel_after_stream_failure(self, run_id: str) -> None:
-        """Fail closed when the client can no longer observe a live run."""
+    def _cancel_after_stream_failure(self, run_id: str) -> str:
+        """Only a settled cancellation can prove execution had no side effects."""
 
         try:
-            self.cancel_run(run_id)
+            result = self.cancel_run(run_id)
         except AgentRuntimeError:
-            pass
+            return "needs_review"
+        if (
+            result.get("status") in {"failed", "cancelled"}
+            and result.get("side_effects_started") is False
+        ):
+            return "failed"
+        return "needs_review"
 
     def _read_run_events(
         self,
@@ -1032,10 +1014,10 @@ class AgentRuntimeClient:
             # running tools after the platform has lost its event stream.
             # Cancel before returning a partial response so execution fails
             # closed and does not continue invisibly in the background.
-            self._cancel_after_stream_failure(run_id)
+            state = self._cancel_after_stream_failure(run_id)
             raise AgentRuntimeRunError(
                 run_id,
-                "needs_review",
+                state,
                 f"{message}; cancellation was requested",
                 partial_content=content,
                 session_id=final_session_id,

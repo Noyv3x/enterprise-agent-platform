@@ -51,7 +51,7 @@ agent-platform-manager logs
 | 现象 | 怎么处理 |
 | --- | --- |
 | 等待中、空间不足、降级 | 用 `status`、`logs`、`preflight` 查看；Manager 会自动等待和重试。不要手动修改状态文件、操作日志、激活记录、Compose 或可变 tag。 |
-| 提交前迁移或核心服务失败 | 同一个操作会恢复快照和上一版本，[状态机](auto-update.md#提交回滚与能力降级)会自行收敛。Platform 不可用时使用宿主机命令行。 |
+| 提交前迁移或核心服务失败 | 同一个操作会恢复其管理的快照和上一版本，[状态机](auto-update.md#提交回滚与能力降级)会自行收敛。Runtime 的 Pi 会话转换不由数据库快照撤销，须遵循下文的手动回滚边界。Platform 不可用时使用宿主机命令行。 |
 | Manager 自身启动有缺陷、socket 一直连不上 | 监督模式会在有界健康检查失败后自动恢复并启动上一份已验证的 Manager，不反复切换。若上一版本也失败，停止 unit、保留数据和日志，按[手动恢复](auto-update.md#手动恢复)核验并恢复可信二进制；不手工改写预约或回滚已开放业务的数据。 |
 
 ## 公共入口与维护
@@ -75,6 +75,14 @@ agent-platform-manager logs
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```
 
+## 本次 Runtime 升级的备份与手动回滚
+
+- **升级前必须人工备份完整数据**：停止唯一写入者，在部署目录之外保存同一恢复点的完整 `<data_root>`，包含数据库及其一致的 WAL 状态、工作区、附件、环境、Runtime 数据和 Manager 状态；校验备份完整性、权限和可恢复性。不能只备份 SQLite，也不能把自动更新的数据库快照当作完整数据备份。
+- 新 Runtime 在接受请求前，将已有 `data/runtimes/agent/sessions` 原目录原封不动保留为 `sessions.pre-pi`，在独立暂存目录完成 Pi 原生格式转换后原子发布新的 `sessions`。启动中断后可安全重试；已有备份不覆盖，未完成转换不开流量。普通会话清理不修改备份。
+- **回滚旧 Runtime 需要人工处理**：旧版本不能假定可读取新会话格式，Manager 的数据库恢复或镜像回滚不自动恢复 `sessions.pre-pi`。运维必须先停止写入者并额外保存当前完整数据，再选择一致的升级前恢复点恢复旧程序与数据；只有确认其它状态兼容且没有需保留的新写入时，才可从 untouched 的 `sessions.pre-pi` 恢复旧会话目录。
+- `sessions.pre-pi` 只是迁移前会话的原样副本，不是整个 Runtime 或平台的完整备份，也不包含升级后的新历史。已开放业务后的新写入不能由旧副本覆盖；此时优先向前修复，确需回退须人工评估和保全数据。不要编辑原始备份、混搭不同时间点的数据或把回滚当作 Run 重放。
+
+
 ## Agent Sandbox
 
 - 个人 AI 和每个频道主 Agent 各有独立的沙箱，委派共用父 Agent 的沙箱。首次调用时创建；没有任务和后台进程、达到空闲期限后只停止，不删除数据。
@@ -85,4 +93,4 @@ enterprise-agent-platform migrate --data /var/lib/agent-platform
 ## 验收
 
 - 按[部署与冒烟](../development/testing.md#部署与冒烟)执行真实的 Compose、用户级 systemd、鉴权交互和恢复门检查；静态检查和单元测试不能替代。
-- 生产环境只通过 Manager 的操作、快照和当前/上一版本来恢复。
+- 常规生产恢复通过 Manager 的操作、快照和当前/上一版本完成；本次 Pi 会话格式迁移的手动恢复例外与完整数据备份要求见上文。

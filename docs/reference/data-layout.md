@@ -36,7 +36,7 @@
 │   ├── agent-envs/<scope-hash>/{home,env}/
 │   ├── agent-skill-state/<scope-hash>/
 │   ├── runtimes/
-│   │   ├── agent/{sessions,approvals,idempotency,logs}/
+│   │   ├── agent/{sessions,sessions.pre-pi,approvals,logs}/
 │   │   ├── camofox/{profiles,cookies,traces,cache,logs}/
 │   │   ├── searxng/{config,cache,logs}/
 │   │   └── firecrawl/{redis,rabbitmq,postgres}/
@@ -46,6 +46,7 @@
 
 - 只接受这几种身份标记：`agent-platform-container-baseline-v1`、`.agent-platform-scope.json`、`.agent-platform-runtime.json` 和当前的沙箱登记表。字段必须精确匹配；旧根目录、旧身份、旧标记、未知字段或混合身份一律拒绝。
 - 普通操作不查找旧路径或修复历史格式。Manager 桥接版本仅对已部署 schema-1 状态、操作、二进制和激活计划保留兼容读取与结算。
+- Runtime 的 `sessions` 是活动 Pi 原生会话及附属状态；`sessions.pre-pi` 只在迁移已有会话时保留，是未经改写的迁移前目录，不参与搜索、追加、压缩或会话清理。Run、结果和 SSE journal 没有持久存储目录。
 - 品牌不改变机器身份。
 
 ## 权威数据与文件安全
@@ -109,7 +110,7 @@
 **一个恢复点至少包含**
 
 - SQLite 备份、attachments、workspaces、agent-envs、agent-skill-state；
-- Runtime 的会话、审批和幂等记录；
+- Runtime 的活动会话、附属状态、审批记录，以及存在时的 `sessions.pre-pi` 原始备份；
 - Manager 的发布、操作和版本记录。
 
 工作区包含 Skill、MCP、服务和用户自己保存的环境变量值，不能跨对话范围混搭恢复。需要网页登录态时，把 Camoufox Profile 纳入备份；Firecrawl 按恢复成本决定是否纳入。
@@ -121,7 +122,7 @@
 3. 在同一文件系统的暂存区准备完整集合。
 4. 原子切换并同步目录；失败时补偿恢复完整的原集合。
 
-- 不手工修改 JSONL、幂等记录或操作日志。
+- 不手工修改 JSONL、迁移备份或操作日志。
 - 新版本已经写入业务数据后，不回滚到会产生分叉的旧快照，而是走新的快照操作。
 
 ## 受控迁移
@@ -130,3 +131,5 @@
 - 全新数据库初始化为当前 schema；当前版本迁移到当前版本不产生转换；高于当前程序支持版本的数据库拒绝打开。schema 版本不倒退。
 - 已完成的 `2026080801 → 2026082901` 旧基线转换不再受支持；不再复制旧 Skill 目录、转换工作区或执行旧挂载点的 root 权限修复。现有数据与当前 `2026082901` 标记保留，已部署上一版本仍可读取。
 - 迁移失败时仍按 Manager 的停止写入者、快照和原操作回滚规则恢复；新版本开放业务之后不得用旧快照覆盖新写入。
+- Runtime 会话格式转换是候选 Runtime 在开放请求前执行的一次性启动迁移，不是 SQLite 结构迁移。已有 `sessions` 原目录原封不动保留为 `sessions.pre-pi`；完整转换到同文件系统暂存目录并校验后，才原子发布新的 `sessions`。崩溃中断可重复执行；已有备份不能覆盖，迁移失败不接受请求，成功后的普通启动不再导入旧目录。
+- 本次发布前必须人工备份完整数据；仅恢复数据库或回滚镜像不能撤销 Pi 会话转换，Manager 不自动恢复该目录。手动回滚旧 Runtime 时必须停止写入者，并使用兼容且一致的恢复点；`sessions.pre-pi` 不包含迁移后的新历史，详见[部署](../operations/deployment.md#本次-runtime-升级的备份与手动回滚)。
