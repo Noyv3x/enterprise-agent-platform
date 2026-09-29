@@ -1,7 +1,7 @@
 /* Page-scoped administration reads. Entering the admin area loads only the
    active page; completed reads stay cached for the current signed-in session. */
 
-import type { AdminPageId, AppState } from "../types";
+import type { AdminPageId } from "../types";
 import { ensureResource, resourceKeys, runResourceLoad } from "./resourceState";
 import {
   loadAutoUpdateConfig,
@@ -57,33 +57,3 @@ export function refreshAdminPageResource(store: AppStore, pageId: AdminPageId): 
   return runResourceLoad(store, resourceKeys.admin(pageId), () => loadAdminPage(store, pageId));
 }
 
-/** Whether an in-memory page payload exists before resource metadata is taken
- * into account. A successful empty response is represented by updatedAt. */
-export function hasAdminPageData(state: AppState, pageId: AdminPageId): boolean {
-  switch (pageId) {
-    case "accounts":
-      return state.users.length > 0 || state.permissionGroups.length > 0;
-    case "tokens":
-      return state.tokenUsage !== null;
-    case "messages":
-      return !!(
-        state.messageAudit.channelMessages.length ||
-        state.messageAudit.privateConversations.length ||
-        state.messageAudit.privateMessages.length
-      );
-    case "agent-runtime":
-      return state.oauthProviders !== null || state.agentRuntimeConfig !== null;
-    case "telegram":
-      return state.telegramConfig !== null;
-    case "updates":
-      return state.autoUpdateConfig !== null;
-    case "branding":
-      return state.brandingConfig !== null;
-    case "security":
-      return state.securityConfig !== null;
-    case "runtime":
-      return state.runtimes !== null;
-    case "secrets":
-      return state.secrets.length > 0;
-  }
-}

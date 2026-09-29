@@ -5,6 +5,7 @@ import { initialAppState, rootReducer } from "../store/reducer";
 import type { RuntimeResponse, RuntimeState, User } from "../types";
 import {
   clearRuntimeStatusRefresh,
+  loadAutoUpdateConfig,
   loadRuntime,
 } from "./loaders";
 
@@ -66,5 +67,33 @@ describe("loadRuntime", () => {
 
     clearRuntimeStatusRefresh(store);
     vi.useRealTimers();
+  });
+});
+
+describe("loadAutoUpdateConfig", () => {
+  it("keeps the latest Manager status when an earlier poll arrives after a mutation refresh", async () => {
+    let resolvePoll!: (value: Response) => void;
+    vi.stubGlobal("fetch", vi.fn()
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => { resolvePoll = resolve; }))
+      .mockResolvedValueOnce(response(200, { config: {}, status: { manager_generation: 8, state: "updating" } })));
+    const store = createStore(rootReducer, initialAppState);
+    const poll = loadAutoUpdateConfig(store);
+    await loadAutoUpdateConfig(store);
+    resolvePoll(new Response(JSON.stringify({ config: {}, status: { manager_generation: 7, state: "idle" } })));
+    await poll;
+    expect(store.getState().autoUpdateConfig?.status).toMatchObject({
+      manager_generation: 8, state: "updating",
+    });
+  });
+
+  it("does not publish a Manager read into another account", async () => {
+    let resolveRead!: (value: Response) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>((resolve) => { resolveRead = resolve; })));
+    const store = createStore(rootReducer, initialAppState);
+    const read = loadAutoUpdateConfig(store);
+    store.dispatch({ type: "SET_USER", payload: { id: 2 } as User });
+    resolveRead(new Response(JSON.stringify({ config: {}, status: { manager_generation: 7, state: "idle" } })));
+    await read;
+    expect(store.getState().autoUpdateConfig).toBeNull();
   });
 });

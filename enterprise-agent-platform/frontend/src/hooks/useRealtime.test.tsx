@@ -9,6 +9,7 @@ import { initialAppState, rootReducer } from "../store/reducer";
 import { StoreContext } from "../store/StoreProvider";
 import type { Message, User } from "../types";
 import { useRealtime } from "./useRealtime";
+import { usePolling } from "./usePolling";
 
 class FakeEventSource extends EventTarget {
   static instances: FakeEventSource[] = [];
@@ -47,7 +48,7 @@ function response(body: unknown, status = 200) {
   };
 }
 
-/** Let the auth probe's fetch/text/throw chain settle without advancing timers. */
+/** Let scoped fetch/text/dispatch work settle without advancing timers. */
 async function settle() {
   await act(async () => {
     for (let index = 0; index < 20; index += 1) await Promise.resolve();
@@ -90,6 +91,9 @@ describe("useRealtime compact updates", () => {
       messages: [{ ...current, id: 11, content: "next" }],
     }));
     vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockResolvedValueOnce(response({
+      mode: "delta", message_revision: 4, messages: [],
+    }));
     const wrapper = ({ children }: { children: ReactNode }) => (
       <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
     );
@@ -98,6 +102,9 @@ describe("useRealtime compact updates", () => {
     const stream = FakeEventSource.instances[0];
     act(() => stream.open());
     expect(result.current).toBe(true);
+    await settle();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    fetchMock.mockClear();
 
     act(() => stream.update({
       message_revision: 4,
@@ -115,8 +122,9 @@ describe("useRealtime compact updates", () => {
     await waitFor(() => expect(store.getState().privateMessages).toHaveLength(2));
   });
 
-  it("keeps the active scope stream open while the loaded page is hidden", () => {
+  it("keeps the active scope stream open while the loaded page is hidden", async () => {
     const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
+    vi.stubGlobal("fetch", vi.fn(async () => response({ messages: [] })));
     const store = createStore(rootReducer, {
       ...initialAppState,
       user,
@@ -128,6 +136,7 @@ describe("useRealtime compact updates", () => {
     renderHook(() => useRealtime(), { wrapper });
     const stream = FakeEventSource.instances[0];
     act(() => stream.open());
+    await settle();
 
     Object.defineProperty(document, "hidden", { configurable: true, value: true });
     act(() => document.dispatchEvent(new Event("visibilitychange")));
@@ -136,40 +145,54 @@ describe("useRealtime compact updates", () => {
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
-  it("keeps recovering with bounded backoff when the post-close auth probe fails transiently", async () => {
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  it("catches up on native reconnect and polls only while disconnected", async () => {
+    vi.useFakeTimers();
     const user = { id: 7, username: "alice", permissions: ["private_agent"] } as User;
     const store = createStore(rootReducer, { ...initialAppState, user, activeView: "private" });
-    const fetchMock = vi.fn(async (_path: string) =>
-      response({ user }, fetchMock.mock.calls.length === 1 ? 502 : 200),
-    );
+    let content = "initial";
+    const fetchMock = vi.fn(async () => response({
+      messages: [{ id: 1, author_type: "agent", content, scope_type: "private", scope_id: "7" }],
+    }));
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = ({ children }: { children: ReactNode }) => (
       <StoreContext.Provider value={store}>{children}</StoreContext.Provider>
     );
+    const { unmount } = renderHook(() => {
+      const connected = useRealtime();
+      usePolling(!connected);
+    }, { wrapper });
+    const stream = FakeEventSource.instances[0];
+    act(() => stream.open());
+    await settle();
+    expect(store.getState().privateMessages[0]?.content).toBe("initial");
+    fetchMock.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(fetchMock).not.toHaveBeenCalled();
 
-    const { unmount } = renderHook(() => useRealtime(), { wrapper });
     act(() => {
-      FakeEventSource.instances[0].open();
-      FakeEventSource.instances[0].fail();
+      stream.readyState = 0;
+      stream.dispatchEvent(new Event("error"));
     });
     await settle();
+    fetchMock.mockClear();
+    content = "missed while disconnected";
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    expect(store.getState().privateMessages[0]?.content).toBe("missed while disconnected");
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(FakeEventSource.instances).toHaveLength(1);
-
-    // The failed probe is retried after the base delay; the successful probe then
-    // schedules the ordinary reconnect, so a new stream appears without any
-    // visibility or pageshow event.
-    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(FakeEventSource.instances).toHaveLength(2);
-
-    // Teardown cancels a pending recovery instead of leaking a later reconnect.
-    act(() => FakeEventSource.instances[1].fail());
+    content = "missed before reconnect";
+    act(() => stream.open());
     await settle();
-    unmount();
+    expect(store.getState().privateMessages[0]?.content).toBe("missed before reconnect");
+    expect(FakeEventSource.instances).toEqual([stream]);
+
+    fetchMock.mockClear();
     await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
-    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+    content = "missed while hidden";
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await settle();
+    expect(store.getState().privateMessages[0]?.content).toBe("missed while hidden");
+    unmount();
   });
 
   it("reconciles channel access loss on SSE disconnect and never reconnects the removed scope", async () => {

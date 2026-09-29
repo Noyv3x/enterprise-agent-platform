@@ -1,58 +1,37 @@
 # 文档工作流
 
-`docs/` 记录产品意图、跨组件规则和对外契约；代码负责实现，测试负责证明。根目录的 `AGENTS.md` 和 `README.md` 只做规则入口和导航，不维护第二份规范。
-
-## 文档写什么、不写什么
-
-文档的读者是以后接手这个仓库的人（包括 AI）。写进文档的，应该是**读代码很难看出来、改错了会出事**的东西：
-
-- 用户能观察到的行为，以及必须守住的规则（例如"切换账号后迟到的结果必须丢弃""宿主机执行必须逐次审批"）；
-- 跨组件的契约：接口字段、配置归属、磁盘布局、发布协议；
-- 做出某个选择的理由，放在[架构决策](../decisions/README.md)里。
-
-**不写**实现细节：组件或函数怎么拆、用了哪个 hook、CSS 怎么分层、动画曲线和像素值、测试怎么组织。这些以代码为准；写进文档只会让每次重构都要跟着改文档，然后文档越来越不准。判断标准：**换一种实现方式但行为不变时，这句话需要改吗？需要改，它就不该写在文档里。**
-
-写法：
-
-- 用正常的中文：短段落、要点列表、表格用于并列的事实。不用斜杠堆砌、缩写和电报体。
-- 每条规则只在一个地方完整定义，其它地方链接过去。精确的数值放在机器契约里，文档引用它们，不抄默认值。
-- 文档之间的链接可以带章节锚点，改标题时记得同步链接（检查会报错）。
-
-## 什么时候改文档
-
-1. **行为或契约变化时，先改文档**：接口、配置、持久格式、用户可见行为、安全边界变化前，先更新对应规范；跨语言的精确值先改机器契约，再生成代码、同步实现和行为测试。
-2. **修 bug、重构、补测试不需要改文档**，除非发现文档本身写错了。不要为了"同步"而给文档追加一句。
-3. 发现代码和文档冲突时，先确认正确的行为和它的权威来源，再决定改哪边；不靠改一句文档掩盖实现上的问题。
-
-交付前完成[测试与验证](testing.md)里的门禁。检查只能证明结构和链接，文档内容是否正确要靠审查。
+`docs/` 记录用户可见行为、安全边界和跨组件契约。行为或契约变化时先改对应规范；纯实现重构不需要追加过程记录。每条规则只有一个权威来源，其它地方链接过去；不要把源码结构或测试实现写成产品规范。
 
 ## 机器契约
 
-跨组件共享的精确值放在 `docs/contracts/` 下的 JSON 里，由 `scripts/docs_sync.py` 生成各语言的只读常量：
+跨语言的精确值由 `docs/contracts/` 中的 JSON 定义，生成目标以 `scripts/docs_sync.py` 的 `CONTRACTS` 为准，不手改生成代码：
 
-| 契约 | 生成的代码 |
-| --- | --- |
-| [runtime-policy.json](../contracts/runtime-policy.json) | Go、Python、Runtime 和前端的 TypeScript |
-| [container-platform.json](../contracts/container-platform.json) | Go、Python、Runtime 和前端的 TypeScript |
-| [technical-profiles.json](../contracts/technical-profiles.json) | Go、Python、Runtime 的 TypeScript |
-| [upstream-sources.json](../contracts/upstream-sources.json) | 不生成代码，由构建脚本直接读取校验后的 JSON |
-
-契约和生成目标的完整清单写在 `scripts/docs_sync.py` 的 `CONTRACTS` 里，是封闭集合。新增契约时同时修改那里、加上校验和生成逻辑，并补测试。
+- [runtime-policy.json](../contracts/runtime-policy.json)：Go、Python、Runtime 和前端常量。
+- [container-platform.json](../contracts/container-platform.json)：Go、Python、Runtime 和前端常量。
+- [technical-profiles.json](../contracts/technical-profiles.json)：Go、Python 和 Runtime 常量。
+- [upstream-sources.json](../contracts/upstream-sources.json)：构建脚本直接读取的上游输入。
 
 ## 命令
 
 在仓库根目录：
 
 ```sh
-python3 scripts/docs_sync.py sync    # 重新生成所有契约的代码
-python3 scripts/docs_sync.py check   # 检查当前文件树
+python3 scripts/docs_sync.py sync   # 契约变化后重新生成
+python3 scripts/docs_sync.py check  # 校验当前文件树
+./scripts/test.sh full             # 交付前完整门禁
 ```
 
-- `sync` 只写登记过的生成文件；不要手改生成的代码。
-- `check` 检查：
-  - 每份契约都能通过严格校验（封闭字段、类型、边界、JavaScript 安全整数、Node 定时器上限），且生成的代码逐字节一致、不可执行；
-  - 契约源文件和生成目标不越出仓库、不经过符号链接、是普通文件；
-  - `docs/`、根目录 `AGENTS.md`、`README.md` 和组件 README 里的本地链接都存在，带锚点的链接指向真实的标题。
-- `check` **不检查**文档内容是否正确、是否与实现一致。
+`check` 验证契约字段和边界、生成字节和路径安全、本地文档链接及标题锚点；不证明语义正确。完整本地门禁和 Quality CI 各检查一次；单组件命令见[测试与验证](testing.md)。
 
-`./scripts/test.sh` 和 CI 都会先运行一次 `check`。只改 `docs/` 下直接存放的 `.md` 文件（以及根目录的 `AGENTS.md`、`README.md`）不会触发新版本发布，规则见[发布资格](../operations/auto-update.md#发布通道)。
+## 发布兼容性清单
+
+修改测试、工作流或打包时，确认当前已安装 Manager 仍能消费候选版本：
+
+- 保留 `.github/workflows/quality.yml` 和工作流名称 `Quality gates`，以及 main 的 push、PR 和手动触发。发布只接受同仓库、同 commit、main 分支、已完成且成功的合格运行，并在公开前复查 run ID 和 attempt。
+- `container-release.yml` 读取的是 Quality 运行的 `id`、`run_attempt`、`path`、`event`、`status`、`conclusion`、`head_branch`、`head_sha`、`head_repository.full_name`，不读取 Quality job 输出或 job 名称。Python 单 job 仍保留 `backend` / `Python 3.11`；其它组件 job 名称不变。
+- PR 权限保持只读，第三方 actions 固定完整提交摘要；Quality 失败、取消或未完成均不授权发布。
+- 保持清单 schema 2、Manager protocol 2、十个镜像键、双架构 Manager 和八个公开资产；镜像使用不可变摘要，资产和字节身份完整后才推进 latest。
+- 数据库迁移沿用受控入口，当前/上一版本仍能读取保留的数据和快照；不得降低数据库版本或削弱身份、审批、维护门和回滚边界。
+- 文档变更是否跳过发布仍按[发布通道](../operations/auto-update.md#发布通道)的累计差异规则判断，不更改资格脚本。
+
+真实安装、恢复和发布证据见[部署与冒烟](testing.md#部署与冒烟)。

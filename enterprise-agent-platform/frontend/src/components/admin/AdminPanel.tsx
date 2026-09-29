@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { usePermissions } from "../../hooks/usePermissions";
 import { useResourceState } from "../../hooks/useResourceState";
-import { ensureAdminPageResource, hasAdminPageData, refreshAdminPageResource } from "../../data/adminResources";
+import { ensureAdminPageResource, refreshAdminPageResource } from "../../data/adminResources";
 import { refreshTokenUsage } from "../../data/adminActions";
 import { resourceKeys } from "../../data/resourceState";
 import { activeAdminPage } from "../../store/selectors";
@@ -19,7 +19,6 @@ export function AdminPanel() {
   const { isAdmin } = usePermissions();
   const store = useStoreHandle();
   const page = useStore(activeAdminPage);
-  const hasData = useStore((state) => hasAdminPageData(state, page.id));
   const resourceKey = resourceKeys.admin(page.id);
   const resource = useResourceState(resourceKey);
   const mutationPending = useStore((state) => state.pendingOperations.some((key) => key.startsWith("admin:")));
@@ -42,7 +41,7 @@ export function AdminPanel() {
     }
     navigation={<AdminPager activeId={page.id} />}
   >
-    <ResourceStatusView resourceKey={resourceKey} hasData={hasData || resource.updatedAt !== null} onRetry={() => { void refreshAdminPageResource(store, page.id); }}>
+    <ResourceStatusView resourceKey={resourceKey} hasData={resource.updatedAt !== null} onRetry={() => { void refreshAdminPageResource(store, page.id); }}>
       <div inert={refreshing} aria-busy={refreshing}>
         <AdminPageContent pageId={page.id} accountCreateOpen={createOpen} onCloseAccountCreate={() => setCreateOpen(false)} />
       </div>

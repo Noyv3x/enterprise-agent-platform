@@ -36,14 +36,10 @@ jobs:
         run: python3 scripts/docs_sync.py check
 
 
-  backend-shard:
-    name: Python shard ${{ matrix.shard }} of 0-3
+  backend:
+    name: Python 3.11
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0, 1, 2, 3]
     defaults:
       run:
         working-directory: enterprise-agent-platform
@@ -64,31 +60,10 @@ jobs:
         run: python3 -m pip install --no-input --editable .
 
       - name: Compile Python sources
-        if: matrix.shard == 0
         run: python3 -m compileall -q enterprise_agent_platform tests
 
       - name: Run Python tests
-        run: >-
-          python3 ../scripts/python_test_shard.py
-          --shard-index "${{ matrix.shard }}"
-          --shard-count 4
-
-  backend:
-    name: Python 3.11
-    if: ${{ always() }}
-    needs: backend-shard
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    steps:
-      - name: Require every Python shard
-        env:
-          SHARD_RESULT: ${{ needs['backend-shard'].result }}
-        shell: bash
-        run: |
-          if [[ "$SHARD_RESULT" != "success" ]]; then
-            printf 'Python shards did not all succeed: %s\n' "$SHARD_RESULT" >&2
-            exit 1
-          fi
+        run: python3 -m unittest discover -s tests
 
   frontend:
     name: Node 24
@@ -147,6 +122,9 @@ jobs:
 
       - name: Install runtime dependencies
         run: npm ci
+
+      - name: Type-check runtime
+        run: npm run check
 
       - name: Build runtime once
         run: npm run build

@@ -34,9 +34,6 @@ elif name == 'docs_sync.py':
     if args != ['check']:
         reject()
     sys.exit(43 if scenario == 'docs-fail' else 0)
-elif name == 'python_test_shard.py':
-    if len(args) != 4 or args[0] != '--shard-index' or args[2] != '--shard-count':
-        reject()
 elif name == 'container-smoke.sh':
     if args:
         reject()
@@ -44,13 +41,7 @@ elif name == 'go':
     if args not in (['test', './...'], ['vet', './...'], ['build', '-buildvcs=false', './cmd/agent-platform-manager']):
         reject()
 elif name == 'git':
-    if scenario == 'git-fail':
-        sys.exit(44)
-    if 'diff' in args:
-        sys.stdout.write('enterprise-agent-platform/frontend/src/example.ts\0')
-    elif 'ls-files' in args:
-        pass
-    elif 'init' in args:
+    if 'init' in args:
         (Path(args[1]) / 'firecrawl').mkdir()
     elif 'checkout' in args:
         (Path(args[1]) / 'docker-compose.yaml').write_text('services: {}\n')

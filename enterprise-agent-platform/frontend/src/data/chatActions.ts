@@ -1,16 +1,4 @@
-/* =====================================================================
-   Chat data and realtime actions.
-   This file owns:
-   - refreshActiveChat(store): the SSE "update" + 4s poll target. Re-fetches the
-     active scope's messages and dispatches ONLY when a cheap fingerprint differs
-     so identical
-     poll/SSE payloads cause zero state change and never disturb scroll/focus.
-   - currentScopeStreamUrl(state): the SSE URL by view.
-   - navigateToView / selectChannel: navigation and loader wiring.
-   - pollInFlight mutex shared by SSE + poll.
-
-   - sendMessage: the optimistic send lifecycle.
-   ===================================================================== */
+/* Chat navigation, realtime refresh, approvals and optimistic sends. */
 
 import {
   api,
@@ -25,11 +13,9 @@ import {
 import { EMPTY_BODY, endpoints } from "../lib/endpoints";
 import { toast } from "../context/ToastContext";
 import { t } from "../i18n";
-import { agentStatusFor, scopeIdFor, scopeTypeFor } from "../store/selectors";
+import { scopeIdFor, scopeTypeFor } from "../store/selectors";
 import { optimisticAttachments } from "../utils/composerFiles";
-import { chatSnapshot } from "../utils/fingerprint";
 import {
-  cacheChat,
   cacheVisibleChat,
   chatScopeKey,
   restoreCachedChat,
@@ -46,8 +32,7 @@ import {
   isStatusReadCurrent,
   issueStatusRead,
 } from "./statusFence";
-import { messageSyncCursor } from "./messageSync";
-import { messageHistoryState } from "./messageHistory";
+import { applyAgentStatus, applyMessageResponse } from "./messageSync";
 import { isChannelUnavailable, removeUnavailableChannel } from "./channelLifecycle";
 import {
   loadChannelMessages,
@@ -100,37 +85,6 @@ let pendingRefresh: {
   generation: number;
 } | null = null;
 
-/* --------- local mirrors of the loaders' private merge/status helpers ---------
-   refreshActiveChat fetches directly (instead of via the dispatching loaders) so
-   it can compare a before/after fingerprint and dispatch only on change; these
-   two helpers reproduce loaders.ts:mergePending / applyAgentStatus exactly. */
-
-function mergePending(
-  state: AppState,
-  mode: ChatMode,
-  scopeId: string,
-  messages: Message[],
-): Message[] {
-  const scopeType = scopeTypeFor(mode);
-  const pending = state.pendingMessages.filter(
-    (message) => message.scope_type === scopeType && message.scope_id === String(scopeId),
-  );
-  return [...messages, ...pending];
-}
-
-function applyAgentStatus(
-  store: AppStore,
-  mode: ChatMode,
-  scopeId: string,
-  status: AgentStatus | null | undefined,
-  authoritative = false,
-): void {
-  if (!status) return;
-  store.dispatch({
-    type: "SET_AGENT_STATUS",
-    payload: { mode, scopeId, status, authoritative },
-  });
-}
 
 async function runStatusMutation<T extends { agent_status?: AgentStatus | null }>(
   store: AppStore,
@@ -213,46 +167,6 @@ async function loadNavigatedChat(
   await loadFullPage();
 }
 
-function mergeDelta(
-  state: AppState,
-  mode: ChatMode,
-  scopeId: string,
-  delta: Message[],
-): Message[] {
-  const pendingIds = new Set(
-    state.pendingMessages
-      .filter(
-        (message) =>
-          message.scope_type === scopeTypeFor(mode) &&
-          message.scope_id === String(scopeId),
-      )
-      .map((message) => String(message.id)),
-  );
-  const current = (mode === "private" ? state.privateMessages : state.messages)
-    .filter((message) => !pendingIds.has(String(message.id)));
-  const positions = new Map(current.map((message, index) => [String(message.id), index]));
-  const merged = [...current];
-  for (const message of delta) {
-    const index = positions.get(String(message.id));
-    if (index === undefined) {
-      positions.set(String(message.id), merged.length);
-      merged.push(message);
-    } else {
-      merged[index] = message;
-    }
-  }
-  merged.sort((left, right) => {
-    const leftId = Number(left.id);
-    const rightId = Number(right.id);
-    return Number.isFinite(leftId) && Number.isFinite(rightId) ? leftId - rightId : 0;
-  });
-  return mergePending(
-    state,
-    mode,
-    scopeId,
-    merged,
-  );
-}
 
 export interface ScopeRealtimeUpdate {
   agent_status?: AgentStatus | null;
@@ -307,8 +221,7 @@ export function applyScopeRealtimeUpdate(
   return revisionChanged || latestChanged;
 }
 
-/** Synchronize the active scope and dispatch only when its fingerprint differs.
- *  Best-effort: explicit user actions surface their own errors. */
+/** Best-effort active-scope synchronization; explicit actions surface errors. */
 export async function refreshActiveChat(
   store: AppStore,
   { authoritativeStatus = true }: { authoritativeStatus?: boolean } = {},
@@ -330,140 +243,21 @@ export async function refreshActiveChat(
 
   pollInFlight = true;
   try {
-    if (mode === "channel") {
-      const channelId = String(initial.activeChannelId);
-      const statusRead = issueStatusRead(store, "channel", channelId);
-      const result = await api<ChannelMessagesResponse>(
-        messageSyncPath(endpoints.channelMessages.path(channelId), initial, "channel", channelId),
-      );
-      const state = store.getState();
-      // Channel-switch race guard: discard a response for a channel we left.
-      if (String(state.activeChannelId) !== channelId) return;
-      if (!isScopeReadCurrent(statusRead)) return;
-      const acceptStatus = isStatusReadCurrent(statusRead);
-      const before = chatSnapshot(
-        "channel",
-        channelId,
-        state.messages,
-        agentStatusFor(state, "channel"),
-        state.typingUsers,
-      );
-      const nextMessages = result.mode === "delta"
-        ? mergeDelta(state, "channel", channelId, result.messages || [])
-        : mergePending(state, "channel", channelId, result.messages || []);
-      const refreshedStatus = acceptStatus ? result.agent_status : undefined;
-      const nextStatus = refreshedStatus ?? agentStatusFor(state, "channel");
-      const nextTyping = result.typing || [];
-      const after = chatSnapshot("channel", channelId, nextMessages, nextStatus, nextTyping);
-      if (before !== after) {
-        store.dispatch({ type: "SET_MESSAGES", payload: nextMessages });
-        applyAgentStatus(
-          store,
-          "channel",
-          channelId,
-          refreshedStatus,
-          authoritativeStatus,
-        );
-        store.dispatch({ type: "SET_TYPING_USERS", payload: nextTyping });
-      }
-      const cursor = messageSyncCursor(
-        result,
-        state.messageSyncCursors[chatScopeKey("channel", channelId)],
-      );
-      if (cursor) {
-        store.dispatch({
-          type: "SET_MESSAGE_SYNC_CURSOR",
-          payload: {
-            key: chatScopeKey("channel", channelId),
-            cursor,
-          },
-        });
-      }
-      const channelKey = chatScopeKey("channel", channelId);
-      if (result.mode !== "delta") {
-        store.dispatch({
-          type: "SET_MESSAGE_HISTORY",
-          payload: {
-            key: channelKey,
-            history: messageHistoryState(result, state.messageHistory[channelKey]),
-          },
-        });
-      }
-      cacheChat(
-        store,
-        "channel",
-        channelId,
-        store.getState().messages,
-        cursor,
-        store.getState().messageHistory[channelKey],
-      );
-    } else {
-      const scopeId = scopeIdFor(initial, "private");
-      const statusRead = issueStatusRead(store, "private", scopeId);
-      const messagesResult = await api<PrivateMessagesResponse>(
-        messageSyncPath(endpoints.privateMessages.path(), initial, "private", scopeId),
-      );
-      const state = store.getState();
-      if (!isScopeReadCurrent(statusRead)) return;
-      const acceptStatus = isStatusReadCurrent(statusRead);
-      const before = chatSnapshot(
-        "private",
-        scopeId,
-        state.privateMessages,
-        agentStatusFor(state, "private"),
-        [],
-      );
-      const nextMessages = messagesResult.mode === "delta"
-        ? mergeDelta(state, "private", scopeId, messagesResult.messages || [])
-        : mergePending(state, "private", scopeId, messagesResult.messages || []);
-      const refreshedStatus = acceptStatus ? messagesResult.agent_status : undefined;
-      const nextStatus = refreshedStatus ?? agentStatusFor(state, "private");
-      const after = chatSnapshot("private", scopeId, nextMessages, nextStatus, []);
-      if (before !== after) {
-        store.dispatch({ type: "SET_PRIVATE_MESSAGES", payload: nextMessages });
-        applyAgentStatus(
-          store,
-          "private",
-          scopeId,
-          refreshedStatus,
-          authoritativeStatus,
-        );
-      }
-      const cursor = messageSyncCursor(
-        messagesResult,
-        state.messageSyncCursors[chatScopeKey("private", scopeId)],
-      );
-      if (cursor) {
-        store.dispatch({
-          type: "SET_MESSAGE_SYNC_CURSOR",
-          payload: {
-            key: chatScopeKey("private", scopeId),
-            cursor,
-          },
-        });
-      }
-      const privateKey = chatScopeKey("private", scopeId);
-      if (messagesResult.mode !== "delta") {
-        store.dispatch({
-          type: "SET_MESSAGE_HISTORY",
-          payload: {
-            key: privateKey,
-            history: messageHistoryState(
-              messagesResult,
-              state.messageHistory[privateKey],
-            ),
-          },
-        });
-      }
-      cacheChat(
-        store,
-        "private",
-        scopeId,
-        store.getState().privateMessages,
-        cursor,
-        store.getState().messageHistory[privateKey],
-      );
-    }
+    const scopeId = mode === "channel"
+      ? String(initial.activeChannelId)
+      : scopeIdFor(initial, "private");
+    const statusRead = issueStatusRead(store, mode, scopeId);
+    const path = mode === "channel"
+      ? endpoints.channelMessages.path(scopeId)
+      : endpoints.privateMessages.path();
+    const result = await api<ChannelMessagesResponse | PrivateMessagesResponse>(
+      messageSyncPath(path, initial, mode, scopeId),
+    );
+    if (mode === "channel" && String(store.getState().activeChannelId) !== scopeId) return;
+    if (!isScopeReadCurrent(statusRead)) return;
+    applyMessageResponse(
+      store, mode, scopeId, result, isStatusReadCurrent(statusRead), authoritativeStatus,
+    );
   } catch (error) {
     if (
       mode === "channel"

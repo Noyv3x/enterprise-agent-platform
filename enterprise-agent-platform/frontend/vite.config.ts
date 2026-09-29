@@ -10,10 +10,8 @@ export default defineConfig({
   },
   base: "/",
   build: {
-    // Direct `vite build` is deliberately safe: it can only replace this local
-    // scratch directory. `npm run build` supplies a unique same-filesystem
-    // staging path and publishes it only after validation.
-    outDir: ".vite-static-staging",
+    // The Platform image copies this complete directory from the build stage.
+    outDir: "../enterprise_agent_platform/static",
     emptyOutDir: true,
     target: "es2020",
     rollupOptions: {

@@ -27,7 +27,7 @@ export function AppShell() {
   const [focusToken, setFocusToken] = useState(0);
   const requestFocus = useCallback(() => setFocusToken(token => token + 1), []);
   const connected = useRealtime();
-  usePolling(connected ? 30_000 : 4_000);
+  usePolling(!connected);
   useReplyNotifications();
   useEffect(() => {
     if (userId != null) void ensureCurrentUserTimezone(store, userId, userTimezone).catch(() => undefined);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { AgentStatus, Message } from "../types";
-import { agentStatusFingerprint, messageFingerprintKey } from "./fingerprint";
+import type { Message } from "../types";
+import { messageFingerprintKey } from "./fingerprint";
 
 const base: Message = {
   id: "message-1",
@@ -108,82 +108,3 @@ describe("messageFingerprintKey", () => {
   });
 });
 
-describe("agentStatusFingerprint", () => {
-  it("observes every stream field used to synthesize a message", () => {
-    const status: AgentStatus = {
-      state: "replying",
-      started_at: 100,
-      stream_message: {
-        id: "stream-1",
-        content: "working",
-        updated_at: 100,
-        username: "Agent One",
-        created_at: 90,
-        turn_id: "run:1",
-        turn_index: 1,
-        active: true,
-      },
-      input_group_id: "agent:job-1",
-      processing_mode: "started",
-      active_input_group: {
-        id: "agent:job-1",
-        state: "collecting",
-        message_count: 1,
-        message_ids: [10],
-      },
-    };
-    const before = agentStatusFingerprint(status);
-    const after = agentStatusFingerprint({
-      ...status,
-      stream_message: {
-        ...status.stream_message,
-        username: "Agent Two",
-        created_at: 91,
-        turn_id: "run:2",
-        turn_index: 2,
-        active: false,
-      },
-      processing_mode: "joined",
-      active_input_group: {
-        id: "agent:job-1",
-        state: "accepted",
-        message_count: 2,
-        message_ids: [10, 11],
-      },
-    });
-    expect(after).not.toEqual(before);
-  });
-
-  it("observes computer projection updates", () => {
-    const status: AgentStatus = {
-      state: "working",
-      computer: {
-        mode: "file",
-        file: { tool: "write_file", workspace_path: "src/app.ts", status: "running" },
-      },
-    };
-    const before = agentStatusFingerprint(status);
-    const after = agentStatusFingerprint({
-      ...status,
-      computer: {
-        ...status.computer,
-        file: { ...status.computer?.file, status: "completed" },
-      },
-    });
-    expect(after).not.toEqual(before);
-  });
-
-  it("observes an approval whose only change is its identity", () => {
-    const status: AgentStatus = {
-      state: "approval",
-      run_id: "run-A",
-      approval: { run_id: "run-A", approval_id: "approval-A", command: "printf harmless", choices: ["once"] },
-    };
-    const before = agentStatusFingerprint(status);
-    const after = agentStatusFingerprint({
-      ...status,
-      approval: { ...status.approval, approval_id: "approval-B" },
-    });
-    expect(after).not.toEqual(before);
-  });
-});

@@ -1,28 +1,8 @@
-/* useRealtime — the EventSource lifecycle for the active chat scope.
-   One stream per active scope. The effect is keyed on
-   [user?.id, view, activeChannelId, url] (+ the stable store handle), so it only
-   re-opens when the scope URL actually changes — no per-render thrash. Cleanup
-   closes the stream and clears the reconnect timer.
-
-   Current semantics:
-   - "update" events apply ephemeral status/typing directly and synchronize
-     messages only when the persisted conversation revision changes;
-   - on a terminal close (readyState === 2) we probe GET /api/auth/me (NOT
-     skipAuthHandling, so a 401 drops to login) and, if still authed + visible,
-     schedule a single 3s reconnect; a transient probe failure (network error,
-     5xx) keeps probing with a doubling, capped backoff for as long as this
-     scope and login generation stay valid, instead of waiting for the next
-     visibility/pageshow event;
-   - hidden tabs keep the lightweight active-scope stream open so reply-complete
-     browser notifications can be delivered while the page remains loaded;
-   - pagehide closes the stream and pageshow restores it after BFCache resume;
-   - logout/401 close it via the session teardown and cancel any pending
-     recovery timer. */
+/* One active-scope EventSource. The browser owns transient reconnects;
+   disconnected polling handles terminal failures and session/access revocation. */
 
 import { useEffect, useState } from "react";
-import { api, getApiSessionGeneration, isApiError, isApiRequestCancelled } from "../lib/api";
-import { endpoints } from "../lib/endpoints";
-import { SSE_RECONNECT_MS, SSE_RECOVERY_MAX_MS } from "../lib/constants";
+import { getApiSessionGeneration } from "../lib/api";
 import { registerSessionTeardown } from "../data/sessionActions";
 import {
   applyScopeRealtimeUpdate,
@@ -57,17 +37,13 @@ export function useRealtime(): boolean {
     if (!userId || !url || typeof EventSource === "undefined") return;
 
     let es: EventSource | null = null;
-    let reconnect: number | null = null;
-    let recoveryAttempt = 0;
     const mode: ChatMode = view === "private" ? "private" : "channel";
     const scopeId = mode === "private" ? String(userId) : String(activeChannelId || "");
     const previewScope: AgentPreviewScope = {
       scope_type: mode,
       scope_id: scopeId,
     };
-    // Guards the async auth-probe below: if the effect is torn down (scope change,
-    // logout) while the probe is in flight, its .then() must not schedule a
-    // reconnect that would open a second EventSource bound to the now-stale scope.
+    // Reject events from a previous scope or login generation.
     let disposed = false;
     const generation = getApiSessionGeneration();
     const ownsScope = () => !disposed
@@ -75,15 +51,7 @@ export function useRealtime(): boolean {
       && String(store.getState().user?.id) === String(userId)
       && currentScopeStreamUrl(store.getState()) === url;
 
-    const clearReconnect = () => {
-      if (reconnect != null) {
-        clearTimeout(reconnect);
-        reconnect = null;
-      }
-    };
-
     const close = () => {
-      clearReconnect();
       if (es) {
         try {
           es.close();
@@ -102,7 +70,9 @@ export function useRealtime(): boolean {
       const current = new EventSource(url, { withCredentials: true });
       es = current;
       current.addEventListener("open", () => {
-        if (es === current && ownsScope()) setConnected(true);
+        if (es !== current || !ownsScope()) return;
+        setConnected(true);
+        void refreshActiveChat(store);
       });
       current.addEventListener("update", (event) => {
         if (es !== current || !ownsScope()) return;
@@ -139,47 +109,17 @@ export function useRealtime(): boolean {
       current.addEventListener("error", () => {
         if (es !== current || !ownsScope()) return;
         setConnected(false);
-        // EventSource hides HTTP status. A scoped read distinguishes an ordinary
-        // disconnect from archived/revoked access and reconciles navigation.
-        if (mode === "channel") void refreshActiveChat(store);
-        // readyState 0 = the browser is auto-reconnecting; leave it. readyState 2
-        // (CLOSED) is terminal — probe auth, then self-reconnect once if valid.
-        if (current.readyState === 2) {
-          close();
-          recover();
-        }
+        // EventSource hides HTTP status; a scoped GET preserves 401 handling and
+        // reconciles archived/revoked channels. Native reconnect stays untouched.
+        void refreshActiveChat(store);
       });
     };
 
-    // Both timers share `reconnect`, so close() (scope change, teardown, pagehide)
-    // cancels whichever recovery step is pending and open() never runs twice.
-    const schedule = (delayMs: number, step: () => void) => {
-      if (!ownsScope() || reconnect != null) return;
-      reconnect = window.setTimeout(() => {
-        reconnect = null;
-        if (ownsScope()) step();
-      }, delayMs);
-    };
-
-    const recover = () => {
-      api(endpoints.authMe.path())
-        .then(() => {
-          if (!ownsScope() || es !== null) return;
-          recoveryAttempt = 0;
-          schedule(SSE_RECONNECT_MS, open);
-        })
-        .catch((error: unknown) => {
-          // A cancelled probe means the session generation moved on (401 →
-          // handleSessionExpired) and a 401 without a handler is equally final.
-          if (!ownsScope() || es !== null || isApiRequestCancelled(error) || isApiError(error, 401)) return;
-          const delayMs = Math.min(SSE_RECONNECT_MS * 2 ** recoveryAttempt, SSE_RECOVERY_MAX_MS);
-          recoveryAttempt += 1;
-          schedule(delayMs, recover);
-        });
-    };
-
     const onVisibility = () => {
-      if (!document.hidden) open();
+      if (!document.hidden && ownsScope()) {
+        open();
+        void refreshActiveChat(store);
+      }
     };
     const onPageHide = () => close();
     const onPageShow = () => open();

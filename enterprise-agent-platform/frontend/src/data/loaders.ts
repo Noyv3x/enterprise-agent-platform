@@ -11,10 +11,9 @@
 import { api, getApiSessionGeneration, isApiError } from "../lib/api";
 import { endpoints } from "../lib/endpoints";
 import type { Store } from "../lib/store";
-import { scopeIdFor, scopeTypeFor } from "../store/selectors";
+import { scopeIdFor } from "../store/selectors";
 import { cacheChat, chatScopeKey } from "./chatCache";
-import { messageSyncCursor } from "./messageSync";
-import { messageHistoryState } from "./messageHistory";
+import { applyMessageResponse } from "./messageSync";
 import { isChannelUnavailable, reconcileChannels, removeUnavailableChannel } from "./channelLifecycle";
 import {
   isScopeReadCurrent,
@@ -24,7 +23,6 @@ import {
 import type {
   Action,
   AgentRuntimeConfigResponse,
-  AgentStatus,
   AppState,
   AuditChannelMessagesResponse,
   AutoUpdateConfigResponse,
@@ -33,7 +31,6 @@ import type {
   ChannelsResponse,
   ChatMode,
   Id,
-  Message,
   OAuthProvidersResponse,
   PermissionGroupsResponse,
   PrivateConversationsResponse,
@@ -96,49 +93,6 @@ export function selectAuditPrivateUserId(store: AppStore, userId: string | null)
   });
 }
 
-/* ----------------------------------------------------------- local helpers */
-
-/** Merge server messages with the still-pending optimistic items for a scope. */
-function mergePending(
-  state: AppState,
-  mode: ChatMode,
-  scopeId: string,
-  messages: Message[],
-): Message[] {
-  const scopeType = scopeTypeFor(mode);
-  const pending = state.pendingMessages.filter(
-    (message) => message.scope_type === scopeType && message.scope_id === String(scopeId),
-  );
-  return [...messages, ...pending];
-}
-
-/** Per-scope Agent-status write. The reducer owns the shared version merge; a
- *  transport-fenced read is marked authoritative for equal-second snapshots. */
-function applyAgentStatus(
-  store: AppStore,
-  mode: ChatMode,
-  scopeId: string,
-  status: AgentStatus | null | undefined,
-  authoritative = false,
-): void {
-  if (!status) return;
-  store.dispatch({
-    type: "SET_AGENT_STATUS",
-    payload: { mode, scopeId, status, authoritative },
-  });
-}
-
-function applyMessageHistory(
-  store: AppStore,
-  mode: ChatMode,
-  scopeId: string,
-  result: ChannelMessagesResponse | PrivateMessagesResponse | SessionBootstrapResponse,
-) {
-  const key = chatScopeKey(mode, scopeId);
-  const history = messageHistoryState(result, store.getState().messageHistory[key]);
-  store.dispatch({ type: "SET_MESSAGE_HISTORY", payload: { key, history } });
-  return history;
-}
 
 /* --------------------------------------------------------------- loaders */
 
@@ -157,37 +111,14 @@ export function hydrateSessionBootstrap(
   const scopeId = mode === "private"
     ? String(result.user.id)
     : String(activeChannelId || requestedScope?.scope_id || "");
-  const messages = result.messages || [];
 
   store.dispatch({ type: "SET_USER", payload: result.user });
   store.dispatch({ type: "SET_CHANNELS", payload: channels });
   store.dispatch({ type: "SET_MENTION_TARGETS", payload: result.mention_targets || [] });
   store.dispatch({ type: "SET_ACTIVE_CHANNEL_ID", payload: activeChannelId });
   store.dispatch({ type: "SET_ACTIVE_VIEW", payload: mode });
-  store.dispatch({
-    type: mode === "private" ? "SET_PRIVATE_MESSAGES" : "SET_MESSAGES",
-    payload: mergePending(store.getState(), mode, scopeId, messages),
-  });
-  applyAgentStatus(store, mode, scopeId, result.agent_status, true);
-  store.dispatch({
-    type: "SET_TYPING_USERS",
-    payload: mode === "channel" ? result.typing || [] : [],
-  });
-  const cursor = messageSyncCursor(
-    result,
-    store.getState().messageSyncCursors[chatScopeKey(mode, scopeId)],
-  );
-  if (cursor) {
-    store.dispatch({
-      type: "SET_MESSAGE_SYNC_CURSOR",
-      payload: {
-        key: chatScopeKey(mode, scopeId),
-        cursor,
-      },
-    });
-  }
-  const history = applyMessageHistory(store, mode, scopeId, result);
-  cacheChat(store, mode, scopeId, messages, cursor, history);
+  applyMessageResponse(store, mode, scopeId, result);
+  if (mode === "private") store.dispatch({ type: "SET_TYPING_USERS", payload: [] });
 }
 
 export async function loadSessionBootstrap(store: AppStore): Promise<void> {
@@ -239,36 +170,7 @@ export async function loadChannelMessages(store: AppStore): Promise<void> {
   // Channel-switch race guard: discard a response for a channel we left.
   if (String(store.getState().activeChannelId) !== channelId) return;
   if (!isScopeReadCurrent(statusRead)) return;
-  store.dispatch({
-    type: "SET_MESSAGES",
-    payload: mergePending(store.getState(), "channel", channelId, result.messages || []),
-  });
-  if (isStatusReadCurrent(statusRead)) {
-    applyAgentStatus(store, "channel", channelId, result.agent_status, true);
-  }
-  store.dispatch({ type: "SET_TYPING_USERS", payload: result.typing || [] });
-  const cursor = messageSyncCursor(
-    result,
-    store.getState().messageSyncCursors[chatScopeKey("channel", channelId)],
-  );
-  if (cursor) {
-    store.dispatch({
-      type: "SET_MESSAGE_SYNC_CURSOR",
-      payload: {
-        key: chatScopeKey("channel", channelId),
-        cursor,
-      },
-    });
-  }
-  const history = applyMessageHistory(store, "channel", channelId, result);
-  cacheChat(
-    store,
-    "channel",
-    channelId,
-    store.getState().messages,
-    cursor,
-    history,
-  );
+  applyMessageResponse(store, "channel", channelId, result, isStatusReadCurrent(statusRead));
 }
 
 export async function loadPrivateMessages(store: AppStore): Promise<void> {
@@ -279,35 +181,7 @@ export async function loadPrivateMessages(store: AppStore): Promise<void> {
     loadPrivateTelegram(store),
   ]);
   if (!isScopeReadCurrent(statusRead)) return;
-  store.dispatch({
-    type: "SET_PRIVATE_MESSAGES",
-    payload: mergePending(store.getState(), "private", scopeId, result.messages || []),
-  });
-  if (isStatusReadCurrent(statusRead)) {
-    applyAgentStatus(store, "private", scopeId, result.agent_status, true);
-  }
-  const cursor = messageSyncCursor(
-    result,
-    store.getState().messageSyncCursors[chatScopeKey("private", scopeId)],
-  );
-  if (cursor) {
-    store.dispatch({
-      type: "SET_MESSAGE_SYNC_CURSOR",
-      payload: {
-        key: chatScopeKey("private", scopeId),
-        cursor,
-      },
-    });
-  }
-  const history = applyMessageHistory(store, "private", scopeId, result);
-  cacheChat(
-    store,
-    "private",
-    scopeId,
-    store.getState().privateMessages,
-    cursor,
-    history,
-  );
+  applyMessageResponse(store, "private", scopeId, result, isStatusReadCurrent(statusRead));
 }
 
 function scopeStillVisible(store: AppStore, mode: ChatMode, scopeId: string): boolean {
@@ -626,11 +500,18 @@ export async function loadTelegramConfig(store: AppStore): Promise<void> {
   });
 }
 
+const managerReads = new WeakMap<AppStore, symbol>();
+
 export async function loadAutoUpdateConfig(store: AppStore): Promise<void> {
-  store.dispatch({
-    type: "SET_AUTO_UPDATE_CONFIG",
-    payload: await api<AutoUpdateConfigResponse>(endpoints.autoUpdateConfig.path()),
-  });
+  const request = Symbol();
+  managerReads.set(store, request);
+  const actorId = store.getState().user?.id;
+  const session = getApiSessionGeneration();
+  const payload = await api<AutoUpdateConfigResponse>(endpoints.autoUpdateConfig.path());
+  if (managerReads.get(store) !== request
+    || session !== getApiSessionGeneration()
+    || actorId !== store.getState().user?.id) return;
+  store.dispatch({ type: "SET_AUTO_UPDATE_CONFIG", payload });
 }
 
 export async function loadBrandingConfig(store: AppStore): Promise<void> {

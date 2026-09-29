@@ -80,12 +80,9 @@ class GovernanceTests(unittest.TestCase):
         self.fake('docs_sync.py', scripts / 'docs_sync.py')
         front = self.root / 'enterprise-agent-platform/frontend'
         front.mkdir(parents=True)
-        for name in ('package.json', 'package-lock.json'):
-            (front / name).write_text('{}\n')
-        self.fake('git')
         self.fake('npm')
         self.env['FIXTURE_SCENARIO'] = scenario
-        result = self.run_process('bash', str(scripts / 'test.sh'), 'affected')
+        result = self.run_process('bash', str(scripts / 'test.sh'), 'frontend')
         self.assertIn(['npm', 'ci'], self.calls(), result.stdout + result.stderr)
         return front, result
 
@@ -95,18 +92,16 @@ class GovernanceTests(unittest.TestCase):
         self.assertNotIn(['npm', 'run', 'build'], self.calls())
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_gov1_failed_ci_does_not_certify_dependencies(self):
-        front, result = self.frontend('ci')
+    def test_gov1_failed_install_stops_frontend_checks(self):
+        _, result = self.frontend('ci')
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn(['npm', 'run', 'check'], self.calls())
-        self.assertFalse((front / 'node_modules/.agent-platform-dependency-fingerprint').exists(),
-                         'npm ci exited 42 but dependencies were stamped as successful\n' + result.stdout)
 
     def gate_repository(self):
         scripts = self.root / 'scripts'
         scripts.mkdir()
         shutil.copyfile(ROOT / 'scripts/test.sh', scripts / 'test.sh')
-        for name in ('docs_sync.py', 'python_test_shard.py', 'container-smoke.sh'):
+        for name in ('docs_sync.py', 'container-smoke.sh'):
             self.fake(name, scripts / name)
         tests = scripts / 'tests'
         tests.mkdir()
@@ -122,109 +117,28 @@ class GovernanceTests(unittest.TestCase):
         (platform / 'enterprise_agent_platform').mkdir(parents=True)
         (platform / 'tests').mkdir()
         (self.root / 'manager').mkdir()
-        for component in ('agent-runtime', 'camofox-runtime', 'frontend'):
-            directory = platform / component
-            (directory / 'src').mkdir(parents=True)
-            for name in ('package.json', 'package-lock.json'):
-                (directory / name).write_text('{}\n')
-        (platform / 'frontend/src/example.ts').write_text('export const value = 1;\n')
-        (self.root / 'README.md').write_text('# Gate fixture\n')
-        (self.root / '.gitignore').write_text(
-            'bin/\nnode_modules/\n__pycache__/\ncalls.jsonl\nscripts-runs\n'
-            'agent-platform-tests.*/\n'
-        )
         for command in ('npm', 'go', 'docker'):
             self.fake(command)
         self.env['FIXTURE_SCENARIO'] = 'control'
-        self.run_process('git', 'init', '--quiet', check=True)
-        self.run_process('git', 'add', '--all', check=True)
-        self.run_process(
-            'git', '-c', 'user.email=fixture@example.invalid',
-            '-c', 'user.name=Gate Fixture', 'commit', '--quiet', '-m', 'baseline',
-            check=True,
-        )
 
-    def run_gate(self, mode='affected'):
+    def run_gate(self, mode='full'):
         return self.run_process('bash', str(self.root / 'scripts/test.sh'), mode)
 
-    def test_full_runs_script_suite_once_and_propagates_its_failure(self):
+    def test_script_suite_failure_stops_full_gate(self):
         self.gate_repository()
         self.env['FIXTURE_SCENARIO'] = 'scripts-fail'
         failed = self.run_gate('full')
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
-        self.assertIn('FAIL scripts', failed.stderr)
+        self.assertNotIn(['go', 'test', './...'], self.calls())
         self.assertEqual((self.root / 'scripts-runs').read_text(), 'run\n')
-        self.env['FIXTURE_SCENARIO'] = 'control'
-        passed = self.run_gate('full')
-        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
-        self.assertEqual((self.root / 'scripts-runs').read_text(), 'run\nrun\n')
-        self.assertEqual(
-            [call for call in self.calls() if call[0] == 'docs_sync.py'],
-            [['docs_sync.py', 'check'], ['docs_sync.py', 'check']],
-        )
 
-    def test_document_only_gate_still_checks_the_current_tree(self):
+    def test_document_failure_stops_full_gate(self):
         self.gate_repository()
-        (self.root / 'README.md').write_text('# Updated gate fixture\n')
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.calls(), [['docs_sync.py', 'check']])
         self.env['FIXTURE_SCENARIO'] = 'docs-fail'
         failed = self.run_gate()
         self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
         self.assertFalse((self.root / 'scripts-runs').exists())
 
-    def test_shared_and_unknown_paths_select_all_gate_components(self):
-        self.gate_repository()
-        for relative in ('scripts/container-smoke.sh', 'containers/compose.yaml', 'unknown/input'):
-            with self.subTest(path=relative):
-                path = self.root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                original = path.read_bytes() if path.exists() else None
-                path.write_bytes((original or b'') + b'\n# changed shared input\n')
-                result = self.run_gate()
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                for component in ('scripts', 'manager', 'python', 'runtime', 'camofox', 'frontend', 'containers'):
-                    self.assertRegex(result.stdout, rf'(?m)^PASS {component}\s')
-                if original is None:
-                    path.unlink()
-                else:
-                    path.write_bytes(original)
-
-    def test_cross_component_rename_runs_both_owners(self):
-        self.gate_repository()
-        self.run_process(
-            'git', 'mv', 'enterprise-agent-platform/frontend/src/example.ts',
-            'enterprise-agent-platform/agent-runtime/src/example.ts', check=True,
-        )
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r'(?m)^PASS frontend\s')
-        self.assertRegex(result.stdout, r'(?m)^PASS runtime\s')
-        self.assertFalse((self.root / 'scripts-runs').exists())
-
-    def test_staged_change_unstaged_revert_and_untracked_file_are_all_selected(self):
-        self.gate_repository()
-        path = self.root / 'enterprise-agent-platform/frontend/src/example.ts'
-        original = path.read_bytes()
-        path.write_text('export const value = 2;\n')
-        self.run_process('git', 'add', str(path), check=True)
-        path.write_bytes(original)
-        (self.root / 'enterprise-agent-platform/tests/test_new.py').write_text('# untracked\n')
-        result = self.run_gate()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r'(?m)^PASS frontend\s')
-        self.assertRegex(result.stdout, r'(?m)^PASS python\s')
-        self.assertFalse((self.root / 'scripts-runs').exists())
-
-    def test_failed_git_enumeration_cannot_report_an_empty_gate(self):
-        self.gate_repository()
-        self.fake('git')
-        self.env['FIXTURE_SCENARIO'] = 'git-fail'
-        result = self.run_gate()
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn('Selected checks:', result.stdout)
-        self.assertFalse((self.root / 'scripts-runs').exists())
 
     def release_repository(self):
         self.repository = self.root / 'source'

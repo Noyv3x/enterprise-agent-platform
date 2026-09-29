@@ -1,12 +1,6 @@
-/* Change-detection fingerprints used by the realtime layer to suppress no-op
-   re-renders, so identical poll/SSE payloads do not disturb scroll or focus.
-   Pure; no store reads. */
+/* Row memoization observes rendered message fields. */
 
-import type { AgentStatus, ChatMode, Message, TypingUser } from "../types";
-
-function scopeTypeFor(mode: ChatMode): "private" | "channel" {
-  return mode === "private" ? "private" : "channel";
-}
+import type { AgentStatus, Message } from "../types";
 
 function flattenActivity(activity: AgentStatus["activity"]): unknown[] {
   return (activity || []).map((item) => ({
@@ -87,96 +81,8 @@ export function messageFingerprint(message: Message): unknown {
   };
 }
 
-/** Stable value used by React.memo. Keeping this beside chatSnapshot ensures
- * realtime suppression and row memoization observe the same render fields. */
+/** Stable value used by React.memo. */
 export function messageFingerprintKey(message: Message): string {
   return JSON.stringify(messageFingerprint(message));
 }
 
-export function agentStatusFingerprint(status: AgentStatus | null | undefined): unknown {
-  if (!status) return null;
-  return {
-    run_id: status.run_id || "",
-    state: status.state,
-    queued_count: status.queued_count || 0,
-    started_at: status.started_at || 0,
-    updated_at: status.updated_at || 0,
-    scope_type: status.scope_type || "",
-    scope_id: status.scope_id == null ? "" : String(status.scope_id),
-    current_step: status.current_step || "",
-    activity: flattenActivity(status.activity),
-    computer: status.computer || null,
-    stream_message: status.stream_message
-      ? {
-          id: status.stream_message.id,
-          content: status.stream_message.content || "",
-          updated_at: status.stream_message.updated_at || 0,
-          active: status.stream_message.active !== false,
-          username: status.stream_message.username || "",
-          created_at: status.stream_message.created_at || 0,
-          turn_id: status.stream_message.turn_id || "",
-          turn_index: status.stream_message.turn_index || 0,
-        }
-      : null,
-    stream_messages: (status.stream_messages || []).map((item) => ({
-      id: item.id,
-      content: item.content || "",
-      updated_at: item.updated_at || 0,
-      active: item.active !== false,
-      username: item.username || "",
-      created_at: item.created_at || 0,
-      turn_id: item.turn_id || "",
-      turn_index: item.turn_index || 0,
-    })),
-    input_group_id: status.input_group_id || "",
-    processing_mode: status.processing_mode || "",
-    active_input_group: status.active_input_group
-      ? {
-          id: status.active_input_group.id,
-          state: status.active_input_group.state || "",
-          message_count: status.active_input_group.message_count,
-          message_ids: status.active_input_group.message_ids || [],
-          first_message_id: status.active_input_group.first_message_id || "",
-          last_message_id: status.active_input_group.last_message_id || "",
-        }
-      : null,
-    approval: status.approval
-      ? {
-          run_id: status.approval.run_id || "",
-          approval_id: status.approval.approval_id || "",
-          command: status.approval.command || "",
-          description: status.approval.description || "",
-          choices: status.approval.choices || [],
-          requested_at: status.approval.requested_at || 0,
-        }
-      : null,
-    replying_to: status.replying_to
-      ? {
-          id: status.replying_to.id,
-          username: status.replying_to.username,
-          content: status.replying_to.content,
-          created_at: status.replying_to.created_at,
-        }
-      : null,
-  };
-}
-
-/** A deep JSON change detector for the active chat scope. Inputs are passed
- * explicitly so this stays store-agnostic. */
-export function chatSnapshot(
-  mode: ChatMode,
-  scopeId: string,
-  messages: Message[],
-  agentStatus: AgentStatus | null | undefined,
-  typingUsers: TypingUser[],
-): string {
-  return JSON.stringify({
-    scope: `${scopeTypeFor(mode)}:${scopeId || ""}`,
-    messages: messages.map(messageFingerprint),
-    agent: agentStatusFingerprint(agentStatus),
-    typing:
-      mode === "channel"
-        ? typingUsers.map((item) => ({ user_id: item.user_id, username: item.username }))
-        : [],
-  });
-}

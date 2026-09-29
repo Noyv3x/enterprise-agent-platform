@@ -1,24 +1,19 @@
-/* usePolling — the safety-net poll behind the SSE stream. The caller selects a fast reconnect
-   interval or a low-frequency connected watchdog. It is gated on an
-   authenticated user and tab visibility; the re-entrancy mutex lives inside
-   refreshActiveChat. Hidden tabs clear the interval; becoming visible does an
-   immediate catch-up refresh and restarts it. The interval is also torn down on
-   logout/401 via the session teardown registry. */
+/* Low-frequency fallback only while realtime is disconnected and visible.
+   Reconnect/visibility catch-up belongs to useRealtime. */
 
 import { useEffect } from "react";
 import { registerSessionTeardown } from "../data/sessionActions";
 import { refreshActiveChat } from "../data/chatActions";
 import { useStore, useStoreHandle } from "../store/useStore";
 
-const DEFAULT_POLL_INTERVAL_MS = 4_000;
+const POLL_INTERVAL_MS = 30_000;
 
-export function usePolling(intervalMs = DEFAULT_POLL_INTERVAL_MS): void {
+export function usePolling(enabled: boolean): void {
   const store = useStoreHandle();
   const userId = useStore((state) => state.user?.id);
-  const interval = Math.max(1_000, Math.min(60_000, Math.round(intervalMs)));
 
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || !enabled) return;
 
     let timer: number | null = null;
 
@@ -29,13 +24,12 @@ export function usePolling(intervalMs = DEFAULT_POLL_INTERVAL_MS): void {
       }
     };
     const start = () => {
-      if (timer == null) timer = window.setInterval(() => void refreshActiveChat(store), interval);
+      if (timer == null) timer = window.setInterval(() => void refreshActiveChat(store), POLL_INTERVAL_MS);
     };
     const onVisibility = () => {
       if (document.hidden) {
         stop();
       } else {
-        void refreshActiveChat(store);
         start();
       }
     };
@@ -49,5 +43,5 @@ export function usePolling(intervalMs = DEFAULT_POLL_INTERVAL_MS): void {
       unregister();
       stop();
     };
-  }, [userId, interval, store]);
+  }, [userId, enabled, store]);
 }

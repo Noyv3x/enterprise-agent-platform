@@ -24,7 +24,6 @@ export const DEFAULT_BRANDING: BrandingSnapshot = Object.freeze({
 
 export interface BrandingCache {
   snapshot: BrandingSnapshot;
-  etag?: string;
 }
 
 interface BrandingContextValue {
@@ -41,7 +40,6 @@ const BrandingContext = createContext<BrandingContextValue>(defaultContext);
 const COLOR_RE = /^#[0-9a-f]{6}$/i;
 const CONTROL_RE = /\p{C}/u;
 const LINE_SEPARATOR_RE = /[\u2028\u2029]/u;
-const STORAGE_REVALIDATE_DELAY_MS = 40;
 
 export function isValidBrandingName(value: string): boolean {
   const normalized = value.trim().normalize("NFC");
@@ -126,30 +124,6 @@ export function normalizeBrandingSnapshot(
   return parseBrandingSnapshot(value, origin) ?? DEFAULT_BRANDING;
 }
 
-function brandingEtag(revision: number): string {
-  return `"branding-${revision}"`;
-}
-
-function validatedBrandingEtag(value: unknown, revision: number): string | undefined {
-  return value === brandingEtag(revision) ? value : undefined;
-}
-
-function sameBrandingSnapshot(left: BrandingSnapshot, right: BrandingSnapshot): boolean {
-  return left.schema_version === right.schema_version
-    && left.revision === right.revision
-    && left.product_name === right.product_name
-    && left.agent_name === right.agent_name
-    && left.primary_color === right.primary_color
-    && left.logo_url === right.logo_url;
-}
-
-function sameBrandingCache(left: BrandingCache | null, right: BrandingCache): boolean {
-  return Boolean(
-    left
-    && left.etag === right.etag
-    && sameBrandingSnapshot(left.snapshot, right.snapshot),
-  );
-}
 
 export function parseBrandingCache(
   raw: string | null | undefined,
@@ -160,11 +134,7 @@ export function parseBrandingCache(
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const snapshot = parseBrandingSnapshot(parsed.snapshot, origin);
     if (!snapshot) return null;
-    const etag = validatedBrandingEtag(parsed.etag, snapshot.revision);
-    return {
-      snapshot,
-      ...(etag ? { etag } : {}),
-    };
+    return { snapshot };
   } catch {
     return null;
   }
@@ -203,25 +173,15 @@ function writeBrandingCache(cache: BrandingCache): void {
 }
 
 export async function fetchPublicBranding(
-  cached: BrandingCache | null,
   signal?: AbortSignal,
-): Promise<BrandingCache | null> {
-  const headers = new Headers({ Accept: "application/json" });
-  const cachedSnapshot = cached ? parseBrandingSnapshot(cached.snapshot) : null;
-  const cachedEtag = cachedSnapshot
-    ? validatedBrandingEtag(cached?.etag, cachedSnapshot.revision)
-    : undefined;
-  if (cachedEtag) headers.set("If-None-Match", cachedEtag);
+): Promise<BrandingSnapshot | null> {
   const response = await fetch(endpoints.platformBranding.path(), {
     method: "GET",
     credentials: "include",
     cache: "no-cache",
-    headers,
+    headers: { Accept: "application/json" },
     signal,
   });
-  if (response.status === 304 && cachedSnapshot && cachedEtag) {
-    return { snapshot: cachedSnapshot, etag: cachedEtag };
-  }
   if (!response.ok) throw new Error(`Branding request failed (${response.status})`);
   let payload: unknown;
   try {
@@ -229,124 +189,48 @@ export async function fetchPublicBranding(
   } catch {
     return null;
   }
-  const snapshot = parseBrandingSnapshot(payload);
-  if (!snapshot) return null;
-  const etag = validatedBrandingEtag(response.headers.get("ETag"), snapshot.revision);
-  return {
-    snapshot,
-    ...(etag ? { etag } : {}),
-  };
+  return parseBrandingSnapshot(payload);
 }
 
 export function BrandingProvider({ children }: { children: ReactNode }) {
   const { locale, t } = useI18n();
-  const [initialCache] = useState<BrandingCache | null>(() => readBrandingCache());
   const [branding, setBranding] = useState<BrandingSnapshot>(
-    () => initialCache?.snapshot ?? DEFAULT_BRANDING,
+    () => readBrandingCache()?.snapshot ?? DEFAULT_BRANDING,
   );
-  const brandingRef = useRef(branding);
-  const cacheRef = useRef<BrandingCache | null>(initialCache);
+  const requestRef = useRef<AbortController | null>(null);
 
-  const acceptMonotonicBranding = useCallback((next: BrandingCache): boolean => {
-    const current = brandingRef.current;
-    const identical = sameBrandingSnapshot(current, next.snapshot);
-    if (
-      next.snapshot.revision < current.revision
-      || (next.snapshot.revision === current.revision && !identical)
-    ) {
-      return false;
-    }
-    const cacheChanged = !sameBrandingCache(cacheRef.current, next);
-    brandingRef.current = next.snapshot;
-    cacheRef.current = next;
-    if (!identical) setBranding(next.snapshot);
-    if (cacheChanged) writeBrandingCache(next);
-    return true;
-  }, []);
-
-  const acceptPublicBranding = useCallback((
-    next: BrandingCache,
-    requestBaseline: BrandingSnapshot,
-  ) => {
-    if (sameBrandingSnapshot(brandingRef.current, requestBaseline)) {
-      const identical = sameBrandingSnapshot(brandingRef.current, next.snapshot);
-      const cacheChanged = !sameBrandingCache(cacheRef.current, next);
-      brandingRef.current = next.snapshot;
-      cacheRef.current = next;
-      if (!identical) setBranding(next.snapshot);
-      if (cacheChanged) writeBrandingCache(next);
-      return;
-    }
-    acceptMonotonicBranding(next);
-  }, [acceptMonotonicBranding]);
-
-  const resetInvalidPublicBranding = useCallback(() => {
-    brandingRef.current = DEFAULT_BRANDING;
-    cacheRef.current = null;
-    setBranding(DEFAULT_BRANDING);
-    clearBrandingCache();
+  const commitBranding = useCallback((snapshot: BrandingSnapshot | null) => {
+    setBranding(snapshot ?? DEFAULT_BRANDING);
+    if (snapshot) writeBrandingCache({ snapshot });
+    else clearBrandingCache();
   }, []);
 
   const applyBranding = useCallback((snapshot: BrandingSnapshot) => {
-    const normalized = parseBrandingSnapshot(snapshot);
-    if (!normalized) {
-      resetInvalidPublicBranding();
-      return;
-    }
-    acceptMonotonicBranding({ snapshot: normalized });
-  }, [acceptMonotonicBranding, resetInvalidPublicBranding]);
+    // A completed admin save supersedes any public read started before it.
+    requestRef.current?.abort();
+    commitBranding(parseBrandingSnapshot(snapshot));
+  }, [commitBranding]);
 
   useEffect(() => {
-    let stopped = false;
-    let requestSequence = 0;
-    let controller: AbortController | null = null;
-    let storageTimer: number | null = null;
-
-    const startRequest = (cached: BrandingCache | null) => {
-      requestSequence += 1;
-      const sequence = requestSequence;
-      const requestBaseline = brandingRef.current;
-      controller?.abort();
-      controller = new AbortController();
-      void fetchPublicBranding(cached, controller.signal).then((next) => {
-        if (stopped || sequence !== requestSequence) return;
-        if (!next) {
-          if (sameBrandingSnapshot(brandingRef.current, requestBaseline)) {
-            resetInvalidPublicBranding();
-          }
-          return;
-        }
-        acceptPublicBranding(next, requestBaseline);
+    const refresh = () => {
+      requestRef.current?.abort();
+      const controller = new AbortController();
+      requestRef.current = controller;
+      void fetchPublicBranding(controller.signal).then((snapshot) => {
+        if (!controller.signal.aborted) commitBranding(snapshot);
       }).catch(() => undefined);
     };
-
     const onStorage = (event: StorageEvent) => {
-      if (event.key !== BRANDING_CACHE_KEY) return;
-      // A storage payload can be stale after a Manager rollback. Treat every
-      // event only as a hint and converge through an unconditional public GET.
-      requestSequence += 1;
-      controller?.abort();
-      if (storageTimer !== null) window.clearTimeout(storageTimer);
-      storageTimer = window.setTimeout(() => {
-        storageTimer = null;
-        startRequest(null);
-      }, STORAGE_REVALIDATE_DELAY_MS);
+      // Other tabs provide an invalidation hint, never authoritative data.
+      if (event.key === BRANDING_CACHE_KEY || event.key === null) refresh();
     };
-
-    // Normalize an invalid cached ETag once at mount, before the initial
-    // conditional request. Storage events themselves never write cache data.
-    if (cacheRef.current) writeBrandingCache(cacheRef.current);
-    else clearBrandingCache();
-    startRequest(cacheRef.current);
+    refresh();
     window.addEventListener("storage", onStorage);
     return () => {
-      stopped = true;
-      requestSequence += 1;
-      controller?.abort();
-      if (storageTimer !== null) window.clearTimeout(storageTimer);
+      requestRef.current?.abort();
       window.removeEventListener("storage", onStorage);
     };
-  }, [acceptPublicBranding, resetInvalidPublicBranding]);
+  }, [commitBranding]);
 
   useEffect(() => {
     document.title = branding.product_name;
