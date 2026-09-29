@@ -1045,7 +1045,6 @@ class EnterpriseService:
         self._telegram_delivery_wakeup = threading.Event()
         self._telegram_delivery_thread: threading.Thread | None = None
         self._telegram_delivery_handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None
-        self._telegram_delivery_generation = 0
         self._schedule_wakeup = threading.Event()
         self._schedule_dispatch_lock = threading.Lock()
         self._schedule_thread: threading.Thread | None = None
@@ -1070,7 +1069,6 @@ class EnterpriseService:
         if self._uses_default_agent_client:
             self.agent_client = self._new_agent_runtime_client()
         self._cleanup_incomplete_attachment_messages()
-        self._cleanup_orphan_attachment_files()
         self._recover_durable_work()
         self._start_learning_worker()
         self._start_schedule_worker()
@@ -2454,10 +2452,6 @@ class EnterpriseService:
             )
         return int(self.config.token_ttl_seconds or DEFAULT_SESSION_TTL_SECONDS)
 
-    def refresh_browser_session(self, token: str | None) -> str | None:
-        if not self.user_from_token(token):
-            return None
-        return self.tokens.maybe_refresh(token)
 
     def public_base_url(self) -> str:
         return (self.get_setting(PLATFORM_SETTING_PUBLIC_BASE_URL) or self.config.public_base_url).rstrip("/")
@@ -3249,22 +3243,30 @@ class EnterpriseService:
         )
 
     def user_from_token(self, token: str | None) -> dict[str, Any] | None:
-        if not token:
-            return None
-        payload = self.tokens.verify(token)
-        if not payload:
-            return None
+        user, _ = self.authenticate_session(token)
+        return user
+
+    def authenticate_session(
+        self, token: str | None, *, renew: bool = False,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Authenticate once; optionally renew a verified browser session."""
+        current = int(time.time())
+        payload = self.tokens.verify(token, now=current) if token else None
+        if payload is None:
+            return None, None
         row = self.db.query_one(
             "SELECT * FROM users WHERE id = ?",
             (payload.user_id,),
         )
         if not row or not row.get("active"):
-            return None
-        # Reject tokens minted before a session-invalidating change (password
-        # reset, role/permission change, deactivation, explicit revoke).
+            return None, None
+        # Renewal keeps the authenticated version; it cannot extend a revoked session.
         if int(row.get("token_version") or 1) != int(payload.version):
-            return None
-        return self.public_user(row)
+            return None, None
+        renewed = None
+        if renew and payload.expires_at - current < (self.tokens.ttl_seconds + 1) // 2:
+            renewed = self.tokens.issue(payload.user_id, payload.version, now=current)
+        return self.public_user(row), renewed
 
     def revoke_user_sessions(self, user_id: int) -> None:
         """Invalidate all outstanding session tokens for a user."""
@@ -4083,25 +4085,25 @@ class EnterpriseService:
     def register_telegram_delivery_handler(
         self,
         handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None],
-    ) -> int:
+    ) -> Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None]:
         """Install the current Bot API sender and start the bounded outbox worker."""
 
         with self._telegram_delivery_lock:
-            self._telegram_delivery_generation += 1
             self._telegram_delivery_handler = handler
-            generation = self._telegram_delivery_generation
             self._ensure_telegram_delivery_worker_locked()
         self._telegram_delivery_wakeup.set()
-        return generation
+        return handler
 
-    def unregister_telegram_delivery_handler(self, generation: int | None = None) -> None:
+    def unregister_telegram_delivery_handler(
+        self,
+        handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None,
+    ) -> None:
         """Revoke one sender registration without disturbing a newer gateway."""
 
         with self._telegram_delivery_lock:
-            if generation is not None and int(generation) != self._telegram_delivery_generation:
+            if handler is not None and self._telegram_delivery_handler is not handler:
                 return
             self._telegram_delivery_handler = None
-            self._telegram_delivery_generation += 1
         self._telegram_delivery_wakeup.set()
 
     def _ensure_telegram_delivery_worker_locked(self) -> None:
@@ -4227,7 +4229,6 @@ class EnterpriseService:
                 continue
             with self._telegram_delivery_lock:
                 handler = self._telegram_delivery_handler
-                generation = self._telegram_delivery_generation
             if handler is None or not self.telegram_enabled():
                 self._telegram_delivery_wakeup.wait(TELEGRAM_DELIVERY_POLL_SECONDS)
                 self._telegram_delivery_wakeup.clear()
@@ -4246,14 +4247,11 @@ class EnterpriseService:
                 if self._maintenance_reservation_active():
                     break
                 with self._telegram_delivery_lock:
-                    registration_is_current = (
-                        self._telegram_delivery_handler is handler
-                        and self._telegram_delivery_generation == generation
-                    )
+                    registration_is_current = self._telegram_delivery_handler is handler
                 if not registration_is_current or not self.telegram_enabled():
                     break
                 try:
-                    self._process_telegram_delivery_job(job, handler, generation)
+                    self._process_telegram_delivery_job(job, handler)
                 except Exception as exc:
                     # Keep the fixed worker alive across an unexpected malformed
                     # row or transient SQLite failure. A future pass/restart sees
@@ -4267,7 +4265,6 @@ class EnterpriseService:
         self,
         job: DurableJob,
         handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None],
-        generation: int,
     ) -> None:
         if self._maintenance_reservation_active():
             return
@@ -4276,7 +4273,7 @@ class EnterpriseService:
         except ServiceError:
             return
         try:
-            self._process_telegram_delivery_job_admitted(job, handler, generation)
+            self._process_telegram_delivery_job_admitted(job, handler)
         finally:
             self._end_agent_update_admission()
 
@@ -4284,7 +4281,6 @@ class EnterpriseService:
         self,
         job: DurableJob,
         handler: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None],
-        generation: int,
     ) -> None:
         payload = job.payload
         text_delivery = str(payload.get("delivery_type") or "") == "text"
@@ -4407,7 +4403,7 @@ class EnterpriseService:
             # Reserve the current registration immediately before transport,
             # but never hold the configuration lock across network I/O. A send
             # already reserved before revocation may finish as an in-flight
-            # request; no later job can reserve the stale generation, and
+            # request; no later job can reserve the stale handler, and
             # shutdown/token rotation cannot block for the Bot API's 60s file
             # timeout merely trying to acquire this lock.
             with self._telegram_delivery_lock:
@@ -4416,7 +4412,6 @@ class EnterpriseService:
                     or self._auto_update_reserved
                     or not self.telegram_enabled()
                     or self._telegram_delivery_handler is not handler
-                    or self._telegram_delivery_generation != int(generation)
                 ):
                     self.jobs.requeue(job.id, error="Telegram delivery handler was revoked")
                     return
@@ -4847,7 +4842,6 @@ class EnterpriseService:
                         secret=key in {TELEGRAM_SECRET_BOT_TOKEN, TELEGRAM_SECRET_WEBHOOK_SECRET},
                     )
             self._telegram_delivery_handler = None
-            self._telegram_delivery_generation += 1
         self._telegram_delivery_wakeup.set()
         self._restart_telegram_gateway()
         return self.telegram_admin_config(actor)
@@ -7258,9 +7252,7 @@ class EnterpriseService:
 
 
     def _mail_actor(self, actor: dict[str, Any]) -> dict[str, Any]:
-        current = self.get_user(int(actor.get("id") or 0))
-        if current is None or not current.get("active"):
-            raise ServiceError(401, "mail account owner is unavailable")
+        current = self._fresh_active_actor(actor)
         require_permission(current, PERMISSION_PRIVATE_AGENT)
         return current
 
@@ -7853,7 +7845,7 @@ class EnterpriseService:
                     if self._auto_update_reserved:
                         break
                 try:
-                    self._poll_mail_account(account)
+                    self._check_mail_account_row(account)
                 except Exception as exc:
                     if isinstance(exc, ServiceError) and exc.status == 503:
                         break
@@ -7875,13 +7867,6 @@ class EnterpriseService:
                     )
             self._mail_wakeup.wait(MAIL_POLL_MAX_SECONDS)
             self._mail_wakeup.clear()
-
-    def _poll_mail_account(self, account: dict[str, Any]) -> dict[str, Any]:
-        """Poll one account. The complete checkpoint/wake implementation is
-        kept below with the public mail API so account ownership stays local.
-        """
-
-        return self._check_mail_account_row(account)
 
     def _start_schedule_worker(self) -> None:
         with self._conversation_lock:
@@ -8247,18 +8232,9 @@ class EnterpriseService:
                     # update based on the pre-dispatch snapshot cannot overwrite
                     # this state transition with an inconsistent hybrid.
                     schedule_fields["revision"] = revision + 1
-                    definition = self.schedules.decoded_schedule(locked_schedule)
-                    if str(definition.get("type")) == "once":
-                        schedule_fields.update(
-                            {"state": "completed", "enabled": 0, "next_run_at": None}
-                        )
-                    else:
-                        following = next_occurrence(
-                            definition,
-                            timezone_name=str(locked_schedule.get("timezone") or "UTC"),
-                            after=max(now_ts(), int(scheduled_for)),
-                        )
-                        schedule_fields["next_run_at"] = following
+                    schedule_fields.update(
+                        self._schedule_advancement(locked_schedule, scheduled_for, now_ts())
+                    )
                 assignments = ", ".join(f"{key} = ?" for key in schedule_fields)
                 conn.execute(
                     f"UPDATE agent_schedules SET {assignments} WHERE id = ?",
@@ -8335,6 +8311,26 @@ class EnterpriseService:
                     reason=reason,
                 )
 
+    def _schedule_advancement(
+        self, schedule: dict[str, Any], scheduled_for: int, timestamp: int
+    ) -> dict[str, Any]:
+        definition = self.schedules.decoded_schedule(schedule)
+        # A triggered or skipped one-shot is consumed, even if the clock moved.
+        following = (
+            None
+            if str(definition.get("type")) == "once"
+            else next_occurrence(
+                definition,
+                timezone_name=str(schedule.get("timezone") or "UTC"),
+                after=max(timestamp, int(scheduled_for)),
+            )
+        )
+        return {
+            "state": "completed" if following is None else "active",
+            "enabled": int(following is not None),
+            "next_run_at": following,
+        }
+
     def _skip_schedule_occurrence_locked(
         self,
         conn,
@@ -8374,22 +8370,7 @@ class EnterpriseService:
         ).fetchone()
         if run is None:
             raise RuntimeError("skipped schedule run insert did not produce a row")
-        definition = self.schedules.decoded_schedule(schedule)
-        if str(definition.get("type")) == "once":
-            # A one-shot occurrence cannot be replayed at its original instant.
-            # Record the missed attempt explicitly and make it a clear terminal
-            # definition; recurring schedules alone coalesce forward and resume.
-            state = "completed"
-            enabled = 0
-            following = None
-        else:
-            state = "active"
-            enabled = 1
-            following = next_occurrence(
-                definition,
-                timezone_name=str(schedule.get("timezone") or "UTC"),
-                after=max(timestamp, int(scheduled_for)),
-            )
+        advancement = self._schedule_advancement(schedule, scheduled_for, timestamp)
         conn.execute(
             """
             UPDATE agent_schedules
@@ -8398,9 +8379,9 @@ class EnterpriseService:
             WHERE id = ?
             """,
             (
-                state,
-                enabled,
-                following,
+                advancement["state"],
+                advancement["enabled"],
+                advancement["next_run_at"],
                 schedule.get("last_run_id") if preserve_current else int(run["id"]),
                 str(reason)[:2000],
                 revision if preserve_current else revision + 1,
@@ -17427,9 +17408,9 @@ class EnterpriseService:
         Callers may already hold ``_conversation_lock``; both locks are
         re-entrant so all deletion paths share the same ordering.  The database
         transition commits before best-effort unlinks. A crash after commit can
-        therefore leave only an unreferenced blob, which startup reconciliation
-        removes, never a live attachment row pointing at an intentionally
-        deleted message.
+        therefore leave only an unreferenced blob, never a live attachment row
+        pointing at an intentionally deleted message. Startup only repairs
+        interrupted uploads; it does not scan historical unreferenced blobs.
         """
 
         ids = sorted({int(message_id) for message_id in message_ids if int(message_id) > 0})
@@ -17490,41 +17471,23 @@ class EnterpriseService:
             except OSError:
                 pass
 
-    def _cleanup_orphan_attachment_files(self) -> None:
-        """Remove attachment blobs that have no database row after a crash."""
-
-        with self._attachment_lock:
-            root = self._attachment_root().resolve()
-            referenced: set[Path] = set()
-            for row in self.db.query("SELECT storage_path FROM attachments"):
-                path = (root / str(row["storage_path"])).resolve()
-                if root != path and root not in path.parents:
-                    continue
-                referenced.add(path)
-            for path in root.rglob("*"):
-                if not path.is_file():
-                    continue
-                try:
-                    resolved = path.resolve()
-                except OSError:
-                    continue
-                if resolved not in referenced:
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
-
     def _cleanup_incomplete_attachment_messages(self) -> None:
-        """Discard messages interrupted before their attachment commit."""
+        """Discard interrupted messages and only their possible orphan blobs."""
 
         message_ids: list[int] = []
         for row in self.db.query(
-            "SELECT id, metadata_json FROM messages WHERE metadata_json LIKE ?",
+            "SELECT id, scope_type, scope_id, metadata_json FROM messages WHERE metadata_json LIKE ?",
             ('%"_attachment_commit":"pending"%',),
         ):
             metadata = decode_json(row.get("metadata_json"))
             if isinstance(metadata, dict) and metadata.get("_attachment_commit") == "pending":
                 message_ids.append(int(row["id"]))
+                # Blob names carry the message id even if their row transaction
+                # never committed. Repair that prefix, not the whole blob tree.
+                root = self._attachment_root().resolve()
+                directory = (root / str(row["scope_type"]) / str(row["scope_id"])).resolve()
+                if root in directory.parents:
+                    self._unlink_attachment_paths(list(directory.glob(f"{int(row['id'])}-*")))
         self._delete_message_ids(
             message_ids,
             reason="message attachment commit was interrupted by service restart",

@@ -66,3 +66,26 @@ class AdminWriteAuthorizationTests(unittest.TestCase):
                                     self.assertIn(error.status, (401, 403))
                         finally:
                             service.close()
+
+    def test_revoked_session_cannot_access_private_mail_accounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = EnterpriseService(make_config(Path(directory)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                service.revoke_user_sessions(actor["id"])
+                actions = {
+                    "list": lambda: service.list_private_mail_accounts(actor),
+                    "get": lambda: service.get_private_mail_account(actor, 1),
+                    "create": lambda: service.create_private_mail_account(actor, {}),
+                    "update": lambda: service.update_private_mail_account(actor, 1, {}),
+                    "delete": lambda: service.delete_private_mail_account(actor, 1),
+                    "test": lambda: service.test_private_mail_account(actor, 1),
+                    "check": lambda: service.check_private_mail_account(actor, 1),
+                }
+                for name, action in actions.items():
+                    with self.subTest(operation=name):
+                        with self.assertRaises(ServiceError) as rejected:
+                            action()
+                        self.assertEqual(rejected.exception.status, 401)
+            finally:
+                service.close()

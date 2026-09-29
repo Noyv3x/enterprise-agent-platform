@@ -1677,8 +1677,6 @@ class ScheduleServiceTests(unittest.TestCase):
 
                 with service._telegram_delivery_lock:
                     service._telegram_delivery_handler = handler
-                    service._telegram_delivery_generation += 1
-                    generation = service._telegram_delivery_generation
 
                 original_lock = service._telegram_identity_delivery_lock
 
@@ -1695,7 +1693,7 @@ class ScheduleServiceTests(unittest.TestCase):
                 ):
                     worker = threading.Thread(
                         target=service._process_telegram_delivery_job,
-                        args=(delivery, handler, generation),
+                        args=(delivery, handler),
                         name="scheduled-telegram-race",
                     )
                     worker.start()
@@ -1752,8 +1750,6 @@ class ScheduleServiceTests(unittest.TestCase):
 
                 with service._telegram_delivery_lock:
                     service._telegram_delivery_handler = handler
-                    service._telegram_delivery_generation += 1
-                    generation = service._telegram_delivery_generation
 
                 original_lock = service._telegram_identity_delivery_lock
                 lock_callers: list[int] = []
@@ -1773,7 +1769,7 @@ class ScheduleServiceTests(unittest.TestCase):
                 ):
                     worker = threading.Thread(
                         target=service._process_telegram_delivery_job,
-                        args=(delivery, handler, generation),
+                        args=(delivery, handler),
                         name="scheduled-telegram-revoke-race",
                     )
                     worker.start()

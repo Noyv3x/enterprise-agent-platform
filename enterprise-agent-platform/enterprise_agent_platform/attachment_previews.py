@@ -40,11 +40,13 @@ class AttachmentPreviewError(ValueError):
     """A bounded, user-facing attachment preview failure."""
 
 
-def extract_xlsx_preview(data: bytes) -> dict[str, object]:
-    """Return a bounded, text-only preview of an OOXML workbook."""
+def _extract_office_preview(data: bytes, suffix: str) -> dict[str, object]:
+    """Share the archive safety boundary across the three OOXML formats."""
 
-    if not data or len(data) > MAX_XLSX_PREVIEW_BYTES or not data.startswith(b"PK"):
-        raise AttachmentPreviewError("XLSX preview input is invalid")
+    maximum = MAX_XLSX_PREVIEW_BYTES if suffix == ".xlsx" else MAX_DOCUMENT_PREVIEW_BYTES
+    kind = suffix[1:].upper()
+    if not data or len(data) > maximum or not data.startswith(b"PK"):
+        raise AttachmentPreviewError(f"{kind} preview input is invalid")
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = _validate_archive(
@@ -52,52 +54,31 @@ def extract_xlsx_preview(data: bytes) -> dict[str, object]:
                 maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
                 maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
             )
-            _validate_archive_identity(archive, names, ".xlsx")
-            return {"kind": "xlsx", **_extract_xlsx_preview(archive, names)}
-    except AttachmentPreviewError:
-        raise
-    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-        raise AttachmentPreviewError("XLSX preview is malformed or unsupported") from exc
-
-
-def extract_docx_preview(data: bytes) -> dict[str, object]:
-    """Return a bounded, text-only preview of an OOXML document."""
-
-    if not data or len(data) > MAX_DOCUMENT_PREVIEW_BYTES or not data.startswith(b"PK"):
-        raise AttachmentPreviewError("DOCX preview input is invalid")
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = _validate_archive(
-                archive,
-                maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
-                maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
-            )
-            _validate_archive_identity(archive, names, ".docx")
-            return _extract_docx_preview(archive, names)
-    except AttachmentPreviewError:
-        raise
-    except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-        raise AttachmentPreviewError("DOCX preview is malformed or unsupported") from exc
-
-
-def extract_pptx_preview(data: bytes) -> dict[str, object]:
-    """Return a bounded, text-only preview of an OOXML presentation."""
-
-    if not data or len(data) > MAX_DOCUMENT_PREVIEW_BYTES or not data.startswith(b"PK"):
-        raise AttachmentPreviewError("PPTX preview input is invalid")
-    try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = _validate_archive(
-                archive,
-                maximum_entries=MAX_XLSX_PREVIEW_ARCHIVE_ENTRIES,
-                maximum_uncompressed_bytes=MAX_XLSX_PREVIEW_UNCOMPRESSED_BYTES,
-            )
-            _validate_archive_identity(archive, names, ".pptx")
+            _validate_archive_identity(archive, names, suffix)
+            if suffix == ".xlsx":
+                return {"kind": "xlsx", **_extract_xlsx_preview(archive, names)}
+            if suffix == ".docx":
+                return _extract_docx_preview(archive, names)
             return _extract_pptx_preview(archive, names)
     except AttachmentPreviewError:
         raise
     except (OSError, RuntimeError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-        raise AttachmentPreviewError("PPTX preview is malformed or unsupported") from exc
+        raise AttachmentPreviewError(f"{kind} preview is malformed or unsupported") from exc
+
+
+def extract_xlsx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML workbook."""
+    return _extract_office_preview(data, ".xlsx")
+
+
+def extract_docx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML document."""
+    return _extract_office_preview(data, ".docx")
+
+
+def extract_pptx_preview(data: bytes) -> dict[str, object]:
+    """Return a bounded, text-only preview of an OOXML presentation."""
+    return _extract_office_preview(data, ".pptx")
 
 
 def extract_pdf_preview(data: bytes) -> dict[str, object]:

@@ -156,6 +156,7 @@ class _CronExpression:
         # would incorrectly turn ``0 0 */1 * 1`` into an every-day schedule.
         self.day_wildcard = self.days == set(range(1, 32))
         self.weekday_wildcard = self.weekdays == set(range(0, 7))
+        self.minute_values = sorted(hour * 60 + minute for hour in self.hours for minute in self.minutes)
 
     @staticmethod
     def _parse_field(raw: str, minimum: int, maximum: int) -> set[int]:
@@ -202,6 +203,17 @@ class _CronExpression:
             raise ValueError("cron field must not be empty")
         return values
 
+    @staticmethod
+    def _epoch_for(candidate_date: date, minute_of_day: int, tz: ZoneInfo) -> int | None:
+        naive = datetime.combine(candidate_date, datetime.min.time()) + timedelta(
+            minutes=minute_of_day
+        )
+        # Use only the first occurrence of a repeated hour and reject gap times.
+        utc = naive.replace(tzinfo=tz, fold=0).astimezone(timezone.utc)
+        if utc.astimezone(tz).replace(tzinfo=None, fold=0) != naive:
+            return None
+        return int(utc.timestamp())
+
     def next_after(self, timestamp: int, tz: ZoneInfo) -> int:
         after = int(timestamp)
         local_start = datetime.fromtimestamp(after, timezone.utc).astimezone(tz).date()
@@ -211,42 +223,17 @@ class _CronExpression:
             candidate_date = local_start + timedelta(days=offset)
             if candidate_date.month not in self.months or not self._date_matches(candidate_date):
                 continue
-            for hour in sorted(self.hours):
-                for minute in sorted(self.minutes):
-                    naive = datetime(
-                        candidate_date.year,
-                        candidate_date.month,
-                        candidate_date.day,
-                        hour,
-                        minute,
-                    )
-                    # fold=0 intentionally chooses only the first occurrence in
-                    # a repeated DST hour. A round trip rejects nonexistent gap
-                    # times rather than silently moving them by an hour.
-                    aware = naive.replace(tzinfo=tz, fold=0)
-                    utc = aware.astimezone(timezone.utc)
-                    if utc.astimezone(tz).replace(tzinfo=None, fold=0) != naive:
-                        continue
-                    epoch = int(utc.timestamp())
-                    if epoch > after:
-                        return epoch
+            for minute_of_day in self.minute_values:
+                epoch = self._epoch_for(candidate_date, minute_of_day, tz)
+                if epoch is not None and epoch > after:
+                    return epoch
         raise ValueError("cron expression has no occurrence within eight years")
 
     def validate_minimum_interval(self, minimum_seconds: int, tz: ZoneInfo) -> None:
-        minute_values = sorted(hour * 60 + minute for hour in self.hours for minute in self.minutes)
+        minute_values = self.minute_values
         gaps = [right - left for left, right in zip(minute_values, minute_values[1:])]
         if gaps and min(gaps) * 60 < int(minimum_seconds):
             raise ValueError(f"cron occurrences must be at least {minimum_seconds} seconds apart")
-
-        def epoch_for(candidate_date: date, minute_of_day: int) -> int | None:
-            naive = datetime.combine(candidate_date, datetime.min.time()) + timedelta(
-                minutes=minute_of_day
-            )
-            aware = naive.replace(tzinfo=tz, fold=0)
-            utc = aware.astimezone(timezone.utc)
-            if utc.astimezone(tz).replace(tzinfo=None, fold=0) != naive:
-                return None
-            return int(utc.timestamp())
 
         def transition_day(candidate_date: date) -> bool:
             # ZoneInfo does not expose its transition table publicly. A small
@@ -273,7 +260,7 @@ class _CronExpression:
             epochs = [
                 epoch
                 for minute_of_day in values_to_check
-                if (epoch := epoch_for(candidate_date, minute_of_day)) is not None
+                if (epoch := self._epoch_for(candidate_date, minute_of_day, tz)) is not None
             ]
             if not epochs:
                 continue

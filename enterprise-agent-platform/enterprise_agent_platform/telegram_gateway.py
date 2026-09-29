@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
 from .service import EnterpriseService, ServiceError, UploadedFile
 
@@ -166,7 +166,7 @@ class TelegramGateway:
         self._offset: int | None = None
         self._autostart = autostart
         self._wait_for_response = wait_for_response
-        self._delivery_registration: int | None = None
+        self._delivery_registration: Callable[[dict[str, Any], dict[str, Any], dict[str, Any]], None] | None = None
         register_delivery = getattr(self.service, "register_telegram_delivery_handler", None)
         if callable(register_delivery):
             self._delivery_registration = register_delivery(self._deliver_agent_response)

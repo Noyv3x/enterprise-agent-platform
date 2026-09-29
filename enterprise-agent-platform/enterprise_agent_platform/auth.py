@@ -114,12 +114,3 @@ class TokenSigner:
             return None
         return payload
 
-    def maybe_refresh(self, token: str, *, now: int | None = None) -> str | None:
-        current = int(time.time() if now is None else now)
-        payload = self.verify(token, now=current)
-        if payload is None:
-            return None
-        remaining = payload.expires_at - current
-        if remaining >= (self._ttl_seconds + 1) // 2:
-            return None
-        return self.issue(payload.user_id, payload.version, now=current)

@@ -2728,7 +2728,7 @@ class PlatformServiceTests(unittest.TestCase):
 
                 # Rotation disables the old registration before enabling and
                 # installing the replacement. Stopping the stale gateway after
-                # that must not unregister the newer generation.
+                # that must not unregister the newer sender.
                 service.unregister_telegram_delivery_handler()
                 service.set_setting("telegram_enabled", "1")
                 new_bot = FakeTelegramBot()
@@ -5055,6 +5055,17 @@ class PlatformServiceTests(unittest.TestCase):
             first = EnterpriseService(config, agent_client=RecordingAgent())
             try:
                 _, admin = first.authenticate("admin", "admin")
+                saved = first._append_message(
+                    scope_type="private",
+                    scope_id=str(admin["id"]),
+                    author_type="agent",
+                    user_id=None,
+                    username="Agent",
+                    content="committed attachment",
+                    metadata={},
+                    attachments=[UploadedFile("saved.txt", "text/plain", b"saved")],
+                )
+                saved_attachment = saved["attachments"][0]
                 with mock.patch.object(first, "_store_attachments", side_effect=SystemExit("simulated kill")):
                     with self.assertRaises(SystemExit):
                         first._append_message(
@@ -5068,11 +5079,16 @@ class PlatformServiceTests(unittest.TestCase):
                             attachments=[UploadedFile("required.txt", "text/plain", b"required")],
                         )
                 pending = first.db.query_one(
-                    "SELECT metadata_json FROM messages WHERE content = ?",
+                    "SELECT id, metadata_json FROM messages WHERE content = ?",
                     ("must not run without its attachment",),
                 )
                 self.assertIsNotNone(pending)
                 self.assertEqual(json.loads(pending["metadata_json"])["_attachment_commit"], "pending")
+                directory = first._attachment_root() / "private" / str(admin["id"])
+                interrupted = directory / f"{pending['id']}-interrupted.txt"
+                interrupted.write_bytes(b"written before the attachment row committed")
+                legacy_orphan = directory / "legacy-untracked.txt"
+                legacy_orphan.write_bytes(b"not part of the interrupted message")
             finally:
                 first.close()
 
@@ -5087,11 +5103,11 @@ class PlatformServiceTests(unittest.TestCase):
                     )
                 )
                 self.assertEqual(agent.calls, [])
-                self.assertEqual(second.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
-                self.assertEqual(
-                    [path for path in second._attachment_root().rglob("*") if path.is_file()],
-                    [],
-                )
+                self.assertEqual(second.db.scalar("SELECT COUNT(*) FROM attachments"), 1)
+                _, saved_path = second.get_attachment_file(admin, saved_attachment["id"])
+                self.assertEqual(saved_path.read_bytes(), b"saved")
+                self.assertFalse(interrupted.exists())
+                self.assertEqual(legacy_orphan.read_bytes(), b"not part of the interrupted message")
             finally:
                 second.close()
 
@@ -6198,20 +6214,30 @@ class PlatformServiceTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
-    def test_token_signer_refreshes_only_after_half_life(self):
-        from enterprise_agent_platform.auth import TokenSigner
-
-        signer = TokenSigner("unit-test-session-secret", ttl_seconds=100)
-        now = 1_700_000_000
-        token = signer.issue(7, 3, now=now)
-        self.assertIsNone(signer.maybe_refresh(token, now=now + 50))
-        refreshed = signer.maybe_refresh(token, now=now + 51)
-        self.assertIsNotNone(refreshed)
-        payload = signer.verify(refreshed, now=now + 51)
-        self.assertEqual(payload.user_id, 7)
-        self.assertEqual(payload.version, 3)
-        self.assertEqual(payload.expires_at, now + 151)
-        self.assertIsNone(signer.maybe_refresh(token, now=now + 101))
+    def test_session_renewal_respects_half_life_expiry_and_revocation(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(
+                replace(make_config(Path(td)), token_ttl_seconds=100),
+                agent_client=RecordingAgent(),
+            )
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                now = 1_700_000_000
+                token = service.tokens.issue(actor["id"], actor._token_version, now=now)
+                with mock.patch("enterprise_agent_platform.service.time.time", return_value=now + 101):
+                    self.assertEqual(service.authenticate_session(token, renew=True), (None, None))
+                with mock.patch("enterprise_agent_platform.service.time.time", return_value=now + 50):
+                    self.assertIsNone(service.authenticate_session(token, renew=True)[1])
+                with mock.patch("enterprise_agent_platform.service.time.time", return_value=now + 51):
+                    user, renewed = service.authenticate_session(token, renew=True)
+                    self.assertEqual(user["id"], actor["id"])
+                    payload = service.tokens.verify(renewed, now=now + 51)
+                    self.assertEqual(payload.version, actor._token_version)
+                    self.assertEqual(payload.expires_at, now + 151)
+                    service.revoke_user_sessions(actor["id"])
+                    self.assertEqual(service.authenticate_session(token, renew=True), (None, None))
+            finally:
+                service.close()
 
     def test_database_handles_concurrent_threads(self):
         with tempfile.TemporaryDirectory() as td:

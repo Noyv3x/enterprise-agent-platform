@@ -7,6 +7,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -94,6 +95,51 @@ class UploadStreamingTests(unittest.TestCase):
             if hasattr(os, "getuid"):
                 self.assertEqual(attachment.staged_path.stat().st_uid, os.getuid())
             self.assertLessEqual(source.largest_request, 64 * 1024)
+
+    def test_binary_boundary_lookalikes_survive_every_chunk_size_and_bare_close(self):
+        boundary = "upload-boundary"
+        payload = b"\x00\xff\r\n--upload-boundaryX\r\n--upload-boundary--X\r\nend"
+        for fragment_bytes in range(1, len(boundary) + 9):
+            for trailing_crlf in (True, False):
+                with self.subTest(fragment_bytes=fragment_bytes, trailing_crlf=trailing_crlf):
+                    body = multipart_body(boundary, payload)
+                    if not trailing_crlf:
+                        body = body[:-2]
+                    with tempfile.TemporaryDirectory() as td:
+                        _, attachments, _ = _parse_multipart_upload(
+                            FragmentedReader(body, fragment_bytes),
+                            length=len(body),
+                            content_type=f"multipart/form-data; boundary={boundary}",
+                            staging_root=Path(td),
+                        )
+                        self.assertEqual(attachments[0].staged_path.read_bytes(), payload)
+
+    def test_invalid_envelopes_and_file_limit_remove_staging(self):
+        boundary = "upload-boundary"
+        body = multipart_body(boundary, b"payload")
+        cases = [
+            (body[:-8], {}, 400),
+            (body + b"not whitespace", {}, 400),
+            (body + b" " * 1025, {}, 400),
+            (body.replace(b"Content-Type:", b"Invalid header\r\nContent-Type:"), {}, 400),
+            (body, {"MAX_ATTACHMENT_BYTES": 6}, 413),
+            (body, {"MAX_BODY_BYTES": 4}, 413),
+            (body, {"MAX_ATTACHMENTS_PER_MESSAGE": 0}, 400),
+        ]
+        for wire, limits, status in cases:
+            with self.subTest(status=status, limits=limits), tempfile.TemporaryDirectory() as td:
+                with ExitStack() as patches:
+                    for name, value in limits.items():
+                        patches.enter_context(mock.patch(f"enterprise_agent_platform.server.{name}", value))
+                    with self.assertRaises(ServiceError) as raised:
+                        _parse_multipart_upload(
+                            FragmentedReader(wire),
+                            length=len(wire),
+                            content_type=f"multipart/form-data; boundary={boundary}",
+                            staging_root=Path(td),
+                        )
+                self.assertEqual(raised.exception.status, status)
+                self.assertEqual(list(Path(td).iterdir()), [])
 
     def test_disconnect_removes_partial_staging_file(self):
         boundary = "----ubitech-disconnect-test"

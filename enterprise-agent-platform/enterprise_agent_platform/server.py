@@ -21,7 +21,11 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO
+
+from werkzeug.datastructures import Headers
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.sansio.multipart import Data, Epilogue, Field, MultipartDecoder, NeedData, Preamble
 
 from .config import PlatformConfig
 from .service import (
@@ -102,98 +106,47 @@ MAX_MULTIPART_BOUNDARY_BYTES = 200
 MAX_MULTIPART_EPILOGUE_BYTES = 1024
 
 
-class _BoundedMultipartInput:
-    """Incrementally consume one Content-Length-bounded multipart body."""
+class _UploadDecoder(MultipartDecoder):
+    """Werkzeug framing with the platform's existing strict boundary semantics.
 
-    def __init__(self, source: BinaryIO, length: int, boundary: bytes):
-        self._source = source
-        self._remaining = int(length)
-        self._buffer = bytearray()
-        self._part_marker = b"\r\n--" + boundary
+    Werkzeug accepts ``--boundary--X`` as a close delimiter. Our binary upload
+    contract treats it as payload. Keep this narrow adapter pinned to the
+    supported decoder version, with split-boundary regression coverage.
+    """
 
-    def _fill(self) -> None:
-        if self._remaining <= 0:
-            raise ServiceError(400, "incomplete multipart body")
-        chunk = self._source.read(min(UPLOAD_STREAM_CHUNK_BYTES, self._remaining))
-        if not chunk:
-            raise ServiceError(400, "incomplete multipart body")
-        if len(chunk) > self._remaining:
-            raise ServiceError(400, "invalid multipart body length")
-        self._remaining -= len(chunk)
-        self._buffer.extend(chunk)
+    def __init__(self, boundary: bytes):
+        super().__init__(
+            boundary,
+            max_form_memory_size=MAX_MULTIPART_HEADER_BYTES + UPLOAD_STREAM_CHUNK_BYTES + 4,
+        )
+        self.preamble_re = re.compile(rb"\A--" + re.escape(boundary) + rb"(\r\n)")
+        self.boundary_re = re.compile(
+            rb"\r\n--" + re.escape(boundary) + rb"(--(?=\r\n)|\r\n)"
+        )
 
-    def take_exact(self, size: int) -> bytes:
-        while len(self._buffer) < size:
-            self._fill()
-        value = bytes(self._buffer[:size])
-        del self._buffer[:size]
-        return value
+    def receive_data(self, data: bytes | None) -> None:
+        if data is None:
+            self.boundary_re = re.compile(
+                rb"\r\n--" + re.escape(self.boundary) + rb"(--(?=\r\n|\Z)|\r\n)"
+            )
+        super().receive_data(data)
 
-    def take_until(self, marker: bytes, *, limit: int) -> bytes:
-        while True:
-            index = self._buffer.find(marker)
-            if index >= 0:
-                if index > limit:
-                    raise ServiceError(400, "multipart part headers are too large")
-                value = bytes(self._buffer[:index])
-                del self._buffer[: index + len(marker)]
-                return value
-            if len(self._buffer) > limit + len(marker):
-                raise ServiceError(400, "multipart part headers are too large")
-            self._fill()
+    def _last_partial_boundary_index(self, data: bytes | bytearray) -> int:
+        # Keep the closing suffix and its CRLF lookahead across socket reads.
+        return min(
+            super()._last_partial_boundary_index(data),
+            max(0, len(data) - len(self.boundary) - 8),
+        )
 
-    def stream_part(self, writer: Callable[[bytes], None]) -> bool:
-        """Write one part body and return True for the final boundary."""
-
-        while True:
-            search_from = 0
-            while True:
-                index = self._buffer.find(self._part_marker, search_from)
-                if index < 0:
-                    break
-                suffix_offset = index + len(self._part_marker)
-                while len(self._buffer) < suffix_offset + 2 and self._remaining > 0:
-                    self._fill()
-                if len(self._buffer) < suffix_offset + 2:
-                    raise ServiceError(400, "incomplete multipart boundary")
-                suffix = bytes(self._buffer[suffix_offset : suffix_offset + 2])
-                suffix_is_valid = suffix == b"\r\n"
-                if suffix == b"--":
-                    while len(self._buffer) < suffix_offset + 4 and self._remaining > 0:
-                        self._fill()
-                    after_close = bytes(self._buffer[suffix_offset + 2 : suffix_offset + 4])
-                    suffix_is_valid = after_close in {b"", b"\r\n"}
-                if suffix_is_valid:
-                    if index:
-                        writer(bytes(self._buffer[:index]))
-                    del self._buffer[: suffix_offset + 2]
-                    return suffix == b"--"
-                search_from = index + 1
-
-            # Retain only enough bytes to recognize a marker split across two
-            # socket reads. Everything before that tail is definitively payload.
-            retain = len(self._part_marker) + 2
-            flush_bytes = len(self._buffer) - retain
-            if flush_bytes > 0:
-                writer(bytes(self._buffer[:flush_bytes]))
-                del self._buffer[:flush_bytes]
-            if self._remaining <= 0:
-                raise ServiceError(400, "multipart closing boundary is missing")
-            self._fill()
-
-    def finish(self) -> None:
-        epilogue_bytes = 0
-        whitespace = frozenset(b" \t\r\n")
-        while self._buffer or self._remaining:
-            if not self._buffer:
-                self._fill()
-            chunk = bytes(self._buffer)
-            self._buffer.clear()
-            epilogue_bytes += len(chunk)
-            if epilogue_bytes > MAX_MULTIPART_EPILOGUE_BYTES or any(
-                byte not in whitespace for byte in chunk
-            ):
-                raise ServiceError(400, "invalid multipart epilogue")
+    def _parse_headers(self, data: bytes | bytearray) -> Headers:
+        if len(data) > MAX_MULTIPART_HEADER_BYTES:
+            raise ServiceError(400, "multipart part headers are too large")
+        self.part = BytesParser(policy=policy.default).parsebytes(bytes(data) + b"\r\n\r\n")
+        if self.part.defects:
+            raise ServiceError(400, "invalid multipart part headers")
+        # Preserve email's filename/charset parsing and accepted dispositions.
+        # The decoder only needs a Field event to delimit the raw part body.
+        return Headers({"Content-Disposition": 'form-data; name=""'})
 
 
 def _multipart_boundary(content_type: str) -> bytes:
@@ -240,98 +193,90 @@ def _parse_multipart_upload(
     root = ensure_private_directory(staging_root)
     request_dir = Path(tempfile.mkdtemp(prefix="request-", dir=root))
     request_dir.chmod(0o700)
-    reader = _BoundedMultipartInput(source, length, boundary)
+    decoder = _UploadDecoder(boundary)
     attachments: list[UploadedFile] = []
     content = ""
     declared_files = 0
+    handle = None
+    remaining = length
     try:
-        opening = b"--" + boundary + b"\r\n"
-        if reader.take_exact(len(opening)) != opening:
-            raise ServiceError(400, "invalid multipart opening boundary")
-
-        final_boundary = False
-        while not final_boundary:
-            header_bytes = reader.take_until(b"\r\n\r\n", limit=MAX_MULTIPART_HEADER_BYTES)
-            try:
-                part = BytesParser(policy=policy.default).parsebytes(
-                    header_bytes + b"\r\n\r\n"
-                )
-            except Exception as exc:
-                raise ServiceError(400, "invalid multipart part headers") from exc
-            if part.defects:
-                raise ServiceError(400, "invalid multipart part headers")
-            transfer_encoding = str(part.get("Content-Transfer-Encoding") or "").strip().lower()
-            if transfer_encoding not in {"", "7bit", "8bit", "binary"}:
-                raise ServiceError(400, "encoded multipart file parts are not supported")
-
-            disposition = part.get_content_disposition()
-            name = part.get_param("name", header="content-disposition")
-            filename = part.get_filename()
-            if disposition in {"form-data", "attachment", "inline"} and filename is not None:
-                declared_files += 1
-                if declared_files > MAX_ATTACHMENTS_PER_MESSAGE:
-                    raise ServiceError(400, f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed")
-                staged_path = request_dir / f"part-{declared_files:04d}"
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                fd = os.open(str(staged_path), flags, 0o600)
+        while True:
+            event = decoder.next_event()
+            if isinstance(event, NeedData):
+                chunk = source.read(min(UPLOAD_STREAM_CHUNK_BYTES, remaining)) if remaining else None
+                if remaining and (not chunk or len(chunk) > remaining):
+                    raise ServiceError(400, "incomplete multipart body")
+                remaining -= len(chunk) if chunk else 0
+                decoder.receive_data(chunk)
+            elif isinstance(event, Preamble):
+                if event.data:
+                    raise ServiceError(400, "invalid multipart opening boundary")
+            elif isinstance(event, Field):
+                part = decoder.part
+                transfer_encoding = str(part.get("Content-Transfer-Encoding") or "").strip().lower()
+                if transfer_encoding not in {"", "7bit", "8bit", "binary"}:
+                    raise ServiceError(400, "encoded multipart file parts are not supported")
+                accepted = part.get_content_disposition() in {"form-data", "attachment", "inline"}
+                filename = part.get_filename() if accepted else None
+                is_content = accepted and filename is None and part.get_param(
+                    "name", header="content-disposition"
+                ) == "content"
+                content_bytes = bytearray()
                 size_bytes = 0
-                digest = hashlib.sha256()
-                try:
-                    with os.fdopen(fd, "wb") as handle:
-                        def write_file(chunk: bytes) -> None:
-                            nonlocal size_bytes
-                            if size_bytes + len(chunk) > MAX_ATTACHMENT_BYTES:
-                                raise ServiceError(
-                                    413,
-                                    f"attachment exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB",
-                                )
-                            handle.write(chunk)
-                            digest.update(chunk)
-                            size_bytes += len(chunk)
-
-                        final_boundary = reader.stream_part(write_file)
+                if filename is not None:
+                    declared_files += 1
+                    if declared_files > MAX_ATTACHMENTS_PER_MESSAGE:
+                        raise ServiceError(400, f"at most {MAX_ATTACHMENTS_PER_MESSAGE} attachments are allowed")
+                    staged_path = request_dir / f"part-{declared_files:04d}"
+                    fd = os.open(staged_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    handle = os.fdopen(fd, "wb")
+                    digest = hashlib.sha256()
+            elif isinstance(event, Data):
+                if handle is not None:
+                    size_bytes += len(event.data)
+                    if size_bytes > MAX_ATTACHMENT_BYTES:
+                        raise ServiceError(413, f"attachment exceeds {MAX_ATTACHMENT_BYTES // (1024 * 1024)} MB")
+                    handle.write(event.data)
+                    digest.update(event.data)
+                elif is_content:
+                    if len(content_bytes) + len(event.data) > MAX_BODY_BYTES:
+                        raise ServiceError(413, "message content is too large")
+                    content_bytes.extend(event.data)
+                if not event.more_data:
+                    if handle is not None:
                         handle.flush()
                         os.fsync(handle.fileno())
-                except BaseException:
-                    staged_path.unlink(missing_ok=True)
-                    raise
-                if filename == "" and size_bytes == 0:
-                    staged_path.unlink(missing_ok=True)
-                    continue
-                attachments.append(
-                    UploadedFile(
-                        filename=filename or "attachment",
-                        content_type=part.get_content_type(),
-                        data=None,
-                        staged_path=staged_path,
-                        size_bytes=size_bytes,
-                        sha256=digest.hexdigest(),
-                    )
-                )
-            elif disposition in {"form-data", "attachment", "inline"} and name == "content":
-                content_bytes = bytearray()
-
-                def write_content(chunk: bytes) -> None:
-                    if len(content_bytes) + len(chunk) > MAX_BODY_BYTES:
-                        raise ServiceError(413, "message content is too large")
-                    content_bytes.extend(chunk)
-
-                final_boundary = reader.stream_part(write_content)
-                charset = part.get_content_charset() or "utf-8"
-                try:
-                    content = bytes(content_bytes).decode(charset, errors="replace")
-                except LookupError as exc:
-                    raise ServiceError(400, "invalid multipart content charset") from exc
-            else:
-                final_boundary = reader.stream_part(lambda _chunk: None)
-
-        reader.finish()
-        return content, attachments, request_dir
+                        handle.close()
+                        handle = None
+                        if filename == "" and size_bytes == 0:
+                            staged_path.unlink()
+                        else:
+                            attachments.append(UploadedFile(
+                                filename=filename or "attachment",
+                                content_type=part.get_content_type(),
+                                data=None,
+                                staged_path=staged_path,
+                                size_bytes=size_bytes,
+                                sha256=digest.hexdigest(),
+                            ))
+                    elif is_content:
+                        try:
+                            content = content_bytes.decode(part.get_content_charset() or "utf-8", errors="replace")
+                        except LookupError as exc:
+                            raise ServiceError(400, "invalid multipart content charset") from exc
+            elif isinstance(event, Epilogue):
+                if len(event.data) > MAX_MULTIPART_EPILOGUE_BYTES or event.data.strip(b" \t\r\n"):
+                    raise ServiceError(400, "invalid multipart epilogue")
+                return content, attachments, request_dir
+    except (ValueError, RequestEntityTooLarge) as exc:
+        _remove_upload_staging_path(request_dir)
+        raise ServiceError(400, "invalid multipart body") from exc
     except BaseException:
         _remove_upload_staging_path(request_dir)
         raise
+    finally:
+        if handle is not None:
+            handle.close()
 
 
 class EnterpriseHTTPServer(ThreadingHTTPServer):
@@ -1364,13 +1309,11 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _require_user(self) -> dict[str, Any]:
         bearer = bearer_token(self.headers.get("Authorization", ""))
         token = self._read_token()
-        user = self.server.service.user_from_token(token)
+        user, renewed = self.server.service.authenticate_session(token, renew=not bearer)
         if not user:
             raise ServiceError(401, "authentication required")
-        if not bearer:
-            renewed = self.server.service.refresh_browser_session(token)
-            if renewed:
-                self._renewed_session_token = renewed
+        if renewed:
+            self._renewed_session_token = renewed
         return user
 
     def _read_token(self) -> str | None:
