@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .loopback_http import RejectRedirectHandler
+
 
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_DEVICE_USER_CODE_URL = "https://auth.openai.com/api/accounts/deviceauth/usercode"
@@ -112,7 +114,7 @@ class OAuthHTTPClient:
             opener = (
                 urllib.request.urlopen
                 if follow_redirects
-                else urllib.request.build_opener(_RejectOAuthRedirects()).open
+                else urllib.request.build_opener(RejectRedirectHandler()).open
             )
             with opener(request, timeout=timeout) as response:
                 text = _read_oauth_response_text(response)
@@ -122,11 +124,6 @@ class OAuthHTTPClient:
             return OAuthHTTPResponse(exc.code, _json_object(text), text)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise OAuthFlowError(502, f"OAuth network request failed: {exc}") from exc
-
-
-class _RejectOAuthRedirects(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        return None
 
 
 def _read_oauth_response_text(response: Any) -> str:

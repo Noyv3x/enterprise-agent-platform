@@ -146,7 +146,10 @@ describe("MessageList Agent work records", () => {
     expect(screen.queryByRole("region", { name: "AI work" })).toBeNull();
   });
 
-  it("shows a real tool call as an open live record whose running row has no evidence control", () => {
+  it.each([
+    { tool: "web", stage: "tool", label: "Web search" },
+    { tool: "browser", stage: "tool.started", label: "Browser" },
+  ])("shows running $tool work as an open live record without an evidence control", ({ tool, stage, label }) => {
     renderMessageList({
       state: "replying",
       replying_to: { username: "Administrator" },
@@ -154,9 +157,9 @@ describe("MessageList Agent work records", () => {
         { source: "platform", stage: "replying" },
         {
           source: "agent",
-          stage: "tool",
-          tool: "web",
-          tool_call_id: "web-1",
+          stage,
+          tool,
+          tool_call_id: `${tool}-1`,
           tool_status: "running",
         },
         { source: "agent", stage: "approval", detail: "Unrelated lifecycle row" },
@@ -168,7 +171,7 @@ describe("MessageList Agent work records", () => {
     expect(within(record).getAllByRole("button")[0]).toHaveAccessibleDescription("Agent is replying to Administrator");
     expect(screen.queryByText("Unrelated lifecycle row")).toBeNull();
     const row = within(record).getByRole("listitem");
-    expect(row).toHaveTextContent("Web search");
+    expect(row).toHaveTextContent(label);
     expect(within(row).queryByRole("button")).toBeNull();
   });
 

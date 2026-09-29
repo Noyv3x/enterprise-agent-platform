@@ -6,7 +6,7 @@ import urllib.request
 
 
 class RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Prevent a validated loopback request from leaving its original URL."""
+    """Prevent a credential-bearing request from following redirects."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -96,12 +96,6 @@ def build_loopback_opener() -> urllib.request.OpenerDirector:
         urllib.request.ProxyHandler({}),
         RejectRedirectHandler(),
     )
-
-
-def build_trusted_service_opener() -> urllib.request.OpenerDirector:
-    """Build a normal proxy-aware opener that never forwards across redirects."""
-
-    return urllib.request.build_opener(RejectRedirectHandler())
 
 
 def build_private_service_opener() -> urllib.request.OpenerDirector:

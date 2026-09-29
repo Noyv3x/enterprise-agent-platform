@@ -10,15 +10,14 @@ export interface ConversationLayoutProps {
   composer: ReactNode;
   /** Controls floated above the composer without taking flow height; only the controls themselves receive input. */
   floatingActions?: ReactNode;
-  companion?: ReactNode;
   notice?: ReactNode;
   threadRef?: Ref<HTMLDivElement>;
   onThreadScroll?: UIEventHandler<HTMLDivElement>;
   threadLabel: string;
 }
 /** The controller owns history anchors, unread state, focus, and all real-time subscriptions. */
-export function ConversationLayout({ header, children, composer, floatingActions, companion, notice, threadRef, onThreadScroll, threadLabel }: ConversationLayoutProps) {
-  return <div className={`wf-conversation${companion ? ' wf-conversation--with-companion' : ''}`}><div className="wf-conversation-header">{header}</div>{notice && <div className="wf-conversation-notice">{notice}</div>}<div className="wf-conversation-body"><div className="wf-conversation-column"><div className="wf-thread" ref={threadRef} onScroll={onThreadScroll} role="log" aria-label={threadLabel} aria-live="off" tabIndex={0}><div className="wf-thread-inner">{children}</div></div><div className="wf-composer-dock">{floatingActions && <div className="wf-composer-rail">{floatingActions}</div>}{composer}</div></div>{companion && <aside className="wf-companion">{companion}</aside>}</div></div>;
+export function ConversationLayout({ header, children, composer, floatingActions, notice, threadRef, onThreadScroll, threadLabel }: ConversationLayoutProps) {
+  return <div className="wf-conversation"><div className="wf-conversation-header">{header}</div>{notice && <div className="wf-conversation-notice">{notice}</div>}<div className="wf-conversation-body"><div className="wf-conversation-column"><div className="wf-thread" ref={threadRef} onScroll={onThreadScroll} role="log" aria-label={threadLabel} aria-live="off" tabIndex={0}><div className="wf-thread-inner">{children}</div></div><div className="wf-composer-dock">{floatingActions && <div className="wf-composer-rail">{floatingActions}</div>}{composer}</div></div></div></div>;
 }
 
 export interface ConversationJumpProps { label: string; count?: number; onClick: () => void }

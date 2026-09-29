@@ -2068,9 +2068,6 @@ class EnterpriseService:
             },
         }
 
-    def _message_has_agent_reply(self, scope_type: str, scope_id: str, message_id: int) -> bool:
-        return self.agent_message_replying_to(scope_type, scope_id, message_id) is not None
-
     def _durable_agent_message_job_index(self) -> tuple[set[int], set[int]]:
         """Build one startup-local index of persisted Agent reply ownership."""
 
@@ -6805,10 +6802,7 @@ class EnterpriseService:
         }
 
     def get_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        row = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if row is None:
-            raise ServiceError(404, "schedule not found")
+        actor, row = self._owned_schedule(actor, schedule_id)
         return {"schedule": self._public_schedule(row)}
 
     def private_schedule_runs(
@@ -6819,9 +6813,7 @@ class EnterpriseService:
         limit: int = 20,
         before_id: int | None = None,
     ) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        if self.schedules.get(int(actor["id"]), int(schedule_id)) is None:
-            raise ServiceError(404, "schedule not found")
+        actor, _ = self._owned_schedule(actor, schedule_id)
         clean_limit = max(1, min(int(limit), 100))
         if before_id is not None and int(before_id) <= 0:
             raise ServiceError(400, "before_id must be a positive integer")
@@ -6839,27 +6831,14 @@ class EnterpriseService:
         }
 
     def pause_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        row = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if row is None:
-            raise ServiceError(404, "schedule not found")
+        actor, row = self._owned_schedule(actor, schedule_id)
         if str(row["state"]) == "active":
-            row = self.schedules.update(
-                owner_user_id=int(actor["id"]),
-                schedule_id=int(schedule_id),
-                fields={"state": "paused", "enabled": 0, "revision": int(row.get("revision") or 1) + 1},
-                expected_revision=int(row.get("revision") or 1),
-            )
-            if row is None:
-                raise ServiceError(409, "schedule changed concurrently")
+            row = self._update_schedule_snapshot(actor, row, {"state": "paused", "enabled": 0})
         self._schedule_wakeup.set()
         return {"schedule": self._public_schedule(row)}
 
     def resume_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        row = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if row is None:
-            raise ServiceError(404, "schedule not found")
+        actor, row = self._owned_schedule(actor, schedule_id)
         definition = self.schedules.decoded_schedule(row)
         if str(row.get("state")) == "active" or (
             str(row.get("state")) == "completed" and str(definition.get("type")) == "once"
@@ -6874,7 +6853,6 @@ class EnterpriseService:
         except ValueError as exc:
             raise ServiceError(400, str(exc)) from exc
         fields: dict[str, Any] = {
-            "revision": int(row.get("revision") or 1) + 1,
             "last_error": "",
             "retry_after": 0,
         }
@@ -6882,22 +6860,12 @@ class EnterpriseService:
             fields.update({"state": "completed", "enabled": 0, "next_run_at": None})
         else:
             fields.update({"state": "active", "enabled": 1, "next_run_at": int(next_at)})
-        row = self.schedules.update(
-            owner_user_id=int(actor["id"]),
-            schedule_id=int(schedule_id),
-            fields=fields,
-            expected_revision=int(row.get("revision") or 1),
-        )
-        if row is None:
-            raise ServiceError(409, "schedule changed concurrently")
+        row = self._update_schedule_snapshot(actor, row, fields)
         self._schedule_wakeup.set()
         return {"schedule": self._public_schedule(row)}
 
     def run_private_schedule_now(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        row = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if row is None:
-            raise ServiceError(404, "schedule not found")
+        actor, row = self._owned_schedule(actor, schedule_id)
         materialized = self._materialize_schedule_occurrence(
             int(schedule_id),
             scheduled_for=now_ts(),
@@ -6910,23 +6878,10 @@ class EnterpriseService:
         }
 
     def delete_private_schedule(self, actor: dict[str, Any], schedule_id: int) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        row = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if row is None:
-            raise ServiceError(404, "schedule not found")
-        ts = now_ts()
-        updated = self.schedules.update(
-            owner_user_id=int(actor["id"]),
-            schedule_id=int(schedule_id),
-            fields={
-                "deleted_at": ts,
-                "enabled": 0,
-                "revision": int(row.get("revision") or 1) + 1,
-            },
-            expected_revision=int(row.get("revision") or 1),
+        actor, row = self._owned_schedule(actor, schedule_id)
+        self._update_schedule_snapshot(
+            actor, row, {"deleted_at": now_ts(), "enabled": 0}
         )
-        if updated is None:
-            raise ServiceError(409, "schedule changed concurrently")
         self._schedule_wakeup.set()
         return {"deleted": True, "id": int(schedule_id)}
 
@@ -6963,10 +6918,7 @@ class EnterpriseService:
         schedule_id: int,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        actor = self._schedule_actor(actor)
-        current = self.schedules.get(int(actor["id"]), int(schedule_id))
-        if current is None:
-            raise ServiceError(404, "schedule not found")
+        actor, current = self._owned_schedule(actor, schedule_id)
         fields: dict[str, Any] = {}
         if "name" in body:
             fields["name"] = self._validated_schedule_name(body.get("name"))
@@ -7014,17 +6966,9 @@ class EnterpriseService:
             if current.get(key) != value
         }
         if changed:
-            changed["revision"] = int(current.get("revision") or 1) + 1
             changed["last_error"] = ""
             changed["retry_after"] = 0
-            row = self.schedules.update(
-                owner_user_id=int(actor["id"]),
-                schedule_id=int(schedule_id),
-                fields=changed,
-                expected_revision=int(current.get("revision") or 1),
-            )
-            if row is None:
-                raise ServiceError(409, "schedule changed concurrently")
+            row = self._update_schedule_snapshot(actor, current, changed)
         else:
             row = current
         self._schedule_wakeup.set()
@@ -7035,6 +6979,29 @@ class EnterpriseService:
         actor = self._fresh_active_actor(actor)
         require_permission(actor, PERMISSION_PRIVATE_AGENT)
         return actor
+
+    def _owned_schedule(
+        self, actor: dict[str, Any], schedule_id: int
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        actor = self._schedule_actor(actor)
+        row = self.schedules.get(int(actor["id"]), int(schedule_id))
+        if row is None:
+            raise ServiceError(404, "schedule not found")
+        return actor, row
+
+    def _update_schedule_snapshot(
+        self, actor: dict[str, Any], current: dict[str, Any], fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        revision = int(current.get("revision") or 1)
+        row = self.schedules.update(
+            owner_user_id=int(actor["id"]),
+            schedule_id=int(current["id"]),
+            fields={**fields, "revision": revision + 1},
+            expected_revision=revision,
+        )
+        if row is None:
+            raise ServiceError(409, "schedule changed concurrently")
+        return row
 
     @staticmethod
     def _validated_schedule_name(value: Any) -> str:
@@ -7212,14 +7179,12 @@ class EnterpriseService:
         try:
             try:
                 result = self.mail_transport.test(account, password)
-            except MailGatewayError as exc:
-                with self._agent_update_admission():
-                    self.mail_accounts.record_check(int(account_id), error=str(exc))
-                raise ServiceError(502, str(exc)) from exc
-            except (imaplib.IMAP4.error, smtplib.SMTPException, OSError) as exc:
-                # Transport adapters normally convert these. Keep this boundary so
-                # a monkey-patched/test implementation still cannot expose secrets.
-                message = f"mail connection test failed: {type(exc).__name__}"
+            except (MailGatewayError, imaplib.IMAP4.error, smtplib.SMTPException, OSError) as exc:
+                # Raw transport exceptions may include secrets; only adapter errors are public.
+                message = (
+                    str(exc) if isinstance(exc, MailGatewayError)
+                    else f"mail connection test failed: {type(exc).__name__}"
+                )
                 with self._agent_update_admission():
                     self.mail_accounts.record_check(int(account_id), error=message)
                 raise ServiceError(502, message) from exc
@@ -9338,10 +9303,10 @@ class EnterpriseService:
                     scope_key, owner_user_id
                 )
                 affected.add((target, owner_user_id))
-                baselines.setdefault(
-                    (target, owner_user_id),
-                    self._memory_usage(conn, scope_key, target, owner_user_id),
-                )
+                if (target, owner_user_id) not in baselines:
+                    baselines[(target, owner_user_id)] = self._memory_usage(
+                        conn, scope_key, target, owner_user_id
+                    )
                 if action == "add":
                     content, content_hash = self._validated_memory_content(raw.get("content"))
                     tags = self._validated_memory_tags(
@@ -9854,38 +9819,27 @@ class EnterpriseService:
                     arguments=arguments,
                     context=context,
                 )
-            if action == "move":
-                uid = normalize_uid(arguments.get("uid"))
-                destination = normalize_folder(arguments.get("destination"))
-                self.mail_transport.move(
-                    account,
-                    password,
-                    folder=folder,
-                    uid=uid,
-                    destination=destination,
-                )
-                return {
-                    "status": "succeeded",
-                    "account_id": account_id,
-                    "uid": uid,
-                    "folder": folder,
-                    "destination": destination,
-                    "expunged": False,
-                }
-            if action == "mark":
-                uid = normalize_uid(arguments.get("uid"))
-                state = str(arguments.get("state") or "").strip().casefold()
-                self.mail_transport.mark(
-                    account, password, folder=folder, uid=uid, state=state
-                )
-                return {
-                    "status": "succeeded",
-                    "account_id": account_id,
-                    "uid": uid,
-                    "folder": folder,
-                    "state": state,
-                }
             uid = normalize_uid(arguments.get("uid"))
+            if action in {"move", "mark"}:
+                if action == "move":
+                    destination = normalize_folder(arguments.get("destination"))
+                    self.mail_transport.move(
+                        account, password, folder=folder, uid=uid, destination=destination
+                    )
+                    details = {"destination": destination, "expunged": False}
+                else:
+                    state = str(arguments.get("state") or "").strip().casefold()
+                    self.mail_transport.mark(
+                        account, password, folder=folder, uid=uid, state=state
+                    )
+                    details = {"state": state}
+                return {
+                    "status": "succeeded",
+                    "account_id": account_id,
+                    "uid": uid,
+                    "folder": folder,
+                    **details,
+                }
             try:
                 attachment_index = int(arguments.get("attachment_index"))
             except (TypeError, ValueError) as exc:
@@ -10193,14 +10147,10 @@ class EnterpriseService:
                     "category": str(arguments.get("category") or "").strip(),
                     "limit": MAX_SKILL_LIST_RESULTS,
                 }
-                if is_review:
-                    with self._learning_review_read_boundary(
-                        context, raw_scope_key
-                    ):
-                        skills = self.skills.list(
-                            scope.scope_key, **list_arguments
-                        )
-                else:
+                with (
+                    self._learning_review_read_boundary(context, raw_scope_key)
+                    if is_review else nullcontext()
+                ):
                     skills = self.skills.list(scope.scope_key, **list_arguments)
                 skills = [
                     skill
@@ -10208,40 +10158,22 @@ class EnterpriseService:
                     if skill.get("enabled") is True
                 ][:limit]
                 return {"skills": skills, "count": len(skills)}
-            if action == "load":
-                if is_review:
-                    with self._learning_review_read_boundary(
-                        context, raw_scope_key
-                    ):
-                        skill = self.skills.load(scope.scope_key, skill_id)
-                        if skill.get("enabled") is not True:
-                            raise ServiceError(409, "Agent skill is disabled")
-                        read_key = (
-                            int(context["review_job_id"]),
-                            str(context.get("run_id") or ""),
-                        )
-                        with self._learning_skill_reads_lock:
-                            self._learning_skill_reads.setdefault(
-                                read_key, set()
-                            ).add(skill_id)
-                else:
-                    skill = self.skills.load(scope.scope_key, skill_id)
+            if action in {"load", "read"}:
+                with (
+                    self._learning_review_read_boundary(context, raw_scope_key)
+                    if is_review else nullcontext()
+                ):
+                    reader = self.skills.load if action == "load" else self.skills.get
+                    skill = reader(scope.scope_key, skill_id)
                     if skill.get("enabled") is not True:
                         raise ServiceError(409, "Agent skill is disabled")
-                return {"skill": self._public_user_skill(skill)}
-            if action == "read":
-                if is_review:
-                    with self._learning_review_read_boundary(
-                        context, raw_scope_key
-                    ):
-                        skill = self.skills.get(scope.scope_key, skill_id)
-                        if skill.get("enabled") is not True:
-                            raise ServiceError(409, "Agent skill is disabled")
+                    if action == "read":
                         support = self.skills.read_support(
                             scope.scope_key,
                             skill_id,
                             str(arguments.get("file_path") or ""),
                         )
+                    if is_review:
                         read_key = (
                             int(context["review_job_id"]),
                             str(context.get("run_id") or ""),
@@ -10250,43 +10182,30 @@ class EnterpriseService:
                             self._learning_skill_reads.setdefault(
                                 read_key, set()
                             ).add(skill_id)
-                else:
-                    skill = self.skills.get(scope.scope_key, skill_id)
-                    if skill.get("enabled") is not True:
-                        raise ServiceError(409, "Agent skill is disabled")
-                    support = self.skills.read_support(
-                        scope.scope_key,
-                        skill_id,
-                        str(arguments.get("file_path") or ""),
-                    )
+                if action == "load":
+                    return {"skill": self._public_user_skill(skill)}
                 return {"id": skill_id, **support}
-            if action == "create":
-                create_arguments = {
-                    "name": arguments.get("name"),
-                    "description": arguments.get("description"),
-                    "instructions": arguments.get("instructions"),
-                    "category": arguments.get("category"),
-                    "version": arguments.get("version"),
-                    "tags": arguments.get("tags"),
-                    "enabled": True,
-                }
-                if is_review:
-                    with self._learning_review_skill_mutation_boundary(
-                        context, raw_scope_key
-                    ):
-                        skill = self.skills.create(
-                            scope.scope_key,
-                            **create_arguments,
-                            created_by="agent",
-                        )
-                    return {"skill": skill}
-                return {
-                    "skill": self.skills.create(
-                        scope.scope_key,
-                        **create_arguments,
-                        created_by="user",
+            if action in {"create", "update"}:
+                fields = {
+                    key: arguments.get(key)
+                    for key in (
+                        "name", "description", "instructions", "category", "version", "tags",
                     )
+                    if action == "create" or key in arguments
                 }
+                if action == "update":
+                    return {"skill": self.skills.update(scope.scope_key, skill_id, **fields)}
+                with (
+                    self._learning_review_skill_mutation_boundary(context, raw_scope_key)
+                    if is_review else nullcontext()
+                ):
+                    skill = self.skills.create(
+                        scope.scope_key,
+                        **fields,
+                        enabled=True,
+                        created_by="agent" if is_review else "user",
+                    )
+                return {"skill": skill}
             if action == "patch":
                 patch_arguments = {
                     "file_path": (
@@ -10300,10 +10219,11 @@ class EnterpriseService:
                         else arguments.get("expected_replacements")
                     ),
                 }
-                if is_review:
-                    with self._learning_review_skill_mutation_boundary(
-                        context, raw_scope_key
-                    ):
+                with (
+                    self._learning_review_skill_mutation_boundary(context, raw_scope_key)
+                    if is_review else nullcontext()
+                ):
+                    if is_review:
                         read_key = (int(context["review_job_id"]), str(context.get("run_id") or ""))
                         with self._learning_skill_reads_lock:
                             # The ledger entry is a same-process grant, while
@@ -10317,44 +10237,17 @@ class EnterpriseService:
                                 403,
                                 "learning review must load or read a skill before patching it",
                             )
-                        # The store holds its scope lock across both provenance
-                        # validation and replacement, so delete/recreate cannot
-                        # cross this final authorization-to-write boundary.
-                        skill = self.skills.patch_automatic(
-                            scope.scope_key,
-                            skill_id,
-                            str(arguments.get("old_string") or ""),
-                            str(arguments.get("new_string") or ""),
-                            **patch_arguments,
-                        )
-                    return {"skill": skill}
-                return {
-                    "skill": self.skills.patch(
+                    # Automatic patching holds the store's scope lock across
+                    # provenance validation and replacement, fencing recreate.
+                    patch = self.skills.patch_automatic if is_review else self.skills.patch
+                    skill = patch(
                         scope.scope_key,
                         skill_id,
                         str(arguments.get("old_string") or ""),
                         str(arguments.get("new_string") or ""),
                         **patch_arguments,
                     )
-                }
-            if action == "update":
-                fields = {
-                    key: arguments[key]
-                    for key in (
-                        "name",
-                        "description",
-                        "instructions",
-                        "category",
-                        "version",
-                        "tags",
-                    )
-                    if key in arguments
-                }
-                return {
-                    "skill": self.skills.update(
-                        scope.scope_key, skill_id, **fields
-                    )
-                }
+                return {"skill": skill}
             if action == "delete":
                 self.skills.delete(scope.scope_key, skill_id)
                 return {"deleted": True, "id": skill_id}
@@ -12532,7 +12425,7 @@ class EnterpriseService:
 
     def _validate_automatic_memory_write_context(
         self, body: dict[str, Any], scope_key: str
-    ) -> DurableJob | None:
+    ) -> None:
         """Fail closed unless this is the owner's current interactive private run."""
 
         scope = self.agent_scopes.get_scope(scope_key)
@@ -12575,8 +12468,55 @@ class EnterpriseService:
                 403,
                 "automatic memory writes require a top-level interactive private Agent run",
             )
-        return None
 
+
+    @staticmethod
+    def _memory_principal_matches(
+        conn: sqlite3.Connection,
+        scope_key: str,
+        lifecycle_id: str,
+        owner_user_id: int,
+        source_message_id: int | str,
+    ) -> bool:
+        """Read shared owner, lifecycle and input authority on the caller's snapshot."""
+        scope_row = conn.execute(
+            """
+            SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
+                   runtime.lifecycle_id
+            FROM agent_scopes AS scopes
+            JOIN agent_runtime_scopes AS runtime
+              ON runtime.scope_key = scopes.scope_key
+            WHERE scopes.scope_key = ?
+            """,
+            (scope_key,),
+        ).fetchone()
+        actor_row = conn.execute(
+            "SELECT id, active, permission_group, role FROM users WHERE id = ?",
+            (owner_user_id,),
+        ).fetchone()
+        source_row = conn.execute(
+            """
+            SELECT id FROM messages
+            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
+              AND author_type = 'user' AND user_id = ?
+            """,
+            (source_message_id, str(owner_user_id), owner_user_id),
+        ).fetchone()
+        actor_group = (
+            public_permission_group(dict(actor_row)) if actor_row is not None else ""
+        )
+        return (
+            scope_row is not None
+            and str(scope_row["scope_type"]) == "private"
+            and str(scope_row["scope_key"]) == scope_key
+            and str(scope_row["scope_id"]) == str(owner_user_id)
+            and str(scope_row["lifecycle_id"]) == lifecycle_id
+            and actor_row is not None
+            and int(actor_row["active"] or 0) == 1
+            and actor_group in PERMISSION_GROUPS
+            and PERMISSION_PRIVATE_AGENT in PERMISSION_GROUPS[actor_group]["permissions"]
+            and source_row is not None
+        )
 
     def _revalidate_learning_review_mutation_context(
         self,
@@ -12612,44 +12552,10 @@ class EnterpriseService:
         ):
             raise ServiceError(403, "learning review context is not authorized")
 
-        scope_row = conn.execute(
-            """
-            SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
-                   runtime.lifecycle_id
-            FROM agent_scopes AS scopes
-            JOIN agent_runtime_scopes AS runtime
-              ON runtime.scope_key = scopes.scope_key
-            WHERE scopes.scope_key = ?
-            """,
-            (scope_key,),
-        ).fetchone()
-        actor_row = conn.execute(
-            "SELECT id, active, permission_group, role FROM users WHERE id = ?",
-            (owner_user_id,),
-        ).fetchone()
-        source_row = conn.execute(
-            """
-            SELECT id FROM messages
-            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
-              AND author_type = 'user' AND user_id = ?
-            """,
-            (source_message_id, str(owner_user_id), owner_user_id),
-        ).fetchone()
-        actor_group = (
-            public_permission_group(dict(actor_row)) if actor_row is not None else ""
-        )
         if (
-            scope_row is None
-            or str(scope_row["scope_type"]) != "private"
-            or str(scope_row["scope_key"]) != scope_key
-            or str(scope_row["scope_id"]) != str(owner_user_id)
-            or str(scope_row["lifecycle_id"]) != lifecycle_id
-            or actor_row is None
-            or int(actor_row["active"] or 0) != 1
-            or actor_group not in PERMISSION_GROUPS
-            or PERMISSION_PRIVATE_AGENT
-            not in PERMISSION_GROUPS[actor_group]["permissions"]
-            or source_row is None
+            not self._memory_principal_matches(
+                conn, scope_key, lifecycle_id, owner_user_id, source_message_id
+            )
             or not self.learning_reviews.context_matches_in_transaction(
                 conn,
                 review_job_id,
@@ -12702,29 +12608,9 @@ class EnterpriseService:
                 "automatic memory writes require a running top-level interactive private Agent run",
             )
 
-        scope_row = conn.execute(
-            """
-            SELECT scopes.scope_key, scopes.scope_type, scopes.scope_id,
-                   runtime.lifecycle_id
-            FROM agent_scopes AS scopes
-            JOIN agent_runtime_scopes AS runtime
-              ON runtime.scope_key = scopes.scope_key
-            WHERE scopes.scope_key = ?
-            """,
-            (scope_key,),
-        ).fetchone()
-        actor_row = conn.execute(
-            "SELECT id, active, permission_group, role FROM users WHERE id = ?",
-            (owner_user_id,),
-        ).fetchone()
-        source_row = conn.execute(
-            """
-            SELECT id FROM messages
-            WHERE id = ? AND scope_type = 'private' AND scope_id = ?
-              AND author_type = 'user' AND user_id = ?
-            """,
-            (source_message_id, str(owner_user_id), owner_user_id),
-        ).fetchone()
+        principal_matches = self._memory_principal_matches(
+            conn, scope_key, lifecycle_id, owner_user_id, source_message_id
+        )
         # The input store reads this thread's transaction and handles both the
         # durable job payload and legacy rows without a second identity ledger.
         source_input = self.agent_inputs.get_by_message(source_message_id)
@@ -12738,23 +12624,7 @@ class EnterpriseService:
                 """,
                 (source_input.parent_job_id, str(owner_user_id)),
             ).fetchone()
-        actor_group = (
-            public_permission_group(dict(actor_row)) if actor_row is not None else ""
-        )
-        if (
-            scope_row is None
-            or str(scope_row["scope_type"]) != "private"
-            or str(scope_row["scope_key"]) != scope_key
-            or str(scope_row["scope_id"]) != str(owner_user_id)
-            or str(scope_row["lifecycle_id"]) != lifecycle_id
-            or actor_row is None
-            or int(actor_row["active"] or 0) != 1
-            or actor_group not in PERMISSION_GROUPS
-            or PERMISSION_PRIVATE_AGENT
-            not in PERMISSION_GROUPS[actor_group]["permissions"]
-            or source_row is None
-            or run_row is None
-        ):
+        if not principal_matches or run_row is None:
             raise ServiceError(
                 403,
                 "automatic memory write context is no longer authorized",
@@ -12778,6 +12648,17 @@ class EnterpriseService:
             raise ServiceError(409, str(exc)) from exc
 
     @contextmanager
+    def _memory_lifecycle_lock(self, scope_key: str):
+        """Keep lock ordering identical for reads, DB writes and filesystem writes."""
+        start_lock = self._agent_run_start_lock(scope_key)
+        with self._conversation_lock:
+            start_lock.acquire()
+        try:
+            yield
+        finally:
+            start_lock.release()
+
+    @contextmanager
     def _learning_review_read_boundary(
         self,
         context: dict[str, Any],
@@ -12785,10 +12666,7 @@ class EnterpriseService:
     ):
         """Observe review authorization and memory rows on one DB snapshot."""
 
-        start_lock = self._agent_run_start_lock(scope_key)
-        with self._conversation_lock:
-            start_lock.acquire()
-        try:
+        with self._memory_lifecycle_lock(scope_key):
             # BEGIN IMMEDIATE gives the review query a deterministic
             # linearization point against revoke/reset/job settlement writers.
             with self.db.transaction(immediate=True) as conn:
@@ -12796,8 +12674,6 @@ class EnterpriseService:
                     conn, context, scope_key
                 )
                 yield conn
-        finally:
-            start_lock.release()
 
     @contextmanager
     def _interactive_memory_mutation_boundary(
@@ -12807,17 +12683,12 @@ class EnterpriseService:
     ):
         """Linearize ordinary automatic memory writes with Run lifecycle."""
 
-        start_lock = self._agent_run_start_lock(scope_key)
-        with self._conversation_lock:
-            start_lock.acquire()
-        try:
+        with self._memory_lifecycle_lock(scope_key):
             with self.db.transaction(immediate=True) as conn:
                 self._revalidate_interactive_memory_mutation_context(
                     conn, context, scope_key
                 )
                 yield conn
-        finally:
-            start_lock.release()
 
     @contextmanager
     def _learning_review_memory_mutation_boundary(
@@ -12829,20 +12700,11 @@ class EnterpriseService:
     ):
         """Linearize review authorization, mutation and lifecycle cleanup."""
 
-        start_lock = self._agent_run_start_lock(scope_key)
-        with self._conversation_lock:
-            start_lock.acquire()
-        try:
-            with self.db.transaction(immediate=True) as conn:
-                self._revalidate_learning_review_mutation_context(
-                    conn, context, scope_key
-                )
-                self._consume_learning_review_mutation_budget(
-                    conn, context, mutation_units
-                )
-                yield conn
-        finally:
-            start_lock.release()
+        with self._learning_review_read_boundary(context, scope_key) as conn:
+            self._consume_learning_review_mutation_budget(
+                conn, context, mutation_units
+            )
+            yield conn
 
     @contextmanager
     def _learning_review_skill_mutation_boundary(
@@ -12858,10 +12720,7 @@ class EnterpriseService:
         consume its unit, but a successful file commit can never escape billing.
         """
 
-        start_lock = self._agent_run_start_lock(scope_key)
-        with self._conversation_lock:
-            start_lock.acquire()
-        try:
+        with self._memory_lifecycle_lock(scope_key):
             with self.db.transaction(immediate=True) as conn:
                 self._revalidate_learning_review_mutation_context(
                     conn, context, scope_key
@@ -12874,8 +12733,6 @@ class EnterpriseService:
                     conn, context, scope_key
                 )
                 yield
-        finally:
-            start_lock.release()
 
     def _validate_memory_owner_for_scope(
         self, scope_key: str, owner_user_id: int | None
@@ -13970,25 +13827,7 @@ class EnterpriseService:
         scope = self._skill_scope_for_actor(
             actor, scope_type, scope_id, mutation=True
         )
-        allowed_keys = {
-            "name",
-            "description",
-            "instructions",
-            "category",
-            "version",
-            "tags",
-            "enabled",
-        }
-        unknown = set(body) - allowed_keys
-        if unknown:
-            raise ServiceError(
-                400,
-                f"unsupported skill fields: {', '.join(sorted(unknown))}",
-            )
         self._validate_user_skill_field_types(body)
-        enabled = body.get("enabled", True)
-        if type(enabled) is not bool:
-            raise ServiceError(400, "skill enabled must be a boolean")
         try:
             skill = self.skills.create(
                 scope.scope_key,
@@ -13998,7 +13837,7 @@ class EnterpriseService:
                 category=body.get("category"),
                 version=body.get("version"),
                 tags=body.get("tags"),
-                enabled=enabled,
+                enabled=body.get("enabled", True),
             )
         except SkillStoreError as exc:
             self._raise_skill_store_error(exc)
@@ -14016,44 +13855,14 @@ class EnterpriseService:
         scope = self._skill_scope_for_actor(
             actor, scope_type, scope_id, mutation=True
         )
-        allowed_keys = {
-            "name",
-            "description",
-            "instructions",
-            "category",
-            "version",
-            "tags",
-            "enabled",
-        }
-        unknown = set(body) - allowed_keys
-        if unknown:
-            raise ServiceError(
-                400,
-                f"unsupported skill fields: {', '.join(sorted(unknown))}",
-            )
         self._validate_user_skill_field_types(body)
-        allowed = {
-            key: body[key]
-            for key in (
-                "name",
-                "description",
-                "instructions",
-                "category",
-                "version",
-                "tags",
-                "enabled",
-            )
-            if key in body
-        }
-        if not allowed:
+        if not body:
             raise ServiceError(400, "skill update has no supported fields")
-        if "enabled" in body and type(body["enabled"]) is not bool:
-            raise ServiceError(400, "skill enabled must be a boolean")
         try:
             skill = self.skills.update(
                 scope.scope_key,
                 str(skill_id),
-                **allowed,
+                **body,
             )
         except SkillStoreError as exc:
             self._raise_skill_store_error(exc)
@@ -14061,6 +13870,13 @@ class EnterpriseService:
 
     @staticmethod
     def _validate_user_skill_field_types(body: dict[str, Any]) -> None:
+        unknown = set(body) - {
+            "name", "description", "instructions", "category", "version", "tags", "enabled",
+        }
+        if unknown:
+            raise ServiceError(
+                400, f"unsupported skill fields: {', '.join(sorted(unknown))}",
+            )
         for key in (
             "name",
             "description",
@@ -14075,6 +13891,8 @@ class EnterpriseService:
             or any(not isinstance(tag, str) for tag in body["tags"])
         ):
             raise ServiceError(400, "skill tags must be a list of strings")
+        if "enabled" in body and type(body["enabled"]) is not bool:
+            raise ServiceError(400, "skill enabled must be a boolean")
 
     def user_delete_skill(
         self,
@@ -15932,7 +15750,6 @@ class EnterpriseService:
             "started_at": started_at,
             "updated_at": started_at,
             "last_error": "",
-            "stream_messages": [],
             "stream_message": None,
             "approval": None,
             "input_group_id": str(task.get("_input_group_id") or ""),
@@ -16000,7 +15817,6 @@ class EnterpriseService:
             "started_at": None,
             "updated_at": now_ts(),
             "last_error": last_error,
-            "stream_messages": [],
             "stream_message": None,
             "approval": None,
             "input_group_id": "",
@@ -16020,7 +15836,7 @@ class EnterpriseService:
         if copied.get("replying_to"):
             copied["replying_to"] = dict(copied["replying_to"])
         copied["activity"] = [dict(item) for item in copied.get("activity") or []]
-        copied["stream_messages"] = [dict(item) for item in copied.get("stream_messages") or []]
+        copied["stream_messages"] = []
         if copied.get("stream_message"):
             copied["stream_message"] = dict(copied["stream_message"])
         if copied.get("approval"):
@@ -16097,7 +15913,7 @@ class EnterpriseService:
         stream["updated_at"] = timestamp
         activity = [dict(item) for item in status.get("activity") or []]
         summary = " ".join(content.split())
-        timeline_index = _append_agent_work_item(
+        _append_agent_work_item(
             status,
             activity,
             {
@@ -16112,15 +15928,6 @@ class EnterpriseService:
             },
         )
         status["activity"] = activity
-        if timeline_index is None:
-            status["stream_message"] = None
-            status["stream_messages"] = []
-            return status
-        # The finalized prose now belongs to the monotonic work timeline. Do
-        # not retain a second copy: MessageList would render it as a full Agent
-        # bubble beside the compact row, and repeated tool boundaries would
-        # otherwise grow this legacy buffer without bound.
-        status["stream_messages"] = []
         status["stream_message"] = None
         return status
 
@@ -16147,7 +15954,6 @@ class EnterpriseService:
                 # user input. Keep a single live Agent bubble instead of
                 # concatenating or preserving an obsolete intermediate answer.
                 status["stream_message"] = None
-                status["stream_messages"] = []
                 status["updated_at"] = timestamp
                 self._agent_status[key] = status
                 return
@@ -16158,7 +15964,7 @@ class EnterpriseService:
             stream.setdefault(
                 "id",
                 f"stream:{status.get('run_id') or key}:{status.get('started_at') or timestamp}:"
-                f"{clean_turn_id or len(status.get('stream_messages') or [])}",
+                f"{clean_turn_id or 0}",
             )
             stream.setdefault("author_type", "agent")
             stream.setdefault("username", "Main Agent" if scope_type == "channel" else "Private Agent")
@@ -16279,7 +16085,6 @@ class EnterpriseService:
                     # The next model turn supersedes any partially streamed
                     # draft from before the user's correction.
                     updated["stream_message"] = None
-                    updated["stream_messages"] = []
                 self._update_active_input_group_status(updated, task)
                 updated["updated_at"] = now_ts()
                 self._agent_status[key] = updated

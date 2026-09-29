@@ -36,9 +36,7 @@ export function ScheduledTasksPanel() {
   const [historyRevision, setHistoryRevision] = useState(0);
   const [confirmation, setConfirmation] = useState<Confirmation>(null);
   const listController = useRef<AbortController | null>(null);
-  const listRequestVersion = useRef(0);
   const historyController = useRef<AbortController | null>(null);
-  const historyRequestVersion = useRef(0);
   const loadMoreController = useRef<AbortController | null>(null);
   const selectedIdRef = useRef<number | null>(null);
   const mutationBusyRef = useRef(false);
@@ -46,17 +44,16 @@ export function ScheduledTasksPanel() {
   const refresh = useCallback(async () => {
     listController.current?.abort();
     const controller = new AbortController();
-    const requestVersion = ++listRequestVersion.current;
     listController.current = controller;
     setLoading(true);
     setLoadError("");
     try {
       const result = await loadAgentSchedules(controller.signal);
-      if (!controller.signal.aborted && listRequestVersion.current === requestVersion) {
+      if (!controller.signal.aborted && listController.current === controller) {
         setSchedules(result.schedules || []);
       }
     } catch (error) {
-      if (!controller.signal.aborted && listRequestVersion.current === requestVersion) {
+      if (!controller.signal.aborted && listController.current === controller) {
         setLoadError(errorText(error));
       }
     } finally {
@@ -70,7 +67,6 @@ export function ScheduledTasksPanel() {
   useEffect(() => {
     void refresh();
     return () => {
-      listRequestVersion.current += 1;
       listController.current?.abort();
       listController.current = null;
     };
@@ -78,7 +74,6 @@ export function ScheduledTasksPanel() {
 
   const selectSchedule = useCallback((id: number | null) => {
     selectedIdRef.current = id;
-    historyRequestVersion.current += 1;
     historyController.current?.abort();
     historyController.current = null;
     loadMoreController.current?.abort();
@@ -93,7 +88,6 @@ export function ScheduledTasksPanel() {
 
   useEffect(() => () => {
     selectedIdRef.current = null;
-    historyRequestVersion.current += 1;
     historyController.current?.abort();
     historyController.current = null;
     loadMoreController.current?.abort();
@@ -113,7 +107,6 @@ export function ScheduledTasksPanel() {
       return;
     }
     const controller = new AbortController();
-    const requestVersion = ++historyRequestVersion.current;
     historyController.current = controller;
     setHistoryLoading(true);
     setHistoryError("");
@@ -122,7 +115,7 @@ export function ScheduledTasksPanel() {
       loadAgentScheduleRuns(selectedId, HISTORY_PAGE_SIZE, undefined, controller.signal),
     ]).then(([detailResult, historyResult]) => {
       if (controller.signal.aborted
-        || historyRequestVersion.current !== requestVersion
+        || historyController.current !== controller
         || selectedIdRef.current !== selectedId) return;
       setDetail(detailResult.schedule);
       setSchedules((current) => current.map((item) =>
@@ -132,7 +125,7 @@ export function ScheduledTasksPanel() {
       setNextBeforeId(historyResult.next_before_id ?? null);
     }).catch((error) => {
       if (!controller.signal.aborted
-        && historyRequestVersion.current === requestVersion
+        && historyController.current === controller
         && selectedIdRef.current === selectedId) {
         setHistoryError(errorText(error));
       }
@@ -146,14 +139,12 @@ export function ScheduledTasksPanel() {
   }, [historyRevision, selectedId]);
 
   const invalidateListRefresh = useCallback(() => {
-    listRequestVersion.current += 1;
     listController.current?.abort();
     listController.current = null;
     setLoading(false);
   }, []);
 
   const invalidateHistoryRefresh = useCallback(() => {
-    historyRequestVersion.current += 1;
     historyController.current?.abort();
     historyController.current = null;
     loadMoreController.current?.abort();
@@ -168,7 +159,7 @@ export function ScheduledTasksPanel() {
 
   const mutate = useCallback(async (
     key: string,
-    work: () => Promise<{ schedule: AgentSchedule }>,
+    work: () => Promise<{ schedule: AgentSchedule } | void>,
     successMessage: string,
   ) => {
     if (mutationBusyRef.current) return;
@@ -179,7 +170,7 @@ export function ScheduledTasksPanel() {
     setMutationError("");
     try {
       const result = await work();
-      replaceSchedule(result.schedule);
+      if (result) replaceSchedule(result.schedule);
       toast(successMessage, { type: "ok", title: t("toast.complete") });
     } catch (error) {
       setMutationError(errorText(error));
@@ -210,25 +201,15 @@ export function ScheduledTasksPanel() {
     },
     t("scheduledTasks.runNowSuccess"),
   );
-  const handleDelete = async (schedule: AgentSchedule) => {
-    if (mutationBusyRef.current) return;
-    mutationBusyRef.current = true;
-    invalidateListRefresh();
-    invalidateHistoryRefresh();
-    setBusyKey(`delete:${schedule.id}`);
-    setMutationError("");
-    try {
+  const handleDelete = (schedule: AgentSchedule) => mutate(
+    `delete:${schedule.id}`,
+    async () => {
       await deleteAgentSchedule(schedule.id);
       setSchedules((current) => current.filter((item) => item.id !== schedule.id));
       if (selectedIdRef.current === schedule.id) selectSchedule(null);
-      toast(t("scheduledTasks.deleteSuccess"), { type: "ok", title: t("toast.complete") });
-    } catch (error) {
-      setMutationError(errorText(error));
-    } finally {
-      mutationBusyRef.current = false;
-      setBusyKey("");
-    }
-  };
+    },
+    t("scheduledTasks.deleteSuccess"),
+  );
 
   const loadMore = async () => {
     if (!detail || nextBeforeId == null || historyLoading) return;

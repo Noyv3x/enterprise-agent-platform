@@ -9,10 +9,10 @@ import urllib.request
 from unittest import mock
 
 from enterprise_agent_platform.loopback_http import (
-    build_trusted_service_opener,
     open_loopback_url,
     open_private_service_url,
 )
+from enterprise_agent_platform.oauth_flows import OAuthHTTPClient
 
 
 class _LoopbackHandler(http.server.BaseHTTPRequestHandler):
@@ -78,15 +78,11 @@ class LoopbackHTTPTests(unittest.TestCase):
             open_loopback_url(request, timeout=2)
         self.assertEqual(raised.exception.code, 302)
 
-    def test_trusted_service_request_rejects_redirects(self):
-        request = urllib.request.Request(
-            self.base_url + "/redirect",
-            headers={"Authorization": "Bearer must-not-be-forwarded"},
-            method="GET",
+    def test_oauth_bearer_request_rejects_redirects(self):
+        response = OAuthHTTPClient().get_bearer_json(
+            self.base_url + "/redirect", "must-not-be-forwarded", timeout=2,
         )
-        with self.assertRaises(urllib.error.HTTPError) as raised:
-            build_trusted_service_opener().open(request, timeout=2)
-        self.assertEqual(raised.exception.code, 302)
+        self.assertEqual(response.status, 302)
 
     def test_private_service_request_ignores_proxies_and_rejects_redirects(self):
         request = urllib.request.Request(self.base_url + "/ok", method="GET")

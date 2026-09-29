@@ -155,7 +155,7 @@ class MailAccountStore:
         return row, password
 
     def create(self, owner_user_id: int, body: dict[str, Any]) -> dict[str, Any]:
-        values = self._validated_create(body)
+        values = self._validated_fields(body, create=True)
         password = self._password(body.get("password"), required=True)
         ts = now_ts()
         with self.db.transaction(immediate=True) as conn:
@@ -210,34 +210,7 @@ class MailAccountStore:
         current = self.get(owner_user_id, account_id)
         if current is None:
             raise MailAccountError("mail account not found")
-        allowed = {
-            "label", "email_address", "username", "imap_host", "imap_port",
-            "imap_security", "smtp_host", "smtp_port", "smtp_security",
-            "enabled", "wake_enabled", "wake_folder", "poll_interval_seconds",
-            "password",
-        }
-        unknown = sorted(set(body) - allowed)
-        if unknown:
-            raise MailAccountError("unknown mail account fields: " + ", ".join(unknown))
-        updates: dict[str, Any] = {}
-        validators = {
-            "label": lambda value: _text(value, field="label", maximum=120),
-            "email_address": lambda value: self._email(value),
-            "username": lambda value: _text(value, field="username", maximum=320),
-            "imap_host": lambda value: _host(value, field="imap_host"),
-            "imap_port": lambda value: _port(value, field="imap_port"),
-            "imap_security": lambda value: _security(value, field="imap_security"),
-            "smtp_host": lambda value: _host(value, field="smtp_host"),
-            "smtp_port": lambda value: _port(value, field="smtp_port"),
-            "smtp_security": lambda value: _security(value, field="smtp_security"),
-            "enabled": lambda value: _boolean(value, field="enabled"),
-            "wake_enabled": lambda value: _boolean(value, field="wake_enabled"),
-            "wake_folder": lambda value: self._folder(value),
-            "poll_interval_seconds": _poll_interval,
-        }
-        for field, validator in validators.items():
-            if field in body:
-                updates[field] = validator(body[field])
+        updates = self._validated_fields(body)
         password: str | None = None
         if "password" in body:
             password = self._password(body.get("password"), required=False)
@@ -364,28 +337,33 @@ class MailAccountStore:
             raise MailAccountError("password is invalid")
         return password
 
-    def _validated_create(self, body: dict[str, Any]) -> dict[str, Any]:
-        allowed = {
-            "label", "email_address", "username", "imap_host", "imap_port",
-            "imap_security", "smtp_host", "smtp_port", "smtp_security",
-            "enabled", "wake_enabled", "wake_folder", "poll_interval_seconds",
-            "password",
+    def _validated_fields(
+        self, body: dict[str, Any], *, create: bool = False
+    ) -> dict[str, Any]:
+        validators = {
+            "label": lambda value: _text(value, field="label", maximum=120),
+            "email_address": self._email,
+            "username": lambda value: _text(value, field="username", maximum=320),
+            "imap_host": lambda value: _host(value, field="imap_host"),
+            "imap_port": lambda value: _port(value, field="imap_port"),
+            "imap_security": lambda value: _security(value, field="imap_security"),
+            "smtp_host": lambda value: _host(value, field="smtp_host"),
+            "smtp_port": lambda value: _port(value, field="smtp_port"),
+            "smtp_security": lambda value: _security(value, field="smtp_security"),
+            "enabled": lambda value: _boolean(value, field="enabled"),
+            "wake_enabled": lambda value: _boolean(value, field="wake_enabled"),
+            "wake_folder": self._folder,
+            "poll_interval_seconds": _poll_interval,
         }
-        unknown = sorted(set(body) - allowed)
+        unknown = sorted(set(body) - validators.keys() - {"password"})
         if unknown:
             raise MailAccountError("unknown mail account fields: " + ", ".join(unknown))
+        defaults = {
+            "enabled": True, "wake_enabled": False,
+            "wake_folder": "INBOX", "poll_interval_seconds": 300,
+        }
         return {
-            "label": _text(body.get("label"), field="label", maximum=120),
-            "email_address": self._email(body.get("email_address")),
-            "username": _text(body.get("username"), field="username", maximum=320),
-            "imap_host": _host(body.get("imap_host"), field="imap_host"),
-            "imap_port": _port(body.get("imap_port"), field="imap_port"),
-            "imap_security": _security(body.get("imap_security"), field="imap_security"),
-            "smtp_host": _host(body.get("smtp_host"), field="smtp_host"),
-            "smtp_port": _port(body.get("smtp_port"), field="smtp_port"),
-            "smtp_security": _security(body.get("smtp_security"), field="smtp_security"),
-            "enabled": _boolean(body.get("enabled", True), field="enabled"),
-            "wake_enabled": _boolean(body.get("wake_enabled", False), field="wake_enabled"),
-            "wake_folder": self._folder(body.get("wake_folder", "INBOX")),
-            "poll_interval_seconds": _poll_interval(body.get("poll_interval_seconds", 300)),
+            field: validator(body.get(field, defaults.get(field)))
+            for field, validator in validators.items()
+            if create or field in body
         }

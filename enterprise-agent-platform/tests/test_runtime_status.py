@@ -147,13 +147,11 @@ class RuntimeStatusContractTests(unittest.TestCase):
             return {}
 
         def blocked_searxng(*, refresh=True):
-            searxng_started.set()
-            release.wait(timeout=2)
+            if refresh:
+                searxng_started.set()
+                release.wait(timeout=2)
             return RuntimeStatus("searxng", True, "running")
 
-        manager._searxng_cache = RuntimeStatus(
-            "searxng", False, "unavailable"
-        ).to_dict()
         with (
             mock.patch.object(manager, "status", side_effect=blocked_status),
             mock.patch.object(

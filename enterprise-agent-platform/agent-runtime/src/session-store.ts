@@ -1,8 +1,9 @@
-import { chmod, type FileHandle, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readFile, readdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { JsonValue as PiJsonValue } from "@earendil-works/pi-ai";
 import { redactCommandForApproval } from "./approval-policy.js";
+import { replaceText, syncDirectory, withQueue } from "./durable-store.js";
 import {
   BackgroundTaskStore,
   type BackgroundTaskObligation,
@@ -53,6 +54,9 @@ export class SessionStore {
   private readonly approvalQueues = new Map<string, Promise<void>>();
   private readonly todos: TodoStore;
   private readonly backgroundTasks: BackgroundTaskStore;
+  private readonly withQueue = withQueue;
+  private readonly replaceText = replaceText;
+  private readonly syncDirectory = syncDirectory;
 
   constructor(home: string, private readonly maxSessionArchiveBytes = MAX_SESSION_ARCHIVE_BYTES) {
     if (!Number.isSafeInteger(maxSessionArchiveBytes) || maxSessionArchiveBytes <= 0) {
@@ -116,18 +120,7 @@ export class SessionStore {
     return await this.withQueue(this.mutationQueues, file, async () => {
       const entries = await this.readEntries(identity);
       if (entries.some((entry) => entry.type === "header")) {
-        return entries
-          .filter((entry) => entry.type === "message")
-          .map((entry) => ({
-            entry_id: entry.id,
-            message: entry.payload as AgentMessage,
-            ...(entry.model_content_security_version !== undefined
-              ? { model_content_security_version: entry.model_content_security_version }
-              : {}),
-            ...(entry.synthetic_kind !== undefined
-              ? { synthetic_kind: entry.synthetic_kind }
-              : {}),
-          }));
+        return entries.filter((entry) => entry.type === "message").map(trackedMessage);
       }
       await mkdir(dirname(file), { recursive: true, mode: 0o700 });
       await this.writeScopeManifest(identity.scope_key);
@@ -151,18 +144,7 @@ export class SessionStore {
   }
 
   async loadTracked(identity: SessionIdentity): Promise<TrackedSessionMessage[]> {
-    return (await this.readEntries(identity))
-      .filter((entry) => entry.type === "message")
-      .map((entry) => ({
-        entry_id: entry.id,
-        message: entry.payload as AgentMessage,
-        ...(entry.model_content_security_version !== undefined
-          ? { model_content_security_version: entry.model_content_security_version }
-          : {}),
-        ...(entry.synthetic_kind !== undefined
-          ? { synthetic_kind: entry.synthetic_kind }
-          : {}),
-      }));
+    return (await this.readEntries(identity)).filter((entry) => entry.type === "message").map(trackedMessage);
   }
 
   async withSessionLock<T>(identity: SessionIdentity, task: () => Promise<T>): Promise<T> {
@@ -224,21 +206,8 @@ export class SessionStore {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     }
-    const entries: SessionEntry[] = [];
-    const lines = text.split("\n");
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index]?.trim();
-      if (!line) continue;
-      try {
-        const candidate = JSON.parse(line) as SessionEntry;
-        if (candidate && typeof candidate.id === "string" && typeof candidate.type === "string") entries.push(candidate);
-      } catch {
-        // A process can die between write(2) and fsync(2). Ignore only the incomplete tail.
-        const hasLaterContent = lines.slice(index + 1).some((candidate) => candidate.trim() !== "");
-        if (hasLaterContent) throw new Error(`Corrupt ${label.toLowerCase()} entry at line ${index + 1}`);
-      }
-    }
-    return entries;
+    return parseJsonLines<SessionEntry>(text, label.toLowerCase())
+      .filter((entry) => entry && typeof entry.id === "string" && typeof entry.type === "string");
   }
 
   async appendMessage(
@@ -683,23 +652,6 @@ export class SessionStore {
     await this.replaceText(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
   }
 
-  private async replaceText(file: string, text: string): Promise<void> {
-    const temporary = `${file}.${id("manifest")}.tmp`;
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(temporary, "wx", 0o600);
-      await handle.writeFile(text, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, file);
-      await chmod(file, 0o600);
-      await this.syncDirectory(dirname(file));
-    } finally {
-      await handle?.close().catch(() => undefined);
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
-  }
 
   private async writeScopeManifest(scopeKey: string): Promise<void> {
     const directory = join(this.sessionsRoot, stableHash(scopeKey));
@@ -707,33 +659,17 @@ export class SessionStore {
     await this.replaceText(join(directory, "scope.json"), `${JSON.stringify({ scope_key: scopeKey }, null, 2)}\n`);
   }
 
-  private async syncDirectory(directoryPath: string): Promise<void> {
-    const directory = await open(directoryPath, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-  }
+}
 
-  private async withQueue<T>(
-    queues: Map<string, Promise<void>>,
-    key: string,
-    task: () => Promise<T>,
-  ): Promise<T> {
-    const previous = queues.get(key) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const current = previous.catch(() => undefined).then(async () => await gate);
-    queues.set(key, current);
-    await previous.catch(() => undefined);
-    try {
-      return await task();
-    } finally {
-      release();
-      if (queues.get(key) === current) queues.delete(key);
-    }
-  }
+function trackedMessage(entry: SessionEntry): TrackedSessionMessage {
+  return {
+    entry_id: entry.id,
+    message: entry.payload as AgentMessage,
+    ...(entry.model_content_security_version !== undefined
+      ? { model_content_security_version: entry.model_content_security_version }
+      : {}),
+    ...(entry.synthetic_kind !== undefined ? { synthetic_kind: entry.synthetic_kind } : {}),
+  };
 }
 
 function durableSessionMessage(message: AgentMessage): AgentMessage {

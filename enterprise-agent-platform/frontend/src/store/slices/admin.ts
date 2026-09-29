@@ -39,8 +39,6 @@ export function adminReducer(state: AppState, action: Action): AppState {
       return { ...state, permissionGroups: action.payload };
     case "SET_ACTIVE_ADMIN_PAGE":
       return { ...state, activeAdminPage: action.payload };
-    case "SET_MESSAGE_AUDIT":
-      return { ...state, messageAudit: action.payload };
     case "PATCH_MESSAGE_AUDIT":
       return { ...state, messageAudit: { ...state.messageAudit, ...action.payload } };
     case "SET_TOKEN_USAGE":
@@ -79,15 +77,6 @@ export function adminReducer(state: AppState, action: Action): AppState {
       }
       return { ...state, oauthProviders };
     }
-    case "SET_OAUTH_FLOW":
-      return {
-        ...state,
-        oauthFlows: { ...state.oauthFlows, [action.payload.providerId]: action.payload.flow },
-      };
-    case "SET_OAUTH_FLOWS":
-      return { ...state, oauthFlows: action.payload };
-    case "RESET_SESSION":
-      return { ...state, messageAudit: initialMessageAudit };
     default:
       return state;
   }

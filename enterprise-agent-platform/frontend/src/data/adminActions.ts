@@ -189,7 +189,35 @@ async function reloadAfterPrivateAuditChange(store: AppStore, userId: Id): Promi
   }
 }
 
-/* ===================================================== audit: channel deletes */
+/* ===================================================== audit: deletes */
+
+async function deleteAuditMessages(
+  store: AppStore,
+  kind: "channel" | "private",
+  id: Id,
+  request: { messageId: Id } | DeleteBeforeRequest | DeleteClearAllRequest,
+): Promise<void> {
+  const single = "messageId" in request;
+  const trim = "before_created_at" in request;
+  if (!id || (single && !request.messageId) || (trim && !request.before_created_at)) return;
+  const operation = single ? "delete" : trim ? "trim" : "clear";
+  const key = `admin:audit:${operation}-${kind}:${single ? request.messageId : id}`;
+  await runBusy(store, key, async () => {
+    const path = single
+      ? (kind === "channel" ? endpoints.deleteChannelMessage : endpoints.deletePrivateMessage).path(id, request.messageId)
+      : (kind === "channel" ? endpoints.deleteChannelMessages : endpoints.deletePrivateMessages).path(id);
+    const result = await api<DeleteResultResponse>(path, {
+      method: "DELETE",
+      body: single ? EMPTY_BODY : JSON.stringify(request),
+    });
+    if (kind === "channel") await reloadAfterChannelAuditChange(store, id);
+    else await reloadAfterPrivateAuditChange(store, id);
+    const message = kind === "channel"
+      ? operation === "clear" ? "admin.toast.channelCleared" : "admin.toast.channelDeleted"
+      : operation === "clear" ? "admin.toast.privateCleared" : "admin.toast.privateDeleted";
+    toast(t(message, { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
+  });
+}
 
 /** Delete one channel message with the API's literal empty JSON body. */
 export async function deleteChannelMessage(
@@ -197,50 +225,22 @@ export async function deleteChannelMessage(
   channelId: Id,
   messageId: Id,
 ): Promise<void> {
-  if (!channelId || !messageId) return;
-  await runBusy(store, `admin:audit:delete-channel:${messageId}`, async () => {
-    const result = await api<DeleteResultResponse>(
-      endpoints.deleteChannelMessage.path(channelId, messageId),
-      { method: "DELETE", body: EMPTY_BODY },
-    );
-    await reloadAfterChannelAuditChange(store, channelId);
-    toast(t("admin.toast.channelDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "channel", channelId, { messageId });
 }
 
-/** Delete channel messages before one message id. */
+/** Delete channel messages before the given creation time. */
 export async function deleteChannelMessagesBefore(
   store: AppStore,
   channelId: Id,
   beforeCreatedAt: number,
 ): Promise<void> {
-  if (!channelId || !beforeCreatedAt) return;
-  await runBusy(store, `admin:audit:trim-channel:${channelId}`, async () => {
-    const body: DeleteBeforeRequest = { before_created_at: beforeCreatedAt };
-    const result = await api<DeleteResultResponse>(endpoints.deleteChannelMessages.path(channelId), {
-      method: "DELETE",
-      body: JSON.stringify(body),
-    });
-    await reloadAfterChannelAuditChange(store, channelId);
-    toast(t("admin.toast.channelDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "channel", channelId, { before_created_at: beforeCreatedAt });
 }
 
 /** Clear all messages in one channel. */
 export async function clearChannelMessages(store: AppStore, channelId: Id): Promise<void> {
-  if (!channelId) return;
-  await runBusy(store, `admin:audit:clear-channel:${channelId}`, async () => {
-    const body: DeleteClearAllRequest = { clear_all: true };
-    const result = await api<DeleteResultResponse>(endpoints.deleteChannelMessages.path(channelId), {
-      method: "DELETE",
-      body: JSON.stringify(body),
-    });
-    await reloadAfterChannelAuditChange(store, channelId);
-    toast(t("admin.toast.channelCleared", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "channel", channelId, { clear_all: true });
 }
-
-/* ===================================================== audit: private deletes */
 
 /** Delete one private message with the API's literal empty JSON body. */
 export async function deletePrivateMessage(
@@ -248,47 +248,21 @@ export async function deletePrivateMessage(
   userId: Id,
   messageId: Id,
 ): Promise<void> {
-  if (!userId || !messageId) return;
-  await runBusy(store, `admin:audit:delete-private:${messageId}`, async () => {
-    const result = await api<DeleteResultResponse>(
-      endpoints.deletePrivateMessage.path(userId, messageId),
-      { method: "DELETE", body: EMPTY_BODY },
-    );
-    await reloadAfterPrivateAuditChange(store, userId);
-    toast(t("admin.toast.privateDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "private", userId, { messageId });
 }
 
-/** Delete private messages before one message id. */
+/** Delete private messages before the given creation time. */
 export async function deletePrivateMessagesBefore(
   store: AppStore,
   userId: Id,
   beforeCreatedAt: number,
 ): Promise<void> {
-  if (!userId || !beforeCreatedAt) return;
-  await runBusy(store, `admin:audit:trim-private:${userId}`, async () => {
-    const body: DeleteBeforeRequest = { before_created_at: beforeCreatedAt };
-    const result = await api<DeleteResultResponse>(endpoints.deletePrivateMessages.path(userId), {
-      method: "DELETE",
-      body: JSON.stringify(body),
-    });
-    await reloadAfterPrivateAuditChange(store, userId);
-    toast(t("admin.toast.privateDeleted", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "private", userId, { before_created_at: beforeCreatedAt });
 }
 
 /** Clear a private conversation. */
 export async function clearPrivateMessages(store: AppStore, userId: Id): Promise<void> {
-  if (!userId) return;
-  await runBusy(store, `admin:audit:clear-private:${userId}`, async () => {
-    const body: DeleteClearAllRequest = { clear_all: true };
-    const result = await api<DeleteResultResponse>(endpoints.deletePrivateMessages.path(userId), {
-      method: "DELETE",
-      body: JSON.stringify(body),
-    });
-    await reloadAfterPrivateAuditChange(store, userId);
-    toast(t("admin.toast.privateCleared", { count: result.deleted || 0 }), { type: "ok", title: t("admin.toast.complete") });
-  });
+  await deleteAuditMessages(store, "private", userId, { clear_all: true });
 }
 
 /* ============================================================= config: PUTs

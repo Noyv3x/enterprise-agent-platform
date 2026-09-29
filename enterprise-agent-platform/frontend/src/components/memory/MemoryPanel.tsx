@@ -55,7 +55,6 @@ export function MemoryPanel() {
   const editorRevision = useRef(0);
   const mounted = useRef(true);
   const memoryController = useRef<AbortController | null>(null);
-  const memoryRequestVersion = useRef(0);
   const busyRef = useRef(false);
   const targetRef = useRef<AgentMemoryTarget>(target);
   const queryRef = useRef(query);
@@ -68,29 +67,18 @@ export function MemoryPanel() {
     const requestedQuery = queryRef.current;
     memoryController.current?.abort();
     const controller = new AbortController();
-    const requestVersion = ++memoryRequestVersion.current;
     memoryController.current = controller;
     setLoading(true);
     setLoadError("");
+    const isCurrent = () => !controller.signal.aborted
+      && memoryController.current === controller
+      && targetRef.current === requestedTarget
+      && queryRef.current === requestedQuery;
     try {
       const result = await loadAgentMemories(requestedTarget, requestedQuery, controller.signal);
-      if (
-        !controller.signal.aborted
-        && memoryRequestVersion.current === requestVersion
-        && targetRef.current === requestedTarget
-        && queryRef.current === requestedQuery
-      ) {
-        setMemories(result.memories || []);
-      }
+      if (isCurrent()) setMemories(result.memories || []);
     } catch (error) {
-      if (
-        !controller.signal.aborted
-        && memoryRequestVersion.current === requestVersion
-        && targetRef.current === requestedTarget
-        && queryRef.current === requestedQuery
-      ) {
-        setLoadError(errorText(error));
-      }
+      if (isCurrent()) setLoadError(errorText(error));
     } finally {
       if (memoryController.current === controller) {
         memoryController.current = null;
@@ -109,7 +97,6 @@ export function MemoryPanel() {
     return () => {
       const controller = memoryController.current;
       memoryController.current = null;
-      memoryRequestVersion.current += 1;
       controller?.abort();
     };
   }, [query, refreshMemories, target]);
@@ -117,7 +104,6 @@ export function MemoryPanel() {
   const stopStaleMemoryLoad = useCallback(() => {
     memoryController.current?.abort();
     memoryController.current = null;
-    memoryRequestVersion.current += 1;
     setLoading(false);
   }, []);
 
@@ -125,7 +111,7 @@ export function MemoryPanel() {
     key: string,
     action: () => Promise<unknown>,
     successMessage: string,
-    options: { refreshMemories?: boolean } = {},
+    options: { refreshMemories?: boolean; failureMessage?: string } = {},
   ) => {
     if (busyRef.current) return false;
     const mutationEpoch = targetEpoch.current;
@@ -140,7 +126,7 @@ export function MemoryPanel() {
       if (options.refreshMemories !== false) await refreshMemories();
       return true;
     } catch (error) {
-      if (mounted.current && targetEpoch.current === mutationEpoch) setMutationError(errorText(error) || t("memory.mutationFailed"));
+      if (mounted.current && targetEpoch.current === mutationEpoch) setMutationError(errorText(error) || options.failureMessage || t("memory.mutationFailed"));
       return false;
     } finally {
       busyRef.current = false;
@@ -231,25 +217,17 @@ export function MemoryPanel() {
     );
   };
 
-  const exportMemories = async () => {
-    if (busyRef.current) return;
-    const exportEpoch = targetEpoch.current;
-    busyRef.current = true;
-    setBusyKey("export");
-    setMutationError("");
-    try {
+  const exportMemories = () => runMutation(
+    "export",
+    async () => {
       const payload = await exportAgentMemories();
       if (!mounted.current) return;
       const stamp = new Date().toISOString().slice(0, 10);
       downloadJson(payload, `agent-memories-${stamp}.json`);
-      toast(t("memory.exportSuccess"), { type: "ok" });
-    } catch (error) {
-      if (mounted.current && targetEpoch.current === exportEpoch) setMutationError(errorText(error) || t("memory.exportFailed"));
-    } finally {
-      busyRef.current = false;
-      if (mounted.current) setBusyKey("");
-    }
-  };
+    },
+    t("memory.exportSuccess"),
+    { refreshMemories: false, failureMessage: t("memory.exportFailed") },
+  );
 
   const busy = !!busyKey;
   const clearLabel = t(target === "user" ? "memory.clearTarget.user" : "memory.clearTarget.agent");

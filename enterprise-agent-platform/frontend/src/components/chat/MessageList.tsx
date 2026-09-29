@@ -5,12 +5,11 @@ import {loadOlderMessages} from "../../data/loaders";
 import {withdrawChannelMessage,navigateToView,selectChannel} from "../../data/chatActions";
 import {getApiSessionGeneration} from "../../lib/api";
 import {useI18n} from "../../i18n";
-import {agentStatusFor,hasPermission,isAgentActive,pendingReplyStatus,scopeTypeFor} from "../../store/selectors";
+import {agentStatusFor,agentStatusText,hasPermission,isAgentActive,pendingReplyStatus,scopeTypeFor} from "../../store/selectors";
 import {useStore,useStoreHandle} from "../../store/useStore";
 import type {ChatMode,Message,TypingUser} from "../../types";
 import {ConversationLayout,ConversationEmpty,ConversationJump,MessageEntry,Notice} from "../ui/fieldwork";
 import {ResourceStatusView} from "../common/ResourceStatusView";
-import {AgentActivity} from "./AgentActivity";
 import {AgentApprovalPrompt} from "./AgentApprovalPrompt";
 import {AgentTyping} from "./AgentTyping";
 import {AgentWorkCard,hasAgentProcessSteps} from "./AgentWorkCard";
@@ -110,7 +109,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
       return <MessageBubble key={String(message.id)} message={message} canWithdraw={canWithdraw} withdrawing={withdrawingMessageId===String(message.id)} hideAuthorName={mode==="private"} onWithdraw={canWithdraw?handleWithdraw:undefined}/>;
     })}
     {liveStatus&&<>
-      {hasAgentProcessSteps(liveStatus)?<AgentActivity status={liveStatus} mode={mode}/>:<AgentTyping status={liveStatus} mode={mode}/>}
+      {hasAgentProcessSteps(liveStatus)?<AgentWorkCard work={liveStatus} active statusText={agentStatusText(liveStatus,mode,t)}/>:<AgentTyping status={liveStatus} mode={mode}/>}
       {liveStatus.approval&&canApprove&&<AgentApprovalPrompt approval={liveStatus.approval} mode={mode} scopeId={scopeId}/>}
       <div aria-live="polite" aria-relevant="additions text">{stream?.content&&<MessageEntry kind="agent" streaming={stream.active!==false}
         header={mode==="channel"?<span className="font-medium">{!stream.username||stream.username==="Main Agent"?t("chat.mainAgent"):stream.username}</span>:undefined}>

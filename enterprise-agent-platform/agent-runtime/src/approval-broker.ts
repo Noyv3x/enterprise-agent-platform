@@ -131,9 +131,7 @@ export class ApprovalBroker {
     if (decision === "session" && !item.request.allow_session) {
       throw new Error("Session approval is not allowed for this request");
     }
-    this.pending.delete(approvalId);
-    clearTimeout(item.timer);
-    if (item.signal && item.onAbort) item.signal.removeEventListener("abort", item.onAbort);
+    this.removePending(item);
     try {
       if (decision === "session") {
         await this.withSessionGrantMutation(async () => {
@@ -202,19 +200,10 @@ export class ApprovalBroker {
     });
   }
 
-  private async withSessionGrantMutation<T>(task: () => Promise<T>): Promise<T> {
-    const previous = this.sessionGrantMutation;
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const current = previous.catch(() => undefined).then(async () => await gate);
-    this.sessionGrantMutation = current;
-    await previous.catch(() => undefined);
-    try {
-      return await task();
-    } finally {
-      release();
-      if (this.sessionGrantMutation === current) this.sessionGrantMutation = Promise.resolve();
-    }
+  private withSessionGrantMutation<T>(task: () => Promise<T>): Promise<T> {
+    const current = this.sessionGrantMutation.then(task);
+    this.sessionGrantMutation = current.then(() => undefined, () => undefined);
+    return current;
   }
 
   private sessionKey(context: ApprovalContext): string {
@@ -236,11 +225,15 @@ export class ApprovalBroker {
   private settle(approvalId: string, resolution: ApprovalResolution, result: ApprovalResult): void {
     const item = this.pending.get(approvalId);
     if (!item) return;
-    this.pending.delete(approvalId);
-    clearTimeout(item.timer);
-    if (item.signal && item.onAbort) item.signal.removeEventListener("abort", item.onAbort);
+    this.removePending(item);
     this.publishResolved(item.request, resolution);
     item.resolve(result);
+  }
+
+  private removePending(item: PendingApproval): void {
+    this.pending.delete(item.request.id);
+    clearTimeout(item.timer);
+    if (item.signal && item.onAbort) item.signal.removeEventListener("abort", item.onAbort);
   }
 
   private publishResolved(request: ApprovalRequest, resolution: ApprovalResolution): void {

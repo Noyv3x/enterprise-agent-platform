@@ -378,8 +378,8 @@ export function Section({ id, title, description, actions, children, tone = 'pla
   const heading = useId();
   return <section id={id} className={`wf-section wf-section--${tone}`} aria-labelledby={title ? heading : undefined}>{(title || description || actions) && <header className="wf-section-head"><div>{title && <h2 id={heading} className="wf-section-title">{title}</h2>}{description && <div className="wf-section-description">{description}</div>}</div>{actions && <div className="wf-actions">{actions}</div>}</header>}<div className="wf-section-body">{children}</div></section>;
 }
-export function FormGrid({ children, columns = 2 }: { children: ReactNode; columns?: 1 | 2 }) {
-  return <div className={`wf-form-grid wf-form-grid--${columns}`}>{children}</div>;
+export function FormGrid({ children }: { children: ReactNode }) {
+  return <div className="wf-form-grid wf-form-grid--2">{children}</div>;
 }
 export function FormFooter({ note, children }: { note?: ReactNode; children: ReactNode }) {
   return <div className="wf-form-footer">{note && <div className="wf-form-note">{note}</div>}<div className="wf-actions">{children}</div></div>;

@@ -2987,14 +2987,15 @@ def _read_private_text(
         ) from exc
 
 
-def _read_private_bytes(
+@contextmanager
+def _checked_private_file(
     path: Path,
     *,
     max_bytes: int,
     missing_status: int,
     label: str,
     require_owner_only: bool = False,
-) -> bytes:
+) -> Iterator[tuple[int, os.stat_result]]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
@@ -3042,8 +3043,24 @@ def _read_private_bytes(
                 f"{label} exceeds its size limit",
                 code="support_size_exceeded" if missing_status == 404 else "corrupt_skill",
             )
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1
+        yield fd, info
+    finally:
+        os.close(fd)
+
+
+def _read_private_bytes(
+    path: Path,
+    *,
+    max_bytes: int,
+    missing_status: int,
+    label: str,
+    require_owner_only: bool = False,
+) -> bytes:
+    with _checked_private_file(
+        path, max_bytes=max_bytes, missing_status=missing_status,
+        label=label, require_owner_only=require_owner_only,
+    ) as (fd, _):
+        with os.fdopen(fd, "rb", closefd=False) as handle:
             data = handle.read(max_bytes + 1)
         if len(data) > max_bytes:
             raise SkillStoreError(
@@ -3052,9 +3069,6 @@ def _read_private_bytes(
                 code="support_size_exceeded" if missing_status == 404 else "corrupt_skill",
             )
         return data
-    finally:
-        if fd >= 0:
-            os.close(fd)
 
 
 def _inspect_private_file_size(
@@ -3066,48 +3080,10 @@ def _inspect_private_file_size(
 ) -> int:
     """Inspect a file without reading its payload or blocking on a FIFO."""
 
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags)
-    except FileNotFoundError as exc:
-        raise SkillStoreError(
-            missing_status,
-            f"{label} not found",
-            code="support_file_not_found" if missing_status == 404 else "corrupt_skill",
-        ) from exc
-    except OSError as exc:
-        raise SkillStoreError(
-            409,
-            f"unsafe {label}: {exc}",
-            code="unsafe_skill_path",
-        ) from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise SkillStoreError(
-                409,
-                f"{label} must be a regular non-symlink file",
-                code="unsafe_skill_path",
-            )
-        if info.st_nlink != 1:
-            raise SkillStoreError(
-                409,
-                f"{label} must not be hard-linked",
-                code="unsafe_skill_path",
-            )
-        if info.st_size > max_bytes:
-            raise SkillStoreError(
-                413 if missing_status == 404 else 500,
-                f"{label} exceeds its size limit",
-                code="support_size_exceeded" if missing_status == 404 else "corrupt_skill",
-            )
+    with _checked_private_file(
+        path, max_bytes=max_bytes, missing_status=missing_status, label=label,
+    ) as (_, info):
         return int(info.st_size)
-    finally:
-        os.close(fd)
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

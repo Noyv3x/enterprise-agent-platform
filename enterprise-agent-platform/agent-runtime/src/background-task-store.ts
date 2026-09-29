@@ -1,9 +1,7 @@
-import { constants } from "node:fs";
-import { mkdir, open, rename, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { keyedQueue, readPrivateText, removeDurableFile, writeState } from "./durable-store.js";
 import { EXECUTION_TARGETS, type ExecutionTarget } from "./container-contract.generated.js";
 import type { SessionIdentity } from "./session-store.js";
-import { id, nowIso } from "./utils.js";
+import { nowIso } from "./utils.js";
 
 export const BACKGROUND_TASK_STATE_SCHEMA_VERSION = 2;
 export const MAX_BACKGROUND_TASK_OBLIGATIONS = 256;
@@ -34,14 +32,12 @@ export interface BackgroundTaskSessionState {
   acknowledge(processId: string, target: ExecutionTarget): Promise<BackgroundTaskStateSnapshot>;
 }
 
-type BackgroundTaskStateDocument = BackgroundTaskStateSnapshot;
-
 /**
  * Atomic, owner-only storage for finite background-process obligations. The
  * identity and execution target are captured outside model-visible state.
  */
 export class BackgroundTaskStore {
-  private readonly queues = new Map<string, Promise<void>>();
+  private readonly withQueue = keyedQueue();
   private readonly runtimeUid: number | undefined;
 
   constructor(
@@ -68,7 +64,7 @@ export class BackgroundTaskStore {
   }
 
   async active(identity: SessionIdentity): Promise<BackgroundTaskObligation[]> {
-    return cloneState(await this.read(identity)).obligations.filter((item) => item.state === "active");
+    return (await this.read(identity)).obligations.filter((item) => item.state === "active");
   }
 
   async register(
@@ -86,7 +82,7 @@ export class BackgroundTaskStore {
         if (existing.target !== target) {
           throw new Error("Background task target does not match its registered obligation");
         }
-        return cloneState(current);
+        return current;
       }
       if (current.obligations.length >= MAX_BACKGROUND_TASK_OBLIGATIONS) {
         throw new Error(`Background task obligations exceed the ${MAX_BACKGROUND_TASK_OBLIGATIONS}-item limit`);
@@ -96,8 +92,8 @@ export class BackgroundTaskStore {
         ...current.obligations,
         { process_id: processId, target, state: "active", created_at: timestamp, updated_at: timestamp },
       ], timestamp);
-      await this.writeUnlocked(file, next);
-      return cloneState(next);
+      await writeState(file, next, false);
+      return next;
     });
   }
 
@@ -112,7 +108,7 @@ export class BackgroundTaskStore {
     return await this.withQueue(file, async () => {
       const current = await this.readUnlocked(file, identity);
       const existing = current.obligations.find((item) => item.process_id === processId);
-      if (!existing) return cloneState(current);
+      if (!existing) return current;
       if (existing.target !== target) {
         throw new Error("Background task target does not match its registered obligation");
       }
@@ -120,8 +116,8 @@ export class BackgroundTaskStore {
       const next = document(identity, current.obligations.map((item) => item.process_id === processId
         ? { ...item, state: "resolved" as const, updated_at: timestamp }
         : item), timestamp);
-      await this.writeUnlocked(file, next);
-      return cloneState(next);
+      await writeState(file, next, false);
+      return next;
     });
   }
 
@@ -136,14 +132,14 @@ export class BackgroundTaskStore {
     return await this.withQueue(file, async () => {
       const current = await this.readUnlocked(file, identity);
       const existing = current.obligations.find((item) => item.process_id === processId);
-      if (!existing) return cloneState(current);
+      if (!existing) return current;
       if (existing.target !== target || existing.state !== "resolved") {
         throw new Error("Background task is not a matching resolved acknowledgement tombstone");
       }
       const timestamp = nowIso();
       const next = document(identity, current.obligations.filter((item) => item.process_id !== processId), timestamp);
-      await this.writeUnlocked(file, next);
-      return cloneState(next);
+      await writeState(file, next, false);
+      return next;
     });
   }
 
@@ -154,86 +150,24 @@ export class BackgroundTaskStore {
 
   /** Delete one already-scoped responsibility file through its mutation queue. */
   async deletePath(file: string): Promise<void> {
-    await this.withQueue(file, async () => {
-      await rm(file, { force: true });
-      try {
-        await syncDirectory(dirname(file));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    });
+    await this.withQueue(file, () => removeDurableFile(file));
   }
 
   private async readUnlocked(
     file: string,
     identity: SessionIdentity,
-  ): Promise<BackgroundTaskStateDocument> {
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
+  ): Promise<BackgroundTaskStateSnapshot> {
+    const raw = await readPrivateText(
+      file, "Background task state", MAX_BACKGROUND_TASK_STATE_BYTES, this.runtimeUid, true,
+    );
+    if (raw === undefined) return document(identity, [], nowIso());
+    let parsed: unknown;
     try {
-      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const info = await handle.stat();
-      if (!info.isFile()) throw new Error("Background task state is not a regular file");
-      if (info.nlink !== 1) throw new Error("Background task state must have exactly one link");
-      if (this.runtimeUid !== undefined && info.uid !== this.runtimeUid) {
-        throw new Error("Background task state is not owned by the Runtime user");
-      }
-      if ((info.mode & 0o077) !== 0) throw new Error("Background task state is not owner-only");
-      if (info.size > MAX_BACKGROUND_TASK_STATE_BYTES) {
-        throw new Error(`Background task state exceeds ${MAX_BACKGROUND_TASK_STATE_BYTES} bytes`);
-      }
-      const raw = await handle.readFile({ encoding: "utf8" });
-      if (Buffer.byteLength(raw, "utf8") > MAX_BACKGROUND_TASK_STATE_BYTES) {
-        throw new Error(`Background task state exceeds ${MAX_BACKGROUND_TASK_STATE_BYTES} bytes`);
-      }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        throw new Error("Background task state contains invalid JSON");
-      }
-      return validateDocument(parsed, identity);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return document(identity, [], nowIso());
-      if ((error as NodeJS.ErrnoException).code === "ELOOP") {
-        throw new Error("Background task state must not be a symbolic link");
-      }
-      throw error;
-    } finally {
-      await handle?.close().catch(() => undefined);
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("Background task state contains invalid JSON");
     }
-  }
-
-  private async writeUnlocked(file: string, state: BackgroundTaskStateDocument): Promise<void> {
-    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    const temporary = `${file}.${id("background")}.tmp`;
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(temporary, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, file);
-      await syncDirectory(dirname(file));
-    } finally {
-      await handle?.close().catch(() => undefined);
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
-  }
-
-  private async withQueue<T>(file: string, task: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(file) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const current = previous.catch(() => undefined).then(async () => await gate);
-    this.queues.set(file, current);
-    await previous.catch(() => undefined);
-    try {
-      return await task();
-    } finally {
-      release();
-      if (this.queues.get(file) === current) this.queues.delete(file);
-    }
+    return validateDocument(parsed, identity);
   }
 }
 
@@ -241,20 +175,16 @@ function document(
   identity: SessionIdentity,
   obligations: BackgroundTaskObligation[],
   updatedAt: string,
-): BackgroundTaskStateDocument {
+): BackgroundTaskStateSnapshot {
   return {
     schema_version: BACKGROUND_TASK_STATE_SCHEMA_VERSION,
     ...identity,
-    obligations: obligations.map((item) => ({ ...item })),
+    obligations,
     updated_at: updatedAt,
   };
 }
 
-function cloneState(state: BackgroundTaskStateDocument): BackgroundTaskStateSnapshot {
-  return document(state, state.obligations, state.updated_at);
-}
-
-function validateDocument(value: unknown, identity: SessionIdentity): BackgroundTaskStateDocument {
+function validateDocument(value: unknown, identity: SessionIdentity): BackgroundTaskStateSnapshot {
   const source = exactObject(value, [
     "schema_version",
     "scope_key",
@@ -336,11 +266,3 @@ function validateTimestamp(value: unknown, label: string): asserts value is stri
   }
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
-  const directory = await open(directoryPath, "r");
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
-}

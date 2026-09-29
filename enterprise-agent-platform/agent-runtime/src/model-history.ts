@@ -13,13 +13,8 @@ const LEGACY_ACTION_ENVELOPE_TOOLS = new Set([
   "sylver_platform",
 ]);
 
-const UNKNOWN_SCHEMA_MAX_DEPTH = 6;
-const UNKNOWN_SCHEMA_MAX_ITEMS = 50;
-const UNKNOWN_SCHEMA_MAX_NODES = 256;
-const UNKNOWN_SCHEMA_MAX_STRING_BYTES = 2_048;
-const MODEL_ARGUMENT_MAX_DEPTH = 12;
-const MODEL_ARGUMENT_MAX_ITEMS = 100;
-const MODEL_ARGUMENT_MAX_NODES = 2_000;
+const SCHEMA_LIMITS = { depth: 6, items: 50, nodes: 256, stringBytes: 2_048, label: "schema value" };
+const ARGUMENT_LIMITS = { depth: 12, items: 100, nodes: 2_000, stringBytes: 0, label: "value" };
 
 /**
  * Build the durable, model-facing copy of tool arguments.
@@ -53,28 +48,14 @@ function projectModelArguments(
   if (toolName === "process") {
     return replaceString(canonical, "input", "input");
   }
-  if (toolName === "write_file") {
-    const redacted = { ...canonical };
-    if (typeof canonical.content === "string") {
-      redacted.content = omittedValue("content", canonical.content);
-    } else if (!Object.hasOwn(canonical, "content")) {
-      redacted.content = omittedValue("content");
+  if (toolName === "write_file" || toolName === "patch_file") {
+    for (const field of toolName === "write_file" ? ["content"] : ["old_text", "new_text"]) {
+      const value = canonical[field];
+      if (typeof value === "string" || !Object.hasOwn(canonical, field)) {
+        canonical[field] = omittedValue(field, typeof value === "string" ? value : undefined);
+      }
     }
-    return redacted;
-  }
-  if (toolName === "patch_file") {
-    const redacted = { ...canonical };
-    if (typeof canonical.old_text === "string") {
-      redacted.old_text = omittedValue("old_text", canonical.old_text);
-    } else if (!Object.hasOwn(canonical, "old_text")) {
-      redacted.old_text = omittedValue("old_text");
-    }
-    if (typeof canonical.new_text === "string") {
-      redacted.new_text = omittedValue("new_text", canonical.new_text);
-    } else if (!Object.hasOwn(canonical, "new_text")) {
-      redacted.new_text = omittedValue("new_text");
-    }
-    return redacted;
+    return canonical;
   }
   if (toolName === "search_files") {
     return replaceString(canonical, "query", "query");
@@ -117,12 +98,12 @@ function projectModelArguments(
     const projected = redactFlexibleValue(
       projectionSource,
       0,
-      { remaining: MODEL_ARGUMENT_MAX_NODES },
+      { remaining: ARGUMENT_LIMITS.nodes },
     );
     const nested = isObject(projected) ? projected : {};
     restoreConstrainedFields(toolName, originalArguments, nested);
-    if (toolName === "browser") {
-      if (browserSchema) nested.schema = boundedUnknownSchema(browserSchema);
+    if (browserSchema) {
+      nested.schema = redactFlexibleValue(browserSchema, 0, { remaining: SCHEMA_LIMITS.nodes }, SCHEMA_LIMITS);
     }
     redacted.arguments = nested;
   }
@@ -198,19 +179,23 @@ function redactFlexibleValue(
   value: unknown,
   depth: number,
   budget: { remaining: number },
+  limits = ARGUMENT_LIMITS,
 ): unknown {
-  if (budget.remaining <= 0 || depth > MODEL_ARGUMENT_MAX_DEPTH) return "[omitted]";
+  if (budget.remaining <= 0 || depth > limits.depth) return "[omitted]";
   budget.remaining -= 1;
-  if (typeof value === "string") return redactFreeText(value, "value");
+  if (typeof value === "string") {
+    const redacted = redactFreeText(value, limits.label);
+    return limits.stringBytes ? boundedUtf8(redacted, limits.stringBytes) : redacted;
+  }
   if (Array.isArray(value)) {
-    return value.slice(0, MODEL_ARGUMENT_MAX_ITEMS)
-      .map((item) => redactFlexibleValue(item, depth + 1, budget));
+    return value.slice(0, limits.items)
+      .map((item) => redactFlexibleValue(item, depth + 1, budget, limits));
   }
   if (!isObject(value)) return value;
   return Object.fromEntries(
     Object.entries(value)
-      .slice(0, MODEL_ARGUMENT_MAX_ITEMS)
-      .map(([key, item]) => [key, redactFlexibleValue(item, depth + 1, budget)]),
+      .slice(0, limits.items)
+      .map(([key, item]) => [key, redactFlexibleValue(item, depth + 1, budget, limits)]),
   );
 }
 
@@ -261,33 +246,6 @@ function restoreConstrainedFields(
   }
 }
 
-function boundedUnknownSchema(value: JsonObject): JsonObject {
-  const budget = { remaining: UNKNOWN_SCHEMA_MAX_NODES };
-  const bounded = boundedUnknownValue(value, 0, budget);
-  return isObject(bounded) ? bounded : {};
-}
-
-function boundedUnknownValue(
-  value: unknown,
-  depth: number,
-  budget: { remaining: number },
-): unknown {
-  if (budget.remaining <= 0 || depth > UNKNOWN_SCHEMA_MAX_DEPTH) return "[omitted]";
-  budget.remaining -= 1;
-  if (Array.isArray(value)) {
-    return value.slice(0, UNKNOWN_SCHEMA_MAX_ITEMS)
-      .map((item) => boundedUnknownValue(item, depth + 1, budget));
-  }
-  if (typeof value === "string") {
-    return boundedUtf8(redactFreeText(value, "schema value"), UNKNOWN_SCHEMA_MAX_STRING_BYTES);
-  }
-  if (!isObject(value)) return value;
-  return Object.fromEntries(
-    Object.entries(value)
-      .slice(0, UNKNOWN_SCHEMA_MAX_ITEMS)
-      .map(([key, item]) => [key, boundedUnknownValue(item, depth + 1, budget)]),
-  );
-}
 
 function boundedUtf8(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;

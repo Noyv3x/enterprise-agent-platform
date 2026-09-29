@@ -228,14 +228,16 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     return;
   }
 
-  if (request.method === "GET" && url.pathname === "/v1/scopes/processes") {
-    const allowedQuery = new Set(["scope_key", "lifecycle_id", "since_revision"]);
-    if ([...url.searchParams.keys()].some((key) => !allowedQuery.has(key))) {
-      throw httpError(400, "Process preview accepts only scope_key, lifecycle_id, and since_revision");
+  if (request.method === "GET" && ["/v1/scopes/processes", "/v1/scopes/process-summary"].includes(url.pathname)) {
+    const summary = url.pathname.endsWith("/process-summary");
+    const allowed = summary ? ["scope_key", "lifecycle_id"] : ["scope_key", "lifecycle_id", "since_revision"];
+    if ([...url.searchParams.keys()].some((key) => !allowed.includes(key))) {
+      throw httpError(400, summary
+        ? "Process summary accepts only scope_key and lifecycle_id"
+        : "Process preview accepts only scope_key, lifecycle_id, and since_revision");
     }
     const scopeKeys = url.searchParams.getAll("scope_key");
     const lifecycleIds = url.searchParams.getAll("lifecycle_id");
-    const sinceRevisions = url.searchParams.getAll("since_revision");
     const scopeKey = scopeKeys.length === 1 ? scopeKeys[0]!.trim() : "";
     const lifecycleId = lifecycleIds.length === 1 ? lifecycleIds[0]!.trim() : "";
     if (!scopeKey || scopeKey.length > 512) {
@@ -244,6 +246,11 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
     if (!lifecycleId || lifecycleId.length > 512) {
       throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
     }
+    if (summary) {
+      json(response, 200, await coordinator.previewProcessSummary(scopeKey, lifecycleId));
+      return;
+    }
+    const sinceRevisions = url.searchParams.getAll("since_revision");
     let sinceRevision: string | undefined;
     if (sinceRevisions.length > 0) {
       const value = sinceRevisions.length === 1 ? sinceRevisions[0]! : "";
@@ -254,25 +261,6 @@ async function route(config: RuntimeConfig, coordinator: RunCoordinator, request
       sinceRevision = value;
     }
     json(response, 200, await coordinator.previewProcesses(scopeKey, lifecycleId, sinceRevision));
-    return;
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/scopes/process-summary") {
-    const allowedQuery = new Set(["scope_key", "lifecycle_id"]);
-    if ([...url.searchParams.keys()].some((key) => !allowedQuery.has(key))) {
-      throw httpError(400, "Process summary accepts only scope_key and lifecycle_id");
-    }
-    const scopeKeys = url.searchParams.getAll("scope_key");
-    const lifecycleIds = url.searchParams.getAll("lifecycle_id");
-    const scopeKey = scopeKeys.length === 1 ? scopeKeys[0]!.trim() : "";
-    const lifecycleId = lifecycleIds.length === 1 ? lifecycleIds[0]!.trim() : "";
-    if (!scopeKey || scopeKey.length > 512) {
-      throw httpError(400, "scope_key must be a non-empty string of at most 512 characters");
-    }
-    if (!lifecycleId || lifecycleId.length > 512) {
-      throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
-    }
-    json(response, 200, await coordinator.previewProcessSummary(scopeKey, lifecycleId));
     return;
   }
 

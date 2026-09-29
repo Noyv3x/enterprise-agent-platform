@@ -30,8 +30,6 @@ export function uiReducer(state: AppState, action: Action): AppState {
           [action.payload.key]: action.payload.state,
         },
       };
-    case "RESET_SESSION":
-      return { ...state, ...uiInitial };
     default:
       return state;
   }

@@ -6,14 +6,6 @@ import { PlatformGateway } from "./platform-gateway.js";
 // Codex (ChatGPT OAuth) is the only product model provider.
 type ProductProvider = "openai-codex";
 
-type ProductProviderId = "openai-codex";
-
-interface ProductProviderDefinition {
-  runtimeProvider: ProductProvider;
-  api: Api;
-  baseUrl: string;
-}
-
 export interface ProductModelCatalogEntry {
   id: string;
   name: string;
@@ -24,34 +16,20 @@ export interface ProductModelCatalogEntry {
 }
 
 export interface ProductModelCatalog {
-  provider: ProductProviderId;
+  provider: ProductProvider;
   runtime_provider: ProductProvider;
   default_model: string;
   models: ProductModelCatalogEntry[];
 }
 
-const PRODUCT_PROVIDERS: Readonly<Record<ProductProviderId, ProductProviderDefinition>> = {
-  "openai-codex": {
-    runtimeProvider: "openai-codex",
-    api: "openai-codex-responses",
-    baseUrl: "https://chatgpt.com/backend-api",
-  },
-};
-
-function definitionForRuntimeProvider(provider: ProductProvider): ProductProviderDefinition {
-  return PRODUCT_PROVIDERS[provider];
+function isTrustedProductModel(model: Model<Api>): boolean {
+  return model.provider === "openai-codex"
+    && model.api === "openai-codex-responses"
+    && model.baseUrl.replace(/\/$/, "") === "https://chatgpt.com/backend-api";
 }
 
-function isTrustedProductModel(model: Model<Api>, definition: ProductProviderDefinition): boolean {
-  return model.provider === definition.runtimeProvider
-    && model.api === definition.api
-    && model.baseUrl.replace(/\/$/, "") === definition.baseUrl;
-}
-
-function trustedModels(provider: ProductProvider): Model<Api>[] {
-  const definition = definitionForRuntimeProvider(provider);
-  const lookup = getModels as unknown as (providerId: string) => readonly Model<Api>[];
-  return [...lookup(provider)].filter((model) => isTrustedProductModel(model, definition));
+function trustedModels(): Model<Api>[] {
+  return getModels("openai-codex").filter(isTrustedProductModel);
 }
 
 /**
@@ -60,32 +38,24 @@ function trustedModels(provider: ProductProvider): Model<Api>[] {
  * catalog responses, and execution cannot drift when the dependency updates.
  */
 export const PRODUCT_MODELS: Readonly<Record<ProductProvider, readonly string[]>> = Object.freeze({
-  "openai-codex": Object.freeze(trustedModels("openai-codex").map((model) => model.id)),
+  "openai-codex": Object.freeze(trustedModels().map((model) => model.id)),
 });
 
-function productModelCatalog(
-  provider: ProductProviderId,
-  definition: ProductProviderDefinition,
-): ProductModelCatalog {
-  const models = trustedModels(definition.runtimeProvider).map((model) => ({
-    id: model.id,
-    name: model.name,
-    reasoning: model.reasoning,
-    input: [...model.input],
-    context_window: model.contextWindow,
-    max_tokens: model.maxTokens,
-  }));
+export function productModelCatalogs(): Record<ProductProvider, ProductModelCatalog> {
   return {
-    provider,
-    runtime_provider: definition.runtimeProvider,
-    default_model: "",
-    models,
-  };
-}
-
-export function productModelCatalogs(): Record<ProductProviderId, ProductModelCatalog> {
-  return {
-    "openai-codex": productModelCatalog("openai-codex", PRODUCT_PROVIDERS["openai-codex"]),
+    "openai-codex": {
+      provider: "openai-codex",
+      runtime_provider: "openai-codex",
+      default_model: "",
+      models: trustedModels().map((model) => ({
+        id: model.id,
+        name: model.name,
+        reasoning: model.reasoning,
+        input: [...model.input],
+        context_window: model.contextWindow,
+        max_tokens: model.maxTokens,
+      })),
+    },
   };
 }
 
@@ -111,10 +81,9 @@ export function validateProductModelRequest(model: ModelRequest): ProductProvide
     throw new ModelValidationError("model.provider must be openai-codex");
   }
   const provider: ProductProvider = model.provider;
-  const definition = definitionForRuntimeProvider(provider);
   const lookup = getModel as unknown as (providerId: string, modelId: string) => Model<Api> | undefined;
   const resolved = lookup(provider, model.id);
-  if (!resolved || !isTrustedProductModel(resolved, definition)) {
+  if (!resolved || !isTrustedProductModel(resolved)) {
     throw new ModelValidationError(`Model ${model.id} is not allowed for provider ${model.provider}`);
   }
   return provider;
@@ -124,8 +93,7 @@ export function resolveModel(request: RunRequest, gateway: PlatformGateway, sign
   const provider = validateProductModelRequest(request.model);
   const lookup = getModel as unknown as (providerId: string, modelId: string) => Model<Api> | undefined;
   const model = lookup(provider, request.model.id);
-  const definition = definitionForRuntimeProvider(provider);
-  if (!model || !isTrustedProductModel(model, definition)) {
+  if (!model || !isTrustedProductModel(model)) {
     throw new Error(`Built-in product model metadata is missing for ${provider}/${request.model.id}`);
   }
   return {
@@ -160,10 +128,9 @@ export async function resolveAuxiliaryVisionModel(
   gateway: PlatformGateway,
   signal?: AbortSignal,
 ): Promise<AuthorizedAuxiliaryModel | undefined> {
-  const provider = validateProductModelRequest(request.model);
   const primary = resolveModel(request, gateway, signal);
   if (modelSupportsImages(primary.model)) return undefined;
-  for (const candidate of trustedModels(provider)) {
+  for (const candidate of trustedModels()) {
     if (candidate.id === request.model.id || !modelSupportsImages(candidate)) continue;
     const candidateRequest: RunRequest = {
       ...request,

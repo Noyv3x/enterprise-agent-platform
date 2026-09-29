@@ -1,4 +1,4 @@
-/* Auth slice — user, busy and error state. Cross-cutting SET_BUSY/SET_ERROR live here. */
+/* Auth slice — user, overlapping busy operations and error state. */
 
 import type { Action, AppState, AuthSliceState } from "../../types";
 
@@ -25,8 +25,6 @@ export function authReducer(state: AppState, action: Action): AppState {
     }
     case "SET_ERROR":
       return { ...state, error: action.payload };
-    case "RESET_SESSION":
-      return { ...state, ...authInitial };
     default:
       return state;
   }

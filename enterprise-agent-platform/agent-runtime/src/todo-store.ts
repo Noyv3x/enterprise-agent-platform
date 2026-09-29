@@ -1,6 +1,4 @@
-import { constants } from "node:fs";
-import { chmod, mkdir, open, rename, rm } from "node:fs/promises";
-import { dirname } from "node:path";
+import { keyedQueue, readPrivateText, removeDurableFile, writeState } from "./durable-store.js";
 import type { SessionIdentity } from "./session-store.js";
 import { id, nowIso } from "./utils.js";
 
@@ -54,7 +52,7 @@ export interface TodoSessionState {
  * session. Caller history and model text never enter this class.
  */
 export class TodoStore {
-  private readonly queues = new Map<string, Promise<void>>();
+  private readonly withQueue = keyedQueue();
 
   constructor(private readonly pathForIdentity: (identity: SessionIdentity) => string) {}
 
@@ -114,101 +112,39 @@ export class TodoStore {
         };
       });
       const state = document(identity, next, timestamp);
-      await this.writeUnlocked(file, state);
+      await writeState(file, state);
       return state;
     });
   }
 
   async deleteSession(identity: SessionIdentity): Promise<void> {
     const file = this.pathForIdentity(identity);
-    await this.withQueue(file, async () => {
-      await rm(file, { force: true });
-      try {
-        await syncDirectory(dirname(file));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-    });
+    await this.withQueue(file, () => removeDurableFile(file));
   }
 
   private async readUnlocked(file: string, identity: SessionIdentity): Promise<TodoStateSnapshot> {
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    const raw = await readPrivateText(file, "Agent todo state", MAX_TODO_STATE_BYTES);
+    let parsed: unknown;
     try {
-      handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
-      const info = await handle.stat();
-      if (!info.isFile()) throw new Error("Agent todo state is not a regular file");
-      if (info.nlink !== 1) throw new Error("Agent todo state must have exactly one link");
-      if (typeof process.getuid === "function" && info.uid !== process.getuid()) {
-        throw new Error("Agent todo state is not owned by the Runtime user");
-      }
-      if ((info.mode & 0o077) !== 0) throw new Error("Agent todo state is not owner-only");
-      if (info.size > MAX_TODO_STATE_BYTES) {
-        throw new Error(`Agent todo state exceeds ${MAX_TODO_STATE_BYTES} bytes`);
-      }
-      const raw = await handle.readFile({ encoding: "utf8" });
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(raw);
-      } catch {
-        return document(identity, [], nowIso());
-      }
-      if (parsed && typeof parsed === "object") {
-        for (const key of ["scope_key", "lifecycle_id", "session_id"] as const) {
-          if (key in parsed && (parsed as Record<string, unknown>)[key] !== identity[key]) {
-            throw new Error(`Agent todo state ${key} does not match its session`);
-          }
+      parsed = raw === undefined ? undefined : JSON.parse(raw);
+    } catch {
+      return document(identity, [], nowIso());
+    }
+    if (parsed && typeof parsed === "object") {
+      for (const key of ["scope_key", "lifecycle_id", "session_id"] as const) {
+        if (key in parsed && (parsed as Record<string, unknown>)[key] !== identity[key]) {
+          throw new Error(`Agent todo state ${key} does not match its session`);
         }
       }
-      try {
-        return validateDocument(parsed, identity);
-      } catch {
-        // Todo data is advisory: malformed legacy state must not block a run.
-        return document(identity, [], nowIso());
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return document(identity, [], nowIso());
-      if ((error as NodeJS.ErrnoException).code === "ELOOP") {
-        throw new Error("Agent todo state must not be a symbolic link");
-      }
-      throw error;
-    } finally {
-      await handle?.close().catch(() => undefined);
+    }
+    try {
+      return validateDocument(parsed, identity);
+    } catch {
+      // Todo data is advisory: malformed legacy state must not block a run.
+      return document(identity, [], nowIso());
     }
   }
 
-  private async writeUnlocked(file: string, state: TodoStateSnapshot): Promise<void> {
-    await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    const temporary = `${file}.${id("state")}.tmp`;
-    let handle: Awaited<ReturnType<typeof open>> | undefined;
-    try {
-      handle = await open(temporary, "wx", 0o600);
-      await handle.writeFile(`${JSON.stringify(state, null, 2)}\n`, "utf8");
-      await handle.sync();
-      await handle.close();
-      handle = undefined;
-      await rename(temporary, file);
-      await chmod(file, 0o600);
-      await syncDirectory(dirname(file));
-    } finally {
-      await handle?.close().catch(() => undefined);
-      await rm(temporary, { force: true }).catch(() => undefined);
-    }
-  }
-
-  private async withQueue<T>(file: string, task: () => Promise<T>): Promise<T> {
-    const previous = this.queues.get(file) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const current = previous.catch(() => undefined).then(async () => await gate);
-    this.queues.set(file, current);
-    await previous.catch(() => undefined);
-    try {
-      return await task();
-    } finally {
-      release();
-      if (this.queues.get(file) === current) this.queues.delete(file);
-    }
-  }
 }
 
 function document(
@@ -295,11 +231,3 @@ function validateTimestamp(value: unknown, label: string): asserts value is stri
   }
 }
 
-async function syncDirectory(directoryPath: string): Promise<void> {
-  const directory = await open(directoryPath, "r");
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
-  }
-}

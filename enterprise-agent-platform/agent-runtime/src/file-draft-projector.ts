@@ -40,11 +40,6 @@ interface DraftState {
   publishedAt: number;
 }
 
-type Eligibility<T> =
-  | { status: "allowed"; value: T }
-  | { status: "pending" }
-  | { status: "rejected" };
-
 /** Project only Pi's parsed cumulative arguments, never raw JSON fragments. */
 export class FileDraftProjector {
   private readonly states = new Map<string, DraftState>();
@@ -59,9 +54,9 @@ export class FileDraftProjector {
     const now = this.now();
     if (!argumentsFinished && previous && now - previous.publishedAt < FILE_DRAFT_INTERVAL_MS) return;
     const args = objectRecord(block.arguments);
-    if (sandboxTarget(args, argumentsFinished).status !== "allowed") return;
-    const path = canonicalWorkspacePath(args.path, argumentsFinished);
-    if (path.status !== "allowed") return;
+    if (!sandboxTarget(args, argumentsFinished)) return;
+    const path = canonicalWorkspacePath(args.path);
+    if (path === undefined) return;
     const raw = args[block.name === "write_file" ? "content" : "new_text"];
     if (typeof raw !== "string") return;
     const safe = safeDraftContent(raw, argumentsFinished);
@@ -70,7 +65,7 @@ export class FileDraftProjector {
       tool_call_id: block.id,
       tool_name: block.name,
       file_draft: {
-        workspace_path: path.value,
+        workspace_path: path,
         kind: block.name === "write_file" ? "file" : "replacement",
         content: safe.content,
         done: false,
@@ -116,66 +111,23 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function sandboxTarget(arguments_: Record<string, unknown>, complete: boolean): Eligibility<true> {
-  if (!Object.hasOwn(arguments_, "target") || arguments_.target === undefined) {
-    // The tool's complete-schema default is sandbox, but an unfinished JSON
-    // object can still append target=host after content. Do not expose any
-    // incomplete body until sandbox is explicit.
-    return complete
-      ? { status: "allowed", value: true }
-      : { status: "pending" };
-  }
-  if (arguments_.target === "sandbox") return { status: "allowed", value: true };
-  if (arguments_.target === "host") return { status: "rejected" };
-  if (
-    !complete
-    && typeof arguments_.target === "string"
-    && ("sandbox".startsWith(arguments_.target) || "host".startsWith(arguments_.target))
-  ) {
-    return { status: "pending" };
-  }
-  return { status: "rejected" };
+function sandboxTarget(arguments_: Record<string, unknown>, complete: boolean): boolean {
+  // Partial arguments may still append target=host; only complete calls get
+  // the executable schema's implicit sandbox default.
+  return arguments_.target === "sandbox"
+    || (complete && (!Object.hasOwn(arguments_, "target") || arguments_.target === undefined));
 }
 
-function canonicalWorkspacePath(value: unknown, complete: boolean): Eligibility<string> {
-  if (typeof value !== "string" || value.length === 0) {
-    return complete ? { status: "rejected" } : { status: "pending" };
-  }
-  if (value.length > 4_096 || /[\\\0-\x1f\x7f]/u.test(value)) return { status: "rejected" };
-
-  let relativePath = value;
-  if (value.startsWith("/")) {
-    if (value === "/workspace" || value === "/workspace/") {
-      return complete ? { status: "rejected" } : { status: "pending" };
-    }
-    if (!value.startsWith("/workspace/")) {
-      return !complete && "/workspace/".startsWith(value)
-        ? { status: "pending" }
-        : { status: "rejected" };
-    }
-    relativePath = value.slice("/workspace/".length);
-  }
-
-  const normalized = posix.normalize(relativePath);
-  if (
-    normalized === ""
-    || normalized === "."
-    || normalized === ".."
-    || normalized.startsWith("../")
-    || posix.isAbsolute(normalized)
-  ) {
-    return complete || normalized.startsWith("../")
-      ? { status: "rejected" }
-      : { status: "pending" };
-  }
-  return { status: "allowed", value: normalized };
+function canonicalWorkspacePath(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value || value.length > 4_096 || /[\\\0-\x1f\x7f]/u.test(value)) return;
+  if (value.startsWith("/") && !value.startsWith("/workspace/")) return;
+  const normalized = posix.normalize(value.startsWith("/workspace/") ? value.slice("/workspace/".length) : value);
+  if (normalized === "" || normalized === "." || normalized === ".."
+    || normalized.startsWith("../") || posix.isAbsolute(normalized)) return;
+  return normalized;
 }
 
-function safeDraftContent(rawContent: string, complete: boolean): {
-  content: string;
-  bytes: number;
-  truncated: boolean;
-} {
+function safeDraftContent(rawContent: string, complete: boolean): { content: string; truncated: boolean } {
   const redacted = redactDraftCredentials(rawContent);
   const redactedBytes = Buffer.byteLength(redacted);
   const visibleBytes = complete
@@ -185,7 +137,6 @@ function safeDraftContent(rawContent: string, complete: boolean): {
   const content = utf8Prefix(redacted, boundedBytes);
   return {
     content,
-    bytes: Buffer.byteLength(content),
     truncated: redactedBytes > FILE_DRAFT_MAX_BYTES,
   };
 }

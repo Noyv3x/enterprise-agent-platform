@@ -14,8 +14,9 @@ export interface PreviewAvailabilityState {
   error: string;
 }
 
-interface StoredPreviewAvailabilityState extends PreviewAvailabilityState {
+interface StoredPreviewAvailabilityState {
   scopeKey: string;
+  state: PreviewAvailabilityState;
 }
 
 function scopeKey(scope: AgentPreviewScope | null): string {
@@ -25,11 +26,13 @@ function scopeKey(scope: AgentPreviewScope | null): string {
 function emptyState(key: string, loading: boolean): StoredPreviewAvailabilityState {
   return {
     scopeKey: key,
-    browserActive: false,
-    runningTerminalCount: 0,
-    presentAvailable: false,
-    loading,
-    error: "",
+    state: {
+      browserActive: false,
+      runningTerminalCount: 0,
+      presentAvailable: false,
+      loading,
+      error: "",
+    },
   };
 }
 
@@ -86,18 +89,19 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
         if (result.kind === "unchanged") {
           setStoredState((current) => current.scopeKey === key ? {
             ...current,
-            loading: false,
-            error: "",
+            state: { ...current.state, loading: false, error: "" },
           } : current);
         } else {
           if (result.etag) etag = result.etag;
           setStoredState({
             scopeKey: key,
-            browserActive: result.browserActive,
-            runningTerminalCount: result.runningTerminalCount,
-            presentAvailable: result.presentAvailable,
-            loading: false,
-            error: "",
+            state: {
+              browserActive: result.browserActive,
+              runningTerminalCount: result.runningTerminalCount,
+              presentAvailable: result.presentAvailable,
+              loading: false,
+              error: "",
+            },
           });
         }
       } catch (error) {
@@ -109,8 +113,11 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
         ) {
           setStoredState((current) => current.scopeKey === key ? {
             ...current,
-            loading: false,
-            error: error instanceof Error ? error.message : String(error),
+            state: {
+              ...current.state,
+              loading: false,
+              error: error instanceof Error ? error.message : String(error),
+            },
           } : current);
         }
       } finally {
@@ -163,17 +170,20 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
       }
       setStoredState((current) => current.scopeKey === key ? {
         ...current,
-        ...(update.browserActive !== undefined
-          ? { browserActive: update.browserActive }
-          : {}),
-        ...(update.runningTerminalCount !== undefined
-          ? { runningTerminalCount: update.runningTerminalCount }
-          : {}),
-        ...(update.presentAvailable !== undefined
-          ? { presentAvailable: update.presentAvailable }
-          : {}),
-        loading: false,
-        error: "",
+        state: {
+          ...current.state,
+          ...(update.browserActive !== undefined
+            ? { browserActive: update.browserActive }
+            : {}),
+          ...(update.runningTerminalCount !== undefined
+            ? { runningTerminalCount: update.runningTerminalCount }
+            : {}),
+          ...(update.presentAvailable !== undefined
+            ? { presentAvailable: update.presentAvailable }
+            : {}),
+          loading: false,
+          error: "",
+        },
       } : current);
     });
     schedule(0);
@@ -191,16 +201,9 @@ export function usePreviewAvailability(scope: AgentPreviewScope | null) {
 
   // Effects run after render. Gate stored data by the current scope so a scope
   // switch cannot expose the previous scope's availability for even one frame.
-  const current = storedState.scopeKey === key
+  const state = (storedState.scopeKey === key
     ? storedState
-    : emptyState(key, Boolean(scope));
-  const state: PreviewAvailabilityState = {
-    browserActive: current.browserActive,
-    runningTerminalCount: current.runningTerminalCount,
-    presentAvailable: current.presentAvailable,
-    loading: current.loading,
-    error: current.error,
-  };
+    : emptyState(key, Boolean(scope))).state;
   const refresh = useCallback(() => requestNow.current(), []);
   return { state, refresh };
 }

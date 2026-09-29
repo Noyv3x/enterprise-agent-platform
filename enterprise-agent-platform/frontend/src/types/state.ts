@@ -167,316 +167,81 @@ export type UiSliceState = Pick<
   "sidebarOpen" | "personalAiGuideOpen" | "personalAiGuideShownThisSession" | "resourceStates"
 >;
 
-/* ===================================================================== */
-/* Action discriminated union — the contract every reducer is filled against. */
-/* ===================================================================== */
+/** Payloads keyed by action type; the mapped union keeps switch narrowing exact. */
+interface ActionPayloads {
+  /* cross-cutting and auth */
+  BEGIN_BUSY: string;
+  END_BUSY: string;
+  SET_ERROR: string;
+  SET_USER: User | null;
 
-/* cross-cutting */
-interface ResetSessionAction {
-  type: "RESET_SESSION";
-}
-interface BeginBusyAction {
-  type: "BEGIN_BUSY";
-  payload: string;
-}
-interface EndBusyAction {
-  type: "END_BUSY";
-  payload: string;
-}
-interface SetErrorAction {
-  type: "SET_ERROR";
-  payload: string;
-}
-
-/* auth slice */
-interface SetUserAction {
-  type: "SET_USER";
-  payload: User | null;
-}
-
-/* chat slice */
-interface SetChannelsAction {
-  type: "SET_CHANNELS";
-  payload: Channel[];
-}
-interface RemoveChannelScopeAction {
-  type: "REMOVE_CHANNEL_SCOPE";
-  payload: Id;
-}
-interface SetActiveViewAction {
-  type: "SET_ACTIVE_VIEW";
-  payload: ActiveView;
-}
-interface SetActiveChannelIdAction {
-  type: "SET_ACTIVE_CHANNEL_ID";
-  payload: Id | null;
-}
-interface SetMessagesAction {
-  type: "SET_MESSAGES";
-  payload: Message[];
-}
-interface SetPrivateMessagesAction {
-  type: "SET_PRIVATE_MESSAGES";
-  payload: Message[];
-}
-interface SetMessageSyncCursorAction {
-  type: "SET_MESSAGE_SYNC_CURSOR";
-  payload: { key: string; cursor: MessageSyncCursor };
-}
-interface SetMessageHistoryAction {
-  type: "SET_MESSAGE_HISTORY";
-  payload: { key: string; history: MessageHistoryState };
-}
-interface PrependMessagesAction {
-  type: "PREPEND_MESSAGES";
-  payload: {
+  /* chat */
+  SET_CHANNELS: Channel[];
+  REMOVE_CHANNEL_SCOPE: Id;
+  SET_ACTIVE_VIEW: ActiveView;
+  SET_ACTIVE_CHANNEL_ID: Id | null;
+  SET_MESSAGES: Message[];
+  SET_PRIVATE_MESSAGES: Message[];
+  SET_MESSAGE_SYNC_CURSOR: { key: string; cursor: MessageSyncCursor };
+  SET_MESSAGE_HISTORY: { key: string; history: MessageHistoryState };
+  PREPEND_MESSAGES: {
     mode: ChatMode;
     scopeId: string;
     messages: Message[];
     nextBeforeId: string | null;
     hasMore: boolean;
   };
-}
-interface SetPendingMessagesAction {
-  type: "SET_PENDING_MESSAGES";
-  payload: Message[];
-}
-interface AddPendingMessageAction {
-  type: "ADD_PENDING_MESSAGE";
-  payload: { mode: ChatMode; scopeId: string; message: Message };
-}
-interface ReplaceOptimisticMessageAction {
-  type: "REPLACE_OPTIMISTIC_MESSAGE";
-  payload: { mode: ChatMode; scopeId: string; tempId: Id; saved: Message | null };
-}
-interface RemoveOptimisticMessageAction {
-  type: "REMOVE_OPTIMISTIC_MESSAGE";
-  payload: { mode: ChatMode; scopeId: string; tempId: Id };
-}
-interface UpdateOptimisticUploadAction {
-  type: "UPDATE_OPTIMISTIC_UPLOAD";
-  payload: { tempId: Id; upload: NonNullable<Message["metadata"]>["upload"] };
-}
-interface SetAgentStatusAction {
-  type: "SET_AGENT_STATUS";
-  payload: {
+  ADD_PENDING_MESSAGE: { mode: ChatMode; scopeId: string; message: Message };
+  REPLACE_OPTIMISTIC_MESSAGE: { mode: ChatMode; scopeId: string; tempId: Id; saved: Message | null };
+  REMOVE_OPTIMISTIC_MESSAGE: { mode: ChatMode; scopeId: string; tempId: Id };
+  UPDATE_OPTIMISTIC_UPLOAD: { tempId: Id; upload: NonNullable<Message["metadata"]>["upload"] };
+  SET_AGENT_STATUS: {
     mode: ChatMode;
     scopeId: string;
     status: AgentStatus | null;
     /** A transport fence proved this response is current for the scope. */
     authoritative?: boolean;
   };
-}
-interface SetAgentStatusesAction {
-  type: "SET_AGENT_STATUSES";
-  payload: AgentStatuses;
-}
-interface ToggleAgentRunAction {
-  type: "TOGGLE_AGENT_RUN";
-  payload: { runId: string; expanded: boolean };
-}
-interface SetExpandedAgentRunsAction {
-  type: "SET_EXPANDED_AGENT_RUNS";
-  payload: Record<string, boolean>;
-}
-interface SetMentionTargetsAction {
-  type: "SET_MENTION_TARGETS";
-  payload: MentionTarget[];
-}
-interface SetTypingUsersAction {
-  type: "SET_TYPING_USERS";
-  payload: TypingUser[];
-}
-interface SetDraftsAction {
-  type: "SET_DRAFTS";
-  payload: Record<string, string>;
-}
-interface SetDraftAction {
-  type: "SET_DRAFT";
-  payload: { key: string; value: string };
-}
-interface SetDraftFilesAction {
-  type: "SET_DRAFT_FILES";
-  payload: { key: string; files: File[] };
-}
-interface RemoveDraftFilesAction {
-  type: "REMOVE_DRAFT_FILES";
-  payload: { key: string };
-}
-interface AddFailedSendAction {
-  type: "ADD_FAILED_SEND";
-  payload: { key: string; send: FailedSend };
-}
-interface RestoreNextFailedSendAction {
-  type: "RESTORE_NEXT_FAILED_SEND";
-  payload: { key: string };
-}
-interface SetPrivateTelegramAction {
-  type: "SET_PRIVATE_TELEGRAM";
-  payload: PrivateTelegram | null;
-}
-interface SetPrivateTelegramExpandedAction {
-  type: "SET_PRIVATE_TELEGRAM_EXPANDED";
-  payload: boolean;
-}
+  SET_AGENT_STATUSES: AgentStatuses;
+  TOGGLE_AGENT_RUN: { runId: string; expanded: boolean };
+  SET_MENTION_TARGETS: MentionTarget[];
+  SET_TYPING_USERS: TypingUser[];
+  SET_DRAFT: { key: string; value: string };
+  SET_DRAFT_FILES: { key: string; files: File[] };
+  REMOVE_DRAFT_FILES: { key: string };
+  ADD_FAILED_SEND: { key: string; send: FailedSend };
+  RESTORE_NEXT_FAILED_SEND: { key: string };
+  SET_PRIVATE_TELEGRAM: PrivateTelegram | null;
+  SET_PRIVATE_TELEGRAM_EXPANDED: boolean;
 
-/* admin slice */
-interface SetUsersAction {
-  type: "SET_USERS";
-  payload: User[];
-}
-interface SetPermissionGroupsAction {
-  type: "SET_PERMISSION_GROUPS";
-  payload: PermissionGroup[];
-}
-interface SetActiveAdminPageAction {
-  type: "SET_ACTIVE_ADMIN_PAGE";
-  payload: AdminPageId;
-}
-interface SetMessageAuditAction {
-  type: "SET_MESSAGE_AUDIT";
-  payload: MessageAudit;
-}
-interface PatchMessageAuditAction {
-  type: "PATCH_MESSAGE_AUDIT";
-  payload: Partial<MessageAudit>;
-}
-interface SetTokenUsageAction {
-  type: "SET_TOKEN_USAGE";
-  payload: TokenUsageReport | null;
-}
-interface SetTokenUsageDaysAction {
-  type: "SET_TOKEN_USAGE_DAYS";
-  payload: number;
-}
-interface SetSecretsAction {
-  type: "SET_SECRETS";
-  payload: Secret[];
-}
-interface SetRuntimesAction {
-  type: "SET_RUNTIMES";
-  payload: RuntimeMap | null;
-}
-interface SetAgentRuntimeConfigAction {
-  type: "SET_AGENT_RUNTIME_CONFIG";
-  payload: AgentRuntimeConfigState | null;
-}
-interface SetTelegramConfigAction {
-  type: "SET_TELEGRAM_CONFIG";
-  payload: TelegramConfigState | null;
-}
-interface SetAutoUpdateConfigAction {
-  type: "SET_AUTO_UPDATE_CONFIG";
-  payload: AutoUpdateConfigState | null;
-}
-interface SetBrandingConfigAction {
-  type: "SET_BRANDING_CONFIG";
-  payload: BrandingSnapshot | null;
-}
-interface SetSecurityConfigAction {
-  type: "SET_SECURITY_CONFIG";
-  payload: SecurityConfigState | null;
-}
-interface SetOAuthProvidersAction {
-  type: "SET_OAUTH_PROVIDERS";
-  payload: OAuthProvidersState | null;
-}
-/** Merge an OAuth provider state response for one provider. */
-interface SetOAuthStateAction {
-  type: "SET_OAUTH_STATE";
-  payload: {
-    providerId: string;
-    providers: OAuthProvider[];
-    flow?: OAuthFlow | null;
-  };
-}
-interface SetOAuthFlowAction {
-  type: "SET_OAUTH_FLOW";
-  payload: { providerId: string; flow: OAuthFlow };
-}
-interface SetOAuthFlowsAction {
-  type: "SET_OAUTH_FLOWS";
-  payload: Record<string, OAuthFlow>;
-}
+  /* admin */
+  SET_USERS: User[];
+  SET_PERMISSION_GROUPS: PermissionGroup[];
+  SET_ACTIVE_ADMIN_PAGE: AdminPageId;
+  PATCH_MESSAGE_AUDIT: Partial<MessageAudit>;
+  SET_TOKEN_USAGE: TokenUsageReport | null;
+  SET_TOKEN_USAGE_DAYS: number;
+  SET_SECRETS: Secret[];
+  SET_RUNTIMES: RuntimeMap | null;
+  SET_AGENT_RUNTIME_CONFIG: AgentRuntimeConfigState | null;
+  SET_TELEGRAM_CONFIG: TelegramConfigState | null;
+  SET_AUTO_UPDATE_CONFIG: AutoUpdateConfigState | null;
+  SET_BRANDING_CONFIG: BrandingSnapshot | null;
+  SET_SECURITY_CONFIG: SecurityConfigState | null;
+  SET_OAUTH_PROVIDERS: OAuthProvidersState | null;
+  /** Merge an OAuth provider state response for one provider. */
+  SET_OAUTH_STATE: { providerId: string; providers: OAuthProvider[]; flow?: OAuthFlow | null };
 
-/* ui slice */
-interface SetSidebarOpenAction {
-  type: "SET_SIDEBAR_OPEN";
-  payload: boolean;
-}
-interface ToggleSidebarAction {
-  type: "TOGGLE_SIDEBAR";
-}
-interface SetPersonalAiGuideOpenAction {
-  type: "SET_PERSONAL_AI_GUIDE_OPEN";
-  payload: { open: boolean; markShown?: boolean };
-}
-interface SetResourceStateAction {
-  type: "SET_RESOURCE_STATE";
-  payload: { key: string; state: ResourceState };
+  /* ui */
+  SET_SIDEBAR_OPEN: boolean;
+  SET_PERSONAL_AI_GUIDE_OPEN: { open: boolean; markShown?: boolean };
+  SET_RESOURCE_STATE: { key: string; state: ResourceState };
 }
 
 export type Action =
-  /* cross-cutting */
-  | ResetSessionAction
-  | BeginBusyAction
-  | EndBusyAction
-  | SetErrorAction
-  /* auth */
-  | SetUserAction
-  /* chat */
-  | SetChannelsAction
-  | RemoveChannelScopeAction
-  | SetActiveViewAction
-  | SetActiveChannelIdAction
-  | SetMessagesAction
-  | SetPrivateMessagesAction
-  | SetMessageSyncCursorAction
-  | SetMessageHistoryAction
-  | PrependMessagesAction
-  | SetPendingMessagesAction
-  | AddPendingMessageAction
-  | ReplaceOptimisticMessageAction
-  | RemoveOptimisticMessageAction
-  | UpdateOptimisticUploadAction
-  | SetAgentStatusAction
-  | SetAgentStatusesAction
-  | ToggleAgentRunAction
-  | SetExpandedAgentRunsAction
-  | SetMentionTargetsAction
-  | SetTypingUsersAction
-  | SetDraftsAction
-  | SetDraftAction
-  | SetDraftFilesAction
-  | RemoveDraftFilesAction
-  | AddFailedSendAction
-  | RestoreNextFailedSendAction
-  | SetPrivateTelegramAction
-  | SetPrivateTelegramExpandedAction
-  /* admin */
-  | SetUsersAction
-  | SetPermissionGroupsAction
-  | SetActiveAdminPageAction
-  | SetMessageAuditAction
-  | PatchMessageAuditAction
-  | SetTokenUsageAction
-  | SetTokenUsageDaysAction
-  | SetSecretsAction
-  | SetRuntimesAction
-  | SetAgentRuntimeConfigAction
-  | SetTelegramConfigAction
-  | SetAutoUpdateConfigAction
-  | SetBrandingConfigAction
-  | SetSecurityConfigAction
-  | SetOAuthProvidersAction
-  | SetOAuthStateAction
-  | SetOAuthFlowAction
-  | SetOAuthFlowsAction
-  /* ui */
-  | SetSidebarOpenAction
-  | ToggleSidebarAction
-  | SetPersonalAiGuideOpenAction
-  | SetResourceStateAction;
+  | { type: "RESET_SESSION" }
+  | { type: "TOGGLE_SIDEBAR" }
+  | { [T in keyof ActionPayloads]: { type: T; payload: ActionPayloads[T] } }[keyof ActionPayloads];
 
 /** Discriminated-union helper: the action for a given `type`. */
 export type ActionOf<T extends Action["type"]> = Extract<Action, { type: T }>;

@@ -102,6 +102,19 @@ import {
   truncate,
 } from "./utils.js";
 
+/** Shared live/replayed terminal wire projection; diagnostic results use the same shape. */
+function runResultEventData(result: RunResult | undefined, sessionId: string): JsonObject {
+  if (!result) return {};
+  return {
+    output: result.content,
+    content: result.content,
+    session_id: sessionId,
+    model: result.model,
+    usage: result.usage ?? {},
+    ...(result.context_usage ? { context_usage: result.context_usage } : {}),
+  };
+}
+
 interface RunCompletion {
   promise: Promise<RunRecord>;
   resolve: (record: RunRecord) => void;
@@ -120,7 +133,6 @@ export interface SessionCompactionResult {
 
 interface AcceptedRunInput {
   fingerprint: string;
-  preparation: Promise<UserMessage>;
   settled: Promise<void>;
   message: UserMessage | undefined;
   state: RunInputState | "preparing";
@@ -131,7 +143,6 @@ interface RunActivityState {
   lastActivityAt: number;
   lastActivity: string;
   pauseDepth: number;
-  pausedReason?: string;
 }
 
 interface ApprovedToolCallBinding {
@@ -203,7 +214,6 @@ export class RunCoordinator {
   private readonly runAttachmentPaths = new Map<string, Set<string>>();
   private readonly inputMessageIds = new WeakMap<object, string>();
   private readonly acceptingInputs = new Set<string>();
-  private readonly turnIndexes = new Map<string, number>();
   /** Total child creations are charged to the trusted in-memory root Run. */
   private readonly delegateCounts = new Map<string, number>();
   private readonly activeDelegateRuns = new Set<string>();
@@ -416,7 +426,6 @@ export class RunCoordinator {
     let settle!: () => void;
     const accepted: AcceptedRunInput = {
       fingerprint,
-      preparation,
       settled: new Promise<void>((resolve) => { settle = resolve; }),
       message: undefined,
       state: "preparing",
@@ -675,23 +684,13 @@ export class RunCoordinator {
         );
         if (signal?.aborted) throw abortError();
 
-        const retained = tracked.slice(compaction.omitted.length);
         const compactedMessages = [
           {
             message: summaryNotice,
             model_content_security_version: CURRENT_MODEL_CONTENT_SECURITY_VERSION,
             synthetic_kind: "context_compaction_notice" as const,
           },
-          ...retained.map((entry) => ({
-            entry_id: entry.entry_id,
-            message: entry.message,
-            ...(entry.model_content_security_version !== undefined
-              ? { model_content_security_version: entry.model_content_security_version }
-              : {}),
-            ...(entry.synthetic_kind !== undefined
-              ? { synthetic_kind: entry.synthetic_kind }
-              : {}),
-          })),
+          ...tracked.slice(compaction.omitted.length),
         ];
         await this.sessions.rewriteCompacted(
           identity,
@@ -884,27 +883,14 @@ export class RunCoordinator {
     }
   }
 
-  private pauseRunIdle(runId: string, reason: string): void {
+  private changeRunIdlePause(runId: string, description: string, delta: 1 | -1): void {
     const now = Date.now();
     for (const activityRunId of this.activityLineage(runId)) {
       const activity = this.runActivities.get(activityRunId);
       if (!activity) continue;
-      activity.lastActivityAt = now;
-      activity.lastActivity = truncate(reason, 500);
-      activity.pauseDepth += 1;
-      activity.pausedReason = reason;
-    }
-  }
-
-  private resumeRunIdle(runId: string, description: string): void {
-    const now = Date.now();
-    for (const activityRunId of this.activityLineage(runId)) {
-      const activity = this.runActivities.get(activityRunId);
-      if (!activity) continue;
-      activity.pauseDepth = Math.max(0, activity.pauseDepth - 1);
+      activity.pauseDepth = Math.max(0, activity.pauseDepth + delta);
       activity.lastActivityAt = now;
       activity.lastActivity = truncate(description, 500);
-      if (activity.pauseDepth === 0) delete activity.pausedReason;
     }
   }
 
@@ -933,8 +919,6 @@ export class RunCoordinator {
     journal.publish("run.started", { status: "running" });
     this.touchRunActivity(record.id, "run started");
     const identity = sessionIdentity(record.request);
-    let rejectIdleTimeout!: (error: Error) => void;
-    const idleTimeoutPromise = new Promise<never>((_resolve, reject) => { rejectIdleTimeout = reject; });
     let idleTimeoutMessage: string | undefined;
     let idleWatchdog: NodeJS.Timeout | undefined;
     if (this.config.runIdleTimeoutMs > 0) {
@@ -958,7 +942,6 @@ export class RunCoordinator {
         this.agents.get(record.id)?.abort();
         this.approvals.cancelRun(record.id);
         void this.executor.cancelRun(runExecutionIdentity(record)).catch(() => false);
-        rejectIdleTimeout(abortError(idleTimeoutMessage));
       }, pollIntervalMs);
       idleWatchdog.unref();
     }
@@ -1045,9 +1028,9 @@ export class RunCoordinator {
       if (recoveredHistory.repaired > 0) {
         journal.publish("session.repaired", { interrupted_tool_messages: recoveredHistory.repaired });
       }
-      let compactionNoticeEntryId: string | undefined;
-      const compactionSummaryCache = new Map<string, UserMessage>();
-      let automaticCompactionSource: AgentMessage[] | undefined;
+      // Pi owns an append-only logical transcript for this one Agent.prompt().
+      // Retain only the provider projection and its consumed logical offset.
+      let automaticCompactionOffset = 0;
       let automaticCompactionView: AgentMessage[] | undefined;
       const executionReview = createExecutionReviewState(activeBackgroundTasksAtStart);
       const ephemeralMessages = new WeakSet<AgentMessage>();
@@ -1167,11 +1150,12 @@ export class RunCoordinator {
           const processWait = tool.name === "process"
             && recordValue(executionParams).action === "wait";
           if (foregroundTerminal || processWait) {
-            this.pauseRunIdle(
+            this.changeRunIdlePause(
               record.id,
               foregroundTerminal
                 ? "foreground terminal command running"
                 : "waiting for background process",
+              1,
             );
           }
           try {
@@ -1216,11 +1200,12 @@ export class RunCoordinator {
           } finally {
             executionReceipts.delete(toolCallId);
             if (foregroundTerminal || processWait) {
-              this.resumeRunIdle(
+              this.changeRunIdlePause(
                 record.id,
                 foregroundTerminal
                   ? "foreground terminal command settled"
                   : "background process wait settled",
+                -1,
               );
             } else {
               this.touchRunActivity(record.id, `tool settled: ${tool.name}`);
@@ -1244,11 +1229,8 @@ export class RunCoordinator {
       const systemPrompt = assembleSystemPrompt(systemPromptParts);
       const contextMeter = new RequestContextUsage(systemPrompt, tools);
       const projectContext = (messages: AgentMessage[]): AgentMessage[] => (
-        automaticCompactionSource
-        && automaticCompactionView
-        && messages.length >= automaticCompactionSource.length
-        && automaticCompactionSource.every((message, index) => messages[index] === message)
-          ? [...automaticCompactionView, ...messages.slice(automaticCompactionSource.length)]
+        automaticCompactionView
+          ? [...automaticCompactionView, ...messages.slice(automaticCompactionOffset)]
           : messages
       );
       const streamFn = withModelStreamRetry(this.streamFn ?? streamSimple, {
@@ -1289,34 +1271,26 @@ export class RunCoordinator {
         // enqueued follow-up asks Pi for one more request, which the follow-up
         // itself satisfies. Error and aborted turns stay hard exits.
         finishTurn: async (turn) => {
-          if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return undefined;
-          if (
-            isRecurringScheduledRun(record.request.metadata)
+          if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted"
+            || turn.message.content.some((block) => block.type === "toolCall")) return undefined;
+          let continuation: string;
+          if (isRecurringScheduledRun(record.request.metadata)
             && !executionReview.scheduleDecision
-            && executionReview.scheduleDecisionContinuations < MAX_SCHEDULE_DECISION_CONTINUATIONS
-            && turn.message.content.every((block) => block.type !== "toolCall")
-          ) {
+            && executionReview.scheduleDecisionContinuations < MAX_SCHEDULE_DECISION_CONTINUATIONS) {
             executionReview.scheduleDecisionContinuations += 1;
-            const decisionFollowUp = runtimeReviewMessage(SCHEDULE_DECISION_CONTINUATION);
-            ephemeralMessages.add(decisionFollowUp);
-            agent?.followUp(decisionFollowUp);
-            return { action: "continue" };
-          }
-          if (
-            !learningReview
+            continuation = SCHEDULE_DECISION_CONTINUATION;
+          } else if (!learningReview
             && executionReview.backgroundTaskContinuations < MAX_BACKGROUND_TASK_CONTINUATIONS
-            && executionReview.activeBackgroundTasks.size > 0
-            && turn.message.content.every((block) => block.type !== "toolCall")
-          ) {
+            && executionReview.activeBackgroundTasks.size > 0) {
             executionReview.backgroundTaskContinuations += 1;
-            const processFollowUp = runtimeReviewMessage(activeBackgroundTaskContinuation(
-              executionReview.activeBackgroundTasks,
-            ));
-            ephemeralMessages.add(processFollowUp);
-            agent?.followUp(processFollowUp);
-            return { action: "continue" };
+            continuation = activeBackgroundTaskContinuation(executionReview.activeBackgroundTasks);
+          } else {
+            return undefined;
           }
-          return undefined;
+          const followUp = runtimeReviewMessage(continuation);
+          ephemeralMessages.add(followUp);
+          agent?.followUp(followUp);
+          return { action: "continue" };
         },
         transformContext: async (transcript) => {
           // Pi carries the prompt and tool declarations as leading system
@@ -1372,16 +1346,13 @@ export class RunCoordinator {
             if (omittedForSummary.length === 0) {
               throw new Error("Context compaction contained no durable history to summarize");
             }
-            const summaryKey = stableHash(serializeCompactionHistory(omittedForSummary));
-            const cachedSummary = compactionSummaryCache.get(summaryKey);
-            const summaryNotice = cachedSummary ?? await this.summarizeContextHandoff(
+            const summaryNotice = await this.summarizeContextHandoff(
               record.request,
               resolved,
               omittedForSummary,
               record.controller.signal,
               (description) => this.touchRunActivity(record.id, description),
             );
-            if (!cachedSummary) compactionSummaryCache.set(summaryKey, summaryNotice);
             compactionNotices.add(summaryNotice);
             compactedMessages = [summaryNotice, ...compaction.messages.slice(1)];
           } else if (compaction.notice) {
@@ -1397,8 +1368,7 @@ export class RunCoordinator {
               const plannedMessage = compaction.omitted[index]!;
               if (ephemeralMessages.has(sourceMessage)) continue;
               const notice = compactionNotices.has(plannedMessage);
-              const entryId = sessionEntryIds.get(sourceMessage)
-                ?? (notice ? compactionNoticeEntryId : undefined);
+              const entryId = sessionEntryIds.get(sourceMessage);
               if (!entryId) throw new Error("Cannot compact a message before its stable session entry is durable");
               if (notice) discardedNoticeEntryIds.add(entryId);
               else omittedEntryIds.add(entryId);
@@ -1427,20 +1397,6 @@ export class RunCoordinator {
                 }];
               },
             );
-            // Normally the prior handoff is present at the head of the reused
-            // projection and was classified above. If Pi supplies a divergent
-            // logical history instead, discard the current Runtime-owned notice
-            // unless this rewrite explicitly retained it.
-            const retainedEntryIds = new Set(compactedSessionMessages.flatMap(
-              (message) => message.entry_id ? [message.entry_id] : [],
-            ));
-            if (
-              compactionNoticeEntryId
-              && !retainedEntryIds.has(compactionNoticeEntryId)
-              && !omittedEntryIds.has(compactionNoticeEntryId)
-            ) {
-              discardedNoticeEntryIds.add(compactionNoticeEntryId);
-            }
             const omittedMessages = compaction.omitted.filter(
               (message) => !compactionNotices.has(message),
             ).length;
@@ -1449,12 +1405,11 @@ export class RunCoordinator {
               retained_messages: compactedMessages.length,
               archived_entries: omittedEntryIds.size,
             }, [...omittedEntryIds], [...discardedNoticeEntryIds]);
-            compactionNoticeEntryId = rewrittenEntryIds[0];
             journal.publish("context.compacted", {
               omitted_messages: omittedMessages,
               retained_messages: compactedMessages.length,
             });
-            automaticCompactionSource = [...messages];
+            automaticCompactionOffset = messages.length;
             automaticCompactionView = compactedMessages;
             for (let index = 0; index < compactedSessionMessages.length; index += 1) {
               const message = compactedSessionMessages[index]?.message;
@@ -1614,7 +1569,7 @@ export class RunCoordinator {
             this.rememberUnattendedAuthorizationBlock(record.id, toolContext.toolCall.id, reason);
             return { block: true, reason };
           }
-          this.pauseRunIdle(record.id, `waiting for approval: ${toolContext.toolCall.name}`);
+          this.changeRunIdlePause(record.id, `waiting for approval: ${toolContext.toolCall.name}`, 1);
           let approvalResult: Awaited<ReturnType<ApprovalBroker["request"]>>;
           try {
             approvalResult = await this.approvals.request({
@@ -1631,7 +1586,7 @@ export class RunCoordinator {
               ...(signal ? { signal } : {}),
             });
           } finally {
-            this.resumeRunIdle(record.id, `approval wait settled: ${toolContext.toolCall.name}`);
+            this.changeRunIdlePause(record.id, `approval wait settled: ${toolContext.toolCall.name}`, -1);
           }
           if (!approvalResult.allowed) {
             return { block: true, reason: approvalFailureReason(approvalResult.outcome) };
@@ -1653,7 +1608,9 @@ export class RunCoordinator {
       this.flushReadyInputs(record);
       const onAbort = (): void => agent.abort();
       record.controller.signal.addEventListener("abort", onAbort, { once: true });
+      let turnIndex = 0;
       agent.subscribe(async (event) => {
+        if (event.type === "turn_start") turnIndex += 1;
         // Pi emits the final response object here (start/update events are clones).
         if (event.type === "message_end" && event.message.role === "assistant") {
           contextMeter.completeResponse(event.message);
@@ -1661,6 +1618,7 @@ export class RunCoordinator {
         await this.handleAgentEvent(
           record,
           event,
+          Math.max(1, turnIndex),
           sessionEntryIds,
           ephemeralMessages,
           approvedToolCalls,
@@ -1734,24 +1692,13 @@ export class RunCoordinator {
         ephemeralMessages,
         record.request.workspace,
       );
-      const inputSummary = this.inputSummary(record.id);
-      result.input_message_ids = inputSummary.input_message_ids;
-      result.unconsumed_input_message_ids = inputSummary.unconsumed_input_message_ids;
       await this.sessions.appendRun(identity, { run_id: record.id, status: "completed" });
       if (learningReview) await this.sessions.deleteSession(identity);
       record.result = result;
-      this.finish(record, "completed", undefined, {
-        output: result.content,
-        content: result.content,
-        session_id: record.request.session_id,
-        model: result.model,
-        usage: result.usage ?? {},
-        ...(result.context_usage ? { context_usage: result.context_usage } : {}),
-        ...inputSummary,
-      });
+      this.finish(record, "completed");
     })();
     try {
-      await Promise.race([executionTask, idleTimeoutPromise, abortPromise]);
+      await Promise.race([executionTask, abortPromise]);
     } catch (error) {
       // Cancellation and inactivity timeout abort every operation, but
       // Promise.race does not cancel its losing promise. Give cooperative
@@ -1821,22 +1768,7 @@ export class RunCoordinator {
           message = `${message}; temporary learning-review session cleanup failed: ${errorMessage(cleanupError)}`;
         }
       }
-      const inputSummary = this.inputSummary(record.id);
-      if (record.result) {
-        record.result.input_message_ids = inputSummary.input_message_ids;
-        record.result.unconsumed_input_message_ids = inputSummary.unconsumed_input_message_ids;
-      }
-      this.finish(record, status, message, {
-        ...(status === "needs_review" && record.result ? {
-          output: record.result.content,
-          content: record.result.content,
-          session_id: record.request.session_id,
-          model: record.result.model,
-          usage: record.result.usage ?? {},
-          ...(record.result.context_usage ? { context_usage: record.result.context_usage } : {}),
-        } : {}),
-        ...inputSummary,
-      });
+      this.finish(record, status, message);
     } finally {
       if (idleWatchdog) clearInterval(idleWatchdog);
       record.controller.signal.removeEventListener("abort", abortRun);
@@ -1860,6 +1792,7 @@ export class RunCoordinator {
   private async handleAgentEvent(
     record: RunRecord,
     event: AgentEvent,
+    turnIndex: number,
     sessionEntryIds: WeakMap<AgentMessage, string>,
     ephemeralMessages: WeakSet<AgentMessage>,
     approvedToolCalls: Map<string, ApprovedToolCallBinding>,
@@ -1870,9 +1803,8 @@ export class RunCoordinator {
     if (event.type === "tool_execution_update" && !startedToolCalls.has(event.toolCallId)) return;
     this.touchRunActivity(record.id, describeAgentActivity(event));
     const journal = this.journals.get(record.id)!;
+    const turn = { turn_id: `${record.id}:${turnIndex}`, turn_index: turnIndex };
     if (event.type === "turn_start") {
-      const turnIndex = (this.turnIndexes.get(record.id) ?? 0) + 1;
-      this.turnIndexes.set(record.id, turnIndex);
       const maxTurns = isLearningReviewRun(record.request)
         ? Math.min(this.config.maxTurnsPerRun, LEARNING_REVIEW_MAX_MODEL_TURNS)
         : this.config.maxTurnsPerRun;
@@ -1895,7 +1827,7 @@ export class RunCoordinator {
         journal.publish("input.injected", {
           message_id: messageId,
           state: "injected",
-          ...this.turnIdentity(record.id),
+          ...turn,
         });
         this.persistRunStatus(record);
       }
@@ -1903,7 +1835,6 @@ export class RunCoordinator {
     }
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
-      const turn = this.turnIdentity(record.id);
       if (update.type === "text_delta") journal.publish("message.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
       else if (update.type === "thinking_delta") journal.publish("thinking.delta", { delta: update.delta, content_index: update.contentIndex, ...turn });
       else if (update.type === "toolcall_delta" || update.type === "toolcall_end") {
@@ -1933,10 +1864,8 @@ export class RunCoordinator {
           content: assistantText(event.message),
           stop_reason: event.message.stopReason,
           usage: event.message.usage as unknown as JsonObject,
-          ...this.turnIdentity(record.id),
+          ...turn,
         });
-      }
-      if (event.message.role === "assistant") {
         for (const block of event.message.content) {
           if (block.type !== "toolCall") continue;
           const unattendedEmailBlock = unattendedEmailToolBlockReason(
@@ -1969,7 +1898,7 @@ export class RunCoordinator {
       const unattendedAuthorizationReason = this.takeUnattendedAuthorizationBlock(record.id, event.toolCallId);
       const draft = fileDraftProjector.finish(event.toolCallId);
       if (draft) {
-        journal.publish("tool.arguments.delta", { ...this.turnIdentity(record.id), ...draft });
+        journal.publish("tool.arguments.delta", { ...turn, ...draft });
       }
       journal.publish(event.isError ? "tool.failed" : "tool.completed", {
         tool_call_id: event.toolCallId,
@@ -1985,11 +1914,6 @@ export class RunCoordinator {
         } : {}),
       });
     }
-  }
-
-  private turnIdentity(runId: string): { turn_id: string; turn_index: number } {
-    const turnIndex = Math.max(1, this.turnIndexes.get(runId) ?? 1);
-    return { turn_id: `${runId}:${turnIndex}`, turn_index: turnIndex };
   }
 
   private inputSummary(runId: string): {
@@ -2319,9 +2243,14 @@ export class RunCoordinator {
     return lineage.at(-1) ?? runId;
   }
 
-  private finish(record: RunRecord, status: RunRecord["status"], error?: string, data: JsonObject = {}): void {
-    if (isTerminal(record.status) && record.status !== "running") return;
+  private finish(record: RunRecord, status: RunRecord["status"], error?: string): void {
+    if (isTerminal(record.status)) return;
     this.closeInputs(record, error || `Run ${status}`);
+    const inputs = this.inputSummary(record.id);
+    if (record.result) Object.assign(record.result, inputs);
+    const data = status === "completed" || status === "needs_review"
+      ? runResultEventData(record.result, record.request.session_id)
+      : {};
     const candidate = { ...record, status, updatedAt: Date.now(), ...(error ? { error } : {}) };
     let persisted = false;
     try {
@@ -2344,7 +2273,7 @@ export class RunCoordinator {
     this.journals.get(record.id)?.publish(eventType, {
       status,
       ...(error ? { error } : {}),
-      ...this.inputSummary(record.id),
+      ...inputs,
       ...data,
     });
     this.runActivities.delete(record.id);
@@ -2374,7 +2303,6 @@ export class RunCoordinator {
       this.runInputs.delete(record.id);
       this.runAttachmentPaths.delete(record.id);
       this.acceptingInputs.delete(record.id);
-      this.turnIndexes.delete(record.id);
       this.runActivities.delete(record.id);
     }, Math.max(1, expiresAt - Date.now()));
     timer.unref();
@@ -2449,11 +2377,6 @@ export class RunCoordinator {
         converted && input.state === "accepted" ? "unconsumed" : input.state;
       restoredInputs.set(messageId, {
         fingerprint: input.fingerprint,
-        preparation: Promise.resolve({
-          role: "user",
-          content: "",
-          timestamp: persisted.updated_at,
-        }),
         settled: Promise.resolve(),
         message: undefined,
         state: restoredState,
@@ -2489,16 +2412,7 @@ export class RunCoordinator {
     journal.publish(terminalType, {
       status,
       reused: true,
-      ...(result ? {
-        output: result.content,
-        content: result.content,
-        session_id: persisted.session_id,
-        model: result.model,
-        usage: result.usage ?? {},
-        ...(result.context_usage ? { context_usage: result.context_usage } : {}),
-        input_message_ids: result.input_message_ids ?? [],
-        unconsumed_input_message_ids: result.unconsumed_input_message_ids ?? [],
-      } : {}),
+      ...runResultEventData(result, persisted.session_id),
       ...this.inputSummary(record.id),
       ...(error ? { error } : {}),
     });
@@ -3057,41 +2971,8 @@ function validateRunInputRequest(request: RunInputRequest): void {
     assertMaximumLength(request.message_id, 512, "message_id");
     assertMaximumLength(request.scope_key, 512, "scope_key");
     assertMaximumLength(request.lifecycle_id, 512, "lifecycle_id");
-    if (typeof request.input !== "string" && !Array.isArray(request.input)) {
-      throw new Error("input must be a string or content array");
-    }
-    if (Array.isArray(request.input)) {
-      for (const block of request.input as unknown[]) {
-        if (!block || typeof block !== "object" || Array.isArray(block)) {
-          throw new Error("input content blocks must be objects");
-        }
-        const candidate = block as Record<string, unknown>;
-        if (candidate.type === "text" && typeof candidate.text === "string") {
-          assertOnlyKeys(candidate, ["type", "text"], "text input block");
-          continue;
-        }
-        if (
-          candidate.type === "image"
-          && typeof candidate.data === "string"
-          && typeof candidate.mimeType === "string"
-        ) {
-          assertOnlyKeys(candidate, ["type", "data", "mimeType"], "image input block");
-          continue;
-        }
-        throw new Error("input content blocks must be valid text or image blocks");
-      }
-    }
-    if (request.attachments !== undefined) {
-      if (!Array.isArray(request.attachments) || request.attachments.length > 64) {
-        throw new Error("attachments must be an array with at most 64 items");
-      }
-      for (const attachment of request.attachments as unknown[]) {
-        if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
-          throw new Error("attachment entries must be objects");
-        }
-        assertClosedAttachment(attachment as Record<string, unknown>);
-      }
-    }
+    validateInputContent(request);
+    validateAttachments(request);
   } catch (error) {
     if (error instanceof RunValidationError) throw error;
     throw new RunValidationError(errorMessage(error));
@@ -3148,40 +3029,9 @@ function validateRunRequest(request: RunRequest): void {
     assertWorkspaceIdentifier(request.execution_context.workspace_id);
   }
   if (typeof request.system_prompt !== "string") throw new Error("system_prompt must be a string");
-  if (typeof request.input !== "string" && !Array.isArray(request.input)) throw new Error("input must be a string or content array");
-  if (Array.isArray(request.input)) {
-    for (const block of request.input as unknown[]) {
-      if (!block || typeof block !== "object" || Array.isArray(block)) {
-        throw new Error("input content blocks must be objects");
-      }
-      const candidate = block as Record<string, unknown>;
-      if (candidate.type === "text" && typeof candidate.text === "string") {
-        assertOnlyKeys(candidate, ["type", "text"], "text input block");
-        continue;
-      }
-      if (
-        candidate.type === "image"
-        && typeof candidate.data === "string"
-        && typeof candidate.mimeType === "string"
-      ) {
-        assertOnlyKeys(candidate, ["type", "data", "mimeType"], "image input block");
-        continue;
-      }
-      throw new Error("input content blocks must be valid text or image blocks");
-    }
-  }
+  validateInputContent(request);
   if (request.history !== undefined && !Array.isArray(request.history)) throw new Error("history must be an array");
-  if (request.attachments !== undefined) {
-    if (!Array.isArray(request.attachments) || request.attachments.length > 64) {
-      throw new Error("attachments must be an array with at most 64 items");
-    }
-    for (const attachment of request.attachments as unknown[]) {
-      if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
-        throw new Error("attachment entries must be objects");
-      }
-      assertClosedAttachment(attachment as Record<string, unknown>);
-    }
-  }
+  validateAttachments(request);
   if (
     request.metadata !== undefined
     && (!request.metadata || typeof request.metadata !== "object" || Array.isArray(request.metadata))
@@ -3224,6 +3074,41 @@ function validateRunRequest(request: RunRequest): void {
     throw new Error("model.reasoning must be a boolean");
   }
   validateProductModelRequest(request.model);
+}
+
+function validateInputContent(request: Pick<RunRequest, "input">): void {
+  if (typeof request.input !== "string" && !Array.isArray(request.input)) {
+    throw new Error("input must be a string or content array");
+  }
+  if (Array.isArray(request.input)) {
+    for (const block of request.input as unknown[]) {
+      if (!block || typeof block !== "object" || Array.isArray(block)) {
+        throw new Error("input content blocks must be objects");
+      }
+      const candidate = block as Record<string, unknown>;
+      if (candidate.type === "text" && typeof candidate.text === "string") {
+        assertOnlyKeys(candidate, ["type", "text"], "text input block");
+      } else if (candidate.type === "image"
+        && typeof candidate.data === "string" && typeof candidate.mimeType === "string") {
+        assertOnlyKeys(candidate, ["type", "data", "mimeType"], "image input block");
+      } else {
+        throw new Error("input content blocks must be valid text or image blocks");
+      }
+    }
+  }
+}
+
+function validateAttachments(request: Pick<RunRequest, "attachments">): void {
+  if (request.attachments === undefined) return;
+  if (!Array.isArray(request.attachments) || request.attachments.length > 64) {
+    throw new Error("attachments must be an array with at most 64 items");
+  }
+  for (const attachment of request.attachments as unknown[]) {
+    if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+      throw new Error("attachment entries must be objects");
+    }
+    assertClosedAttachment(attachment as Record<string, unknown>);
+  }
 }
 
 function assertOnlyKeys(

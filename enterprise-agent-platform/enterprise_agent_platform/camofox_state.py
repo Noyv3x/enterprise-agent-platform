@@ -170,18 +170,6 @@ def ensure_camofox_runtime_sidecar(
         os.close(directory_fd)
 
 
-def _read_sidecar(path: Path) -> dict[str, Any]:
-    directory_fd = open_private_directory_fd(path.parent)
-    try:
-        return _read_sidecar_at(directory_fd, path.name)
-    except UnsafePrivatePathError as exc:
-        raise sqlite3.DatabaseError(
-            f"Platform Camoufox sidecar cannot be opened safely: {path}"
-        ) from exc
-    finally:
-        os.close(directory_fd)
-
-
 def _read_sidecar_at(directory_fd: int, name: str) -> dict[str, Any]:
     try:
         raw, _ = read_private_file_at(

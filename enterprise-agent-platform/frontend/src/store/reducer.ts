@@ -20,24 +20,7 @@ export function rootReducer(state: AppState, action: Action): AppState {
   // atomic transition so a slice added later cannot accidentally retain data
   // from the previous account.
   if (action.type === "RESET_SESSION") {
-    return {
-      ...initialAppState,
-      agentStatuses: { channels: {}, private: null },
-      drafts: {},
-      draftFiles: {},
-      expandedAgentRuns: {},
-      messageAudit: {
-        auditChannelId: null,
-        channelMessages: [],
-        channelTotal: 0,
-        privateConversations: [],
-        auditPrivateUserId: null,
-        privateMessages: [],
-        privateTotal: 0,
-      },
-      oauthFlows: {},
-      pendingOperations: [],
-    };
+    return structuredClone(initialAppState);
   }
   let next = state;
   next = authReducer(next, action);

@@ -46,7 +46,7 @@ function redactCommandFlat(value: string): string {
     "$1[redacted]",
   );
   command = command.replace(
-    redactedAssignmentPattern(),
+    /\b([A-Za-z_][A-Za-z0-9_.-]{0,127})\s*=\s*("[^"]*"|'[^']*'|[^\s;|&]+)/g,
     (match, name: string) => SENSITIVE_COMMAND_NAME.test(name) ? `${name}=[redacted]` : match,
   );
   command = command.replace(/((?:set-)?cookie\s*:\s*)[^\s'";|&]+/gi, "$1[redacted]");
@@ -99,7 +99,7 @@ function hasAmbiguousCredentialDisplay(command: string): boolean {
 
 function redactCurlSensitiveHeaders(command: string): string {
   return command.replace(
-    curlHeaderArgumentPattern(),
+    /(^|[\s;|&])((?:--header(?:[\t\r\n ]*=[\t\r\n ]*|[\t\r\n ]+)|-H(?:[\t\r\n ]*=[\t\r\n ]*|[\t\r\n ]*)))("[^"\r\n]*"|'[^'\r\n]*'|[^\s;|&]+)/gi,
     (match, leading: string, option: string, argument: string) => {
       const parsed = parseSensitiveHeaderArgument(argument);
       if (!parsed) return match;
@@ -107,15 +107,6 @@ function redactCurlSensitiveHeaders(command: string): string {
     },
   );
 }
-
-function curlHeaderArgumentPattern(): RegExp {
-  return /(^|[\s;|&])((?:--header(?:[\t\r\n ]*=[\t\r\n ]*|[\t\r\n ]+)|-H(?:[\t\r\n ]*=[\t\r\n ]*|[\t\r\n ]*)))("[^"\r\n]*"|'[^'\r\n]*'|[^\s;|&]+)/gi;
-}
-
-function redactedAssignmentPattern(): RegExp {
-  return /\b([A-Za-z_][A-Za-z0-9_.-]{0,127})\s*=\s*("[^"]*"|'[^']*'|[^\s;|&]+)/g;
-}
-
 
 function parseSensitiveHeaderArgument(argument: string): { quote: string; prefix: string } | undefined {
   const quote = (argument.startsWith("\"") && argument.endsWith("\""))
@@ -236,7 +227,7 @@ export function actionApprovalObject(toolName: string, args: JsonObject): Approv
     : nested;
   if (toolName === "mcp") validateMcpApprovalValue(executionArguments);
   const identity = { action, arguments: executionArguments };
-  const displayArguments = displayActionArguments(toolName, action, executionArguments);
+  const displayArguments = { tool: toolName, action, arguments: redactActionArguments(toolName, action, executionArguments) };
   const validationError = approvalDisplayValidationError(displayArguments);
   if (validationError) throw new Error(validationError);
   return {
@@ -370,15 +361,6 @@ function effectiveTerminalTimeout(value: unknown, defaultTimeoutMs: number): num
 
 function approvalKey(toolName: string, identity: JsonObject): string {
   return `v2:${toolName}:${stableHash(canonicalJson(identity))}`;
-}
-
-function displayActionArguments(
-  toolName: string,
-  action: string,
-  args: JsonObject,
-): JsonObject {
-  const display = redactActionArguments(toolName, action, args);
-  return { tool: toolName, action, arguments: display };
 }
 
 function redactActionArguments(toolName: string, action: string, args: JsonObject): JsonObject {

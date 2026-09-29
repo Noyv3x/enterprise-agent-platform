@@ -145,8 +145,6 @@ export function SkillsPanel({
   const [confirmation, setConfirmation] = useState<DeleteConfirmation | null>(null);
   const listController = useRef<AbortController | null>(null);
   const detailController = useRef<AbortController | null>(null);
-  const listRequestVersion = useRef(0);
-  const detailRequestVersion = useRef(0);
   const busyRef = useRef(false);
   const canManageRef = useRef(canManage);
   const detailTriggerRef = useRef<HTMLElement | null>(null);
@@ -166,31 +164,18 @@ export function SkillsPanel({
     const requestedQuery = queryRef.current;
     listController.current?.abort();
     const controller = new AbortController();
-    const requestVersion = ++listRequestVersion.current;
     listController.current = controller;
     setLoading(true);
     setLoadError("");
+    const isCurrent = () => !controller.signal.aborted
+      && listController.current === controller
+      && scopeEpoch.current.key === requestedScopeKey
+      && queryRef.current === requestedQuery;
     try {
       const result = await loadAgentSkills(requestedScope, requestedQuery, controller.signal);
-      const currentScope = scopeRef.current;
-      if (
-        !controller.signal.aborted
-        && listRequestVersion.current === requestVersion
-        && `${currentScope.scope_type}:${currentScope.scope_id}` === requestedScopeKey
-        && queryRef.current === requestedQuery
-      ) {
-        setSkills(result.skills || []);
-      }
+      if (isCurrent()) setSkills(result.skills || []);
     } catch (error) {
-      const currentScope = scopeRef.current;
-      if (
-        !controller.signal.aborted
-        && listRequestVersion.current === requestVersion
-        && `${currentScope.scope_type}:${currentScope.scope_id}` === requestedScopeKey
-        && queryRef.current === requestedQuery
-      ) {
-        setLoadError(errorText(error));
-      }
+      if (isCurrent()) setLoadError(errorText(error));
     } finally {
       if (listController.current === controller) {
         listController.current = null;
@@ -209,7 +194,6 @@ export function SkillsPanel({
     queryRef.current = "";
     detailController.current?.abort();
     detailController.current = null;
-    detailRequestVersion.current += 1;
     detailTriggerRef.current = null;
   }, [scopeKey]);
 
@@ -217,7 +201,6 @@ export function SkillsPanel({
     if (canManage) return;
     detailController.current?.abort();
     detailController.current = null;
-    detailRequestVersion.current += 1;
     detailTriggerRef.current = null;
     setEditor(null);
     setConfirmation(null);
@@ -229,7 +212,6 @@ export function SkillsPanel({
     return () => {
       const controller = listController.current;
       listController.current = null;
-      listRequestVersion.current += 1;
       controller?.abort();
     };
   }, [query, refreshSkills, scopeKey]);
@@ -237,13 +219,11 @@ export function SkillsPanel({
   useEffect(() => () => {
     detailController.current?.abort();
     detailController.current = null;
-    detailRequestVersion.current += 1;
   }, []);
 
   const stopStaleListLoad = useCallback(() => {
     listController.current?.abort();
     listController.current = null;
-    listRequestVersion.current += 1;
     setLoading(false);
   }, []);
 
@@ -262,19 +242,12 @@ export function SkillsPanel({
     stopStaleListLoad();
     detailController.current?.abort();
     detailController.current = null;
-    detailRequestVersion.current += 1;
     try {
       await action();
       const currentScope = scopeRef.current;
       if (scopeEpoch.current.version !== actionVersion || currentScope.scope_type !== actionScope.scope_type || String(currentScope.scope_id) !== String(actionScope.scope_id)) return false;
       toast(successMessage, { type: "ok" });
-      if (
-        closeEditor
-        && currentScope.scope_type === actionScope.scope_type
-        && String(currentScope.scope_id) === String(actionScope.scope_id)
-      ) {
-        setEditor(null);
-      }
+      if (closeEditor) setEditor(null);
       await refreshSkills();
       return true;
     } catch (error) {
@@ -291,7 +264,6 @@ export function SkillsPanel({
     if (!canManage || busyRef.current) return;
     detailController.current?.abort();
     detailController.current = null;
-    detailRequestVersion.current += 1;
     detailTriggerRef.current = null;
     setEditor({ mode: "create", draft: emptyDraft(), linkedFileCount: 0 });
     setMutationError("");
@@ -306,7 +278,6 @@ export function SkillsPanel({
     setMutationError("");
     detailController.current?.abort();
     const controller = new AbortController();
-    const requestVersion = ++detailRequestVersion.current;
     const requestedScope = { ...scopeRef.current };
     const requestedScopeKey = `${requestedScope.scope_type}:${requestedScope.scope_id}`;
     detailController.current = controller;
@@ -315,7 +286,7 @@ export function SkillsPanel({
       const currentScope = scopeRef.current;
       if (
         !controller.signal.aborted
-        && detailRequestVersion.current === requestVersion
+        && detailController.current === controller
         && `${currentScope.scope_type}:${currentScope.scope_id}` === requestedScopeKey
       ) {
         const detailed = result.skill;
@@ -332,18 +303,16 @@ export function SkillsPanel({
           : { mode: "edit", ...detail });
       }
     } catch (error) {
-      if (!controller.signal.aborted && detailRequestVersion.current === requestVersion) {
+      if (!controller.signal.aborted && detailController.current === controller) {
         if (detailTriggerRef.current === trigger) detailTriggerRef.current = null;
         setMutationError(errorText(error) || t("skills.detailLoadFailed"));
       }
     } finally {
+      const stale = controller.signal.aborted || detailController.current !== controller;
       if (detailController.current === controller) detailController.current = null;
       if (
         detailTriggerRef.current === trigger
-        && (
-          controller.signal.aborted
-          || detailRequestVersion.current !== requestVersion
-        )
+        && stale
       ) {
         detailTriggerRef.current = null;
       }

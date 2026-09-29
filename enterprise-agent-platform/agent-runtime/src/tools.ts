@@ -1,5 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
-import { Type, type ImageContent, type Static } from "@earendil-works/pi-ai";
+import { Type, type ImageContent, type Static, type TSchema } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
   CONTAINER_PATHS,
@@ -252,6 +252,13 @@ async function withUntrustedErrorBoundary<T>(
   }
 }
 
+function actionSchema<A extends string, P extends TSchema>(action: A, arguments_: P) {
+  return Type.Object({
+    action: Type.Literal(action),
+    arguments: arguments_,
+  }, { additionalProperties: false });
+}
+
 const terminalSchema = Type.Object({
   target: Type.Optional(Type.Union([Type.Literal(EXECUTION_TARGETS[0]), Type.Literal(EXECUTION_TARGETS[1])], {
     description: "Execution target. Defaults to this Agent's sandbox; choose host explicitly for one call only.",
@@ -423,25 +430,16 @@ const searchFilesSchema = Type.Object({
 }, { additionalProperties: false });
 
 const runtimeSessionSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("search"),
-    arguments: Type.Object({
-      query: Type.String({ minLength: 1, maxLength: 4_000 }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("read"),
-    arguments: Type.Object({
-      index: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("list"),
-    arguments: Type.Optional(Type.Object({
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
-    }, { additionalProperties: false })),
-  }, { additionalProperties: false }),
+  actionSchema("search", Type.Object({
+    query: Type.String({ minLength: 1, maxLength: 4_000 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false })),
+  actionSchema("read", Type.Object({
+    index: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+  }, { additionalProperties: false })),
+  actionSchema("list", Type.Optional(Type.Object({
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false }))),
 ]);
 
 const mcpServerSchema = Type.String({
@@ -466,32 +464,26 @@ const webExtractLimitsSchema = {
   char_limit: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 500_000 })),
 };
 const webSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("search"),
-    arguments: Type.Object({
-      query: Type.String({ minLength: 1, maxLength: 4_096 }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-      language: Type.Optional(Type.String({
-        pattern: "^(?:auto|all|[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,8})?)$",
-      })),
+  actionSchema("search", Type.Object({
+    query: Type.String({ minLength: 1, maxLength: 4_096 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    language: Type.Optional(Type.String({
+      pattern: "^(?:auto|all|[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,8})?)$",
+    })),
+  }, { additionalProperties: false })),
+  actionSchema("extract", Type.Union([
+    Type.Object({
+      url: Type.String({ minLength: 1, maxLength: 8_192 }),
+      ...webExtractLimitsSchema,
     }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("extract"),
-    arguments: Type.Union([
-      Type.Object({
-        url: Type.String({ minLength: 1, maxLength: 8_192 }),
-        ...webExtractLimitsSchema,
-      }, { additionalProperties: false }),
-      Type.Object({
-        urls: Type.Array(Type.String({ minLength: 1, maxLength: 8_192 }), {
-          minItems: 1,
-          maxItems: 5,
-        }),
-        ...webExtractLimitsSchema,
-      }, { additionalProperties: false }),
-    ]),
-  }, { additionalProperties: false }),
+    Type.Object({
+      urls: Type.Array(Type.String({ minLength: 1, maxLength: 8_192 }), {
+        minItems: 1,
+        maxItems: 5,
+      }),
+      ...webExtractLimitsSchema,
+    }, { additionalProperties: false }),
+  ])),
 ]);
 
 const mailAccountIdSchema = Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER });
@@ -509,102 +501,75 @@ const mailBodyFields = {
   text_body: Type.Optional(Type.String({ maxLength: 200_000 })),
   html_body: Type.Optional(Type.String({ maxLength: 800_000 })),
 };
-const mailAccountsSchema = Type.Object({
-  action: Type.Literal("accounts"),
-  arguments: Type.Optional(Type.Object({}, { additionalProperties: false })),
-}, { additionalProperties: false });
-const mailFoldersSchema = Type.Object({
-  action: Type.Literal("folders"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailSearchSchema = Type.Object({
-  action: Type.Literal("search"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    criteria: Type.Optional(Type.Object({
-      unread: Type.Optional(Type.Boolean()),
-      from: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-      to: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-      subject: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-      since: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
-      before: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
-    }, { additionalProperties: false })),
-    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailReadMessageSchema = Type.Object({
-  action: Type.Literal("read"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    uid: mailUidSchema,
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
+const mailAccountsSchema = actionSchema("accounts", Type.Optional(Type.Object({}, { additionalProperties: false })));
+const mailFoldersSchema = actionSchema("folders", Type.Object({
+  account_id: mailAccountIdSchema,
+}, { additionalProperties: false }));
+const mailSearchSchema = actionSchema("search", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  criteria: Type.Optional(Type.Object({
+    unread: Type.Optional(Type.Boolean()),
+    from: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+    to: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+    subject: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+    since: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
+    before: Type.Optional(Type.String({ pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" })),
+  }, { additionalProperties: false })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+}, { additionalProperties: false }));
+const mailReadMessageSchema = actionSchema("read", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  uid: mailUidSchema,
+}, { additionalProperties: false }));
 const mailReadSchema = Type.Union([
   mailAccountsSchema,
   mailFoldersSchema,
   mailSearchSchema,
   mailReadMessageSchema,
 ]);
-const mailSendSchema = Type.Object({
-  action: Type.Literal("send"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    to: mailAddressListSchema,
-    cc: optionalMailRecipientsSchema,
-    bcc: optionalMailRecipientsSchema,
-    subject: Type.String({ maxLength: 998 }),
-    ...mailBodyFields,
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailReplySchema = Type.Object({
-  action: Type.Literal("reply"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    uid: mailUidSchema,
-    cc: optionalMailRecipientsSchema,
-    bcc: optionalMailRecipientsSchema,
-    subject: Type.Optional(Type.String({ maxLength: 998 })),
-    ...mailBodyFields,
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailMoveSchema = Type.Object({
-  action: Type.Literal("move"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    uid: mailUidSchema,
-    destination: mailFolderSchema,
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailMarkSchema = Type.Object({
-  action: Type.Literal("mark"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    uid: mailUidSchema,
-    state: Type.Union([
-      Type.Literal("seen"),
-      Type.Literal("unseen"),
-      Type.Literal("flagged"),
-      Type.Literal("unflagged"),
-    ]),
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
-const mailSaveAttachmentSchema = Type.Object({
-  action: Type.Literal("save_attachment"),
-  arguments: Type.Object({
-    account_id: mailAccountIdSchema,
-    folder: Type.Optional(mailFolderSchema),
-    uid: mailUidSchema,
-    attachment_index: Type.Integer({ minimum: 0, maximum: 10_000 }),
-    path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
-  }, { additionalProperties: false }),
-}, { additionalProperties: false });
+const mailSendSchema = actionSchema("send", Type.Object({
+  account_id: mailAccountIdSchema,
+  to: mailAddressListSchema,
+  cc: optionalMailRecipientsSchema,
+  bcc: optionalMailRecipientsSchema,
+  subject: Type.String({ maxLength: 998 }),
+  ...mailBodyFields,
+}, { additionalProperties: false }));
+const mailReplySchema = actionSchema("reply", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  uid: mailUidSchema,
+  cc: optionalMailRecipientsSchema,
+  bcc: optionalMailRecipientsSchema,
+  subject: Type.Optional(Type.String({ maxLength: 998 })),
+  ...mailBodyFields,
+}, { additionalProperties: false }));
+const mailMoveSchema = actionSchema("move", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  uid: mailUidSchema,
+  destination: mailFolderSchema,
+}, { additionalProperties: false }));
+const mailMarkSchema = actionSchema("mark", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  uid: mailUidSchema,
+  state: Type.Union([
+    Type.Literal("seen"),
+    Type.Literal("unseen"),
+    Type.Literal("flagged"),
+    Type.Literal("unflagged"),
+  ]),
+}, { additionalProperties: false }));
+const mailSaveAttachmentSchema = actionSchema("save_attachment", Type.Object({
+  account_id: mailAccountIdSchema,
+  folder: Type.Optional(mailFolderSchema),
+  uid: mailUidSchema,
+  attachment_index: Type.Integer({ minimum: 0, maximum: 10_000 }),
+  path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+}, { additionalProperties: false }));
 const mailSchema = Type.Union([
   mailAccountsSchema,
   mailFoldersSchema,
@@ -632,107 +597,74 @@ const memoryTagsSchema = Type.Array(
   { maxItems: 20 },
 );
 const memorySchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("search"),
-    arguments: Type.Object({
-      query: Type.String({ minLength: 1, maxLength: 4_000 }),
-      target: Type.Optional(memoryReadTargetSchema),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("read"),
-    arguments: Type.Object({
-      id: memoryIdSchema,
-      target: Type.Optional(memoryReadTargetSchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("list"),
-    arguments: Type.Optional(Type.Object({
-      target: Type.Optional(memoryReadTargetSchema),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-    }, { additionalProperties: false })),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("store"),
-    arguments: Type.Object({
-      content: Type.String({ minLength: 1, maxLength: 4_000 }),
-      target: Type.Optional(memoryTargetSchema),
-      tags: Type.Optional(memoryTagsSchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("replace"),
-    arguments: Type.Object({
-      id: memoryIdSchema,
-      content: Type.String({ minLength: 1, maxLength: 4_000 }),
-      target: Type.Optional(memoryTargetSchema),
-      tags: Type.Optional(memoryTagsSchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("forget"),
-    arguments: Type.Object({
-      id: memoryIdSchema,
-      target: Type.Optional(memoryTargetSchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("reconcile"),
-    arguments: Type.Object({
-      operations: Type.Array(Type.Union([
-        Type.Object({
-          action: Type.Literal("store"),
-          content: Type.String({ minLength: 1, maxLength: 4_000 }),
-          target: Type.Optional(memoryTargetSchema),
-          tags: Type.Optional(memoryTagsSchema),
-        }, { additionalProperties: false }),
-        Type.Object({
-          action: Type.Literal("replace"),
-          id: memoryIdSchema,
-          content: Type.String({ minLength: 1, maxLength: 4_000 }),
-          target: Type.Optional(memoryTargetSchema),
-          tags: Type.Optional(memoryTagsSchema),
-        }, { additionalProperties: false }),
-        Type.Object({
-          action: Type.Literal("forget"),
-          id: memoryIdSchema,
-          target: Type.Optional(memoryTargetSchema),
-        }, { additionalProperties: false }),
-      ]), { minItems: 1, maxItems: 20 }),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("clear"),
-    arguments: Type.Optional(Type.Object({
-      target: Type.Optional(memoryTargetSchema),
-    }, { additionalProperties: false })),
-  }, { additionalProperties: false }),
+  actionSchema("search", Type.Object({
+    query: Type.String({ minLength: 1, maxLength: 4_000 }),
+    target: Type.Optional(memoryReadTargetSchema),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+  }, { additionalProperties: false })),
+  actionSchema("read", Type.Object({
+    id: memoryIdSchema,
+    target: Type.Optional(memoryReadTargetSchema),
+  }, { additionalProperties: false })),
+  actionSchema("list", Type.Optional(Type.Object({
+    target: Type.Optional(memoryReadTargetSchema),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+  }, { additionalProperties: false }))),
+  actionSchema("store", Type.Object({
+    content: Type.String({ minLength: 1, maxLength: 4_000 }),
+    target: Type.Optional(memoryTargetSchema),
+    tags: Type.Optional(memoryTagsSchema),
+  }, { additionalProperties: false })),
+  actionSchema("replace", Type.Object({
+    id: memoryIdSchema,
+    content: Type.String({ minLength: 1, maxLength: 4_000 }),
+    target: Type.Optional(memoryTargetSchema),
+    tags: Type.Optional(memoryTagsSchema),
+  }, { additionalProperties: false })),
+  actionSchema("forget", Type.Object({
+    id: memoryIdSchema,
+    target: Type.Optional(memoryTargetSchema),
+  }, { additionalProperties: false })),
+  actionSchema("reconcile", Type.Object({
+    operations: Type.Array(Type.Union([
+      Type.Object({
+        action: Type.Literal("store"),
+        content: Type.String({ minLength: 1, maxLength: 4_000 }),
+        target: Type.Optional(memoryTargetSchema),
+        tags: Type.Optional(memoryTagsSchema),
+      }, { additionalProperties: false }),
+      Type.Object({
+        action: Type.Literal("replace"),
+        id: memoryIdSchema,
+        content: Type.String({ minLength: 1, maxLength: 4_000 }),
+        target: Type.Optional(memoryTargetSchema),
+        tags: Type.Optional(memoryTagsSchema),
+      }, { additionalProperties: false }),
+      Type.Object({
+        action: Type.Literal("forget"),
+        id: memoryIdSchema,
+        target: Type.Optional(memoryTargetSchema),
+      }, { additionalProperties: false }),
+    ]), { minItems: 1, maxItems: 20 }),
+  }, { additionalProperties: false })),
+  actionSchema("clear", Type.Optional(Type.Object({
+    target: Type.Optional(memoryTargetSchema),
+  }, { additionalProperties: false }))),
 ]);
 
 const sessionSearchSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("search"),
-    arguments: Type.Object({
-      query: Type.String({ minLength: 1, maxLength: 4_000 }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-      window: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("list"),
-    arguments: Type.Optional(Type.Object({
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
-    }, { additionalProperties: false })),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("read"),
-    arguments: Type.Object({
-      session_id: Type.String({ minLength: 1, maxLength: 512 }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
+  actionSchema("search", Type.Object({
+    query: Type.String({ minLength: 1, maxLength: 4_000 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+    window: Type.Optional(Type.Integer({ minimum: 0, maximum: 10 })),
+  }, { additionalProperties: false })),
+  actionSchema("list", Type.Optional(Type.Object({
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+  }, { additionalProperties: false }))),
+  actionSchema("read", Type.Object({
+    session_id: Type.String({ minLength: 1, maxLength: 512 }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false })),
 ]);
 
 const SKILL_ID_PATTERN = "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$";
@@ -760,81 +692,54 @@ const skillFilePathSchema = Type.String({
   pattern: SKILL_FILE_PATH_PATTERN,
 });
 const skillSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("list"),
-    arguments: Type.Optional(Type.Object({
-      query: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000 })),
-      category: Type.Optional(skillCategorySchema),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
-    }, { additionalProperties: false })),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("load"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("read"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-      file_path: skillFilePathSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("create"),
-    arguments: Type.Object({
-      name: skillNameSchema,
-      description: skillDescriptionSchema,
-      instructions: skillInstructionsSchema,
-      category: Type.Optional(skillCategorySchema),
-      version: Type.Optional(skillVersionSchema),
-      tags: Type.Optional(skillTagsSchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("update"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-      name: Type.Optional(skillNameSchema),
-      description: Type.Optional(skillDescriptionSchema),
-      instructions: Type.Optional(skillInstructionsSchema),
-      category: Type.Optional(skillCategorySchema),
-      version: Type.Optional(skillVersionSchema),
-      tags: Type.Optional(skillTagsSchema),
-    }, { additionalProperties: false, minProperties: 2 }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("patch"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-      file_path: Type.Optional(skillFilePathSchema),
-      old_string: Type.String({ minLength: 1, maxLength: 524_288 }),
-      new_string: Type.String({ maxLength: 524_288 }),
-      expected_replacements: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  ...(["delete", "enable", "disable"] as const).map((action) => Type.Object({
-    action: Type.Literal(action),
-    arguments: Type.Object({
-      id: skillIdSchema,
-    }, { additionalProperties: false }),
+  actionSchema("list", Type.Optional(Type.Object({
+    query: Type.Optional(Type.String({ minLength: 1, maxLength: 4_000 })),
+    category: Type.Optional(skillCategorySchema),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })),
+  }, { additionalProperties: false }))),
+  actionSchema("load", Type.Object({
+    id: skillIdSchema,
   }, { additionalProperties: false })),
-  Type.Object({
-    action: Type.Literal("write_file"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-      file_path: skillFilePathSchema,
-      content: Type.String({ maxLength: 524_288 }),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("remove_file"),
-    arguments: Type.Object({
-      id: skillIdSchema,
-      file_path: skillFilePathSchema,
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
+  actionSchema("read", Type.Object({
+    id: skillIdSchema,
+    file_path: skillFilePathSchema,
+  }, { additionalProperties: false })),
+  actionSchema("create", Type.Object({
+    name: skillNameSchema,
+    description: skillDescriptionSchema,
+    instructions: skillInstructionsSchema,
+    category: Type.Optional(skillCategorySchema),
+    version: Type.Optional(skillVersionSchema),
+    tags: Type.Optional(skillTagsSchema),
+  }, { additionalProperties: false })),
+  actionSchema("update", Type.Object({
+    id: skillIdSchema,
+    name: Type.Optional(skillNameSchema),
+    description: Type.Optional(skillDescriptionSchema),
+    instructions: Type.Optional(skillInstructionsSchema),
+    category: Type.Optional(skillCategorySchema),
+    version: Type.Optional(skillVersionSchema),
+    tags: Type.Optional(skillTagsSchema),
+  }, { additionalProperties: false, minProperties: 2 })),
+  actionSchema("patch", Type.Object({
+    id: skillIdSchema,
+    file_path: Type.Optional(skillFilePathSchema),
+    old_string: Type.String({ minLength: 1, maxLength: 524_288 }),
+    new_string: Type.String({ maxLength: 524_288 }),
+    expected_replacements: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  }, { additionalProperties: false })),
+  ...(["delete", "enable", "disable"] as const).map((action) => actionSchema(action, Type.Object({
+    id: skillIdSchema,
+  }, { additionalProperties: false }))),
+  actionSchema("write_file", Type.Object({
+    id: skillIdSchema,
+    file_path: skillFilePathSchema,
+    content: Type.String({ maxLength: 524_288 }),
+  }, { additionalProperties: false })),
+  actionSchema("remove_file", Type.Object({
+    id: skillIdSchema,
+    file_path: skillFilePathSchema,
+  }, { additionalProperties: false })),
 ]);
 
 const LEARNING_REVIEW_MEMORY_ACTIONS = new Set([
@@ -956,55 +861,31 @@ const scheduleTargetArgumentsSchema = Type.Object({
 }, { additionalProperties: false });
 
 const scheduleSchema = Type.Union([
-  Type.Object({
-    action: Type.Literal("list"),
-    arguments: Type.Optional(emptyScheduleArgumentsSchema),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("get"),
-    arguments: scheduleTargetArgumentsSchema,
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("history"),
-    arguments: Type.Object({
-      schedule_id: scheduleIdSchema,
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-      before_id: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("continue_current"),
-    arguments: emptyScheduleArgumentsSchema,
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("complete_current"),
-    arguments: emptyScheduleArgumentsSchema,
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("create"),
-    arguments: Type.Object({
-      name: Type.String({ minLength: 1, maxLength: 120 }),
-      prompt: Type.String({ minLength: 1, maxLength: 20_000 }),
-      schedule: scheduleDefinitionSchema,
-      timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-      delivery: Type.Optional(scheduleDeliverySchema),
-    }, { additionalProperties: false }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("update"),
-    arguments: Type.Object({
-      schedule_id: scheduleIdSchema,
-      name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-      prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
-      schedule: Type.Optional(scheduleDefinitionSchema),
-      timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
-      delivery: Type.Optional(scheduleDeliverySchema),
-    }, { additionalProperties: false, minProperties: 2 }),
-  }, { additionalProperties: false }),
-  ...(["pause", "resume", "delete", "run_now"] as const).map((action) => Type.Object({
-    action: Type.Literal(action),
-    arguments: scheduleTargetArgumentsSchema,
+  actionSchema("list", Type.Optional(emptyScheduleArgumentsSchema)),
+  actionSchema("get", scheduleTargetArgumentsSchema),
+  actionSchema("history", Type.Object({
+    schedule_id: scheduleIdSchema,
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    before_id: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
   }, { additionalProperties: false })),
+  actionSchema("continue_current", emptyScheduleArgumentsSchema),
+  actionSchema("complete_current", emptyScheduleArgumentsSchema),
+  actionSchema("create", Type.Object({
+    name: Type.String({ minLength: 1, maxLength: 120 }),
+    prompt: Type.String({ minLength: 1, maxLength: 20_000 }),
+    schedule: scheduleDefinitionSchema,
+    timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+    delivery: Type.Optional(scheduleDeliverySchema),
+  }, { additionalProperties: false })),
+  actionSchema("update", Type.Object({
+    schedule_id: scheduleIdSchema,
+    name: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+    prompt: Type.Optional(Type.String({ minLength: 1, maxLength: 20_000 })),
+    schedule: Type.Optional(scheduleDefinitionSchema),
+    timezone: Type.Optional(Type.String({ minLength: 1, maxLength: 120 })),
+    delivery: Type.Optional(scheduleDeliverySchema),
+  }, { additionalProperties: false, minProperties: 2 })),
+  ...(["pause", "resume", "delete", "run_now"] as const).map((action) => actionSchema(action, scheduleTargetArgumentsSchema)),
 ]);
 
 const delegateRoleSchema = Type.Union([
@@ -1057,6 +938,52 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     const result = skillMutationQueue.then(operation, operation);
     skillMutationQueue = result.then(() => undefined, () => undefined);
     return result;
+  };
+
+  const invokeGateway = (
+    name: "memory" | "skill" | "web" | "browser" | "mail" | "schedule" | "session_search",
+    params: { action: string; arguments?: unknown },
+    signal?: AbortSignal,
+    toolCallId?: string,
+  ): Promise<AgentToolResult<JsonValue>> => {
+    const source = name === "skill" ? `skill.${params.action}` : name;
+    return withUntrustedErrorBoundary(source, signal, async () => {
+      const result = await context.gateway.invoke(
+        context.request,
+        context.runId,
+        name === "session_search" ? "session" : name,
+        params.action,
+        objectValue(params.arguments),
+        signal,
+        toolCallId,
+      );
+      if (name === "browser") return browserGatewayResult(result);
+      if (name === "skill") return skillGatewayResult(result, params.action);
+      return untrustedDataResult(result, source);
+    });
+  };
+
+  const executeFile = async (
+    name: string,
+    toolCallId: string,
+    params: { path?: string },
+    signal?: AbortSignal,
+  ): Promise<AgentToolResult<JsonValue>> => {
+    if (name !== "search_files") throwIfAborted(signal);
+    if (name === "write_file" || name === "patch_file") context.markSideEffect();
+    const binding = managedExecutionBinding(name, params, context.request.workspace);
+    const response = await executionManager(context).file(
+      managedCallContext(context, toolCallId), binding.action, binding.arguments, signal,
+    );
+    const source = name === "search_files"
+      ? "workspace_search"
+      : name === "read_file" && await isCurrentAttachmentPath(context, String(params.path))
+        ? "attachment"
+        : undefined;
+    return textResult(
+      source ? frameUntrustedText(source, response.content) : response.content,
+      response.details ?? null,
+    );
   };
 
   const terminal: AgentTool<typeof terminalSchema, JsonValue> = {
@@ -1172,21 +1099,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     description: "Read a UTF-8 file from the Agent workspace. Read relevant files before editing them, and request independent reads together in the same assistant turn.",
     parameters: readFileSchema,
     executionMode: "parallel",
-    async execute(_toolCallId, params, signal) {
-      throwIfAborted(signal);
-      const binding = managedExecutionBinding("read_file", params, context.request.workspace);
-      const response = await executionManager(context).file(
-        managedCallContext(context, _toolCallId),
-        binding.action,
-        binding.arguments,
-        signal,
-      );
-      const path = String(params.path);
-      const modelText = await isCurrentAttachmentPath(context, path)
-        ? frameUntrustedText("attachment", response.content)
-        : response.content;
-      return textResult(modelText, response.details ?? null);
-    },
+    execute: (id, params, signal) => executeFile("read_file", id, params, signal),
   };
 
   const writeTool: AgentTool<typeof writeFileSchema, JsonValue> = {
@@ -1198,18 +1111,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       withDefaultSandboxTarget(arguments_) as Static<typeof writeFileSchema>
     ),
     executionMode: "sequential",
-    async execute(_toolCallId, params, signal) {
-      throwIfAborted(signal);
-      context.markSideEffect();
-      const binding = managedExecutionBinding("write_file", params, context.request.workspace);
-      const response = await executionManager(context).file(
-        managedCallContext(context, _toolCallId),
-        binding.action,
-        binding.arguments,
-        signal,
-      );
-      return textResult(response.content, response.details ?? null);
-    },
+    execute: (id, params, signal) => executeFile("write_file", id, params, signal),
   };
 
   const patchTool: AgentTool<typeof patchFileSchema, JsonValue> = {
@@ -1221,18 +1123,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       withDefaultSandboxTarget(arguments_) as Static<typeof patchFileSchema>
     ),
     executionMode: "sequential",
-    async execute(_toolCallId, params, signal) {
-      throwIfAborted(signal);
-      context.markSideEffect();
-      const binding = managedExecutionBinding("patch_file", params, context.request.workspace);
-      const response = await executionManager(context).file(
-        managedCallContext(context, _toolCallId),
-        binding.action,
-        binding.arguments,
-        signal,
-      );
-      return textResult(response.content, response.details ?? null);
-    },
+    execute: (id, params, signal) => executeFile("patch_file", id, params, signal),
   };
 
   const searchTool: AgentTool<typeof searchFilesSchema, JsonValue> = {
@@ -1241,19 +1132,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     description: "Search filenames and UTF-8 file contents below a workspace directory. Use this to locate definitions and usages before reading or editing, and batch independent searches in one assistant turn.",
     parameters: searchFilesSchema,
     executionMode: "parallel",
-    async execute(_toolCallId, params, signal) {
-      const binding = managedExecutionBinding("search_files", params, context.request.workspace);
-      const response = await executionManager(context).file(
-        managedCallContext(context, _toolCallId),
-        binding.action,
-        binding.arguments,
-        signal,
-      );
-      return textResult(
-        frameUntrustedText("workspace_search", response.content),
-        response.details ?? null,
-      );
-    },
+    execute: (id, params, signal) => executeFile("search_files", id, params, signal),
   };
 
   const todoTool: AgentTool<typeof todoSchema, JsonValue> | undefined = todoState
@@ -1303,17 +1182,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         throw new Error("durable memory can be modified only by a top-level interactive private Agent run or an authorized learning review");
       }
       if (isGatewayMutation("memory", params.action)) context.markSideEffect();
-      return await withUntrustedErrorBoundary("memory", signal, async () => untrustedDataResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "memory",
-          params.action,
-          objectValue(params.arguments),
-          signal,
-        ),
-        "memory",
-      ));
+      return invokeGateway("memory", params, signal);
     },
   };
 
@@ -1336,21 +1205,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       if (learningReview && params.action === "patch" && !loadedSkillIds.has(skillId)) {
         throw new Error("learning review must load or read the Skill before patching it");
       }
-      const operation = async (): Promise<AgentToolResult<JsonValue>> => await withUntrustedErrorBoundary(
-        `skill.${params.action}`,
-        signal,
-        async () => skillGatewayResult(
-          await context.gateway.invoke(
-            context.request,
-            context.runId,
-            "skill",
-            params.action,
-            arguments_,
-            signal,
-          ),
-          params.action,
-        ),
-      );
+      const operation = () => invokeGateway("skill", params, signal);
       if (!isSkillMutation(params.action)) {
         const result = await operation();
         if (learningReview && (params.action === "load" || params.action === "read") && skillId) {
@@ -1402,19 +1257,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     description: gatewayDescription("web"),
     parameters: webSchema,
     executionMode: "parallel",
-    async execute(_toolCallId, params, signal) {
-      return await withUntrustedErrorBoundary("web", signal, async () => untrustedDataResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "web",
-          params.action,
-          objectValue(params.arguments),
-          signal,
-        ),
-        "web",
-      ));
-    },
+    execute: (_id, params, signal) => invokeGateway("web", params, signal),
   };
 
   const browserTool: AgentTool<typeof browserSchema, JsonValue> = {
@@ -1425,18 +1268,8 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
 
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
-      const browserArguments = objectValue(params.arguments);
       if (isGatewayMutation("browser", params.action)) context.markSideEffect();
-      return await withUntrustedErrorBoundary("browser", signal, async () => browserGatewayResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "browser",
-          params.action,
-          browserArguments,
-          signal,
-        ),
-      ));
+      return invokeGateway("browser", params, signal);
     },
   };
 
@@ -1451,18 +1284,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         throw new Error("unattended email-triggered runs can only read mail");
       }
       if (isMailMutation(params.action)) context.markSideEffect();
-      return await withUntrustedErrorBoundary("mail", signal, async () => untrustedDataResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "mail",
-          params.action,
-          objectValue(params.arguments),
-          signal,
-          toolCallId,
-        ),
-        "mail",
-      ));
+      return invokeGateway("mail", params, signal, toolCallId);
     },
   };
 
@@ -1473,19 +1295,8 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     parameters: scheduleSchema,
     executionMode: "sequential",
     async execute(_toolCallId, params, signal) {
-      const arguments_ = objectValue(params.arguments);
       if (isScheduleMutation(params.action)) context.markSideEffect();
-      return await withUntrustedErrorBoundary("schedule", signal, async () => untrustedDataResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "schedule",
-          params.action,
-          arguments_,
-          signal,
-        ),
-        "schedule",
-      ));
+      return invokeGateway("schedule", params, signal);
     },
   };
 
@@ -1519,17 +1330,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     executionMode: "parallel",
     async execute(_toolCallId, params, signal) {
       throwIfAborted(signal);
-      return await withUntrustedErrorBoundary("session_search", signal, async () => untrustedDataResult(
-        await context.gateway.invoke(
-          context.request,
-          context.runId,
-          "session",
-          params.action,
-          objectValue(params.arguments),
-          signal,
-        ),
-        "session_search",
-      ));
+      return invokeGateway("session_search", params, signal);
     },
   };
 

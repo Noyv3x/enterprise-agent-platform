@@ -60,6 +60,26 @@ afterEach(() => {
 });
 
 describe("message audit selection", () => {
+  it("keeps channel and private reads independent when their IDs match", async () => {
+    const channel = deferred<FetchStub>();
+    const privateThread = deferred<FetchStub>();
+    vi.stubGlobal("fetch", vi.fn((path: string) => {
+      if (path === endpoints.auditChannelMessages.path("11")) return channel.promise;
+      if (path === endpoints.auditPrivateMessages.path("11")) return privateThread.promise;
+      throw new Error(`unexpected request ${path}`);
+    }));
+    const store = makeStore();
+    const channelRead = selectAuditChannel(store, "11");
+    const privateRead = selectAuditConversation(store, 11);
+    privateThread.resolve(response({ messages: [{ id: 2, content: "PRIVATE" }], total: 1 }));
+    await privateRead;
+    channel.resolve(response({ messages: [{ id: 1, content: "CHANNEL" }], total: 1 }));
+    await channelRead;
+
+    expect(contents(store, "channelMessages")).toEqual(["CHANNEL"]);
+    expect(contents(store, "privateMessages")).toEqual(["PRIVATE"]);
+  });
+
   it("keeps the selected channel's rows when the earlier channel answers late", async () => {
     const first = deferred<FetchStub>();
     const second = deferred<FetchStub>();

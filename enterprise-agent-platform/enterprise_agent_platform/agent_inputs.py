@@ -49,16 +49,19 @@ class AgentRunInputStore:
             (json.dumps(association, ensure_ascii=False), now_ts(), int(job_id)),
         )
 
+    def _associate(self, conn, message_id, job_id, parent_job_id, input_group_id, state):
+        self._save(conn, job_id, {
+            "message_id": int(message_id), "parent_job_id": int(parent_job_id),
+            "input_group_id": str(input_group_id), "state": state,
+        })
+        return self.get_by_job(job_id)
+
     def start_root(self, *, message_id: int, job_id: int, input_group_id: str) -> AgentRunInput:
         with self.db.transaction(immediate=True) as conn:
             previous = self.get_by_job(job_id)
             if previous is not None and previous.state in TERMINAL_STATES:
                 return previous
-            self._save(conn, job_id, {
-                "message_id": int(message_id), "parent_job_id": int(job_id),
-                "input_group_id": str(input_group_id), "state": "running",
-            })
-            result = self.get_by_job(job_id)
+            result = self._associate(conn, message_id, job_id, job_id, input_group_id, "running")
         if result is None:
             raise RuntimeError("Agent input root has no durable job")
         return result
@@ -77,11 +80,7 @@ class AgentRunInputStore:
             )
             if not claimed.rowcount:
                 return None
-            self._save(conn, job_id, {
-                "message_id": int(message_id), "parent_job_id": int(parent_job_id),
-                "input_group_id": str(input_group_id), "state": "reserved",
-            })
-            return self.get_by_job(job_id)
+            return self._associate(conn, message_id, job_id, parent_job_id, input_group_id, "reserved")
 
     def reserve_pending(
         self, *, message_id: int, job_id: int, parent_job_id: int, input_group_id: str,
@@ -90,11 +89,7 @@ class AgentRunInputStore:
             row = conn.execute("SELECT status FROM durable_jobs WHERE id = ?", (int(job_id),)).fetchone()
             if row is None or row["status"] != "queued":
                 return None
-            self._save(conn, job_id, {
-                "message_id": int(message_id), "parent_job_id": int(parent_job_id),
-                "input_group_id": str(input_group_id), "state": "reserved",
-            })
-            return self.get_by_job(job_id)
+            return self._associate(conn, message_id, job_id, parent_job_id, input_group_id, "reserved")
 
     def get_by_message(self, message_id: int) -> AgentRunInput | None:
         row = self.db.query_one(

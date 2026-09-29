@@ -41,10 +41,9 @@ export function withModelStreamRetry(
     const signal = streamOptions?.signal;
 
     void (async () => {
-      for (let attempt = 0; ; attempt += 1) {
+      attempts: for (let attempt = 0; ; attempt += 1) {
         const buffered: AssistantMessageEvent[] = [];
         let visible = false;
-        let terminal = false;
         const source = await stream(model, context, streamOptions);
 
         for await (const event of source) {
@@ -57,7 +56,6 @@ export function withModelStreamRetry(
           }
 
           if (event.type === "error") {
-            terminal = true;
             const mayRetry = !visible
               && attempt < maxRetries
               && !isContextOverflow(event.error, model.contextWindow)
@@ -73,19 +71,18 @@ export function withModelStreamRetry(
                 options.activityHeartbeatMs,
                 options.onRetryActivity,
               );
-              break;
+              continue attempts;
             }
             flush(output, buffered);
             return;
           }
 
           if (event.type === "done") {
-            terminal = true;
             flush(output, buffered);
             return;
           }
         }
-        if (!terminal) throw new Error("model stream ended without a terminal event");
+        throw new Error("model stream ended without a terminal event");
       }
     })().catch((error: unknown) => {
       // EventStream.end() without a result leaves result() unresolved. Always
@@ -125,7 +122,8 @@ export function withModelStreamRetry(
 }
 
 function flush(output: AssistantMessageEventStream, buffered: AssistantMessageEvent[]): void {
-  while (buffered.length > 0) output.push(buffered.shift()!);
+  for (const event of buffered) output.push(event);
+  buffered.length = 0;
 }
 
 function eventHasVisibleModelOutput(event: AssistantMessageEvent): boolean {

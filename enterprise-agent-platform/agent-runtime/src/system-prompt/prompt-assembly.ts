@@ -156,15 +156,16 @@ function availableSkillIndexWhenPresent(value: unknown): string {
 function renderAvailableSkillIndex(entries: readonly AvailableSkillMetadata[]): string {
   const prefix = "<available_skills>\n";
   const suffix = "\n</available_skills>";
-  const selected: AvailableSkillMetadata[] = [];
-  let encoded = "[]";
+  const selected: string[] = [];
+  let length = prefix.length + suffix.length + 2;
   for (const entry of entries) {
-    const candidate = safeCompactPromptJson([...selected, entry]);
-    if (prefix.length + candidate.length + suffix.length > MAX_AVAILABLE_SKILL_INDEX_CHARS) continue;
-    selected.push(entry);
-    encoded = candidate;
+    const encoded = safePromptJson(entry, 0);
+    const addition = encoded.length + (selected.length ? 1 : 0);
+    if (length + addition > MAX_AVAILABLE_SKILL_INDEX_CHARS) continue;
+    selected.push(encoded);
+    length += addition;
   }
-  return `${prefix}${encoded}${suffix}`;
+  return `${prefix}[${selected.join(",")}]${suffix}`;
 }
 
 function normalizeAvailableSkills(value: unknown): AvailableSkillMetadata[] {
@@ -195,15 +196,8 @@ function boundedSkillMetadataField(value: unknown, maximum: number): string | un
   return normalized.slice(0, maximum);
 }
 
-function safePromptJson(value: unknown): string {
-  return (JSON.stringify(value, null, 2) ?? "null")
-    .replaceAll("<", "\\u003c")
-    .replaceAll(">", "\\u003e")
-    .replaceAll("&", "\\u0026");
-}
-
-function safeCompactPromptJson(value: unknown): string {
-  return (JSON.stringify(value) ?? "null")
+function safePromptJson(value: unknown, space = 2): string {
+  return (JSON.stringify(value, null, space) ?? "null")
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
     .replaceAll("&", "\\u0026");

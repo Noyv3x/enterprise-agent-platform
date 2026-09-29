@@ -69,6 +69,15 @@ SENSITIVE_JSON_EXPORT_PATHS = frozenset(
     }
 )
 
+# Shared standard JSON policy; specialized parsers and statuses stay explicit.
+_CONFIG_ACTIONS = {
+    "/api/system/security/config": ("platform_security_config", "update_platform_security_config"),
+    "/api/system/branding/config": ("branding_admin_config", "update_branding_config"),
+    "/api/system/agent-runtime/config": ("agent_runtime_config", "update_agent_runtime_config"),
+    "/api/system/telegram/config": ("telegram_admin_config", "update_telegram_admin_config"),
+    "/api/system/auto-update/config": ("auto_update_config", "update_auto_update_config"),
+}
+
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.environ.get(name)
@@ -822,32 +831,44 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._json(service.delete_channel(actor, int(m.group(1))))
             return
 
-        m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
-        if m and method == "GET":
-            limit = int_arg(query, "limit", 100)
-            sync = service.message_sync(
-                actor,
-                "channel",
-                m.group(1),
-                limit=limit,
-                after_id=optional_int_arg(query, "after_id", minimum=0),
-                before_id=optional_int_arg(query, "before_id", minimum=0),
-                since_revision=optional_int_arg(
-                    query, "since_revision", minimum=0
-                ),
-            )
-            self._json(
-                {
+        m = re.fullmatch(
+            r"/api/(?:channels/(\d+)|private-agent)/(messages|agent-approval|agent-status|events)",
+            path,
+        )
+        if m:
+            scope_type = "channel" if m.group(1) is not None else "private"
+            scope_id = m.group(1) if scope_type == "channel" else str(actor["id"])
+            action = m.group(2)
+            if action == "messages" and method == "GET":
+                sync = service.message_sync(
+                    actor, scope_type, scope_id,
+                    limit=int_arg(query, "limit", 100),
+                    after_id=optional_int_arg(query, "after_id", minimum=0),
+                    before_id=optional_int_arg(query, "before_id", minimum=0),
+                    since_revision=optional_int_arg(query, "since_revision", minimum=0),
+                )
+                self._json({
                     **sync,
-                    "agent_status": service.agent_status(
-                        actor, "channel", m.group(1)
-                    ),
-                    "typing": service.typing_users(
-                        actor, "channel", m.group(1)
-                    ),
-                }
-            )
-            return
+                    "agent_status": service.agent_status(actor, scope_type, scope_id),
+                    "typing": service.typing_users(actor, scope_type, scope_id)
+                    if scope_type == "channel" else [],
+                })
+                return
+            if action == "agent-approval" and method == "POST":
+                body = self._body_json()
+                self._json(service.respond_agent_approval(
+                    actor, scope_type, scope_id, str(body.get("choice", "")),
+                    run_id=body.get("run_id"), approval_id=body.get("approval_id"),
+                ))
+                return
+            if action == "agent-status" and method == "GET":
+                self._json({"agent_status": service.agent_status(actor, scope_type, scope_id)})
+                return
+            if action == "events" and method == "GET":
+                self._stream_scope_events(actor, scope_type, scope_id)
+                return
+
+        m = re.fullmatch(r"/api/channels/(\d+)/messages", path)
         if m and method == "POST":
             content, attachments = self._body_message()
             self._json(service.send_channel_message(actor, int(m.group(1)), content, attachments), status=201)
@@ -866,28 +887,6 @@ class RequestHandler(BaseHTTPRequestHandler):
         if m and method == "POST":
             body = self._body_json()
             self._json(service.update_typing(actor, "channel", m.group(1), bool(body.get("typing"))))
-            return
-        m = re.fullmatch(r"/api/channels/(\d+)/agent-approval", path)
-        if m and method == "POST":
-            body = self._body_json()
-            self._json(
-                service.respond_agent_approval(
-                    actor,
-                    "channel",
-                    m.group(1),
-                    str(body.get("choice", "")),
-                    run_id=body.get("run_id"),
-                    approval_id=body.get("approval_id"),
-                )
-            )
-            return
-        m = re.fullmatch(r"/api/channels/(\d+)/agent-status", path)
-        if m and method == "GET":
-            self._json({"agent_status": service.agent_status(actor, "channel", m.group(1))})
-            return
-        m = re.fullmatch(r"/api/channels/(\d+)/events", path)
-        if m and method == "GET":
-            self._stream_scope_events(actor, "channel", m.group(1))
             return
 
         if path == "/api/agent/reply-events" and method == "GET":
@@ -916,29 +915,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if path == "/api/private-agent/messages" and method == "GET":
-            limit = int_arg(query, "limit", 100)
-            sync = service.message_sync(
-                actor,
-                "private",
-                str(actor["id"]),
-                limit=limit,
-                after_id=optional_int_arg(query, "after_id", minimum=0),
-                before_id=optional_int_arg(query, "before_id", minimum=0),
-                since_revision=optional_int_arg(
-                    query, "since_revision", minimum=0
-                ),
-            )
-            self._json(
-                {
-                    **sync,
-                    "agent_status": service.agent_status(
-                        actor, "private", str(actor["id"])
-                    ),
-                    "typing": [],
-                }
-            )
-            return
         if path == "/api/private-agent/messages" and method == "POST":
             content, attachments = self._body_message()
             self._json(service.send_private_message(actor, content, attachments), status=201)
@@ -1037,25 +1013,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                     skill_id=m.group(1),
                 )
             )
-            return
-        if path == "/api/private-agent/agent-status" and method == "GET":
-            self._json({"agent_status": service.agent_status(actor, "private", str(actor["id"]))})
-            return
-        if path == "/api/private-agent/agent-approval" and method == "POST":
-            body = self._body_json()
-            self._json(
-                service.respond_agent_approval(
-                    actor,
-                    "private",
-                    str(actor["id"]),
-                    str(body.get("choice", "")),
-                    run_id=body.get("run_id"),
-                    approval_id=body.get("approval_id"),
-                )
-            )
-            return
-        if path == "/api/private-agent/events" and method == "GET":
-            self._stream_scope_events(actor, "private", str(actor["id"]))
             return
         if path == "/api/private-agent/status" and method == "GET":
             self._json(service.private_status(actor))
@@ -1193,17 +1150,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/settings/agent-token" and method == "GET":
             self._json(service.agent_tool_token(actor))
             return
-        if path == "/api/system/security/config" and method == "GET":
-            self._json(service.platform_security_config(actor))
-            return
-        if path == "/api/system/security/config" and method == "PUT":
-            self._json(service.update_platform_security_config(actor, self._body_json()))
-            return
-        if path == "/api/system/branding/config" and method == "GET":
-            self._json(service.branding_admin_config(actor))
-            return
-        if path == "/api/system/branding/config" and method == "PUT":
-            self._json(service.update_branding_config(actor, self._body_json()))
+        if path in _CONFIG_ACTIONS and method in {"GET", "PUT"}:
+            read_action, update_action = _CONFIG_ACTIONS[path]
+            payload = (
+                getattr(service, read_action)(actor) if method == "GET"
+                else getattr(service, update_action)(actor, self._body_json())
+            )
+            self._json(payload)
             return
         if path == "/api/system/branding/logo" and method == "PUT":
             self._json(service.update_branding_logo(actor, self._body_json()))
@@ -1213,24 +1166,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/system/runtime" and method == "GET":
             self._json(service.runtime_status(actor))
-            return
-        if path == "/api/system/agent-runtime/config" and method == "GET":
-            self._json(service.agent_runtime_config(actor))
-            return
-        if path == "/api/system/agent-runtime/config" and method == "PUT":
-            self._json(service.update_agent_runtime_config(actor, self._body_json()))
-            return
-        if path == "/api/system/telegram/config" and method == "GET":
-            self._json(service.telegram_admin_config(actor))
-            return
-        if path == "/api/system/telegram/config" and method == "PUT":
-            self._json(service.update_telegram_admin_config(actor, self._body_json()))
-            return
-        if path == "/api/system/auto-update/config" and method == "GET":
-            self._json(service.auto_update_config(actor))
-            return
-        if path == "/api/system/auto-update/config" and method == "PUT":
-            self._json(service.update_auto_update_config(actor, self._body_json()))
             return
         if path == "/api/system/auto-update/check" and method == "POST":
             self._json(service.trigger_auto_update_check(actor), status=202)

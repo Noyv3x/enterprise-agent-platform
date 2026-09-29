@@ -210,51 +210,30 @@ function gatewayTarget(baseUrl: string, request: GatewayToolRequest): { method: 
 }
 
 function authoritativeMemoryArguments(request: GatewayToolRequest): JsonObject {
-  const owner = request.context.owner_user_id;
-  const result: JsonObject = { ...request.arguments };
-  delete result.owner_user_id;
-  if (owner !== undefined) result.owner_user_id = owner;
+  const normalize = (arguments_: JsonObject, action: string): JsonObject => {
+    const result = { ...arguments_ };
+    for (const key of ["owner_user_id", "source_run_id", "source_message_id", "source_message_key", "source_type", "candidate_hash"]) {
+      delete result[key];
+    }
+    if (request.context.owner_user_id !== undefined) result.owner_user_id = request.context.owner_user_id;
+    if (!["search", "read", "list"].includes(action)) {
+      result.source_run_id = request.context.run_id;
+      result.source_type = "automatic";
+      if (request.context.source_message_id !== undefined) result.source_message_id = request.context.source_message_id;
+    }
+    return result;
+  };
+  const result = normalize(request.arguments, request.action);
   if (Array.isArray(request.arguments.operations)) {
     result.operations = request.arguments.operations.map((operation) => {
       if (!operation || typeof operation !== "object" || Array.isArray(operation)) return operation;
-      const normalized: JsonObject = { ...(operation as JsonObject) };
-      delete normalized.owner_user_id;
-      if (owner !== undefined) normalized.owner_user_id = owner;
-      delete normalized.source_run_id;
-      delete normalized.source_message_id;
-      delete normalized.source_message_key;
-      delete normalized.source_type;
-      delete normalized.candidate_hash;
-      const operationAction = typeof normalized.action === "string" ? normalized.action : request.action;
-      if (!["search", "read", "list"].includes(operationAction)) {
-        normalized.source_run_id = request.context.run_id;
-        normalized.source_type = "automatic";
-        if (request.context.source_message_id !== undefined) {
-          normalized.source_message_id = request.context.source_message_id;
-        }
-      }
-      if (operationAction === "store") normalized.action = "add";
-      if (operationAction === "forget") normalized.action = "remove";
+      const action = typeof operation.action === "string" ? operation.action : request.action;
+      const normalized = normalize(operation, action);
+      if (action === "store") normalized.action = "add";
+      if (action === "forget") normalized.action = "remove";
       return normalized;
     });
   }
-  if (!["search", "read", "list"].includes(request.action)) {
-    result.source_run_id = request.context.run_id;
-    result.source_type = "automatic";
-    if (request.context.source_message_id !== undefined) {
-      result.source_message_id = request.context.source_message_id;
-    } else {
-      delete result.source_message_id;
-    }
-    delete result.source_message_key;
-  } else {
-    delete result.source_run_id;
-    delete result.source_message_id;
-    delete result.source_message_key;
-    delete result.source_type;
-    delete result.candidate_hash;
-  }
-  delete result.candidate_hash;
   return result;
 }
 

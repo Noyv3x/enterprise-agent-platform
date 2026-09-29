@@ -172,18 +172,14 @@ export class ManagerExecutorClient implements ExecutionManager {
     signal?: AbortSignal,
     completionOwnerId?: string,
   ): Promise<ExecutorTerminalResponse> {
-    const response = objectValue(await this.post(
-      "/v1/executor/terminal",
-      executionBody(context, {
-        action: "run",
-        arguments: arguments_,
-        ...(completionOwnerId ? {
-          completion_required: true,
-          completion_owner_id: completionOwnerId,
-        } : {}),
-      }),
-      signal,
-    ));
+    const response = await this.execute("terminal", context, {
+      action: "run",
+      arguments: arguments_,
+      ...(completionOwnerId ? {
+        completion_required: true,
+        completion_owner_id: completionOwnerId,
+      } : {}),
+    }, signal);
     return { result: processSnapshot(response.result) };
   }
 
@@ -197,14 +193,11 @@ export class ManagerExecutorClient implements ExecutionManager {
       && Number(arguments_.timeout_ms) > 0
       ? Number(arguments_.timeout_ms)
       : undefined;
-    const response = objectValue(await this.post(
-      "/v1/executor/process",
-      executionBody(context, { action, arguments: arguments_ }),
-      signal,
+    const response = await this.execute("process", context, { action, arguments: arguments_ }, signal,
       waitTimeout === undefined
         ? undefined
         : Math.max(this.requestTimeoutMs, waitTimeout + PROCESS_WAIT_TRANSPORT_GRACE_MILLISECONDS),
-    ));
+    );
     if (action === "wait") {
       return { result: processWaitResult(response.result) as unknown as JsonValue };
     }
@@ -217,11 +210,7 @@ export class ManagerExecutorClient implements ExecutionManager {
     arguments_: JsonObject,
     signal?: AbortSignal,
   ): Promise<ExecutorFileResponse> {
-    const response = objectValue(await this.post(
-      "/v1/executor/file",
-      executionBody(context, { action, arguments: arguments_ }),
-      signal,
-    ));
+    const response = await this.execute("file", context, { action, arguments: arguments_ }, signal);
     if (typeof response.content !== "string") {
       throw new Error("Manager executor file response is missing content");
     }
@@ -330,6 +319,16 @@ export class ManagerExecutorClient implements ExecutionManager {
   async previewSummary(identity: Required<ScopeExecutionIdentity>): Promise<ProcessPreviewSummary> {
     const response = objectValue(await this.post("/v1/executor/scopes/process-summary", identity));
     return { running_terminal_count: boundedCount(response.running_terminal_count, "running_terminal_count") };
+  }
+
+  private async execute(
+    tool: string,
+    context: ExecutionCallContext,
+    body: JsonObject,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<JsonObject> {
+    return objectValue(await this.post(`/v1/executor/${tool}`, executionBody(context, body), signal, timeoutMs));
   }
 
   private async post(

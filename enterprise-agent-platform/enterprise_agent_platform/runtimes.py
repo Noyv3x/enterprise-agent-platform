@@ -54,6 +54,14 @@ class RuntimeStatus:
         }
 
 
+@dataclass
+class _StatusCache:
+    snapshot: dict[str, Any] | None = None
+    checked_at: float = 0.0
+    generation: int = 0
+    thread: threading.Thread | None = None
+
+
 class PlatformRuntimeManager:
     """HTTP health and configuration adapters for Manager-owned services."""
 
@@ -67,15 +75,9 @@ class PlatformRuntimeManager:
         self.config = config
         self.secret_provider = secret_provider
         self.setting_provider = setting_provider
-        self._status_cache_lock = threading.Lock()
-        self._status_cache: dict[str, Any] | None = None
-        self._status_cache_checked_at = 0.0
-        self._status_cache_generation = 0
-        self._status_refresh_thread: threading.Thread | None = None
-        self._searxng_cache_lock = threading.Lock()
-        self._searxng_cache: dict[str, Any] | None = None
-        self._searxng_cache_checked_at = 0.0
-        self._searxng_refresh_thread: threading.Thread | None = None
+        self._cache_lock = threading.Lock()
+        self._status_cache = _StatusCache()
+        self._searxng_cache = _StatusCache()
         self._closed = False
 
     def status(self, *, refresh: bool = True) -> dict[str, Any]:
@@ -105,98 +107,71 @@ class PlatformRuntimeManager:
         *,
         max_age_seconds: float = RUNTIME_STATUS_CACHE_SECONDS,
     ) -> dict[str, Any]:
-        now = time.time()
-        with self._status_cache_lock:
-            if self._status_cache is None:
-                self._status_cache = deepcopy(self.status(refresh=False))
-            snapshot = deepcopy(self._status_cache)
-            checked_at = self._status_cache_checked_at
-            stale = checked_at <= 0 or now - checked_at >= max(
-                0.0, float(max_age_seconds)
-            )
-            refresh_running = self._status_refresh_thread is not None
-        if stale and not refresh_running:
-            self.refresh_status_async()
-        return {
-            **snapshot,
-            "checked_at": int(checked_at) if checked_at > 0 else None,
-            "stale": stale,
-        }
+        return self._cached_status(self._status_cache, max_age_seconds)
 
     def refresh_status_async(self) -> None:
-        with self._status_cache_lock:
-            if self._closed or self._status_refresh_thread is not None:
-                return
-            generation = self._status_cache_generation
-            thread = threading.Thread(
-                target=self._refresh_status_cache,
-                args=(generation,),
-                name="runtime-status-refresh",
-                daemon=True,
-            )
-            self._status_refresh_thread = thread
-            thread.start()
-
-    def _refresh_status_cache(self, generation: int) -> None:
-        try:
-            snapshot = self.status(refresh=True)
-            checked_at = time.time()
-            with self._status_cache_lock:
-                if not self._closed and generation == self._status_cache_generation:
-                    self._status_cache = deepcopy(snapshot)
-                    self._status_cache_checked_at = checked_at
-        finally:
-            with self._status_cache_lock:
-                if self._status_refresh_thread is threading.current_thread():
-                    self._status_refresh_thread = None
+        with self._cache_lock:
+            self._start_refresh(self._status_cache)
 
     def cached_searxng_status(
         self,
         *,
         max_age_seconds: float = 1.0,
     ) -> dict[str, Any]:
+        return self._cached_status(self._searxng_cache, max_age_seconds)
+
+    def _status_snapshot(self, cache: _StatusCache, *, refresh: bool) -> dict[str, Any]:
+        return (
+            self.status(refresh=refresh)
+            if cache is self._status_cache
+            else self.searxng_status(refresh=refresh).to_dict()
+        )
+
+    def _cached_status(self, cache: _StatusCache, max_age_seconds: float) -> dict[str, Any]:
         now = time.time()
-        with self._searxng_cache_lock:
-            if self._searxng_cache is None:
-                self._searxng_cache = self.searxng_status(refresh=False).to_dict()
-            snapshot = deepcopy(self._searxng_cache)
-            checked_at = self._searxng_cache_checked_at
-            stale = checked_at <= 0 or now - checked_at >= max(
-                0.0, float(max_age_seconds)
-            )
-            refresh_running = self._searxng_refresh_thread is not None
-            if stale and not refresh_running and not self._closed:
-                thread = threading.Thread(
-                    target=self._refresh_searxng_cache,
-                    name="searxng-status-refresh",
-                    daemon=True,
-                )
-                self._searxng_refresh_thread = thread
-                thread.start()
+        with self._cache_lock:
+            if cache.snapshot is None:
+                cache.snapshot = deepcopy(self._status_snapshot(cache, refresh=False))
+            snapshot = deepcopy(cache.snapshot)
+            checked_at = cache.checked_at
+            stale = checked_at <= 0 or now - checked_at >= max(0.0, float(max_age_seconds))
+            if stale:
+                self._start_refresh(cache)
         return {
             **snapshot,
             "checked_at": int(checked_at) if checked_at > 0 else None,
             "stale": stale,
         }
 
-    def _refresh_searxng_cache(self) -> None:
+    def _start_refresh(self, cache: _StatusCache) -> None:
+        # Caller holds _cache_lock so close cannot miss a newly started worker.
+        if self._closed or cache.thread is not None:
+            return
+        cache.thread = threading.Thread(
+            target=self._refresh_cache,
+            args=(cache, cache.generation),
+            name="runtime-status-refresh" if cache is self._status_cache else "searxng-status-refresh",
+            daemon=True,
+        )
+        cache.thread.start()
+
+    def _refresh_cache(self, cache: _StatusCache, generation: int) -> None:
         try:
-            snapshot = self.searxng_status(refresh=True).to_dict()
-            with self._searxng_cache_lock:
-                if not self._closed:
-                    self._searxng_cache = deepcopy(snapshot)
-                    self._searxng_cache_checked_at = time.time()
+            snapshot = self._status_snapshot(cache, refresh=True)
+            checked_at = time.time()
+            with self._cache_lock:
+                if not self._closed and generation == cache.generation:
+                    cache.snapshot = deepcopy(snapshot)
+                    cache.checked_at = checked_at
         finally:
-            with self._searxng_cache_lock:
-                if self._searxng_refresh_thread is threading.current_thread():
-                    self._searxng_refresh_thread = None
+            with self._cache_lock:
+                if cache.thread is threading.current_thread():
+                    cache.thread = None
 
     def invalidate_status_cache(self) -> None:
-        with self._status_cache_lock:
-            self._status_cache_generation += 1
-            self._status_cache_checked_at = 0.0
-        with self._searxng_cache_lock:
-            self._searxng_cache_checked_at = 0.0
+        with self._cache_lock:
+            self._status_cache.generation += 1
+            self._status_cache.checked_at = self._searxng_cache.checked_at = 0.0
 
     def agent_runtime_config(self) -> dict[str, Any]:
         return {
@@ -265,17 +240,15 @@ class PlatformRuntimeManager:
         )
 
     def close(self) -> None:
-        with self._status_cache_lock:
+        with self._cache_lock:
             self._closed = True
-            self._status_cache_generation += 1
-            status_thread = self._status_refresh_thread
-        with self._searxng_cache_lock:
-            searxng_thread = self._searxng_refresh_thread
+            self._status_cache.generation += 1
+            threads = (self._status_cache.thread, self._searxng_cache.thread)
 
         deadline = time.monotonic() + 4.0
         current = threading.current_thread()
         seen: set[int] = set()
-        for thread in (status_thread, searxng_thread):
+        for thread in threads:
             if thread is None or thread is current or id(thread) in seen:
                 continue
             seen.add(id(thread))

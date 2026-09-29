@@ -347,6 +347,35 @@ export async function loadPermissionGroups(store: AppStore): Promise<void> {
   store.dispatch({ type: "SET_PERMISSION_GROUPS", payload: result.permission_groups });
 }
 
+async function loadAuditMessages(
+  store: AppStore,
+  kind: "channel" | "private",
+  id: Id | null,
+): Promise<void> {
+  const selectionKey = kind === "channel" ? "auditChannelId" : "auditPrivateUserId";
+  let result: AuditChannelMessagesResponse | AuditPrivateMessagesResponse | undefined;
+  if (id) {
+    const selected = String(id);
+    if (store.getState().messageAudit[selectionKey] !== selected) return;
+    const fenceKey = `${kind}:${selected}`;
+    const version = issueAuditRead(store, fenceKey);
+    const endpoint = kind === "channel" ? endpoints.auditChannelMessages : endpoints.auditPrivateMessages;
+    result = await api<AuditChannelMessagesResponse | AuditPrivateMessagesResponse>(endpoint.path(selected));
+    if (
+      auditReadVersions.get(store)?.get(fenceKey) !== version ||
+      store.getState().messageAudit[selectionKey] !== selected
+    ) return;
+  }
+  const messages = result?.messages || [];
+  const total = result?.total || 0;
+  store.dispatch({
+    type: "PATCH_MESSAGE_AUDIT",
+    payload: kind === "channel"
+      ? { channelMessages: messages, channelTotal: total }
+      : { privateMessages: messages, privateTotal: total },
+  });
+}
+
 /** Read the selected channel's audit rows. The caller selects first; a read for
  *  a channel that is no longer selected is skipped rather than re-selecting it,
  *  and a late response for a superseded selection or read is discarded. */
@@ -354,25 +383,7 @@ export async function loadAuditChannelMessages(
   store: AppStore,
   channelId: Id | null = store.getState().messageAudit.auditChannelId,
 ): Promise<void> {
-  if (!channelId) {
-    store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { channelMessages: [], channelTotal: 0 } });
-    return;
-  }
-  const selected = String(channelId);
-  if (store.getState().messageAudit.auditChannelId !== selected) return;
-  const fenceKey = `channel:${selected}`;
-  const version = issueAuditRead(store, fenceKey);
-  const result = await api<AuditChannelMessagesResponse>(
-    endpoints.auditChannelMessages.path(selected),
-  );
-  if (
-    auditReadVersions.get(store)?.get(fenceKey) !== version ||
-    store.getState().messageAudit.auditChannelId !== selected
-  ) return;
-  store.dispatch({
-    type: "PATCH_MESSAGE_AUDIT",
-    payload: { channelMessages: result.messages || [], channelTotal: result.total || 0 },
-  });
+  await loadAuditMessages(store, "channel", channelId);
 }
 
 export async function loadPrivateConversations(store: AppStore): Promise<void> {
@@ -399,25 +410,7 @@ export async function loadAuditPrivateMessages(
   store: AppStore,
   userId: Id | null = store.getState().messageAudit.auditPrivateUserId,
 ): Promise<void> {
-  if (!userId) {
-    store.dispatch({ type: "PATCH_MESSAGE_AUDIT", payload: { privateMessages: [], privateTotal: 0 } });
-    return;
-  }
-  const selected = String(userId);
-  if (store.getState().messageAudit.auditPrivateUserId !== selected) return;
-  const fenceKey = `private:${selected}`;
-  const version = issueAuditRead(store, fenceKey);
-  const result = await api<AuditPrivateMessagesResponse>(
-    endpoints.auditPrivateMessages.path(selected),
-  );
-  if (
-    auditReadVersions.get(store)?.get(fenceKey) !== version ||
-    store.getState().messageAudit.auditPrivateUserId !== selected
-  ) return;
-  store.dispatch({
-    type: "PATCH_MESSAGE_AUDIT",
-    payload: { privateMessages: result.messages || [], privateTotal: result.total || 0 },
-  });
+  await loadAuditMessages(store, "private", userId);
 }
 
 export async function loadSecrets(store: AppStore): Promise<void> {

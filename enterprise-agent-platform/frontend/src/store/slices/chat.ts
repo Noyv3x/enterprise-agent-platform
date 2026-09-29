@@ -135,21 +135,15 @@ export function chatReducer(state: AppState, action: Action): AppState {
       }
       return { ...state, messageHistory };
     }
-    case "SET_PENDING_MESSAGES":
-      return { ...state, pendingMessages: action.payload };
     case "SET_AGENT_STATUSES":
       return {
         ...state,
         agentStatuses: mergeAgentStatuses(state.agentStatuses, action.payload),
       };
-    case "SET_EXPANDED_AGENT_RUNS":
-      return { ...state, expandedAgentRuns: action.payload };
     case "SET_MENTION_TARGETS":
       return { ...state, mentionTargets: action.payload };
     case "SET_TYPING_USERS":
       return { ...state, typingUsers: action.payload };
-    case "SET_DRAFTS":
-      return { ...state, drafts: action.payload };
     case "SET_DRAFT":
       return {
         ...state,
@@ -333,17 +327,6 @@ export function chatReducer(state: AppState, action: Action): AppState {
         },
       };
 
-    case "RESET_SESSION":
-      return {
-        ...state,
-        pendingMessages: [],
-        draftFiles: {},
-        failedSends: {},
-        messageSyncCursors: {},
-        messageHistory: {},
-        mentionTargets: [],
-        typingUsers: [],
-      };
     default:
       return state;
   }

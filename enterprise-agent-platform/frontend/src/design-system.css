@@ -101,7 +101,6 @@
 .wf-section--danger .wf-section-title { color: var(--wf-danger); }
 .wf-form-grid { display: grid; gap: 0 var(--wf-space-4); align-items: start; min-inline-size: 0; }
 .wf-form-grid--2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.wf-form-grid--1 { grid-template-columns: minmax(0, 1fr); }
 .wf-form-grid > * { min-inline-size: 0; }
 .wf-form-span { grid-column: 1 / -1; }
 .wf-form-footer { display: flex; align-items: center; justify-content: flex-end; gap: var(--wf-space-3); flex-wrap: wrap; padding-block-start: var(--wf-space-3); border-block-start: var(--wf-border) solid var(--wf-line); }
@@ -254,7 +253,6 @@
 .wf-composer-jump { position: absolute; inset-inline-start: 50%; inset-block-end: 0; transform: translateX(-50%); padding-block-end: var(--wf-space-2); }
 .wf-root .wf-composer-rail .wf-latest-action { box-shadow: var(--wf-shadow-raised); border-radius: var(--wf-radius-pill); }
 .wf-rotate { transform: rotate(90deg); }
-.wf-companion { flex: 0 1 40%; max-inline-size: var(--wf-detail-width); min-inline-size: 0; overflow: auto; border-inline-start: var(--wf-border) solid var(--wf-line); background: var(--wf-canvas); padding: var(--wf-space-4); }
 .wf-computer { display: flex; flex-direction: column; border-radius: var(--wf-radius-lg); background: var(--wf-raised); box-shadow: var(--wf-shadow-card); overflow: hidden; min-inline-size: 0; max-block-size: 100%; }
 .wf-computer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--wf-space-3); padding: var(--wf-space-3); border-block-end: var(--wf-border) solid var(--wf-line); flex: none; flex-wrap: wrap; }
 .wf-computer-heading { min-inline-size: 0; }
@@ -295,7 +293,6 @@
 @media (max-width: 1279px) {
   .wf-conversation-body { flex-direction: column; }
   .wf-conversation-column { flex: 1; }
-  .wf-companion { flex: none; max-inline-size: none; max-block-size: 10rem; border-inline-start: 0; border-block-start: var(--wf-border) solid var(--wf-line); padding: var(--wf-space-3) var(--wf-page-gutter); }
 }
 @media (max-width: 1039px) {
   .wf-root { --wf-page-gutter: var(--wf-space-5); }
@@ -344,7 +341,6 @@
   .wf-thread-inner { padding-block-start: var(--wf-space-4); }
   .wf-message--user .wf-message-content { max-inline-size: 92%; }
   .wf-composer-dock { padding-block-end: max(var(--wf-space-3), env(safe-area-inset-bottom)); }
-  .wf-companion { max-block-size: 8rem; padding-block: var(--wf-space-2); }
   .wf-computer-meta { gap: var(--wf-space-1) var(--wf-space-2); }
 }
 @media (pointer: coarse), (max-width: 639px) {

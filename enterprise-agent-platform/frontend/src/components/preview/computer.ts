@@ -8,20 +8,13 @@ import type {
   ComputerProjection,
   ComputerSearchHit,
 } from "../../types";
+import type { PreviewAvailabilityState } from "./usePreviewAvailability";
 
-export const COMPUTER_FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
-export const COMPUTER_SEARCH_TOOLS = new Set(["web", "search_files"]);
-export const COMPUTER_TERMINAL_TOOLS = new Set(["terminal", "process"]);
-export const COMPUTER_BROWSER_TOOLS = new Set(["browser"]);
+const COMPUTER_FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
+const COMPUTER_SEARCH_TOOLS = new Set(["web", "search_files"]);
+const COMPUTER_TERMINAL_TOOLS = new Set(["terminal", "process"]);
+const COMPUTER_BROWSER_TOOLS = new Set(["browser"]);
 const HTML_SUFFIX = /\.(html|htm)$/i;
-
-export interface ComputerAvailability {
-  browserActive: boolean;
-  runningTerminalCount: number;
-  presentAvailable: boolean;
-  loading: boolean;
-  error: string;
-}
 
 export interface ComputerSurface {
   visible: boolean;
@@ -56,7 +49,7 @@ function toolName(step: ActivityStep | null | undefined): string {
   return String(step?.tool || step?.label || "").trim().toLowerCase();
 }
 
-export function isComputerTool(tool: string): boolean {
+function isComputerTool(tool: string): boolean {
   const name = tool.trim().toLowerCase();
   return (
     COMPUTER_FILE_TOOLS.has(name)
@@ -66,7 +59,7 @@ export function isComputerTool(tool: string): boolean {
   );
 }
 
-export function isHtmlWorkspacePath(value: string | undefined): boolean {
+function isHtmlWorkspacePath(value: string | undefined): boolean {
   return Boolean(value && HTML_SUFFIX.test(value.trim()));
 }
 
@@ -97,7 +90,7 @@ export function latestComputerStep(work: AgentWork | AgentStatus | null | undefi
   return latest;
 }
 
-export function computerModeFromStep(step: ActivityStep | null): ComputerMode | null {
+function computerModeFromStep(step: ActivityStep | null): ComputerMode | null {
   if (!step) return null;
   const tool = toolName(step);
   if (COMPUTER_FILE_TOOLS.has(tool)) {
@@ -166,7 +159,7 @@ export function deriveComputerSurface({
   availability,
 }: {
   status: AgentStatus | null | undefined;
-  availability: ComputerAvailability;
+  availability: PreviewAvailabilityState;
 }): ComputerSurface {
   const live = status?.state === "replying" || status?.state === "approval";
   const runId = String(status?.run_id || "");
