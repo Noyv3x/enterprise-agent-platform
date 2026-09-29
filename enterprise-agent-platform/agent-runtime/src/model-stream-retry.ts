@@ -8,8 +8,10 @@ import {
 } from "@earendil-works/pi-ai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
-export const MODEL_STREAM_MAX_RETRIES = 3;
-const MODEL_STREAM_RETRY_BASE_DELAY_MS = 1_000;
+// Backoff of 2, 4, 8, 16, 32 s (±20%) rides out provider overload windows of
+// about a minute before the Run reports the failure.
+export const MODEL_STREAM_MAX_RETRIES = 5;
+const MODEL_STREAM_RETRY_BASE_DELAY_MS = 2_000;
 const MODEL_STREAM_RETRY_JITTER = 0.2;
 
 interface ModelStreamRetryOptions {

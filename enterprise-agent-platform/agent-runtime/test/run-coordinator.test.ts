@@ -1199,9 +1199,12 @@ test("RunCoordinator requests one bounded verification after a file change", asy
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
+    // The interim answer stays user-visible; its MEDIA lines are withheld and
+    // only the validated markers are restored after the final reply.
     assert.equal(
       completed.result?.content,
-      "Verified the updated file.\nMEDIA: \"/workspace/summary.csv\""
+      "The requested file was updated."
+      + "\n\nVerified the updated file.\nMEDIA: \"/workspace/summary.csv\""
       + "\n\nMEDIA: /workspace/changed.txt"
       + "\nMEDIA: /workspace/page.html"
       + "\nMEDIA: /workspace/deck.htm",
@@ -1219,8 +1222,8 @@ test("RunCoordinator requests one bounded verification after a file change", asy
     });
     const durableText = JSON.stringify(durable);
     assert.doesNotMatch(durableText, /active run contains no focused post-change check/);
-    assert.doesNotMatch(durableText, /The requested file was updated/);
-    assert.doesNotMatch(
+    assert.match(durableText, /The requested file was updated/);
+    assert.match(
       JSON.stringify(completed.result?.messages),
       /The requested file was updated/,
     );
@@ -1268,7 +1271,7 @@ test("an unrelated read does not satisfy focused file verification", async () =>
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.equal(completed.result?.content, "Verified changed.txt.");
+    assert.equal(completed.result?.content, "The file is updated.\n\nVerified changed.txt.");
     assert.equal(faux.state.callCount, 5);
   } finally {
     coordinator.shutdown();
@@ -1313,7 +1316,7 @@ test("a failed terminal check does not satisfy file verification", async () => {
     });
     const completed = await coordinator.wait(run.id);
     assert.equal(completed.status, "completed");
-    assert.equal(completed.result?.content, "Verified after the failed check.");
+    assert.equal(completed.result?.content, "The file is updated.\n\nVerified after the failed check.");
     assert.equal(faux.state.callCount, 5);
   } finally {
     coordinator.shutdown();
@@ -1366,7 +1369,7 @@ test("a failed automatic verification does not restore a MEDIA marker", async ()
     assert.equal(completed.status, "completed");
     assert.equal(
       completed.result?.content,
-      "Workbook validation failed, so the file is not being delivered.",
+      "The workbook is ready.\n\nWorkbook validation failed, so the file is not being delivered.",
     );
     assert.doesNotMatch(completed.result?.content || "", /MEDIA:/);
     assert.equal(await readFile(`${workspace}/report.xlsx`, "utf8"), "not a valid workbook\n");
@@ -1422,7 +1425,7 @@ test("a successful terminal document verification restores a MEDIA marker", asyn
     assert.equal(completed.status, "completed");
     assert.equal(
       completed.result?.content,
-      "The workbook reopened successfully.\n\nMEDIA: /workspace/report.xlsx",
+      "The workbook is ready.\n\nThe workbook reopened successfully.\n\nMEDIA: /workspace/report.xlsx",
     );
     assert.equal(await readFile(`${workspace}/report.xlsx`, "utf8"), "xlsx");
   } finally {
@@ -1474,7 +1477,7 @@ test("a failed mutating terminal command still requires file verification", asyn
     assert.equal(completed.status, "completed");
     assert.equal(
       completed.result?.content,
-      "Verified the file written before the command failed.",
+      "The command stopped after changing the file.\n\nVerified the file written before the command failed.",
     );
     assert.equal(await readFile(`${workspace}/failed-change.txt`, "utf8"), "updated\n");
     assert.equal(faux.state.callCount, 4);

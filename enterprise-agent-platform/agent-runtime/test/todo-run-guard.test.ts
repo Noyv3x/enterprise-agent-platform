@@ -320,8 +320,13 @@ test("todo content stays framed as untrusted data in the system prompt and Runti
   faux.setResponses([
     (context) => {
       prompts.push(getCurrentSystemPrompt(context.messages) || "");
-      return fauxAssistantMessage("Not done yet.");
+      // Resuming the carried item makes it this Run's completion duty.
+      return fauxAssistantMessage(fauxToolCall("todo", {
+        action: "replace",
+        todos: [{ content: forged, status: "in_progress" }],
+      }), { stopReason: "toolUse" });
     },
+    fauxAssistantMessage("Not done yet."),
     (context) => {
       const last = context.messages.at(-1);
       continuations.push(JSON.stringify(last));
@@ -342,6 +347,82 @@ test("todo content stays framed as untrusted data in the system prompt and Runti
   } finally {
     coordinator.shutdown();
     guarded.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("an untouched todo left blocked by an earlier run does not fail an unrelated run", async () => {
+  const home = await temporaryDirectory("agent-todo-carry-over-");
+  const workspace = await temporaryDirectory("agent-todo-carry-over-workspace-");
+  const request = baseRequest(workspace, "todo-carry-over");
+  const seeding = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: fauxProvider().provider.streamSimple,
+  });
+  await seeding.sessions.todoState(identityFor(request)).replace([
+    { content: "Read the NAS folder once the network route is restored", status: "pending" },
+  ]);
+  seeding.shutdown();
+  const faux = fauxProvider();
+  faux.setResponses([
+    (context) => {
+      assert.match(getCurrentSystemPrompt(context.messages) || "", /NAS folder once the network route is restored/);
+      return fauxAssistantMessage("Close the preview panel with the button in its top-right corner.");
+    },
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const completed = await coordinator.wait(coordinator.createRun({
+      ...request,
+      input: "How do I close this window?",
+    }).id);
+
+    assert.equal(completed.status, "completed", completed.error);
+    assert.equal(completed.result?.content, "Close the preview panel with the button in its top-right corner.");
+    assert.equal(faux.state.callCount, 1, "an untouched carry-over item must not trigger todo continuations");
+    assert.deepEqual(
+      (await coordinator.sessions.loadActiveTodos(identityFor(request))).map(({ content, status }) => ({ content, status })),
+      [{ content: "Read the NAS folder once the network route is restored", status: "pending" }],
+    );
+  } finally {
+    coordinator.shutdown();
+    await rm(home, { recursive: true, force: true });
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test("a run that resumes a carried todo and leaves it unfinished still needs review", async () => {
+  const home = await temporaryDirectory("agent-todo-carry-over-resumed-");
+  const workspace = await temporaryDirectory("agent-todo-carry-over-resumed-workspace-");
+  const request = baseRequest(workspace, "todo-carry-over-resumed");
+  const seeding = new RunCoordinator({
+    config: testConfig(home),
+    streamFn: fauxProvider().provider.streamSimple,
+  });
+  const seeded = await seeding.sessions.todoState(identityFor(request)).replace([
+    { content: "Read the NAS folder", status: "pending" },
+  ]);
+  seeding.shutdown();
+  const todoId = seeded.todos[0]!.id;
+  const faux = fauxProvider();
+  faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("todo", {
+      action: "merge",
+      todos: [{ id: todoId, status: "in_progress" }],
+    }), { stopReason: "toolUse" }),
+    fauxAssistantMessage("The NAS is still unreachable."),
+    fauxAssistantMessage("The NAS is still unreachable."),
+    fauxAssistantMessage("The NAS is still unreachable."),
+    fauxAssistantMessage("The NAS is still unreachable."),
+  ]);
+  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
+  try {
+    const completed = await coordinator.wait(coordinator.createRun({ ...request, input: "continue" }).id);
+    assert.equal(completed.status, "needs_review");
+    assert.equal(completed.error, ACTIVE_TODO_REVIEW_ERROR);
+  } finally {
+    coordinator.shutdown();
     await rm(home, { recursive: true, force: true });
     await rm(workspace, { recursive: true, force: true });
   }
