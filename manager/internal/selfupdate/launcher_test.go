@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -575,5 +576,95 @@ func TestLauncherAcknowledgementRejectsWrongRegistrationAndIdentity(t *testing.T
 				t.Fatal("rejected registration changed acknowledgement")
 			}
 		})
+	}
+}
+
+func TestLauncherParentRegistrationWaitsForRecoveryLock(t *testing.T) {
+	m := launcherAcknowledgementFixture(t)
+	m.LauncherHealthTimeout = time.Minute
+	release, err := acquireRecoveryLock(m.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	result := make(chan error, 1)
+	go func() {
+		result <- m.mutateLauncher(func(s *launcherState) error {
+			s.ChildPID = os.Getpid()
+			return nil
+		})
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("registration did not wait for held recovery lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	before, err := m.readLauncher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ChildPID != 0 || before.Acknowledged {
+		t.Fatalf("held lock allowed premature registration: %+v", before)
+	}
+	release()
+	release = nil
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("registration failed after lock release: %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("registration remained blocked after lock release")
+	}
+	if err := m.AcknowledgeStartup(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := m.readLauncher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ChildPID != os.Getpid() || !after.Acknowledged {
+		t.Fatalf("registered child was not acknowledged: %+v", after)
+	}
+}
+
+func TestLauncherLockWaitIsBoundedWithoutChangingRecoveryAdmission(t *testing.T) {
+	m, _ := launcherFixture(t)
+	release, err := acquireRecoveryLock(m.Root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	called := false
+	err = m.mutateLauncherContext(ctx, func(s *launcherState) error {
+		called = true
+		s.ChildPID = os.Getpid()
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || called {
+		t.Fatalf("held lock did not bound mutation: called=%v err=%v", called, err)
+	}
+	// Genuine external ownership claims must still fail immediately, not wait.
+	claim := make(chan error, 1)
+	go func() {
+		unlock, err := acquireRecoveryLock(m.Root)
+		if unlock != nil {
+			unlock()
+		}
+		claim <- err
+	}()
+	select {
+	case err := <-claim:
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Fatalf("external ownership admission changed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("external ownership claim waited for held lock")
 	}
 }

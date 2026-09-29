@@ -62,7 +62,13 @@ func (m *Manager) readLauncher() (launcherState, error) {
 	return s, nil
 }
 func (m *Manager) mutateLauncher(f func(*launcherState) error) error {
-	releaseLock, err := m.acquireLauncherMutation()
+	return m.mutateLauncherContext(context.Background(), f)
+}
+
+func (m *Manager) mutateLauncherContext(ctx context.Context, f func(*launcherState) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	releaseLock, err := waitRecoveryLock(ctx, m.Root)
 	if err != nil {
 		return err
 	}
@@ -80,17 +86,9 @@ func (m *Manager) mutateLauncher(f func(*launcherState) error) error {
 }
 
 func (m *Manager) acquireLauncherMutation() (func(), error) {
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		release, err := acquireRecoveryLock(m.Root)
-		if err == nil {
-			return release, nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) || time.Now().After(deadline) {
-			return nil, err
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return waitRecoveryLock(ctx, m.Root)
 }
 func (m *Manager) verifyLauncherVersion(v Version, launcher bool) error {
 	if !validSHA256(v.SHA256) || v.Version == "" || !filepath.IsAbs(v.Path) || filepath.Clean(v.Path) != v.Path {
@@ -255,8 +253,6 @@ func (m *Manager) SupervisedCandidateStartup() (bool, error) {
 	return s.Pending, err
 }
 
-var errLauncherChildUnregistered = errors.New("launcher child PID registration is pending")
-
 func (m *Manager) acknowledgeLauncher() error {
 	timeout := m.launcherDeadline()
 	if timeout > time.Minute {
@@ -264,36 +260,50 @@ func (m *Manager) acknowledgeLauncher() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
 	for {
-		err := m.mutateLauncher(func(s *launcherState) error {
-			if s.LauncherPID != os.Getppid() || strconv.Itoa(s.LauncherPID) != os.Getenv("AGENT_PLATFORM_LAUNCHER_PID") ||
-				!binaryMatches(fmt.Sprintf("/proc/%d/exe", s.LauncherPID), s.Launcher.SHA256) ||
-				s.Selected.Version != m.RunningVersion || !binaryMatches("/proc/self/exe", s.Selected.SHA256) {
-				return errors.New("launcher acknowledgement identity mismatch")
-			}
-			// Start makes the child runnable before its parent can persist PID.
-			// Release both mutation locks while waiting for that exact registration.
-			if s.ChildPID == 0 {
-				return errLauncherChildUnregistered
-			}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Atomic replacement makes an unlocked observation safe. Do not hash
+		// executables while holding the lock needed by the parent to register us.
+		s, err := m.readLauncher()
+		if err != nil {
+			return err
+		}
+		if s.LauncherPID != os.Getppid() || strconv.Itoa(s.LauncherPID) != os.Getenv("AGENT_PLATFORM_LAUNCHER_PID") ||
+			s.Selected.Version != m.RunningVersion {
+			return errors.New("launcher acknowledgement identity mismatch")
+		}
+		if s.ChildPID != 0 {
 			if s.ChildPID != os.Getpid() {
 				return errors.New("launcher acknowledgement process mismatch")
 			}
-			s.Acknowledged = true
-			return nil
-		})
-		if !errors.Is(err, errLauncherChildUnregistered) {
-			return err
+			if !binaryMatches(fmt.Sprintf("/proc/%d/exe", s.LauncherPID), s.Launcher.SHA256) ||
+				!binaryMatches("/proc/self/exe", s.Selected.SHA256) {
+				return errors.New("launcher acknowledgement identity mismatch")
+			}
+			return m.mutateLauncherContext(ctx, func(latest *launcherState) error {
+				// Authenticate the snapshot outside the lock, then atomically
+				// acknowledge only the same exact processes and executable identities.
+				if latest.LauncherPID != s.LauncherPID || latest.ChildPID != s.ChildPID ||
+					latest.Launcher != s.Launcher || latest.Selected != s.Selected {
+					return errors.New("launcher acknowledgement identity changed")
+				}
+				latest.Acknowledged = true
+				return nil
+			})
 		}
 		if m.launcherRegistrationPending != nil {
 			m.launcherRegistrationPending()
 		}
+		// Start the delay after observing/calling the hook, rather than consuming
+		// a buffered ticker tick and immediately competing with parent registration.
+		timer := time.NewTimer(10 * time.Millisecond)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }

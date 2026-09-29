@@ -363,6 +363,30 @@ func (m *Manager) settleOrdinaryRollbackCheckpointForRecovery(platformCommit str
 	return settled, err
 }
 
+// waitRecoveryLock coordinates short ordinary state operations. External
+// recovery admission deliberately uses acquireRecoveryLock directly instead.
+func waitRecoveryLock(ctx context.Context, root string) (func(), error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		release, err := acquireRecoveryLock(root)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, err
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func acquireRecoveryLock(root string) (func(), error) {
 	path := filepath.Join(root, "recovery.lock")
 	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
