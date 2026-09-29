@@ -69,14 +69,12 @@ export interface ToolFactoryContext {
 
 export type DelegationRole = "leaf" | "orchestrator";
 
-/** Runtime-issued child evidence. None of these fields are model arguments. */
+/** Runtime-issued child result. None of these fields are model arguments. */
 export interface DelegationResult {
   child_run_id: string;
   status: "completed";
   content: string;
   side_effects_started: boolean;
-  changed_files: string[];
-  unknown_change: boolean;
 }
 
 function textResult(content: string, details: JsonValue = null): AgentToolResult<JsonValue> {
@@ -333,18 +331,6 @@ const todoReplacementSchema = Type.Object({
   status: Type.Optional(todoStatusSchema),
 }, { additionalProperties: false });
 
-const todoMergeSchema = Type.Union([
-  Type.Object({
-    content: todoContentSchema,
-    status: Type.Optional(todoStatusSchema),
-  }, { additionalProperties: false }),
-  Type.Object({
-    id: todoIdSchema,
-    content: Type.Optional(todoContentSchema),
-    status: Type.Optional(todoStatusSchema),
-  }, { additionalProperties: false, minProperties: 2 }),
-]);
-
 const todoSchema = Type.Union([
   Type.Object({
     action: Type.Literal("read"),
@@ -352,10 +338,6 @@ const todoSchema = Type.Union([
   Type.Object({
     action: Type.Literal("replace"),
     todos: Type.Array(todoReplacementSchema, { maxItems: MAX_TODO_ITEMS }),
-  }, { additionalProperties: false }),
-  Type.Object({
-    action: Type.Literal("merge"),
-    todos: Type.Array(todoMergeSchema, { minItems: 1, maxItems: MAX_TODO_ITEMS }),
   }, { additionalProperties: false }),
 ]);
 
@@ -1297,7 +1279,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
           "Maintain the structured execution checklist for this Runtime session.",
           "Use it only when the work has at least three distinct, independently trackable steps or the user requested multiple separately completable tasks.",
           "Skip it for direct answers, a single read/query/command or small single-file change when that is the whole request, and simple one- or two-step work; routine inspection, one small change, and its focused verification are one linear task, not a ceremonial checklist.",
-          "Use read to inspect the complete list, replace to set the complete list, and merge to add a new item or update an existing Runtime-issued id.",
+          "Use read to inspect the complete list and replace to set the complete list; include existing Runtime-issued ids to retain items.",
           "Once a checklist exists, keep only one item in_progress, update it when work starts, mark it completed immediately after it is actually finished and appropriately verified, mark abandoned work cancelled, and append only newly discovered necessary work.",
           "This is not a scheduled-task tool, process watcher, or durable memory store.",
           "For a background command that this run must finish, use process.wait; for a real future time trigger, use schedule; for stable cross-session facts, use memory.",
@@ -1309,9 +1291,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
           throwIfAborted(signal);
           const state = params.action === "read"
             ? await todoState.read()
-            : params.action === "replace"
-              ? await todoState.replace(params.todos)
-              : await todoState.merge(params.todos);
+            : await todoState.replace(params.todos);
           throwIfAborted(signal);
           const result: JsonValue = {
             schema_version: state.schema_version,
@@ -1578,7 +1558,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
       `A batch accepts at most ${maximumDelegates} tasks, starts independent children concurrently, waits for every child, and returns results in input order.`,
       "Children are leaf Agents by default and cannot delegate. Set role=orchestrator only when a child genuinely needs another bounded delegation layer.",
       "Do not ask parallel children to modify the same file or shared external object.",
-      "Child output is an unverified report: the parent must re-check files and externally visible side effects before relying on it.",
+      "Use each child's final report as task context; decide what further work the user request needs.",
     ].join(" "),
     parameters: delegateParameters,
     executionMode: "sequential",
@@ -1610,8 +1590,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
         : { index, status: "failed", error: errorMessage(result.reason) });
       const details: JsonValue = { results };
       return textResult(
-        "Delegated batch settled. Treat child reports as unverified: re-check relevant files and externally visible "
-          + `side effects before relying on them.\n${JSON.stringify(details, null, 2)}`,
+        `Delegated batch settled.\n${JSON.stringify(details, null, 2)}`,
         details,
       );
     },

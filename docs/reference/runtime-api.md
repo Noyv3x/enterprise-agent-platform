@@ -118,6 +118,7 @@
 
 - `{run_id,status,created_at,updated_at,session_id,scope_key,result?:RunResult,error?:string}`，除 status 和 result 外都是字符串。
 - `RunResult = {content:string,messages:AgentMessage[],model:{provider:string,id:string},usage?:object,context_usage?:ContextUsage,input_message_ids?:string[],unconsumed_input_message_ids?:string[]}`。
+- `content` 是本 Run 最后一条助手回复的正文；不拼接中间回答，不扣留或恢复 MEDIA 标记。
 - 没有值的可选字段直接省略。持久化的 messages 经过脱敏，不保存实时图片的 base64；恢复时 messages 为空数组，不恢复原消息流。
 
 **ContextUsage**
@@ -184,7 +185,7 @@
 | `input.accepted` / `input.injected` | `message_id,state:"accepted"` / `message_id,state:"injected",...T` |
 | `input.unconsumed` | `message_id,state:"unconsumed",reason` |
 | `delegation.started` | `child_run_id,depth:number` |
-| `delegation.completed` | `child_run_id,content,side_effects_started:boolean,changed_files:string[],unknown_change:boolean` |
+| `delegation.completed` | `child_run_id,content,side_effects_started:boolean` |
 | `delegation.failed` | `child_run_id,status,error,side_effects_started:boolean` |
 | `context.compacted` / `session.repaired` | `omitted_messages:number,retained_messages:number` / `interrupted_tool_messages:number` |
 | `run.idle_timeout` | `timeout_ms:number,idle_ms:number,last_activity:string,last_activity_at:string` |
@@ -197,7 +198,7 @@
 - `run.completed | run.failed | run.cancelled | run.needs_review` 的 data 包含 `status,input_message_ids:string[],unconsumed_input_message_ids:string[],error?:string`。
 - 有结果时再加 `output:string,content:string,session_id:string,model:{provider:string,id:string},usage:object,context_usage?:ContextUsage`，其中 output 和 content 相同。没有结果时省略这些字段；恢复时另加 `reused:true`。
 - needs_review 的正文只是真实的、有上限的阶段诊断，error 单独给出阻塞原因；在 Python 中是 `AgentRuntimeRunError.partial_content`。幂等重放后仍然不是成功。非成功的 Run 中的 MEDIA 不解析、不复制、不发布为附件。
-- 成功的 output 只在内部复验清除相关变更之后，才保留中间回复里规范的 MEDIA 标记，而且仍然需要 Platform 授权。
+- 成功的 output 直接保留最终助手回复；其中的 MEDIA 标记仍须经 Platform 授权，不执行 Runtime 的中间回复标记恢复。
 - [模型重试](../design/agent-runtime.md#run-状态机)只针对还没有可见增量的请求，不新增 Run、会话或工具记录；Platform 不根据错误文字重新提交 Run。
 
 ### 文件草稿
@@ -212,9 +213,9 @@
 
 **delegate_task 的结果**
 
-- 单个任务实时返回 `{child_run_id,status:"completed",content,side_effects_started:boolean,changed_files:string[],unknown_change:boolean}`。
-- 批量返回 `{results:[{index:number,...成功证据}|{index:number,status:"failed",error:string}]}`，按输入顺序排列。
-- 证据由 Runtime 生成，不从模型参数或文字解析；父 Run 的[复验](../design/agent-runtime.md#委派)不能被子 Run 的成功自述代替。
+- 单个任务实时返回 `{child_run_id,status:"completed",content,side_effects_started:boolean}`。
+- 批量返回 `{results:[{index:number,...成功结果}|{index:number,status:"failed",error:string}]}`，按输入顺序排列。
+- 副作用标记由 Runtime 生成并传播到父 Run，失败或取消后的不确定结果仍须人工确认；成功委派不触发额外复验守卫。
 
 ## 审批与执行审计
 

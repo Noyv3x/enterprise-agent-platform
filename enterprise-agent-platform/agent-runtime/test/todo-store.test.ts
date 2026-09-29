@@ -46,15 +46,16 @@ test("Runtime todo sidecar ignores caller history and persists a complete isolat
     );
 
     const activeId = replaced.todos[1]!.id;
-    const merged = await store.todoState(identity).merge([
-      { id: activeId, status: "completed" },
+    const updated = await store.todoState(identity).replace([
+      { id: activeId, content: "Implement the bounded change", status: "completed" },
       { content: "Run targeted tests" },
     ]);
-    assert.equal(merged.todos.length, 3);
-    assert.equal(merged.todos[1]!.id, activeId, "updates must preserve stable Runtime ids");
-    assert.equal(merged.todos[1]!.status, "completed");
-    assert.equal(merged.todos[2]!.status, "pending");
-    assert.deepEqual((await new SessionStore(home).todoState(identity).read()).todos, merged.todos);
+    assert.equal(updated.todos.length, 2, "replacement removes omitted items");
+    assert.equal(updated.todos[0]!.id, activeId);
+    assert.equal(updated.todos[0]!.created_at, replaced.todos[1]!.created_at);
+    assert.equal(updated.todos[0]!.status, "completed");
+    assert.equal(updated.todos[1]!.status, "pending");
+    assert.deepEqual((await new SessionStore(home).todoState(identity).read()).todos, updated.todos);
 
     const sibling = { ...identity, session_id: "session-b" };
     assert.deepEqual((await store.todoState(sibling).read()).todos, []);
@@ -68,7 +69,7 @@ test("Runtime todo mutations are bounded, serialized, and preserve the last vali
   try {
     const store = new SessionStore(home);
     const identity = { scope_key: "private:2", lifecycle_id: "life", session_id: "session" };
-    const initial = await store.todoState(identity).replace([{ content: "Initial task" }]);
+    await store.todoState(identity).replace([{ content: "Initial task" }]);
     const before = await readFile(store.todoPath(identity), "utf8");
 
     await assert.rejects(
@@ -79,33 +80,29 @@ test("Runtime todo mutations are bounded, serialized, and preserve the last vali
       /256-item limit/,
     );
     await assert.rejects(
-      store.todoState(identity).merge([{ content: "x".repeat(MAX_TODO_CONTENT_CHARACTERS + 1) }]),
+      store.todoState(identity).replace([{ content: "x".repeat(MAX_TODO_CONTENT_CHARACTERS + 1) }]),
       /4000 characters/,
     );
     await assert.rejects(
-      store.todoState(identity).merge([{ id: "todo_00000000000000000000000000000000", status: "completed" }]),
+      store.todoState(identity).replace([{ id: "todo_00000000000000000000000000000000", content: "Unknown", status: "completed" }]),
       /unknown todo id/,
     );
     assert.equal(await readFile(store.todoPath(identity), "utf8"), before);
 
     await Promise.all([
-      store.todoState(identity).merge([{ content: "Concurrent A" }]),
-      store.todoState(identity).merge([{ content: "Concurrent B" }]),
+      store.todoState(identity).replace([{ content: "Concurrent A" }]),
+      store.todoState(identity).replace([{ content: "Concurrent B" }]),
     ]);
     const after = await store.todoState(identity).read();
-    assert.equal(after.todos.length, 3);
-    assert.equal(after.todos[0]!.id, initial.todos[0]!.id);
-    assert.deepEqual(new Set(after.todos.map((todo) => todo.content)), new Set([
-      "Initial task",
-      "Concurrent A",
-      "Concurrent B",
-    ]));
+    assert.deepEqual(after.todos.map((todo) => todo.content), ["Concurrent B"]);
+    await store.todoState(identity).replace([]);
+    assert.deepEqual((await store.todoState(identity).read()).todos, []);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
 });
 
-test("Runtime todo sidecar rejects identity drift, unknown fields, links, and broad permissions", async () => {
+test("Runtime todo sidecar preserves legacy fields but rejects identity drift, links, and broad permissions", async () => {
   const home = await temporaryDirectory("agent-todo-integrity-");
   try {
     const store = new SessionStore(home);
@@ -121,7 +118,7 @@ test("Runtime todo sidecar rejects identity drift, unknown fields, links, and br
     mismatched.scope_key = identity.scope_key;
     mismatched.unknown = true;
     await writeFile(path, `${JSON.stringify(mismatched)}\n`, { mode: 0o600 });
-    await assert.rejects(store.todoState(identity).read(), /unknown or missing fields/);
+    assert.equal((await store.todoState(identity).read()).todos[0]!.content, "Protected state");
 
     delete mismatched.unknown;
     await writeFile(path, `${JSON.stringify(mismatched)}\n`, { mode: 0o666 });
@@ -133,6 +130,25 @@ test("Runtime todo sidecar rejects identity drift, unknown fields, links, and br
     await writeFile(target, `${JSON.stringify(mismatched)}\n`, { mode: 0o600 });
     await symlink(target, path);
     await assert.rejects(store.todoState(identity).read(), /symbolic link/);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("malformed legacy todo data is ignored without rewriting it and can be replaced", async () => {
+  const home = await temporaryDirectory("agent-todo-legacy-");
+  try {
+    const store = new SessionStore(home);
+    const identity = { scope_key: "private:legacy", lifecycle_id: "life", session_id: "session" };
+    const state = await store.todoState(identity).replace([{ content: "Old task" }]);
+    const path = store.todoPath(identity);
+    for (const raw of ["{broken", JSON.stringify({ ...state, todos: [{ content: "Missing id" }] })]) {
+      await writeFile(path, raw);
+      assert.deepEqual((await store.todoState(identity).read()).todos, []);
+      assert.equal(await readFile(path, "utf8"), raw);
+    }
+    await store.todoState(identity).replace([{ content: "New task" }]);
+    assert.deepEqual((await store.loadActiveTodos(identity)).map(({ content }) => content), ["New task"]);
   } finally {
     await rm(home, { recursive: true, force: true });
   }
@@ -160,7 +176,7 @@ test("session and scope deletion remove the todo sidecar with the journal", asyn
   }
 });
 
-test("todo tool has closed read/replace/merge schemas, returns the full list, and stays out of learning review", async () => {
+test("todo tool replaces the full list with closed arguments and stays out of learning review", async () => {
   const home = await temporaryDirectory("agent-todo-tool-");
   try {
     const store = new SessionStore(home);
@@ -176,26 +192,12 @@ test("todo tool has closed read/replace/merge schemas, returns the full list, an
     };
     const todo = createTools(baseContext).find((tool) => tool.name === "todo");
     assert.ok(todo);
-    assert.match(todo.description, /at least three distinct, independently trackable steps/);
-    assert.match(todo.description, /multiple separately completable tasks/);
-    assert.match(todo.description, /single read\/query\/command or small single-file change when that is the whole request/);
-    assert.match(todo.description, /routine inspection, one small change, and its focused verification are one linear task/);
-    assert.match(todo.description, /keep only one item in_progress/);
-    assert.match(todo.description, /completed immediately after it is actually finished and appropriately verified/);
-    assert.match(todo.description, /not a scheduled-task tool, process watcher, or durable memory store/);
-    assert.match(todo.description, /process\.wait/);
-
-    assert.doesNotThrow(() => validateToolArguments(todo, fauxToolCall("todo", { action: "read" })));
-    assert.doesNotThrow(() => validateToolArguments(todo, fauxToolCall("todo", {
-      action: "replace",
-      todos: [{ content: "Do the work", status: "in_progress" }],
-    })));
     assert.throws(
       () => validateToolArguments(todo, fauxToolCall("todo", { action: "read", owner: "forged" })),
       /additional properties/,
     );
     assert.throws(
-      () => validateToolArguments(todo, fauxToolCall("todo", { action: "append", todos: [] })),
+      () => validateToolArguments(todo, fauxToolCall("todo", { action: "merge", todos: [] })),
       /must match a schema in anyOf/,
     );
 
@@ -205,14 +207,14 @@ test("todo tool has closed read/replace/merge schemas, returns the full list, an
     } as never, undefined);
     const firstText = replaced.content.find((block) => block.type === "text")?.text ?? "";
     const firstId = (JSON.parse(firstText) as { todos: Array<{ id: string }> }).todos[0]!.id;
-    const merged = await todo.execute("merge", {
-      action: "merge",
+    const updated = await todo.execute("replace", {
+      action: "replace",
       todos: [
-        { id: firstId, status: "completed" },
+        { id: firstId, content: "Do the work", status: "completed" },
         { content: "Verify the result" },
       ],
     } as never, undefined);
-    const full = JSON.parse(merged.content.find((block) => block.type === "text")?.text ?? "") as {
+    const full = JSON.parse(updated.content.find((block) => block.type === "text")?.text ?? "") as {
       todos: Array<{ content: string; status: string }>;
     };
     assert.deepEqual(full.todos.map(({ content, status }) => ({ content, status })), [

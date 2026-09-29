@@ -39,10 +39,6 @@ export interface TodoReplacement {
   status?: TodoStatus;
 }
 
-export type TodoMerge =
-  | { content: string; status?: TodoStatus }
-  | { id: string; content?: string; status?: TodoStatus };
-
 /**
  * A session-bound view of the Runtime-owned todo sidecar. The identity is
  * captured outside model-visible arguments and revalidated on every read.
@@ -50,11 +46,8 @@ export type TodoMerge =
 export interface TodoSessionState {
   read(): Promise<TodoStateSnapshot>;
   replace(todos: readonly TodoReplacement[]): Promise<TodoStateSnapshot>;
-  merge(todos: readonly TodoMerge[]): Promise<TodoStateSnapshot>;
   active(): Promise<TodoItem[]>;
 }
-
-type TodoStateDocument = TodoStateSnapshot;
 
 /**
  * Atomic, owner-only storage for one structured todo sidecar per Runtime
@@ -70,7 +63,6 @@ export class TodoStore {
     return {
       read: async () => await this.read(captured),
       replace: async (todos) => await this.replace(captured, todos),
-      merge: async (todos) => await this.merge(captured, todos),
       active: async () => await this.active(captured),
     };
   }
@@ -82,9 +74,7 @@ export class TodoStore {
 
   async active(identity: SessionIdentity): Promise<TodoItem[]> {
     const state = await this.read(identity);
-    return state.todos
-      .filter((todo) => todo.status === "pending" || todo.status === "in_progress")
-      .map((todo) => ({ ...todo }));
+    return state.todos.filter((todo) => todo.status === "pending" || todo.status === "in_progress");
   }
 
   async replace(
@@ -113,7 +103,7 @@ export class TodoStore {
         }
         const status = replacement.status ?? "pending";
         if (previous && previous.content === replacement.content && previous.status === status) {
-          return { ...previous };
+          return previous;
         }
         return {
           id: todoId,
@@ -125,60 +115,7 @@ export class TodoStore {
       });
       const state = document(identity, next, timestamp);
       await this.writeUnlocked(file, state);
-      return cloneState(state);
-    });
-  }
-
-  async merge(identity: SessionIdentity, patches: readonly TodoMerge[]): Promise<TodoStateSnapshot> {
-    const file = this.pathForIdentity(identity);
-    return await this.withQueue(file, async () => {
-      if (patches.length === 0) throw new Error("Todo merge requires at least one item");
-      if (patches.length > MAX_TODO_ITEMS) {
-        throw new Error(`Todo merge exceeds the ${MAX_TODO_ITEMS}-item operation limit`);
-      }
-      const current = await this.readUnlocked(file, identity);
-      const todos = current.todos.map((todo) => ({ ...todo }));
-      const indexes = new Map(todos.map((todo, index) => [todo.id, index]));
-      const patched = new Set<string>();
-      const timestamp = nowIso();
-      for (const patch of patches) {
-        if ("id" in patch) {
-          validateTodoId(patch.id);
-          if (patched.has(patch.id)) throw new Error(`Duplicate todo id: ${patch.id}`);
-          patched.add(patch.id);
-          const index = indexes.get(patch.id);
-          if (index === undefined) throw new Error(`Cannot merge unknown todo id: ${patch.id}`);
-          if (patch.content === undefined && patch.status === undefined) {
-            throw new Error(`Todo merge ${patch.id} must change content or status`);
-          }
-          const previous = todos[index]!;
-          const content = patch.content ?? previous.content;
-          const status = patch.status ?? previous.status;
-          validateContent(content);
-          validateStatus(status);
-          todos[index] = previous.content === content && previous.status === status
-            ? previous
-            : { ...previous, content, status, updated_at: timestamp };
-          continue;
-        }
-        validateContent(patch.content);
-        validateStatus(patch.status ?? "pending");
-        if (todos.length >= MAX_TODO_ITEMS) {
-          throw new Error(`Todo list exceeds the ${MAX_TODO_ITEMS}-item limit`);
-        }
-        const todoId = id("todo");
-        todos.push({
-          id: todoId,
-          content: patch.content,
-          status: patch.status ?? "pending",
-          created_at: timestamp,
-          updated_at: timestamp,
-        });
-        indexes.set(todoId, todos.length - 1);
-      }
-      const state = document(identity, todos, timestamp);
-      await this.writeUnlocked(file, state);
-      return cloneState(state);
+      return state;
     });
   }
 
@@ -194,7 +131,7 @@ export class TodoStore {
     });
   }
 
-  private async readUnlocked(file: string, identity: SessionIdentity): Promise<TodoStateDocument> {
+  private async readUnlocked(file: string, identity: SessionIdentity): Promise<TodoStateSnapshot> {
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -213,9 +150,21 @@ export class TodoStore {
       try {
         parsed = JSON.parse(raw);
       } catch {
-        throw new Error("Agent todo state contains invalid JSON");
+        return document(identity, [], nowIso());
       }
-      return validateDocument(parsed, identity);
+      if (parsed && typeof parsed === "object") {
+        for (const key of ["scope_key", "lifecycle_id", "session_id"] as const) {
+          if (key in parsed && (parsed as Record<string, unknown>)[key] !== identity[key]) {
+            throw new Error(`Agent todo state ${key} does not match its session`);
+          }
+        }
+      }
+      try {
+        return validateDocument(parsed, identity);
+      } catch {
+        // Todo data is advisory: malformed legacy state must not block a run.
+        return document(identity, [], nowIso());
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return document(identity, [], nowIso());
       if ((error as NodeJS.ErrnoException).code === "ELOOP") {
@@ -227,7 +176,7 @@ export class TodoStore {
     }
   }
 
-  private async writeUnlocked(file: string, state: TodoStateDocument): Promise<void> {
+  private async writeUnlocked(file: string, state: TodoStateSnapshot): Promise<void> {
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
     const temporary = `${file}.${id("state")}.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -266,28 +215,17 @@ function document(
   identity: SessionIdentity,
   todos: TodoItem[],
   updatedAt: string,
-): TodoStateDocument {
+): TodoStateSnapshot {
   return {
     schema_version: TODO_STATE_SCHEMA_VERSION,
     ...identity,
-    todos: todos.map((todo) => ({ ...todo })),
+    todos,
     updated_at: updatedAt,
   };
 }
 
-function cloneState(state: TodoStateDocument): TodoStateSnapshot {
-  return document(state, state.todos, state.updated_at);
-}
-
-function validateDocument(value: unknown, identity: SessionIdentity): TodoStateDocument {
-  const source = exactObject(value, [
-    "schema_version",
-    "scope_key",
-    "lifecycle_id",
-    "session_id",
-    "todos",
-    "updated_at",
-  ], "Agent todo state");
+function validateDocument(value: unknown, identity: SessionIdentity): TodoStateSnapshot {
+  const source = object(value, "Agent todo state");
   if (source.schema_version !== TODO_STATE_SCHEMA_VERSION) {
     throw new Error("Agent todo state schema version is unsupported");
   }
@@ -301,11 +239,7 @@ function validateDocument(value: unknown, identity: SessionIdentity): TodoStateD
   }
   const seen = new Set<string>();
   const todos = source.todos.map((value, index): TodoItem => {
-    const todo = exactObject(
-      value,
-      ["id", "content", "status", "created_at", "updated_at"],
-      `Agent todo state item ${index}`,
-    );
+    const todo = object(value, `Agent todo state item ${index}`);
     validateTodoId(todo.id);
     validateContent(todo.content);
     validateStatus(todo.status);
@@ -324,17 +258,11 @@ function validateDocument(value: unknown, identity: SessionIdentity): TodoStateD
   return document(identity, todos, source.updated_at);
 }
 
-function exactObject(value: unknown, keys: readonly string[], label: string): Record<string, unknown> {
+function object(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`${label} must be an object`);
   }
-  const source = value as Record<string, unknown>;
-  const actual = Object.keys(source).sort();
-  const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
-    throw new Error(`${label} has unknown or missing fields`);
-  }
-  return source;
+  return value as Record<string, unknown>;
 }
 
 function validateTodoId(value: unknown): asserts value is string {

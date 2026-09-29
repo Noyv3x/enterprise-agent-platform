@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import test from "node:test";
 import type { Context } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
@@ -141,7 +141,13 @@ test("a delegated child can complete when top-level concurrency is one", async (
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "child task" }), { stopReason: "toolUse" }),
     fauxAssistantMessage("child complete"),
-    fauxAssistantMessage("parent complete"),
+    (context) => {
+      const result = context.messages.find((message) => message.role === "toolResult" && message.toolName === "delegate_task");
+      assert.ok(result && result.role === "toolResult");
+      assert.equal(result.isError, false);
+      assert.match(result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"), /child complete/);
+      return fauxAssistantMessage("parent complete");
+    },
   ]);
   const coordinator = new RunCoordinator({
     config: testConfig(home, { maxConcurrency: 1 }),
@@ -237,194 +243,28 @@ test("a delegated child that needs review forces the parent to needs_review", as
   }
 });
 
-test("a child write cannot be accepted until the parent performs focused verification", async () => {
-  const home = await temporaryDirectory("agent-delegation-parent-verify-");
-  const workspace = await temporaryDirectory("agent-delegation-parent-verify-workspace-");
+test("a successful delegated write completes without an extra parent verification turn", async () => {
+  const home = await temporaryDirectory("agent-delegation-write-");
+  const workspace = await temporaryDirectory("agent-delegation-write-workspace-");
   const faux = fauxProvider();
   faux.setResponses([
     fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "write child.txt" }), { stopReason: "toolUse" }),
     fauxAssistantMessage(fauxToolCall("write_file", { path: "child.txt", content: "child\n" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "child.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("child done"),
-    fauxAssistantMessage("parent done without checking"),
-    (context) => {
-      assert.match(lastUserText(context), /delegated Agent started side effects/i);
-      return fauxAssistantMessage(fauxToolCall("read_file", { path: "child.txt" }), { stopReason: "toolUse" });
-    },
-    fauxAssistantMessage("parent verified child.txt"),
+    fauxAssistantMessage("child wrote child.txt"),
+    fauxAssistantMessage("parent accepted child result"),
   ]);
   const coordinator = new RunCoordinator({
     config: testConfig(home, { maxConcurrency: 1 }),
     streamFn: faux.provider.streamSimple,
   });
   try {
-    const parent = coordinator.createRun(request(workspace, "verify delegated write"));
+    const parent = coordinator.createRun(request(workspace, "delegate a file write"));
     const completed = await withDeadline(coordinator.wait(parent.id));
     assert.equal(completed.status, "completed", completed.error);
-    assert.equal(completed.result?.content, "parent done without checking\n\nparent verified child.txt");
+    assert.equal(completed.result?.content, "parent accepted child result");
+    assert.equal(completed.sideEffectsStarted, true);
     assert.equal(await readFile(`${workspace}/child.txt`, "utf8"), "child\n");
-    assert.equal(faux.state.callCount, 7);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("a parent that repeatedly skips delegated side-effect verification enters needs_review", async () => {
-  const home = await temporaryDirectory("agent-delegation-unverified-");
-  const workspace = await temporaryDirectory("agent-delegation-unverified-workspace-");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "write child.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("write_file", { path: "child.txt", content: "child\n" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "child.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("child done"),
-    fauxAssistantMessage("parent skipped verification one"),
-    fauxAssistantMessage("parent skipped verification two"),
-    fauxAssistantMessage("parent skipped verification three"),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
-    streamFn: faux.provider.streamSimple,
-  });
-  try {
-    const parent = coordinator.createRun(request(workspace, "reject unverified delegated write"));
-    const completed = await withDeadline(coordinator.wait(parent.id));
-    assert.equal(completed.status, "needs_review");
-    assert.match(completed.error || "", /delegated Agent started side effects/i);
-    assert.ok(faux.state.callCount >= 7);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("a child with unlocatable side effects is accepted after the parent inspects its reported result", async () => {
-  const home = await temporaryDirectory("agent-delegation-unknown-verify-");
-  const workspace = await temporaryDirectory("agent-delegation-unknown-verify-workspace-");
-  await writeFile(`${workspace}/report.txt`, "report\n");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "analyse the project" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("terminal", { command: "printf analysed" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("child analysed the project"),
-    fauxAssistantMessage("The full analysis is in report.txt.\nMEDIA: /workspace/report.txt"),
-    (context) => {
-      assert.match(lastUserText(context), /delegated Agent started side effects/i);
-      return fauxAssistantMessage(fauxToolCall("terminal", { command: "test -s report.txt" }), { stopReason: "toolUse" });
-    },
-    fauxAssistantMessage("Confirmed report.txt is non-empty."),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
-    streamFn: faux.provider.streamSimple,
-  });
-  try {
-    const parent = coordinator.createRun(request(workspace, "verify unlocatable delegated change"));
-    const completed = await withDeadline(coordinator.wait(parent.id));
-    assert.equal(completed.status, "completed", completed.error);
-    assert.equal(
-      completed.result?.content,
-      "The full analysis is in report.txt.\n\nConfirmed report.txt is non-empty.\n\nMEDIA: /workspace/report.txt",
-    );
-    assert.equal(faux.state.callCount, 6);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("a reported child file still requires a parent check of that file", async () => {
-  const home = await temporaryDirectory("agent-delegation-known-path-");
-  const workspace = await temporaryDirectory("agent-delegation-known-path-workspace-");
-  await writeFile(`${workspace}/other.txt`, "other\n");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "write child.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("write_file", { path: "child.txt", content: "child\n" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "child.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("child done"),
-    fauxAssistantMessage("parent done"),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "other.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("parent checked another file"),
-    fauxAssistantMessage("parent still did not check child.txt"),
-    fauxAssistantMessage("parent final reply"),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
-    streamFn: faux.provider.streamSimple,
-  });
-  try {
-    const parent = coordinator.createRun(request(workspace, "reject unrelated delegated check"));
-    const completed = await withDeadline(coordinator.wait(parent.id));
-    assert.equal(completed.status, "needs_review");
-    assert.match(completed.error || "", /delegated Agent started side effects/i);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("a read-only child does not impose a parent verification turn", async () => {
-  const home = await temporaryDirectory("agent-delegation-readonly-");
-  const workspace = await temporaryDirectory("agent-delegation-readonly-workspace-");
-  await writeFile(`${workspace}/source.txt`, "source\n");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("delegate_task", { prompt: "inspect source.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "source.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("child read it"),
-    fauxAssistantMessage("parent accepted read-only report"),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1 }),
-    streamFn: faux.provider.streamSimple,
-  });
-  try {
-    const parent = coordinator.createRun(request(workspace, "delegate readonly"));
-    const completed = await withDeadline(coordinator.wait(parent.id));
-    assert.equal(completed.status, "completed", completed.error);
     assert.equal(faux.state.callCount, 4);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
-test("batch delegation requires one parent verification when any child has side effects", async () => {
-  const home = await temporaryDirectory("agent-delegation-batch-verify-");
-  const workspace = await temporaryDirectory("agent-delegation-batch-verify-workspace-");
-  await writeFile(`${workspace}/source.txt`, "source\n");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("delegate_task", {
-      tasks: [{ prompt: "read source.txt" }, { prompt: "write batch.txt" }],
-    }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "source.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage(fauxToolCall("write_file", { path: "batch.txt", content: "batch\n" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("read child done"),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "batch.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("write child done"),
-    fauxAssistantMessage("parent tried direct final"),
-    fauxAssistantMessage(fauxToolCall("read_file", { path: "batch.txt" }), { stopReason: "toolUse" }),
-    fauxAssistantMessage("parent verified batch"),
-  ]);
-  const coordinator = new RunCoordinator({
-    config: testConfig(home, { maxConcurrency: 1, maxDelegatesPerRun: 2 }),
-    streamFn: faux.provider.streamSimple,
-  });
-  try {
-    const parent = coordinator.createRun(request(workspace, "delegate mixed batch"));
-    const completed = await withDeadline(coordinator.wait(parent.id));
-    assert.equal(completed.status, "completed", completed.error);
-    // Concurrent children draw from one scripted queue, so whether the parent
-    // produced an interim reply first depends on scheduling.
-    assert.match(completed.result?.content || "", /(?:^|\n\n)parent verified batch$/);
   } finally {
     coordinator.shutdown();
     await rm(home, { recursive: true, force: true });

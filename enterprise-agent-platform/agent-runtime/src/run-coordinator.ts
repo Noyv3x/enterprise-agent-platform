@@ -9,13 +9,9 @@ import {
 } from "@earendil-works/pi-agent-core";
 import {
   normalizeContext,
-  type Api,
   type AssistantMessage,
   type ImageContent,
-  type Model,
   type TextContent,
-  type ToolCall,
-  type ToolResultMessage,
   type UserMessage,
   type JsonValue as PiJsonValue,
 } from "@earendil-works/pi-ai";
@@ -88,9 +84,7 @@ import {
   assembleSystemPrompt,
   buildSystemPromptParts,
 } from "./system-prompt/prompt-assembly.js";
-import { withCodexPromptCacheKey } from "./system-prompt/prompt-cache-key.js";
 import { frameUntrustedText, untrustedImageNotice } from "./untrusted-content.js";
-import type { TodoItem } from "./todo-store.js";
 import {
   abortError,
   assertNonEmpty,
@@ -207,7 +201,6 @@ export class RunCoordinator {
   /** Total child creations are charged to the trusted in-memory root Run. */
   private readonly delegateCounts = new Map<string, number>();
   private readonly activeDelegateRuns = new Set<string>();
-  private readonly delegationResults = new Map<string, DelegationResult>();
   private readonly idempotencyIndex = new Map<string, string>();
   private readonly topLevelQueue: string[] = [];
   private readonly activeTopLevelRuns = new Set<string>();
@@ -958,9 +951,6 @@ export class RunCoordinator {
     record.controller.signal.addEventListener("abort", abortRun, { once: true });
     if (record.controller.signal.aborted) abortRun();
     const currentRunBackgroundTaskIds = new Set<string>();
-    // Todo revisions visible when this Run started. Items still carrying the
-    // same revision were left by an earlier Run and are not this Run's duty.
-    let todoRevisionsAtStart: ReadonlyMap<string, string> = new Map();
     let completionGuardPreservedProcessIds: string[] = [];
     const executionTask = (async () => {
       this.touchRunActivity(record.id, "recalling memory");
@@ -973,7 +963,6 @@ export class RunCoordinator {
         normalizeInitialHistory(record.request.history ?? [], record.request, resolved.model.api, resolved.model.provider),
       );
       const activeTodosAtStart = learningReview ? [] : await this.sessions.loadActiveTodos(identity);
-      todoRevisionsAtStart = new Map(activeTodosAtStart.map((todo) => [todo.id, todoRevision(todo)]));
       const backgroundTaskState = this.sessions.backgroundTaskState(identity);
       let activeBackgroundTasksAtStart: BackgroundTaskObligation[] = [];
       if (!learningReview) {
@@ -1066,7 +1055,6 @@ export class RunCoordinator {
         ),
         markSideEffect: () => {
           record.sideEffectsStarted = true;
-          executionReview.sideEffectMarks += 1;
         },
         delegate: async (prompt, signal, role) => await this.delegate(
           record,
@@ -1175,15 +1163,7 @@ export class RunCoordinator {
             );
           }
           try {
-            const sideEffectMarksBefore = executionReview.sideEffectMarks;
             const result = await tool.execute(toolCallId, executionParams, signal, onUpdate);
-            if (executionReview.sideEffectMarks > sideEffectMarksBefore) {
-              recordDelegationSideEffect(
-                executionReview,
-                tool.name,
-                recordValue(executionParams),
-              );
-            }
             if (
               tool.name === "schedule"
               && isRecurringScheduledRun(record.request.metadata)
@@ -1286,14 +1266,6 @@ export class RunCoordinator {
         },
         sessionId: record.request.session_id,
         getApiKey: resolved.getApiKey,
-        ...(codexOAuthProvider ? {
-          onPayload: (payload: unknown, model: Model<Api>) => withCodexPromptCacheKey(
-            payload,
-            model,
-            systemPromptParts.stable,
-            record.request.scope_key,
-          ),
-        } : {}),
         // Pi's default execution policy respects each tool's executionMode:
         // batches containing a sequential tool remain ordered, while pure
         // parallel/read-only batches can overlap. Approval preflight remains
@@ -1306,12 +1278,6 @@ export class RunCoordinator {
         // itself satisfies. Error and aborted turns stay hard exits.
         finishTurn: async (turn) => {
           if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return undefined;
-          const followUp = executionReviewFollowUp(executionReview, turn.message, turn.toolResults);
-          if (followUp) {
-            ephemeralMessages.add(followUp);
-            agent?.followUp(followUp);
-            return { action: "continue" };
-          }
           if (
             isRecurringScheduledRun(record.request.metadata)
             && !executionReview.scheduleDecision
@@ -1323,16 +1289,6 @@ export class RunCoordinator {
             ephemeralMessages.add(decisionFollowUp);
             agent?.followUp(decisionFollowUp);
             return { action: "continue" };
-          }
-          if (!learningReview && executionReview.todoContinuations < MAX_TODO_CONTINUATIONS) {
-            const activeTodos = todosOwnedByRun(await this.sessions.loadActiveTodos(identity), todoRevisionsAtStart);
-            if (activeTodos.length > 0 && turn.message.content.every((block) => block.type !== "toolCall")) {
-              executionReview.todoContinuations += 1;
-              const todoFollowUp = runtimeReviewMessage(activeTodoContinuation(activeTodos));
-              ephemeralMessages.add(todoFollowUp);
-              agent?.followUp(todoFollowUp);
-              return { action: "continue" };
-            }
           }
           if (
             !learningReview
@@ -1692,7 +1648,6 @@ export class RunCoordinator {
           record,
           event,
           sessionEntryIds,
-          executionReview,
           ephemeralMessages,
           approvedToolCalls,
           startedToolCalls,
@@ -1719,12 +1674,6 @@ export class RunCoordinator {
         record.controller.signal.removeEventListener("abort", onAbort);
       }
       if (record.controller.signal.aborted) throw abortError();
-      if (
-        executionReview.delegatedVerificationRequired
-        && !executionReview.delegatedVerificationSucceeded
-      ) {
-        this.forcedReviewReasons.set(record.id, DELEGATED_SIDE_EFFECT_REVIEW_ERROR);
-      }
       if (isRecurringScheduledRun(record.request.metadata) && !executionReview.scheduleDecision) {
         this.forcedReviewReasons.set(record.id, MISSING_SCHEDULE_DECISION_REVIEW_ERROR);
       }
@@ -1739,12 +1688,6 @@ export class RunCoordinator {
           }
         } catch {
           this.forcedReviewReasons.set(record.id, BACKGROUND_TASK_STATE_REVIEW_ERROR);
-        }
-      }
-      if (!learningReview) {
-        const activeTodos = todosOwnedByRun(await this.sessions.loadActiveTodos(identity), todoRevisionsAtStart);
-        if (activeTodos.length > 0 && !this.forcedReviewReasons.has(record.id)) {
-          this.forcedReviewReasons.set(record.id, ACTIVE_TODO_REVIEW_ERROR);
         }
       }
       const conversation = agent.state.messages.slice(leadingSystemMessageCount(agent.state.messages));
@@ -1763,7 +1706,6 @@ export class RunCoordinator {
           contextUsage,
           history.length,
           ephemeralMessages,
-          executionReview.retainedAnswers,
         );
         if (diagnostic) record.result = diagnostic;
         throw new Error(forcedReviewReason);
@@ -1777,21 +1719,10 @@ export class RunCoordinator {
         history.length,
         ephemeralMessages,
         record.request.workspace,
-        // Markers held back during review return only once every related
-        // change has passed the check that caused the hold.
-        (executionReview.validationContinuationIssued
-          ? executionReview.validationSucceeded
-          : executionReview.delegatedVerificationSucceeded)
-          ? executionReview.preservedMediaMarkers
-          : [],
-        executionReview.retainedAnswers,
       );
       const inputSummary = this.inputSummary(record.id);
       result.input_message_ids = inputSummary.input_message_ids;
       result.unconsumed_input_message_ids = inputSummary.unconsumed_input_message_ids;
-      if (this.childRuns.has(record.id)) {
-        this.delegationResults.set(record.id, delegationResult(record, result.content, executionReview));
-      }
       await this.sessions.appendRun(identity, { run_id: record.id, status: "completed" });
       if (learningReview) await this.sessions.deleteSession(identity);
       record.result = result;
@@ -1829,19 +1760,6 @@ export class RunCoordinator {
           }
         } catch {
           this.forcedReviewReasons.set(record.id, BACKGROUND_TASK_STATE_REVIEW_ERROR);
-        }
-      }
-      if (
-        cleanupConfirmed
-        && !learningReview
-        && journal.list().some((event) => event.type === "run.turn_limit")
-      ) {
-        const activeTodos = todosOwnedByRun(
-          await this.sessions.loadActiveTodos(identity).catch(() => []),
-          todoRevisionsAtStart,
-        );
-        if (activeTodos.length > 0 && !this.forcedReviewReasons.has(record.id)) {
-          this.forcedReviewReasons.set(record.id, ACTIVE_TODO_REVIEW_ERROR);
         }
       }
       const aborted = record.controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
@@ -1929,7 +1847,6 @@ export class RunCoordinator {
     record: RunRecord,
     event: AgentEvent,
     sessionEntryIds: WeakMap<AgentMessage, string>,
-    executionReview: ExecutionReviewState,
     ephemeralMessages: WeakSet<AgentMessage>,
     approvedToolCalls: Map<string, ApprovedToolCallBinding>,
     startedToolCalls: Set<string>,
@@ -1994,20 +1911,6 @@ export class RunCoordinator {
     }
     if (event.type === "message_end") {
       if (ephemeralMessages.has(event.message)) return;
-      if (event.message.role === "assistant") {
-        const reviewReason = executionReviewReason(executionReview, event.message);
-        if (reviewReason === "validation" || reviewReason === "delegation_validation") {
-          // The interim answer is real user-facing content; only the Runtime
-          // follow-up that asks for verification stays ephemeral.
-          if (reviewReason === "validation") {
-            preserveWorkspaceMediaMarkers(executionReview, event.message);
-          }
-          retainInterimAnswer(executionReview, event.message);
-        } else if (reviewReason !== undefined) {
-          ephemeralMessages.add(event.message);
-          return;
-        }
-      }
       const entryId = await this.sessions.appendMessage(
         sessionIdentity(record.request),
         event.message,
@@ -2355,26 +2258,24 @@ export class RunCoordinator {
         });
         throw new Error(completed.error || `Child run ${completed.status}`);
       }
-      const evidence = this.delegationResults.get(child.id);
-      if (!evidence) {
-        this.forcedReviewReasons.set(parent.id, "A delegated Agent completed without Runtime-owned verification evidence");
-        throw new Error("Delegated Agent result is missing Runtime-owned verification evidence");
-      }
+      const result: DelegationResult = {
+        child_run_id: child.id,
+        status: "completed",
+        content: completed.result.content,
+        side_effects_started: completed.sideEffectsStarted,
+      };
       journal.publish("delegation.completed", {
         child_run_id: child.id,
         content: completed.result.content,
-        side_effects_started: evidence.side_effects_started,
-        changed_files: evidence.changed_files,
-        unknown_change: evidence.unknown_change,
+        side_effects_started: completed.sideEffectsStarted,
       });
       this.touchRunActivity(parent.id, `delegated run completed: ${child.id}`);
-      return structuredClone(evidence);
+      return result;
     } finally {
       // Admission covers active child execution, not bounded post-run cleanup.
       // Release before cleanup so a cancelled child cannot hold a global slot
       // while its isolated scope artifacts are being retired.
       this.activeDelegateRuns.delete(child.id);
-      this.delegationResults.delete(child.id);
       unsubscribeChildJournal?.();
       signal?.removeEventListener("abort", onAbort);
       await this.executor.cancelRun(runExecutionIdentity(child)).catch(() => false);
@@ -2454,7 +2355,6 @@ export class RunCoordinator {
       this.completions.delete(record.id);
       this.delegateCounts.delete(record.id);
       this.activeDelegateRuns.delete(record.id);
-      this.delegationResults.delete(record.id);
       this.childRuns.delete(record.id);
       this.runInputs.delete(record.id);
       this.runAttachmentPaths.delete(record.id);
@@ -3000,36 +2900,12 @@ function canonicalJson(value: unknown): string {
     .join(",")}}`;
 }
 
-const MAX_PROMISE_ONLY_CONTINUATIONS = 1;
-const MAX_EMPTY_AFTER_TOOL_CONTINUATIONS = 1;
 const MAX_SCHEDULE_DECISION_CONTINUATIONS = 2;
-const MAX_TODO_CONTINUATIONS = 3;
 const MAX_BACKGROUND_TASK_CONTINUATIONS = 3;
-const MAX_DELEGATED_VALIDATION_CONTINUATIONS = 2;
-const MAX_PRESERVED_MEDIA_MARKERS = 32;
-const MAX_PRESERVED_MEDIA_MARKER_LENGTH = 4096;
-const PRESERVED_MEDIA_SUFFIX_RE = /\.(?:png|jpe?g|gif|webp|bmp|tiff|svg|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|tsv|json|xml|ya?ml|apk|ipa|html?)$/i;
-const UNSAFE_MEDIA_PATH_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
-const PROMISE_ONLY_CONTINUATION = "Do not stop at a promise or progress statement. If the request requires action and "
-  + "a suitable tool is available, perform the next concrete step now. If action is genuinely unnecessary or "
-  + "impossible, give a self-contained final answer explaining that instead. Respect every permission, approval, and "
-  + "safety policy.";
-const EMPTY_AFTER_TOOL_CONTINUATION = "You already have tool results from this Run, but your last response contained "
-  + "no visible answer. Use the existing tool evidence to give a self-contained result now, or state the concrete "
-  + "blocker if the task cannot continue. Do not repeat a completed tool call merely to recover the response.";
-const RETAINED_ANSWER_NOTICE = " Your previous reply has been kept and will be shown to the user before your next "
-  + "reply, so do not repeat it; after verifying, report only the outcome and any correction.";
-const FILE_VALIDATION_CONTINUATION = "Code or files changed, but the active run contains no focused post-change check. "
-  + "Perform one bounded verification now, such as reading the changed area or running the narrowest "
-  + "relevant check or test. If verification cannot be run, state the concrete reason and do not claim success. Respect "
-  + "every permission, approval, and safety policy." + RETAINED_ANSWER_NOTICE;
-const ACTIVE_TODO_REVIEW_ERROR = "Agent run stopped with unfinished Runtime todo items; review is required before resuming";
 const REVIEW_DIAGNOSTIC_MAX_CHARS = 24_000;
 const ACTIVE_BACKGROUND_TASK_REVIEW_ERROR = "Agent run stopped before observing a required background task reach a terminal state; review is required before resuming";
 const BACKGROUND_TASK_STATE_REVIEW_ERROR = "Runtime could not safely verify finite background task state; review is required before resuming";
 const DELEGATED_BACKGROUND_PROCESS_BLOCK = "Delegated Agents cannot start background processes; run the command in the foreground and wait for it to finish";
-const DELEGATED_SIDE_EFFECT_REVIEW_ERROR = "A delegated Agent started side effects, but the parent did not complete a successful focused verification; review is required";
-const DELEGATED_SIDE_EFFECT_CONTINUATION = "A delegated Agent started side effects. Its report is unverified. Before finishing, perform one successful, non-delegate focused verification with a tool. Read or search a reported changed file or run a command that checks that path; when the child reported no specific changed file, read, search, or inspect the result it reported, or run a comprehensive check. A written claim of verification does not count." + RETAINED_ANSWER_NOTICE;
 const ACTIVE_BACKGROUND_TASK_SCHEDULE_BLOCK = "Cannot create a schedule while this session has an active finite background task; use process.wait instead";
 const MISSING_SCHEDULE_DECISION_REVIEW_ERROR = "Recurring scheduled run stopped without a successful continue_current or complete_current decision; review is required and the schedule must be paused";
 const SCHEDULE_DECISION_CONTINUATION = "Before this recurring scheduled occurrence can finish, call schedule with exactly "
@@ -3038,62 +2914,21 @@ const SCHEDULE_DECISION_CONTINUATION = "Before this recurring scheduled occurren
   + "status statement, or schedule id does not count.";
 
 interface ExecutionReviewState {
-  promiseOnlyContinuations: number;
-  emptyAfterToolContinuations: number;
-  observedToolResult: boolean;
   scheduleDecisionContinuations: number;
   scheduleDecision?: "continue_current" | "complete_current";
-  todoContinuations: number;
   backgroundTaskContinuations: number;
   activeBackgroundTasks: Map<string, ExecutionTarget>;
-  sideEffectMarks: number;
-  delegationChangedFilesEver: Set<string>;
-  delegationUnknownChangeEver: boolean;
-  delegatedChangedFiles: Set<string>;
-  delegatedUnknownChange: boolean;
-  delegatedVerificationRequired: boolean;
-  delegatedVerificationSucceeded: boolean;
-  delegatedValidationContinuations: number;
-  validationContinuationIssued: boolean;
-  validationSucceeded: boolean;
-  changedFiles: Set<string>;
-  unknownFileChange: boolean;
-  preservedMediaMarkers: string[];
-  retainedAnswers: RetainedAnswer[];
-}
-
-interface RetainedAnswer {
-  message: AssistantMessage;
-  text: string;
 }
 
 function createExecutionReviewState(
   activeBackgroundTasks: readonly BackgroundTaskObligation[] = [],
 ): ExecutionReviewState {
   return {
-    promiseOnlyContinuations: 0,
-    emptyAfterToolContinuations: 0,
-    observedToolResult: false,
     scheduleDecisionContinuations: 0,
-    todoContinuations: 0,
     backgroundTaskContinuations: 0,
     activeBackgroundTasks: new Map(
       activeBackgroundTasks.map((task) => [task.process_id, task.target]),
     ),
-    sideEffectMarks: 0,
-    delegationChangedFilesEver: new Set<string>(),
-    delegationUnknownChangeEver: false,
-    delegatedChangedFiles: new Set<string>(),
-    delegatedUnknownChange: false,
-    delegatedVerificationRequired: false,
-    delegatedVerificationSucceeded: false,
-    delegatedValidationContinuations: 0,
-    validationContinuationIssued: false,
-    validationSucceeded: false,
-    changedFiles: new Set<string>(),
-    unknownFileChange: false,
-    preservedMediaMarkers: [],
-    retainedAnswers: [],
   };
 }
 
@@ -3165,7 +3000,6 @@ async function updateBackgroundTaskEvidence(
 
 function isMechanicalCompletionGuardReason(reason: string | undefined): boolean {
   return reason === ACTIVE_BACKGROUND_TASK_REVIEW_ERROR
-    || reason === ACTIVE_TODO_REVIEW_ERROR
     || reason === MISSING_SCHEDULE_DECISION_REVIEW_ERROR;
 }
 
@@ -3186,450 +3020,6 @@ function activeBackgroundTaskContinuation(processes: ReadonlyMap<string, Executi
     + "on each listed id with its matching target and continue when it returns completed, failed, or cancelled. A wait timeout, running, or "
     + "orphaned result is not completion; wait again, read the final state, or kill it only when cancellation is "
     + `actually intended. Do not create a schedule to poll it and do not claim the task is complete.\n${listed}`;
-}
-
-function todoRevision(todo: TodoItem): string {
-  return JSON.stringify([todo.updated_at, todo.status, todo.content]);
-}
-
-/** Active todos this Run created or changed; untouched carry-overs are excluded. */
-function todosOwnedByRun(
-  activeTodos: readonly TodoItem[],
-  revisionsAtStart: ReadonlyMap<string, string>,
-): TodoItem[] {
-  return activeTodos.filter((todo) => revisionsAtStart.get(todo.id) !== todoRevision(todo));
-}
-
-function activeTodoContinuation(todos: readonly TodoItem[]): string {
-  const list = frameUntrustedText(
-    "runtime.todo",
-    safePromptJson(todos.slice(0, 32).map(({ id, status, content }) => ({ id, status, content }))),
-  );
-  return "The Runtime-owned todo checklist still contains unfinished work. Continue with the next concrete action now, "
-    + "or use the todo tool to complete/cancel items only when that status is truthful. If a real blocker requires user "
-    + "input, approval, or an external state change, explain it precisely and update the checklist rather than claiming "
-    + `success.\n${list}`;
-}
-
-function recordDelegationSideEffect(
-  state: ExecutionReviewState,
-  toolName: string,
-  params: Record<string, unknown>,
-): void {
-  if (toolName === "write_file" || toolName === "patch_file") {
-    const path = normalizedValidationPath(params.path);
-    if (path) state.delegationChangedFilesEver.add(path);
-    else state.delegationUnknownChangeEver = true;
-    return;
-  }
-  // Child evidence from delegate_task is applied from its Runtime-owned
-  // result rather than inferred from model arguments.
-  if (toolName === "delegate_task") return;
-  state.delegationUnknownChangeEver = true;
-}
-
-function delegationResult(
-  record: RunRecord,
-  content: string,
-  state: ExecutionReviewState,
-): DelegationResult {
-  const workspace = normalizedValidationPath(record.request.workspace).replace(/\/$/, "");
-  const changedFiles = [...state.delegationChangedFilesEver].map((path) => (
-    workspace && path.startsWith(`${workspace}/`)
-      ? path.slice(workspace.length + 1)
-      : path
-  )).sort();
-  return {
-    child_run_id: record.id,
-    status: "completed",
-    content,
-    side_effects_started: record.sideEffectsStarted,
-    changed_files: changedFiles,
-    unknown_change: record.sideEffectsStarted
-      && (state.delegationUnknownChangeEver || changedFiles.length === 0),
-  };
-}
-
-function applyDelegationToolEvidence(
-  state: ExecutionReviewState,
-  detailsValue: unknown,
-): void {
-  const details = recordValue(detailsValue);
-  const candidates = Array.isArray(details.results)
-    ? details.results
-    : [detailsValue];
-  for (const candidateValue of candidates.slice(0, 256)) {
-    const candidate = recordValue(candidateValue);
-    if (candidate.status !== "completed" || candidate.side_effects_started !== true) continue;
-    state.delegatedVerificationRequired = true;
-    state.delegatedVerificationSucceeded = false;
-    state.delegatedValidationContinuations = 0;
-    const changedFiles = Array.isArray(candidate.changed_files)
-      ? candidate.changed_files.slice(0, 256)
-      : [];
-    let validChangedFile = false;
-    for (const pathValue of changedFiles) {
-      if (typeof pathValue !== "string" || pathValue.length > 4096) continue;
-      const path = normalizedValidationPath(pathValue);
-      if (!path) continue;
-      validChangedFile = true;
-      state.delegatedChangedFiles.add(path);
-      state.delegationChangedFilesEver.add(path);
-      state.changedFiles.add(path);
-    }
-    // An unlocatable child change is settled by the hard delegated
-    // verification, not by a second soft file-validation turn.
-    if (candidate.unknown_change === true || !validChangedFile) {
-      state.delegatedUnknownChange = true;
-      state.delegationUnknownChangeEver = true;
-    }
-  }
-}
-
-function isFocusedDelegationValidation(
-  state: ExecutionReviewState,
-  toolCall: ToolCall,
-): boolean {
-  const arguments_ = recordValue(toolCall.arguments);
-  // Without a reported path, any focused inspection of the reported result is
-  // the strongest check the parent can make; known paths must be targeted.
-  const pathUnknown = state.delegatedChangedFiles.size === 0;
-  if (toolCall.name === "read_file" || toolCall.name === "search_files") {
-    const path = normalizedValidationPath(arguments_.path);
-    return Boolean(path) && (pathUnknown || state.delegatedChangedFiles.has(path));
-  }
-  if (toolCall.name !== "terminal") return false;
-  const command = String(arguments_.command || "");
-  if (isComprehensiveValidationCommand(command)) return true;
-  const focusedInspection = /(?:^|[\n;&|])\s*(?:rg|grep|cat|head|tail|stat|test|file|wc|cmp|diff|sha256sum)\b/i.test(command)
-    || /\b(?:openpyxl|load_workbook|PdfReader|python-pptx|python-docx|pdfinfo|qpdf|libreoffice|soffice|unzip\s+-t)\b/i.test(command);
-  return focusedInspection && (pathUnknown || [...state.delegatedChangedFiles].some(
-    (path) => path.length > 0 && command.includes(path),
-  ));
-}
-
-function executionReviewFollowUp(
-  state: ExecutionReviewState,
-  message: AssistantMessage,
-  toolResults: ToolResultMessage[],
-): UserMessage | undefined {
-  updateExecutionEvidence(state, message, toolResults);
-  const reason = executionReviewReason(state, message);
-  if (reason === "delegation_validation") {
-    preserveWorkspaceMediaMarkers(state, message);
-    state.delegatedValidationContinuations += 1;
-    return runtimeReviewMessage(DELEGATED_SIDE_EFFECT_CONTINUATION);
-  }
-  if (reason === "validation") {
-    preserveWorkspaceMediaMarkers(state, message);
-    state.validationContinuationIssued = true;
-    state.validationSucceeded = false;
-    return runtimeReviewMessage(FILE_VALIDATION_CONTINUATION);
-  }
-  if (reason === "promise") {
-    state.promiseOnlyContinuations += 1;
-    return runtimeReviewMessage(PROMISE_ONLY_CONTINUATION);
-  }
-  if (reason === "empty_after_tool") {
-    state.emptyAfterToolContinuations += 1;
-    return runtimeReviewMessage(EMPTY_AFTER_TOOL_CONTINUATION);
-  }
-  return undefined;
-}
-
-function workspaceMediaMarkers(content: string): string[] {
-  const markers: string[] = [];
-  for (const line of content.split(/\r?\n/)) {
-    if (markers.length >= MAX_PRESERVED_MEDIA_MARKERS) break;
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed.length > MAX_PRESERVED_MEDIA_MARKER_LENGTH) continue;
-    const match = /^MEDIA:\s*(.+)$/i.exec(trimmed);
-    if (!match) continue;
-    let path = String(match[1] || "").trim();
-    const wrapper = path[0];
-    if (wrapper === "`" || wrapper === "\"" || wrapper === "'") {
-      if (path.length < 2 || path[path.length - 1] !== wrapper) continue;
-      path = path.slice(1, -1).trim();
-    } else if (path.includes("`") || path.includes("\"") || path.includes("'")) {
-      continue;
-    }
-    const relative = path.slice(`${CONTAINER_PATHS.workspace}/`.length);
-    const segments = relative.split("/");
-    if (
-      !path.startsWith(`${CONTAINER_PATHS.workspace}/`)
-      || relative.length === 0
-      || segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
-      || path.includes("\\")
-      || UNSAFE_MEDIA_PATH_TEXT_RE.test(path)
-      || path.length > MAX_PRESERVED_MEDIA_MARKER_LENGTH
-      || !PRESERVED_MEDIA_SUFFIX_RE.test(path)
-    ) continue;
-    const marker = `MEDIA: ${path}`;
-    if (!markers.includes(marker)) markers.push(marker);
-  }
-  return markers;
-}
-
-function preserveWorkspaceMediaMarkers(
-  state: ExecutionReviewState,
-  message: AssistantMessage,
-): void {
-  for (const marker of workspaceMediaMarkers(assistantText(message))) {
-    if (
-      state.preservedMediaMarkers.length >= MAX_PRESERVED_MEDIA_MARKERS
-      || state.preservedMediaMarkers.includes(marker)
-    ) continue;
-    state.preservedMediaMarkers.push(marker);
-  }
-}
-
-function retainInterimAnswer(
-  state: ExecutionReviewState,
-  message: AssistantMessage,
-): void {
-  // MEDIA lines stay behind the verification gate via preservedMediaMarkers.
-  const text = assistantText(message)
-    .split(/\r?\n/)
-    .filter((line) => !/^\s*MEDIA:/i.test(line))
-    .join("\n")
-    .trim();
-  if (text) state.retainedAnswers.push({ message, text });
-}
-
-function withRetainedAnswers(
-  content: string,
-  finalMessage: AssistantMessage,
-  retainedAnswers: readonly RetainedAnswer[],
-): string {
-  const earlier = retainedAnswers
-    .filter((answer) => answer.message !== finalMessage)
-    .map((answer) => answer.text);
-  if (earlier.length === 0) return content;
-  const final = content.trim();
-  return [...earlier, ...(final ? [final] : [])].join("\n\n");
-}
-
-function appendPreservedMediaMarkers(
-  content: string,
-  preservedMarkers: readonly string[],
-): string {
-  if (preservedMarkers.length === 0) return content;
-  const present = new Set(workspaceMediaMarkers(content));
-  const missing = preservedMarkers.filter((marker) => !present.has(marker));
-  if (missing.length === 0) return content;
-  const base = content.trimEnd();
-  return `${base}${base ? "\n\n" : ""}${missing.join("\n")}`;
-}
-
-function executionReviewReason(
-  state: ExecutionReviewState,
-  message: AssistantMessage,
-): "delegation_validation" | "validation" | "promise" | "empty_after_tool" | undefined {
-  if (
-    message.stopReason === "error"
-    || message.stopReason === "aborted"
-    || message.stopReason === "length"
-    || assistantToolCalls(message).length > 0
-  ) return undefined;
-
-  if (
-    state.delegatedVerificationRequired
-    && !state.delegatedVerificationSucceeded
-    && state.delegatedValidationContinuations < MAX_DELEGATED_VALIDATION_CONTINUATIONS
-  ) {
-    return "delegation_validation";
-  }
-  if (
-    (state.changedFiles.size > 0 || state.unknownFileChange)
-    && !state.validationContinuationIssued
-  ) {
-    return "validation";
-  }
-  if (
-    state.promiseOnlyContinuations < MAX_PROMISE_ONLY_CONTINUATIONS
-    && isPromiseOnlyFinalResponse(assistantText(message))
-  ) {
-    return "promise";
-  }
-  if (
-    state.observedToolResult
-    && state.emptyAfterToolContinuations < MAX_EMPTY_AFTER_TOOL_CONTINUATIONS
-    && message.stopReason === "stop"
-    && assistantText(message).trim().length === 0
-  ) {
-    return "empty_after_tool";
-  }
-  return undefined;
-}
-
-function updateExecutionEvidence(
-  state: ExecutionReviewState,
-  message: AssistantMessage,
-  toolResults: ToolResultMessage[],
-): void {
-  if (toolResults.length > 0) state.observedToolResult = true;
-  const results = new Map(toolResults.map((result) => [result.toolCallId, result]));
-  for (const toolCall of assistantToolCalls(message)) {
-    const result = results.get(toolCall.id);
-    if (!result) continue;
-    const successful = successfulToolResult(toolCall, result);
-    if (successful && toolCall.name === "delegate_task") {
-      applyDelegationToolEvidence(state, result.details);
-    }
-    if (
-      successful
-      && toolCall.name !== "delegate_task"
-      && state.delegatedVerificationRequired
-      && isFocusedDelegationValidation(state, toolCall)
-    ) {
-      state.delegatedVerificationSucceeded = true;
-    }
-    const validationAttempt = (
-      state.validationContinuationIssued
-      && isFocusedValidationToolCall(state, toolCall)
-    );
-    if (validationAttempt) state.validationSucceeded = successful;
-    if (result.isError) continue;
-    const changedByThisCall = recordFileChange(state, toolCall);
-    if (state.validationContinuationIssued && changedByThisCall) {
-      state.validationSucceeded = validationAttempt && successful;
-    }
-    if (!successful) continue;
-    applyFileValidation(state, toolCall, changedByThisCall);
-  }
-}
-
-function preservedMediaValidationPaths(state: ExecutionReviewState): string[] {
-  const workspacePrefix = `${CONTAINER_PATHS.workspace}/`;
-  return state.preservedMediaMarkers.flatMap((marker) => {
-    const path = marker.slice("MEDIA: ".length);
-    const normalized = normalizedValidationPath(path);
-    return path.startsWith(workspacePrefix)
-      ? [normalized, normalizedValidationPath(path.slice(workspacePrefix.length))]
-      : [normalized];
-  });
-}
-
-function isFocusedValidationToolCall(
-  state: ExecutionReviewState,
-  toolCall: ToolCall,
-): boolean {
-  const arguments_ = recordValue(toolCall.arguments);
-  if (toolCall.name === "read_file" || toolCall.name === "search_files") {
-    const path = normalizedValidationPath(arguments_.path);
-    return Boolean(path) && (
-      state.changedFiles.has(path)
-      || preservedMediaValidationPaths(state).includes(path)
-    );
-  }
-  if (toolCall.name !== "terminal") return false;
-  const command = String(arguments_.command || "");
-  if (isComprehensiveValidationCommand(command)) return true;
-  if (
-    /\b(?:openpyxl|load_workbook|PdfReader|python-pptx|python-docx|pdfinfo|qpdf|libreoffice|soffice|unzip\s+-t)\b/i.test(command)
-  ) return true;
-  return preservedMediaValidationPaths(state).some(
-    (path) => path.length > 0 && command.includes(path),
-  );
-}
-
-function assistantToolCalls(message: AssistantMessage): ToolCall[] {
-  return message.content.filter((block): block is ToolCall => block.type === "toolCall");
-}
-
-function successfulToolResult(toolCall: ToolCall, result: ToolResultMessage): boolean {
-  if (result.isError) return false;
-  if (toolCall.name !== "terminal") return true;
-  const exitCode = recordValue(result.details).exit_code;
-  return typeof exitCode !== "number" || exitCode === 0;
-}
-
-function recordFileChange(state: ExecutionReviewState, toolCall: ToolCall): boolean {
-  if (toolCall.name === "write_file" || toolCall.name === "patch_file") {
-    const path = normalizedValidationPath(recordValue(toolCall.arguments).path);
-    if (path) state.changedFiles.add(path);
-    else state.unknownFileChange = true;
-    return true;
-  }
-  if (toolCall.name !== "terminal") return false;
-  const command = String(recordValue(toolCall.arguments).command || "");
-  const changed = [
-    /(?:^|[\n;&|])\s*(?:touch|mkdir|rmdir|rm|mv|cp|install|truncate|tee|patch|apply_patch)\b/i,
-    /\bgit\s+(?:apply|checkout|restore|reset|clean|mv|rm|pull|merge|rebase|cherry-pick|am|stash\s+(?:apply|pop))\b/i,
-    /\b(?:sed\s+[^\n;&|]*-[^\s]*i|perl\s+[^\n;&|]*-[^\s]*i)\b/i,
-    /\b(?:write_text|write_bytes|writeFile|writeFileSync|appendFile|appendFileSync|rename|unlink)\s*\(/i,
-    /\bopen\s*\([^)]*,\s*["'`](?:w|a|x|\+|r\+)/i,
-    /(?:^|[^<])(?:>>|>)\s*["']?(?!\/dev\/(?:null|stdout|stderr)\b)[^\s;&|]+/i,
-    /\b(?:unzip\b|7z\s+x\b|tar\s+[^\n;&|]*-[^\s]*x|rsync\b|dd\b[^\n;&|]*\bof=)/i,
-    /\b(?:npm|pnpm|yarn)\s+(?:install|add|remove|update)\b/i,
-    /\b(?:prettier\s+--write|eslint\s+--fix|ruff\s+format|black\b|gofmt\s+-w|cargo\s+fmt)\b/i,
-  ].some((pattern) => pattern.test(command));
-  if (changed) state.unknownFileChange = true;
-  return changed;
-}
-
-function applyFileValidation(
-  state: ExecutionReviewState,
-  toolCall: ToolCall,
-  changedByThisCall: boolean,
-): void {
-  if (toolCall.name === "read_file") {
-    state.changedFiles.delete(
-      normalizedValidationPath(recordValue(toolCall.arguments).path),
-    );
-    return;
-  }
-  if (toolCall.name === "search_files") {
-    const searchedPath = normalizedValidationPath(recordValue(toolCall.arguments).path);
-    if (searchedPath) state.changedFiles.delete(searchedPath);
-    return;
-  }
-  if (toolCall.name !== "terminal") return;
-  const command = String(recordValue(toolCall.arguments).command || "");
-  if (isComprehensiveValidationCommand(command)) {
-    state.changedFiles.clear();
-    state.unknownFileChange = false;
-    return;
-  }
-  const focusedInspection = /(?:^|[\n;&|])\s*(?:rg|grep|cat|head|tail|stat)\b/i.test(command);
-  if (!focusedInspection) return;
-  for (const path of state.changedFiles) {
-    if (command.includes(path)) state.changedFiles.delete(path);
-  }
-  if (changedByThisCall) state.unknownFileChange = false;
-}
-
-function isComprehensiveValidationCommand(command: string): boolean {
-  return [
-    /\b(?:pytest|unittest|compileall|go\s+test|cargo\s+(?:test|check|clippy)|make\s+(?:test|check))\b/i,
-    /\b(?:npm|pnpm|yarn|bun)\s+(?:(?:run|exec)\s+)?(?:test|check|build|lint|typecheck)\b/i,
-    /\b(?:tsc|mypy|pyright|ruff\s+check|eslint)\b/i,
-    /\bgit\s+(?:diff|status|show)\b/i,
-  ].some((pattern) => pattern.test(command));
-}
-
-function normalizedValidationPath(value: unknown): string {
-  const path = String(value || "").trim().replaceAll("\\", "/");
-  return path.replace(/^(?:\.\/)+/, "").replace(/\/+/g, "/");
-}
-
-function isPromiseOnlyFinalResponse(text: string): boolean {
-  const candidate = text.trim();
-  if (!candidate || candidate.length > 1_600) return false;
-  if (/[?？]/u.test(candidate)) return false;
-  if (/(?:无法|不能|缺少|受阻|需要你|请提供|cannot|can't|unable|blocked|need you|please provide)/iu.test(candidate)) {
-    return false;
-  }
-  if (/(?:已(?:完成|修改|更新|修复|执行|运行|检查|验证)|测试通过|检查结果|结果如下|implemented|completed|updated|fixed|verified|tests? pass(?:ed)?|results? (?:are|follow))/iu.test(candidate)) {
-    return false;
-  }
-  return [
-    /(?:^|[\n。！!])\s*(?:好的?[，,:：\s]*)?(?:(?:我(?:会|将)(?:先|马上|立即|开始|继续)?|我(?:现在|马上|接下来|先)|(?:现在|马上)(?:开始)?|(?:接下来|下一步)(?:我)?(?:会|将)|正在)).{0,80}?(?:开始|继续|处理|执行|检查|查看|修改|实现|修复|运行|测试|验证|更新|开发|搜索|查询|调查|整理|部署|提交|推送)/iu,
-    /(?:^|[\n.!])\s*(?:okay[,.: ]*)?i(?:'ll| will)(?: now| first| next| immediately)?\s+(?:start|continue|work|handle|inspect|check|run|implement|fix|update|test|verify|search|investigate|deploy|commit|push)\b/iu,
-    /(?:^|[\n.!])\s*(?:okay[,.: ]*)?i(?:'m| am) (?:now )?(?:starting|working on|checking|inspecting|running|implementing|fixing|updating|testing|verifying)\b/iu,
-    /(?:^|[\n.!])\s*(?:okay[,.: ]*)?(?:let me (?:start|continue|check|inspect|run|implement|fix|update|test|verify)|starting now|next,? i(?:'ll| will) (?:start|continue|check|inspect|run|implement|fix|update|test|verify))\b/iu,
-    /(?:请稍候|请稍等|稍等一下|马上为你处理|正在处理中|working on it|give me a moment|one moment while i)/iu,
-  ].some((pattern) => pattern.test(candidate));
 }
 
 function runtimeReviewMessage(content: string): UserMessage {
@@ -4099,8 +3489,6 @@ function resultFromMessages(
   runMessageStart = 0,
   ephemeralMessages?: WeakSet<AgentMessage>,
   workspace?: string,
-  preservedMediaMarkers: readonly string[] = [],
-  retainedAnswers: readonly RetainedAnswer[] = [],
 ): RunResult {
   const assistant = [...messages].reverse().find(
     (message): message is AssistantMessage => (
@@ -4130,10 +3518,7 @@ function resultFromMessages(
     }
   }
   return {
-    content: appendPreservedMediaMarkers(
-      withRetainedAnswers(assistantText(assistant), assistant, retainedAnswers),
-      preservedMediaMarkers,
-    ),
+    content: assistantText(assistant),
     messages: durableRunResultMessages(
       messages.filter((message) => !ephemeralMessages?.has(message)),
       workspace,
@@ -4145,10 +3530,8 @@ function resultFromMessages(
 }
 
 /**
- * Preserve the model's genuine current-Run replies when a mechanical Runtime
- * completion guard refuses success. The resulting object is diagnostic data
- * on a needs_review Run, never a successful completion result. In particular,
- * no preserved MEDIA marker is restored at this boundary.
+ * Preserve the last current-Run assistant reply as diagnostic data when a
+ * deterministic completion guard refuses success, never as a successful result.
  */
 function reviewDiagnosticFromMessages(
   messages: AgentMessage[],
@@ -4157,14 +3540,12 @@ function reviewDiagnosticFromMessages(
   contextUsage: ContextUsage | undefined,
   runMessageStart: number,
   ephemeralMessages: WeakSet<AgentMessage>,
-  retainedAnswers: readonly RetainedAnswer[] = [],
 ): RunResult | undefined {
   const currentMessages = messages.slice(Math.max(0, runMessageStart));
   const assistant = [...currentMessages].reverse().find(
     (message): message is AssistantMessage => (
       message.role === "assistant"
       && !ephemeralMessages.has(message)
-      && assistantText(message).trim().length > 0
     ),
   );
   if (!assistant) return undefined;
@@ -4178,7 +3559,7 @@ function reviewDiagnosticFromMessages(
   );
   // Keep the selected current-Run assistant authoritative even if result
   // serialization evolves; historical messages are deliberately absent.
-  diagnostic.content = withRetainedAnswers(assistantText(assistant), assistant, retainedAnswers);
+  diagnostic.content = assistantText(assistant);
   diagnostic.content = truncate(diagnostic.content.trim(), REVIEW_DIAGNOSTIC_MAX_CHARS);
   return diagnostic.content ? diagnostic : undefined;
 }

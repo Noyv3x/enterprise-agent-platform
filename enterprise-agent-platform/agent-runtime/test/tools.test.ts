@@ -118,8 +118,6 @@ test("delegate_task preserves single-call behavior and batches bounded children 
       status: "completed";
       content: string;
       side_effects_started: boolean;
-      changed_files: string[];
-      unknown_change: boolean;
     }) => void;
     reject: (error: Error) => void;
   }>();
@@ -140,8 +138,6 @@ test("delegate_task preserves single-call behavior and batches bounded children 
           status: "completed";
           content: string;
           side_effects_started: boolean;
-          changed_files: string[];
-          unknown_change: boolean;
         }>((resolve, reject) => { releases.set(prompt, { resolve, reject }); });
       } finally {
         active -= 1;
@@ -190,8 +186,6 @@ test("delegate_task preserves single-call behavior and batches bounded children 
     status: "completed",
     content: "first result",
     side_effects_started: true,
-    changed_files: ["first.txt"],
-    unknown_change: false,
   });
   const result = await pending;
   assert.deepEqual(result.details, {
@@ -202,13 +196,10 @@ test("delegate_task preserves single-call behavior and batches bounded children 
         status: "completed",
         content: "first result",
         side_effects_started: true,
-        changed_files: ["first.txt"],
-        unknown_change: false,
       },
       { index: 1, status: "failed", error: "second failed" },
     ],
   });
-  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /re-check relevant files/);
 
   const singlePending = delegate.execute("single", { prompt: "single" }, undefined);
   assert.deepEqual(started.at(-1), { prompt: "single", role: "leaf" });
