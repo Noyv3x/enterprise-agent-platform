@@ -2,13 +2,11 @@ import type {
   ActivityStep,
   AgentStatus,
   AgentWork,
-  Attachment,
   ComputerFileClue,
   ComputerMode,
   ComputerPresentClue,
   ComputerProjection,
   ComputerSearchHit,
-  Message,
 } from "../../types";
 
 export const COMPUTER_FILE_TOOLS = new Set(["read_file", "write_file", "patch_file"]);
@@ -36,7 +34,7 @@ export interface ComputerSurface {
   searchHits: ComputerSearchHit[];
   searchTool: string;
   present: ComputerPresentClue | null;
-  /** Retained work can outlive the resource that supplied its preview. */
+  /** The current resource is no longer available. */
   unavailable?: boolean;
   /** False keeps completed terminal output local without polling expired processes. */
   terminalPolling?: boolean;
@@ -70,13 +68,6 @@ export function isComputerTool(tool: string): boolean {
 
 export function isHtmlWorkspacePath(value: string | undefined): boolean {
   return Boolean(value && HTML_SUFFIX.test(value.trim()));
-}
-
-export function isHtmlAttachment(attachment: Attachment | undefined): boolean {
-  if (!attachment) return false;
-  const filename = String(attachment.filename || "");
-  const mime = String(attachment.mime_type || "").split(";", 1)[0].trim().toLowerCase();
-  return HTML_SUFFIX.test(filename) || mime === "text/html" || mime === "application/xhtml+xml";
 }
 
 function stepSequence(step: ActivityStep): number {
@@ -139,7 +130,6 @@ function fileClueFromStep(step: ActivityStep | null): ComputerFileClue | null {
     tool_call_id: step.tool_call_id,
     sequence: step.sequence,
     updated_sequence: step.updated_sequence,
-    revision: stepRevision(step),
   };
 }
 
@@ -171,62 +161,11 @@ function presentFromProjection(computer: ComputerProjection | undefined): Comput
   return null;
 }
 
-export function presentClueFromMessages(messages: Message[]): ComputerPresentClue | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.author_type !== "agent") continue;
-    if (message.metadata?.needs_review) continue;
-    const work = message.metadata?.agent_work;
-    if (work && work.state && work.state !== "complete") continue;
-    const attachments = message.attachments || [];
-    for (let attachmentIndex = attachments.length - 1; attachmentIndex >= 0; attachmentIndex -= 1) {
-      const attachment = attachments[attachmentIndex];
-      if (isHtmlAttachment(attachment)) {
-        return {
-          attachment_id: attachment.id,
-          status: "completed",
-          revision: `message:${String(message.id)}:attachment:${String(attachment.id)}`,
-        };
-      }
-    }
-    const step = latestComputerStep(work);
-    const workspacePath = String(step?.parameters?.workspace_path || "");
-    if (
-      step
-      && (toolName(step) === "write_file" || toolName(step) === "patch_file")
-      && String(step.parameters?.target || "sandbox") !== "host"
-      && isHtmlWorkspacePath(workspacePath)
-    ) {
-      return {
-        workspace_path: workspacePath,
-        status: String(step.tool_status || "completed"),
-        tool_call_id: step.tool_call_id,
-        sequence: step.sequence,
-        updated_sequence: step.updated_sequence,
-        revision: stepRevision(step),
-      };
-    }
-  }
-  return null;
-}
-
-function lastCompletedComputerMode(messages: Message[]): ComputerMode | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.author_type !== "agent") continue;
-    const mode = computerModeFromStep(latestComputerStep(message.metadata?.agent_work));
-    if (mode) return mode;
-  }
-  return null;
-}
-
 export function deriveComputerSurface({
   status,
-  messages,
   availability,
 }: {
   status: AgentStatus | null | undefined;
-  messages: Message[];
   availability: ComputerAvailability;
 }): ComputerSurface {
   const live = status?.state === "replying" || status?.state === "approval";
@@ -249,27 +188,15 @@ export function deriveComputerSurface({
   const currentPresent = projectedPresent
     ? { ...(stepPresent || {}), ...projectedPresent }
     : stepPresent;
-  const historicalPresent = presentClueFromMessages(messages);
-  const availabilityUnconfirmed = availability.loading || Boolean(availability.error);
-  const present = currentPresent || (
-    availability.presentAvailable || availabilityUnconfirmed
-      ? historicalPresent
-      : null
-  );
-  const presentReadable = availability.presentAvailable || Boolean(present);
-  const hasClues = Boolean(present);
+  const present = currentPresent;
 
   if (live) {
-    let mode = liveMode;
-    if (mode === "browser" && !availability.loading && !availability.browserActive) {
-      mode = file ? "file" : searchHits.length ? "search" : presentReadable ? "present" : availability.runningTerminalCount > 0 ? "terminal" : "browser";
-    }
     return {
       visible: true,
       live: true,
       runId,
       startedAt,
-      mode,
+      mode: liveMode,
       latestStep: liveStep,
       file,
       searchHits,
@@ -278,104 +205,10 @@ export function deriveComputerSurface({
     };
   }
 
-  const keepAfterRun = availability.browserActive
-    || availability.runningTerminalCount > 0
-    || availability.presentAvailable
-    || Boolean(present && (availability.loading || availability.error));
-  if (!keepAfterRun && !hasClues) return EMPTY_SURFACE;
-  if (!keepAfterRun && !availability.loading && !availability.error) return EMPTY_SURFACE;
-  if (!keepAfterRun && availability.loading && !hasClues) return EMPTY_SURFACE;
-
-  const lastMode = lastCompletedComputerMode(messages);
-  let mode: ComputerMode | null = null;
-  if (lastMode === "browser" && availability.browserActive) mode = "browser";
-  else if (lastMode === "terminal" && availability.runningTerminalCount > 0) mode = "terminal";
-  else if ((lastMode === "present" || lastMode === "file") && presentReadable) mode = "present";
-  else if (availability.browserActive) mode = "browser";
-  else if (availability.runningTerminalCount > 0) mode = "terminal";
-  else if (presentReadable) mode = "present";
-
-  if (!mode) {
-    if (availability.loading || availability.error) {
-      return {
-        visible: hasClues,
-        live: false,
-        runId,
-        startedAt,
-        mode: lastMode === "present" || lastMode === "file" ? "present" : lastMode,
-        latestStep: liveStep,
-        file,
-        searchHits,
-        searchTool,
-        present,
-      };
-    }
-    return EMPTY_SURFACE;
-  }
-
-  return {
-    visible: true,
-    live: false,
-    runId,
-    startedAt,
-    mode,
-    latestStep: liveStep,
-    file,
-    searchHits,
-    searchTool,
-    present,
-  };
+  // Available resources remain explicitly accessible, but never create automatic PiP.
+  const mode: ComputerMode | null = availability.browserActive ? "browser"
+    : availability.runningTerminalCount > 0 ? "terminal"
+    : availability.presentAvailable ? "present" : null;
+  return mode ? {...EMPTY_SURFACE, visible: true, mode} : EMPTY_SURFACE;
 }
 
-/** Keep only the observed run, accepting final metadata from its own settled message. */
-export function retainComputerSurface(
-  observed: ComputerSurface,
-  runIds: readonly string[],
-  messages: Message[],
-  availability: ComputerAvailability,
-): ComputerSurface {
-  let finalSurface: ComputerSurface | null = null;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    const work = message.metadata?.agent_work;
-    if (message.author_type !== "agent" || message.metadata?.needs_review
-      || (work?.state !== "complete" && work?.state !== "error")
-      || !work.run_id || !runIds.includes(work.run_id)) continue;
-    finalSurface = deriveComputerSurface({
-      status: {...work, state:"replying"},
-      messages: [message],
-      availability,
-    });
-    // Completed work rows need not repeat bounded projected search results.
-    // Keep the observed results unless final metadata identifies a different call.
-    if (finalSurface.mode === "search" && observed.mode === "search" && !work.computer?.search
-      && (!finalSurface.latestStep?.tool_call_id || !observed.latestStep?.tool_call_id
-        || finalSurface.latestStep.tool_call_id === observed.latestStep.tool_call_id)) {
-      finalSurface = {...finalSurface,searchHits:observed.searchHits,searchTool:observed.searchTool};
-    }
-    break;
-  }
-  const final = finalSurface?.mode ? finalSurface : observed;
-  const finished = (status: string | undefined) => ["completed", "complete", "done", "failed", "error", "cancelled"].includes(String(status || "").toLowerCase());
-  const latestStep = finished(final.latestStep?.tool_status) ? final.latestStep : null;
-  const file = finished(final.file?.status) ? final.file : null;
-  const present = finished(final.present?.status) ? final.present : null;
-  const terminalPolling = availability.runningTerminalCount > 0;
-  const unavailable = final.mode === "browser" ? !availability.browserActive
-    : final.mode === "terminal" ? !terminalPolling && !latestStep
-    : final.mode === "present" ? !availability.presentAvailable
-    : final.mode === "file" ? !file
-    : !final.mode;
-  return {
-    ...final,
-    visible: true,
-    live: false,
-    runId: observed.runId,
-    startedAt: observed.startedAt,
-    latestStep,
-    file,
-    present,
-    unavailable,
-    terminalPolling,
-  };
-}

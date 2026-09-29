@@ -825,16 +825,6 @@ class MailServiceTests(unittest.TestCase):
             9,
         )
 
-        # Queue recovery hydrates the same reference from the authoritative
-        # message and de-duplicates repeated recovery passes in memory.
-        with self.service._conversation_lock:
-            self.service._agent_queues.clear()
-        with mock.patch.object(self.service, "_start_agent_worker_locked"):
-            self.service._recover_durable_work()
-            self.service._recover_durable_work()
-        queue = self.service._agent_queues["private:1"]
-        self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["content"], message["content"])
 
         self.service.db.execute(
             """

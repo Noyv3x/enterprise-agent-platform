@@ -428,7 +428,6 @@ SCHEDULE_POLL_MAX_SECONDS = max(
 )
 SCHEDULE_DISPATCH_RETRY_SECONDS = 60
 SCHEDULE_PROMPT_SAFETY_ERROR = "stored scheduled prompt failed safety validation"
-_DURABLE_AGENT_START_MESSAGE_SETTING = "durable_agent_jobs_start_message_id"
 TELEGRAM_LINK_CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 SAFE_INLINE_ATTACHMENT_MIME_TYPES = {
     "image/png",
@@ -470,8 +469,8 @@ COMPUTER_TERMINAL_TOOLS = frozenset({"terminal", "process"})
 COMPUTER_BROWSER_TOOLS = frozenset({"browser"})
 COMPUTER_HTML_SUFFIXES = frozenset({".html", ".htm"})
 COMPUTER_FILE_PREVIEW_MAX_BYTES = 64 * 1024
+COMPUTER_FILE_DRAFT_MAX_BYTES = 16 * 1024
 COMPUTER_FILE_DRAFT_TOOL_CALL_ID_MAX = 512
-COMPUTER_FILE_DRAFT_REVISION_MAX = (2**53) - 1
 COMPUTER_FILE_DRAFT_KINDS = {
     "write_file": "file",
     "patch_file": "replacement",
@@ -904,7 +903,6 @@ class EnterpriseService:
         self.jobs.recover_interrupted(
             unsafe_kinds={"agent", TELEGRAM_DELIVERY_JOB_KIND, MAIL_DELIVERY_JOB_KIND}
         )
-        self.agent_inputs.quarantine_interrupted_jobs()
         # Telegram updates interrupted before acknowledgement are made
         # claimable again. Telegram will redeliver an unacknowledged webhook or
         # an uncommitted long-poll update; the update-id row remains the dedupe
@@ -985,7 +983,6 @@ class EnterpriseService:
         # administrative deletion; it is deliberately re-entrant because the
         # high-level delete helpers call the lower-level file cleanup helper.
         self._attachment_lock = threading.RLock()
-        self._agent_queues: dict[str, Deque[dict[str, Any]]] = {}
         self._agent_workers: dict[str, threading.Thread] = {}
         self._agent_active_tasks: dict[str, dict[str, Any]] = {}
         self._learning_wakeup = threading.Event()
@@ -998,7 +995,6 @@ class EnterpriseService:
         # lock, so a request either becomes durable work first or receives the
         # maintenance response; it can never be stranded between the two.
         self._agent_update_admissions = 0
-        self._auto_update_reserved = bool(startup_reservation_id)
         self._auto_update_reservation_id = startup_reservation_id
         self._auto_update_reservation_owner = startup_reservation_owner
         startup_settlement_id = (
@@ -1015,6 +1011,8 @@ class EnterpriseService:
         self._agent_scope_epochs: dict[str, int] = {}
         self._agent_status: dict[str, dict[str, Any]] = {}
         self._typing: dict[str, dict[int, dict[str, Any]]] = {}
+        self._scope_notifications: dict[str, tuple[float, int, dict[str, Any]]] = {}
+        self._scope_notification_revision = 0
         self._auth_lock = threading.RLock()
         self._login_lock = threading.RLock()
         self.model_catalogs = ModelCatalogManager(
@@ -1765,14 +1763,8 @@ class EnterpriseService:
             active = self._agent_active_tasks.get(key)
             if active is not None:
                 active["_accepting_inputs"] = False
-            queued = list(self._agent_queues.pop(key, deque()))
             self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
             self._typing.pop(key, None)
-        queued_ids = {
-            int(task.get("_job_id") or 0)
-            for task in queued
-            if int(task.get("_job_id") or 0) > 0
-        }
         timestamp = now_ts()
         with (nullcontext(conn) if conn is not None else self.db.transaction(immediate=True)) as conn:
             cancellable_job_ids = [
@@ -1828,36 +1820,11 @@ class EnterpriseService:
                 )
                 conn.execute(
                     """
-                    UPDATE agent_run_inputs
-                    SET state = 'failed', last_error = ?, updated_at = ?
-                    WHERE job_id IN (
-                        SELECT id FROM durable_jobs
-                        WHERE kind = 'agent' AND scope_type = 'private'
-                          AND scope_id = ? AND status = 'failed'
-                    )
-                      AND state NOT IN ('succeeded', 'failed')
-                    """,
-                    (str(reason)[:2000], timestamp, scope_id),
-                )
-                conn.execute(
-                    """
                     UPDATE durable_jobs
                     SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
                     WHERE kind = ? AND scope_type = 'private' AND scope_id = ? AND status = 'queued'
                     """,
                     (str(reason)[:2000], timestamp, TELEGRAM_DELIVERY_JOB_KIND, scope_id),
-                )
-            # Queues are only a wake-up mechanism, but keeping this explicit set
-            # makes the intent clear and covers an in-memory task whose scope
-            # fields were malformed before validation.
-            for job_id in queued_ids:
-                conn.execute(
-                    """
-                    UPDATE durable_jobs
-                    SET status = 'failed', lease_until = 0, last_error = ?, updated_at = ?
-                    WHERE id = ? AND status IN ('queued', 'running')
-                    """,
-                    (str(reason)[:2000], timestamp, job_id),
                 )
 
         if scope_type == "private":
@@ -1868,9 +1835,8 @@ class EnterpriseService:
             self._cleanup_agent_scope(scope_key)
 
     def _recover_durable_work(self) -> None:
-        """Rebuild disposable wake-up queues from the SQLite work ledger."""
+        """Validate durable queued work before any scope dispatcher starts."""
 
-        self._repair_schedule_run_job_gaps()
         message_job_ids, completed_message_job_ids = (
             self._durable_agent_message_job_index()
         )
@@ -1881,14 +1847,10 @@ class EnterpriseService:
         self._surface_failed_agent_jobs_without_message(
             message_job_ids=message_job_ids,
         )
-        self.agent_inputs.reconcile_terminal_jobs()
         self._sync_schedule_runs_from_jobs()
-        self._recover_agent_message_job_gaps()
 
-        # Recovery is the only producer for these disposable in-memory queues;
-        # silently truncating here strands every row after the limit until a
-        # later process restart. Small internal deployments can safely rebuild
-        # all queued ledger entries in one pass.
+        # A dispatcher reads the whole scope directly from SQLite. Validate
+        # every recovered row before waking one, including later FIFO entries.
         for job in self.jobs.queued("agent", limit=None):
             task = self._task_from_durable_agent_job(job)
             if task is None or not self._valid_recovered_agent_task(task):
@@ -1902,10 +1864,13 @@ class EnterpriseService:
                     self._block_recovered_scheduled_job(job.id, schedule_run_id)
                     continue
                 task["schedule_run_id"] = schedule_run_id
-            key = self._conversation_key(str(task["scope_type"]), str(task["scope_id"]))
-            task["_scope_epoch"] = int(self._agent_scope_epochs.get(key, 0))
-            task["_job_id"] = job.id
-            self._schedule_agent_task(task, enforce_limit=False)
+                if task != job.payload:
+                    self.db.execute(
+                        "UPDATE durable_jobs SET payload_json = ? WHERE id = ? AND status = 'queued'",
+                        (encode_json(task), job.id),
+                    )
+        with self._conversation_lock:
+            self._start_deferred_agent_workers_locked()
 
     def _surface_interrupted_agent_jobs(
         self,
@@ -2018,86 +1983,6 @@ class EnterpriseService:
             except Exception as exc:
                 print(f"Failed to restore Agent error message for job {job.id}: {exc}", file=sys.stderr)
 
-    def _recover_agent_message_job_gaps(self) -> None:
-        """Repair the narrow message-commit/job-enqueue crash window.
-
-        The database baseline owns the high-water mark. Startup only validates
-        and consumes it, then recreates a missing idempotent job when no Agent
-        reply already targets that message.
-        """
-
-        raw_start = self.get_setting(_DURABLE_AGENT_START_MESSAGE_SETTING)
-        try:
-            start_id = int(raw_start) if raw_start is not None else -1
-        except (TypeError, ValueError):
-            start_id = -1
-        if start_id < 0:
-            raise RuntimeError(
-                "database durable Agent message high-water mark is invalid"
-            )
-
-        rows = self.db.query(
-            """
-            SELECT * FROM messages
-            WHERE id > ? AND author_type = 'user'
-            ORDER BY id
-            """,
-            (start_id,),
-        )
-        for row in rows:
-            message_id = int(row["id"])
-            metadata = decode_json(row.get("metadata_json"))
-            if str(row["scope_type"]) == "channel" and not bool(metadata.get("agent_mention")):
-                continue
-            if self.db.scalar(
-                "SELECT 1 FROM durable_jobs WHERE kind = 'agent' AND dedupe_key = ?",
-                (f"message:{message_id}",),
-            ):
-                continue
-            if self._message_has_agent_reply(str(row["scope_type"]), str(row["scope_id"]), message_id):
-                continue
-            task = self._recovered_agent_task_from_message(row, metadata)
-            if task is None:
-                continue
-            job, _ = self.jobs.enqueue(
-                kind="agent",
-                dedupe_key=f"message:{message_id}",
-                payload=task,
-                scope_type=str(row["scope_type"]),
-                scope_id=str(row["scope_id"]),
-            )
-            task = dict(job.payload)
-            task["_job_id"] = job.id
-            self._schedule_agent_task(task, enforce_limit=False)
-
-    def _recovered_agent_task_from_message(
-        self,
-        row: dict[str, Any],
-        metadata: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        user_id = row.get("user_id")
-        actor = self.get_user(int(user_id)) if user_id is not None else None
-        if not actor or not actor.get("active"):
-            return None
-        scope_type = str(row["scope_type"])
-        scope_id = str(row["scope_id"])
-        user_message = self._message_from_row(row)
-        task: dict[str, Any] = {
-            "scope_type": scope_type,
-            "scope_id": scope_id,
-            "actor": actor,
-            "content": str(metadata.get("agent_request_content") or row.get("content") or ""),
-            "attachments": self._attachments_for_message(int(row["id"]), include_local_path=True),
-            "generation": metadata.get("generation") if isinstance(metadata.get("generation"), dict) else {},
-            "user_message": user_message,
-        }
-        if scope_type == "channel":
-            channel = self.db.query_one("SELECT * FROM channels WHERE id = ? AND archived = 0", (int(scope_id),))
-            if channel is None:
-                return None
-            task["channel"] = channel
-        return task
-
     def _task_from_durable_agent_job(
         self, job: DurableJob
     ) -> dict[str, Any] | None:
@@ -2115,7 +2000,7 @@ class EnterpriseService:
         )
         if not is_mail_wake:
             return payload
-        if set(payload) != {"task_type", "source_message_id"}:
+        if set(payload) - {"_input"} != {"task_type", "source_message_id"}:
             return None
         if payload.get("task_type") != MAIL_WAKE_TASK_TYPE:
             return None
@@ -4037,7 +3922,7 @@ class EnterpriseService:
     ) -> dict[str, Any]:
         key = self._conversation_key(scope_type, str(scope_id))
         with self._conversation_lock:
-            status = self._agent_status.get(key)
+            status = self._agent_status_from_ledger_locked(scope_type, str(scope_id))
             if status is None:
                 status = self._idle_agent_status(scope_type, str(scope_id))
                 # A read must not manufacture a new observable status version
@@ -4051,6 +3936,45 @@ class EnterpriseService:
                 scope_id=str(scope_id),
             )
         return result
+
+    def scope_notification_for_system(
+        self, scope_type: str, scope_id: str
+    ) -> dict[str, Any]:
+        """Share one polled snapshot across already-authorized scope observers.
+
+        Revisions are process-local; every new SSE connection gets a snapshot.
+        Cached nested values are read-only. User-specific typing exclusion is
+        applied by the transport, never stored in the shared scope snapshot.
+        """
+        key = self._conversation_key(scope_type, str(scope_id))
+        with self._conversation_lock:
+            now = time.monotonic()
+            previous = self._scope_notifications.get(key)
+            if previous is not None and now - previous[0] < 0.4:
+                return {"revision": previous[1], **previous[2]}
+            status = self.agent_status_for_system(scope_type, scope_id, include_jobs=True)
+            snapshot = {
+                "agent_status": status,
+                "status": {
+                    field: status.get(field)
+                    for field in ("state", "run_id", "queued_count", "updated_at")
+                },
+                "latest_message_id": self.latest_message_id(scope_type, scope_id),
+                "message_revision": self.conversation_revision(scope_type, scope_id)["revision"],
+                "typing": self.typing_users_for_system(scope_type, scope_id),
+                "preview_changed": True,
+            }
+            if previous is not None and snapshot == previous[2]:
+                revision = previous[1]
+            else:
+                self._scope_notification_revision += 1
+                revision = self._scope_notification_revision
+            # Bound memory even when clients continuously visit new scopes.
+            # A global counter keeps revisions increasing after cache eviction.
+            if previous is None and len(self._scope_notifications) >= 256:
+                self._scope_notifications.pop(next(iter(self._scope_notifications)))
+            self._scope_notifications[key] = (now, revision, snapshot)
+            return {"revision": revision, **snapshot}
 
     def telegram_enabled(self) -> bool:
         raw = self.get_setting(TELEGRAM_SETTING_ENABLED)
@@ -4975,6 +4899,11 @@ class EnterpriseService:
             "retry_after_ms": 2000 if state in {"waiting_for_tasks", "updating"} else 5000,
         }
 
+    @property
+    def _auto_update_reserved(self) -> bool:
+        """Reservation identity is the single source of admission gate state."""
+        return bool(self._auto_update_reservation_id)
+
     def platform_update_is_blocking(self) -> bool:
         return self._auto_update_reserved
 
@@ -4999,7 +4928,6 @@ class EnterpriseService:
                 return result
             if self._auto_update_has_agent_blockers(result):
                 return result
-            self._auto_update_reserved = True
             self._auto_update_reservation_id = clean_update_id
             self._auto_update_reservation_owner = "manager"
             self._auto_update_last_committed_id = ""
@@ -5048,7 +4976,6 @@ class EnterpriseService:
         expected_owner: str = "",
     ) -> bool:
         clean_update_id = str(update_id or "").strip()
-        resume_workers = False
         with self._conversation_lock:
             if expected_owner and self._auto_update_reservation_owner != expected_owner:
                 if not self._auto_update_reserved and clean_update_id:
@@ -5073,13 +5000,10 @@ class EnterpriseService:
             ):
                 return False
             self._auto_update_last_released_id = clean_update_id
-            self._auto_update_reserved = False
             self._auto_update_reservation_id = ""
             self._auto_update_reservation_owner = ""
-            resume_workers = True
             self._start_deferred_agent_workers_locked()
-        if resume_workers:
-            self._resume_deferred_background_workers()
+        self._resume_deferred_background_workers()
         return True
 
     def _resume_deferred_background_workers(self) -> None:
@@ -6369,48 +6293,55 @@ class EnterpriseService:
             cleaned = AGENT_MENTION_RE.sub("", content).strip()
             cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
             agent_content = cleaned
-        with self._conversation_lock:
-            actor = self._fresh_active_actor(actor)
-            require_permission(actor, PERMISSION_CHAT)
-            channel = self.get_channel(actor, channel_id)
-            generation = self.account_generation_config(actor)
-            user_msg = self._append_message(
-                scope_type="channel",
-                scope_id=scope_id,
-                author_type="user",
-                user_id=actor["id"],
-                username=actor["display_name"],
-                content=content,
-                metadata={
-                    "generation": generation,
-                    "agent_mention": agent_content is not None,
-                    "agent_request_content": agent_content or "",
-                    "attachment_count": len(uploads),
-                },
-                attachments=uploads,
-            )
-            if agent_content is None:
-                return {
-                    "user_message": user_msg,
-                    "agent_message": None,
-                    "agent_status": self.agent_status(actor, "channel", scope_id),
-                }
-            agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-            task = {
-                "scope_type": "channel",
-                "scope_id": scope_id,
-                "channel": channel,
-                "actor": actor.copy(),
-                "content": agent_content,
-                "attachments": agent_attachments,
-                "generation": generation,
-                "user_message": user_msg,
-            }
-        enqueue_result = self._enqueue_after_browser_assistance_handoff(
-            task,
-            self.agent_scopes.channel_scope_key(scope_id),
-            int(actor["id"]),
-        )
+        root_scope_key = self.agent_scopes.channel_scope_key(scope_id)
+        with self._agent_browser_operation_lock(root_scope_key):
+            with self._conversation_lock:
+                actor = self._fresh_active_actor(actor)
+                require_permission(actor, PERMISSION_CHAT)
+                channel = self.get_channel(actor, channel_id)
+                generation = self.account_generation_config(actor)
+                if agent_content is not None:
+                    self._release_owned_browser_assistance_serialized(root_scope_key, int(actor["id"]))
+                with self._message_transaction() as (conn, rollback_paths):
+                    user_msg = self._append_message(
+                        scope_type="channel",
+                        scope_id=scope_id,
+                        author_type="user",
+                        user_id=actor["id"],
+                        username=actor["display_name"],
+                        content=content,
+                        metadata={
+                            "generation": generation,
+                            "agent_mention": agent_content is not None,
+                            "agent_request_content": agent_content or "",
+                            "attachment_count": len(uploads),
+                        },
+                        attachments=uploads,
+                        conn=conn,
+                        rollback_paths=rollback_paths,
+                    )
+                    if agent_content is not None:
+                        task = {
+                            "scope_type": "channel",
+                            "scope_id": scope_id,
+                            "channel": channel,
+                            "actor": actor.copy(),
+                            "content": agent_content,
+                            "attachments": self._attachments_for_message(int(user_msg["id"]), include_local_path=True),
+                            "generation": generation,
+                            "user_message": user_msg,
+                        }
+                        self.jobs.enqueue(
+                            kind="agent", dedupe_key=f"message:{user_msg['id']}",
+                            payload=task, scope_type="channel", scope_id=scope_id, conn=conn,
+                        )
+                if agent_content is None:
+                    return {
+                        "user_message": user_msg,
+                        "agent_message": None,
+                        "agent_status": self.agent_status(actor, "channel", scope_id),
+                    }
+            enqueue_result = self._enqueue_agent_reply(task)
         return {
             "user_message": user_msg,
             "agent_message": None,
@@ -6649,62 +6580,66 @@ class EnterpriseService:
         telegram_message_id: int | None,
         telegram_thread_id: int | None,
     ) -> dict[str, Any]:
-        with self._conversation_lock:
-            actor = self._fresh_active_actor(actor)
-            require_permission(actor, PERMISSION_PRIVATE_AGENT)
-            default_generation = self.account_generation_config(actor)
-            user_msg = (
-                self._private_user_message_for_telegram_update(scope_id, telegram_update_id)
-                if telegram_update_id is not None
-                else None
-            )
-            if user_msg is None:
-                if uploads:
-                    self._enforce_upload_rate_limit(actor.get("id"))
-                metadata: dict[str, Any] = {
-                    "generation": default_generation,
-                    "attachment_count": len(uploads),
-                }
-                if telegram_update_id is not None:
-                    metadata["telegram_update_id"] = telegram_update_id
-                    metadata["telegram_delivery"] = {
-                        "chat_id": telegram_chat_id,
-                        "reply_to_message_id": telegram_message_id,
-                        "message_thread_id": telegram_thread_id,
+        root_scope_key = self.agent_scopes.private_scope_key(actor["id"])
+        with self._agent_browser_operation_lock(root_scope_key):
+            with self._conversation_lock:
+                actor = self._fresh_active_actor(actor)
+                require_permission(actor, PERMISSION_PRIVATE_AGENT)
+                default_generation = self.account_generation_config(actor)
+                agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
+                self._release_owned_browser_assistance_serialized(root_scope_key, int(actor["id"]))
+                with self._message_transaction() as (conn, rollback_paths):
+                    user_msg = (
+                        self._private_user_message_for_telegram_update(scope_id, telegram_update_id)
+                        if telegram_update_id is not None
+                        else None
+                    )
+                    if user_msg is None:
+                        if uploads:
+                            self._enforce_upload_rate_limit(actor.get("id"))
+                        metadata: dict[str, Any] = {
+                            "generation": default_generation,
+                            "attachment_count": len(uploads),
+                        }
+                        if telegram_update_id is not None:
+                            metadata["telegram_update_id"] = telegram_update_id
+                            metadata["telegram_delivery"] = {
+                                "chat_id": telegram_chat_id,
+                                "reply_to_message_id": telegram_message_id,
+                                "message_thread_id": telegram_thread_id,
+                            }
+                        user_msg = self._append_message(
+                            scope_type="private",
+                            scope_id=scope_id,
+                            author_type="user",
+                            user_id=actor["id"],
+                            username=actor["display_name"],
+                            content=content,
+                            metadata=metadata,
+                            attachments=uploads,
+                            conn=conn,
+                            rollback_paths=rollback_paths,
+                        )
+                    stored_metadata = user_msg.get("metadata") if isinstance(user_msg.get("metadata"), dict) else {}
+                    generation = (
+                        stored_metadata.get("generation")
+                        if isinstance(stored_metadata.get("generation"), dict)
+                        else default_generation
+                    )
+                    task = {
+                        "scope_type": "private",
+                        "scope_id": scope_id,
+                        "actor": actor.copy(),
+                        "content": str(user_msg.get("content") or ""),
+                        "attachments": self._attachments_for_message(int(user_msg["id"]), include_local_path=True),
+                        "generation": generation,
+                        "user_message": user_msg,
                     }
-                user_msg = self._append_message(
-                    scope_type="private",
-                    scope_id=scope_id,
-                    author_type="user",
-                    user_id=actor["id"],
-                    username=actor["display_name"],
-                    content=content,
-                    metadata=metadata,
-                    attachments=uploads,
-                )
-            stored_metadata = user_msg.get("metadata") if isinstance(user_msg.get("metadata"), dict) else {}
-            generation = (
-                stored_metadata.get("generation")
-                if isinstance(stored_metadata.get("generation"), dict)
-                else default_generation
-            )
-            task_content = str(user_msg.get("content") or "")
-            agent_attachments = self._attachments_for_message(int(user_msg["id"]), include_local_path=True)
-            agent_scope = self.agent_scopes.ensure_private_scope(actor["id"])
-            task = {
-                "scope_type": "private",
-                "scope_id": scope_id,
-                "actor": actor.copy(),
-                "content": task_content,
-                "attachments": agent_attachments,
-                "generation": generation,
-                "user_message": user_msg,
-            }
-        enqueue_result = self._enqueue_after_browser_assistance_handoff(
-            task,
-            agent_scope.scope_key,
-            int(actor["id"]),
-        )
+                    self.jobs.enqueue(
+                        kind="agent", dedupe_key=f"message:{user_msg['id']}",
+                        payload=task, scope_type="private", scope_id=scope_id, conn=conn,
+                    )
+            enqueue_result = self._enqueue_agent_reply(task)
         return {
             "user_message": user_msg,
             "agent_message": None,
@@ -6882,7 +6817,6 @@ class EnterpriseService:
                 "owner_user_id": int(actor["id"]),
                 "source_message_id": int(user_msg["id"]),
                 "response_message_id": int(message["id"]),
-                "tool_calls": len(task.get("_learning_tool_call_ids") or ()),
                 "tool_trace": list(task.get("_learning_tool_trace") or ()),
             }
         self._telegram_delivery_wakeup.set()
@@ -6912,26 +6846,7 @@ class EnterpriseService:
     def list_private_schedules(self, actor: dict[str, Any]) -> dict[str, Any]:
         actor = self._schedule_actor(actor)
         rows = self.schedules.list(int(actor["id"]))
-        schedule_ids = [int(row["id"]) for row in rows]
-        latest_by_schedule: dict[int, dict[str, Any]] = {}
-        if schedule_ids:
-            placeholders = ",".join("?" for _ in schedule_ids)
-            latest_rows = self.db.query(
-                f"""
-                SELECT r.*
-                FROM agent_schedule_runs r
-                JOIN (
-                    SELECT schedule_id, MAX(id) AS latest_id
-                    FROM agent_schedule_runs
-                    WHERE schedule_id IN ({placeholders})
-                    GROUP BY schedule_id
-                ) latest ON latest.latest_id = r.id
-                """,
-                schedule_ids,
-            )
-            latest_by_schedule = {
-                int(row["schedule_id"]): row for row in latest_rows
-            }
+        latest_by_schedule = self.schedules.latest_runs([int(row["id"]) for row in rows])
         return {
             "schedules": [
                 self._public_schedule(
@@ -7247,7 +7162,9 @@ class EnterpriseService:
             ),
             "started_at": rfc3339_utc(row.get("started_at")),
             "finished_at": rfc3339_utc(row.get("finished_at")),
-            "error": str(row.get("error") or ""),
+            "error": "\n".join(
+                str(value) for value in (row.get("error"), row.get("delivery_warning")) if value
+            ),
         }
 
 
@@ -8395,61 +8312,6 @@ class EnterpriseService:
         ).fetchone()
         return {"schedule": dict(final_schedule), "run": dict(run)}
 
-    def _repair_schedule_run_job_gaps(self) -> None:
-        """Idempotently close a committed system-message/job crash window."""
-
-        for run in self.schedules.missing_job_runs():
-            source = self.db.query_one(
-                "SELECT * FROM messages WHERE id = ?",
-                (int(run["source_message_id"]),),
-            )
-            if source is None:
-                self.schedules.update_run_status(
-                    int(run["id"]), "cancelled", error="scheduled source message is missing"
-                )
-                continue
-            metadata = decode_json(source.get("metadata_json"))
-            task = self._recovered_agent_task_from_message(source, metadata)
-            if task is None:
-                self.schedules.update_run_status(
-                    int(run["id"]), "cancelled", error="schedule owner is missing or inactive"
-                )
-                continue
-            scheduled_task = metadata.get("scheduled_task") if isinstance(metadata, dict) else {}
-            scheduled_for = str((scheduled_task or {}).get("scheduled_for") or rfc3339_utc(run["scheduled_for"]) or "")
-            task["schedule_run_id"] = int(run["id"])
-            task["runtime_metadata"] = {
-                "trigger": "scheduled",
-                "unattended": True,
-                "schedule_id": str(run["schedule_id"]),
-                "schedule_run_id": str(run["id"]),
-                "schedule_recurring": str(
-                    self.schedules.decoded_schedule(run).get("type") or ""
-                )
-                in {"interval", "cron"},
-                "scheduled_for": scheduled_for,
-            }
-            try:
-                task["content"] = validate_schedule_prompt(task.get("content"))
-            except ValueError:
-                self.schedules.update_run_status_and_pause_current_schedule(
-                    int(run["id"]),
-                    "blocked",
-                    error=SCHEDULE_PROMPT_SAFETY_ERROR,
-                )
-                self._schedule_wakeup.set()
-                continue
-            job, _ = self.jobs.enqueue(
-                kind="agent",
-                dedupe_key=f"message:{int(source['id'])}",
-                payload=task,
-                scope_type="private",
-                scope_id=str(run["owner_user_id"]),
-            )
-            self.db.execute(
-                "UPDATE agent_schedule_runs SET durable_job_id = ?, updated_at = ? WHERE id = ?",
-                (job.id, now_ts(), int(run["id"])),
-            )
 
     def _sync_schedule_runs_from_jobs(self) -> None:
         rows = self.db.query(
@@ -8461,17 +8323,8 @@ class EnterpriseService:
             WHERE r.status IN ('queued', 'running')
             """
         )
-        status_map = {
-            "queued": "queued",
-            "running": "running",
-            "succeeded": "succeeded",
-            "failed": "failed",
-            "needs_review": "needs_review",
-        }
         for row in rows:
-            status = status_map.get(str(row["job_status"]))
-            if status is None:
-                continue
+            status = str(row["job_status"])
             response = None
             if row.get("source_message_id") is not None:
                 source = self.db.query_one(
@@ -8499,21 +8352,12 @@ class EnterpriseService:
                 )
             if status == str(row["run_status"]):
                 continue
-            if status in {"needs_review", "blocked"}:
-                self.schedules.update_run_status_and_pause_current_schedule(
-                    int(row["run_id"]),
-                    status,
-                    response_message_id=int(response["id"]) if response else None,
-                    error=restored_error,
-                )
-                self._schedule_wakeup.set()
-            else:
-                self.schedules.update_run_status(
-                    int(row["run_id"]),
-                    status,
-                    response_message_id=int(response["id"]) if response else None,
-                    error=restored_error,
-                )
+            self._update_schedule_run_for_task(
+                {"schedule_run_id": row["run_id"]},
+                status,
+                response_message_id=int(response["id"]) if response else None,
+                error=restored_error,
+            )
 
     def agent_terminal_previews(
         self,
@@ -8897,11 +8741,7 @@ class EnterpriseService:
                 if status and status.get("state") in {"replying", "approval"}
                 else {}
             )
-        if (
-            draft
-            and draft.get("discarded") is not True
-            and draft.get("workspace_path") == relative
-        ):
+        if draft and draft.get("workspace_path") == relative:
             return {
                 "workspace_path": relative,
                 "content": str(draft.get("content") or ""),
@@ -8909,7 +8749,6 @@ class EnterpriseService:
                 "encoding": "utf-8",
                 "source": "draft",
                 "draft_kind": str(draft.get("draft_kind") or ""),
-                "revision": _computer_file_draft_revision(draft),
             }
         data = self._read_workspace_preview_bytes(
             scope,
@@ -9363,7 +9202,7 @@ class EnterpriseService:
     def agent_memory_search(self, body: dict[str, Any]) -> dict[str, Any]:
         scope_key = self._validated_agent_memory_scope(body.get("scope_key"))
         if str(body.get("review_mode") or "").strip():
-            with self._learning_review_memory_read_boundary(
+            with self._learning_review_read_boundary(
                 body, scope_key
             ) as conn:
                 return self._agent_memory_search_in_transaction(
@@ -9497,14 +9336,13 @@ class EnterpriseService:
             for raw in operations
             if isinstance(raw, dict)
         }
-        review_job: DurableJob | None = None
+        is_review = bool(str(body.get("review_mode") or "").strip())
         if outer_source == "automatic" or "automatic" in requested_sources:
             if requested_sources != {"automatic"}:
                 raise ServiceError(400, "automatic memory operations cannot mix source types")
-            review_job = self._validate_automatic_memory_write_context(
-                body, scope_key
-            )
-        if review_job is not None:
+            if not is_review:
+                self._validate_automatic_memory_write_context(body, scope_key)
+        if is_review:
             if len(operations) > 20:
                 raise ServiceError(
                     400, "learning review memory operations may contain at most 20 items"
@@ -9524,7 +9362,7 @@ class EnterpriseService:
         baselines: dict[tuple[str, int | None], tuple[int, int]] = {}
         outer_owner = body.get("owner_user_id")
         automatic_write = outer_source == "automatic" or "automatic" in requested_sources
-        if review_job is not None:
+        if is_review:
             mutation_boundary = self._learning_review_memory_mutation_boundary(
                 body,
                 scope_key,
@@ -10359,11 +10197,8 @@ class EnterpriseService:
                     403, "skill owner does not match private Agent scope"
                 )
 
-        review_job: DurableJob | None = None
-        if str(context.get("review_mode") or "").strip():
-            review_job = self._validate_learning_review_context(
-                context, raw_scope_key
-            )
+        is_review = bool(str(context.get("review_mode") or "").strip())
+        if is_review:
             if action not in {"list", "load", "read", "create", "patch"}:
                 raise ServiceError(
                     403, "learning reviews may only read, create, or patch skills"
@@ -10379,7 +10214,7 @@ class EnterpriseService:
             "write_file",
             "remove_file",
         }
-        if action in mutations:
+        if action in mutations and not is_review:
             try:
                 owner_user_id = int(context.get("owner_user_id"))
             except (TypeError, ValueError) as exc:
@@ -10412,8 +10247,8 @@ class EnterpriseService:
                     "category": str(arguments.get("category") or "").strip(),
                     "limit": MAX_SKILL_LIST_RESULTS,
                 }
-                if review_job is not None:
-                    with self._learning_review_skill_read_boundary(
+                if is_review:
+                    with self._learning_review_read_boundary(
                         context, raw_scope_key
                     ):
                         skills = self.skills.list(
@@ -10428,15 +10263,15 @@ class EnterpriseService:
                 ][:limit]
                 return {"skills": skills, "count": len(skills)}
             if action == "load":
-                if review_job is not None:
-                    with self._learning_review_skill_read_boundary(
+                if is_review:
+                    with self._learning_review_read_boundary(
                         context, raw_scope_key
                     ):
                         skill = self.skills.load(scope.scope_key, skill_id)
                         if skill.get("enabled") is not True:
                             raise ServiceError(409, "Agent skill is disabled")
                         read_key = (
-                            review_job.id,
+                            int(context["review_job_id"]),
                             str(context.get("run_id") or ""),
                         )
                         with self._learning_skill_reads_lock:
@@ -10449,8 +10284,8 @@ class EnterpriseService:
                         raise ServiceError(409, "Agent skill is disabled")
                 return {"skill": self._public_user_skill(skill)}
             if action == "read":
-                if review_job is not None:
-                    with self._learning_review_skill_read_boundary(
+                if is_review:
+                    with self._learning_review_read_boundary(
                         context, raw_scope_key
                     ):
                         skill = self.skills.get(scope.scope_key, skill_id)
@@ -10462,7 +10297,7 @@ class EnterpriseService:
                             str(arguments.get("file_path") or ""),
                         )
                         read_key = (
-                            review_job.id,
+                            int(context["review_job_id"]),
                             str(context.get("run_id") or ""),
                         )
                         with self._learning_skill_reads_lock:
@@ -10489,7 +10324,7 @@ class EnterpriseService:
                     "tags": arguments.get("tags"),
                     "enabled": True,
                 }
-                if review_job is not None:
+                if is_review:
                     with self._learning_review_skill_mutation_boundary(
                         context, raw_scope_key
                     ):
@@ -10519,11 +10354,11 @@ class EnterpriseService:
                         else arguments.get("expected_replacements")
                     ),
                 }
-                if review_job is not None:
-                    read_key = (review_job.id, str(context.get("run_id") or ""))
+                if is_review:
                     with self._learning_review_skill_mutation_boundary(
                         context, raw_scope_key
                     ):
+                        read_key = (int(context["review_job_id"]), str(context.get("run_id") or ""))
                         with self._learning_skill_reads_lock:
                             # The ledger entry is a same-process grant, while
                             # the surrounding boundary rechecks every durable
@@ -11653,21 +11488,6 @@ class EnterpriseService:
                     released += 1
         return released
 
-    def _enqueue_after_browser_assistance_handoff(
-        self,
-        task: dict[str, Any],
-        root_scope_key: str,
-        owner_user_id: int,
-    ) -> dict[str, Any]:
-        """Atomically hand browser control back before making Agent work runnable."""
-
-        with self._agent_browser_operation_lock(root_scope_key):
-            self._release_owned_browser_assistance_serialized(
-                root_scope_key,
-                owner_user_id,
-            )
-            return self._enqueue_agent_reply(task)
-
     def browser_preview(
         self,
         actor: dict[str, Any],
@@ -12773,9 +12593,6 @@ class EnterpriseService:
     ) -> DurableJob | None:
         """Fail closed unless this is the owner's current interactive private run."""
 
-        if str(body.get("review_mode") or "").strip():
-            return self._validate_learning_review_context(body, scope_key)
-
         scope = self.agent_scopes.get_scope(scope_key)
         if (
             scope is None
@@ -12818,56 +12635,6 @@ class EnterpriseService:
             )
         return None
 
-    def _validate_learning_review_context(
-        self,
-        context: dict[str, Any],
-        scope_key: str,
-    ) -> DurableJob:
-        """Validate every trusted field before granting review-only writes."""
-
-        scope = self.agent_scopes.get_scope(scope_key)
-        try:
-            review_job_id = int(context.get("review_job_id"))
-            owner_user_id = int(context.get("owner_user_id"))
-            source_message_id = int(
-                context.get("source_message_id") or context.get("source_message_key")
-            )
-            delegation_depth = int(context.get("delegation_depth") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ServiceError(403, "learning review context is invalid") from exc
-        lifecycle_id = str(context.get("lifecycle_id") or "").strip()
-        run_id = str(context.get("run_id") or "").strip()
-        parent_run_id = str(context.get("parent_run_id") or "").strip()
-        actor = self.get_user(owner_user_id)
-        if (
-            scope is None
-            or scope.scope_type != "private"
-            or scope.scope_key != scope_key
-            or str(scope.scope_id) != str(owner_user_id)
-            or lifecycle_id != scope.lifecycle_id
-            or actor is None
-            or not actor.get("active")
-            or PERMISSION_PRIVATE_AGENT not in set(actor.get("permissions") or [])
-            or str(context.get("review_mode") or "").strip() != "memory_skill"
-            or str(context.get("trigger") or "").strip() != "learning_review"
-            or context.get("unattended") is not True
-            or review_job_id <= 0
-            or source_message_id <= 0
-            or delegation_depth != 0
-            or parent_run_id
-            or not run_id
-        ):
-            raise ServiceError(403, "learning review context is not authorized")
-        job = self.jobs.get(review_job_id)
-        if not self.learning_reviews.context_matches(
-            job,
-            scope_key=scope_key,
-            lifecycle_id=lifecycle_id,
-            owner_user_id=owner_user_id,
-            source_message_id=source_message_id,
-        ):
-            raise ServiceError(403, "learning review job is not active")
-        return job
 
     def _revalidate_learning_review_mutation_context(
         self,
@@ -13016,20 +12783,19 @@ class EnterpriseService:
             """,
             (source_message_id, str(owner_user_id), owner_user_id),
         ).fetchone()
-        run_row = conn.execute(
-            """
-            SELECT inputs.message_id
-            FROM agent_run_inputs AS inputs
-            JOIN durable_jobs AS parent ON parent.id = inputs.parent_job_id
-            WHERE inputs.message_id = ?
-              AND inputs.runtime_run_id = ?
-              AND parent.kind = 'agent'
-              AND parent.status = 'running'
-              AND parent.scope_type = 'private'
-              AND parent.scope_id = ?
-            """,
-            (source_message_id, run_id, str(owner_user_id)),
-        ).fetchone()
+        # The input store reads this thread's transaction and handles both the
+        # durable job payload and legacy rows without a second identity ledger.
+        source_input = self.agent_inputs.get_by_message(source_message_id)
+        run_row = None
+        if source_input is not None and source_input.runtime_run_id == run_id:
+            run_row = conn.execute(
+                """
+                SELECT id FROM durable_jobs
+                WHERE id = ? AND kind = 'agent' AND status = 'running'
+                  AND scope_type = 'private' AND scope_id = ?
+                """,
+                (source_input.parent_job_id, str(owner_user_id)),
+            ).fetchone()
         actor_group = (
             public_permission_group(dict(actor_row)) if actor_row is not None else ""
         )
@@ -13070,7 +12836,7 @@ class EnterpriseService:
             raise ServiceError(409, str(exc)) from exc
 
     @contextmanager
-    def _learning_review_memory_read_boundary(
+    def _learning_review_read_boundary(
         self,
         context: dict[str, Any],
         scope_key: str,
@@ -13088,29 +12854,6 @@ class EnterpriseService:
                     conn, context, scope_key
                 )
                 yield conn
-        finally:
-            start_lock.release()
-
-    @contextmanager
-    def _learning_review_skill_read_boundary(
-        self,
-        context: dict[str, Any],
-        scope_key: str,
-    ):
-        """Linearize review authorization with Skill reads and read-ledger writes."""
-
-        start_lock = self._agent_run_start_lock(scope_key)
-        with self._conversation_lock:
-            start_lock.acquire()
-        try:
-            # Keep this write-serialized snapshot open across the bounded Skill
-            # filesystem read and read-ledger registration. Revocation, reset,
-            # and job settlement therefore occur wholly before or after it.
-            with self.db.transaction(immediate=True) as conn:
-                self._revalidate_learning_review_mutation_context(
-                    conn, context, scope_key
-                )
-                yield
         finally:
             start_lock.release()
 
@@ -14795,7 +14538,9 @@ class EnterpriseService:
         scope_type, scope_id = self._normalize_conversation(actor, scope_type, scope_id)
         key = self._conversation_key(scope_type, scope_id)
         with self._conversation_lock:
-            status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
+            status = self._agent_status_from_ledger_locked(scope_type, scope_id)
+            if status is None:
+                status = self._idle_agent_status(scope_type, scope_id)
             result = self._copy_status(status)
         result["jobs"] = self.jobs.counts(
             kind="agent", scope_type=scope_type, scope_id=scope_id
@@ -14846,7 +14591,7 @@ class EnterpriseService:
                             require_permission(actor, PERMISSION_CHAT)
                         busy = bool(
                             self._agent_active_tasks.get(conversation_key)
-                            or self._agent_queues.get(conversation_key)
+                            or self._queued_agent_tasks(conversation_key)
                             or (
                                 self._agent_workers.get(conversation_key)
                                 and self._agent_workers[conversation_key].is_alive()
@@ -14988,13 +14733,30 @@ class EnterpriseService:
                 exclude_user_id=exclude_user_id,
             )
 
+    def _agent_status_from_ledger_locked(
+        self, scope_type: str, scope_id: str,
+    ) -> dict[str, Any] | None:
+        key = self._conversation_key(scope_type, scope_id)
+        status = self._agent_status.get(key)
+        if status is None or status.get("state") == "idle":
+            counts = self.jobs.counts(kind="agent", scope_type=scope_type, scope_id=scope_id)
+            if counts["queued"] or counts["running"]:
+                status = self._idle_agent_status(scope_type, scope_id)
+                status["state"] = "replying" if counts["running"] else "queued"
+                status["queued_count"] = counts["queued"]
+                self._agent_status[key] = status
+        return status
+
     def wait_for_agent_idle(self, scope_type: str, scope_id: str, timeout: float = 5) -> dict[str, Any]:
         key = self._conversation_key(scope_type, str(scope_id))
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._conversation_lock:
                 worker = self._agent_workers.get(key)
-                status = self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+                status = self._copy_status(
+                    self._agent_status_from_ledger_locked(scope_type, str(scope_id))
+                    or self._idle_agent_status(scope_type, str(scope_id))
+                )
             if status["state"] == "idle" and (worker is None or not worker.is_alive()):
                 return status
             if worker is not None:
@@ -15002,7 +14764,10 @@ class EnterpriseService:
             else:
                 time.sleep(0.05)
         with self._conversation_lock:
-            return self._copy_status(self._agent_status.get(key) or self._idle_agent_status(scope_type, str(scope_id)))
+            return self._copy_status(
+                self._agent_status_from_ledger_locked(scope_type, str(scope_id))
+                or self._idle_agent_status(scope_type, str(scope_id))
+            )
 
     def _prune_agent_status_locked(self) -> None:
         """Drop the oldest idle conversation statuses once the cap is exceeded.
@@ -15017,7 +14782,7 @@ class EnterpriseService:
             (status.get("updated_at") or 0, key)
             for key, status in self._agent_status.items()
             if status.get("state") == "idle"
-            and not self._agent_queues.get(key)
+            and not self._queued_agent_tasks(key)
             and not (self._agent_workers.get(key) and self._agent_workers[key].is_alive())
         ]
         prunable.sort()
@@ -15089,7 +14854,10 @@ class EnterpriseService:
             if joined is not None:
                 return joined
         with self._conversation_lock:
-            was_busy = bool(self._agent_active_tasks.get(key) or self._agent_queues.get(key))
+            was_busy = bool(
+                self._agent_active_tasks.get(key)
+                or any(item["_job_id"] != job.id for item in self._queued_agent_tasks(key))
+            )
         try:
             status = self._schedule_agent_task(task, enforce_limit=True)
         except Exception as exc:
@@ -15111,7 +14879,7 @@ class EnterpriseService:
         with self._conversation_lock:
             parent = self._agent_active_tasks.get(key)
             pending_root_claim = False
-            queue = self._agent_queues.get(key)
+            queue = self._queued_agent_tasks(key)
             if parent is None and queue:
                 candidate = queue[0]
                 if candidate.get("_admission_pending_claim"):
@@ -15128,6 +14896,8 @@ class EnterpriseService:
                 return None
             group_id = str(parent.get("_input_group_id") or "")
             parent_job_id = int(parent.get("_job_id") or 0)
+            if pending_root_claim and child_job_id == parent_job_id:
+                return None
             joined_tasks = list(parent.get("_joined_input_tasks") or [])
             queued_behind_parent = max(0, len(queue or ()) - (1 if pending_root_claim else 0))
             outstanding = (
@@ -15159,10 +14929,12 @@ class EnterpriseService:
             child["_input_group_id"] = group_id
             child["_processing_mode"] = "joined"
             if pending_root_claim:
-                # The root durable job is still queued and has not been claimed.
-                # Keep the child queued too; the worker atomically claims both
-                # only after it owns the root. A crash here safely recovers the
-                # child as ordinary standalone queued work.
+                association = self.agent_inputs.reserve_pending(
+                    message_id=child_message_id, job_id=child_job_id,
+                    parent_job_id=parent_job_id, input_group_id=group_id,
+                )
+                if association is None:
+                    return None
                 child["_pending_input_claim"] = True
                 joined_tasks.append(child)
                 parent["_joined_input_tasks"] = joined_tasks
@@ -15409,13 +15181,7 @@ class EnterpriseService:
             return
         key = self._conversation_key("private", str(child["scope_id"]))
         with self._conversation_lock:
-            queue = self._agent_queues.setdefault(key, deque())
-            if not any(int(item.get("_job_id") or 0) == job_id for item in queue):
-                fallback = dict(child)
-                fallback["_input_group_id"] = f"agent:{job_id}"
-                fallback["_processing_mode"] = "queued"
-                fallback.pop("_pending_input_claim", None)
-                self._insert_agent_queue_by_job_id_locked(queue, fallback)
+            queue = self._queued_agent_tasks(key)
             status = dict(
                 self._agent_status.get(key)
                 or self._status_for_task(parent, "replying", queued_count=len(queue))
@@ -15605,55 +15371,47 @@ class EnterpriseService:
         task.setdefault("_input_submit_lock", threading.Lock())
         task["_admission_pending_claim"] = True
 
-    @staticmethod
-    def _insert_agent_queue_by_job_id_locked(
-        queue: Deque[dict[str, Any]],
-        task: dict[str, Any],
-    ) -> None:
-        """Insert fallback work at its durable ingress position."""
-
-        job_id = int(task.get("_job_id") or 0)
-        if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):
-            return
-        items = list(queue)
-        position = len(items)
-        if job_id:
-            for index, item in enumerate(items):
-                queued_job_id = int(item.get("_job_id") or 0)
-                if queued_job_id and queued_job_id > job_id:
-                    position = index
-                    break
-        items.insert(position, task)
-        queue.clear()
-        queue.extend(items)
-
-    def _release_pending_root_inputs_locked(
-        self,
-        task: dict[str, Any],
-        queue: Deque[dict[str, Any]],
-    ) -> None:
-        """Return never-claimed children to the standalone FIFO."""
-
-        for child in list(task.get("_joined_input_tasks") or []):
-            if not child.get("_pending_input_claim"):
+    def _queued_agent_tasks(self, key: str) -> list[dict[str, Any]]:
+        """Read FIFO ownership from SQLite; only running tasks live in memory."""
+        scope_type, scope_id = self._split_conversation_key(key)
+        tasks = {}
+        for job in self.jobs.queued_for_scope("agent", scope_type, scope_id):
+            task = self._task_from_durable_agent_job(job)
+            if task is None:
+                self.jobs.mark_failed(job.id, "durable Agent payload is no longer valid")
                 continue
-            fallback = dict(child)
-            fallback.pop("_pending_input_claim", None)
-            fallback["_input_group_id"] = f"agent:{int(fallback['_job_id'])}"
-            fallback["_processing_mode"] = "queued"
-            fallback["_accepting_inputs"] = False
-            self._insert_agent_queue_by_job_id_locked(queue, fallback)
+            task["_input"] = job.payload.get("_input") or {}
+            task["_job_id"] = job.id
+            task["_available_at"] = job.available_at
+            task["_scope_epoch"] = int(self._agent_scope_epochs.get(key, 0))
+            tasks[task["_job_id"]] = task
+        roots = []
+        for task in tasks.values():
+            association = task.get("_input") or {}
+            parent_id = int(association.get("parent_job_id") or 0)
+            parent = tasks.get(parent_id)
+            if parent is not None and parent is not task and association.get("state") == "reserved":
+                task["_pending_input_claim"] = True
+                task["_input_group_id"] = association["input_group_id"]
+                task["_processing_mode"] = "joined"
+                parent.setdefault("_joined_input_tasks", []).append(task)
+            else:
+                roots.append(task)
+        if roots:
+            self._prepare_private_input_admission(roots[0], roots[0]["_job_id"])
+        return roots
+
+    def _release_pending_root_inputs_locked(self, task: dict[str, Any]) -> None:
+        for child in list(task.get("_joined_input_tasks") or []):
+            if child.get("_pending_input_claim"):
+                self.agent_inputs.transition(
+                    int(child["user_message"]["id"]), "unconsumed",
+                    allowed_from=("reserved",),
+                )
         task["_joined_input_tasks"] = [
-            child
-            for child in list(task.get("_joined_input_tasks") or [])
+            child for child in task.get("_joined_input_tasks", [])
             if not child.get("_pending_input_claim")
         ]
-        if queue:
-            first = queue[0]
-            self._prepare_private_input_admission(
-                first,
-                int(first.get("_job_id") or 0),
-            )
 
     def _schedule_agent_task(self, task: dict[str, Any], *, enforce_limit: bool) -> dict[str, Any]:
         scope_type = str(task["scope_type"])
@@ -15664,18 +15422,11 @@ class EnterpriseService:
                 raise ServiceError(503, "service is shutting down")
             if scope_type == "channel":
                 self.get_channel(task.get("actor") or {}, int(scope_id))
-            queue = self._agent_queues.setdefault(key, deque())
-            job_id = int(task.get("_job_id") or 0)
-            if job_id and any(int(item.get("_job_id") or 0) == job_id for item in queue):
-                status = self._agent_status.get(key) or self._idle_agent_status(scope_type, scope_id)
-                return self._copy_status(status)
+            queue = self._queued_agent_tasks(key)
             active = self._agent_active_tasks.get(key)
             joined_count = self._active_joined_input_count(active or {})
-            if enforce_limit and len(queue) + joined_count >= MAX_AGENT_QUEUE_DEPTH:
+            if enforce_limit and len(queue) + joined_count > MAX_AGENT_QUEUE_DEPTH:
                 raise ServiceError(429, "agent is busy; too many queued messages for this conversation")
-            if not active and not queue:
-                self._prepare_private_input_admission(task, job_id)
-            queue.append(task)
             status = self._agent_status.get(key)
             if not status or status.get("state") == "idle":
                 status = self._status_for_task(task, "queued", queued_count=len(queue))
@@ -15708,27 +15459,46 @@ class EnterpriseService:
     def _start_deferred_agent_workers_locked(self) -> None:
         """Resume recovered queues only after durable maintenance has ended."""
 
-        if self._auto_update_reserved or self._closed:
+        if self._closed:
             return
-        for key, queue in list(self._agent_queues.items()):
-            if queue:
-                self._start_agent_worker_locked(key)
+        for row in self.db.query(
+            "SELECT DISTINCT scope_type, scope_id FROM durable_jobs "
+            "WHERE kind = 'agent' AND status = 'queued'"
+        ):
+            key = self._conversation_key(row["scope_type"], row["scope_id"])
+            queue = self._queued_agent_tasks(key)
+            if queue and not self._agent_active_tasks.get(key):
+                self._agent_status[key] = self._status_for_task(
+                    queue[0], "queued", queued_count=len(queue)
+                )
+            self._start_agent_worker_locked(key)
 
     def _agent_worker(self, key: str) -> None:
-        # Wrapped in try/finally so the worker is always unregistered (and any
-        # empty queue dropped) even on an unexpected BaseException, preventing a
-        # conversation from being stuck in a non-idle state with a dead worker.
+        # The thread serializes this scope; SQLite owns every queued task.
+        delay = 0
         try:
             while True:
+                if delay:
+                    time.sleep(min(delay, 0.25))
+                    delay = 0
                 with self._conversation_lock:
-                    queue = self._agent_queues.get(key)
-                    if self._closed or not queue:
+                    queue = self._queued_agent_tasks(key)
+                    if self._closed or self._auto_update_reserved or not queue:
                         scope_type, scope_id = self._split_conversation_key(key)
-                        self._agent_status[key] = self._idle_agent_status(scope_type, scope_id)
+                        self._agent_status[key] = (
+                            self._status_for_task(queue[0], "queued", queued_count=len(queue))
+                            if queue else self._idle_agent_status(scope_type, scope_id)
+                        )
                         self._drop_empty_conversation_maps_locked(key)
                         self._agent_workers.pop(key, None)
                         return
-                    task = queue.popleft()
+                    task = queue.pop(0)
+                    delay = max(0, int(task["_available_at"]) - now_ts())
+                    if delay:
+                        self._agent_status[key] = self._status_for_task(
+                            task, "queued", queued_count=len(queue) + 1
+                        )
+                        continue
                     job_id = int(task.get("_job_id") or 0)
                     preparation_error: Exception | None = None
                     try:
@@ -15736,7 +15506,7 @@ class EnterpriseService:
                             # Another worker (or a terminal transition) already owns
                             # this ledger entry. Never execute a side-effectful Agent
                             # run unless this worker atomically claimed it.
-                            self._release_pending_root_inputs_locked(task, queue)
+                            self._release_pending_root_inputs_locked(task)
                             continue
                         if (
                             str(task.get("scope_type")) == "private"
@@ -15780,14 +15550,10 @@ class EnterpriseService:
                                 claimed_children.append(claimed)
                             task["_joined_input_tasks"] = claimed_children
                             for child in unclaimed_children:
-                                fallback = dict(child)
-                                fallback.pop("_pending_input_claim", None)
-                                fallback["_input_group_id"] = (
-                                    f"agent:{int(fallback['_job_id'])}"
+                                self.agent_inputs.transition(
+                                    int(child["user_message"]["id"]), "unconsumed",
+                                    allowed_from=("reserved",),
                                 )
-                                fallback["_processing_mode"] = "queued"
-                                fallback["_accepting_inputs"] = False
-                                self._insert_agent_queue_by_job_id_locked(queue, fallback)
                         else:
                             task["_accepting_inputs"] = False
                         self._update_schedule_run_for_task(task, "running")
@@ -15796,7 +15562,7 @@ class EnterpriseService:
                         # failure path, retaining independent queued input owners.
                         preparation_error = exc
                         task["_accepting_inputs"] = False
-                        self._release_pending_root_inputs_locked(task, queue)
+                        self._release_pending_root_inputs_locked(task)
                     self._agent_active_tasks[key] = task
                     self._agent_status[key] = self._status_for_task(task, "replying", queued_count=len(queue))
 
@@ -15846,7 +15612,6 @@ class EnterpriseService:
                                 owner_user_id=int(learning_candidate["owner_user_id"]),
                                 source_message_id=int(learning_candidate["source_message_id"]),
                                 response_message_id=int(learning_candidate["response_message_id"]),
-                                tool_calls=int(learning_candidate.get("tool_calls") or 0),
                                 tool_trace=list(learning_candidate.get("tool_trace") or ()),
                             )
                             ledger_succeeded = completion.succeeded
@@ -16008,7 +15773,7 @@ class EnterpriseService:
 
                 with self._conversation_lock:
                     self._agent_active_tasks.pop(key, None)
-                    queue = self._agent_queues.get(key)
+                    queue = self._queued_agent_tasks(key)
                     if queue:
                         self._agent_status[key] = self._status_for_task(queue[0], "queued", queued_count=len(queue))
                         continue
@@ -16043,8 +15808,6 @@ class EnterpriseService:
                 self._agent_active_tasks.pop(key, None)
                 if worker is None or worker is threading.current_thread():
                     self._agent_workers.pop(key, None)
-                    if not self._agent_queues.get(key):
-                        self._agent_queues.pop(key, None)
     def _update_schedule_run_for_task(
         self,
         task: dict[str, Any],
@@ -16060,21 +15823,14 @@ class EnterpriseService:
         if run_id <= 0:
             return
         try:
-            if status in {"needs_review", "blocked"}:
-                self.schedules.update_run_status_and_pause_current_schedule(
-                    run_id,
-                    status,
-                    response_message_id=response_message_id,
-                    error=error,
-                )
+            pause = status in {"needs_review", "blocked"}
+            update = (
+                self.schedules.update_run_status_and_pause_current_schedule
+                if pause else self.schedules.update_run_status
+            )
+            update(run_id, status, response_message_id=response_message_id, error=error)
+            if pause:
                 self._schedule_wakeup.set()
-            else:
-                self.schedules.update_run_status(
-                    run_id,
-                    status,
-                    response_message_id=response_message_id,
-                    error=error,
-                )
         except Exception as exc:
             print(f"Failed to update scheduled run {run_id}: {exc}", file=sys.stderr)
 
@@ -16085,8 +15841,6 @@ class EnterpriseService:
         bounded separately by ``_prune_agent_status_locked``; this keeps the
         unbounded companion maps (queues / typing) consistent with that cap.
         """
-        if not self._agent_queues.get(key):
-            self._agent_queues.pop(key, None)
         if not self._typing.get(key):
             self._typing.pop(key, None)
 
@@ -16510,18 +16264,6 @@ class EnterpriseService:
                         "detail": tool_work_projection.agent_tool_detail(event)[:500],
                     }
                 )
-        if (
-            event_type in {"tool.completed", "tool.failed"}
-            and event.get("execution_started") is not False
-        ):
-            tool_call_id = str(
-                event.get("tool_call_id")
-                or event.get("toolCallId")
-                or event.get("id")
-                or ""
-            ).strip()
-            if tool_call_id:
-                task.setdefault("_learning_tool_call_ids", set()).add(tool_call_id)
         if event_type in {"input.accepted", "input.injected", "input.unconsumed"}:
             self._record_joined_input_progress(task, event_type, event)
         if task.get("schedule_run_id"):
@@ -16824,13 +16566,8 @@ class EnterpriseService:
             )
             if same_tool_call_id and current.get("tool") != draft["tool"]:
                 return
-            same_tool = (
-                same_tool_call_id
-                and current.get("tool") == draft["tool"]
-            )
-            if same_tool and int(current.get("remote_revision") or 0) >= draft["remote_revision"]:
-                return
-            if draft["discarded"]:
+            if draft["done"]:
+                same_tool = same_tool_call_id and current.get("tool") == draft["tool"]
                 if not same_tool:
                     return
                 status.pop("_computer_file_draft", None)
@@ -17093,6 +16830,22 @@ class EnterpriseService:
             self._typing.pop(key, None)
         return result
 
+    @contextmanager
+    def _message_transaction(self):
+        """Commit message, attachments and queued work before dispatching."""
+        markers: list[Path] = []
+        with self._attachment_lock:
+            try:
+                with self.db.transaction(immediate=True) as conn:
+                    yield conn, markers
+            finally:
+                for marker in markers:
+                    try:
+                        self._cleanup_attachment_commit(marker)
+                    except OSError:
+                        # Keep recovery identity when filesystem cleanup fails.
+                        pass
+
     def _append_message(
         self,
         *,
@@ -17106,6 +16859,8 @@ class EnterpriseService:
         attachments: list[UploadedFile] | None = None,
         attachment_source: str = "upload",
         attachment_uploader_user_id: int | None = None,
+        conn: sqlite3.Connection | None = None,
+        rollback_paths: list[Path] | None = None,
     ) -> dict[str, Any]:
         with self._attachment_lock:
             return self._append_message_with_attachments_locked(
@@ -17119,6 +16874,8 @@ class EnterpriseService:
                 attachments=attachments,
                 attachment_source=attachment_source,
                 attachment_uploader_user_id=attachment_uploader_user_id,
+                conn=conn,
+                rollback_paths=rollback_paths,
             )
 
     def _append_message_with_attachments_locked(
@@ -17134,26 +16891,27 @@ class EnterpriseService:
         attachments: list[UploadedFile] | None = None,
         attachment_source: str = "upload",
         attachment_uploader_user_id: int | None = None,
+        conn: sqlite3.Connection | None = None,
+        rollback_paths: list[Path] | None = None,
     ) -> dict[str, Any]:
         attachments = list(attachments or [])
         metadata = dict(metadata)
         if attachments:
             metadata["attachment_count"] = len(attachments)
         final_metadata = dict(metadata)
-        if attachments:
-            # The message row and attachment rows live in separate SQLite
-            # transactions because blob writes occur between them. Mark the row
-            # incomplete first; startup deletes any row left in this state by a
-            # hard process death, before durable Agent-gap recovery can execute
-            # a request with silently missing files.
+        if attachments and conn is None:
+            # Independent callers retain the existing crash-recovery marker.
+            # Transactional producers publish all rows together instead.
             metadata["_attachment_commit"] = "pending"
-        msg_id = self.db.insert(
+        execute = conn.execute if conn is not None else self.db.execute
+        cursor = execute(
             """
             INSERT INTO messages(scope_type, scope_id, author_type, user_id, username, content, metadata_json, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (scope_type, str(scope_id), author_type, user_id, username, content, encode_json(metadata), now_ts()),
         )
+        msg_id = int(cursor.lastrowid)
         if attachments:
             try:
                 self._store_attachments(
@@ -17167,12 +16925,16 @@ class EnterpriseService:
                     ),
                     source=attachment_source,
                     attachments=attachments,
+                    conn=conn,
+                    rollback_paths=rollback_paths,
                 )
-                self.db.execute(
+                execute(
                     "UPDATE messages SET metadata_json = ? WHERE id = ?",
                     (encode_json(final_metadata), int(msg_id)),
                 )
             except Exception:
+                if conn is not None:
+                    raise
                 # The message row is already committed with attachment_count=N
                 # but the blobs/rows failed to land. Remove the orphaned message
                 # (ON DELETE CASCADE clears any partial attachment rows) so we do
@@ -17257,6 +17019,8 @@ class EnterpriseService:
         uploader_user_id: int | None,
         source: str,
         attachments: list[UploadedFile],
+        conn: sqlite3.Connection | None = None,
+        rollback_paths: list[Path] | None = None,
     ) -> None:
         root = self._attachment_root()
         target_dir = root / scope_type / str(scope_id)
@@ -17264,11 +17028,21 @@ class EnterpriseService:
         ensure_private_directory(target_dir)
         timestamp = now_ts()
         written: list[Path] = []
+        storage_paths = [
+            f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}"
+            f"{safe_attachment_suffix(attachment.filename)}"
+            for attachment in attachments
+        ]
+        if rollback_paths is not None:
+            marker_root = ensure_private_directory(self.config.data_dir / "attachment-commits")
+            marker = marker_root / f"{secrets.token_urlsafe(18)}.json"
+            write_private_file_exclusive(marker, encode_json(storage_paths).encode("utf-8"))
+            rollback_paths.append(marker)
         try:
             # Serialize quota check + rows so concurrent uploads cannot all
             # pass an old SUM snapshot. Files are staged under owner-only
             # directories and removed if the transaction fails.
-            with self.db.transaction(immediate=True) as conn:
+            with (nullcontext(conn) if conn is not None else self.db.transaction(immediate=True)) as conn:
                 self._enforce_attachment_quota(
                     uploader_user_id,
                     attachments,
@@ -17277,9 +17051,7 @@ class EnterpriseService:
                     scope_id=str(scope_id),
                     source=source,
                 )
-                for attachment in attachments:
-                    ext = safe_attachment_suffix(attachment.filename)
-                    storage_path = f"{scope_type}/{scope_id}/{message_id}-{secrets.token_urlsafe(12)}{ext}"
+                for attachment, storage_path in zip(attachments, storage_paths):
                     target = root / storage_path
                     if attachment.staged_path is not None:
                         size_bytes, digest = copy_private_file_exclusive(
@@ -17471,8 +17243,57 @@ class EnterpriseService:
             except OSError:
                 pass
 
+    def _cleanup_attachment_commit(self, marker: Path) -> None:
+        """Recover only exact generated blobs, preserving committed references."""
+        marker_fd = open_private_directory_fd(marker.parent)
+        try:
+            raw, _ = read_private_file_at(marker_fd, marker.name, maximum_bytes=64 * 1024)
+            paths = json.loads(raw)
+            if not isinstance(paths, list) or len(paths) > MAX_ATTACHMENTS_PER_MESSAGE:
+                raise ValueError("invalid attachment commit manifest")
+            for value in paths:
+                if not isinstance(value, str) or not re.fullmatch(
+                    r"(?:private|channel)/[1-9][0-9]*/[1-9][0-9]*-[A-Za-z0-9_-]{16}"
+                    r"(?:\.[a-z0-9][a-z0-9._-]{0,22})?",
+                    value,
+                ):
+                    raise ValueError("invalid attachment commit path")
+            for value in paths:
+                if self.db.query_one("SELECT id FROM attachments WHERE storage_path = ?", (value,)):
+                    continue
+                path = self._attachment_root() / value
+                try:
+                    directory_fd = open_private_directory_fd(path.parent)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        os.unlink(path.name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            os.unlink(marker.name, dir_fd=marker_fd)
+            os.fsync(marker_fd)
+        finally:
+            os.close(marker_fd)
+
     def _cleanup_incomplete_attachment_messages(self) -> None:
         """Discard interrupted messages and only their possible orphan blobs."""
+        marker_root = ensure_private_directory(self.config.data_dir / "attachment-commits")
+        data_fd = open_private_directory_fd(self.config.data_dir)
+        try:
+            os.fsync(data_fd)
+        finally:
+            os.close(data_fd)
+        marker_fd = open_private_directory_fd(marker_root)
+        try:
+            for name in os.listdir(marker_fd):
+                if re.fullmatch(r"[A-Za-z0-9_-]{24}\.json", name):
+                    self._cleanup_attachment_commit(marker_root / name)
+        finally:
+            os.close(marker_fd)
 
         message_ids: list[int] = []
         for row in self.db.query(
@@ -18864,69 +18685,48 @@ def _validated_computer_file_draft(event: dict[str, Any]) -> dict[str, Any] | No
         return None
     if not isinstance(raw, dict) or raw.get("kind") != expected_kind:
         return None
-    revision = raw.get("revision")
-    if (
-        isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision <= 0
-        or revision > COMPUTER_FILE_DRAFT_REVISION_MAX
-    ):
-        return None
     workspace_path = raw.get("workspace_path")
     if not isinstance(workspace_path, str):
         return None
     relative = tool_work_projection.workspace_relative_path(workspace_path)
     if not relative or workspace_path != relative:
         return None
-    if not all(isinstance(raw.get(field), bool) for field in ("complete", "truncated", "discarded")):
+    if not all(isinstance(raw.get(field), bool) for field in ("done", "truncated")):
         return None
-    discarded = raw["discarded"]
-    if discarded:
-        if "content" in raw:
+    content = raw.get("content")
+    if not isinstance(content, str) or "\x00" in content:
+        return None
+    try:
+        if len(content.encode("utf-8")) > COMPUTER_FILE_DRAFT_MAX_BYTES:
             return None
-        content = ""
-        secondary_truncated = False
-    else:
-        content = raw.get("content")
-        if not isinstance(content, str) or "\x00" in content:
-            return None
-        try:
-            if len(content.encode("utf-8")) > COMPUTER_FILE_PREVIEW_MAX_BYTES:
-                return None
-        except UnicodeEncodeError:
-            return None
-        content = tool_work_projection._safe_tool_summary_text(
-            content,
-            limit=COMPUTER_FILE_PREVIEW_MAX_BYTES,
-            preserve_whitespace=True,
-            redact_paths=False,
-        )
-        encoded = content.encode("utf-8")
-        secondary_truncated = len(encoded) > COMPUTER_FILE_PREVIEW_MAX_BYTES
-        if secondary_truncated:
-            content = encoded[: COMPUTER_FILE_PREVIEW_MAX_BYTES - 3].decode(
-                "utf-8",
-                errors="ignore",
-            ).rstrip() + "…"
+    except UnicodeEncodeError:
+        return None
+    content = tool_work_projection._safe_tool_summary_text(
+        content,
+        limit=COMPUTER_FILE_DRAFT_MAX_BYTES,
+        preserve_whitespace=True,
+        redact_paths=False,
+    )
+    encoded = content.encode("utf-8")
+    secondary_truncated = len(encoded) > COMPUTER_FILE_DRAFT_MAX_BYTES
+    if secondary_truncated:
+        content = encoded[: COMPUTER_FILE_DRAFT_MAX_BYTES - 3].decode(
+            "utf-8",
+            errors="ignore",
+        ).rstrip() + "…"
     return {
         "tool": tool,
         "tool_call_id": tool_call_id,
         "workspace_path": relative,
         "draft_kind": expected_kind,
         "content": content,
-        "remote_revision": revision,
-        "complete": raw["complete"],
+        "done": raw["done"],
         "truncated": raw["truncated"] or secondary_truncated,
-        "discarded": discarded,
     }
 
 
-def _computer_file_draft_revision(draft: dict[str, Any]) -> str:
-    return f"draft:{draft['tool_call_id']}:{draft['remote_revision']}"
-
-
 def _computer_file_draft_clue(draft: Any) -> dict[str, Any] | None:
-    if not isinstance(draft, dict) or draft.get("discarded") is True:
+    if not isinstance(draft, dict):
         return None
     if draft.get("tool") not in COMPUTER_FILE_DRAFT_KINDS:
         return None
@@ -18937,8 +18737,9 @@ def _computer_file_draft_clue(draft: Any) -> dict[str, Any] | None:
         "target": "sandbox",
         "tool_call_id": draft["tool_call_id"],
         "workspace_path": draft["workspace_path"],
-        "status": "pending" if draft.get("complete") is True else "drafting",
-        "revision": _computer_file_draft_revision(draft),
+        "status": "drafting",
+        "done": draft["done"],
+        "truncated": draft["truncated"],
     }
 
 

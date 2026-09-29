@@ -742,7 +742,7 @@ function useRunFocusHandoff(runId: string, replaceable: boolean, triggerRef: Ref
       if (!headers.size && registry.headers.get(runId) === headers) registry.headers.delete(runId);
     };
   }, [runId, sectionRef, store, triggerRef]);
-  // On unmount only: hand focus inside a live or settling record to the same run's next header.
+  // On unmount only: hand focus inside a live record to the same run's next header.
   useLayoutEffect(() => {
     const section = sectionRef.current;
     const log = section?.closest<HTMLElement>('[role="log"]');
@@ -777,14 +777,12 @@ function useRunFocusHandoff(runId: string, replaceable: boolean, triggerRef: Ref
 /**
  * Live runs open by default and can be folded to a one-line summary of the current task; a settled
  * run starts folded and remembers its disclosure per run in the store. The live choice is local, so
- * settling collapses exactly once (in place, or by remounting as the persisted record) and later
- * updates never re-collapse or re-open it. `settling` marks a finished run shown until its persisted
- * record replaces it; like a live record, it hands focus to that successor.
+ * completion collapses exactly once (in place, or by remounting as the persisted record) and later
+ * updates never re-collapse or re-open it.
  */
-export function AgentWorkCard({ work, active, settling = false, statusText = "" }: {
+export function AgentWorkCard({ work, active, statusText = "" }: {
   work: Work;
   active: boolean;
-  settling?: boolean;
   /** Live status wording for the header's description; the caller knows the conversation. */
   statusText?: string;
 }) {
@@ -798,7 +796,7 @@ export function AgentWorkCard({ work, active, settling = false, statusText = "" 
   const panelId = useId();
   const statusId = useId();
   const sectionRef = useRef<HTMLElement>(null);
-  useRunFocusHandoff(runId, active || settling, disclosure.triggerRef, sectionRef);
+  useRunFocusHandoff(runId, active, disclosure.triggerRef, sectionRef);
   const elapsedSeconds = useElapsedSeconds(work.started_at, active, runId);
   if (!hasAgentProcessSteps(work)) return null;
 

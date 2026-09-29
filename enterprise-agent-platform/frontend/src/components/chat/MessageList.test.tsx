@@ -203,27 +203,6 @@ describe("MessageList Agent work records", () => {
     expect(screen.queryByRole("region", { name: "AI work" })).not.toBeNull();
   });
 
-  it("deduplicates finalized commentary and prefers the live version of a repeated stream identity", () => {
-    const phase = "The documents are checked.";
-    renderMessageList({
-      run_id: "run-transition",
-      state: "replying",
-      activity: [
-        { stage: "assistant.message", line: phase, detail: phase, sequence: 1 },
-        { stage: "tool.completed", tool: "read_file", tool_call_id: "read-transition", tool_status: "completed", sequence: 2 },
-      ],
-      stream_messages: [
-        { id: "phase-buffer", content: phase },
-        { id: "answer-buffer", content: "Obsolete partial answer" },
-      ],
-      stream_message: { id: "answer-buffer", content: "Current final answer", active: true },
-    });
-
-    expect(screen.getAllByText(phase)).toHaveLength(1);
-    expect(screen.getAllByText("Current final answer")).toHaveLength(1);
-    expect(screen.queryByText("Obsolete partial answer")).toBeNull();
-    expect(within(screen.getByRole("region", { name: "AI work" })).queryByText("Current final answer")).toBeNull();
-  });
 
   it("keeps a folded live record folded and above the answer when the final response starts streaming", () => {
     const initialStatus: AgentStatus = {
@@ -306,84 +285,39 @@ describe("MessageList Agent work records", () => {
     expect(screen.getByText("Report ready")).toBeVisible();
   });
 
-  it("keeps the finished reply on screen until its persisted message arrives", () => {
-    const activity: AgentStatus["activity"] = [
-      { stage: "tool.completed", tool: "terminal", tool_call_id: "terminal-gap", tool_status: "completed", parameters: { command: "make report" }, result: "done" },
-    ];
-    const live: AgentStatus = {
-      run_id: "run-gap",
-      state: "replying",
+  it("renders the current stream alongside approval and clears it when Platform withdraws it", () => {
+    const status: AgentStatus = {
+      run_id: "run-approval-stream",
+      state: "approval",
       updated_at: 100,
-      activity,
-      stream_message: { id: "stream-gap", content: "Quarterly report is ready", updated_at: 100 },
+      stream_message: { id: "reply", content: "Checking the deployment", active: true },
+      approval: { approval_id: "approval-stream", description: "Deploy the service", choices: ["once", "deny"] },
+      activity: [{ stage: "tool", tool: "terminal", tool_call_id: "deploy", tool_status: "running", parameters: { command: "deploy service" } }],
     };
-    const view = renderMessageList(live, [], "private");
-    expect(screen.getByText("Quarterly report is ready")).toBeVisible();
-
-    act(() => {
-      view.store.dispatch({
-        type: "SET_AGENT_STATUS",
-        payload: { mode: "private", scopeId: "1", status: { run_id: "", state: "idle", updated_at: 101 } },
-      });
-    });
-    expect(screen.getByText("Quarterly report is ready")).toBeVisible();
-    expect(screen.getAllByRole("region", { name: "AI work" })).toHaveLength(1);
-
-    act(() => {
-      view.store.dispatch({
-        type: "SET_PRIVATE_MESSAGES",
-        payload: [{
-          id: 45,
-          author_type: "agent",
-          username: "Private Agent",
-          content: "Quarterly report is ready",
-          metadata: { agent_work: { run_id: "run-gap", state: "complete", activity } },
-          created_at: 101,
-        }],
-      });
-    });
-    expect(screen.getAllByText("Quarterly report is ready")).toHaveLength(1);
+    const view = renderMessageList(status);
+    expect(screen.getByText("Checking the deployment")).toBeVisible();
+    expect(screen.getByText("Access approval")).toBeVisible();
+    expect(screen.getByRole("region", { name: "AI work" })).toBeVisible();
+    act(() => view.store.dispatch({
+      type: "SET_AGENT_STATUS",
+      payload: { mode: "channel", scopeId: "1", status: { ...status, updated_at: 101, stream_message: { id: "reply", content: "Deployment is authorized", active: true } } },
+    }));
+    expect(screen.queryByText("Checking the deployment")).toBeNull();
+    expect(screen.getByText("Deployment is authorized")).toBeVisible();
+    act(() => view.store.dispatch({
+      type: "SET_AGENT_STATUS",
+      payload: { mode: "channel", scopeId: "1", status: { state: "idle", updated_at: 102 } },
+    }));
+    expect(screen.queryByText("Deployment is authorized")).toBeNull();
+    expect(screen.queryByText("Access approval")).toBeNull();
+    act(() => view.store.dispatch({
+      type: "SET_MESSAGES",
+      payload: [{ id: 46, author_type: "agent", username: "Agent", content: "Deployment completed", metadata: { agent_work: { run_id: status.run_id, state: "complete", activity: [{ ...status.activity![0], tool_status: "completed" }] } } }],
+    }));
+    expect(screen.getByText("Deployment completed")).toBeVisible();
     expect(screen.getAllByRole("region", { name: "AI work" })).toHaveLength(1);
   });
 
-  it("keeps the finished reply above the next queued run until it is persisted", () => {
-    const view = renderMessageList({
-      run_id: "run-first",
-      state: "replying",
-      updated_at: 100,
-      stream_message: { id: "stream-first", content: "First answer", updated_at: 100 },
-    });
-    act(() => {
-      view.store.dispatch({
-        type: "SET_AGENT_STATUS",
-        payload: { mode: "channel", scopeId: "1", status: { run_id: "run-second", state: "queued", updated_at: 101, queued_count: 1 } },
-      });
-    });
-    expect(screen.getByText("First answer")).toBeVisible();
-  });
-
-  it("drops an unpersisted finished reply after the settle window", () => {
-    vi.useFakeTimers();
-    try {
-      const view = renderMessageList({
-        run_id: "run-lost",
-        state: "replying",
-        updated_at: 100,
-        stream_message: { id: "stream-lost", content: "Never persisted", updated_at: 100 },
-      });
-      act(() => {
-        view.store.dispatch({
-          type: "SET_AGENT_STATUS",
-          payload: { mode: "channel", scopeId: "1", status: { run_id: "", state: "idle", updated_at: 101 } },
-        });
-      });
-      expect(screen.getByText("Never persisted")).toBeVisible();
-      act(() => { vi.advanceTimersByTime(20_000); });
-      expect(screen.queryByText("Never persisted")).toBeNull();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
 
   it.each([
     { order: "in one update", steps: ["both"] },
@@ -563,53 +497,6 @@ describe("MessageList Agent work records", () => {
     expect(screen.queryByText("Agent is replying to Administrator")).toBeNull();
   });
 
-  it("hides an obsolete streamed draft after a newer steering turn starts", () => {
-    renderMessageList({
-      state: "replying",
-      stream_messages: [
-        {
-          id: "old-turn",
-          content: "obsolete draft",
-          turn_id: "run:1",
-          turn_index: 1,
-          active: false,
-        },
-      ],
-      stream_message: {
-        id: "new-turn",
-        content: "consolidated answer",
-        turn_id: "run:2",
-        turn_index: 2,
-        active: true,
-      },
-    });
-
-    expect(screen.queryByText("obsolete draft")).toBeNull();
-    expect(screen.getByText("consolidated answer")).toBeTruthy();
-  });
-
-  it("prefers the live draft when turn metadata is only partially available", () => {
-    renderMessageList({
-      state: "replying",
-      stream_messages: [
-        {
-          id: "tagged-old-turn",
-          content: "tagged obsolete draft",
-          turn_id: "run:1",
-          turn_index: 1,
-          active: false,
-        },
-      ],
-      stream_message: {
-        id: "untagged-live-turn",
-        content: "live consolidated answer",
-        active: true,
-      },
-    });
-
-    expect(screen.queryByText("tagged obsolete draft")).toBeNull();
-    expect(screen.getByText("live consolidated answer")).toBeTruthy();
-  });
   it("announces a newly persisted member message once but not hydration or older history", () => {
     const initial: Message = { id: 20, author_type: "user", user_id: 2, username: "Alice", content: "Existing conversation" };
     const incoming: Message = { id: 21, author_type: "user", user_id: 2, username: "Alice", content: "New member message" };

@@ -1244,13 +1244,12 @@ class SkillStore:
         try:
             sidecar_path.lstat()
         except FileNotFoundError:
-            # Portable Skill packages installed by other clients commonly
-            # contain only SKILL.md. Validate the complete untrusted document
-            # before publishing Platform-owned lifecycle metadata.
+            # SKILL.md is the catalog. Import only the small UI/identity sidecar;
+            # usage defaults are derived until there is an actual usage event.
             self._read_document(skill_dir, check_instruction_threats=True)
             self._scan_linked_files(skill_dir, check_sensitive_material=True)
             scope_dir = skill_dir.parent
-            usage_state, old_usage_bytes = self._read_usage_state_snapshot(scope_dir)
+            usage_state, _ = self._read_usage_state_snapshot(scope_dir)
             timestamp = _utc_now()
             sidecar = {
                 "schema_version": 1,
@@ -1258,31 +1257,16 @@ class SkillStore:
                 "enabled": True,
                 "created_at": timestamp,
                 "updated_at": timestamp,
-                "package_dev": int(
-                    os.fstat(self._operation.paths[str(skill_dir)]).st_dev
-                ),
-                "package_ino": int(
-                    os.fstat(self._operation.paths[str(skill_dir)]).st_ino
-                ),
-                "package_ctime_ns": int(
-                    os.fstat(self._operation.paths[str(skill_dir)]).st_ctime_ns
-                ),
+                **self._bind_sidecar({}, skill_dir),
             }
-            try:
-                sidecar_path = self._sidecar_path(skill_dir, create_parent=True)
-                _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
-                usage_state["skills"][skill_id] = _default_usage_record(
-                    created_by="user"
-                )
+            # A missing identity sidecar cannot authorize retained agent usage.
+            # Clear an orphan before publishing the new identity, so failure
+            # cannot attach old maintenance permissions to a new package.
+            if skill_id in usage_state["skills"]:
+                usage_state["skills"].pop(skill_id)
                 self._write_usage_state(scope_dir, usage_state)
-            except BaseException:
-                try:
-                    sidecar_path.unlink(missing_ok=True)
-                    _fsync_directory(skill_dir)
-                except OSError:
-                    pass
-                self._restore_usage_state(scope_dir, old_usage_bytes)
-                raise
+            sidecar_path = self._sidecar_path(skill_dir, create_parent=True)
+            _atomic_write_bytes(sidecar_path, _render_sidecar(sidecar))
             return sidecar
         except OSError as exc:
             raise SkillStoreError(
@@ -1334,7 +1318,6 @@ class SkillStore:
             missing_status=500,
             label=_USAGE_STATE_FILE,
             require_owner_only=True,
-            require_single_link=True,
         )
         return _parse_usage_state(raw), raw
 
@@ -3011,7 +2994,6 @@ def _read_private_bytes(
     missing_status: int,
     label: str,
     require_owner_only: bool = False,
-    require_single_link: bool = False,
 ) -> bytes:
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
@@ -3041,12 +3023,6 @@ def _read_private_bytes(
                 code="unsafe_skill_path",
             )
         if info.st_nlink != 1:
-            raise SkillStoreError(
-                409,
-                f"{label} must not be hard-linked",
-                code="unsafe_skill_path",
-            )
-        if require_single_link and info.st_nlink != 1:
             raise SkillStoreError(
                 409,
                 f"{label} must not be hard-linked",

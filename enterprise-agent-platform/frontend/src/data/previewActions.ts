@@ -251,6 +251,10 @@ export async function fetchPreviewFile(
   if (typeof body.workspace_path !== "string" || typeof body.content !== "string") {
     throw new Error(t("computer.file.failed"));
   }
+  const byteLength = new TextEncoder().encode(body.content).byteLength;
+  if (body.workspace_path !== workspacePath || byteLength > (body.source === "draft" ? 16 * 1024 : MAX_FILE_PREVIEW_BYTES)) {
+    throw new Error(t("computer.file.failed"));
+  }
   const common = {
     workspace_path: body.workspace_path,
     content: body.content,
@@ -263,14 +267,11 @@ export async function fetchPreviewFile(
   if (
     body.source === "draft"
     && (body.draft_kind === "file" || body.draft_kind === "replacement")
-    && typeof body.revision === "string"
-    && body.revision.length > 0
   ) {
     return {
       ...common,
       source: "draft",
       draft_kind: body.draft_kind,
-      revision: body.revision,
     };
   }
   throw new Error(t("computer.file.failed"));

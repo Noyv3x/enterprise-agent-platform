@@ -1677,7 +1677,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         service = self.server.service
         # Authorize before emitting any response so a denial becomes a normal
         # JSON error (no headers are sent yet).
-        authorized_status = service.agent_status(actor, scope_type, scope_id)
+        service.authorize_conversation(actor, scope_type, scope_id)
         # Admission control: bound the number of concurrent long-lived streams
         # globally and per user so a scripted client cannot pin worker threads
         # (and their per-thread SQLite connections) indefinitely. Reject before
@@ -1704,17 +1704,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.server.release_request_slot_once()
             deadline = time.time() + SSE_MAX_SECONDS
             next_auth_check = time.time() + SSE_AUTH_RECHECK_SECONDS
-            last_token = None
-            last_write = 0.0
             last_revision: int | None = None
-            latest = 0
-            cached_jobs = dict(authorized_status.get("jobs") or {})
-            last_jobs_token = (
-                authorized_status.get("run_id"),
-                authorized_status.get("state"),
-                authorized_status.get("queued_count"),
-                authorized_status.get("updated_at"),
-            )
+            last_write = 0.0
             while time.time() < deadline and not self.server.shutdown_event.is_set():
                 now = time.time()
                 if now >= next_auth_check:
@@ -1734,92 +1725,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                         scope_id,
                     )
                     next_auth_check = now + SSE_AUTH_RECHECK_SECONDS
-                status = service.agent_status_for_system(scope_type, scope_id)
-                jobs_token = (
-                    status.get("run_id"),
-                    status.get("state"),
-                    status.get("queued_count"),
-                    status.get("updated_at"),
-                )
-                if jobs_token != last_jobs_token:
-                    status = service.agent_status_for_system(
-                        scope_type,
-                        scope_id,
-                        include_jobs=True,
-                    )
-                    cached_jobs = dict(status.get("jobs") or {})
-                    last_jobs_token = (
-                        status.get("run_id"),
-                        status.get("state"),
-                        status.get("queued_count"),
-                        status.get("updated_at"),
-                    )
-                else:
-                    status["jobs"] = cached_jobs
-                revision = service.conversation_revision(
-                    scope_type,
-                    scope_id,
-                )["revision"]
+                notification = service.scope_notification_for_system(scope_type, scope_id)
+                revision = notification["revision"]
                 if revision != last_revision:
-                    latest = service.latest_message_id(scope_type, scope_id)
-                    last_revision = revision
-                typing = service.typing_users_for_system(
-                    scope_type,
-                    scope_id,
-                    exclude_user_id=int(actor["id"]),
-                )
-                stream = status.get("stream_message") or {}
-                approval = status.get("approval") or {}
-                activity = status.get("activity") or []
-                last_activity = activity[-1] if activity else {}
-                computer = status.get("computer") or {}
-                computer_file = computer.get("file") or {}
-                jobs = status.get("jobs") or {}
-                token_tuple = (
-                    latest,
-                    revision,
-                    status.get("state"),
-                    status.get("updated_at"),
-                    status.get("current_step"),
-                    len(activity),
-                    last_activity.get("stage"),
-                    last_activity.get("line"),
-                    computer_file.get("revision"),
-                    stream.get("content"),
-                    len(status.get("stream_messages") or []),
-                    approval.get("run_id"),
-                    approval.get("approval_id"),
-                    approval.get("command"),
-                    approval.get("description"),
-                    tuple(
-                        (item.get("user_id"), item.get("updated_at"))
-                        for item in typing
-                    ),
-                    tuple(
-                        sorted(
-                            (str(key), str(value))
-                            for key, value in jobs.items()
-                        )
-                    ),
-                )
-                if token_tuple != last_token:
-                    payload = json.dumps(
-                        {
-                            "agent_status": status,
-                            "latest_message_id": latest,
-                            "message_revision": revision,
-                            "typing": typing,
-                            # Browser/terminal activity is observed through a
-                            # separate lightweight endpoint. Nudge that observer
-                            # whenever the Agent status may have changed so a
-                            # newly opened preview button does not wait for its
-                            # 15-second watchdog.
-                            "preview_changed": True,
-                        },
-                        ensure_ascii=False,
-                    )
+                    notification["typing"] = [
+                        item for item in notification["typing"]
+                        if item.get("user_id") != int(actor["id"])
+                    ]
+                    payload = json.dumps(notification, ensure_ascii=False)
                     self.wfile.write(f"event: update\ndata: {payload}\n\n".encode("utf-8"))
-                    last_token = token_tuple
+                    last_revision = revision
                     last_write = time.monotonic()
                     self.wfile.flush()
                 elif time.monotonic() - last_write >= SSE_KEEPALIVE_SECONDS:

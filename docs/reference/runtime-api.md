@@ -204,13 +204,11 @@
 
 ### 文件草稿
 
-- 只有 openai-codex + openai-codex-responses 的沙箱 `write_file`/`patch_file`、且路径是安全的工作区路径时，才会附加：`{...C,file_draft:{workspace_path:string,kind:"file"|"replacement",content?:string,revision:number,complete:boolean,truncated:boolean,discarded:boolean}}`。
-- write 取累积的完整内容（kind=file）；patch 只取 new_text（kind=replacement）。路径是规范的工作区相对路径。
-- 调用身份保持稳定，revision 严格递增。累积正文经过脱敏、有上限；未完成时保留安全尾窗，只在检查点发布；`toolcall_end` 时发布最终版。
-- complete 只表示参数已输出完毕，不代表通过了校验、审批、执行或提交。之后如果目标或路径变得不合格，同一身份以 `discarded=true` 且**省略 content** 撤回。
-- 不传原始 JSON 片段、old_text、宿主机或工作区外的正文、凭据。其它供应商、API、工具或没有安全路径的情况只有不含正文的进度。
-- 只有 Codex 这两个工具的 schema 要求显式 target；完整调用意外省略 target 时，在校验、执行和写入历史之前补为 sandbox；显式的 host 以及其它供应商和工具的默认值不变。未完成的参数不校验、不审批、不执行，也不授权副作用。
-- 前端只能平滑地揭示已收到的字符，不能缩小安全窗口或伪造 revision。正文只在当前 Run 里临时预览，不进入通用的状态 SSE 或持久工作记录。
+- Pi 原生 `toolcall_delta` 中解析后的累计参数可为沙箱 `write_file`/`patch_file` 附加：`{...C,file_draft:{workspace_path:string,kind:"file"|"replacement",content:string,done:boolean,truncated:boolean}}`，不限定模型供应商。路径必须是规范的工作区相对路径。
+- write 显示累计内容（kind=file）；patch 只显示 new_text 替换片段（kind=replacement）。每次发布都是最新前缀，按时间节流，单次正文最多 16 KiB；不使用检查点、修订号或撤回协议。
+- 未完成参数的正文经过脱敏并保留安全尾窗。参数结束会发布最后的草稿，但 `done` 仍为 false；工具执行结束后发布 `done:true`，前端才读取已提交的工作区内容。失败、取消或 Run 结束会清理临时草稿，不把草稿冒充提交结果。
+- 不传原始 JSON 片段、old_text、宿主机或工作区外的正文、凭据。未完成的参数不校验、不审批、不执行，也不授权副作用。
+- Platform 按授权对话范围只保留最新草稿，正文经授权预览接口读取，不进入通用状态 SSE、附件或持久工作记录。前端直接显示最新收到的草稿；工具完成后只发起一次可取消的文件读取，不追版本、不排读取队列、不自动重试。
 
 **delegate_task 的结果**
 

@@ -90,7 +90,8 @@ function textOfLength(length: number): string {
   return line.repeat(Math.ceil(length / line.length)).slice(0, length);
 }
 
-test("RunCoordinator journals Codex parsed file drafts without raw provider deltas", async () => {
+for (const explicitTarget of [true, false]) {
+test(`RunCoordinator completes drafts with ${explicitTarget ? "explicit" : "default"} sandbox target`, async () => {
   const home = await temporaryDirectory("agent-file-draft-home-");
   const workspace = await temporaryDirectory("agent-file-draft-workspace-");
   const urlPassword = "CorrectHorseBattery";
@@ -105,13 +106,13 @@ test("RunCoordinator journals Codex parsed file drafts without raw provider delt
         id: "call_codex_write|item_1",
         name: "write_file",
         arguments: {
-          target: "sandbox",
+          ...(explicitTarget ? { target: "sandbox" } : {}),
           path: "draft.ts",
           content: finalContent,
         },
       };
       return toolCallStream(model, toolCall, [640, 768, 1_024, 1_536].map((length) => ({
-        target: "sandbox",
+        ...(explicitTarget ? { target: "sandbox" } : {}),
         path: "draft.ts",
         content: textOfLength(length),
       })));
@@ -152,11 +153,13 @@ test("RunCoordinator journals Codex parsed file drafts without raw provider delt
         ? [event.data]
         : [];
     });
-    assert.deepEqual(
-      drafts.map((data) => (data.file_draft as { revision: number }).revision),
-      [1, 2, 3, 4, 5],
-    );
-    assert.equal((drafts.at(-1)?.file_draft as { complete?: boolean }).complete, true);
+    if (explicitTarget) assert.ok(drafts.length >= 3);
+    else assert.equal(drafts.length, 2, "implicit target stays private until arguments finish");
+    assert.equal(drafts.slice(0, -1).every((data) => (data.file_draft as { done: boolean }).done === false), true);
+    assert.equal((drafts.at(-1)?.file_draft as { done: boolean }).done, true);
+    const completedIndex = journal.findIndex((event) => event.type === "tool.completed" && event.data.tool_call_id === "call_codex_write|item_1");
+    const doneIndex = journal.findIndex((event) => event.type === "tool.arguments.delta" && (event.data.file_draft as { done?: boolean } | undefined)?.done);
+    assert.ok(doneIndex >= 0 && completedIndex === doneIndex + 1);
     assert.equal((drafts.at(-1)?.file_draft as { content?: string }).content, redactedFinalContent);
     assert.equal(drafts.at(-1)?.tool_call_id, "call_codex_write|item_1");
     assert.equal(drafts.at(-1)?.tool_name, "write_file");
@@ -169,89 +172,5 @@ test("RunCoordinator journals Codex parsed file drafts without raw provider delt
     await rm(workspace, { recursive: true, force: true });
   }
 });
+}
 
-test("Codex file compatibility prepares an omitted complete target as sandbox before validation", async () => {
-  const home = await temporaryDirectory("agent-file-default-target-home-");
-  const workspace = await temporaryDirectory("agent-file-default-target-workspace-");
-  const finalContent = "target compatibility remained sandboxed\n";
-  let modelTurns = 0;
-  let nextTurnTarget: unknown;
-  const streamFn: StreamFn = (model, context) => {
-    modelTurns += 1;
-    if (modelTurns === 1) {
-      return toolCallStream(model, {
-        type: "toolCall",
-        id: "call_codex_default_write|item_1",
-        name: "write_file",
-        arguments: {
-          path: "default-target.txt",
-          content: finalContent,
-        },
-      });
-    }
-    if (modelTurns === 2) {
-      const previousCall = context.messages.flatMap((entry) => (
-        entry.role === "assistant"
-          ? entry.content.filter((block): block is ToolCall => block.type === "toolCall")
-          : []
-      )).find((toolCall) => toolCall.id === "call_codex_default_write|item_1");
-      nextTurnTarget = previousCall?.arguments.target;
-      return toolCallStream(model, {
-        type: "toolCall",
-        id: "call_codex_default_read|item_2",
-        name: "read_file",
-        arguments: { target: "sandbox", path: "default-target.txt" },
-      });
-    }
-    return finalTextStream(model, "The default-target file was written and verified.");
-  };
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn });
-
-  try {
-    const modelId = productModelCatalogs()["openai-codex"].models[0]?.id;
-    assert.ok(modelId, "the locked Codex catalog must contain a model");
-    const run = coordinator.createRun({
-      scope_key: "scope",
-      lifecycle_id: "life",
-      session_id: "file-default-target-integration",
-      workspace,
-      system_prompt: "You are an Agent.",
-      input: "write and verify the file",
-      model: { provider: "openai-codex", id: modelId },
-    });
-    assert.equal((await coordinator.wait(run.id)).status, "completed");
-    assert.equal(await readFile(`${workspace}/default-target.txt`, "utf8"), finalContent);
-    assert.equal(nextTurnTarget, "sandbox");
-
-    const journal = coordinator.getJournal(run.id)?.list() ?? [];
-    const finalDraft = journal.find((event) => (
-      event.type === "tool.arguments.delta"
-      && typeof event.data.file_draft === "object"
-    ));
-    assert.equal((finalDraft?.data.file_draft as { complete?: boolean }).complete, true);
-    assert.equal((finalDraft?.data.file_draft as { content?: string }).content, finalContent);
-    assert.equal(journal.some((event) => (
-      event.type === "tool.completed"
-      && event.data.tool_call_id === "call_codex_default_write|item_1"
-    )), true);
-    assert.equal(journal.some((event) => (
-      event.type === "tool.failed"
-      && event.data.tool_call_id === "call_codex_default_write|item_1"
-    )), false);
-    const durable = await coordinator.sessions.load({
-      scope_key: "scope",
-      lifecycle_id: "life",
-      session_id: "file-default-target-integration",
-    });
-    const durableCall = durable.flatMap((entry) => (
-      entry.role === "assistant"
-        ? entry.content.filter((block): block is ToolCall => block.type === "toolCall")
-        : []
-    )).find((toolCall) => toolCall.id === "call_codex_default_write|item_1");
-    assert.equal(durableCall?.arguments.target, "sandbox");
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});

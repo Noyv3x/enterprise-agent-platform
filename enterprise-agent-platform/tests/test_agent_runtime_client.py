@@ -712,19 +712,113 @@ class AgentRuntimeClientTests(unittest.TestCase):
         self.assertEqual(result.raw["event_count"], 2)
         self.assertIn("_parse_error", result.raw["events"][0])
 
-    def test_completed_run_without_assistant_content_is_protocol_error(self):
-        self.runtime.events = [
-            _event(1, "run.completed", {"output": "", "session_id": "session-1"}),
+    def test_empty_completion_uses_only_this_runs_last_nonempty_assistant_text(self):
+        cases = [
+            (
+                [
+                    ("message.final", {"content": "first", "turn_id": "turn-1"}),
+                    ("input.injected", {"turn_id": "turn-2"}),
+                    ("message.final", {"content": "last", "turn_id": "turn-2"}),
+                    ("message.final", {"content": " \n", "turn_id": "turn-3"}),
+                ],
+                "last",
+            ),
+            (
+                [
+                    ("message.delta", {"delta": "last ", "turn_id": "turn-1"}),
+                    ("message.delta", {"delta": "answer", "turn_id": "turn-1"}),
+                    ("message.delta", {"delta": " \n", "turn_id": "turn-2"}),
+                    ("message.final", {"content": "", "turn_id": "turn-2"}),
+                ],
+                "last answer",
+            ),
+            (
+                [
+                    ("message.delta", {"delta": "draft"}),
+                    ("message.final", {"content": "corrected"}),
+                    ("message.delta", {"delta": "next"}),
+                    ("message.final", {"content": ""}),
+                ],
+                "next",
+            ),
         ]
+        for events, expected in cases:
+            for output in ("", " \n"):
+                with self.subTest(events=events, output=output):
+                    self.runtime.events = [
+                        _event(index, name, data)
+                        for index, (name, data) in enumerate(events, 1)
+                    ] + [_event(9, "run.completed", {"output": output})]
+                    result = self.client.generate(
+                        system_prompt="system",
+                        user_message="question",
+                        history=[],
+                        session_id="session-1",
+                        session_key="private:7",
+                    )
+                    self.assertEqual(result.content, expected)
 
-        with self.assertRaisesRegex(AgentRuntimeProtocolError, "without assistant content"):
-            self.client.generate(
-                system_prompt="system",
-                user_message="question",
-                history=[],
-                session_id="session-1",
-                session_key="private:7",
-            )
+    def test_empty_completion_does_not_reuse_prior_run_or_reprompt(self):
+        self.runtime.events = [
+            _event(1, "message.final", {"content": "Previous run answer"}),
+            _event(2, "run.completed", {"output": ""}),
+        ]
+        arguments = dict(
+            system_prompt="system",
+            user_message="question",
+            history=[{"role": "assistant", "content": "History answer"}],
+            session_id="session-1",
+            session_key="private:7",
+        )
+        self.assertEqual(self.client.generate(**arguments).content, "Previous run answer")
+        self.runtime.events = [
+            _event(1, "tool.completed", {"result": "Tool result"}),
+            _event(2, "message.final", {"content": " \n"}),
+            _event(3, "run.completed", {"output": "", "session_id": "session-2"}),
+        ]
+        result = self.client.generate(**arguments)
+        self.assertEqual(result.session_id, "session-2")
+        self.assertNotIn("error", result.raw)
+        self.assertNotIn(result.content, ("Previous run answer", "History answer", "Tool result", "", " \n"))
+        self.assertEqual(
+            [(request["method"], request["path"]) for request in self.runtime.requests],
+            [("POST", "/v1/runs"), ("GET", "/v1/runs/run-1/events")] * 2,
+        )
+
+    def test_terminal_projection_preserves_metadata_and_error_states(self):
+        for state in ("completed", "failed", "cancelled", "needs_review"):
+            with self.subTest(state=state):
+                self.runtime.events = [
+                    _event(1, "message.final", {"content": "Earlier answer"}),
+                    _event(2, f"run.{state}", {
+                        "output": "Terminal answer",
+                        "session_id": "session-terminal",
+                        "usage": {"input": 12, "output": 8},
+                        "context_usage": {"used_tokens": 20},
+                        "input_message_ids": ["42"],
+                        "unconsumed_input_message_ids": ["43"],
+                        "error": "Blocked" if state != "completed" else "",
+                    }),
+                ]
+                arguments = dict(
+                    system_prompt="system", user_message="question", history=[],
+                    session_id="session-1", session_key="private:7",
+                )
+                if state == "completed":
+                    result = self.client.generate(**arguments)
+                    self.assertEqual(result.content, "Terminal answer")
+                else:
+                    with self.assertRaises(AgentRuntimeRunError) as raised:
+                        self.client.generate(**arguments)
+                    result = raised.exception
+                    self.assertEqual(result.state, state)
+                    self.assertEqual(result.partial_content, "Terminal answer")
+                    self.assertEqual(result.raw["error"], "Blocked")
+                self.assertEqual(result.session_id, "session-terminal")
+                self.assertEqual(result.raw["usage"], {"input": 12, "output": 8})
+                self.assertEqual(result.raw["context_usage"], {"used_tokens": 20})
+                self.assertEqual(result.raw["input_message_ids"], ["42"])
+                self.assertEqual(result.raw["unconsumed_input_message_ids"], ["43"])
 
     def test_event_stream_eof_before_terminal_event_cancels_run_best_effort(self):
         self.runtime.events = [
@@ -797,10 +891,8 @@ class AgentRuntimeClientTests(unittest.TestCase):
                         "workspace_path": "README.md",
                         "kind": "file",
                         "content": "draft TOKEN=super-secret",
-                        "revision": 1,
-                        "complete": False,
+                        "done": False,
                         "truncated": False,
-                        "discarded": False,
                     },
                 },
             ),
@@ -863,7 +955,7 @@ class AgentRuntimeClientTests(unittest.TestCase):
             if event.get("sequence") == 4
         )["data"]["file_draft"]
         self.assertNotIn("content", retained_draft)
-        self.assertEqual(retained_draft["revision"], 1)
+        self.assertNotIn("super-secret", json.dumps(result.raw))
 
     def test_approval_callback_maps_platform_choice_to_runtime_decision(self):
         self.runtime.events = [

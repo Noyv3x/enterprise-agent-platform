@@ -242,12 +242,12 @@ export interface ComputerFileClue {
   target?: "sandbox" | "host" | string;
   source?: "draft" | "workspace";
   draft_kind?: "file" | "replacement";
+  done?: boolean;
+  truncated?: boolean;
   status?: string;
   tool_call_id?: string;
   sequence?: number;
   updated_sequence?: number;
-  /** Changes whenever the projected tool lifecycle advances, even for the same path. */
-  revision?: string;
 }
 
 export interface ComputerPresentClue {

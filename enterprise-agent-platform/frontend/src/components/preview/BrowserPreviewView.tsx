@@ -7,23 +7,11 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import {
-  acquireBrowserControl,
-  releaseBrowserControl,
-  sendBrowserControlInput,
-  type BrowserControlInput,
-} from "../../data/previewActions";
 import { intlLocale, useI18n } from "../../i18n";
-import { isApiError } from "../../lib/api";
-import {
-  BROWSER_CONTROL_RELINQUISH_EVENT,
-  browserControlRelinquishScope,
-  waitForBrowserControlRelinquish,
-} from "../../lib/browserControl";
 import type { AgentPreviewScope } from "../../types";
 import { BrowserControlBar, EmptyState, LoadingState, Notice } from "../ui/fieldwork";
 import { PreviewStatus } from "./PreviewStatus";
-import { useBrowserPreview } from "./useBrowserPreview";
+import { useBrowserControl } from "./useBrowserControl";
 
 function previewTime(value: string | number | null, locale: string): string {
   if (value == null || value === "") return "";
@@ -38,7 +26,6 @@ function previewTime(value: string | number | null, locale: string): string {
   });
 }
 
-const DEFAULT_BROWSER_LEASE_MS = 90_000;
 const DRAG_MOVEMENT_THRESHOLD_PX = 6;
 const MAX_DRAG_POINTS = 64;
 const MAX_LOCAL_DRAG_POINTS = 256;
@@ -86,14 +73,6 @@ function boundLocalDragPoints(points: BrowserDragPoint[]): BrowserDragPoint[] {
   ];
 }
 
-interface ActiveBrowserLease {
-  id: string;
-  tabId: string;
-  expiresAt: number;
-  generation: number;
-  scope: AgentPreviewScope;
-}
-
 export function BrowserPreviewView({
   scope,
   controlRequestId,
@@ -102,25 +81,8 @@ export function BrowserPreviewView({
   controlRequestId?: string | number | null;
 }) {
   const { t, locale } = useI18n();
-  const [lease, setLease] = useState<ActiveBrowserLease | null>(null);
-  const leaseActiveForScope = Boolean(
-    lease
-    && `${lease.scope.scope_type}:${String(lease.scope.scope_id)}` === `${scope.scope_type}:${String(scope.scope_id)}`,
-  );
-  const { state, refresh } = useBrowserPreview(scope, leaseActiveForScope);
-  const [controlBusy, setControlBusy] = useState(false);
-  const [controlError, setControlError] = useState("");
   const [textInput, setTextInput] = useState("");
   const [pointerFeedback, setPointerFeedback] = useState<LocalPointerFeedback | null>(null);
-  const sequenceRef = useRef(0);
-  const leaseGenerationRef = useRef(0);
-  const leaseRef = useRef<ActiveBrowserLease | null>(null);
-  const controlQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const acquireInFlightRef = useRef(false);
-  const mountedRef = useRef(false);
-  const viewGenerationRef = useRef(0);
-  const controlLifecycleRef = useRef(0);
-  const currentTabRef = useRef(state.tabId);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const clickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pointerGestureRef = useRef<ActivePointerGesture | null>(null);
@@ -128,32 +90,11 @@ export function BrowserPreviewView({
   const consumedControlRequestRef = useRef<string | number | null>(null);
   const consumedControlScopeRef = useRef("");
   const [quickControlTimedOut, setQuickControlTimedOut] = useState(false);
-  const lastUpdate = previewTime(state.capturedAt || state.checkedAt, intlLocale(locale));
   const scopeKey = `${scope.scope_type}:${String(scope.scope_id)}`;
   if (consumedControlScopeRef.current !== scopeKey) {
     consumedControlScopeRef.current = scopeKey;
     consumedControlRequestRef.current = null;
   }
-  currentTabRef.current = state.tabId;
-  const controlling = Boolean(
-    lease
-    && lease.tabId === state.tabId
-    && `${lease.scope.scope_type}:${String(lease.scope.scope_id)}` === scopeKey,
-  );
-
-  const enqueueControl = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
-    const next = controlQueueRef.current.catch(() => undefined).then(operation);
-    controlQueueRef.current = next.then(() => undefined, () => undefined);
-    return next;
-  }, []);
-
-  const waitForControlIdle = useCallback(async () => {
-    for (;;) {
-      const pending = controlQueueRef.current;
-      await pending.catch(() => undefined);
-      if (pending === controlQueueRef.current) return;
-    }
-  }, []);
 
   const clearPointerGesture = useCallback(() => {
     const gesture = pointerGestureRef.current;
@@ -170,234 +111,19 @@ export function BrowserPreviewView({
     }
   }, []);
 
-  const queueBestEffortRelease = useCallback((active: ActiveBrowserLease) => {
-    void enqueueControl(() => releaseBrowserControl(
-      active.scope,
-      active.tabId,
-      active.id,
-    )).catch(() => undefined);
-  }, [enqueueControl]);
-
-  const relinquishLease = useCallback((
-    expected: ActiveBrowserLease | null = leaseRef.current,
-    message = "",
-  ) => {
-    const current = leaseRef.current;
-    if (!expected || !current || current.generation !== expected.generation) return;
-    leaseRef.current = null;
-    sequenceRef.current = 0;
-    setLease(null);
+  const clearControlGesture = useCallback(() => {
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current);
       clickTimerRef.current = null;
     }
     clearPointerGesture();
-    if (message) setControlError(message);
-    queueBestEffortRelease(expected);
-  }, [clearPointerGesture, queueBestEffortRelease]);
+  }, [clearPointerGesture]);
+  const {
+    state, refresh, controlling, controlBusy, controlError,
+    beginControl, endControl, sendInput,
+  } = useBrowserControl(scope, clearControlGesture);
+  const lastUpdate = previewTime(state.capturedAt || state.checkedAt, intlLocale(locale));
 
-  const refreshLeaseExpiry = useCallback((
-    active: ActiveBrowserLease,
-    expiresInMs: number | undefined,
-  ) => {
-    const current = leaseRef.current;
-    if (!current || current.generation !== active.generation) return;
-    const duration = typeof expiresInMs === "number" && Number.isFinite(expiresInMs) && expiresInMs > 0
-      ? expiresInMs
-      : DEFAULT_BROWSER_LEASE_MS;
-    const next = { ...current, expiresAt: Date.now() + duration };
-    leaseRef.current = next;
-    setLease(next);
-  }, []);
-
-  const sendInput = useCallback((input: BrowserControlInput): Promise<void> => {
-    const active = leaseRef.current;
-    if (!active || currentTabRef.current !== active.tabId) return Promise.resolve();
-    const sequence = ++sequenceRef.current;
-    return enqueueControl(async () => {
-      const current = leaseRef.current;
-      if (!current || current.generation !== active.generation) return;
-      if (Date.now() >= current.expiresAt) {
-        relinquishLease(current);
-        return;
-      }
-      setControlError("");
-      try {
-        const result = await sendBrowserControlInput(
-          current.scope,
-          current.tabId,
-          current.id,
-          sequence,
-          input,
-        );
-        refreshLeaseExpiry(current, result.expires_in_ms);
-        refresh();
-      } catch (error) {
-        if (isApiError(error, 409)) {
-          relinquishLease(current, t("browserPreview.controlExpired"));
-          return;
-        }
-        if (leaseRef.current?.generation === current.generation) {
-          setControlError(error instanceof Error ? error.message : String(error));
-        }
-      }
-    });
-  }, [enqueueControl, refresh, refreshLeaseExpiry, relinquishLease, t]);
-
-  const endControl = useCallback(() => {
-    relinquishLease();
-  }, [relinquishLease]);
-
-  useEffect(() => {
-    const generation = ++viewGenerationRef.current;
-    mountedRef.current = true;
-    const active = leaseRef.current;
-    if (
-      active
-      && `${active.scope.scope_type}:${String(active.scope.scope_id)}` !== scopeKey
-    ) {
-      leaseRef.current = null;
-      sequenceRef.current = 0;
-      setLease(null);
-      queueBestEffortRelease(active);
-    }
-    return () => {
-      if (viewGenerationRef.current === generation) {
-        mountedRef.current = false;
-        viewGenerationRef.current += 1;
-      }
-      if (clickTimerRef.current) {
-        clearTimeout(clickTimerRef.current);
-        clickTimerRef.current = null;
-      }
-      clearPointerGesture();
-      const latest = leaseRef.current;
-      if (latest) {
-        leaseRef.current = null;
-        sequenceRef.current = 0;
-        queueBestEffortRelease(latest);
-      }
-    };
-  }, [clearPointerGesture, queueBestEffortRelease, scopeKey]);
-
-  useEffect(() => {
-    const active = leaseRef.current;
-    if (active && active.tabId !== state.tabId) {
-      controlLifecycleRef.current += 1;
-      relinquishLease(active);
-    }
-  }, [relinquishLease, state.tabId]);
-
-  useEffect(() => {
-    if (!lease) return;
-    const remaining = lease.expiresAt - Date.now();
-    if (remaining <= 0) {
-      relinquishLease(lease);
-      return;
-    }
-    const timer = setTimeout(() => relinquishLease(lease), remaining);
-    return () => clearTimeout(timer);
-  }, [lease, relinquishLease]);
-
-  useEffect(() => {
-    const onBlur = () => {
-      controlLifecycleRef.current += 1;
-      relinquishLease();
-    };
-    const onVisibilityChange = () => {
-      if (document.hidden) {
-        controlLifecycleRef.current += 1;
-        relinquishLease();
-      }
-    };
-    window.addEventListener("blur", onBlur);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      window.removeEventListener("blur", onBlur);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  }, [relinquishLease]);
-
-  useEffect(() => {
-    const onMessageSubmit = (event: Event) => {
-      const requestedScope = browserControlRelinquishScope(event);
-      if (
-        requestedScope
-        && `${requestedScope.scope_type}:${requestedScope.scope_id}` === scopeKey
-      ) {
-        controlLifecycleRef.current += 1;
-        relinquishLease();
-        waitForBrowserControlRelinquish(event, waitForControlIdle());
-      }
-    };
-    window.addEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, onMessageSubmit);
-    return () => window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, onMessageSubmit);
-  }, [relinquishLease, scopeKey, waitForControlIdle]);
-
-  const beginControl = useCallback(async () => {
-    const requestedTab = state.tabId;
-    if (!requestedTab || controlBusy || acquireInFlightRef.current) return;
-    const previousLease = leaseRef.current;
-    if (previousLease) relinquishLease(previousLease);
-    const requestedScope: AgentPreviewScope = {
-      scope_type: scope.scope_type,
-      scope_id: scope.scope_id,
-    };
-    const viewGeneration = viewGenerationRef.current;
-    const controlLifecycle = controlLifecycleRef.current;
-    acquireInFlightRef.current = true;
-    setControlBusy(true);
-    setControlError("");
-    try {
-      const result = await enqueueControl(() => acquireBrowserControl(
-        requestedScope,
-        requestedTab,
-      ));
-      if (!result.lease_id) throw new Error(t("browserPreview.controlFailed"));
-      const active: ActiveBrowserLease = {
-        id: result.lease_id,
-        tabId: requestedTab,
-        expiresAt: Date.now() + (
-          result.expires_in_ms && result.expires_in_ms > 0
-            ? result.expires_in_ms
-            : DEFAULT_BROWSER_LEASE_MS
-        ),
-        generation: ++leaseGenerationRef.current,
-        scope: requestedScope,
-      };
-      if (
-        !mountedRef.current
-        || viewGenerationRef.current !== viewGeneration
-        || controlLifecycleRef.current !== controlLifecycle
-        || currentTabRef.current !== requestedTab
-        || document.hidden
-      ) {
-        queueBestEffortRelease(active);
-        return;
-      }
-      sequenceRef.current = 0;
-      leaseRef.current = active;
-      setLease(active);
-    } catch (error) {
-      if (mountedRef.current && viewGenerationRef.current === viewGeneration) {
-        setControlError(error instanceof Error ? error.message : String(error));
-      }
-    } finally {
-      acquireInFlightRef.current = false;
-      if (mountedRef.current && viewGenerationRef.current === viewGeneration) {
-        setControlBusy(false);
-      }
-    }
-  }, [
-    controlBusy,
-    enqueueControl,
-    queueBestEffortRelease,
-    relinquishLease,
-    scope.scope_id,
-    scope.scope_type,
-    state.tabId,
-    t,
-  ]);
 
   const hasQuickControlRequest = (
     (typeof controlRequestId === "number" && controlRequestId > 0)
@@ -571,8 +297,7 @@ export function BrowserPreviewView({
       window.setTimeout(() => { suppressClickRef.current = false; }, 0);
     }
     clearPointerGesture();
-    controlLifecycleRef.current += 1;
-    relinquishLease();
+    void endControl();
   };
 
   const onFrameClick = (event: ReactMouseEvent<HTMLDivElement>) => {

@@ -507,12 +507,10 @@ export type AgentPreviewFileResponse = AgentPreviewFileResponseBase & (
   | {
       source: "workspace";
       draft_kind?: never;
-      revision?: never;
     }
   | {
       source: "draft";
       draft_kind: AgentPreviewFileDraftKind;
-      revision: string;
     }
 );
 

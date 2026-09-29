@@ -5,6 +5,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
+import { StoreProvider } from "../../store/StoreProvider";
 import { TestUiProviders } from "../../test/TestUiProviders";
 import type { AgentPreviewFileResponse } from "../../types";
 import type { ComputerSurface } from "./computer";
@@ -20,8 +21,8 @@ vi.mock("../../data/previewActions", async () => {
 const scope = { scope_type: "private" as const, scope_id: "7" };
 const defaultMatchMedia = window.matchMedia;
 
-/** The same tool call identity across two Runs; only the Run and the draft revision differ. */
-function runningDraftSurface(runId: string, draftRevision: number): ComputerSurface {
+/** The same tool call identity and path across two Runs. */
+function runningDraftSurface(runId: string): ComputerSurface {
   return {
     visible: true,
     live: true,
@@ -37,7 +38,7 @@ function runningDraftSurface(runId: string, draftRevision: number): ComputerSurf
       draft_kind: "file",
       status: "running",
       tool_call_id: "call",
-      revision: `draft:call:${draftRevision}`,
+      done: false,
     },
     searchHits: [],
     searchTool: "",
@@ -45,7 +46,7 @@ function runningDraftSurface(runId: string, draftRevision: number): ComputerSurf
   };
 }
 
-function draft(content: string, draftRevision: number): AgentPreviewFileResponse {
+function draft(content: string): AgentPreviewFileResponse {
   return {
     workspace_path: "draft.txt",
     content,
@@ -53,20 +54,19 @@ function draft(content: string, draftRevision: number): AgentPreviewFileResponse
     encoding: "utf-8",
     source: "draft",
     draft_kind: "file",
-    revision: `draft:call:${draftRevision}`,
   };
 }
 
 function screenFor(surface: ComputerSurface) {
   return (
-    <TestUiProviders>
+    <StoreProvider><TestUiProviders>
       <ComputerScreen
         scope={scope}
         surface={surface}
         availabilityError=""
         onRetryAvailability={() => undefined}
       />
-    </TestUiProviders>
+    </TestUiProviders></StoreProvider>
   );
 }
 
@@ -101,7 +101,7 @@ describe("ComputerScreen", () => {
 
   it("shows waiting work until real content arrives without reading a fallback file", () => {
     const waiting: ComputerSurface = {
-      ...runningDraftSurface("run-waiting", 1),
+      ...runningDraftSurface("run-waiting"),
       mode: null,
       file: null,
     };
@@ -129,7 +129,7 @@ describe("ComputerScreen", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-15T12:00:05.000Z"));
     const working: ComputerSurface = {
-      ...runningDraftSurface("run-clock", 1),
+      ...runningDraftSurface("run-clock"),
       startedAt: Date.parse("2026-08-15T12:00:00.000Z") / 1_000,
       mode: null,
       file: null,
@@ -161,20 +161,20 @@ describe("ComputerScreen", () => {
       pending.push({ resolve });
     }));
 
-    const rendered = render(screenFor(runningDraftSurface("run-A", 9)));
+    const rendered = render(screenFor(runningDraftSurface("run-A")));
     await waitFor(() => expect(pending).toHaveLength(1));
 
-    // Run B reuses the tool call identity and path; its own draft numbering restarts.
-    rendered.rerender(screenFor(runningDraftSurface("run-B", 1)));
+    // Run B reuses the tool call identity and path.
+    rendered.rerender(screenFor(runningDraftSurface("run-B")));
     await act(async () => {
-      pending[0].resolve(draft("A_STALE_DRAFT", 9));
+      pending[0].resolve(draft("A_STALE_DRAFT"));
       await Promise.resolve();
     });
 
     expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
     await waitFor(() => expect(pending).toHaveLength(2));
     await act(async () => {
-      pending[1].resolve(draft("B_CURRENT_DRAFT", 1));
+      pending[1].resolve(draft("B_CURRENT_DRAFT"));
       await Promise.resolve();
     });
 
@@ -182,41 +182,4 @@ describe("ComputerScreen", () => {
     expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
   });
 
-  it("replaces a displayed high-revision draft of the previous Run with the new Run's low revisions while they keep being superseded", async () => {
-    const pending: Array<{ resolve: (value: AgentPreviewFileResponse) => void }> = [];
-    vi.mocked(fetchPreviewFile).mockImplementation(() => new Promise((resolve) => {
-      pending.push({ resolve });
-    }));
-
-    const rendered = render(screenFor(runningDraftSurface("run-A", 100)));
-    await waitFor(() => expect(pending).toHaveLength(1));
-    await act(async () => {
-      pending[0].resolve(draft("A_DRAFT_100", 100));
-      await Promise.resolve();
-    });
-    expect(await screen.findByText("A_DRAFT_100")).toBeVisible();
-
-    // Run B reuses the tool call identity and path with a restarted numbering that
-    // stays far below the previous Run's displayed revision.
-    rendered.rerender(screenFor(runningDraftSurface("run-B", 1)));
-    await waitFor(() => expect(pending).toHaveLength(2));
-
-    for (let revision = 1; revision <= 3; revision += 1) {
-      // B announces its next revision before the in-flight read answers, so every
-      // B response arrives already superseded within its own lineage.
-      rendered.rerender(screenFor(runningDraftSurface("run-B", revision + 1)));
-      const read = pending[pending.length - 1];
-      expect(pending).toHaveLength(revision + 1);
-      await act(async () => {
-        read.resolve(draft(`B_DRAFT_${revision}`, revision));
-        await Promise.resolve();
-      });
-      // The displayed revision belongs to Run A; B's first draft is a new lineage,
-      // not an older revision of the same one, and must appear at once.
-      expect(await screen.findByText(`B_DRAFT_${revision}`)).toBeVisible();
-      expect(screen.queryByText("A_DRAFT_100")).not.toBeInTheDocument();
-      await waitFor(() => expect(pending).toHaveLength(revision + 2));
-    }
-
-  });
 });

@@ -1,24 +1,19 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .db import Database, now_ts
 
 
-INPUT_STATES = frozenset(
-    {
-        "running",
-        "reserved",
-        "submitting",
-        "accepted",
-        "injected",
-        "unconsumed",
-        "succeeded",
-        "failed",
-        "needs_review",
-    }
-)
+INPUT_STATES = frozenset({
+    "running", "reserved", "submitting", "accepted", "injected", "unconsumed",
+    "succeeded", "failed", "needs_review",
+})
+TERMINAL_STATES = frozenset({"succeeded", "failed", "needs_review"})
 
 
 @dataclass(frozen=True)
@@ -37,288 +32,166 @@ class AgentRunInput:
 
 
 class AgentRunInputStore:
-    """Durable relationship between one Agent run and all joined user turns."""
+    """Runtime input phase on the durable job, with read-only legacy support.
+
+    The phase describes Runtime admission, not a second job lifecycle. Terminal
+    state and errors always come from the owning job. Old association rows stay
+    intact so a rollback reader can still inspect its historical records.
+    """
 
     def __init__(self, db: Database):
         self.db = db
 
-    def start_root(
-        self,
-        *,
-        message_id: int,
-        job_id: int,
-        input_group_id: str,
-    ) -> AgentRunInput:
-        ts = now_ts()
-        with self.db.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO agent_run_inputs(
-                    message_id, job_id, parent_job_id, input_group_id,
-                    state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', ?, ?)
-                ON CONFLICT(message_id) DO UPDATE SET
-                    job_id = excluded.job_id,
-                    parent_job_id = excluded.parent_job_id,
-                    input_group_id = excluded.input_group_id,
-                    state = CASE
-                        WHEN agent_run_inputs.state IN ('succeeded', 'failed', 'needs_review')
-                            THEN agent_run_inputs.state
-                        ELSE 'running'
-                    END,
-                    runtime_run_id = CASE
-                        WHEN agent_run_inputs.state IN ('succeeded', 'failed', 'needs_review')
-                            THEN agent_run_inputs.runtime_run_id
-                        ELSE ''
-                    END,
-                    turn_id = CASE
-                        WHEN agent_run_inputs.state IN ('succeeded', 'failed', 'needs_review')
-                            THEN agent_run_inputs.turn_id
-                        ELSE ''
-                    END,
-                    turn_index = CASE
-                        WHEN agent_run_inputs.state IN ('succeeded', 'failed', 'needs_review')
-                            THEN agent_run_inputs.turn_index
-                        ELSE 0
-                    END,
-                    last_error = CASE
-                        WHEN agent_run_inputs.state IN ('succeeded', 'failed', 'needs_review')
-                            THEN agent_run_inputs.last_error
-                        ELSE ''
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (int(message_id), int(job_id), int(job_id), str(input_group_id), ts, ts),
-            )
-            row = conn.execute(
-                "SELECT * FROM agent_run_inputs WHERE message_id = ?",
-                (int(message_id),),
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Agent input root insert did not produce a row")
-        return self._from_row(dict(row))
+    def _save(self, conn, job_id: int, association: dict[str, Any]) -> None:
+        conn.execute(
+            "UPDATE durable_jobs SET payload_json = json_set(payload_json, '$._input', json(?)), "
+            "updated_at = ? WHERE id = ?",
+            (json.dumps(association, ensure_ascii=False), now_ts(), int(job_id)),
+        )
+
+    def start_root(self, *, message_id: int, job_id: int, input_group_id: str) -> AgentRunInput:
+        with self.db.transaction(immediate=True) as conn:
+            previous = self.get_by_job(job_id)
+            if previous is not None and previous.state in TERMINAL_STATES:
+                return previous
+            self._save(conn, job_id, {
+                "message_id": int(message_id), "parent_job_id": int(job_id),
+                "input_group_id": str(input_group_id), "state": "running",
+            })
+            result = self.get_by_job(job_id)
+        if result is None:
+            raise RuntimeError("Agent input root has no durable job")
+        return result
 
     def reserve_and_claim(
-        self,
-        *,
-        message_id: int,
-        job_id: int,
-        parent_job_id: int,
-        input_group_id: str,
-        lease_seconds: int,
+        self, *, message_id: int, job_id: int, parent_job_id: int,
+        input_group_id: str, lease_seconds: int,
     ) -> AgentRunInput | None:
-        """Atomically remove a joined child from FIFO ownership and reserve it."""
-
         ts = now_ts()
         with self.db.transaction() as conn:
             claimed = conn.execute(
-                """
-                UPDATE durable_jobs
-                SET status = 'running', attempts = attempts + 1,
-                    lease_until = ?, last_error = '', updated_at = ?
-                WHERE id = ? AND status = 'queued' AND available_at <= ?
-                """,
-                (
-                    ts + max(1, int(lease_seconds)),
-                    ts,
-                    int(job_id),
-                    ts,
-                ),
+                "UPDATE durable_jobs SET status = 'running', attempts = attempts + 1, "
+                "lease_until = ?, last_error = '', updated_at = ? "
+                "WHERE id = ? AND status = 'queued' AND available_at <= ?",
+                (ts + max(1, int(lease_seconds)), ts, int(job_id), ts),
             )
-            if claimed.rowcount <= 0:
+            if not claimed.rowcount:
                 return None
-            conn.execute(
-                """
-                INSERT INTO agent_run_inputs(
-                    message_id, job_id, parent_job_id, input_group_id,
-                    state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'reserved', ?, ?)
-                """,
-                (
-                    int(message_id),
-                    int(job_id),
-                    int(parent_job_id),
-                    str(input_group_id),
-                    ts,
-                    ts,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM agent_run_inputs WHERE message_id = ?",
-                (int(message_id),),
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Agent input claim did not produce a row")
-        return self._from_row(dict(row))
+            self._save(conn, job_id, {
+                "message_id": int(message_id), "parent_job_id": int(parent_job_id),
+                "input_group_id": str(input_group_id), "state": "reserved",
+            })
+            return self.get_by_job(job_id)
+
+    def reserve_pending(
+        self, *, message_id: int, job_id: int, parent_job_id: int, input_group_id: str,
+    ) -> AgentRunInput | None:
+        with self.db.transaction(immediate=True) as conn:
+            row = conn.execute("SELECT status FROM durable_jobs WHERE id = ?", (int(job_id),)).fetchone()
+            if row is None or row["status"] != "queued":
+                return None
+            self._save(conn, job_id, {
+                "message_id": int(message_id), "parent_job_id": int(parent_job_id),
+                "input_group_id": str(input_group_id), "state": "reserved",
+            })
+            return self.get_by_job(job_id)
 
     def get_by_message(self, message_id: int) -> AgentRunInput | None:
         row = self.db.query_one(
-            "SELECT * FROM agent_run_inputs WHERE message_id = ?",
+            "SELECT id FROM durable_jobs WHERE kind = 'agent' "
+            "AND json_extract(payload_json, '$._input.message_id') = ?",
             (int(message_id),),
         )
-        return self._from_row(row) if row else None
+        if row is None:
+            row = self.db.query_one(
+                "SELECT job_id AS id FROM agent_run_inputs WHERE message_id = ?",
+                (int(message_id),),
+            )
+        return self.get_by_job(int(row["id"])) if row else None
 
     def get_by_job(self, job_id: int) -> AgentRunInput | None:
-        row = self.db.query_one(
-            "SELECT * FROM agent_run_inputs WHERE job_id = ?",
-            (int(job_id),),
+        job = self.db.query_one("SELECT * FROM durable_jobs WHERE id = ?", (int(job_id),))
+        if job is None:
+            return None
+        data = json.loads(job["payload_json"]).get("_input")
+        if not isinstance(data, dict):
+            data = self.db.query_one("SELECT * FROM agent_run_inputs WHERE job_id = ?", (int(job_id),))
+        if not data:
+            return None
+        state = str(job["status"]) if job["status"] in TERMINAL_STATES else str(data["state"])
+        return AgentRunInput(
+            message_id=int(data["message_id"]), job_id=int(job_id),
+            parent_job_id=int(data["parent_job_id"]), input_group_id=str(data["input_group_id"]),
+            runtime_run_id=str(data.get("runtime_run_id") or ""), state=state,
+            turn_id=str(data.get("turn_id") or ""), turn_index=int(data.get("turn_index") or 0),
+            last_error=str(job.get("last_error") or ""),
+            created_at=int(job["created_at"]), updated_at=int(job["updated_at"]),
         )
-        return self._from_row(row) if row else None
 
     def for_group(self, input_group_id: str) -> list[AgentRunInput]:
-        return [
-            self._from_row(row)
-            for row in self.db.query(
-                """
-                SELECT * FROM agent_run_inputs
-                WHERE input_group_id = ?
-                ORDER BY message_id
-                """,
-                (str(input_group_id),),
-            )
-        ]
+        rows = self.db.query(
+            "SELECT id FROM durable_jobs WHERE kind = 'agent' "
+            "AND json_extract(payload_json, '$._input.input_group_id') = ? "
+            "UNION SELECT job_id AS id FROM agent_run_inputs WHERE input_group_id = ?",
+            (str(input_group_id), str(input_group_id)),
+        )
+        result = [self.get_by_job(int(row["id"])) for row in rows]
+        return sorted(
+            (item for item in result if item is not None and item.input_group_id == input_group_id),
+            key=lambda item: item.message_id,
+        )
 
     def set_runtime_run(self, input_group_id: str, runtime_run_id: str) -> None:
-        self.db.execute(
-            """
-            UPDATE agent_run_inputs
-            SET runtime_run_id = ?, updated_at = ?
-            WHERE input_group_id = ?
-            """,
-            (str(runtime_run_id), now_ts(), str(input_group_id)),
-        )
+        with self.db.transaction(immediate=True) as conn:
+            for item in self.for_group(input_group_id):
+                self.transition(item.message_id, item.state, runtime_run_id=runtime_run_id, conn=conn)
 
     def transition(
-        self,
-        message_id: int,
-        state: str,
-        *,
-        allowed_from: Iterable[str] | None = None,
-        runtime_run_id: str | None = None,
-        turn_id: str | None = None,
-        turn_index: int | None = None,
-        error: str = "",
+        self, message_id: int, state: str, *, allowed_from: Iterable[str] | None = None,
+        runtime_run_id: str | None = None, turn_id: str | None = None,
+        turn_index: int | None = None, error: str = "", conn: sqlite3.Connection | None = None,
     ) -> bool:
-        clean_state = str(state)
-        if clean_state not in INPUT_STATES:
-            raise ValueError(f"unsupported Agent input state: {clean_state}")
-        assignments = ["state = ?", "last_error = ?", "updated_at = ?"]
-        params: list[Any] = [clean_state, str(error)[:2000], now_ts()]
-        if runtime_run_id is not None:
-            assignments.append("runtime_run_id = ?")
-            params.append(str(runtime_run_id))
-        if turn_id is not None:
-            assignments.append("turn_id = ?")
-            params.append(str(turn_id))
-        if turn_index is not None:
-            assignments.append("turn_index = ?")
-            params.append(max(0, int(turn_index)))
-        sql = f"UPDATE agent_run_inputs SET {', '.join(assignments)} WHERE message_id = ?"
-        params.append(int(message_id))
-        allowed = tuple(str(item) for item in (allowed_from or ()))
-        if allowed:
-            placeholders = ",".join("?" for _ in allowed)
-            sql += f" AND state IN ({placeholders})"
-            params.extend(allowed)
-        return self.db.execute(sql, params).rowcount > 0
+        if state not in INPUT_STATES:
+            raise ValueError(f"unsupported Agent input state: {state}")
+        with self.db.transaction(immediate=True) if conn is None else nullcontext(conn) as conn:
+            item = self.get_by_message(message_id)
+            if item is None or (allowed_from and item.state not in allowed_from):
+                return False
+            # Job transitions own terminal outcomes; input callers only annotate
+            # admission/consumption and never resurrect terminal work.
+            if item.state in TERMINAL_STATES:
+                return item.state == state
+            data = {
+                "message_id": item.message_id, "parent_job_id": item.parent_job_id,
+                "input_group_id": item.input_group_id,
+                "state": state if state not in TERMINAL_STATES else item.state,
+                "runtime_run_id": item.runtime_run_id if runtime_run_id is None else str(runtime_run_id),
+                "turn_id": item.turn_id if turn_id is None else str(turn_id),
+                "turn_index": item.turn_index if turn_index is None else max(0, int(turn_index)),
+            }
+            self._save(conn, item.job_id, data)
+            if state in TERMINAL_STATES:
+                conn.execute(
+                    "UPDATE durable_jobs SET status = ?, last_error = ?, lease_until = 0 "
+                    "WHERE id = ? AND status IN ('queued', 'running')",
+                    (state, str(error)[:2000], item.job_id),
+                )
+            return True
 
     def recover_reserved_jobs(self) -> int:
-        """Safely requeue inputs that were never submitted to the runtime."""
-
-        ts = now_ts()
-        with self.db.transaction() as conn:
-            rows = conn.execute(
-                """
-                SELECT message_id, job_id FROM agent_run_inputs
-                WHERE state IN ('reserved', 'unconsumed')
-                """
-            ).fetchall()
-            recovered = 0
+        """Only inputs proven not submitted may be replayed after restart."""
+        rows = self.db.query("SELECT id FROM durable_jobs WHERE kind = 'agent' AND status = 'running'")
+        recovered = 0
+        with self.db.transaction(immediate=True) as conn:
             for row in rows:
-                cursor = conn.execute(
-                    """
-                    UPDATE durable_jobs
-                    SET status = 'queued', lease_until = 0,
-                        last_error = 'joined input was not submitted before restart',
-                        updated_at = ?
-                    WHERE id = ? AND status = 'running'
-                    """,
-                    (ts, int(row["job_id"])),
-                )
-                if cursor.rowcount:
-                    recovered += 1
-                conn.execute(
-                    """
-                    UPDATE agent_run_inputs
-                    SET state = 'unconsumed', updated_at = ?
-                    WHERE message_id = ?
-                    """,
-                    (ts, int(row["message_id"])),
-                )
+                item = self.get_by_job(int(row["id"]))
+                if item is None or item.state not in {"reserved", "unconsumed"}:
+                    continue
+                self.transition(item.message_id, "unconsumed", conn=conn)
+                recovered += conn.execute(
+                    "UPDATE durable_jobs SET status = 'queued', lease_until = 0, "
+                    "last_error = 'joined input was not submitted before restart', updated_at = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (now_ts(), item.job_id),
+                ).rowcount
         return recovered
-
-    def quarantine_interrupted_jobs(self) -> None:
-        self.db.execute(
-            """
-            UPDATE agent_run_inputs
-            SET state = 'needs_review',
-                last_error = 'worker interrupted after runtime input submission',
-                updated_at = ?
-            WHERE state IN ('running', 'submitting', 'accepted', 'injected')
-              AND job_id IN (
-                  SELECT id FROM durable_jobs WHERE status = 'needs_review'
-              )
-            """,
-            (now_ts(),),
-        )
-
-    def reconcile_terminal_jobs(self) -> None:
-        """Make the input ledger agree with authoritative durable job terminals."""
-
-        self.db.execute(
-            """
-            UPDATE agent_run_inputs
-            SET state = CASE (
-                    SELECT status FROM durable_jobs
-                    WHERE durable_jobs.id = agent_run_inputs.job_id
-                )
-                    WHEN 'succeeded' THEN 'succeeded'
-                    WHEN 'needs_review' THEN 'needs_review'
-                    WHEN 'failed' THEN 'failed'
-                    ELSE state
-                END,
-                updated_at = ?
-            WHERE job_id IN (
-                SELECT id FROM durable_jobs
-                WHERE status IN ('succeeded', 'needs_review', 'failed')
-            )
-              AND state != (
-                CASE (
-                    SELECT status FROM durable_jobs
-                    WHERE durable_jobs.id = agent_run_inputs.job_id
-                )
-                    WHEN 'succeeded' THEN 'succeeded'
-                    WHEN 'needs_review' THEN 'needs_review'
-                    WHEN 'failed' THEN 'failed'
-                    ELSE state
-                END
-              )
-            """,
-            (now_ts(),),
-        )
-
-    @staticmethod
-    def _from_row(row: dict[str, Any]) -> AgentRunInput:
-        return AgentRunInput(
-            message_id=int(row["message_id"]),
-            job_id=int(row["job_id"]),
-            parent_job_id=int(row["parent_job_id"]),
-            input_group_id=str(row["input_group_id"]),
-            runtime_run_id=str(row.get("runtime_run_id") or ""),
-            state=str(row["state"]),
-            turn_id=str(row.get("turn_id") or ""),
-            turn_index=int(row.get("turn_index") or 0),
-            last_error=str(row.get("last_error") or ""),
-            created_at=int(row["created_at"]),
-            updated_at=int(row["updated_at"]),
-        )

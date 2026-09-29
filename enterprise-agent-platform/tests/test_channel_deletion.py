@@ -21,6 +21,29 @@ class ChannelDeletionTests(unittest.TestCase):
             call()
         self.assertEqual(raised.exception.status, status)
 
+    def test_failed_channel_cancellation_rolls_back_archive_and_queued_jobs(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                channel = service.create_channel(admin, "cancel-rollback")
+                with mock.patch.object(service, "_start_agent_worker_locked"):
+                    sent = service.send_channel_message(admin, channel["id"], "@agent queued")
+                original = service._cancel_agent_scope_work
+
+                def fail_after_cancellation(*args, **kwargs):
+                    original(*args, **kwargs)
+                    raise RuntimeError("rollback cancellation")
+
+                with mock.patch.object(service, "_cancel_agent_scope_work", side_effect=fail_after_cancellation):
+                    with self.assertRaisesRegex(RuntimeError, "rollback cancellation"):
+                        service.delete_channel(admin, channel["id"])
+                self.assertEqual(service.get_channel(admin, channel["id"])["id"], channel["id"])
+                job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                self.assertEqual(job.status, "queued")
+            finally:
+                service.close()
+
     def test_manager_deletion_retains_content_identity_and_name_but_removes_access(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -344,7 +367,7 @@ class ChannelDeletionTests(unittest.TestCase):
             try:
                 _, admin = service.authenticate("admin", "admin")
                 channel = service.create_channel(admin, "send-delete-race")
-                original = service._enqueue_after_browser_assistance_handoff
+                original = service._enqueue_agent_reply
 
                 def delayed_enqueue(*args, **kwargs):
                     entered.set()
@@ -356,7 +379,7 @@ class ChannelDeletionTests(unittest.TestCase):
                     deleting.set()
                     return service.delete_channel(admin, channel["id"])
 
-                with mock.patch.object(service, "_enqueue_after_browser_assistance_handoff", side_effect=delayed_enqueue), mock.patch.object(service, "_start_agent_worker_locked"):
+                with mock.patch.object(service, "_enqueue_agent_reply", side_effect=delayed_enqueue), mock.patch.object(service, "_start_agent_worker_locked"):
                     with ThreadPoolExecutor(max_workers=2) as pool:
                         sent_future = pool.submit(service.send_channel_message, admin, channel["id"], "@agent ordered input")
                         self.assertTrue(entered.wait(timeout=2))

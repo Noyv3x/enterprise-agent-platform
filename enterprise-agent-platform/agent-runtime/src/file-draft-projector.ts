@@ -2,9 +2,6 @@ import { posix } from "node:path";
 import type { AssistantMessageEvent, ToolCall } from "@earendil-works/pi-ai";
 import { redactSensitiveText } from "./sensitive-text.js";
 
-const CODEX_API = "openai-codex-responses";
-const CODEX_PROVIDER = "openai-codex";
-
 /** Keep draft bodies comfortably below the Runtime journal's per-run byte budget. */
 export const FILE_DRAFT_MAX_BYTES = 16 * 1024;
 
@@ -15,22 +12,7 @@ export const FILE_DRAFT_MAX_BYTES = 16 * 1024;
  */
 export const FILE_DRAFT_SAFETY_TAIL_BYTES = 512;
 
-// Exponential early checkpoints make small files visibly stream. Past 1 KiB,
-// fixed 2 KiB checkpoints avoid a long 8 -> 16 KiB UI pause while keeping the
-// total journal body written by one tool call strictly bounded.
-const FILE_DRAFT_CHECKPOINT_BYTES = Object.freeze([
-  128,
-  256,
-  512,
-  1_024,
-  3_072,
-  5_120,
-  7_168,
-  9_216,
-  11_264,
-  13_312,
-  15_360,
-]);
+const FILE_DRAFT_INTERVAL_MS = 100;
 
 type DraftToolCallUpdate = Extract<
   AssistantMessageEvent,
@@ -42,11 +24,9 @@ export type FileDraftKind = "file" | "replacement";
 export interface RuntimeFileDraft {
   workspace_path: string;
   kind: FileDraftKind;
-  content?: string;
-  revision: number;
-  complete: boolean;
+  content: string;
+  done: boolean;
   truncated: boolean;
-  discarded: boolean;
 }
 
 export interface RuntimeFileDraftProjection {
@@ -56,16 +36,8 @@ export interface RuntimeFileDraftProjection {
 }
 
 interface DraftState {
-  toolCallId: string;
-  toolName: RuntimeFileDraftProjection["tool_name"];
-  kind: FileDraftKind;
-  workspacePath?: string;
-  revision: number;
-  nextCheckpoint: number;
-  published: boolean;
-  discarded: boolean;
-  complete: boolean;
-  truncated: boolean;
+  projection: RuntimeFileDraftProjection;
+  publishedAt: number;
 }
 
 type Eligibility<T> =
@@ -73,179 +45,49 @@ type Eligibility<T> =
   | { status: "pending" }
   | { status: "rejected" };
 
-/**
- * Per-Run projector for the one provider/API pair whose adapter exposes
- * progressively parsed cumulative tool arguments. It never consumes or
- * returns the provider's raw JSON delta.
- */
-export class CodexFileDraftProjector {
+/** Project only Pi's parsed cumulative arguments, never raw JSON fragments. */
+export class FileDraftProjector {
   private readonly states = new Map<string, DraftState>();
-  private readonly activeByContentIndex = new Map<number, string>();
 
-  constructor(private readonly enabled: boolean) {}
-
-  /**
-   * Normalize the complete compatibility default before Agent Core emits
-   * message_end. This keeps the assistant call in the next model context and
-   * durable session aligned with the Codex-only required-target schema.
-   */
-  normalizeCompleteTarget(update: Extract<AssistantMessageEvent, { type: "toolcall_end" }>): void {
-    if (
-      !this.enabled
-      || update.partial.api !== CODEX_API
-      || update.partial.provider !== CODEX_PROVIDER
-      || !isToolCall(update.toolCall)
-      || (update.toolCall.name !== "write_file" && update.toolCall.name !== "patch_file")
-      || !isObjectRecord(update.toolCall.arguments)
-      || Object.hasOwn(update.toolCall.arguments, "target")
-    ) {
-      return;
-    }
-    const normalizedArguments = { ...update.toolCall.arguments, target: "sandbox" };
-    update.toolCall.arguments = normalizedArguments;
-    const partialBlock = update.partial.content[update.contentIndex];
-    if (
-      isToolCall(partialBlock)
-      && partialBlock.id === update.toolCall.id
-      && partialBlock.name === update.toolCall.name
-    ) {
-      partialBlock.arguments = normalizedArguments;
-    }
-  }
+  constructor(private readonly now: () => number = Date.now) {}
 
   project(update: DraftToolCallUpdate): RuntimeFileDraftProjection | undefined {
-    if (!this.enabled) return undefined;
-    const complete = update.type === "toolcall_end";
-    const activeId = this.activeByContentIndex.get(update.contentIndex);
-    if (update.partial.api !== CODEX_API || update.partial.provider !== CODEX_PROVIDER) {
-      return activeId ? this.discardAt(update.contentIndex, this.states.get(activeId), complete) : undefined;
-    }
-
-    const partialBlock = update.partial.content[update.contentIndex];
-    const block = complete ? update.toolCall : partialBlock;
-    if (!isToolCall(block)) {
-      return activeId ? this.discardAt(update.contentIndex, this.states.get(activeId), complete) : undefined;
-    }
-    if (
-      complete
-      && isToolCall(partialBlock)
-      && (partialBlock.id !== block.id || partialBlock.name !== block.name)
-    ) {
-      return activeId ? this.discardAt(update.contentIndex, this.states.get(activeId), true) : undefined;
-    }
-    if (activeId && activeId !== block.id) {
-      return this.discardAt(update.contentIndex, this.states.get(activeId), complete);
-    }
-    if (block.name !== "write_file" && block.name !== "patch_file") {
-      return activeId ? this.discardAt(update.contentIndex, this.states.get(activeId), complete) : undefined;
-    }
-
-    let state = this.states.get(block.id);
-    if (!state) {
-      state = {
-        toolCallId: block.id,
-        toolName: block.name,
-        kind: block.name === "write_file" ? "file" : "replacement",
-        revision: 0,
-        nextCheckpoint: 0,
-        published: false,
-        discarded: false,
-        complete: false,
-        truncated: false,
-      };
-      this.states.set(block.id, state);
-      this.activeByContentIndex.set(update.contentIndex, block.id);
-    }
-    if (state.complete) return undefined;
-    if (state.toolName !== block.name) return this.discardAt(update.contentIndex, state, complete);
-    if (state.discarded) return complete ? this.discardAt(update.contentIndex, state, true) : undefined;
-
-    const arguments_ = objectRecord(block.arguments);
-    const target = sandboxTarget(arguments_, complete);
-    if (target.status === "rejected") return this.discardAt(update.contentIndex, state, complete);
-    if (target.status === "pending") return undefined;
-
-    const path = canonicalWorkspacePath(arguments_.path, complete);
-    if (path.status === "rejected") return this.discardAt(update.contentIndex, state, complete);
-    if (path.status === "pending") return undefined;
-    if (state.published && state.workspacePath !== path.value) {
-      // A normal cumulative JSON string cannot change after its closing quote.
-      // Treat a post-publication path mutation as an unstable projection and
-      // withdraw it instead of moving the same identity between files.
-      return this.discardAt(update.contentIndex, state, complete);
-    }
-    state.workspacePath = path.value;
-
-    const contentKey = state.toolName === "write_file" ? "content" : "new_text";
-    const rawContent = arguments_[contentKey];
-    if (typeof rawContent !== "string") {
-      return complete || state.published
-        ? this.discardAt(update.contentIndex, state, complete)
-        : undefined;
-    }
-
-    const safe = safeDraftContent(rawContent, complete);
-    state.truncated = safe.truncated;
-    if (!complete) {
-      const threshold = FILE_DRAFT_CHECKPOINT_BYTES[state.nextCheckpoint];
-      if (threshold === undefined || safe.bytes < threshold) return undefined;
-      while (
-        state.nextCheckpoint < FILE_DRAFT_CHECKPOINT_BYTES.length
-        && safe.bytes >= FILE_DRAFT_CHECKPOINT_BYTES[state.nextCheckpoint]!
-      ) {
-        state.nextCheckpoint += 1;
-      }
-    }
-
-    state.revision += 1;
-    state.published = true;
-    state.complete = complete;
-    if (complete) this.activeByContentIndex.delete(update.contentIndex);
-    return {
-      tool_call_id: state.toolCallId,
-      tool_name: state.toolName,
+    const argumentsFinished = update.type === "toolcall_end";
+    const block = argumentsFinished ? update.toolCall : update.partial.content[update.contentIndex];
+    if (!isToolCall(block) || (block.name !== "write_file" && block.name !== "patch_file")) return;
+    const previous = this.states.get(block.id);
+    const now = this.now();
+    if (!argumentsFinished && previous && now - previous.publishedAt < FILE_DRAFT_INTERVAL_MS) return;
+    const args = objectRecord(block.arguments);
+    if (sandboxTarget(args, argumentsFinished).status !== "allowed") return;
+    const path = canonicalWorkspacePath(args.path, argumentsFinished);
+    if (path.status !== "allowed") return;
+    const raw = args[block.name === "write_file" ? "content" : "new_text"];
+    if (typeof raw !== "string") return;
+    const safe = safeDraftContent(raw, argumentsFinished);
+    if (!argumentsFinished && safe.content.length === 0) return;
+    const projection: RuntimeFileDraftProjection = {
+      tool_call_id: block.id,
+      tool_name: block.name,
       file_draft: {
-        workspace_path: state.workspacePath,
-        kind: state.kind,
+        workspace_path: path.value,
+        kind: block.name === "write_file" ? "file" : "replacement",
         content: safe.content,
-        revision: state.revision,
-        complete,
+        done: false,
         truncated: safe.truncated,
-        discarded: false,
       },
     };
+    this.states.set(block.id, { projection, publishedAt: now });
+    return projection;
   }
 
-  private discardAt(
-    contentIndex: number,
-    state: DraftState | undefined,
-    complete: boolean,
-  ): RuntimeFileDraftProjection | undefined {
-    if (!state || state.complete) return undefined;
-    if (!state.published || !state.workspacePath) {
-      state.discarded = true;
-      state.complete = complete;
-      if (complete) this.activeByContentIndex.delete(contentIndex);
-      return undefined;
-    }
-    // Emit the first withdrawal immediately. If toolcall_end follows, emit one
-    // final complete withdrawal as the terminal revision for this identity.
-    if (state.discarded && !complete) return undefined;
-    state.revision += 1;
-    state.discarded = true;
-    state.complete = complete;
-    if (complete) this.activeByContentIndex.delete(contentIndex);
+  finish(toolCallId: string): RuntimeFileDraftProjection | undefined {
+    const state = this.states.get(toolCallId);
+    if (!state) return;
+    this.states.delete(toolCallId);
     return {
-      tool_call_id: state.toolCallId,
-      tool_name: state.toolName,
-      file_draft: {
-        workspace_path: state.workspacePath,
-        kind: state.kind,
-        revision: state.revision,
-        complete,
-        truncated: state.truncated,
-        discarded: true,
-      },
+      ...state.projection,
+      file_draft: { ...state.projection.file_draft, done: true },
     };
   }
 }

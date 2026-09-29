@@ -37,3 +37,18 @@ export function waitForBrowserControlRelinquish(event: Event, operation: Promise
   const waitUntil = (detail as Partial<BrowserControlRelinquishDetail>).waitUntil;
   if (typeof waitUntil === "function") waitUntil(operation);
 }
+
+/** Register a scoped handoff barrier without leaking DOM event plumbing into views. */
+export function onBrowserControlRelinquish(
+  scope: AgentPreviewScope,
+  relinquish: () => Promise<unknown>,
+): () => void {
+  const listener = (event: Event) => {
+    const requested = browserControlRelinquishScope(event);
+    if (requested?.scope_type === scope.scope_type && requested.scope_id === scope.scope_id) {
+      waitForBrowserControlRelinquish(event, relinquish());
+    }
+  };
+  window.addEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, listener);
+  return () => window.removeEventListener(BROWSER_CONTROL_RELINQUISH_EVENT, listener);
+}

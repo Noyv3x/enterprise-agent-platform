@@ -65,45 +65,6 @@ test("managed file and process policy auto-allows sandbox and requires one-shot 
   }
 });
 
-test("file schemas require an explicit target and prepare omitted sandbox defaults", () => {
-  const codexTools = createTools({
-    runId: "run-openai-codex",
-    request: {
-      scope_key: "private:1",
-      model: { provider: "openai-codex", id: "test-model" },
-    } as never,
-    gateway: {} as never,
-    querySession: async () => null,
-    delegate: async () => "",
-    markSideEffect: () => undefined,
-  });
-
-  for (const [name, arguments_] of [
-    ["write_file", { path: "note.txt", content: "hello" }],
-    ["patch_file", { path: "note.txt", old_text: "hello", new_text: "updated" }],
-  ] as const) {
-    const codex = codexTools.find((tool) => tool.name === name);
-    assert.ok(codex);
-    assert.equal(
-      ((codex.parameters as { required?: string[] }).required ?? []).includes("target"),
-      true,
-    );
-    assert.ok(codex.prepareArguments);
-    assert.throws(
-      () => validateToolArguments(codex, fauxToolCall(name, arguments_)),
-      /target/,
-    );
-    const originalArguments = { ...arguments_ };
-    const prepared = codex.prepareArguments(originalArguments);
-    assert.equal(prepared, originalArguments, "compatibility normalization must update model history in place");
-    assert.deepEqual(prepared, { ...arguments_, target: "sandbox" });
-    assert.doesNotThrow(
-      () => validateToolArguments(codex, fauxToolCall(name, prepared)),
-    );
-    const hostPrepared = codex.prepareArguments({ ...arguments_, target: "host" }) as Record<string, unknown>;
-    assert.equal(hostPrepared.target, "host");
-  }
-});
 
 test("delegate_task preserves single-call behavior and batches bounded children concurrently in input order", async () => {
   const started: Array<{ prompt: string; role: string }> = [];

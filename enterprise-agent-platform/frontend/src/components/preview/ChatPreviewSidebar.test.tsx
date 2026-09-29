@@ -369,6 +369,33 @@ describe("ChatPreviewSidebar", () => {
     expect(within(preview).getByRole("button", { name: "Show the AI computer" })).toBeVisible();
   });
 
+  it("follows browser, terminal, and file activity only after a run identity arrives", async () => {
+    mocks.availability.browserActive = true;
+    const view = renderSidebar(privateScope, true, <ChatComposerFixture />);
+    const update = (status: AgentStatus) => act(() => view.store.dispatch({
+      type: "SET_AGENT_STATUS", payload: { mode: "private", scopeId: "7", status, authoritative: true },
+    }));
+    const preview = screen.getByRole("region", { name: "Computer preview" });
+    update({state:"replying"});
+    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
+    update({state:"replying",run_id:"activity-run",activity:[{tool:"browser",sequence:1,tool_status:"running"}]});
+    expect(within(preview).getByRole("img", {hidden:true})).toHaveAttribute("src", "blob:live-frame");
+    update({state:"replying",run_id:"activity-run",activity:[
+      {tool:"browser",sequence:1,tool_status:"completed"},
+      {tool:"terminal",sequence:2,tool_status:"completed",result:"Current terminal output"},
+    ]});
+    expect(within(preview).getByLabelText("Read-only terminal output")).toHaveTextContent("Current terminal output");
+    update({state:"replying",run_id:"activity-run",activity:[
+      {tool:"terminal",sequence:2,tool_status:"completed"},
+      {tool:"read_file",sequence:3,tool_status:"completed",parameters:{workspace_path:"notes.md"}},
+    ]});
+    expect(await within(preview).findByText("Committed file result")).toBeVisible();
+    expect(within(preview).queryByLabelText("Read-only terminal output")).not.toBeInTheDocument();
+    update({state:"idle"});
+    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
+    expect(screen.queryByText("Committed file result")).not.toBeInTheDocument();
+  });
+
   it.each(["browser", "present"] as const)("offers idle %s resources only through the header", async (resource) => {
     mocks.availability.browserActive = resource === "browser";
     mocks.availability.presentAvailable = resource === "present";
@@ -383,123 +410,13 @@ describe("ChatPreviewSidebar", () => {
     expect(within(preview).queryByRole("button", { name: "Show the AI computer" })).not.toBeInTheDocument();
   });
 
-  it("retains stopped work without resources and keeps a later dismissal through idle, queues, and manual expansion", async () => {
-    const view = renderSidebar(privateScope, true, <ChatComposerFixture />);
-    const update = (status: AgentStatus) => act(() => view.store.dispatch({
-      type: "SET_AGENT_STATUS", payload: { mode: "private", scopeId: "7", status, authoritative: true },
-    }));
-    const preview = screen.getByRole("region", { name: "Computer preview" });
-    update({state:"replying",run_id:"run-1",computer:{mode:"search",search:{hits:[{title:"Observed result"}]}}});
-    update({state:"approval",run_id:"run-1"});
-    update({state:"idle",run_id:""});
-    act(() => view.store.dispatch({type:"SET_PRIVATE_MESSAGES",payload:[{
-      id:11,author_type:"agent",metadata:{agent_work:{
-        state:"complete",run_id:"run-1",activity:[{tool:"web",tool_status:"completed"}],
-      }},
-    }]}));
-    expect(within(preview).getByRole("button", {name:"Show the AI computer"})).toBeVisible();
-    expect(within(preview).getByText("Observed result")).toBeVisible();
-    expect(within(preview).queryByText("Working")).not.toBeInTheDocument();
-    await userEvent.click(within(preview).getByRole("button", {name:"Hide the AI computer"}));
-    mocks.availability.browserActive = true;
-    update({state:"idle",run_id:""});
-    update({state:"queued",run_id:"next-run"});
-    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", {name:"Show the AI computer"}));
-    const computer = await waitForOpenPreview("AI computer");
-    expect(within(computer).getByText("Observed result")).toBeVisible();
-    await userEvent.click(within(computer).getByRole("button", {name:"Minimize the AI computer"}));
-    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
-    mocks.availability.browserActive = false;
-    update({state:"replying",run_id:"next-run"});
-    expect(within(preview).getByRole("button", {name:"Show the AI computer"})).toBeVisible();
-    expect(screen.queryByText("Observed result")).not.toBeInTheDocument();
-  });
-
-  it.each(["", "private:7:12"])("preserves dismissal while provisional identity %s becomes canonical", async (runId) => {
-    const view = renderSidebar(privateScope, true, <ChatComposerFixture />);
-    const update = (status: AgentStatus) => act(() => view.store.dispatch({
-      type: "SET_AGENT_STATUS", payload: { mode: "private", scopeId: "7", status, authoritative: true },
-    }));
-    const preview = screen.getByRole("region", {name:"Computer preview"});
-    update({state:"replying",run_id:runId});
-    await userEvent.click(within(preview).getByRole("button", {name:"Hide the AI computer"}));
-    update({state:"approval",run_id:"runtime-run",computer:{mode:"search",search:{hits:[{title:"Approval result"}]}}});
-    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
-    update({state:"replying",run_id:"runtime-run"});
-    update({state:"idle",run_id:""});
-    update({state:"queued",run_id:"queued-run"});
-    expect(within(preview).queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
-    update({state:"replying",run_id:""});
-    expect(within(preview).getByRole("button", {name:"Show the AI computer"})).toBeVisible();
-  });
-
-  it.each(["browser", "present", "terminal"] as const)("retains an honest stopped %s window without its expired resource", async (mode) => {
-    mocks.availability.browserActive = mode === "browser";
-    mocks.availability.presentAvailable = mode === "present";
-    mocks.availability.runningTerminalCount = mode === "terminal" ? 1 : 0;
-    const view = renderSidebar(privateScope, true, <ChatComposerFixture />, {
-      ...initialAppState,
-      agentStatuses:{...initialAppState.agentStatuses,private:{state:"replying",run_id:"resource-run",computer:{mode}}},
-    });
-    const preview = screen.getByRole("region", {name:"Computer preview"});
-    await userEvent.click(within(preview).getByRole("button", {name:"Show the AI computer"}));
-    const computer = await waitForOpenPreview("AI computer");
-    mocks.availability.browserActive = false;
-    mocks.availability.presentAvailable = false;
-    mocks.availability.runningTerminalCount = 0;
-    act(() => view.store.dispatch({type:"SET_AGENT_STATUS",payload:{
-      mode:"private",scopeId:"7",status:{state:"idle",run_id:""},authoritative:true,
-    }}));
-    expect(computer).toBeVisible();
-    expect(within(computer).getByText("Work has stopped. This preview is no longer available.")).toBeVisible();
-    expect(within(computer).queryByRole("img", {name:"Latest Agent browser frame"})).not.toBeInTheDocument();
-    expect(within(computer).queryByTitle("Presented page")).not.toBeInTheDocument();
-    expect(within(computer).queryByLabelText("Read-only terminal output")).not.toBeInTheDocument();
-    await userEvent.click(within(computer).getByRole("button", {name:"Minimize the AI computer"}));
-    expect(within(preview).getByRole("button", {name:"Show the AI computer"})).toBeVisible();
-  });
-
-  it.each([
-    {mode:"file",state:"complete"}, {mode:"terminal",state:"complete"},
-    {mode:"file",state:"error"}, {mode:"terminal",state:"error"},
-  ])("uses only matching finished $mode metadata after the run ends with $state", async ({mode,state}) => {
-    const tool = mode === "file" ? "write_file" : "terminal";
-    const step = {tool,tool_call_id:"call",tool_status:"running",parameters:{workspace_path:"notes.md",command:"printf final"}};
-    const view = renderSidebar(privateScope, true, <ChatComposerFixture />, {
-      ...initialAppState,
-      agentStatuses:{...initialAppState.agentStatuses,private:{state:"replying",run_id:"observed-run",activity:[step]}},
-    });
-    const updateMessages = (runId: string) => act(() => view.store.dispatch({
-      type:"SET_PRIVATE_MESSAGES",payload:[{id:10,author_type:"agent",metadata:{agent_work:{
-        state,run_id:runId,activity:[{...step,tool_status:"completed",result:"Final terminal result\n[exit 0]"}],
-      }}}],
-    }));
-    act(() => view.store.dispatch({type:"SET_AGENT_STATUS",payload:{
-      mode:"private",scopeId:"7",status:{state:"idle",run_id:""},authoritative:true,
-    }}));
-    updateMessages("unrelated-run");
-    expect(screen.getByText("Work has stopped. This preview is no longer available.")).toBeVisible();
-    const readsBeforeFinal = vi.mocked(fetchTerminalPreviews).mock.calls.length;
-    updateMessages("observed-run");
-    if (mode === "file") expect(await screen.findByText("Committed file result")).toBeVisible();
-    else {
-      expect(screen.getByLabelText("Read-only terminal output")).toHaveTextContent("Final terminal result");
-      expect(fetchTerminalPreviews).toHaveBeenCalledTimes(readsBeforeFinal);
-    }
-    expect(screen.queryByText("Running")).not.toBeInTheDocument();
-  });
-
-  it("drops retained content on a store replacement even within the same scope", () => {
+  it("drops current content on a store replacement even within the same scope", () => {
     const view = renderSidebar(privateScope, true, <ChatComposerFixture />, {
       ...initialAppState,
       agentStatuses:{...initialAppState.agentStatuses,private:{
         state:"replying",run_id:"account-run",computer:{mode:"search",search:{hits:[{title:"Private retained result"}]}},
       }},
     });
-    act(() => view.store.dispatch({type:"SET_AGENT_STATUS",payload:{
-      mode:"private",scopeId:"7",status:{state:"idle",run_id:""},authoritative:true,
-    }}));
     expect(screen.getByText("Private retained result")).toBeVisible();
     view.rerender(
       <StoreContext.Provider value={createStore(rootReducer, initialAppState)}>
@@ -510,16 +427,13 @@ describe("ChatPreviewSidebar", () => {
     expect(screen.queryByRole("button", {name:"Show the AI computer"})).not.toBeInTheDocument();
   });
 
-  it("clears retained work synchronously across an account session reset", () => {
+  it("clears current work synchronously across an account session reset", () => {
     const view = renderSidebar(privateScope, true, <ChatComposerFixture />, {
       ...initialAppState,
       agentStatuses:{...initialAppState.agentStatuses,private:{
         state:"replying",run_id:"account-run",computer:{mode:"search",search:{hits:[{title:"Outgoing account result"}]}},
       }},
     });
-    act(() => view.store.dispatch({type:"SET_AGENT_STATUS",payload:{
-      mode:"private",scopeId:"7",status:{state:"idle",run_id:""},authoritative:true,
-    }}));
     expect(screen.getByText("Outgoing account result")).toBeVisible();
     act(() => {
       resetApiSession();

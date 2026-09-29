@@ -535,6 +535,38 @@ describe("BrowserPreviewView", () => {
     expect(screen.queryByText("Human assistance")).not.toBeInTheDocument();
   });
 
+  it("drains an in-flight input then releases before scoped handoff finishes", async () => {
+    Object.assign(mocks.state, {
+      connection: "connected", activity: "live", frameUrl: "blob:frame", tabId: "tab-1",
+    });
+    let finishInput!: (value: { ok: boolean }) => void;
+    let finishRelease!: (value: { released: boolean }) => void;
+    mocks.send.mockImplementationOnce(() => new Promise(resolve => { finishInput = resolve; }));
+    mocks.release.mockImplementationOnce(() => new Promise(resolve => { finishRelease = resolve; }));
+    const user = userEvent.setup();
+    renderPreview();
+    await user.click(screen.getByRole("button", { name: "Take control" }));
+    await user.click(screen.getByRole("button", { name: "Back" }));
+    await user.click(screen.getByRole("button", { name: "Forward" }));
+
+    await act(() => relinquishBrowserControlFor({ scope_type: "channel", scope_id: "7" }));
+    expect(screen.getByText("Human assistance")).toBeVisible();
+    let finished = false;
+    let handoff!: Promise<void>;
+    act(() => {
+      handoff = relinquishBrowserControlFor({ scope_type: "private", scope_id: "7" })
+        .then(() => { finished = true; });
+    });
+    expect(mocks.release).not.toHaveBeenCalled();
+    await act(async () => { finishInput({ ok: true }); });
+    expect(mocks.send).toHaveBeenCalledTimes(1);
+    expect(mocks.release).toHaveBeenCalledTimes(1);
+    expect(finished).toBe(false);
+    await act(async () => { finishRelease({ released: true }); await handoff; });
+    expect(finished).toBe(true);
+    expect(screen.getByText("Read only")).toBeVisible();
+  });
+
   it("expires the local lease and best-effort releases it", async () => {
     mocks.state.connection = "connected";
     mocks.state.activity = "live";

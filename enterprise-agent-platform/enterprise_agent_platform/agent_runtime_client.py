@@ -832,11 +832,13 @@ class AgentRuntimeClient:
         content_callback: AgentContentCallback | None,
     ) -> AgentResult:
         content_parts: list[str] = []
+        last_assistant_parts: list[str] = []
         final_output = ""
         final_session_id = response_session
         usage: dict[str, Any] | None = None
         terminal_type = ""
         terminal_error = ""
+        terminal_payload: dict[str, Any] = {}
         current_turn_id = ""
         raw_events: list[dict[str, Any]] = []
         event_count = 0
@@ -846,7 +848,7 @@ class AgentRuntimeClient:
         def dispatch() -> bool:
             nonlocal data_lines, event_name, event_count
             nonlocal final_output, final_session_id, usage, terminal_type, terminal_error
-            nonlocal current_turn_id, content_parts
+            nonlocal current_turn_id, content_parts, last_assistant_parts, terminal_payload
             if not data_lines:
                 event_name = "message"
                 return False
@@ -893,7 +895,6 @@ class AgentRuntimeClient:
                 turn_id = str(payload.get("turn_id") or "").strip()
                 if turn_id and current_turn_id and turn_id != current_turn_id:
                     content_parts = []
-                    final_output = ""
                     self._emit_content(
                         content_callback,
                         None,
@@ -905,6 +906,8 @@ class AgentRuntimeClient:
                 delta = _text_from_content(payload.get("delta", payload.get("content")))
                 if delta:
                     content_parts.append(delta)
+                    if delta.strip():
+                        last_assistant_parts = content_parts
                     self._emit_content(
                         content_callback,
                         delta,
@@ -916,14 +919,16 @@ class AgentRuntimeClient:
                 turn_id = str(payload.get("turn_id") or "").strip()
                 if turn_id:
                     current_turn_id = turn_id
-                final_output = _text_from_content(payload.get("output", payload.get("content")))
+                text = _text_from_content(payload.get("output", payload.get("content")))
+                if text.strip():
+                    last_assistant_parts = [text]
+                content_parts = []
                 return False
             if event_type == "input.injected":
                 turn_id = str(payload.get("turn_id") or "").strip()
                 if turn_id and turn_id != current_turn_id:
                     current_turn_id = turn_id
                     content_parts = []
-                    final_output = ""
                     self._emit_content(
                         content_callback,
                         None,
@@ -946,43 +951,19 @@ class AgentRuntimeClient:
                     if not approval_id or self._pending_approvals.get(run_id) == approval_id:
                         self._pending_approvals.pop(run_id, None)
 
-            if event_type == "run.completed":
+            if event_type in _TERMINAL_EVENTS:
                 terminal_type = event_type
-                completed_output = _text_from_content(payload.get("output", payload.get("content")))
-                if completed_output:
-                    final_output = completed_output
-                event_session = str(payload.get("session_id") or "").strip()
-                if event_session:
-                    final_session_id = event_session
-                raw_usage = payload.get("usage")
-                if isinstance(raw_usage, dict):
-                    usage = raw_usage
-                for key in ("input_message_ids", "unconsumed_input_message_ids"):
-                    values = payload.get(key)
-                    if isinstance(values, list):
-                        raw_values = [str(value) for value in values if str(value or "").strip()]
-                        payload[key] = raw_values
-                return True
-            if event_type in _TERMINAL_EVENTS - {"run.completed"}:
-                terminal_type = event_type
+                terminal_payload = payload
                 terminal_error = _error_message(payload) or event_type
-                terminal_output = _text_from_content(
+                final_output = _text_from_content(
                     payload.get("output", payload.get("content"))
                 )
-                if terminal_output:
-                    final_output = terminal_output
                 event_session = str(payload.get("session_id") or "").strip()
                 if event_session:
                     final_session_id = event_session
                 raw_usage = payload.get("usage")
                 if isinstance(raw_usage, dict):
                     usage = raw_usage
-                for key in ("input_message_ids", "unconsumed_input_message_ids"):
-                    values = payload.get(key)
-                    if isinstance(values, list):
-                        payload[key] = [
-                            str(value) for value in values if str(value or "").strip()
-                        ]
                 return True
 
             if event_type in _PROGRESS_EVENT_TYPES:
@@ -1009,7 +990,7 @@ class AgentRuntimeClient:
         if data_lines and not terminal_type:
             dispatch()
 
-        content = final_output or "".join(content_parts)
+        content = final_output if final_output.strip() else "".join(last_assistant_parts)
         raw: dict[str, Any] = {
             "mode": "agent-runtime",
             "run_id": run_id,
@@ -1022,16 +1003,6 @@ class AgentRuntimeClient:
             raw["model_config"] = model
         if usage is not None:
             raw["usage"] = usage
-        terminal_payload = next(
-            (
-                event.get("data")
-                for event in reversed(raw_events)
-                if isinstance(event, dict)
-                and str(event.get("type") or event.get("event") or "") == terminal_type
-                and isinstance(event.get("data"), dict)
-            ),
-            {},
-        )
         if isinstance(terminal_payload, dict):
             for key in ("input_message_ids", "unconsumed_input_message_ids"):
                 values = terminal_payload.get(key)
@@ -1070,10 +1041,8 @@ class AgentRuntimeClient:
                 session_id=final_session_id,
                 raw=raw,
             )
-        if not content:
-            raise AgentRuntimeProtocolError(
-                f"Agent run {run_id} completed without assistant content after {event_count} events"
-            )
+        if not content.strip():
+            content = "No text response was returned."
         return AgentResult(content=content, session_id=final_session_id, raw=raw)
 
     def _json_request(

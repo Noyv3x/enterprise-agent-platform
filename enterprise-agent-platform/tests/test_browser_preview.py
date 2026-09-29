@@ -504,17 +504,13 @@ class BrowserPreviewServiceTests(unittest.TestCase):
                     "_enqueue_agent_reply",
                     return_value={"agent_status": {"state": "queued"}},
                 ):
-                    service._enqueue_after_browser_assistance_handoff(
-                        {},
-                        scope.scope_key,
-                        int(member["id"]),
-                    )
+                    service.send_channel_message(member, 1, "@agent leave the other user's browser alone")
 
                 self.assertIn((scope.scope_key, "tab-1"), service._browser_control_leases)
             finally:
                 service.close()
 
-    def test_channel_agent_message_releases_senders_lease_before_enqueue(self):
+    def test_channel_agent_message_releases_senders_lease_before_job_publication(self):
         with tempfile.TemporaryDirectory() as td:
             service = self._service(Path(td))
             try:
@@ -542,24 +538,21 @@ class BrowserPreviewServiceTests(unittest.TestCase):
                         },
                     )
 
-                observed: dict[str, object] = {}
+                observed: list[dict] = []
+                enqueue = service.jobs.enqueue
 
-                def enqueue(_task):
-                    observed["leases"] = dict(service._browser_control_leases)
-                    return {
-                        "agent_status": {"state": "queued"},
-                        "processing_mode": "queued",
-                        "input_group_id": "group-1",
-                    }
+                def observe_publication(**kwargs):
+                    observed.append(dict(service._browser_control_leases))
+                    return enqueue(**kwargs)
 
                 with mock.patch.object(
-                    service,
-                    "_enqueue_agent_reply",
-                    side_effect=enqueue,
+                    service.jobs, "enqueue", side_effect=observe_publication,
+                ), mock.patch.object(
+                    service, "_enqueue_agent_reply", return_value={"agent_status": {"state": "queued"}},
                 ):
                     service.send_channel_message(actor, 1, "@agent 再试试")
 
-                self.assertEqual(observed["leases"], {})
+                self.assertEqual(observed, [{}])
             finally:
                 service.close()
 

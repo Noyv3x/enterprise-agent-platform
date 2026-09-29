@@ -3,14 +3,20 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchPreviewFile } from "../../data/previewActions";
 import { LOCALE_STORAGE_KEY } from "../../i18n";
-import { TestUiProviders } from "../../test/TestUiProviders";
+import { StoreProvider } from "../../store/StoreProvider";
+import { TestUiProviders as UiProviders } from "../../test/TestUiProviders";
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerPip } from "./ComputerPip";
 import type { ComputerSurface } from "./computer";
 import type { AgentPreviewFileResponse } from "../../types";
+
+function TestUiProviders({ children }: { children: ReactNode }) {
+  return <StoreProvider><UiProviders>{children}</UiProviders></StoreProvider>;
+}
 
 vi.mock("./useBrowserPreview", () => ({
   useBrowserPreview: () => ({
@@ -280,7 +286,6 @@ describe("ComputerPip", () => {
             file: {
               ...surface.file,
               status: "completed",
-              revision: "write-1:2:completed",
             },
           },
           openComputer: vi.fn(),
@@ -302,7 +307,7 @@ describe("ComputerPip", () => {
     vi.mocked(fetchPreviewFile).mockImplementation(() => new Promise((resolve) => {
       pending.push({ resolve });
     }));
-    const pipFor = (runId: string, draftRevision: number) => (
+    const pipFor = (runId: string) => (
       <TestUiProviders>
         <ChatPreviewContext.Provider value={{
           scope: { scope_type: "private", scope_id: "7" },
@@ -322,7 +327,7 @@ describe("ComputerPip", () => {
               draft_kind: "file",
               status: "running",
               tool_call_id: "call",
-              revision: `draft:call:${draftRevision}`,
+              done: false,
             },
           },
           openComputer: vi.fn(),
@@ -335,29 +340,28 @@ describe("ComputerPip", () => {
         </ChatPreviewContext.Provider>
       </TestUiProviders>
     );
-    const draft = (content: string, draftRevision: number): AgentPreviewFileResponse => ({
+    const draft = (content: string): AgentPreviewFileResponse => ({
       workspace_path: "draft.txt",
       content,
       truncated: false,
       encoding: "utf-8",
       source: "draft",
       draft_kind: "file",
-      revision: `draft:call:${draftRevision}`,
     });
 
-    const rendered = render(pipFor("run-A", 9));
+    const rendered = render(pipFor("run-A"));
     await waitFor(() => expect(pending).toHaveLength(1));
 
-    rendered.rerender(pipFor("run-B", 1));
+    rendered.rerender(pipFor("run-B"));
     await act(async () => {
-      pending[0].resolve(draft("A_STALE_DRAFT", 9));
+      pending[0].resolve(draft("A_STALE_DRAFT"));
       await Promise.resolve();
     });
     expect(screen.queryByText("A_STALE_DRAFT")).not.toBeInTheDocument();
 
     await waitFor(() => expect(pending).toHaveLength(2));
     await act(async () => {
-      pending[1].resolve(draft("B_CURRENT_DRAFT", 1));
+      pending[1].resolve(draft("B_CURRENT_DRAFT"));
       await Promise.resolve();
     });
     expect(await screen.findByText("B_CURRENT_DRAFT")).toBeVisible();

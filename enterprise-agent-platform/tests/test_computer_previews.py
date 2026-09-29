@@ -10,7 +10,6 @@ from unittest import mock
 
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import (
-    COMPUTER_FILE_PREVIEW_MAX_BYTES,
     COMPUTER_PRESENT_MAX_BYTES,
     PRESENT_PAGE_CSP,
     ServiceError,
@@ -235,21 +234,16 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
         kind: str = "file",
         workspace_path: str = "src/app.ts",
         content: str = "draft text",
-        revision: object = 1,
-        complete: object = False,
+        done: object = False,
         truncated: object = False,
-        discarded: object = False,
     ) -> dict[str, object]:
         draft: dict[str, object] = {
             "workspace_path": workspace_path,
             "kind": kind,
-            "revision": revision,
-            "complete": complete,
+            "content": content,
+            "done": done,
             "truncated": truncated,
-            "discarded": discarded,
         }
-        if discarded is not True:
-            draft["content"] = content
         return {
             "event": "tool.arguments.delta",
             "tool_name": tool,
@@ -257,7 +251,7 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
             "file_draft": draft,
         }
 
-    def test_write_draft_is_live_only_monotonic_and_cleared_by_terminal_event(self):
+    def test_latest_arrival_is_live_redacted_and_cleared_by_terminal_event(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
@@ -287,7 +281,8 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                             "tool_call_id": "write-draft-1",
                             "workspace_path": "src/app.ts",
                             "status": "drafting",
-                            "revision": "draft:write-draft-1:1",
+                            "done": False,
+                            "truncated": False,
                         },
                     },
                 )
@@ -301,7 +296,7 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                 )
                 self.assertEqual(preview["source"], "draft")
                 self.assertEqual(preview["draft_kind"], "file")
-                self.assertEqual(preview["revision"], "draft:write-draft-1:1")
+                self.assertNotIn("revision", preview)
                 self.assertIn("TOKEN=•••", preview["content"])
                 self.assertNotIn("super-secret", preview["content"])
 
@@ -313,7 +308,7 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                 service._record_agent_progress(
                     "private",
                     str(actor["id"]),
-                    self._draft_event(content="stale", revision=1, complete=True),
+                    self._draft_event(content="newest content"),
                 )
                 self.assertEqual(
                     service.agent_preview_file(
@@ -321,8 +316,8 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                         "private",
                         str(actor["id"]),
                         "src/app.ts",
-                    )["revision"],
-                    "draft:write-draft-1:1",
+                    )["content"],
+                    "newest content",
                 )
 
                 service._record_agent_progress(
@@ -333,7 +328,6 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                         tool_call_id="write-draft-1",
                         kind="replacement",
                         content="identity swap",
-                        revision=2,
                     ),
                 )
                 self.assertEqual(
@@ -342,18 +336,17 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                         "private",
                         str(actor["id"]),
                         "src/app.ts",
-                    )["revision"],
-                    "draft:write-draft-1:1",
+                    )["content"],
+                    "newest content",
                 )
 
                 service._record_agent_progress(
                     "private",
                     str(actor["id"]),
-                    self._draft_event(content="final draft", revision=2, complete=True),
+                    self._draft_event(content="final draft"),
                 )
                 pending = service.agent_status(actor, "private", str(actor["id"]))
-                self.assertEqual(pending["computer"]["file"]["status"], "pending")
-                self.assertEqual(pending["computer"]["file"]["revision"], "draft:write-draft-1:2")
+                self.assertNotIn("final draft", json.dumps(pending))
                 self.assertEqual(
                     service.agent_preview_file(
                         actor,
@@ -403,14 +396,14 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                 self.assertEqual(committed["source"], "workspace")
                 self.assertEqual(committed["content"], "committed old text")
                 completed = service.agent_status(actor, "private", str(actor["id"]))
+                self.assertGreaterEqual(completed["updated_at"], pending["updated_at"])
                 self.assertNotEqual(
-                    completed.get("computer", {}).get("file", {}).get("revision"),
-                    "draft:write-draft-1:2",
+                    completed.get("computer", {}).get("file", {}).get("source"), "draft"
                 )
             finally:
                 service.close()
 
-    def test_patch_replacement_draft_can_be_discarded(self):
+    def test_patch_done_switches_preview_to_workspace(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
             try:
@@ -428,7 +421,6 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                         tool_call_id="patch-draft-1",
                         kind="replacement",
                         content="replacement fragment",
-                        complete=True,
                     ),
                 )
                 preview = service.agent_preview_file(
@@ -440,6 +432,14 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                 self.assertEqual(preview["source"], "draft")
                 self.assertEqual(preview["draft_kind"], "replacement")
                 self.assertEqual(preview["content"], "replacement fragment")
+                service._record_agent_progress(
+                    "private", str(actor["id"]),
+                    self._draft_event(tool_call_id="older-write", done=True),
+                )
+                self.assertEqual(
+                    service.agent_preview_file(actor, "private", str(actor["id"]), "src/app.ts")["content"],
+                    "replacement fragment",
+                )
 
                 service._record_agent_progress(
                     "private",
@@ -448,8 +448,7 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                         tool="patch_file",
                         tool_call_id="patch-draft-1",
                         kind="replacement",
-                        revision=2,
-                        discarded=True,
+                        done=True,
                     ),
                 )
                 self.assertEqual(
@@ -465,6 +464,16 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                     "computer",
                     service.agent_status(actor, "private", str(actor["id"])),
                 )
+                service._record_agent_progress(
+                    "private", str(actor["id"]), self._draft_event(content="failed write"),
+                )
+                service._record_agent_progress(
+                    "private", str(actor["id"]),
+                    {"event": "tool.failed", "tool_name": "write_file", "tool_call_id": "write-draft-1"},
+                )
+                preview = service.agent_preview_file(actor, "private", str(actor["id"]), "src/app.ts")
+                self.assertEqual(preview["source"], "workspace")
+                self.assertEqual(preview["content"], "committed")
             finally:
                 service.close()
 
@@ -528,6 +537,84 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_drafts_do_not_grant_access_or_leak_across_scopes(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, owner = service.authenticate("admin", "admin")
+                other = service.create_user(
+                    username="draft-viewer", password="viewer-password",
+                    actor=owner, permission_group="member",
+                )
+                for actor in (owner, other):
+                    scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                    target = Path(scope.workspace_path) / "src" / "app.ts"
+                    target.parent.mkdir()
+                    target.write_text(f"workspace {actor['id']}", encoding="utf-8")
+                    self._activate(service, actor)
+                service._record_agent_progress(
+                    "private", str(owner["id"]),
+                    self._draft_event(content="owner confidential draft"),
+                )
+                with self.assertRaises(ServiceError) as raised:
+                    service.agent_preview_file(other, "private", str(owner["id"]), "src/app.ts")
+                self.assertEqual(raised.exception.status, 403)
+                preview = service.agent_preview_file(other, "private", str(other["id"]), "src/app.ts")
+                self.assertEqual(preview["source"], "workspace")
+                self.assertEqual(preview["content"], f"workspace {other['id']}")
+                with self.assertRaises(ServiceError):
+                    service.agent_preview_file(owner, "private", str(owner["id"]), "../src/app.ts")
+            finally:
+                service.close()
+
+    def test_truncated_utf8_draft_respects_byte_boundary(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                self._activate(service, actor)
+                content = "é" * (16 * 1024 // 2)
+                service._record_agent_progress(
+                    "private", str(actor["id"]), self._draft_event(content=content, truncated=True),
+                )
+                preview = service.agent_preview_file(actor, "private", str(actor["id"]), "src/app.ts")
+                self.assertEqual(preview["content"], content)
+                self.assertTrue(preview["truncated"])
+                self.assertLessEqual(len(preview["content"].encode("utf-8")), 16 * 1024)
+                service._record_agent_progress(
+                    "private", str(actor["id"]), self._draft_event(content=content + "é"),
+                )
+                self.assertEqual(
+                    service.agent_preview_file(actor, "private", str(actor["id"]), "src/app.ts")["content"],
+                    content,
+                )
+            finally:
+                service.close()
+
+    def test_redaction_expansion_is_truncated_to_draft_byte_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                service.agent_scopes.ensure_private_scope(int(actor["id"]))
+                self._activate(service, actor)
+                content = "token=x\n" * (16 * 1024 // len("token=x\n"))
+                service._record_agent_progress(
+                    "private", str(actor["id"]), self._draft_event(content=content),
+                )
+                preview = service.agent_preview_file(actor, "private", str(actor["id"]), "src/app.ts")
+                self.assertLessEqual(len(preview["content"].encode("utf-8")), 16 * 1024)
+                self.assertTrue(preview["truncated"])
+                self.assertIn("token=•••", preview["content"])
+                self.assertNotIn("token=x", preview["content"])
+                self.assertNotIn("\ufffd", preview["content"])
+                status = service.agent_status(actor, "private", str(actor["id"]))
+                self.assertTrue(status["computer"]["file"]["truncated"])
+                self.assertNotIn("token=", json.dumps(status))
+            finally:
+                service.close()
+
     def test_invalid_file_draft_payloads_are_ignored(self):
         with tempfile.TemporaryDirectory() as td:
             service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
@@ -538,17 +625,13 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                     self._draft_event(tool="read_file"),
                     self._draft_event(tool_call_id=""),
                     self._draft_event(kind="replacement"),
-                    self._draft_event(revision=0),
-                    self._draft_event(revision=True),
-                    self._draft_event(revision=2**53),
+                    self._draft_event(done="false"),
+                    self._draft_event(truncated="false"),
                     self._draft_event(workspace_path="/workspace/src/app.ts"),
                     self._draft_event(workspace_path="../app.ts"),
-                    self._draft_event(content="x" * (COMPUTER_FILE_PREVIEW_MAX_BYTES + 1)),
-                    self._draft_event(complete="false"),
+                    self._draft_event(content="x" * (16 * 1024 + 1)),
+                    self._draft_event(content="é" * (16 * 1024 // 2 + 1)),
                 ]
-                invalid_discard = self._draft_event(discarded=True)
-                invalid_discard["file_draft"]["content"] = "must be omitted"
-                invalid.append(invalid_discard)
                 for event in invalid:
                     with self.subTest(event=event):
                         service._record_agent_progress(
@@ -556,9 +639,10 @@ class ComputerFileDraftProjectionTests(unittest.TestCase):
                             str(actor["id"]),
                             event,
                         )
-                        with service._conversation_lock:
-                            internal = service._agent_status[f"private:{actor['id']}"]
-                            self.assertNotIn("_computer_file_draft", internal)
+                        self.assertNotIn(
+                            "computer",
+                            service.agent_status(actor, "private", str(actor["id"])),
+                        )
             finally:
                 service.close()
 
@@ -644,8 +728,6 @@ class ComputerPreviewHTTPTests(unittest.TestCase):
                         ComputerFileDraftProjectionTests._draft_event(
                             workspace_path="notes/readme.md",
                             content="HTTP draft TOKEN=http-secret",
-                            revision=4,
-                            complete=True,
                         ),
                     )
                     connection = http.client.HTTPConnection(host, port, timeout=5)
@@ -659,7 +741,7 @@ class ComputerPreviewHTTPTests(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                     self.assertEqual(draft_body["source"], "draft")
                     self.assertEqual(draft_body["draft_kind"], "file")
-                    self.assertEqual(draft_body["revision"], "draft:write-draft-1:4")
+                    self.assertNotIn("revision", draft_body)
                     self.assertIn("TOKEN=•••", draft_body["content"])
                     self.assertNotIn("http-secret", json.dumps(draft_body))
                 finally:

@@ -600,7 +600,6 @@ def publish_private_file_at(
         published_identity = (final_info.st_dev, final_info.st_ino)
         file_fd = open_private_file_fd_at(parent_fd, name, writable=False)
         try:
-            verify_private_file_fd_at(parent_fd, name, file_fd)
             pinned = os.fstat(file_fd)
             if (pinned.st_dev, pinned.st_ino) != published_identity:
                 raise UnsafePrivatePathError(
@@ -707,10 +706,6 @@ def publish_private_file_at(
                 maximum_bytes=max(len(data), len(replace_data), 1),
             )
         else:
-            if staged_raw == replace_data and final_raw == data:
-                os.unlink(staging_name, dir_fd=staging_fd)
-                os.fsync(staging_fd)
-                return
             if staged_raw != data:
                 raise UnsafePrivatePathError(
                     f"private replacement staging conflicts: {staging_name}"

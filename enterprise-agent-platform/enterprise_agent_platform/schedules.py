@@ -423,7 +423,7 @@ class AgentScheduleStore:
             before = " AND r.id < ?"
             params.append(int(before_id))
         params.append(max(1, min(int(limit), 101)))
-        return self.db.query(
+        rows = self.db.query(
             f"""
             SELECT r.* FROM agent_schedule_runs r
             JOIN agent_schedules s ON s.id = r.schedule_id
@@ -433,31 +433,60 @@ class AgentScheduleStore:
             """,
             params,
         )
+        return [self._project_run(row) for row in rows]
 
     def get_run(self, run_id: int) -> dict[str, Any] | None:
-        return self.db.query_one(
+        row = self.db.query_one(
             "SELECT * FROM agent_schedule_runs WHERE id = ?",
             (int(run_id),),
         )
+        return self._project_run(row) if row is not None else None
 
     def latest_run(self, schedule_id: int) -> dict[str, Any] | None:
-        return self.db.query_one(
+        row = self.db.query_one(
             "SELECT * FROM agent_schedule_runs WHERE schedule_id = ? ORDER BY id DESC LIMIT 1",
             (int(schedule_id),),
         )
+        return self._project_run(row) if row is not None else None
 
-    def missing_job_runs(self) -> list[dict[str, Any]]:
-        return self.db.query(
-            """
-            SELECT r.*, s.owner_user_id, s.name, s.prompt, s.timezone, s.delivery,
-                   s.schedule_json
-            FROM agent_schedule_runs r
-            JOIN agent_schedules s ON s.id = r.schedule_id
-            WHERE r.status = 'queued' AND r.source_message_id IS NOT NULL
-              AND r.durable_job_id IS NULL
-            ORDER BY r.id
-            """
+    def latest_runs(self, schedule_ids: list[int]) -> dict[int, dict[str, Any]]:
+        if not schedule_ids:
+            return {}
+        placeholders = ",".join("?" for _ in schedule_ids)
+        rows = self.db.query(
+            f"""SELECT r.* FROM agent_schedule_runs r
+                JOIN (
+                    SELECT schedule_id, MAX(id) AS latest_id FROM agent_schedule_runs
+                    WHERE schedule_id IN ({placeholders}) GROUP BY schedule_id
+                ) latest ON latest.latest_id = r.id""",
+            schedule_ids,
         )
+        return {int(row["schedule_id"]): self._project_run(row) for row in rows}
+
+    def _project_run(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Read durable outcomes; retained run columns are rollback-reader caches."""
+        job = self.db.query_one(
+            "SELECT status, last_error, updated_at FROM durable_jobs WHERE id = ?",
+            (row.get("durable_job_id"),),
+        )
+        if job is not None:
+            status = str(job["status"])
+            # These schedule-only outcomes are not part of the job vocabulary.
+            if status == "needs_review" or row["status"] not in {"blocked", "cancelled", "skipped"}:
+                row["status"] = status
+                row["error"] = str(job["last_error"] or "")
+                if status in {"succeeded", "failed", "needs_review"}:
+                    row["finished_at"] = job["updated_at"]
+        delivery = self.db.query_one(
+            """SELECT status, last_error FROM durable_jobs
+               WHERE kind = 'telegram_delivery' AND dedupe_key = ?""",
+            (f"message:{row.get('source_message_id')}",),
+        )
+        if delivery is not None and delivery["status"] in {"failed", "needs_review"}:
+            prefix = "Telegram delivery needs review: " if delivery["status"] == "needs_review" else ""
+            row["delivery_warning"] = prefix + str(delivery["last_error"] or "")
+        return row
+
 
     def update_run_status(
         self,

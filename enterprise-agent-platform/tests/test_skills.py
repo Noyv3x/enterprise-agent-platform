@@ -752,6 +752,34 @@ class SkillStoreTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "automatic_skill_patch_forbidden")
 
+    def test_missing_identity_never_restores_orphaned_maintenance_on_retry(self):
+        scope = "private:missing-identity"
+        skill = self.create_skill(scope, name="Learned", created_by="agent")
+        sidecar = self.sidecar_path(skill["id"], scope)
+        sidecar.unlink()
+        real_write = skills_module._atomic_write_bytes
+
+        def fail_identity_write(path, data):
+            if path == sidecar:
+                raise OSError("identity publication interrupted")
+            return real_write(path, data)
+
+        with mock.patch.object(
+            skills_module, "_atomic_write_bytes", side_effect=fail_identity_write
+        ):
+            with self.assertRaises(OSError):
+                self.store.load(scope, skill["id"])
+
+        with self.assertRaises(SkillStoreError) as raised:
+            self.store.patch_automatic(
+                scope, skill["id"], "Verify sources", "Change user instructions"
+            )
+        self.assertEqual(raised.exception.code, "automatic_skill_patch_forbidden")
+        self.assertEqual(
+            self.store.load(scope, skill["id"])["instructions"],
+            "# Workflow\n\nVerify sources before summarizing.",
+        )
+
     @unittest.skipUnless(hasattr(os, "symlink"), "symlinks are not supported")
     def test_package_swap_after_open_cannot_cross_scope_read(self):
         scope = "private:swap-reader"

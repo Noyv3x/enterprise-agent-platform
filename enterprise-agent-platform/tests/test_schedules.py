@@ -13,6 +13,7 @@ from unittest import mock
 
 from enterprise_agent_platform.agent_runtime_client import AgentResult, AgentRuntimeRunError
 from enterprise_agent_platform.config import PlatformConfig
+from enterprise_agent_platform.db import migrate_database
 from enterprise_agent_platform.schedules import next_occurrence, normalize_schedule
 from enterprise_agent_platform.server import serve_in_thread
 from enterprise_agent_platform.service import EnterpriseService, ServiceError
@@ -223,6 +224,52 @@ class ScheduleServiceTests(unittest.TestCase):
                 "context": {"scope_key": scope.scope_key},
             }
         )["data"]["schedule"]
+
+    def test_history_projects_uncertain_jobs_without_replaying_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                _, actor = service.authenticate("admin", "admin")
+                schedule = self._create(service, actor)
+                source = service._append_message(
+                    scope_type="private", scope_id=str(actor["id"]), author_type="system",
+                    user_id=actor["id"], username="Scheduled Task", content="Review outcome",
+                    metadata={},
+                )
+                agent_job, _ = service.jobs.enqueue(
+                    kind="agent", dedupe_key="projection-smoke", payload={},
+                    scope_type="private", scope_id=str(actor["id"]),
+                )
+                delivery, _ = service.jobs.enqueue(
+                    kind="telegram_delivery", dedupe_key=f"message:{source['id']}", payload={},
+                    scope_type="private", scope_id=str(actor["id"]),
+                )
+                service.db.execute(
+                    """INSERT INTO agent_schedule_runs(
+                        schedule_id, schedule_revision, occurrence_key, scheduled_for,
+                        trigger, status, source_message_id, durable_job_id, created_at, updated_at
+                    ) VALUES (?, 1, 'manual:projection', 1, 'manual', 'running', ?, ?, 1, 1)""",
+                    (schedule["id"], source["id"], agent_job.id),
+                )
+                service.jobs.mark_running(agent_job.id, lease_seconds=60)
+                service.jobs.mark_failed(agent_job.id, "Runtime outcome unknown", needs_review=True)
+                service.jobs.mark_running(delivery.id, lease_seconds=60)
+                service.jobs.mark_failed(delivery.id, "response lost", needs_review=True)
+                history = service.schedules.runs(actor["id"], schedule["id"], limit=10)
+                self.assertEqual(history[0]["status"], "needs_review")
+                self.assertEqual(history[0]["error"], "Runtime outcome unknown")
+                self.assertEqual(history[0]["delivery_warning"], "Telegram delivery needs review: response lost")
+                self.assertEqual(service.schedules.latest_run(schedule["id"])["status"], "needs_review")
+                summary = service.list_private_schedules(actor)["schedules"][0]
+                self.assertEqual(summary["last_run"]["status"], "needs_review")
+                self.assertEqual(
+                    summary["last_run"]["error"],
+                    "Runtime outcome unknown\nTelegram delivery needs review: response lost",
+                )
+                self.assertIsNone(service.jobs.mark_running(delivery.id, lease_seconds=60))
+                self.assertEqual(service.jobs.get(delivery.id).status, "needs_review")
+            finally:
+                service.close()
 
     @staticmethod
     def _complete_current_context(
@@ -1291,13 +1338,11 @@ class ScheduleServiceTests(unittest.TestCase):
                     cleanup_runtime=False,
                 )
                 self.assertEqual(service.jobs.get(job_id).status, "succeeded")
-                self.assertEqual(service.schedules.get_run(run["id"])["status"], "running")
-                service._sync_schedule_runs_from_jobs()
                 self.assertEqual(service.schedules.get_run(run["id"])["status"], "succeeded")
             finally:
                 service.close()
 
-    def test_restart_repairs_system_source_message_job_gap_once(self):
+    def test_migration_repairs_system_source_message_job_gap_once(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             first = EnterpriseService(config, agent_client=RecordingAgent())
@@ -1358,6 +1403,8 @@ class ScheduleServiceTests(unittest.TestCase):
                     (json.dumps(metadata), source),
                 )
             first.close()
+            migrate_database(config.db_path, data_dir=config.data_dir)
+            migrate_database(config.db_path, data_dir=config.data_dir)
 
             agent = RecordingAgent()
             recovered = EnterpriseService(config, agent_client=agent)
@@ -1506,7 +1553,7 @@ class ScheduleServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_gap_repair_blocks_unsafe_scheduled_source_before_enqueue(self):
+    def test_migrated_gap_blocks_unsafe_scheduled_source_before_execution(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
@@ -1574,21 +1621,14 @@ class ScheduleServiceTests(unittest.TestCase):
                         (json.dumps(metadata), source_id),
                     )
 
-                with mock.patch.object(service.jobs, "enqueue") as enqueue:
-                    service._recover_durable_work()
-                    enqueue.assert_not_called()
+                service.close()
+                migrate_database(Path(td) / "platform.db", data_dir=Path(td))
+                service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=5)
 
                 blocked = service.schedules.get_run(run_id)
                 self.assertEqual(blocked["status"], "blocked")
                 self.assertIn("safety validation", blocked["error"])
-                self.assertIsNone(blocked["durable_job_id"])
-                self.assertEqual(
-                    service.db.scalar(
-                        "SELECT COUNT(*) FROM durable_jobs WHERE dedupe_key = ?",
-                        (f"message:{source_id}",),
-                    ),
-                    0,
-                )
                 self.assertEqual(agent.calls, [])
 
                 service._recover_durable_work()

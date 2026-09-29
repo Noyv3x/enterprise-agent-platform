@@ -3,20 +3,19 @@ import { Button } from "antd";
 import { useI18n } from "../../i18n";
 import { getApiSessionGeneration } from "../../lib/api";
 import { useStore, useStoreHandle } from "../../store/useStore";
-import type { AgentPreviewScope, ComputerMode, Message } from "../../types";
+import type { AgentPreviewScope, ComputerMode } from "../../types";
 import { Glyph, LoadingState, OverlayPanel } from "../ui/fieldwork";
 import { Icon } from "../common/Icon";
 import { HeaderAction } from "../shell/HeaderAction";
 import { ChatPreviewContext } from "./ChatPreviewContext";
 import { ComputerScreen } from "./ComputerScreen";
-import { deriveComputerSurface, retainComputerSurface, type ComputerSurface } from "./computer";
+import { deriveComputerSurface } from "./computer";
 import { usePreviewAvailability } from "./usePreviewAvailability";
 import "./preview.css";
 
 const MemoryPanel=lazy(() => import("../memory/MemoryPanel").then(module => ({default:module.MemoryPanel})));
 const SkillsPanel=lazy(() => import("../skills/SkillsPanel").then(module => ({default:module.SkillsPanel})));
 const ScheduledTasksPanel=lazy(() => import("../scheduled-tasks/ScheduledTasksPanel").then(module => ({default:module.ScheduledTasksPanel})));
-const EMPTY_MESSAGES:Message[]=[];
 type Capability="memory"|"skills"|"tasks"|"computer";
 
 type SidebarProps = {scope:AgentPreviewScope|null;canManageSkills?:boolean;children:ReactNode};
@@ -37,40 +36,15 @@ function ScopedChatPreviewSidebar({scope,canManageSkills=true,children}: Sidebar
   const {t}=useI18n();
   const {state,refresh}=usePreviewAvailability(scope);
   const status=useStore(value => !scope ? null : scope.scope_type === "private" ? value.agentStatuses.private : value.agentStatuses.channels[String(scope.scope_id)] || null);
-  const messages=useStore(value => !scope ? EMPTY_MESSAGES : scope.scope_type === "private" ? value.privateMessages : value.messages);
-  const currentSurface=useMemo(() => deriveComputerSurface({status,messages,availability:state}),[status,messages,state]);
+  const surface=useMemo(() => deriveComputerSurface({status,availability:state}),[status,state]);
   const scopeKey=scope ? `${scope.scope_type}:${scope.scope_id}` : "";
   const [selection,setSelection]=useState<{scope:string;kind:Capability}|null>(null);
   const [intent,setIntent]=useState<{scope:string;request:number;pending:boolean}|null>(null);
-  const [work,setWork]=useState<{
-    status: typeof status;
-    live: boolean;
-    observed: ComputerSurface | null;
-    runIds: string[];
-    dismissed: boolean;
-  }>(() => ({status:null,live:false,observed:null,runIds:[],dismissed:false}));
-  // A platform task ID is provisional until the runtime assigns its canonical run ID.
-  // Adoption is not new work; queued/idle -> live and distinct identified runs are.
-  if (work.status !== status) {
-    const runId=currentSurface.runId;
-    const previousId=work.observed?.runId || "";
-    const identifiedNewRun=Boolean(runId && previousId && runId !== previousId
-      && !work.runIds.includes(runId) && !(previousId.startsWith(`${scopeKey}:`) && !runId.startsWith(`${scopeKey}:`)));
-    const newWork=currentSurface.live && (!work.live || identifiedNewRun);
-    const runIds=newWork ? runId ? [runId] : []
-      : runId && currentSurface.live && !work.runIds.includes(runId) ? [...work.runIds,runId] : work.runIds;
-    const observedSurface=!newWork && !currentSurface.mode && work.observed ? work.observed : currentSurface;
-    setWork({
-      status,
-      live:currentSurface.live,
-      observed:currentSurface.live ? {...observedSurface,runId:runId || (newWork ? "" : previousId)} : work.observed,
-      runIds,
-      dismissed:newWork ? false : work.dismissed,
-    });
+  const [work,setWork]=useState({runId:"",dismissed:false});
+  // Stable run identity is the only automatic PiP lifecycle boundary.
+  if (surface.live && surface.runId && surface.runId !== work.runId) {
+    setWork({runId:surface.runId,dismissed:false});
   }
-  const surface=useMemo(() => currentSurface.live ? currentSurface
-    : work.observed ? retainComputerSurface(work.observed,work.runIds,messages,state) : currentSurface,
-  [currentSurface,work.observed,work.runIds,messages,state]);
   const sequence=useRef(0);
   const opener=useRef<HTMLElement|null>(null);
   const computerCloseIcon = useRef<HTMLSpanElement|null>(null);
@@ -148,7 +122,7 @@ function ScopedChatPreviewSidebar({scope,canManageSkills=true,children}: Sidebar
       {privateScope ? <HeaderAction icon={<Glyph name="schedule" size={16} />} label={t("scheduledTasks.title")} aria-label={t("scheduledTasks.open")} aria-expanded={visible === "tasks"} onClick={event => open("tasks",event.currentTarget)} /> : null}
     </>
   ) : null, [scope, t, computerActive, visible, openComputer, privateScope, open]);
-  const computerPipDismissed=!work.observed || work.dismissed;
+  const computerPipDismissed=!surface.live || !surface.runId || work.dismissed;
   const context=useMemo(() => ({scope,capabilityActions,browserDrawerOpen:visible === "computer" && mode === "browser",computerDrawerOpen:visible === "computer",computerMode:mode,computerSurface:screenSurface,openComputer,openBrowserAssist,computerPipDismissed,dismissComputerPip}),[scope,capabilityActions,visible,mode,screenSurface,openComputer,openBrowserAssist,computerPipDismissed,dismissComputerPip]);
   const title=visible === "memory" ? t("memory.title") : visible === "skills" ? t("skills.title") : visible === "tasks" ? t("scheduledTasks.title") : t("computer.title");
   const computerScreen=visible === "computer" && scope ? <ComputerScreen key={scopeKey} scope={scope} surface={screenSurface} availabilityError={state.error} onRetryAvailability={refresh} browserControlRequestId={intentCurrent ? intent?.request : undefined} /> : null;

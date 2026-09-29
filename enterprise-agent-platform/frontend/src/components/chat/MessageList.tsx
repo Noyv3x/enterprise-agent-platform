@@ -4,11 +4,11 @@ import {useStickyScroll} from "../../hooks/useStickyScroll";
 import {loadOlderMessages} from "../../data/loaders";
 import {withdrawChannelMessage,navigateToView,selectChannel} from "../../data/chatActions";
 import {getApiSessionGeneration} from "../../lib/api";
-import {useI18n,type Translator} from "../../i18n";
+import {useI18n} from "../../i18n";
 import {agentStatusFor,hasPermission,isAgentActive,pendingReplyStatus,scopeTypeFor} from "../../store/selectors";
 import {useStore,useStoreHandle} from "../../store/useStore";
-import type {AgentStatus,ChatMode,Message,ScopeType,StreamMsg,TypingUser} from "../../types";
-import {ConversationLayout,ConversationEmpty,ConversationJump,Notice} from "../ui/fieldwork";
+import type {ChatMode,Message,TypingUser} from "../../types";
+import {ConversationLayout,ConversationEmpty,ConversationJump,MessageEntry,Notice} from "../ui/fieldwork";
 import {ResourceStatusView} from "../common/ResourceStatusView";
 import {AgentActivity} from "./AgentActivity";
 import {AgentApprovalPrompt} from "./AgentApprovalPrompt";
@@ -16,72 +16,8 @@ import {AgentTyping} from "./AgentTyping";
 import {AgentWorkCard,hasAgentProcessSteps} from "./AgentWorkCard";
 import {MessageBubble} from "./MessageBubble";
 import {TypingUsers} from "./TypingUsers";
-import {useSettlingRun} from "./useSettlingRun";
+import {MessageBody} from "./MessageBody";
 const EMPTY_TYPING:TypingUser[]=[];
-function currentTurnStreams(status: AgentStatus): StreamMsg[] {
-  const active = status.stream_message?.content ? status.stream_message : null;
-  const commentary = new Set((status.activity || [])
-    .filter(step => step.stage === "assistant.message")
-    .map(step => (step.detail || step.line || "").trim()).filter(Boolean));
-  const streams = [
-    ...(status.stream_messages || []).filter(stream => !!stream?.content
-      && !(active?.id && stream.id === active.id)
-      && !commentary.has(stream.content.trim())),
-    ...(active ? [active] : []),
-  ];
-  const hasTurnMetadata = streams.some(
-    (stream) => Number.isFinite(stream.turn_index) || !!stream.turn_id,
-  );
-  // The active stream can arrive before its turn fields while buffered segments
-  // are already tagged. Prefer the live buffer until the snapshot is complete.
-  if (
-    active &&
-    hasTurnMetadata &&
-    !Number.isFinite(active.turn_index) &&
-    !active.turn_id
-  ) {
-    return [active];
-  }
-  if (active?.turn_id && !Number.isFinite(active.turn_index)) {
-    return streams.filter((stream) => stream.turn_id === active.turn_id);
-  }
-  const indexed = streams.filter((stream) => Number.isFinite(stream.turn_index));
-  if (indexed.length) {
-    const newestTurn = Math.max(...indexed.map((stream) => Number(stream.turn_index)));
-    return streams.filter((stream) => Number(stream.turn_index) === newestTurn);
-  }
-  const newestTurnId =
-    status.stream_message?.turn_id ||
-    [...streams].reverse().find((stream) => !!stream.turn_id)?.turn_id;
-  return newestTurnId ? streams.filter((stream) => stream.turn_id === newestTurnId) : streams;
-}
-
-/** Synthesize pseudo-messages from streaming buffers for <MessageBubble>. */
-function agentStreamingMessages(
-  status: AgentStatus,
-  mode: ChatMode,
-  scopeType: ScopeType,
-  scopeId: string,
-  translate: Translator,
-  segments: StreamMsg[],
-): Message[] {
-  return segments.map((stream, index) => ({
-    id: stream.id || `stream-${status.run_id || status.started_at || "agent"}-${index}`,
-    scope_type: scopeType,
-    scope_id: scopeId,
-    author_type: "agent",
-    user_id: null,
-    username:
-      !stream.username || stream.username === "Private Agent" || stream.username === "Main Agent"
-        ? mode === "private"
-          ? translate("chat.privateAgent")
-          : translate("chat.mainAgent")
-        : stream.username,
-    content: stream.content || "",
-    metadata: { streaming: stream.active !== false, stream_segment: stream.active === false },
-    created_at: stream.created_at || status.started_at || Math.floor(Date.now() / 1000),
-  }));
-}
 
 export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,composer,preview,resourceKey}: {
  mode:ChatMode;scopeId:string;noChannel:boolean;forceBottomToken:number;header?:ReactNode;composer?:ReactNode;preview?:ReactNode;resourceKey?:string;
@@ -144,13 +80,10 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
     },
     [scopeId, store],
   );
-  const currentStreams = status ? currentTurnStreams(status) : [];
-  const settling = useSettlingRun(scopeKey, status, currentStreams, messages);
-  const streamCount = currentStreams.length + (settling?.streams.length || 0);
+  const stream = isAgentActive(status) ? status?.stream_message : null;
   const contentRevision =
     messages.reduce((total, message) => total + (message.content?.length || 0), 0) +
-    currentStreams.reduce((total, stream) => total + (stream.content?.length || 0), 0) +
-    (settling?.streams || []).reduce((total, stream) => total + (stream.content?.length || 0), 0) +
+    (stream?.content?.length || 0) +
     (status?.activity || []).reduce(
       (total, step) => total + (step.label?.length || 0) + (step.detail?.length || 0) + (step.line?.length || 0),
       0,
@@ -159,7 +92,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
     ref,
     scopeKey,
     forceBottomToken,
-    messages.length + streamCount,
+    messages.length + (stream?.content ? 1 : 0),
     contentRevision,
     history?.prependVersion || 0,
   );
@@ -167,9 +100,7 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   const active=isAgentActive(status);
   // A just-sent Agent request waits in the reply slot at once; the Platform's status then takes over in place.
   const liveStatus=active?status:pendingReplyStatus(mode,messages);
-  const empty=!messages.length&&!active&&!settling&&status?.state!=="error";
-  const streamMessages=status&&active?agentStreamingMessages(status,mode,scopeType,scopeId,t,currentStreams):[];
-  const settlingMessages=settling?agentStreamingMessages(settling.status,mode,scopeType,scopeId,t,settling.streams).map(message=>({...message,metadata:{...message.metadata,streaming:false}})):[];
+  const empty=!messages.length&&!active&&status?.state!=="error";
   const content=noChannel?<ConversationEmpty title={t("chat.empty.noChannelTitle")} description={t("chat.empty.noAccessibleChannelText")}/>:empty?<ConversationEmpty
     title={mode==="private"?t("chat.empty.privateTitle"):t("chat.empty.channelTitle")}
     description={mode==="private"?t("chat.empty.privateText"):canChat?t("chat.empty.channelText"):t("chat.empty.readOnlyChannelText")}/>:<>
@@ -178,14 +109,13 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
       const canWithdraw=mode==="channel"&&canChat&&message.author_type==="user"&&message.user_id!=null&&currentUserId!=null&&String(message.user_id)===String(currentUserId)&&!message.metadata?.local_pending;
       return <MessageBubble key={String(message.id)} message={message} canWithdraw={canWithdraw} withdrawing={withdrawingMessageId===String(message.id)} hideAuthorName={mode==="private"} onWithdraw={canWithdraw?handleWithdraw:undefined}/>;
     })}
-    {settling&&<>
-      {hasAgentProcessSteps(settling.status)&&<AgentWorkCard work={settling.status} active={false} settling/>}
-      {settlingMessages.map(message=><MessageBubble key={String(message.id)} message={message} hideAuthorName={mode==="private"}/>)}
-    </>}
     {liveStatus&&<>
       {hasAgentProcessSteps(liveStatus)?<AgentActivity status={liveStatus} mode={mode}/>:<AgentTyping status={liveStatus} mode={mode}/>}
       {liveStatus.approval&&canApprove&&<AgentApprovalPrompt approval={liveStatus.approval} mode={mode} scopeId={scopeId}/>}
-      <div aria-live="polite" aria-relevant="additions text">{streamMessages.map(message=><MessageBubble key={String(message.id)} message={message} hideAuthorName={mode==="private"}/>)}</div>
+      <div aria-live="polite" aria-relevant="additions text">{stream?.content&&<MessageEntry kind="agent" streaming={stream.active!==false}
+        header={mode==="channel"?<span className="font-medium">{!stream.username||stream.username==="Main Agent"?t("chat.mainAgent"):stream.username}</span>:undefined}>
+        <MessageBody content={stream.content}/>
+      </MessageEntry>}</div>
     </>}
     {!liveStatus&&status?.state==="error"&&(hasAgentProcessSteps(status)?<AgentWorkCard work={status} active={false}/>:<Notice tone="danger" title={t("chat.agent.replyFailed")}>{status.last_error||[...(status.activity||[])].reverse().find(step=>step.stage==="error")?.detail}</Notice>)}
     {mode==="channel"&&typingUsers.length>0&&<TypingUsers users={typingUsers}/>}

@@ -2824,6 +2824,148 @@ class Database:
         return int(cur.lastrowid)
 
 
+def _migrate_durable_work(database: Database, data_dir: Path) -> None:
+    """One explicit, additive cutover; normal startup never repairs job gaps."""
+    # Reuse pure projections without constructing a service or starting workers.
+    from .service import (
+        EnterpriseService, CONTAINER_PATHS, normalize_attachment_mime,
+        is_safe_inline_attachment_mime, rfc3339_utc,
+    )
+    marker = "durable_work_queue_v1"
+    with database.transaction(immediate=True) as conn:
+        if conn.execute("SELECT 1 FROM settings WHERE key = ?", (marker,)).fetchone():
+            return
+        timestamp = now_ts()
+        for legacy in conn.execute("SELECT * FROM agent_run_inputs").fetchall():
+            association = dict(legacy)
+            for key in ("job_id", "created_at", "updated_at", "last_error"):
+                association.pop(key, None)
+            conn.execute(
+                "UPDATE durable_jobs SET payload_json = json_set(payload_json, '$._input', json(?)) "
+                "WHERE id = ? AND json_type(payload_json, '$._input') IS NULL",
+                (json.dumps(association), int(legacy["job_id"])),
+            )
+        start = conn.execute(
+            "SELECT value FROM settings WHERE key = 'durable_agent_jobs_start_message_id'"
+        ).fetchone()
+        start_id = int(start["value"])
+        replied = set()
+        for reply in conn.execute("SELECT metadata_json FROM messages WHERE author_type = 'agent'"):
+            metadata = decode_json(reply["metadata_json"])
+            for value in [metadata.get("reply_to_message_id"), (metadata.get("reply_to") or {}).get("message_id"), *(metadata.get("reply_to_message_ids") or [])]:
+                if value is not None:
+                    replied.add(int(value))
+        runs = {
+            int(row["source_message_id"]): dict(row)
+            for row in conn.execute(
+                "SELECT r.*, s.schedule_json FROM agent_schedule_runs r "
+                "JOIN agent_schedules s ON s.id = r.schedule_id "
+                "WHERE r.durable_job_id IS NULL AND r.source_message_id IS NOT NULL "
+                "AND r.status IN ('queued', 'running')"
+            )
+        }
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE (id > ? AND author_type = 'user') "
+            "OR id IN (SELECT source_message_id FROM agent_schedule_runs "
+            "WHERE durable_job_id IS NULL AND status IN ('queued', 'running')) ORDER BY id",
+            (start_id,),
+        ).fetchall()
+        for row in rows:
+            message_id = int(row["id"])
+            metadata = decode_json(row["metadata_json"])
+            run = runs.get(message_id)
+            existing = conn.execute(
+                "SELECT id FROM durable_jobs WHERE kind = 'agent' AND dedupe_key = ?",
+                (f"message:{message_id}",),
+            ).fetchone()
+            if existing:
+                if run:
+                    conn.execute(
+                        "UPDATE agent_schedule_runs SET durable_job_id = ?, updated_at = ? WHERE id = ?",
+                        (existing["id"], timestamp, run["id"]),
+                    )
+                continue
+            if not run and row["scope_type"] == "channel" and not metadata.get("agent_mention"):
+                continue
+            if message_id in replied:
+                continue
+            actor_row = conn.execute("SELECT * FROM users WHERE id = ? AND active = 1", (row["user_id"],)).fetchone()
+            if actor_row is None:
+                if run:
+                    conn.execute(
+                        "UPDATE agent_schedule_runs SET status = 'cancelled', error = ?, updated_at = ? WHERE id = ?",
+                        ("schedule owner is missing or inactive", timestamp, run["id"]),
+                    )
+                continue
+            attachments = []
+            for stored in conn.execute("SELECT * FROM attachments WHERE message_id = ? ORDER BY id", (message_id,)):
+                attachment = dict(stored)
+                storage = Path(attachment["storage_path"])
+                parts = storage.parts
+                if storage.is_absolute() or len(parts) < 3 or parts[:2] != (row["scope_type"], row["scope_id"]) or ".." in parts:
+                    raise sqlite3.DatabaseError("attachment storage path does not match its scope")
+                mime = normalize_attachment_mime(attachment["filename"], attachment["mime_type"])
+                item = {key: attachment[key] for key in (
+                    "id", "message_id", "scope_type", "scope_id", "source", "filename",
+                    "size_bytes", "sha256", "created_at",
+                )}
+                item.update({
+                    "mime_type": mime, "is_image": is_safe_inline_attachment_mime(mime),
+                    "url": f"/api/attachments/{attachment['id']}",
+                    "download_url": f"/api/attachments/{attachment['id']}?download=1",
+                    "local_path": str(data_dir / "attachments" / storage),
+                    "path": str(Path(CONTAINER_PATHS["workspace"]) / database.technical_profile.workspace_internal_directory / "attachments" / Path(*parts[2:])),
+                })
+                attachments.append(item)
+            message = {key: row[key] for key in (
+                "id", "scope_type", "scope_id", "author_type", "user_id", "username", "content", "created_at",
+            )}
+            message.update({"metadata": metadata, "attachments": [
+                {key: value for key, value in item.items() if key not in {"path", "local_path"}}
+                for item in attachments
+            ]})
+            payload = {
+                "scope_type": row["scope_type"], "scope_id": row["scope_id"],
+                "actor": EnterpriseService.public_user(dict(actor_row)),
+                "content": str(metadata.get("agent_request_content") or row["content"] or ""),
+                "attachments": attachments,
+                "generation": metadata.get("generation") if isinstance(metadata.get("generation"), dict) else {},
+                "user_message": message,
+            }
+            if row["scope_type"] == "channel":
+                channel = conn.execute("SELECT * FROM channels WHERE id = ? AND archived = 0", (row["scope_id"],)).fetchone()
+                if channel is None:
+                    continue
+                payload["channel"] = dict(channel)
+            if run:
+                payload["schedule_run_id"] = int(run["id"])
+                payload["runtime_metadata"] = {
+                    "trigger": "scheduled", "unattended": True,
+                    "schedule_id": str(run["schedule_id"]), "schedule_run_id": str(run["id"]),
+                    "schedule_recurring": decode_json(run["schedule_json"]).get("type") in {"interval", "cron"},
+                    "scheduled_for": str((metadata.get("scheduled_task") or {}).get("scheduled_for") or rfc3339_utc(run["scheduled_for"]) or ""),
+                }
+            conn.execute(
+                "INSERT INTO durable_jobs(kind, scope_type, scope_id, dedupe_key, payload_json, "
+                "status, available_at, created_at, updated_at) "
+                "VALUES ('agent', ?, ?, ?, ?, 'queued', ?, ?, ?) "
+                "ON CONFLICT(kind, dedupe_key) DO NOTHING",
+                (row["scope_type"], row["scope_id"], f"message:{message_id}",
+                 json.dumps(payload), timestamp, timestamp, timestamp),
+            )
+            if run:
+                conn.execute(
+                    "UPDATE agent_schedule_runs SET durable_job_id = "
+                    "(SELECT id FROM durable_jobs WHERE kind = 'agent' AND dedupe_key = ?), "
+                    "updated_at = ? WHERE id = ?",
+                    (f"message:{message_id}", timestamp, int(run["id"])),
+                )
+        conn.execute(
+            "INSERT INTO settings(key, value, secret, updated_at) VALUES (?, '1', 0, ?)",
+            (marker, timestamp),
+        )
+
+
 def migrate_database(
     path: Path,
     technical_profile_value: TechnicalProfile | str = TARGET_TECHNICAL_PROFILE,
@@ -2861,6 +3003,7 @@ def migrate_database(
                 fresh_initialization=True,
                 technical_profile_value=technical_profile_value,
             )
+        _migrate_durable_work(database, data_dir)
         return int(
             database.scalar(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"

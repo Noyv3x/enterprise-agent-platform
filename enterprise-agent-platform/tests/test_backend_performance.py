@@ -204,19 +204,11 @@ class BackendPerformanceServiceTests(unittest.TestCase):
                         since_revision=int(delta["message_revision"]),
                     )
 
-                # The message row is visible before its attachment transaction
-                # completes. Finalizing metadata advances a reset revision so a
-                # client that observed that intermediate row is forced through
-                # a complete, attachment-consistent window.
-                self.assertEqual(attachment_sync["mode"], "full")
-                self.assertEqual(
-                    [message["id"] for message in attachment_sync["messages"]],
-                    [first["id"], second["id"], third["id"]],
-                )
                 self.assertEqual(
                     attachment_sync["messages"][-1]["attachments"][0]["filename"],
                     "note.txt",
                 )
+                self.assertEqual(attachment_sync["messages"][-1]["id"], third["id"])
                 self.assertEqual(len(attachment_queries), 1)
 
                 service.delete_channel_message(

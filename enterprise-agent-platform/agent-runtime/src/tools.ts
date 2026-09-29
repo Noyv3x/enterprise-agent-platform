@@ -375,12 +375,6 @@ const writeFileSchema = Type.Object({
   content: writeFileContentSchema,
 }, { additionalProperties: false });
 
-const codexWriteFileSchema = Type.Object({
-  target: fileExecutionTargetSchema,
-  path: filePathSchema,
-  content: writeFileContentSchema,
-}, { additionalProperties: false });
-
 const patchFilePathSchema = Type.String({
   minLength: 1,
   description: "File path. Relative paths use the selected target's Agent workspace.",
@@ -400,14 +394,6 @@ const expectedReplacementsSchema = Type.Integer({
 
 const patchFileSchema = Type.Object({
   target: Type.Optional(fileExecutionTargetSchema),
-  path: patchFilePathSchema,
-  old_text: patchOldTextSchema,
-  new_text: patchNewTextSchema,
-  expected_replacements: Type.Optional(expectedReplacementsSchema),
-}, { additionalProperties: false });
-
-const codexPatchFileSchema = Type.Object({
-  target: fileExecutionTargetSchema,
   path: patchFilePathSchema,
   old_text: patchOldTextSchema,
   new_text: patchNewTextSchema,
@@ -1207,7 +1193,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "write_file",
     label: "Write file",
     description: "Create or replace a complete UTF-8 file atomically. Prefer patch_file for localized edits; do not create files by terminal heredoc.",
-    parameters: codexWriteFileSchema as unknown as typeof writeFileSchema,
+    parameters: writeFileSchema,
     prepareArguments: (arguments_: unknown) => (
       withDefaultSandboxTarget(arguments_) as Static<typeof writeFileSchema>
     ),
@@ -1230,7 +1216,7 @@ export function createTools(context: ToolFactoryContext): AgentTool[] {
     name: "patch_file",
     label: "Patch file",
     description: "Replace exact text in a workspace file, refusing ambiguous replacement counts. If a patch fails, re-read the current file before retrying.",
-    parameters: codexPatchFileSchema as unknown as typeof patchFileSchema,
+    parameters: patchFileSchema,
     prepareArguments: (arguments_: unknown) => (
       withDefaultSandboxTarget(arguments_) as Static<typeof patchFileSchema>
     ),

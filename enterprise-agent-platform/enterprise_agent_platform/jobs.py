@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,6 +50,7 @@ class DurableJobStore:
         scope_type: str = "",
         scope_id: str = "",
         available_at: int | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> tuple[DurableJob, bool]:
         clean_kind = str(kind or "").strip()
         clean_key = str(dedupe_key or "").strip()
@@ -56,7 +59,7 @@ class DurableJobStore:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         ts = now_ts()
         ready_at = ts if available_at is None else max(0, int(available_at))
-        with self.db.transaction() as conn:
+        with self.db.transaction() if conn is None else nullcontext(conn) as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO durable_jobs(
@@ -85,6 +88,17 @@ class DurableJobStore:
             (str(kind), str(dedupe_key)),
         )
         return self._from_row(row) if row else None
+
+    def queued_for_scope(self, kind: str, scope_type: str, scope_id: str) -> list[DurableJob]:
+        """Read FIFO ownership, retaining delayed heads ahead of later work."""
+        return [
+            self._from_row(row)
+            for row in self.db.query(
+                "SELECT * FROM durable_jobs WHERE kind = ? AND scope_type = ? "
+                "AND scope_id = ? AND status = 'queued' ORDER BY id",
+                (str(kind), str(scope_type), str(scope_id)),
+            )
+        ]
 
     def ready(self, kind: str, *, limit: int = 100) -> list[DurableJob]:
         rows = self.db.query(

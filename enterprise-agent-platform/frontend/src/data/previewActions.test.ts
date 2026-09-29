@@ -187,7 +187,7 @@ describe("computer file and present transport", () => {
     );
   });
 
-  it("maps a revisioned uncommitted replacement draft", async () => {
+  it("maps an uncommitted replacement draft", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       workspace_path: "src/value.ts",
       content: "nextValue",
@@ -195,7 +195,6 @@ describe("computer file and present transport", () => {
       encoding: "utf-8",
       source: "draft",
       draft_kind: "replacement",
-      revision: "draft:patch-1:2",
     }), { status: 200, headers: { "Content-Type": "application/json" } })));
 
     await expect(
@@ -207,11 +206,10 @@ describe("computer file and present transport", () => {
       encoding: "utf-8",
       source: "draft",
       draft_kind: "replacement",
-      revision: "draft:patch-1:2",
     });
   });
 
-  it("rejects a draft response without its kind and monotonic revision", async () => {
+  it("rejects a draft response without its kind", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
       workspace_path: "notes.md",
       content: "partial",
@@ -222,6 +220,16 @@ describe("computer file and present transport", () => {
     await expect(
       fetchPreviewFile(scope, "notes.md", new AbortController().signal),
     ).rejects.toThrow();
+  });
+
+  it.each([
+    { workspace_path: "other.md", content: "private" },
+    { workspace_path: "notes.md", content: "界".repeat(5462) },
+  ])("rejects mismatched paths and over-limit UTF-8 drafts", async value => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
+      ...value, source: "draft", draft_kind: "file", truncated: false,
+    }), { status: 200 })));
+    await expect(fetchPreviewFile(scope, "notes.md", new AbortController().signal)).rejects.toThrow();
   });
 
   it("builds the authenticated present URL without extra client paths", () => {

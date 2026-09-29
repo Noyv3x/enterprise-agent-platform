@@ -56,7 +56,7 @@ class LearningReviewStoreTests(unittest.TestCase):
             finally:
                 db.close()
 
-    def test_foreground_success_and_tenth_turn_outbox_are_atomic(self):
+    def test_foreground_success_and_tenth_turn_enqueue_are_atomic(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "platform.db")
             jobs = DurableJobStore(db)
@@ -79,7 +79,6 @@ class LearningReviewStoreTests(unittest.TestCase):
                         owner_user_id=1,
                         source_message_id=index * 2 - 1,
                         response_message_id=index * 2,
-                        tool_calls=0,
                         tool_trace=(
                             [{"tool": "terminal", "detail": "pytest focused"}]
                             if index == 10
@@ -109,34 +108,18 @@ class LearningReviewStoreTests(unittest.TestCase):
                     owner_user_id=1,
                     source_message_id=19,
                     response_message_id=20,
-                    tool_calls=100,
                 )
                 self.assertFalse(replay.succeeded)
                 self.assertEqual(len(jobs.queued(LEARNING_REVIEW_JOB_KIND, limit=None)), 1)
             finally:
                 db.close()
 
-    def test_tool_cadence_triggers_and_lifecycle_rotation_resets_turns(self):
+    def test_lifecycle_rotation_resets_turns(self):
         with tempfile.TemporaryDirectory() as td:
             db = Database(Path(td) / "platform.db")
             jobs = DurableJobStore(db)
             reviews = LearningReviewStore(db)
             try:
-                first, _ = jobs.enqueue(kind="agent", dedupe_key="tool", payload={})
-                jobs.mark_running(first.id, lease_seconds=60)
-                result = reviews.complete_foreground_job(
-                    first.id,
-                    scope_key="private:7",
-                    lifecycle_id="life-a",
-                    owner_user_id=7,
-                    source_message_id=1,
-                    response_message_id=2,
-                    tool_calls=10,
-                )
-                self.assertIsNotNone(result.review_job_id)
-                review = jobs.get(result.review_job_id or 0)
-                self.assertEqual(review.payload["reasons"], ["tool_cadence"])
-
                 for index in range(2, 11):
                     job, _ = jobs.enqueue(
                         kind="agent", dedupe_key=f"old-life:{index}", payload={}
@@ -149,7 +132,6 @@ class LearningReviewStoreTests(unittest.TestCase):
                         owner_user_id=9,
                         source_message_id=index * 2 - 1,
                         response_message_id=index * 2,
-                        tool_calls=0,
                     )
                 rotated, _ = jobs.enqueue(
                     kind="agent", dedupe_key="new-life", payload={}
@@ -162,7 +144,6 @@ class LearningReviewStoreTests(unittest.TestCase):
                     owner_user_id=9,
                     source_message_id=101,
                     response_message_id=102,
-                    tool_calls=0,
                 )
                 self.assertIsNone(rotated_result.review_job_id)
             finally:
@@ -277,7 +258,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
             raise AssertionError("foreground response was not persisted")
         scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
         with service._conversation_lock:
-            service._auto_update_reserved = True
+            service._auto_update_reservation_id = "test-maintenance"
         review, _ = service.jobs.enqueue(
             kind=LEARNING_REVIEW_JOB_KIND,
             dedupe_key=dedupe_key,
@@ -349,7 +330,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                     }
                 )
                 with service._conversation_lock:
-                    service._auto_update_reserved = True
+                    service._auto_update_reservation_id = "test-maintenance"
 
                 review_counter = 0
 
@@ -513,7 +494,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(response)
                 scope = service.agent_scopes.ensure_private_scope(member["id"])
                 with service._conversation_lock:
-                    service._auto_update_reserved = True
+                    service._auto_update_reservation_id = "test-maintenance"
                 review, _ = service.jobs.enqueue(
                     kind=LEARNING_REVIEW_JOB_KIND,
                     dedupe_key="review-submission-revoke-race",
@@ -615,7 +596,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(response)
                 scope = service.agent_scopes.ensure_private_scope(member["id"])
                 with service._conversation_lock:
-                    service._auto_update_reserved = True
+                    service._auto_update_reservation_id = "test-maintenance"
                 review, _ = service.jobs.enqueue(
                     kind=LEARNING_REVIEW_JOB_KIND,
                     dedupe_key="review-memory-revoke-race",
@@ -646,17 +627,20 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                     "unattended": True,
                     "delegation_depth": 0,
                 }
-                original_precheck = service._validate_automatic_memory_write_context
+                original_boundary = service._learning_review_memory_mutation_boundary
                 original_transactional = (
                     service._revalidate_learning_review_mutation_context
                 )
 
-                def delayed_precheck(body, requested_scope):
-                    result = original_precheck(body, requested_scope)
+                @contextmanager
+                def delayed_boundary(body, requested_scope, *, mutation_units):
                     preliminary_checked.set()
                     if not continue_mutation.wait(timeout=5):
                         raise RuntimeError("test did not release memory mutation")
-                    return result
+                    with original_boundary(
+                        body, requested_scope, mutation_units=mutation_units
+                    ) as conn:
+                        yield conn
 
                 def observe_transaction(conn, body, requested_scope):
                     transaction_states.append(bool(conn.in_transaction))
@@ -678,8 +662,8 @@ class LearningReviewIntegrationTests(unittest.TestCase):
 
                 with mock.patch.object(
                     service,
-                    "_validate_automatic_memory_write_context",
-                    side_effect=delayed_precheck,
+                    "_learning_review_memory_mutation_boundary",
+                    side_effect=delayed_boundary,
                 ), mock.patch.object(
                     service,
                     "_revalidate_learning_review_mutation_context",
@@ -842,8 +826,17 @@ class LearningReviewIntegrationTests(unittest.TestCase):
             service = EnterpriseService(make_config(Path(td)), agent_client=agent)
             try:
                 _, actor = service.authenticate("admin", "admin")
-                service.send_private_message(actor, "Use the code review Skill.")
-                service.wait_for_agent_idle("private", str(actor["id"]), timeout=5)
+                for turn in range(10):
+                    service.send_private_message(actor, f"Use the code review Skill, turn {turn}.")
+                    service.wait_for_agent_idle("private", str(actor["id"]), timeout=5)
+                    if turn < 9:
+                        self.assertEqual(
+                            service.db.scalar(
+                                "SELECT COUNT(*) FROM durable_jobs WHERE kind = ?",
+                                (LEARNING_REVIEW_JOB_KIND,),
+                            ),
+                            0,
+                        )
 
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
@@ -975,7 +968,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(response)
                 scope = service.agent_scopes.ensure_private_scope(actor["id"])
                 with service._conversation_lock:
-                    service._auto_update_reserved = True
+                    service._auto_update_reservation_id = "test-maintenance"
                 review, _ = service.jobs.enqueue(
                     kind=LEARNING_REVIEW_JOB_KIND,
                     dedupe_key="manual-review",
@@ -1420,7 +1413,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                 before_boundary = threading.Event()
                 allow_boundary = threading.Event()
                 denied_errors: list[BaseException] = []
-                original_boundary = service._learning_review_skill_read_boundary
+                original_boundary = service._learning_review_read_boundary
 
                 @contextmanager
                 def paused_boundary(request, scope_key):
@@ -1446,7 +1439,7 @@ class LearningReviewIntegrationTests(unittest.TestCase):
                 with (
                     mock.patch.object(
                         service,
-                        "_learning_review_skill_read_boundary",
+                        "_learning_review_read_boundary",
                         side_effect=paused_boundary,
                     ),
                     mock.patch.object(

@@ -71,7 +71,7 @@
 - 文件先写入工作区，再在回复里单独一行写 `MEDIA: /workspace/<相对路径>`。只有 Platform 能把它授权转换成附件，不能用任意宿主路径或文件名代替。
 - Run 输出是 Pi 本轮最后一条助手回复的正文，不拼接中间回复，也不扣留或恢复 `MEDIA:` 行。Platform 仍只在成功 Run 上按原有权限检查交付附件。
 
-Codex 草稿见 [SSE journal](../reference/runtime-api.md#sse-journal)，它不构成执行或副作用授权。工作过程、电脑画面和文档预览归[前端](frontend.md#电脑画面)，Runtime 不新增呈现、桌面或静态站点工具。
+Pi 原生工具参数流的文件草稿见 [SSE journal](../reference/runtime-api.md#sse-journal)，它不构成执行或副作用授权。工作过程、电脑画面和文档预览归[前端](frontend.md#电脑画面)，Runtime 不新增呈现、桌面或静态站点工具。
 
 ### 完成守卫
 

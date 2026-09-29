@@ -11,7 +11,6 @@ from .jobs import DurableJob
 
 LEARNING_REVIEW_JOB_KIND = "agent_learning_review"
 LEARNING_REVIEW_TURN_CADENCE = 10
-LEARNING_REVIEW_TOOL_CADENCE = 10
 LEARNING_REVIEW_MAX_ATTEMPTS = 3
 LEARNING_REVIEW_LEASE_SECONDS = 30 * 60
 LEARNING_REVIEW_MUTATION_BUDGET = 20
@@ -28,7 +27,7 @@ class ForegroundCompletion:
 
 
 class LearningReviewStore:
-    """Durable cadence and outbox for post-reply memory/Skill reviews."""
+    """Single durable cadence for post-reply memory/Skill review jobs."""
 
     def __init__(self, db: Database):
         self.db = db
@@ -65,7 +64,7 @@ class LearningReviewStore:
             "scope_key": scope_key,
             "lifecycle_id": lifecycle_id,
             "successful_turns": bounded_counter(value.get("successful_turns")),
-            "tool_calls": bounded_counter(value.get("tool_calls")),
+            "tool_calls": 0,
         }
 
     def complete_foreground_job(
@@ -77,7 +76,6 @@ class LearningReviewStore:
         owner_user_id: int,
         source_message_id: int,
         response_message_id: int,
-        tool_calls: int,
         tool_trace: list[dict[str, Any]] | None = None,
     ) -> ForegroundCompletion:
         """CAS the foreground job and atomically advance/enqueue review work."""
@@ -91,7 +89,6 @@ class LearningReviewStore:
         response = int(response_message_id)
         if owner <= 0 or source <= 0 or response <= 0:
             raise ValueError("learning review owner and message ids must be positive")
-        completed_tools = max(0, min(int(tool_calls), 10_000))
         timestamp = now_ts()
         state_key = self._state_key(clean_scope)
         review_job_id: int | None = None
@@ -115,14 +112,10 @@ class LearningReviewStore:
                 lifecycle_id=clean_lifecycle,
             )
             state["successful_turns"] += 1
-            state["tool_calls"] += completed_tools
             reasons: list[str] = []
             if state["successful_turns"] >= LEARNING_REVIEW_TURN_CADENCE:
                 reasons.append("turn_cadence")
                 state["successful_turns"] %= LEARNING_REVIEW_TURN_CADENCE
-            if state["tool_calls"] >= LEARNING_REVIEW_TOOL_CADENCE:
-                reasons.append("tool_cadence")
-                state["tool_calls"] %= LEARNING_REVIEW_TOOL_CADENCE
             state["last_source_message_id"] = source
             state["last_response_message_id"] = response
             state["updated_at"] = timestamp
@@ -191,7 +184,7 @@ class LearningReviewStore:
                     (LEARNING_REVIEW_JOB_KIND, dedupe_key),
                 ).fetchone()
                 if review_row is None:
-                    raise RuntimeError("learning review outbox insert did not produce a job")
+                    raise RuntimeError("learning review insert did not produce a job")
                 review_job_id = int(review_row["id"])
         return ForegroundCompletion(True, review_job_id)
 

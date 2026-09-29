@@ -7,6 +7,8 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -504,10 +506,8 @@ class FileDraftProgressAgent(RecordingAgent):
                         "workspace_path": "notes/private.txt",
                         "kind": "file",
                         "content": "ephemeral-file-draft-never-persist",
-                        "revision": 1,
-                        "complete": True,
+                        "done": False,
                         "truncated": False,
-                        "discarded": False,
                     },
                 }
             )
@@ -706,6 +706,35 @@ def make_config(tmp: Path) -> PlatformConfig:
     return config
 
 class PlatformServiceTests(unittest.TestCase):
+    def test_recovered_delayed_and_maintenance_work_remains_visibly_queued(self):
+        for reserved in (False, True):
+            with self.subTest(reserved=reserved), tempfile.TemporaryDirectory() as td:
+                service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+                try:
+                    _, user = service.authenticate("admin", "admin")
+                    scope_id = str(user["id"])
+                    with mock.patch.object(service, "_start_agent_worker_locked"):
+                        sent = service.send_private_message(user, "durable queued status")
+                    job = service.jobs.get_by_key("agent", f"message:{sent['user_message']['id']}")
+                    service.db.execute(
+                        "UPDATE durable_jobs SET available_at = ? WHERE id = ?",
+                        (int(time.time()) + 3600, job.id),
+                    )
+                    with service._conversation_lock:
+                        service._agent_status.clear()
+                        service._auto_update_reservation_id = "status-recovery" if reserved else ""
+                    service._recover_durable_work()
+                    for status in (
+                        service.agent_status(user, "private", scope_id),
+                        service.agent_status_for_system("private", scope_id),
+                        service.wait_for_agent_idle("private", scope_id, timeout=0.1),
+                    ):
+                        self.assertEqual(status["state"], "queued")
+                        self.assertEqual(status["queued_count"], 1)
+                    self.assertEqual(service.agent_client.calls, [])
+                finally:
+                    service.close()
+
     def test_office_attachment_mime_normalization_does_not_depend_on_host_database(self):
         with mock.patch(
             "enterprise_agent_platform.service.mimetypes.guess_type",
@@ -1752,6 +1781,8 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertNotIn("ephemeral-file-draft-never-persist", stored)
                 self.assertNotIn("persistent-draft-check", stored)
                 self.assertNotIn("file_draft", stored)
+                self.assertNotIn("ephemeral-file-draft-never-persist", json.dumps(message))
+                self.assertEqual(message["attachments"], [])
                 self.assertNotIn(
                     "computer",
                     service.agent_status(actor, "private", str(actor["id"])),
@@ -2965,6 +2996,209 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_atomic_attachment_recovery_after_process_death_before_and_after_commit(self):
+        child = """
+import os, sys
+from pathlib import Path
+from unittest import mock
+sys.path.insert(0, sys.argv[3])
+from test_platform import EnterpriseService, RecordingAgent, UploadedFile, make_config
+service = EnterpriseService(make_config(Path(sys.argv[1])), agent_client=RecordingAgent())
+_, actor = service.authenticate("admin", "admin")
+if sys.argv[2] == "before":
+    original = service.jobs.enqueue
+    def terminate(**kwargs):
+        original(**kwargs)
+        os._exit(75)
+    patch = mock.patch.object(service.jobs, "enqueue", side_effect=terminate)
+else:
+    patch = mock.patch.object(service, "_cleanup_attachment_commit", side_effect=lambda marker: os._exit(75))
+with patch:
+    service.send_channel_message(actor, 1, "@agent crash-safe attachment",
+        [UploadedFile("crash.txt", "text/plain", b"crash-safe")])
+"""
+        for phase in ("before", "after"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as td:
+                result = subprocess.run(
+                    [sys.executable, "-c", child, td, phase, str(Path(__file__).parent)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 75, result.stderr)
+                markers = Path(td) / "attachment-commits"
+                marker_paths = list(markers.glob("*.json"))
+                self.assertEqual(len(marker_paths), 1)
+                storage_path = json.loads(marker_paths[0].read_text())[0]
+                config = make_config(Path(td))
+                agent = RecordingAgent()
+                service = EnterpriseService(config, agent_client=agent)
+                try:
+                    _, actor = service.authenticate("admin", "admin")
+                    service.wait_for_agent_idle("channel", "1")
+                    self.assertEqual(list(markers.glob("*.json")), [])
+                    path = service._attachment_root() / storage_path
+                    if phase == "before":
+                        self.assertFalse(path.exists())
+                        self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
+                        self.assertEqual(service.list_messages(actor, "channel", "1"), [])
+                        self.assertEqual(agent.calls, [])
+                    else:
+                        self.assertEqual(path.read_bytes(), b"crash-safe")
+                        self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 1)
+                        self.assertEqual(len(agent.calls), 1)
+                        self.assertEqual(
+                            service.db.scalar("SELECT status FROM durable_jobs WHERE kind = 'agent'"),
+                            "succeeded",
+                        )
+                finally:
+                    service.close()
+
+    def test_atomic_attachment_write_failure_and_cancellation_leave_no_partial_publication(self):
+        for failure in (OSError("write failed"), SystemExit("cancelled")):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as td:
+                service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+                try:
+                    _, actor = service.authenticate("admin", "admin")
+                    write = secure_fs.write_private_file_exclusive
+
+                    def interrupt_second_blob(path, data):
+                        if data == b"second":
+                            raise failure
+                        return write(path, data)
+
+                    with mock.patch(
+                        "enterprise_agent_platform.service.write_private_file_exclusive",
+                        side_effect=interrupt_second_blob,
+                    ), self.assertRaises(type(failure)):
+                        service.send_channel_message(actor, 1, "@agent attachment interruption", [
+                            UploadedFile("first.txt", "text/plain", b"first"),
+                            UploadedFile("second.txt", "text/plain", b"second"),
+                        ])
+                    self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM messages"), 0)
+                    self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM attachments"), 0)
+                    self.assertEqual(service.db.scalar("SELECT COUNT(*) FROM durable_jobs"), 0)
+                    self.assertEqual(list((Path(td) / "attachment-commits").iterdir()), [])
+                    self.assertEqual(
+                        [path for path in service._attachment_root().rglob("*") if path.is_file()], [],
+                    )
+                finally:
+                    service.close()
+
+    def test_attachment_manifest_rejects_paths_outside_generated_blob_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = EnterpriseService(make_config(Path(td)), agent_client=RecordingAgent())
+            try:
+                unrelated = Path(td) / "keep.txt"
+                unrelated.write_bytes(b"keep")
+                marker = Path(td) / "attachment-commits" / ("a" * 24 + ".json")
+                secure_fs.write_private_file_exclusive(marker, b'["../keep.txt"]')
+                with self.assertRaisesRegex(ValueError, "attachment commit path"):
+                    service._cleanup_attachment_commit(marker)
+                self.assertEqual(unrelated.read_bytes(), b"keep")
+                self.assertTrue(marker.exists())
+            finally:
+                service.close()
+
+    def test_user_message_and_agent_job_rollback_together_with_attachment_blobs(self):
+        for scope_type in ("channel", "private"):
+            for failure in ("enqueue", "commit"):
+                with self.subTest(scope_type=scope_type, failure=failure), tempfile.TemporaryDirectory() as td:
+                    agent = RecordingAgent()
+                    service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+                    try:
+                        _, user = service.authenticate("admin", "admin")
+                        service.agent_scopes.ensure_private_scope(user["id"])
+                        enqueue = service.jobs.enqueue
+                        commit = service.db._commit_or_rollback
+                        baseline = {
+                            table: service.db.scalar(f"SELECT COUNT(*) FROM {table}")
+                            for table in ("messages", "attachments", "durable_jobs")
+                        }
+
+                        def enqueue_then_fail(**kwargs):
+                            result = enqueue(**kwargs)
+                            if kwargs.get("conn") is not None and failure == "enqueue":
+                                raise RuntimeError("forced producer failure")
+                            return result
+
+                        def fail_message_commit(conn):
+                            if failure == "commit" and conn.execute(
+                                "SELECT 1 FROM messages WHERE content = '@agent atomic message'"
+                            ).fetchone():
+                                conn.rollback()
+                                raise RuntimeError("forced producer failure")
+                            return commit(conn)
+
+                        with (
+                            mock.patch.object(service.jobs, "enqueue", side_effect=enqueue_then_fail),
+                            mock.patch.object(service.db, "_commit_or_rollback", side_effect=fail_message_commit),
+                            self.assertRaisesRegex(RuntimeError, "forced producer failure"),
+                        ):
+                            attachments = [UploadedFile("atomic.txt", "text/plain", b"atomic")]
+                            if scope_type == "channel":
+                                service.send_channel_message(user, 1, "@agent atomic message", attachments)
+                            else:
+                                service.send_private_message(user, "@agent atomic message", attachments)
+                        self.assertEqual(
+                            {table: service.db.scalar(f"SELECT COUNT(*) FROM {table}") for table in baseline},
+                            baseline,
+                        )
+                        self.assertEqual(
+                            [path for path in service._attachment_root().rglob("*") if path.is_file()],
+                            [],
+                        )
+                        self.assertEqual(agent.calls, [])
+                    finally:
+                        service.close()
+
+    def test_user_message_job_and_attachment_are_invisible_until_atomic_commit(self):
+        for scope_type in ("channel", "private"):
+            with self.subTest(scope_type=scope_type), tempfile.TemporaryDirectory() as td:
+                agent = RecordingAgent()
+                service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+                try:
+                    _, user = service.authenticate("admin", "admin")
+                    enqueue = service.jobs.enqueue
+                    observed = []
+
+                    def observe_enqueue(**kwargs):
+                        result = enqueue(**kwargs)
+                        if kwargs.get("conn") is not None:
+                            message_id = kwargs["payload"]["user_message"]["id"]
+                            with sqlite3.connect(service.config.db_path) as observer:
+                                observed.append(tuple(
+                                    observer.execute(sql, (message_id,)).fetchone()[0]
+                                    for sql in (
+                                        "SELECT COUNT(*) FROM messages WHERE id = ?",
+                                        "SELECT COUNT(*) FROM attachments WHERE message_id = ?",
+                                        "SELECT COUNT(*) FROM durable_jobs WHERE dedupe_key = 'message:' || ?",
+                                    )
+                                ))
+                        return result
+
+                    with mock.patch.object(service.jobs, "enqueue", side_effect=observe_enqueue):
+                        attachments = [UploadedFile("atomic.txt", "text/plain", b"atomic")]
+                        if scope_type == "channel":
+                            result = service.send_channel_message(user, 1, "@agent atomic success", attachments)
+                        else:
+                            result = service.send_private_message(user, "atomic success", attachments)
+                    scope_id = "1" if scope_type == "channel" else str(user["id"])
+                    service.wait_for_agent_idle(scope_type, scope_id)
+                    self.assertEqual(observed, [(0, 0, 0)])
+                    self.assertEqual(len(agent.calls), 1)
+                    self.assertEqual(Path(agent.calls[0]["attachments"][0]["local_path"]).read_bytes(), b"atomic")
+                    message_id = result["user_message"]["id"]
+                    with sqlite3.connect(service.config.db_path) as observer:
+                        committed = observer.execute(
+                            "SELECT m.id, a.filename, j.status FROM messages m "
+                            "JOIN attachments a ON a.message_id = m.id "
+                            "JOIN durable_jobs j ON j.dedupe_key = 'message:' || m.id "
+                            "WHERE m.id = ?",
+                            (message_id,),
+                        ).fetchall()
+                    self.assertEqual(committed, [(message_id, "atomic.txt", "succeeded")])
+                finally:
+                    service.close()
+
     def test_channel_image_attachment_is_stored_and_passed_to_agent(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()
@@ -3310,9 +3544,6 @@ class PlatformServiceTests(unittest.TestCase):
                     f"message:{second['user_message']['id']}",
                 )
                 self.assertEqual(second_job.status, "queued")
-                self.assertIsNone(
-                    service.agent_inputs.get_by_message(second["user_message"]["id"])
-                )
 
                 release_worker.set()
                 self.assertTrue(agent.started.wait(timeout=2))
@@ -6654,7 +6885,9 @@ class PlatformServiceTests(unittest.TestCase):
             finally:
                 recovered.close()
 
-    def test_startup_repairs_user_message_committed_before_agent_job(self):
+    def test_explicit_migration_recovers_legacy_message_without_job(self):
+        from enterprise_agent_platform.db import migrate_database
+
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             seed = EnterpriseService(config, agent_client=RecordingAgent())
@@ -6676,6 +6909,8 @@ class PlatformServiceTests(unittest.TestCase):
                 self.assertIsNone(seed.jobs.get_by_key("agent", f"message:{orphan['id']}"))
             finally:
                 seed.close()
+
+            migrate_database(config.db_path, data_dir=config.data_dir)
 
             agent = RecordingAgent()
             recovered = EnterpriseService(config, agent_client=agent)
@@ -8413,6 +8648,8 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIn('"agent_status"', event_block)
                 self.assertIn('"latest_message_id"', event_block)
                 self.assertIn('"message_revision"', event_block)
+                initial = json.loads(event_block.split("data: ", 1)[1])
+                self.assertEqual(initial["status"]["state"], "idle")
 
                 service.update_typing(alice, "channel", "1", True)
                 next_update = None
@@ -8433,6 +8670,9 @@ class PlatformHTTPTests(unittest.TestCase):
                 self.assertIsNotNone(next_update)
                 self.assertIn('"typing": [{', next_update)
                 self.assertIn("SSE Alice", next_update)
+                changed = json.loads(next_update.split("data: ", 1)[1])
+                self.assertGreater(changed["revision"], initial["revision"])
+                self.assertEqual(changed["message_revision"], initial["message_revision"])
                 conn.close()
             finally:
                 server.shutdown()
@@ -8440,136 +8680,115 @@ class PlatformHTTPTests(unittest.TestCase):
                 service.close()
                 thread.join(timeout=2)
 
-    def test_scope_events_stream_uses_file_draft_revision_without_leaking_content(self):
+    def test_scope_events_cap_and_live_token_revocation(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch(
+            "enterprise_agent_platform.server.MAX_SSE_STREAMS_PER_USER", 1
+        ), mock.patch(
+            "enterprise_agent_platform.server.SSE_AUTH_RECHECK_SECONDS", 0.05
+        ):
+            config = make_config(Path(td))
+            service = EnterpriseService(config, agent_client=RecordingAgent())
+            server, thread = serve_in_thread(config, service)
+            host, port = server.server_address
+            connections = []
+            try:
+                token, admin = service.authenticate("admin", "admin")
+
+                def connect(current_token):
+                    conn = http.client.HTTPConnection(host, port, timeout=5)
+                    connections.append(conn)
+                    conn.request("GET", "/api/channels/1/events", headers={
+                        "Authorization": f"Bearer {current_token}",
+                    })
+                    return conn.getresponse()
+
+                stream = connect(token)
+                self.assertEqual(stream.status, 200)
+                first = []
+                while (line := stream.readline()) != b"\n":
+                    self.assertTrue(line, "stream ended before its initial snapshot")
+                    first.append(line)
+                initial = json.loads(next(line[6:] for line in first if line.startswith(b"data: ")))
+                self.assertEqual(connect(token).status, 503)
+                service.db.execute(
+                    "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+                    (admin["id"],),
+                )
+                self.assertEqual(stream.read(), b"")
+                new_token, _ = service.authenticate("admin", "admin")
+                reconnected = connect(new_token)
+                self.assertEqual(reconnected.status, 200)
+                block = []
+                while (line := reconnected.readline()) != b"\n":
+                    self.assertTrue(line, "reconnect omitted its initial snapshot")
+                    block.append(line)
+                fresh = json.loads(next(line[6:] for line in block if line.startswith(b"data: ")))
+                self.assertGreaterEqual(fresh["revision"], initial["revision"])
+                self.assertEqual(fresh["status"]["state"], "idle")
+            finally:
+                for conn in connections:
+                    conn.close()
+                server.shutdown()
+                server.server_close()
+                service.close()
+                thread.join(timeout=2)
+
+    def test_file_draft_api_returns_latest_authorized_redacted_content(self):
         with tempfile.TemporaryDirectory() as td:
             config = make_config(Path(td))
             service = EnterpriseService(config, agent_client=RecordingAgent())
+            token, actor = service.authenticate("admin", "admin")
+            scope = service.agent_scopes.ensure_private_scope(int(actor["id"]))
+            target = Path(scope.workspace_path) / "draft.txt"
+            target.write_text("workspace text", encoding="utf-8")
             task = {
-                "scope_type": "channel",
-                "scope_id": "1",
+                "scope_type": "private", "scope_id": str(actor["id"]),
                 "user_message": {"id": 91, "content": "write it"},
-                "actor": {"id": 1, "username": "admin", "display_name": "Administrator"},
-                "content": "write it",
+                "actor": actor, "content": "write it",
             }
             with service._conversation_lock:
-                service._agent_status["channel:1"] = service._status_for_task(
-                    task,
-                    "replying",
-                    queued_count=0,
+                service._agent_status[f"private:{actor['id']}"] = service._status_for_task(
+                    task, "replying", queued_count=0,
                 )
             server, thread = serve_in_thread(config, service)
             host, port = server.server_address
             connection = http.client.HTTPConnection(host, port, timeout=5)
+            path = (
+                f"/api/agent-previews/file?scope_type=private&scope_id={actor['id']}"
+                "&workspace_path=draft.txt"
+            )
             try:
-                token, _ = service.authenticate("admin", "admin")
-                connection.request(
-                    "GET",
-                    "/api/channels/1/events",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                response = connection.getresponse()
-                self.assertEqual(response.status, 200)
-                buffer = b""
-
-                def next_update() -> tuple[dict[str, object], str]:
-                    nonlocal buffer
-                    deadline = time.time() + 5
-                    while time.time() < deadline:
-                        chunk = response.read(1)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                        while b"\n\n" in buffer:
-                            block, buffer = buffer.split(b"\n\n", 1)
-                            text = block.decode("utf-8")
-                            if not text.startswith("event: update"):
-                                continue
-                            data = next(
-                                line.removeprefix("data: ")
-                                for line in text.splitlines()
-                                if line.startswith("data: ")
-                            )
-                            return json.loads(data), text
-                    self.fail("timed out waiting for scope SSE update")
-
-                next_update()
-                base_event = {
-                    "event": "tool.arguments.delta",
-                    "tool_name": "write_file",
-                    "tool_call_id": "sse-draft",
-                }
-                with mock.patch(
-                    "enterprise_agent_platform.service.now_ts",
-                    return_value=1_700_000_000,
+                for content, done, expected in (
+                    ("first TOKEN=secret-one", False, "first TOKEN=•••"),
+                    ("latest TOKEN=secret-two", False, "latest TOKEN=•••"),
+                    ("", True, "workspace text"),
                 ):
-                    service._record_agent_progress(
-                        "channel",
-                        "1",
-                        {
-                            **base_event,
-                            "file_draft": {
-                                "workspace_path": "src/app.ts",
-                                "kind": "file",
-                                "content": "first secret draft",
-                                "revision": 1,
-                                "complete": False,
-                                "truncated": False,
-                                "discarded": False,
+                    with mock.patch("enterprise_agent_platform.service.now_ts", return_value=1_700_000_000):
+                        service._record_agent_progress(
+                            "private", str(actor["id"]),
+                            {
+                                "event": "tool.arguments.delta", "tool_name": "write_file",
+                                "tool_call_id": "http-draft",
+                                "file_draft": {
+                                    "workspace_path": "draft.txt", "kind": "file",
+                                    "content": content, "done": done, "truncated": False,
+                                },
                             },
-                        },
-                    )
-                first, first_text = next_update()
-                first_file = first["agent_status"]["computer"]["file"]
-                self.assertEqual(first_file["revision"], "draft:sse-draft:1")
-                self.assertNotIn("first secret draft", first_text)
-                self.assertNotIn("content", first_file)
-
-                with mock.patch(
-                    "enterprise_agent_platform.service.now_ts",
-                    return_value=1_700_000_000,
-                ):
-                    service._record_agent_progress(
-                        "channel",
-                        "1",
-                        {
-                            **base_event,
-                            "file_draft": {
-                                "workspace_path": "src/app.ts",
-                                "kind": "file",
-                                "content": "second secret draft",
-                                "revision": 2,
-                                "complete": True,
-                                "truncated": False,
-                                "discarded": False,
-                            },
-                        },
-                    )
-                second, second_text = next_update()
-                second_file = second["agent_status"]["computer"]["file"]
-                self.assertEqual(second_file["revision"], "draft:sse-draft:2")
-                self.assertEqual(second_file["status"], "pending")
-                self.assertNotIn("second secret draft", second_text)
-
-                with mock.patch(
-                    "enterprise_agent_platform.service.now_ts",
-                    return_value=1_700_000_000,
-                ):
-                    service._record_agent_progress(
-                        "channel",
-                        "1",
-                        {
-                            "event": "tool.failed",
-                            "tool_name": "write_file",
-                            "tool_call_id": "sse-draft",
-                            "execution_started": False,
-                        },
-                    )
-                terminal, terminal_text = next_update()
-                self.assertNotEqual(
-                    terminal["agent_status"].get("computer", {}).get("file", {}).get("revision"),
-                    "draft:sse-draft:2",
-                )
-                self.assertNotIn("second secret draft", terminal_text)
+                        )
+                    connection.request("GET", path)
+                    response = connection.getresponse()
+                    response.read()
+                    self.assertEqual(response.status, 401)
+                    connection.request("GET", path, headers={"Authorization": f"Bearer {token}"})
+                    response = connection.getresponse()
+                    body = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(body["content"], expected)
+                    self.assertEqual(body["source"], "workspace" if done else "draft")
+                    self.assertNotIn("revision", body)
+                    status = service.agent_status(actor, "private", str(actor["id"]))
+                    self.assertNotIn("secret-", json.dumps(status))
+                    self.assertNotIn("TOKEN=", json.dumps(status))
             finally:
                 connection.close()
                 server.shutdown()

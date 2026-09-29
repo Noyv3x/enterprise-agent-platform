@@ -297,26 +297,26 @@ class AgentScopeManager:
             raise ValueError(f"unsupported Agent scope type: {scope_type}")
 
     def _expected_workspace(self, scope_type: str, scope_id: str) -> Path:
-        candidate = self._workspace_root / self._workspace_id(scope_type, scope_id)
-
-        ensure_private_directory(candidate.parent)
-        candidate.mkdir(parents=True, mode=0o700, exist_ok=True)
-        resolved = candidate.resolve()
+        workspace_id = self._workspace_id(scope_type, scope_id)
+        candidate = self._workspace_root / workspace_id
+        directory_fd = open_private_directory_fd(self._workspace_root)
         try:
-            resolved.relative_to(self._workspace_root)
-        except ValueError as exc:
-            raise ValueError("Agent workspace resolves outside the managed workspace root") from exc
-        # A symlink anywhere below the managed root could redirect a nominally
-        # scoped path into another workspace.  Reject it at the platform
-        # boundary; this is defensive path hygiene, not a shell sandbox.
-        relative = candidate.relative_to(self._workspace_root)
-        current = self._workspace_root
-        for part in relative.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("Agent workspace must not contain symlink path components")
-        ensure_private_directory(resolved)
-        return resolved
+            for part in Path(workspace_id).parts:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                child_fd = open_private_child_directory_fd(
+                    directory_fd, part, mode=None
+                )
+                os.close(directory_fd)
+                directory_fd = child_fd
+                os.fchmod(directory_fd, 0o700)
+        except (OSError, UnsafePrivatePathError) as exc:
+            raise ValueError("Agent workspace must contain only private directories") from exc
+        finally:
+            os.close(directory_fd)
+        return candidate
 
     def _assert_workspace_records(self) -> None:
         """Reject scope rows outside the current relative-workspace contract."""
