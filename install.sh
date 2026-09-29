@@ -358,10 +358,21 @@ mv -f "$manager_incoming" "$stable_manager"
 manager_incoming=""
 stable_installed=1
 
+# Fresh-only provisioning verifies and stages the immutable launcher directly.
+# Existing installations must upgrade through their running supervised Manager.
+"$stable_manager" bootstrap-launcher --config "$config_path"
+launcher="$data_root/manager/manager-binaries/launcher"
+[[ -f "$launcher" && ! -L "$launcher" && -x "$launcher" ]] || {
+  printf '%s\n' 'verified immutable Manager launcher is unavailable' >&2
+  exit 73
+}
+[[ "$(sha256sum "$launcher" | awk '{ print $1 }')" == "$expected" ]] || {
+  printf '%s\n' 'immutable Manager launcher checksum mismatch' >&2
+  exit 73
+}
+
 "$stable_manager" preflight --config "$config_path"
 
-# Bootstrap with the legacy-compatible command. Once installation and its gate
-# settle, Manager atomically hands this same unit to its verified launcher.
 unit_incoming="$(mktemp "$unit_dir/.agent-platform-manager.service.XXXXXX")"
 cat > "$unit_incoming" <<EOF
 [Unit]
@@ -371,7 +382,7 @@ After=docker.service
 
 [Service]
 Type=simple
-ExecStart="$stable_manager" serve --config "$config_path"
+ExecStart="$launcher" launcher --config "$config_path"
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=60s
@@ -381,7 +392,7 @@ UMask=0077
 [Install]
 WantedBy=default.target
 EOF
-chmod 0600 "$unit_incoming"
+chmod 0644 "$unit_incoming"
 mv -f "$unit_incoming" "$unit_path"
 unit_incoming=""
 unit_installed=1

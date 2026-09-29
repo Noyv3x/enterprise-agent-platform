@@ -259,98 +259,65 @@ func TestSupervisorPreProofDefersReservationAndCleanupRecovery(t *testing.T) {
 	}
 }
 
-func TestSupervisorHalfCommittedCoreFailureRetainsReservationBeforeProof(t *testing.T) {
-	for _, candidate := range []bool{false, true} {
-		t.Run(fmt.Sprintf("candidate=%t", candidate), func(t *testing.T) {
-			orchestrator, id, previousID, candidateID := supervisorFinalizeFixture(t)
-			engine := &supervisorRejectedCoreEngine{fakeEngine: &fakeEngine{}, rejectedID: candidateID}
-			orchestrator.Engine = engine
-			if _, err := orchestrator.Store.UpdateOperation(id, func(op *model.Operation) error {
-				op.ReservationStatus = model.ReservationConfirmed
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := orchestrator.Store.MutateState(time.Now(), func(state *model.ManagerState) error {
-				state.Candidate = state.Current
-				state.Current = state.Previous
-				state.Previous = nil
-				state.ActiveOperationID = id
-				state.FinalizePendingOperationID = ""
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			var err error
-			if candidate {
-				err = orchestrator.RecoverBeforeActivation(context.Background())
-			} else {
-				err = orchestrator.RecoverBeforeSupervisorProof(context.Background())
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			state := orchestrator.Store.State()
-			op, err := orchestrator.Store.Operation(id)
-			if err != nil {
-				t.Fatal(err)
-			}
-			gate := orchestrator.Gate.(*scriptedGate)
-			snapshots := orchestrator.Snapshots.(*scriptedSnapshot)
-			if state.ActiveOperationID != id || state.Current.ID != previousID || !state.Maintenance ||
-				op.Status != model.OperationRunning || !op.SnapshotRestored || op.Finalized || op.ReservationReleased ||
-				op.PreparedCleanupPending || op.GateSettlementAction != "" || len(gate.releaseIDs) != 0 {
-				t.Fatalf("failed half-commit escaped pre-proof rollback: state=%#v operation=%#v gate=%#v", state, op, gate)
-			}
-			if !reflect.DeepEqual(engine.probed, []string{candidateID, previousID}) ||
-				!reflect.DeepEqual(snapshots.restores, []string{"/snapshots/supervisor-cutover"}) {
-				t.Fatalf("failed half-commit did not restore previous core: probes=%v restores=%v", engine.probed, snapshots.restores)
-			}
-		})
+func TestGateCommitIntentForbidsSnapshotRollbackAndRecoversForward(t *testing.T) {
+	orchestrator, id, _, target := supervisorFinalizeFixture(t)
+	orchestrator.SelfUpdate = &recordingSelfUpdate{rolledBack: true}
+	op, err := orchestrator.Store.UpdateOperation(id, func(value *model.Operation) error {
+		value.GateSettlementAction = model.GateSettlementCommit
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.restoreAfterMaintenance(context.Background(), op, nil, errors.New("commit reply lost"), true)
+	snapshots := orchestrator.Snapshots.(*scriptedSnapshot)
+	if len(snapshots.restores) != 0 || orchestrator.Store.State().Current.ID != target {
+		t.Fatal("uncertain gate commit restored the old database")
+	}
+	if err := orchestrator.RecoverBeforeSupervisorProof(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	op, err = orchestrator.Store.Operation(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := orchestrator.Gate.(*scriptedGate)
+	if !op.Finalized || orchestrator.Store.State().Maintenance || len(snapshots.restores) != 0 ||
+		!reflect.DeepEqual(gate.commitIDs, []string{id, id}) || len(gate.abortIDs) != 0 {
+		t.Fatalf("forward recovery did not settle the same target: op=%#v gate=%#v", op, gate)
 	}
 }
 
-func TestSupervisorHalfCommitPrecedesReservationRecovery(t *testing.T) {
-	for _, candidate := range []bool{false, true} {
-		t.Run(fmt.Sprintf("candidate=%t", candidate), func(t *testing.T) {
-			orchestrator, id, previousID, candidateID := supervisorFinalizeFixture(t)
-			engine := &supervisorRejectedCoreEngine{fakeEngine: &fakeEngine{}}
-			orchestrator.Engine = engine
-			if _, err := orchestrator.Store.UpdateOperation(id, func(op *model.Operation) error {
-				op.ReservationStatus = model.ReservationConfirmed
-				return nil
-			}); err != nil {
-				t.Fatal(err)
+func TestGateRestartBeforeReceiptIsReconciledBeforeMaintenanceOpens(t *testing.T) {
+	orchestrator, id, _, _ := supervisorFinalizeFixture(t)
+	orchestrator.SelfUpdate = &recordingSelfUpdate{}
+	reserved := true
+	gate := &recordingGate{}
+	gate.onCommit = func() {
+		state, op, err := orchestrator.Store.StateWithReferencedOperation()
+		if err != nil || op == nil || op.ID != id || !state.Maintenance {
+			t.Fatalf("gate request lost its closed owner: %#v %#v %v", state, op, err)
+		}
+		reserved = false
+		if gate.commits == 1 {
+			if op.Finalized {
+				t.Fatal("first gate request claimed an unconfirmed receipt")
 			}
-			if _, err := orchestrator.Store.MutateState(time.Now(), func(state *model.ManagerState) error {
-				state.Candidate = state.Current
-				state.Current = state.Previous
-				state.Previous = nil
-				state.ActiveOperationID = id
-				state.FinalizePendingOperationID = ""
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			var err error
-			if candidate {
-				err = orchestrator.RecoverBeforeActivation(context.Background())
-			} else {
-				err = orchestrator.RecoverBeforeSupervisorProof(context.Background())
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := orchestrator.ProbeCurrentGeneration(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			state := orchestrator.Store.State()
-			gate := orchestrator.Gate.(*scriptedGate)
-			if state.Current.ID != candidateID || state.Previous == nil || state.Previous.ID != previousID ||
-				state.FinalizePendingOperationID != id || !state.Maintenance || len(gate.releaseIDs) != 0 ||
-				!reflect.DeepEqual(engine.probed, []string{candidateID, candidateID}) {
-				t.Fatalf("half-commit did not bind proof to target behind retained reservation: state=%#v gate=%#v probes=%v", state, gate, engine.probed)
-			}
-		})
+			// Platform restarts immediately after replying. Its startup sees
+			// no finalized receipt yet and reconstructs the reservation.
+			reserved = true
+		} else if !op.Finalized || op.GateSettlementAction != model.GateSettlementCommit {
+			t.Fatal("gate reconciliation preceded its durable receipt")
+		}
+	}
+	orchestrator.Gate = gate
+	if err := orchestrator.Recover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if reserved || orchestrator.Store.State().Maintenance {
+		t.Fatal("Manager opened maintenance without releasing the rebooted Platform gate")
 	}
 }

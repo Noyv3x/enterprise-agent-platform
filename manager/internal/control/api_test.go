@@ -658,19 +658,16 @@ func TestAPIProjectsOversizedDiagnosticsWithoutRewritingJournal(t *testing.T) {
 	state.PublicState = model.StateIdle
 	state.Maintenance = false
 	state.LastError = diagnostic
-	statePath := filepath.Join(dir, "state.json")
-	opPath := filepath.Join(dir, "operations", op.ID+".json")
-	if err := atomicfile.WriteJSON(statePath, state, 0o600); err != nil {
+	checkpointPath := filepath.Join(dir, "update.json")
+	checkpoint := struct {
+		SchemaVersion int                        `json:"schema_version"`
+		State         model.ManagerState         `json:"state"`
+		Operations    map[string]model.Operation `json:"operations"`
+	}{1, state, map[string]model.Operation{op.ID: op}}
+	if err := atomicfile.WriteJSON(checkpointPath, checkpoint, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := atomicfile.WriteJSON(opPath, op, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	stateBefore, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opBefore, err := os.ReadFile(opPath)
+	before, err := os.ReadFile(checkpointPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,9 +747,8 @@ func TestAPIProjectsOversizedDiagnosticsWithoutRewritingJournal(t *testing.T) {
 		t.Fatalf("idempotent operation was not safely projected: %#v", started)
 	}
 
-	stateAfter, _ := os.ReadFile(statePath)
-	opAfter, _ := os.ReadFile(opPath)
-	if !bytes.Equal(stateBefore, stateAfter) || !bytes.Equal(opBefore, opAfter) {
+	after, _ := os.ReadFile(checkpointPath)
+	if !bytes.Equal(before, after) {
 		t.Fatal("API observation rewrote journal evidence")
 	}
 }

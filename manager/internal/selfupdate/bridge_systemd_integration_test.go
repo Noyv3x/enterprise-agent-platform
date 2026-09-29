@@ -4,8 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"net/http"
@@ -17,35 +23,39 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
-const bridgeIntegrationOldCommit = "535ac3fadeb46b2a625b03ea0d8471b467bb4544"
-const bridgeIntegrationN = "2222222222222222222222222222222222222222"
+const bridgeIntegrationN = "770add1e3f4dc63d88e37597c9f7b2dd85a96c45"
 const bridgeIntegrationNext = "3333333333333333333333333333333333333333"
 const bridgeIntegrationRejected = "4444444444444444444444444444444444444444"
+const bridgeIntegrationPeriodic = "5555555555555555555555555555555555555555"
 const bridgeIntegrationInner = "AGENT_PLATFORM_BRIDGE_INTEGRATION_BINARIES"
 
 // TestBridgeSystemdBinaryUpgradeIntegration exercises real CLI executables, not
 // test-process identity responders. Only their compiled technical namespace is
 // changed, in disposable source trees, to avoid touching the installed service.
-// The fixture seeds the legacy binary transaction; it does not claim to execute
-// Docker migrations, a release gate transaction, or a full `update` operation.
+// The fixture starts the actual release-N immutable supervisor and child from
+// a settled deployment checkpoint. It exercises binary activation and migration
+// of N's seeded pending finalization through authenticated mock gate settlement,
+// not Docker migrations, real Platform gate behavior, or the full update CLI.
 func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
-	if os.Getenv(recoverySystemdIntegrationEnvironment) != "1" {
+	if os.Getenv("AGENT_PLATFORM_SYSTEMD_INTEGRATION") != "1" {
 		t.Skip("set AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "show-environment")
 	if binaries := os.Getenv(bridgeIntegrationInner); binaries != "" {
-		inner, innerCancel := context.WithTimeout(ctx, 150*time.Second)
+		inner, innerCancel := context.WithTimeout(ctx, 180*time.Second)
 		defer innerCancel()
 		bridgeIntegrationRun(t, inner, binaries)
 		return
@@ -59,7 +69,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	bridgeIntegrationCopyTree(t, module, currentTree)
-	archive := bridgeIntegrationCommand(t, ctx, filepath.Dir(module), "git", "archive", bridgeIntegrationOldCommit, "manager")
+	archive := bridgeIntegrationCommand(t, ctx, filepath.Dir(module), "git", "archive", bridgeIntegrationN, "manager")
 	reader := tar.NewReader(bytes.NewReader(archive))
 	for {
 		header, err := reader.Next()
@@ -82,7 +92,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 		}
 		bridgeIntegrationWrite(t, filepath.Join(oldTree, relative), data, os.FileMode(header.Mode))
 	}
-	namespace := "agent-platform-bridge-it-" + recoverySystemdIntegrationSuffix(t)
+	namespace := "agent-platform-bridge-it-" + bridgeIntegrationSuffix(t)
 	for _, tree := range []string{currentTree, oldTree} {
 		path := filepath.Join(tree, "internal", "identity", "technical_profiles_generated.go")
 		data, err := os.ReadFile(path)
@@ -97,17 +107,48 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, binary := range []struct{ tree, name, version string }{
-		{oldTree, "old", bridgeIntegrationOldCommit},
-		{currentTree, "bridge", bridgeIntegrationN},
+		{oldTree, "bridge", bridgeIntegrationN},
 		{currentTree, "next", bridgeIntegrationNext},
-		// A real pre-launcher executable cannot acknowledge the authenticated
-		// supervised boot protocol. This injects a missing startup acknowledgement
-		// without replacing Manager's HTTP identity endpoint with a mock.
-		{oldTree, "rejected", bridgeIntegrationRejected},
+		{currentTree, "periodic", bridgeIntegrationPeriodic},
+		{currentTree, "rejected", bridgeIntegrationRejected},
 	} {
+		// Only the negative candidate has an injected startup failure; version
+		// and artifact verification still execute the real current CLI.
+		mainPath := filepath.Join(binary.tree, "cmd", "agent-platform-manager", "main.go")
+		mainSource, err := os.ReadFile(mainPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if binary.name == "rejected" {
+			positions := token.NewFileSet()
+			parsed, err := parser.ParseFile(positions, mainPath, mainSource, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyOffset := -1
+			for _, declaration := range parsed.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if ok && function.Recv == nil && function.Name.Name == "main" && function.Body != nil {
+					bodyOffset = positions.Position(function.Body.Lbrace).Offset + 1
+					break
+				}
+			}
+			if bodyOffset < 0 {
+				t.Fatal("cannot locate main function for candidate immediate-exit fault")
+			}
+			injection := []byte("\nif len(os.Args) > 1 && os.Args[1] == \"serve\" { os.Exit(42) }\n")
+			fault := make([]byte, 0, len(mainSource)+len(injection))
+			fault = append(fault, mainSource[:bodyOffset]...)
+			fault = append(fault, injection...)
+			fault = append(fault, mainSource[bodyOffset:]...)
+			bridgeIntegrationWrite(t, mainPath, fault, 0o600)
+		}
 		bridgeIntegrationCommand(t, ctx, binary.tree, "go", "build", "-buildvcs=false", "-ldflags=-X main.version="+binary.version, "-o", filepath.Join(binaries, binary.name), "./cmd/agent-platform-manager")
+		if binary.name == "rejected" {
+			bridgeIntegrationWrite(t, mainPath, mainSource, 0o600)
+		}
 	}
-	command := exec.CommandContext(ctx, "go", "test", "-count=1", "-v", "-timeout=210s", "-run=^TestBridgeSystemdBinaryUpgradeIntegration$", "./internal/selfupdate")
+	command := exec.CommandContext(ctx, "go", "test", "-count=1", "-v", "-timeout=240s", "-run=^TestBridgeSystemdBinaryUpgradeIntegration$", "./internal/selfupdate")
 	command.Dir = currentTree
 	command.Env = append(os.Environ(), bridgeIntegrationInner+"="+binaries)
 	output, err := command.CombinedOutput()
@@ -127,7 +168,7 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	profile := testTechnicalProfile
+	profile := identity.TargetProfile()
 	stable := filepath.Join(account.HomeDir, ".local", "bin", profile.ManagerBinary)
 	unitPath := filepath.Join(account.HomeDir, ".config", "systemd", "user", profile.ManagerUnit)
 	for _, path := range []string{stable, unitPath} {
@@ -147,7 +188,38 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 	address := listener.Addr().String()
 	_ = listener.Close()
 	generation, composePath := bridgeIntegrationCore(t, ctx, base, stateDir, profile.ManagerBinary)
-	bridgeIntegrationWrite(t, configPath, []byte(fmt.Sprintf("data_root = %q\nsocket_path = %q\nlisten = %q\nupdate_enabled = false\ncompose_project = %q\ncompose_file = %q\n", filepath.Join(base, "data"), socketPath, address, profile.ManagerBinary, composePath)), 0o600)
+	const transitionID = "integration-n-to-next"
+	var gateRequests atomic.Int32
+	var gateCommitted atomic.Bool
+	var gateEffects atomic.Int32
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer bridge-integration-control-token" {
+			t.Errorf("Platform gate received unauthenticated request to %s", r.URL.Path)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/internal/manager/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		var request struct {
+			OperationID string `json:"operation_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request.OperationID != transitionID || r.Method != http.MethodPost || r.URL.Path != "/internal/manager/update/commit-release" {
+			t.Errorf("unexpected gate settlement: %s %s operation=%q error=%v", r.Method, r.URL.Path, request.OperationID, err)
+			http.Error(w, "unexpected settlement", http.StatusBadRequest)
+			return
+		}
+		gateRequests.Add(1)
+		// Platform settles an operation idempotently. The Manager can replay
+		// the same identity after its durable receipt without committing twice.
+		if gateCommitted.CompareAndSwap(false, true) {
+			gateEffects.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(gate.Close)
+	bridgeIntegrationWrite(t, configPath, []byte(fmt.Sprintf("data_root = %q\nsocket_path = %q\nlisten = %q\nupdate_enabled = false\ncompose_project = %q\ncompose_file = %q\nplatform_gate_url = %q\n", filepath.Join(base, "data"), socketPath, address, profile.ManagerBinary, composePath, gate.URL)), 0o600)
 	bridgeIntegrationWrite(t, tokenPath, []byte("bridge-integration-control-token\n"), 0o600)
 	bridgeIntegrationWrite(t, filepath.Join(stateDir, "secrets", "manager-executor-token"), []byte("bridge-integration-executor-token\n"), 0o600)
 	journalState := model.NewState(time.Now())
@@ -155,133 +227,71 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 	if err := atomicfile.WriteJSON(filepath.Join(stateDir, "state.json"), journalState, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	manager := &Manager{Profile: testActiveProfile, ConfigPath: configPath, Root: root, StatePath: filepath.Join(stateDir, "manager-binaries.json"), InstallPath: stable, SocketPath: socketPath, ControlTokenFile: tokenPath, UnitName: profile.ManagerUnit, RunningVersion: bridgeIntegrationN}
-	old := bridgeIntegrationVersion(t, root, filepath.Join(binaries, "old"), bridgeIntegrationOldCommit)
-	candidate := bridgeIntegrationVersion(t, root, filepath.Join(binaries, "bridge"), bridgeIntegrationN)
-	oldData, err := os.ReadFile(old.Path)
+	manager := &Manager{Profile: identity.CompileTimeActiveProfile(), ConfigPath: configPath, Root: root, StatePath: filepath.Join(stateDir, "manager-binaries.json"), InstallPath: stable, SocketPath: socketPath, ControlTokenFile: tokenPath, UnitName: profile.ManagerUnit, RunningVersion: bridgeIntegrationN}
+
+	selected := bridgeIntegrationVersion(t, root, filepath.Join(binaries, "bridge"), bridgeIntegrationN)
+	data, err := os.ReadFile(selected.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	bridgeIntegrationWrite(t, stable, oldData, 0o700)
-	planPath := filepath.Join(root, "activations", bridgeIntegrationN+".json")
-	now := time.Now().UTC()
-	state := State{SchemaVersion: 1, Current: &old, Candidate: &candidate, Activation: &Activation{PlanPath: planPath, CandidateSHA: candidate.SHA256, CandidatePath: candidate.Path, StartedAt: now}, UpdatedAt: now}
-	if err := atomicfile.WriteJSON(manager.StatePath, State{SchemaVersion: 1, Current: &old, UpdatedAt: now}, 0o600); err != nil {
+	bridgeIntegrationWrite(t, stable, data, 0o755)
+	launcher := selected
+	launcher.Path = filepath.Join(root, "launcher")
+	bridgeIntegrationWrite(t, launcher.Path, data, 0o700)
+	if err := atomicfile.WriteJSON(manager.StatePath, State{SchemaVersion: 1, Current: &selected, Previous: &selected, UpdatedAt: time.Now().UTC()}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan := Plan{SchemaVersion: 1, PlanPath: planPath, Status: "prepared", StatePath: manager.StatePath, InstallPath: stable, SocketPath: socketPath, ControlTokenFile: tokenPath, UnitName: profile.ManagerUnit, CandidateVersion: candidate.Version, CandidateSHA: candidate.SHA256, CandidatePath: candidate.Path, PlatformCommit: candidate.SourceCommit, PreviousPath: old.Path, CreatedAt: now, UpdatedAt: now, HealthTimeoutMS: 30000, BootID: "bridge-integration"}
-	if err := persistActivationPlan(planPath, plan); err != nil {
+	if err := atomicfile.WriteJSON(manager.launcherPath(), launcherState{SchemaVersion: 1, Launcher: launcher, Proven: true, Selected: selected, Previous: &selected}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	watchdog := profile.WatchdogUnitPrefix + bridgeIntegrationN[:12]
+	if err := atomicfile.WriteJSON(filepath.Join(root, "bridge-handoff.json"), map[string]any{"schema_version": 1, "status": "proven", "launcher": launcher}, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if t.Failed() {
-			output, _ := exec.CommandContext(cleanup, "journalctl", "--user", "--no-pager", "-n", "100", "-u", profile.ManagerUnit, "-u", watchdog+".service").CombinedOutput()
+			output, _ := exec.CommandContext(cleanup, "journalctl", "--user", "--no-pager", "-n", "100", "-u", profile.ManagerUnit).CombinedOutput()
 			t.Logf("isolated unit diagnostics:\n%s", output)
-			for _, path := range []string{manager.StatePath, filepath.Join(stateDir, "state.json"), manager.bridgeHandoffPath(), manager.launcherPath()} {
+			for _, path := range []string{manager.StatePath, filepath.Join(stateDir, "state.json"), filepath.Join(stateDir, "update.json"), manager.launcherPath()} {
 				data, err := os.ReadFile(path)
 				t.Logf("isolated durable state %s: %s (error=%v)", path, data, err)
 			}
 		}
-		_ = exec.CommandContext(cleanup, "systemctl", "--user", "stop", profile.ManagerUnit+"-bridge-handoff.service", profile.ManagerUnit, watchdog+".service").Run()
-		worker := profile.ManagerUnit + "-bridge-handoff.service"
-		_ = exec.CommandContext(cleanup, "systemctl", "--user", "disable", worker).Run()
-		_ = os.Remove(filepath.Join(filepath.Dir(unitPath), worker))
+		_ = exec.CommandContext(cleanup, "systemctl", "--user", "stop", profile.ManagerUnit).Run()
 		_ = os.Remove(unitPath)
 		_ = os.Remove(stable)
 		_ = exec.CommandContext(cleanup, "systemctl", "--user", "daemon-reload").Run()
-		_ = exec.CommandContext(cleanup, "systemctl", "--user", "reset-failed", profile.ManagerUnit, worker, watchdog+".service").Run()
+		_ = exec.CommandContext(cleanup, "systemctl", "--user", "reset-failed", profile.ManagerUnit).Run()
 	})
-	bridgeIntegrationWrite(t, unitPath, []byte(fmt.Sprintf("[Unit]\nDescription=Isolated Manager bridge integration\n[Service]\nType=simple\nExecStart=%s serve --config %s\nRestart=on-failure\nRestartSec=1\nTimeoutStopSec=5\nNoNewPrivileges=true\n[Install]\nWantedBy=default.target\n", stable, configPath)), 0o600)
+	bridgeIntegrationWrite(t, unitPath, []byte(fmt.Sprintf("[Unit]\nDescription=Isolated Manager N to N+1 integration\n[Service]\nType=simple\nExecStart=%s launcher --config %s\nRestart=on-failure\nRestartSec=1\nTimeoutStopSec=5\nNoNewPrivileges=true\n[Install]\nWantedBy=default.target\n", launcher.Path, configPath)), 0o644)
 	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "daemon-reload")
 	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", profile.ManagerUnit)
-	initialPID := bridgeIntegrationIdentity(t, ctx, manager, old)
-	bridgeIntegrationCatalogCheck(t, ctx, manager, stateDir)
-	if err := atomicfile.WriteJSON(manager.StatePath, state, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	bridgeIntegrationCommand(t, ctx, "", "systemd-run", "--user", "--quiet", "--collect", "--unit="+watchdog, old.Path, "self-update-watchdog", "--plan", planPath, "--config", configPath)
-	recoverySystemdIntegrationEventually(t, ctx, "genuine old watchdog ownership", func() (bool, error) {
-		pid, err := recoverySystemdIntegrationPID(ctx, watchdog+".service")
-		if err != nil || pid < 2 {
-			return false, err
-		}
-		sha, err := fileSHA256(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
-		return sha == old.SHA256, err
+	bridgeIntegrationIdentity(t, ctx, manager, selected)
+	bridgeIntegrationEventually(t, ctx, "release N supervised child and core readiness", func() (bool, error) {
+		s, err := manager.readLauncher()
+		return err == nil && s.BootReady && s.Acknowledged && !s.Pending && s.Selected.SHA256 == selected.SHA256, err
 	})
-	data, err := os.ReadFile(candidate.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bridgeIntegrationWrite(t, stable, data, 0o700)
-	plan.Activated, plan.Status = true, "activated"
-	if err := persistActivationPlan(planPath, plan); err != nil {
-		t.Fatal(err)
-	}
-	recoverySystemdIntegrationEventually(t, ctx, "old watchdog commit", func() (bool, error) {
-		var durable Plan
-		if err := atomicfile.ReadJSON(planPath, &durable); err != nil {
-			return false, err
-		}
-		return durable.Status == "committed", nil
-	})
-	bridgePID := bridgeIntegrationIdentity(t, ctx, manager, candidate)
-	if bridgePID == initialPID {
-		t.Fatal("legacy activation did not replace old Manager process")
-	}
-	recoverySystemdIntegrationEventually(t, ctx, "automatic immutable launcher handoff", func() (bool, error) { return manager.LauncherEnabled() })
-	recoverySystemdIntegrationEventually(t, ctx, "independent handoff worker durable proof", func() (bool, error) {
-		var handoff bridgeHandoff
-		if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &handoff); err != nil {
-			return false, err
-		}
-		return handoff.Status == "proven", nil
-	})
-	launcherPID, err := recoverySystemdIntegrationPID(ctx, profile.ManagerUnit)
+	launcherPID, err := bridgeIntegrationPID(ctx, profile.ManagerUnit)
 	if err != nil {
 		t.Fatal(err)
 	}
 	launcherSHA, err := fileSHA256(filepath.Join("/proc", strconv.Itoa(launcherPID), "exe"))
-	if err != nil || launcherSHA != candidate.SHA256 {
-		t.Fatalf("launcher executable SHA=%s error=%v", launcherSHA, err)
+	if err != nil || launcherSHA != selected.SHA256 {
+		t.Fatalf("initial launcher is not release N: SHA=%s: %v", launcherSHA, err)
 	}
 	launcherPath, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(launcherPID), "exe"))
-	if err != nil || launcherPath == stable {
-		t.Fatalf("launcher must be independent of stable: %s: %v", launcherPath, err)
+	if err != nil || launcherPath != launcher.Path || launcherPath == stable {
+		t.Fatalf("launcher is not independently immutable: path=%s: %v", launcherPath, err)
 	}
-	load, err := recoverySystemdProperty(ctx, watchdog+".service", "LoadState")
-	if err != nil || load != "not-found" {
-		t.Fatalf("legacy watchdog still present: %s: %v", load, err)
+	initial, err := manager.readLauncher()
+	if err != nil || initial.ChildPID <= 1 || initial.ChildPID == launcherPID {
+		t.Fatalf("release N was not supervised: %#v: %v", initial, err)
 	}
-	t.Logf("old watchdog committed N; old PID=%d, immutable launcher PID=%d path=%s SHA=%s; handoff record proven", initialPID, launcherPID, launcherPath, launcherSHA)
-	var checked model.ManagerState
-	if err := atomicfile.ReadJSON(filepath.Join(stateDir, "state.json"), &checked); err != nil {
-		t.Fatal(err)
+	initialSHA, err := fileSHA256(filepath.Join("/proc", strconv.Itoa(initial.ChildPID), "exe"))
+	if err != nil || initialSHA != selected.SHA256 {
+		t.Fatalf("initial child is not actual release N: SHA=%s: %v", initialSHA, err)
 	}
-	if checked.Candidate == nil || checked.Candidate.ID != bridgeIntegrationNext {
-		t.Fatalf("handoff discarded the checked release catalog candidate: %#v", checked.Candidate)
-	}
-	for _, phase := range []string{"prepared", "switching", "failed"} {
-		scenario := "resume-handoff-" + phase
-		if phase == "failed" {
-			scenario = "explicit-retry-failed-handoff"
-		}
-		t.Run(scenario, func(t *testing.T) {
-			bridgeIntegrationResumeHandoff(t, ctx, manager, unitPath, phase, candidate)
-		})
-	}
-	for _, phase := range []string{"switching", "recovering"} {
-		t.Run("boot-recovery-missing-launcher-"+phase, func(t *testing.T) {
-			bridgeIntegrationMissingLauncherRecovery(t, ctx, manager, unitPath, phase, candidate)
-		})
-	}
-	launcherPID, err = recoverySystemdIntegrationPID(ctx, profile.ManagerUnit)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	for _, upgrade := range []struct {
 		name, version string
 		fallback      bool
@@ -293,21 +303,60 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) }))
 			defer server.Close()
-			manifest := releasetest.NewTarget(upgrade.version, releasetest.WithArtifactBaseURL(server.URL), releasetest.WithManagerBinary(runtime.GOARCH, payload)).Manifest
+			compose, err := os.ReadFile(composePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest := releasetest.NewTarget(upgrade.version, releasetest.WithArtifactBaseURL(server.URL), releasetest.WithManagerBinary(runtime.GOARCH, payload), releasetest.WithCompose(compose)).Manifest
+			manifest.Images = generation.Images
 			if err := manager.Prepare(ctx, manifest); err != nil {
 				t.Fatal(err)
 			}
 			if err := manager.MarkPlatformCommitted(manifest); err != nil {
 				t.Fatal(err)
 			}
+			if !upgrade.fallback {
+				// Recreate the exact N finalization checkpoint offline; the live
+				// N child above is stopped so it cannot rewrite seeded state.
+				bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "stop", profile.ManagerUnit)
+				now := time.Now().UTC()
+				manifestPath := filepath.Join(stateDir, "releases", manifest.ID(), "manifest.json")
+				bridgeIntegrationWrite(t, filepath.Join(filepath.Dir(manifestPath), "compose.yaml"), compose, 0o600)
+				if err := atomicfile.WriteJSON(manifestPath, manifest, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				snapshotPath := filepath.Join(stateDir, "snapshots", transitionID)
+				target := model.Generation{ID: manifest.ID(), ManifestPath: manifestPath, SourceCommit: manifest.SourceCommit, DatabaseVersion: manifest.DatabaseSchemaVersion, Images: manifest.Images, RollbackSnapshotPath: snapshotPath, ActivatedAt: now}
+				state := model.NewState(now)
+				state.Current, state.Previous = &target, &generation
+				state.FinalizePendingOperationID = transitionID
+				state.Maintenance, state.PublicState, state.Phase = true, model.StateUpdating, model.PhaseProbing
+				op := model.Operation{SchemaVersion: 1, ID: transitionID, Kind: model.OperationUpdate, IdempotencyKey: transitionID, Attempt: 1, TargetGeneration: target.ID, Status: model.OperationSucceeded, Phase: model.PhaseProbing, ReservationStatus: model.ReservationMutationStarted, SnapshotPath: snapshotPath, CreatedAt: now, UpdatedAt: now, CompletedAt: &now}
+				if err := atomicfile.WriteJSON(filepath.Join(stateDir, "operations", transitionID+".json"), op, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := atomicfile.WriteJSON(filepath.Join(stateDir, "state.json"), state, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Lstat(filepath.Join(stateDir, "update.json")); !os.IsNotExist(err) {
+					t.Fatalf("N unexpectedly owns the N+1 transaction record: %v", err)
+				}
+			}
 			if err := manager.Activate(ctx, manifest); err != nil {
 				t.Fatal(err)
+			}
+			if !upgrade.fallback {
+				bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", profile.ManagerUnit)
+				launcherPID, err = bridgeIntegrationPID(ctx, profile.ManagerUnit)
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			want := upgrade.version
 			if upgrade.fallback {
 				want = bridgeIntegrationN
 			}
-			recoverySystemdIntegrationEventually(t, ctx, "bounded supervised selection "+want, func() (bool, error) {
+			bridgeIntegrationEventually(t, ctx, "bounded supervised selection "+want, func() (bool, error) {
 				settled, err := manager.State()
 				if err != nil {
 					return false, err
@@ -320,7 +369,7 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 				t.Fatal(err)
 			}
 			bridgeIntegrationIdentity(t, ctx, manager, *settled.Current)
-			pid, err := recoverySystemdIntegrationPID(ctx, profile.ManagerUnit)
+			pid, err := bridgeIntegrationPID(ctx, profile.ManagerUnit)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -348,7 +397,7 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 			}
 			if upgrade.fallback {
 				time.Sleep(2 * time.Second)
-				after, err := recoverySystemdIntegrationPID(ctx, profile.ManagerUnit)
+				after, err := bridgeIntegrationPID(ctx, profile.ManagerUnit)
 				if err != nil || after != pid {
 					t.Fatalf("fallback loops launcher: before=%d after=%d: %v", pid, after, err)
 				}
@@ -359,15 +408,34 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 				if err := manager.Prepare(ctx, manifest); err == nil {
 					t.Fatal("rejected candidate was admitted again")
 				}
-			} else if settled.Previous == nil || settled.Previous.Version != bridgeIntegrationN {
-				t.Fatalf("successful update lost bridge fallback: %#v", settled.Previous)
+			} else if settled.Previous == nil || settled.Previous.Version != bridgeIntegrationN || settled.Previous.SHA256 != selected.SHA256 {
+				t.Fatalf("successful update lost byte-identical release N fallback: %#v", settled.Previous)
+			} else {
+				version := bridgeIntegrationCommand(t, ctx, "", settled.Previous.Path, "version")
+				if strings.TrimSpace(string(version)) != bridgeIntegrationN {
+					t.Fatalf("previous N is no longer runnable: %s", version)
+				}
 			}
 			manager.RunningVersion = want
 			t.Logf("selected version=%s child PID=%d SHA=%s, same launcher PID=%d, fallback=%t", want, supervised.ChildPID, childSHA, pid, upgrade.fallback)
 		})
 	}
+	bridgeIntegrationEventually(t, ctx, "N operation migrated and gate-settled by N+1", func() (bool, error) {
+		var checkpoint struct {
+			State      model.ManagerState         `json:"state"`
+			Operations map[string]model.Operation `json:"operations"`
+		}
+		if err := atomicfile.ReadJSON(filepath.Join(stateDir, "update.json"), &checkpoint); err != nil {
+			return false, err
+		}
+		op := checkpoint.Operations[transitionID]
+		return op.ID == transitionID && op.IdempotencyKey == transitionID && op.Finalized && op.Status == model.OperationSucceeded && op.GateSettlementAction == model.GateSettlementCommit && checkpoint.State.FinalizePendingOperationID == "" && !checkpoint.State.Maintenance && checkpoint.State.Current != nil && checkpoint.State.Current.SourceCommit == bridgeIntegrationNext && checkpoint.State.Previous != nil && checkpoint.State.Previous.SourceCommit == bridgeIntegrationN, nil
+	})
+	if requests, effects := gateRequests.Load(), gateEffects.Load(); requests != 2 || effects != 1 {
+		t.Fatalf("N gate settlement requests=%d effects=%d, want receipt-fenced replay and one logical commit", requests, effects)
+	}
 	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "restart", profile.ManagerUnit)
-	recoverySystemdIntegrationEventually(t, ctx, "rejected selection remains rejected after service restart", func() (bool, error) {
+	bridgeIntegrationEventually(t, ctx, "rejected selection remains rejected after service restart", func() (bool, error) {
 		supervised, err := manager.readLauncher()
 		if err != nil {
 			return false, err
@@ -379,8 +447,89 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 		t.Fatal(err)
 	}
 	bridgeIntegrationIdentity(t, ctx, manager, *settled.Current)
+	if effects := gateEffects.Load(); effects != 1 {
+		t.Fatalf("settled operation produced another commit effect after restart: %d", effects)
+	}
 	t.Run("committed-restart-pending-operation", func(t *testing.T) {
 		bridgeIntegrationPendingRestart(t, ctx, manager, stateDir, *settled.Current)
+	})
+	t.Run("periodic-update-after-supervised-restart", func(t *testing.T) {
+		bridgeIntegrationPeriodicUpdate(t, ctx, manager, stateDir, binaries, *settled.Current)
+	})
+	t.Run("fresh-bootstrap-installer-permissions", func(t *testing.T) {
+		bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "stop", profile.ManagerUnit)
+		freshBase := filepath.Join(base, "fresh")
+		freshStateDir := filepath.Join(freshBase, "data", "manager")
+		freshConfig := filepath.Join(freshBase, "manager.toml")
+		freshSocket := filepath.Join(freshBase, "control", "manager.sock")
+		freshToken := filepath.Join(freshStateDir, "secrets", "manager-token")
+		bridgeIntegrationWrite(t, freshConfig, []byte(fmt.Sprintf("data_root = %q\nsocket_path = %q\nlisten = %q\nupdate_enabled = false\ncompose_project = %q\ncompose_file = %q\nplatform_gate_url = %q\n", filepath.Join(freshBase, "data"), freshSocket, address, profile.ManagerBinary, composePath, gate.URL)), 0o600)
+		bridgeIntegrationWrite(t, freshToken, []byte("bridge-integration-control-token\n"), 0o600)
+		bridgeIntegrationWrite(t, filepath.Join(freshStateDir, "secrets", "manager-executor-token"), []byte("bridge-integration-executor-token\n"), 0o600)
+		payload, err := os.ReadFile(filepath.Join(binaries, "next"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bridgeIntegrationWrite(t, stable, payload, 0o755)
+		fresh := &Manager{Profile: identity.CompileTimeActiveProfile(), ConfigPath: freshConfig, Root: filepath.Join(freshStateDir, "manager-binaries"), StatePath: filepath.Join(freshStateDir, "manager-binaries.json"), InstallPath: stable, SocketPath: freshSocket, ControlTokenFile: freshToken, UnitName: profile.ManagerUnit, RunningVersion: bridgeIntegrationNext}
+		freshLauncher := filepath.Join(fresh.Root, "launcher")
+		bridgeIntegrationWrite(t, unitPath, []byte(fmt.Sprintf("[Unit]\nDescription=Isolated fresh Manager bootstrap\n[Service]\nType=simple\nExecStart=%s launcher --config %s\nRestart=on-failure\nRestartSec=1\nTimeoutStopSec=5\nNoNewPrivileges=true\n[Install]\nWantedBy=default.target\n", freshLauncher, freshConfig)), 0o644)
+		output := bridgeIntegrationCommand(t, ctx, "", stable, "bootstrap-launcher", "--config", freshConfig)
+		if strings.TrimSpace(string(output)) != freshLauncher {
+			t.Fatalf("bootstrap returned unexpected launcher: %s", output)
+		}
+		// Bootstrap must run before any deployment state exists. Seed the same
+		// healthy core checkpoint only afterward to exercise supervised readiness.
+		checkpoint := model.NewState(time.Now())
+		checkpoint.Current = &generation
+		if err := atomicfile.WriteJSON(filepath.Join(freshStateDir, "state.json"), checkpoint, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "daemon-reload")
+		bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", profile.ManagerUnit)
+		bridgeIntegrationEventually(t, ctx, "fresh N+1 bootstrap supervised child readiness", func() (bool, error) {
+			supervised, err := fresh.readLauncher()
+			return err == nil && supervised.Bootstrap && supervised.BootReady && supervised.Acknowledged && !supervised.Pending && supervised.Selected.Version == bridgeIntegrationNext, err
+		})
+		supervised, err := fresh.readLauncher()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := bridgeIntegrationPID(ctx, profile.ManagerUnit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bridgeIntegrationIdentity(t, ctx, fresh, supervised.Selected)
+		childPID := supervised.ChildPID
+		if childPID <= 1 || childPID == pid || supervised.LauncherPID != pid {
+			t.Fatalf("fresh bootstrap did not launch an independent supervised child: launcher=%d child=%d state=%#v", pid, childPID, supervised)
+		}
+		for _, process := range []struct {
+			pid  int
+			path string
+		}{{pid, freshLauncher}, {childPID, supervised.Selected.Path}} {
+			executable := filepath.Join("/proc", strconv.Itoa(process.pid), "exe")
+			path, err := os.Readlink(executable)
+			if err != nil || path != process.path {
+				t.Fatalf("fresh process %d executable=%q, want %q: %v", process.pid, path, process.path, err)
+			}
+			hash, err := fileSHA256(executable)
+			if err != nil || hash != sha256Hex(payload) {
+				t.Fatalf("fresh process %d is not actual N+1: SHA=%s: %v", process.pid, hash, err)
+			}
+		}
+		for path, mode := range map[string]os.FileMode{
+			stable: 0o755, unitPath: 0o644, fresh.StatePath: 0o600, fresh.launcherPath(): 0o600,
+			freshToken: 0o600, filepath.Join(freshStateDir, "secrets", "manager-executor-token"): 0o600,
+		} {
+			info, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.Mode().IsRegular() || info.Mode().Perm() != mode {
+				t.Fatalf("bootstrap changed installer permissions: %s has %s, want %04o", path, info.Mode(), mode)
+			}
+		}
 	})
 }
 
@@ -391,7 +540,7 @@ func bridgeIntegrationIdentity(t *testing.T, ctx context.Context, manager *Manag
 	}}, Timeout: time.Second}
 	defer client.CloseIdleConnections()
 	var pid int
-	recoverySystemdIntegrationEventually(t, ctx, "authenticated real Manager identity "+version.Version, func() (bool, error) {
+	bridgeIntegrationEventually(t, ctx, "authenticated real Manager identity "+version.Version, func() (bool, error) {
 		request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://manager/v1/identity", nil)
 		request.Header.Set("Authorization", "Bearer bridge-integration-control-token")
 		response, err := client.Do(request)
@@ -409,9 +558,21 @@ func bridgeIntegrationIdentity(t *testing.T, ctx context.Context, manager *Manag
 		if identity.Status != "healthy" || identity.Version != version.Version || identity.SHA256 != version.SHA256 {
 			return false, nil
 		}
-		pid, err = recoverySystemdIntegrationPID(ctx, manager.UnitName)
+		pid, err = bridgeIntegrationPID(ctx, manager.UnitName)
 		return pid > 1, err
 	})
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://manager/v1/identity", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated identity returned %d", response.StatusCode)
+	}
 	return pid
 }
 
@@ -421,7 +582,7 @@ func bridgeIntegrationVersion(t *testing.T, root, source, version string) Versio
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(root, "versions", version+"-"+version[:12], testTechnicalProfile.ManagerBinary)
+	path := filepath.Join(root, "versions", version+"-"+version[:12], identity.TargetProfile().ManagerBinary)
 	bridgeIntegrationWrite(t, path, data, 0o700)
 	result := Version{Version: version, SourceCommit: version, SHA256: sha256Hex(data), Path: path, VerifiedAt: time.Now().UTC(), PlatformCommitted: true}
 	if err := atomicfile.WriteJSON(filepath.Join(filepath.Dir(path), "metadata.json"), result, 0o600); err != nil {
@@ -515,87 +676,6 @@ func bridgeIntegrationCore(t *testing.T, ctx context.Context, base, stateDir, pr
 	return model.Generation{ID: fixture.Manifest.ID(), ManifestPath: manifestPath, SourceCommit: bridgeIntegrationN, DatabaseVersion: fixture.Manifest.DatabaseSchemaVersion, Images: fixture.Manifest.Images, ActivatedAt: time.Now().UTC()}, composePath
 }
 
-// Recreate a durable crash checkpoint with the independent worker absent.
-// This deliberately avoids timing a SIGKILL against a sub-millisecond write:
-// every resumed process is real, but the interrupted record is seeded offline.
-func bridgeIntegrationResumeHandoff(t *testing.T, ctx context.Context, manager *Manager, unitPath, phase string, selected Version) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(ctx, 35*time.Second)
-	defer cancel()
-	worker := manager.UnitName + "-bridge-handoff.service"
-	recoverySystemdIntegrationEventually(t, ctx, "previous handoff worker exit", func() (bool, error) {
-		return bridgeIntegrationWorkerStopped(ctx, worker)
-	})
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "stop", manager.UnitName)
-	var handoff bridgeHandoff
-	if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &handoff); err != nil {
-		t.Fatal(err)
-	}
-	handoff.Status = phase
-	handoff.Error = ""
-	if phase == "failed" {
-		handoff.Error = "isolated failed handoff checkpoint"
-	}
-	if err := atomicfile.WriteJSON(manager.bridgeHandoffPath(), handoff, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.mutateLauncher(func(state *launcherState) error {
-		state.Proven = false
-		state.Failed = phase == "failed"
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	unit := handoff.Replacement
-	if phase == "prepared" || phase == "failed" {
-		unit = handoff.Original
-	}
-	bridgeIntegrationWrite(t, unitPath, unit, 0o600)
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "daemon-reload")
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", manager.UnitName)
-	if phase == "failed" {
-		stablePID := bridgeIntegrationIdentity(t, ctx, manager, selected)
-		// Give normal startup reconciliation an opportunity to observe the
-		// terminal record. It must not silently retry a failed switch.
-		time.Sleep(6 * time.Second)
-		var terminal bridgeHandoff
-		if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &terminal); err != nil {
-			t.Fatal(err)
-		}
-		proven, err := manager.LauncherEnabled()
-		if err != nil || proven || terminal.Status != "failed" {
-			t.Fatalf("failed handoff retried without explicit authorization: %#v proven=%t: %v", terminal, proven, err)
-		}
-		pid, err := recoverySystemdIntegrationPID(ctx, manager.UnitName)
-		if err != nil || pid != stablePID {
-			t.Fatalf("failed handoff loops restored service: initial=%d final=%d: %v", stablePID, pid, err)
-		}
-		bridgeIntegrationCommand(t, ctx, "", manager.InstallPath, "bridge-handoff", "--retry", "--config", manager.ConfigPath)
-	}
-	recoverySystemdIntegrationEventually(t, ctx, "interrupted "+phase+" handoff to regain durable proof", func() (bool, error) {
-		var resumed bridgeHandoff
-		if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &resumed); err != nil {
-			return false, err
-		}
-		proven, err := manager.LauncherEnabled()
-		return err == nil && proven && resumed.Status == "proven", err
-	})
-	pid := bridgeIntegrationIdentity(t, ctx, manager, selected)
-	executable, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
-	if err != nil || executable != filepath.Join(manager.Root, "launcher") {
-		t.Fatalf("resumed handoff is not supervised: %s: %v", executable, err)
-	}
-	state, err := manager.readLauncher()
-	if err != nil || !state.BootReady || state.Failed || state.ChildPID <= 1 {
-		t.Fatalf("resumed child is not ready: %#v: %v", state, err)
-	}
-	digest, err := fileSHA256(filepath.Join("/proc", strconv.Itoa(state.ChildPID), "exe"))
-	if err != nil || digest != selected.SHA256 {
-		t.Fatalf("resumed child digest=%s, expected %s: %v", digest, selected.SHA256, err)
-	}
-	t.Logf("resumed %s handoff with worker initially absent: launcher=%d child=%d", phase, pid, state.ChildPID)
-}
-
 func bridgeIntegrationPendingRestart(t *testing.T, ctx context.Context, manager *Manager, stateDir string, selected Version) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
@@ -632,7 +712,7 @@ func bridgeIntegrationPendingRestart(t *testing.T, ctx context.Context, manager 
 		t.Fatal(err)
 	}
 	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", manager.UnitName)
-	recoverySystemdIntegrationEventually(t, ctx, "committed child readiness with an unfinished validating operation", func() (bool, error) {
+	bridgeIntegrationEventually(t, ctx, "committed child readiness with an unfinished validating operation", func() (bool, error) {
 		launcher, err := manager.readLauncher()
 		if err != nil {
 			return false, err
@@ -649,149 +729,187 @@ func bridgeIntegrationPendingRestart(t *testing.T, ctx context.Context, manager 
 	if err != nil {
 		t.Fatal(err)
 	}
-	pid, err := recoverySystemdIntegrationPID(ctx, manager.UnitName)
+	pid, err := bridgeIntegrationPID(ctx, manager.UnitName)
 	if err != nil || launcher.LauncherPID != pid || !launcher.BootReady || launcher.Failed {
 		t.Fatalf("resumed operation lost live supervisor readiness: %#v MainPID=%d: %v", launcher, pid, err)
 	}
-	var persisted model.Operation
-	if err := atomicfile.ReadJSON(filepath.Join(stateDir, "operations", operation.ID+".json"), &persisted); err != nil {
+	var checkpoint struct {
+		SchemaVersion int                        `json:"schema_version"`
+		State         model.ManagerState         `json:"state"`
+		Operations    map[string]model.Operation `json:"operations"`
+	}
+	if err := atomicfile.ReadJSON(filepath.Join(stateDir, "update.json"), &checkpoint); err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ID != operation.ID || persisted.IdempotencyKey != operation.IdempotencyKey || persisted.Phase != model.PhaseValidating || persisted.Status == model.OperationFailed {
+	persisted, found := checkpoint.Operations[operation.ID]
+	if checkpoint.SchemaVersion != 1 || checkpoint.State.ActiveOperationID != operation.ID || !found || persisted.ID != operation.ID || persisted.IdempotencyKey != operation.IdempotencyKey || persisted.Phase != model.PhaseValidating || persisted.Status == model.OperationFailed {
 		t.Fatalf("restart did not retain pending operation identity: %#v", persisted)
 	}
 	t.Logf("committed supervised Manager became ready and resumed original validating operation %s", operation.ID)
 }
 
-func bridgeIntegrationCatalogCheck(t *testing.T, ctx context.Context, manager *Manager, stateDir string) {
+func bridgeIntegrationPeriodicUpdate(t *testing.T, ctx context.Context, manager *Manager, stateDir, binaries string, selected Version) {
 	t.Helper()
-	var fixture releasetest.Fixture
+	ctx, cancel := context.WithTimeout(ctx, 75*time.Second)
+	defer cancel()
+	type checkpoint struct {
+		State      model.ManagerState         `json:"state"`
+		Operations map[string]model.Operation `json:"operations"`
+	}
+	var before checkpoint
+	bridgeIntegrationEventually(t, ctx, "previous restart operation finalized", func() (bool, error) {
+		var current checkpoint
+		if err := atomicfile.ReadJSON(filepath.Join(stateDir, "update.json"), &current); err != nil {
+			return false, err
+		}
+		before = current
+		return before.State.ActiveOperationID == "" && before.State.FinalizePendingOperationID == "", nil
+	})
+	previous, err := manager.readLauncher()
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentPayload, err := os.ReadFile(filepath.Join(binaries, "next"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose, err := os.ReadFile(filepath.Join(filepath.Dir(before.State.Current.ManifestPath), "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(filepath.Join(binaries, "periodic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var published atomic.Bool
+	var initialPolls atomic.Int32
+	var targetPolls atomic.Int32
+	var binaryRequests atomic.Int32
+	var currentManifest, targetManifest []byte
+	releaseBinary := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/manifest.json":
-			_ = json.NewEncoder(w).Encode(fixture.Manifest)
-		case "/agent-platform-compose.yaml":
-			_, _ = w.Write(fixture.Compose)
+			w.Header().Set("Content-Type", "application/json")
+			if published.Load() {
+				targetPolls.Add(1)
+				_, _ = w.Write(targetManifest)
+			} else {
+				initialPolls.Add(1)
+				_, _ = w.Write(currentManifest)
+			}
+		case "/agent-platform-compose.yaml", "/current/agent-platform-compose.yaml":
+			_, _ = w.Write(compose)
+		case "/current/agent-platform-manager-linux-" + runtime.GOARCH:
+			_, _ = w.Write(currentPayload)
+		case "/agent-platform-manager-linux-" + runtime.GOARCH:
+			// Pause a real artifact transfer after target admission so the
+			// durable operation can be inspected without starting a cutover.
+			binaryRequests.Add(1)
+			select {
+			case <-releaseBinary:
+				_, _ = w.Write(payload)
+			case <-r.Context().Done():
+			}
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
-	fixture = releasetest.NewTarget(bridgeIntegrationNext, releasetest.WithArtifactBaseURL(server.URL))
-	body, err := json.Marshal(map[string]string{"idempotency_key": "bridge-catalog-before-handoff", "manifest_url": server.URL + "/manifest.json"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", manager.SocketPath)
-	}}, Timeout: 10 * time.Second}
-	defer client.CloseIdleConnections()
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://manager/v1/check", bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Authorization", "Bearer bridge-integration-control-token")
-	request.Header.Set("Content-Type", "application/json")
-	response, err := client.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	data, err := io.ReadAll(response.Body)
-	if err != nil || response.StatusCode != http.StatusOK {
-		t.Fatalf("real legacy release check: status=%d body=%s: %v", response.StatusCode, data, err)
-	}
-	var state model.ManagerState
-	if err := atomicfile.ReadJSON(filepath.Join(stateDir, "state.json"), &state); err != nil {
-		t.Fatal(err)
-	}
-	if state.Candidate == nil || state.Candidate.ID != bridgeIntegrationNext || state.ActiveOperationID != "" || state.FinalizePendingOperationID != "" || state.Maintenance {
-		t.Fatalf("release check did not publish an isolated catalog candidate: %#v", state)
-	}
-	t.Logf("actual legacy /v1/check persisted catalog-only candidate %s before N handoff", state.Candidate.ID)
-}
-
-// Start the enabled persistent recovery entrypoint with no surviving worker or
-// main process, as at user-systemd boot. The replacement main executable is
-// deliberately absent, so successful recovery cannot depend on its startup.
-func bridgeIntegrationMissingLauncherRecovery(t *testing.T, ctx context.Context, manager *Manager, unitPath, phase string, selected Version) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(ctx, 35*time.Second)
-	defer cancel()
-	worker := manager.UnitName + "-bridge-handoff.service"
-	recoverySystemdIntegrationEventually(t, ctx, "completed recovery worker exit", func() (bool, error) {
-		return bridgeIntegrationWorkerStopped(ctx, worker)
-	})
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "stop", manager.UnitName)
-	var handoff bridgeHandoff
-	if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &handoff); err != nil {
-		t.Fatal(err)
-	}
-	handoff.Status, handoff.Error = phase, ""
-	if err := atomicfile.WriteJSON(manager.bridgeHandoffPath(), handoff, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.mutateLauncher(func(state *launcherState) error {
-		state.Proven = false
-		state.BootReady = false
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	bridgeIntegrationWrite(t, unitPath, handoff.Replacement, 0o600)
-	launcherBytes, err := os.ReadFile(handoff.Launcher.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(handoff.Launcher.Path); err != nil {
-		t.Fatal(err)
-	}
+	defer close(releaseBinary)
 	defer func() {
-		if _, err := os.Lstat(handoff.Launcher.Path); os.IsNotExist(err) {
-			bridgeIntegrationWrite(t, handoff.Launcher.Path, launcherBytes, 0o700)
-		}
+		stop, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		bridgeIntegrationCommand(t, stop, "", "systemctl", "--user", "stop", manager.UnitName)
 	}()
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "daemon-reload")
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "enable", worker)
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "is-enabled", worker)
-	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "start", worker)
-	recoverySystemdIntegrationEventually(t, ctx, "independent stable bridge recovery of "+phase+" with absent launcher", func() (bool, error) {
-		var recovered bridgeHandoff
-		if err := atomicfile.ReadJSON(manager.bridgeHandoffPath(), &recovered); err != nil {
+	current := releasetest.NewTarget(bridgeIntegrationNext, releasetest.WithArtifactBaseURL(server.URL+"/current"), releasetest.WithManagerBinary(runtime.GOARCH, currentPayload), releasetest.WithCompose(compose))
+	current.Manifest.Images = before.State.Current.Images
+	currentManifest, err = json.Marshal(current.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := releasetest.NewTarget(bridgeIntegrationPeriodic, releasetest.WithArtifactBaseURL(server.URL), releasetest.WithManagerBinary(runtime.GOARCH, payload), releasetest.WithCompose(compose))
+	fixture.Manifest.Images = before.State.Current.Images
+	targetManifest, err = json.Marshal(fixture.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config = bytes.Replace(config, []byte("update_enabled = false"), []byte("update_enabled = true"), 1)
+	releaseURL := server.URL + "/manifest.json"
+	config = append(config, []byte(fmt.Sprintf("update_interval = \"30s\"\nrelease_manifest_url = %q\n", releaseURL))...)
+	bridgeIntegrationWrite(t, manager.ConfigPath, config, 0o600)
+	bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "restart", manager.UnitName)
+	bridgeIntegrationEventually(t, ctx, "N+1 supervised restart and initial automatic poll", func() (bool, error) {
+		supervised, err := manager.readLauncher()
+		return err == nil && supervised.LauncherPID != previous.LauncherPID && supervised.ChildPID != previous.ChildPID && supervised.BootReady && !supervised.Pending && supervised.Selected.SHA256 == selected.SHA256 && initialPolls.Load() > 0, err
+	})
+	bridgeIntegrationIdentity(t, ctx, manager, selected)
+	// The startup poll sees only the committed release. Publishing afterward
+	// requires a later periodic tick; no control check/update endpoint is used.
+	published.Store(true)
+	var started model.Operation
+	bridgeIntegrationEventually(t, ctx, "periodic automatic target operation after restart", func() (bool, error) {
+		var current checkpoint
+		if err := atomicfile.ReadJSON(filepath.Join(stateDir, "update.json"), &current); err != nil {
 			return false, err
 		}
-		return recovered.Status == "failed", nil
+		op, found := current.Operations[current.State.ActiveOperationID]
+		if !found || op.TargetGeneration != fixture.Manifest.ID() || binaryRequests.Load() == 0 {
+			return false, nil
+		}
+		hash := sha256.New()
+		for _, value := range []string{releaseURL, fixture.Manifest.ID(), op.CreatedAt.UTC().Format("2006010215")} {
+			_, _ = hash.Write([]byte(value))
+			_, _ = hash.Write([]byte{0})
+		}
+		wantKey := "auto-" + hex.EncodeToString(hash.Sum(nil))
+		if _, existed := before.Operations[op.ID]; existed || op.Kind != model.OperationUpdate || op.IdempotencyKey != wantKey || op.TargetManifestURL != releaseURL || op.Phase != model.PhaseValidating || op.Status != model.OperationRunning || op.Attempt != 1 {
+			return false, fmt.Errorf("unexpected automatic operation: %#v, want key %s", op, wantKey)
+		}
+		if current.State.Current == nil || current.State.Current.ID != before.State.Current.ID || current.State.Candidate == nil || current.State.Candidate.ID != fixture.Manifest.ID() {
+			return false, fmt.Errorf("automatic admission changed committed generation or lost candidate: %#v", current.State)
+		}
+		started = op
+		return targetPolls.Load() >= 2, nil
 	})
-	pid := bridgeIntegrationIdentity(t, ctx, manager, selected)
-	executable, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
-	if err != nil || executable != manager.InstallPath {
-		t.Fatalf("missing-launcher recovery did not restore stable service: %s: %v", executable, err)
-	}
-	actualUnit, err := os.ReadFile(unitPath)
-	if err != nil || !bytes.Equal(actualUnit, handoff.Original) {
-		t.Fatalf("missing-launcher recovery did not restore saved unit: %v", err)
-	}
-	if _, err := os.Lstat(handoff.Launcher.Path); !os.IsNotExist(err) {
-		t.Fatalf("recovery unexpectedly required or replaced absent launcher: %v", err)
-	}
-	recoverySystemdIntegrationEventually(t, ctx, "independent recovery worker to finish", func() (bool, error) {
-		return bridgeIntegrationWorkerStopped(ctx, worker)
-	})
-	t.Logf("enabled persistent worker restored stable PID=%d from %s with launcher absent", pid, phase)
-	// Repair the deliberately removed fixture artifact, then use the real
-	// operator retry command to leave a proven supervisor for later scenarios.
-	bridgeIntegrationWrite(t, handoff.Launcher.Path, launcherBytes, 0o700)
-	bridgeIntegrationCommand(t, ctx, "", manager.InstallPath, "bridge-handoff", "--retry", "--config", manager.ConfigPath)
-	recoverySystemdIntegrationEventually(t, ctx, "proof after repairing missing fixture launcher", func() (bool, error) {
-		return manager.LauncherEnabled()
-	})
+	t.Logf("periodic poll after supervised N+1 restart started operation=%s target=%s key=%s phase=%s", started.ID, started.TargetGeneration, started.IdempotencyKey, started.Phase)
 }
 
-func bridgeIntegrationWorkerStopped(ctx context.Context, unit string) (bool, error) {
-	active, err := recoverySystemdProperty(ctx, unit, "ActiveState")
-	if err != nil || (active != "inactive" && active != "failed") {
-		return false, err
+func bridgeIntegrationSuffix(t *testing.T) string {
+	t.Helper()
+	value := make([]byte, 12)
+	if _, err := rand.Read(value); err != nil {
+		t.Fatalf("generate collision-resistant systemd unit suffix: %v", err)
 	}
-	pid, err := recoverySystemdIntegrationPID(ctx, unit)
-	return pid == 0, err
+	return fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(value))
+}
+
+func bridgeIntegrationPID(ctx context.Context, unit string) (int, error) {
+	output, err := exec.CommandContext(ctx, "systemctl", "--user", "show", unit, "--property=MainPID", "--value").Output()
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(output)))
+}
+
+func bridgeIntegrationEventually(t *testing.T, ctx context.Context, description string, check func() (bool, error)) {
+	t.Helper()
+	for {
+		ok, err := check()
+		if err != nil {
+			t.Fatalf("wait for %s: %v", description, err)
+		}
+		if ok {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for %s: %v", description, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }

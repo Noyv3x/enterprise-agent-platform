@@ -190,38 +190,6 @@ func (e *sandboxEngine) ExecArgs(driver.SandboxSpec, string, string, []string) (
 	return "true", nil
 }
 
-func TestEnsureWaitsForMaintenanceAdmission(t *testing.T) {
-	engine := &sandboxEngine{entered: make(chan struct{}), release: make(chan struct{})}
-	root := t.TempDir()
-	maintenance := &sync.Mutex{}
-	maintenance.Lock()
-	manager, err := Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	manager.MaintenanceMu = maintenance
-	done := make(chan error, 1)
-	go func() {
-		_, ensureErr := manager.Ensure(context.Background(), "private-1", "user-1", time.Now())
-		done <- ensureErr
-	}()
-	select {
-	case <-engine.entered:
-		t.Fatal("on-demand sandbox crossed maintenance admission")
-	case <-time.After(30 * time.Millisecond):
-	}
-	maintenance.Unlock()
-	select {
-	case <-engine.entered:
-		close(engine.release)
-	case <-time.After(time.Second):
-		t.Fatal("sandbox did not resume after maintenance admission")
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestEnsureRunsOneMaintenancePassBeforeRetryingSandboxCapacity(t *testing.T) {
 	engine := &capacityPreparingEngine{sandboxEngine: &sandboxEngine{}}
 	root := t.TempDir()

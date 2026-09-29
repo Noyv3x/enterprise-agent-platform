@@ -49,13 +49,8 @@ type Manager struct {
 	Network   string
 	Idle      time.Duration
 	UID, GID  int
-	// MaintenanceMu serializes lifecycle registration with Manager artifact
-	// cleanup. It is intentionally held only for short Sandbox registry and
-	// container transitions, never for an Agent command's execution lifetime.
-	MaintenanceMu sync.Locker
 	// ReclaimCapacity performs one controlled maintenance pass before a missing
-	// Sandbox image is retried. It is invoked before MaintenanceMu is acquired so
-	// cleanup cannot invert admission locks.
+	// Sandbox image is retried, before acquiring any sandbox lifecycle lock.
 	ReclaimCapacity func(context.Context) error
 	mu              sync.Mutex
 	registry        registry
@@ -106,15 +101,12 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 			return driver.SandboxSpec{}, fmt.Errorf("prepare sandbox image: %w", prepareErr)
 		}
 	}
-	unlockMaintenance := m.lockMaintenance()
 	m.mu.Lock()
 	imageStillCurrent := m.Image == desiredImage
 	m.mu.Unlock()
 	if !imageStillCurrent {
-		unlockMaintenance()
 		return m.Ensure(ctx, sandboxID, workspaceID, now)
 	}
-	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 
@@ -212,8 +204,6 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 }
 
 func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -234,8 +224,6 @@ func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
 	return nil
 }
 func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Time) error {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -255,8 +243,6 @@ func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Tim
 	return m.persistLocked()
 }
 func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -274,8 +260,6 @@ func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
 }
 
 func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	m.mu.Lock()
 	candidates := make([]Record, 0)
 	for _, record := range m.registry.Records {
@@ -323,8 +307,6 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 // remain untouched; the next Ensure recreates the ephemeral container from the
 // current digest. Unknown or running containers are retained.
 func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string, error) {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	m.mu.Lock()
 	desired := m.Image
 	candidates := make([]Record, 0)
@@ -401,14 +383,6 @@ func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string,
 	return updated, nil
 }
 
-func (m *Manager) lockMaintenance() func() {
-	if m.MaintenanceMu == nil {
-		return func() {}
-	}
-	m.MaintenanceMu.Lock()
-	return m.MaintenanceMu.Unlock
-}
-
 func (m *Manager) Spec(sandboxID string) (driver.SandboxSpec, error) {
 	m.mu.Lock()
 	record, ok := m.registry.Records[sandboxID]
@@ -433,8 +407,6 @@ func (m *Manager) Records() []Record {
 // from the persisted managed-process records after a Manager restart. Unknown
 // or uninspectable sandbox processes are counted conservatively by the caller.
 func (m *Manager) ReconcileProcesses(background map[string]int, now time.Time) error {
-	unlockMaintenance := m.lockMaintenance()
-	defer unlockMaintenance()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, record := range m.registry.Records {

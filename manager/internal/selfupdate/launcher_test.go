@@ -54,6 +54,9 @@ func launcherFixture(t *testing.T) (*Manager, launcherState) {
 	if err := atomicfile.WriteJSON(m.launcherPath(), s, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := atomicfile.WriteJSON(filepath.Join(m.Root, "bridge-handoff.json"), map[string]any{"status": "proven", "launcher": launcher}, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := atomicfile.WriteJSON(m.StatePath, State{SchemaVersion: 1, Current: &previous, Candidate: &candidate}, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -246,53 +249,6 @@ func TestLauncherInterruptedCandidateDoesNotRestartIt(t *testing.T) {
 	}
 }
 
-func TestLauncherFreshSettledInstallUsesCurrentAsFallback(t *testing.T) {
-	m, s := launcherFixture(t)
-	data, err := os.ReadFile("/proc/self/exe")
-	if err != nil {
-		t.Fatal(err)
-	}
-	current := *s.Previous
-	current.SHA256 = sha256Hex(data)
-	m.RunningVersion = current.Version
-	if err := os.WriteFile(current.Path, data, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(m.InstallPath, data, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicfile.WriteJSON(filepath.Join(filepath.Dir(current.Path), "metadata.json"), current, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicfile.WriteJSON(m.StatePath, State{SchemaVersion: 1, Current: &current}, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(m.launcherPath()); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(s.Launcher.Path); err != nil {
-		t.Fatal(err)
-	}
-	staged, err := m.StageLauncher()
-	if err != nil {
-		t.Fatal(err)
-	}
-	after, err := m.readLauncher()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.Proven || after.Pending || after.Previous == nil || *after.Previous != current || after.Selected != current || staged.SHA256 != current.SHA256 {
-		t.Fatalf("fresh staging selection: %+v", after)
-	}
-	legacy, err := m.load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if legacy.Previous != nil || legacy.Candidate != nil || legacy.Activation != nil {
-		t.Fatalf("fresh staging fabricated legacy history: %+v", legacy)
-	}
-}
-
 func TestLauncherActivationProofSurvivesCommittedBootHandshake(t *testing.T) {
 	m, s := launcherFixture(t)
 	manifest := release.Manifest{SourceCommit: s.Selected.SourceCommit, Manager: release.ManagerRelease{Version: s.Selected.Version, Artifacts: map[string]release.Artifact{runtime.GOARCH: {SHA256: s.Selected.SHA256}}}}
@@ -362,28 +318,6 @@ func TestLauncherRejectedHistoryDoesNotEraseLaterPreparedCandidate(t *testing.T)
 	}
 	if after.Candidate == nil || *after.Candidate != next {
 		t.Fatal("refused projection changed candidate")
-	}
-}
-
-func TestLauncherReconcilesOwnedVersionWriteResidues(t *testing.T) {
-	m, s := launcherFixture(t)
-	for _, v := range []Version{s.Selected, *s.Previous} {
-		residue := filepath.Join(filepath.Dir(v.Path), ".tmp-424242")
-		writeStartupTempResidue(t, residue)
-	}
-	if err := m.verifyLauncherSelection(); err != nil {
-		t.Fatalf("selected version rejected owned write residue: %v", err)
-	}
-	if err := m.mutateLauncher(m.selectLauncherFallback); err != nil {
-		t.Fatalf("fallback rejected owned write residue: %v", err)
-	}
-	for _, v := range []Version{s.Selected, *s.Previous} {
-		if _, err := os.Stat(filepath.Join(filepath.Dir(v.Path), ".tmp-424242")); !os.IsNotExist(err) {
-			t.Fatalf("owned residue remains: %v", err)
-		}
-		if !binaryMatches(v.Path, v.SHA256) {
-			t.Fatal("cleanup changed verified executable")
-		}
 	}
 }
 

@@ -59,7 +59,6 @@ type Orchestrator struct {
 	LocalActiveProcesses  func() int
 	FixedStackMu          sync.Locker
 	MaintenanceMu         sync.Locker
-	ReclaimCapacity       func(context.Context, string, release.Manifest) error
 	AdmissionCheck        func(model.ManagerState) error
 	mu                    sync.Mutex
 	finalizeMu            sync.Mutex
@@ -224,10 +223,8 @@ func (o *Orchestrator) Await(ctx context.Context, id string) (model.Operation, e
 	}
 }
 
-// RecoverBeforeActivation validates the durable operation journal while the
-// active-binary watchdog can still reject the candidate Manager. Finalize hooks
-// are deliberately withheld until the watchdog has committed the candidate
-// binary.
+// RecoverBeforeActivation probes the target before the immutable launcher
+// confirms this child. Gate settlement remains withheld until confirmation.
 func (o *Orchestrator) RecoverBeforeActivation(ctx context.Context) error {
 	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
 	if err != nil {
@@ -273,7 +270,7 @@ func (o *Orchestrator) recoverBeforeSupervisorProof(ctx context.Context, candida
 		if err != nil {
 			return err
 		}
-		if !candidate && !op.Finalized && o.SelfUpdate != nil && op.Kind == model.OperationUpdate {
+		if !candidate && !op.Finalized && op.GateSettlementAction != model.GateSettlementCommit && o.SelfUpdate != nil && op.Kind == model.OperationUpdate {
 			rejected, err := o.SelfUpdate.ActivationRolledBack(manifest)
 			if err != nil {
 				return err
@@ -287,10 +284,6 @@ func (o *Orchestrator) recoverBeforeSupervisorProof(ctx context.Context, candida
 	// Inverse cleanup owns the operation even if its terminal write lagged.
 	if op.PreparedCleanupPending {
 		return nil
-	}
-	// Converge the journal-only half-commit so startup probes the target.
-	if op.Status == model.OperationSucceeded && state.Candidate != nil && op.TargetGeneration == state.Candidate.ID {
-		return o.recover(ctx, false, true)
 	}
 	// Reservation uncertainty and pre-mutation work wait for startup proof.
 	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed ||
@@ -372,11 +365,7 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 	if op.ManagerActivationRollback {
 		return o.recoverManagerActivationRollback(ctx, *op)
 	}
-	// A terminal operation can be durable while Manager state still names it as
-	// active. Resolve that half-commit before inspecting reservation checkpoints:
-	// inverse cleanup deliberately retains the old reservation fields, and must
-	// never be routed back through reservation or update recovery after its
-	// terminal write has cleared PreparedCleanupPending.
+	// Failed rollback attempts remain active behind maintenance until restored.
 	if op.Status == model.OperationFailed {
 		state = o.Store.State()
 		if state.Maintenance {
@@ -389,36 +378,6 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 			value.LastError = op.Error
 			value.RetryAfterSeconds = 0
 		}, op.Error, o.now())
-		return err
-	}
-	state = o.Store.State()
-	if op.Status == model.OperationSucceeded && state.Candidate != nil && op.TargetGeneration == state.Candidate.ID {
-		manifest, loadErr := o.loadManifest(state.Candidate.ManifestPath)
-		if loadErr != nil {
-			return loadErr
-		}
-		if probeErr := o.probeCommittedGeneration(ctx, manifest); probeErr != nil {
-			o.restoreAfterMaintenance(ctx, *op, &manifest, fmt.Errorf("recover half-committed generation: %w", probeErr), runFinalizeHooks)
-			if !runFinalizeHooks {
-				return o.preProofRollbackResult(op.ID)
-			}
-			return nil
-		}
-		now := o.now()
-		_, err = o.Store.Complete(op.ID, true, func(value *model.ManagerState) {
-			value.Previous = value.Current
-			value.Current = value.Candidate
-			value.Current.RollbackSnapshotPath = op.SnapshotPath
-			value.Current.ActivatedAt = now
-			value.Candidate = nil
-			value.FinalizePendingOperationID = op.ID
-			value.PublicState = model.StateUpdating
-			value.Maintenance = true
-			value.LastError = ""
-		}, "", now)
-		if err == nil && runFinalizeHooks {
-			err = o.finalizeCommitted(ctx, *op, manifest)
-		}
 		return err
 	}
 	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
@@ -576,7 +535,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		return
 	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
-		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreDownload, manifest); err != nil {
+		if err = checker.CheckCapacity(ctx, driver.CapacityPreDownload, manifest); err != nil {
 			o.failBeforeMaintenanceRetryable(op, err)
 			return
 		}
@@ -613,7 +572,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		o.failPreparedBeforeMaintenance(op, manifest, path, fmt.Errorf("persist pulling phase: %w", err), false)
 		return
 	}
-	if err = o.pullWithCapacityRetry(ctx, op.ID, manifest); err != nil {
+	if err = o.Engine.Pull(ctx, manifest); err != nil {
 		o.failPreparedBeforeMaintenance(op, manifest, path, err, true)
 		return
 	}
@@ -626,7 +585,7 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 		return
 	}
 	if checker, ok := o.Engine.(driver.CapacityChecker); ok {
-		if err = o.checkCapacity(ctx, checker, op.ID, driver.CapacityPreCutover, manifest); err != nil {
+		if err = checker.CheckCapacity(ctx, driver.CapacityPreCutover, manifest); err != nil {
 			o.failPreparedBeforeMaintenance(op, manifest, path, err, true)
 			return
 		}
@@ -747,38 +706,6 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 	}
 }
 
-func (o *Orchestrator) checkCapacity(ctx context.Context, checker driver.CapacityChecker, operationID, stage string, manifest release.Manifest) error {
-	err := checker.CheckCapacity(ctx, stage, manifest)
-	if err == nil || !driver.IsInsufficientCapacity(err) || o.ReclaimCapacity == nil {
-		return err
-	}
-	reclaimErr := o.ReclaimCapacity(ctx, operationID, manifest)
-	retryErr := checker.CheckCapacity(ctx, stage, manifest)
-	if retryErr == nil {
-		return nil
-	}
-	if reclaimErr != nil {
-		return errors.Join(retryErr, fmt.Errorf("controlled maintenance before capacity retry: %w", reclaimErr))
-	}
-	return retryErr
-}
-
-func (o *Orchestrator) pullWithCapacityRetry(ctx context.Context, operationID string, manifest release.Manifest) error {
-	err := o.Engine.Pull(ctx, manifest)
-	if err == nil || !driver.IsInsufficientCapacity(err) || o.ReclaimCapacity == nil {
-		return err
-	}
-	reclaimErr := o.ReclaimCapacity(ctx, operationID, manifest)
-	retryErr := o.Engine.Pull(ctx, manifest)
-	if retryErr == nil {
-		return nil
-	}
-	if reclaimErr != nil {
-		return errors.Join(retryErr, fmt.Errorf("controlled maintenance before image pull retry: %w", reclaimErr))
-	}
-	return retryErr
-}
-
 func (o *Orchestrator) failReservedCapacityRecheck(op model.Operation, manifest release.Manifest, path string, cause error) {
 	released := o.resolveReservationUncertainty(o.Gate, op.ID, fmt.Errorf("recheck capacity after admission reservation: %w", cause))
 	var uncertain *reservationReleaseUncertainError
@@ -799,8 +726,8 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	if stateBefore.FinalizePendingOperationID != op.ID {
 		return errors.New("pending finalize operation changed")
 	}
-	watchdogCommitted := false
-	if !op.Finalized {
+	launcherCommitted := op.GateSettlementAction == model.GateSettlementCommit
+	if !op.Finalized && !launcherCommitted {
 		isGenerationChange := op.Kind == model.OperationInstall || op.Kind == model.OperationUpdate
 		if isGenerationChange && o.SelfUpdate != nil {
 			rolledBack, selfErr := o.SelfUpdate.ActivationRolledBack(manifest)
@@ -821,12 +748,9 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 				return o.finalizeFailure("manager activation acknowledgement is pending", selfErr)
 			}
 			if !committed {
-				// The old process normally reaches this point immediately after queuing
-				// its own restart. Finalization is intentionally deferred until the
-				// watchdog has observed and committed a healthy new Manager.
-				return o.finalizeFailure("manager activation acknowledgement is pending", errors.New("watchdog has not committed the candidate Manager"))
+				return o.finalizeFailure("manager activation acknowledgement is pending", errors.New("launcher has not confirmed the candidate Manager"))
 			}
-			watchdogCommitted = true
+			launcherCommitted = true
 		}
 		if (isGenerationChange || op.Kind == model.OperationRollback) && o.OnCommit != nil {
 			o.OnCommit(manifest)
@@ -839,25 +763,15 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 	if err := o.probeCommittedGeneration(ctx, manifest); err != nil {
 		return o.finalizeFailure("final committed generation readiness is pending", err)
 	}
-	if !op.Finalized {
-		// Persist the exact effect that really crossed the external Gate. A
-		// generation operation without a SelfUpdate owner retains its supported
-		// abort behavior; only durable watchdog evidence grants commit authority.
-		action := model.GateSettlementAbort
-		if watchdogCommitted {
+	action := op.GateSettlementAction
+	if action == "" {
+		action = model.GateSettlementAbort
+		if launcherCommitted {
 			action = model.GateSettlementCommit
 		}
-		releaseErr := o.settleGate(ctx, op.ID, op.Kind, action)
-		if releaseErr != nil {
-			return o.finalizeFailure("update reservation release is pending", releaseErr)
-		}
-		o.event(op.ID, "operation.committed", manifest.ID(), nil)
-		var err error
-		if op, err = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
-			if value.Status != model.OperationSucceeded {
-				return errors.New("cannot finalize a non-succeeded operation")
-			}
-			value.Finalized = true
+		// Commit may succeed even when its reply is lost. Record forward-only
+		// intent before calling the gate; recovery retries the same operation ID.
+		if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 			value.GateSettlementAction = action
 			value.UpdatedAt = o.now()
 			return nil
@@ -865,37 +779,35 @@ func (o *Orchestrator) finalizeCommitted(ctx context.Context, op model.Operation
 			return err
 		}
 	}
-	// Finalized and finalize_pending are separate durable files. Persisting
-	// Finalized first makes /v1/status.gate_settlement authoritative for a
-	// Platform that restarts in this window. Always replay the idempotent Gate
-	// after that checkpoint, then and only then clear Manager maintenance state.
-	// Recovery enters here with Finalized already true and therefore repeats no
-	// SelfUpdate, OnCommit, or audit hook.
-	if releaseErr := o.reconcileFinalizedGate(ctx, op); releaseErr != nil {
-		return o.finalizeFailure("update reservation reconciliation is pending", releaseErr)
+	if err := o.settleGate(ctx, op.ID, op.Kind, action); err != nil {
+		return o.finalizeFailure("update reservation settlement is pending", err)
 	}
-	_, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
-		if state.FinalizePendingOperationID != op.ID {
-			return errors.New("pending finalize operation changed")
+	// Keep the existing status settlement receipt until maintenance opens.
+	// This is another phase of the same checkpoint, not a second authority.
+	if !op.Finalized {
+		if _, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
+			value.Finalized = true
+			value.GateSettlementAction = action
+			value.UpdatedAt = o.now()
+			return nil
+		}); err != nil {
+			return err
 		}
-		state.FinalizePendingOperationID = ""
-		state.PublicState = model.StateIdle
-		state.Maintenance = false
-		state.LastError = ""
-		state.RetryAfterSeconds = 0
-		return nil
-	})
-	if err != nil {
+		// Platform may have rebooted after accepting the first request while
+		// status still projected no receipt. Reconcile its recreated reservation
+		// against the now-durable receipt before opening maintenance.
+		if err := o.settleGate(ctx, op.ID, op.Kind, action); err != nil {
+			return o.finalizeFailure("update reservation receipt reconciliation is pending", err)
+		}
+	}
+	if err := o.Store.Finalize(op.ID, action, o.now()); err != nil {
 		return err
 	}
+	o.event(op.ID, "operation.committed", manifest.ID(), nil)
 	if o.OnFinalized != nil {
 		o.OnFinalized(manifest)
 	}
 	return nil
-}
-
-func (o *Orchestrator) reconcileFinalizedGate(ctx context.Context, op model.Operation) error {
-	return o.settleGate(ctx, op.ID, op.Kind, op.GateSettlementAction)
 }
 
 func (o *Orchestrator) settleGate(ctx context.Context, operationID string, kind model.OperationKind, action model.GateSettlementAction) error {
@@ -934,10 +846,10 @@ func (o *Orchestrator) prepareManagerActivationRollback(ctx context.Context, op 
 	if op.Kind != model.OperationUpdate || state.FinalizePendingOperationID != op.ID ||
 		state.Current == nil || state.Current.ID != manifest.ID() || state.Previous == nil ||
 		state.Previous.ID == "" || state.Previous.ManifestPath == "" || op.SnapshotPath == "" ||
-		op.ReservationStatus != model.ReservationMutationStarted {
+		op.ReservationStatus != model.ReservationMutationStarted || op.GateSettlementAction == model.GateSettlementCommit {
 		return o.finalizeFailure("manager activation rollback cannot restore the previous generation", errors.New("committed update rollback evidence is incomplete"))
 	}
-	message := journal.BoundDiagnostic("Manager candidate was rejected by its activation watchdog; restoring the previous Platform generation")
+	message := journal.BoundDiagnostic("Manager candidate was rejected by its launcher; restoring the previous Platform generation")
 	updated, err := o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		if value.Status != model.OperationSucceeded || value.TargetGeneration != manifest.ID() {
 			return errors.New("committed update operation changed before Manager rollback")
@@ -951,7 +863,7 @@ func (o *Orchestrator) prepareManagerActivationRollback(ctx context.Context, op 
 		value.Phase = model.PhaseRollingBack
 		value.CompletedAt = nil
 		value.Error = message
-		value.History = append(value.History, model.PhaseEvent{Phase: model.PhaseRollingBack, At: o.now(), Note: "Manager watchdog rejected candidate; restoring previous generation"})
+		value.History = append(value.History, model.PhaseEvent{Phase: model.PhaseRollingBack, At: o.now(), Note: "Manager launcher rejected candidate; restoring previous generation"})
 		value.UpdatedAt = o.now()
 		return nil
 	})
@@ -1139,7 +1051,7 @@ func (o *Orchestrator) runRollback(ctx context.Context, op model.Operation) {
 		o.failBeforeMaintenance(op, fmt.Errorf("persist rollback image phase: %w", err))
 		return
 	}
-	if err = o.pullWithCapacityRetry(ctx, op.ID, manifest); err != nil {
+	if err = o.Engine.Pull(ctx, manifest); err != nil {
 		o.failBeforeMaintenanceRetryable(op, fmt.Errorf("prepare previous generation images: %w", err))
 		return
 	}
@@ -1806,6 +1718,10 @@ func (o *Orchestrator) restoreAfterMaintenance(ctx context.Context, op model.Ope
 	if operationErr != nil {
 		return
 	}
+	if current.GateSettlementAction == model.GateSettlementCommit {
+		_ = o.finalizeFailure("forward recovery required after gate commit intent", cause)
+		return
+	}
 	firstAttempt := current.Phase != model.PhaseRollingBack
 	failureAlreadyRecorded := current.Error != ""
 	originalError := current.Error
@@ -1828,9 +1744,7 @@ func (o *Orchestrator) restoreAfterMaintenance(ctx context.Context, op model.Ope
 			}
 		}
 	}
-	// A process can die between persisting the operation terminal record and
-	// persisting Manager state. Re-open that half-commit as a durable rollback
-	// before SetPhase, which intentionally rejects terminal operations.
+	// Persist rollback intent before stopping writers or restoring the snapshot.
 	if _, operationErr = o.Store.UpdateOperation(op.ID, func(value *model.Operation) error {
 		value.Status = model.OperationRunning
 		value.Finalized = false

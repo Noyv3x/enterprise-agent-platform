@@ -2,7 +2,6 @@ package snapshot
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"os"
@@ -415,60 +414,6 @@ func TestCreateCleansOperationStagingAfterMidCopyFailure(t *testing.T) {
 				t.Fatalf("failed copy left snapshot artifacts: %#v %v", entries, readErr)
 			}
 		})
-	}
-}
-
-func TestPruneRemovesOnlyExpiredRecognizedSnapshotStaging(t *testing.T) {
-	root := t.TempDir()
-	backups := filepath.Join(root, "backups")
-	if err := os.MkdirAll(backups, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	makeStaging := func(operationID string) string {
-		t.Helper()
-		encoded := base64.RawURLEncoding.EncodeToString([]byte(operationID))
-		path, err := os.MkdirTemp(backups, ".snapshot-"+encoded+".*")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	old := makeStaging("op_crashed")
-	recent := makeStaging("op_recent")
-	unknown := makeStaging("op_unknown")
-	for _, path := range []string{old, recent, unknown} {
-		if err := os.WriteFile(filepath.Join(path, "platform.db"), []byte("partial"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(unknown, "operator-note.txt"), []byte("retain"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC()
-	oldTime := now.Add(-2 * time.Hour)
-	for _, path := range []string{old, unknown} {
-		if err := os.Chtimes(path, oldTime, oldTime); err != nil {
-			t.Fatal(err)
-		}
-	}
-	store := Store{BackupDir: backups, StagingRetention: time.Hour}
-	removed, err := store.Prune(context.Background(), now, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if removed != 1 {
-		t.Fatalf("removed staging count = %d, want 1", removed)
-	}
-	if _, err := os.Lstat(old); !os.IsNotExist(err) {
-		t.Fatalf("expired recognized staging remains: %v", err)
-	}
-	for _, path := range []string{recent, unknown} {
-		if _, err := os.Lstat(path); err != nil {
-			t.Fatalf("protected staging %s changed: %v", path, err)
-		}
 	}
 }
 

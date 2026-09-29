@@ -175,16 +175,23 @@ func TestForegroundCleanupWaitsForEndCall(t *testing.T) {
 		done: make(chan struct{}), stdout: &boundedBuffer{limit: 1024}, stderr: &boundedBuffer{limit: 1024},
 	}
 	m.processes["foreground"] = p
-	gate := &settlementGate{entered: make(chan struct{}), release: make(chan struct{})}
-	m.Sandboxes.MaintenanceMu = gate
-	go m.wait(p)
+	gate := &settlementEngine{Engine: m.Sandboxes.Engine, entered: make(chan struct{}), release: make(chan struct{})}
+	m.Sandboxes.Engine = gate
+	ensureDone := make(chan error, 1)
+	go func() {
+		_, err := m.Sandboxes.Ensure(context.Background(), "private-1", "user-1", time.Now())
+		ensureDone <- err
+	}()
 	select {
 	case <-gate.entered:
 	case <-time.After(15 * time.Second):
-		t.Fatal("controller did not reach EndCall")
+		t.Fatal("sandbox lifecycle backend did not block")
 	}
 	defer func() {
 		close(gate.release)
+		if err := <-ensureDone; err != nil {
+			t.Errorf("concurrent sandbox ensure failed: %v", err)
+		}
 		select {
 		case <-p.done:
 		case <-time.After(15 * time.Second):
@@ -197,6 +204,17 @@ func TestForegroundCleanupWaitsForEndCall(t *testing.T) {
 			t.Error("settled foreground controller did not confirm cleanup")
 		}
 	}()
+	go m.wait(p)
+	deadline := time.After(15 * time.Second)
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for m.snapshot(p).Status != "completed" {
+		select {
+		case <-deadline:
+			t.Fatal("foreground command did not finish before accounting settlement")
+		case <-poll.C:
+		}
+	}
 	if confirmStopped([]*managedProcess{p}, 40*time.Millisecond) {
 		t.Fatal("controller confirmed before EndCall completed")
 	}
@@ -205,10 +223,14 @@ func TestForegroundCleanupWaitsForEndCall(t *testing.T) {
 	}
 }
 
-type settlementGate struct {
+type settlementEngine struct {
+	driver.Engine
 	entered chan struct{}
 	release chan struct{}
 }
 
-func (g *settlementGate) Lock()   { close(g.entered); <-g.release }
-func (g *settlementGate) Unlock() {}
+func (e *settlementEngine) EnsureSandbox(ctx context.Context, spec driver.SandboxSpec) error {
+	close(e.entered)
+	<-e.release
+	return e.Engine.EnsureSandbox(ctx, spec)
+}

@@ -19,8 +19,9 @@
 ```text
 <data_root>/
 ├── manager/
-│   ├── state.json
-│   ├── operations/
+│   ├── update.json
+│   ├── state.json       # N 的只读回退记录（若存在）
+│   ├── operations/     # N 的只读回退记录（若存在）
 │   ├── releases/
 │   ├── manager-binaries/
 │   ├── active-generation
@@ -45,7 +46,7 @@
 ```
 
 - 只接受这几种身份标记：`agent-platform-container-baseline-v1`、`.agent-platform-scope.json`、`.agent-platform-runtime.json` 和当前的沙箱登记表。字段必须精确匹配；旧根目录、旧身份、旧标记、未知字段或混合身份一律拒绝。
-- 普通操作不查找旧路径或修复历史格式。Manager 桥接版本仅对已部署 schema-1 状态、操作、二进制和激活计划保留兼容读取与结算。
+- 普通操作不查找旧路径或修复历史格式。N+1 不提供旧激活或恢复协议；旧事务必须先由桥接版本 N 结算。唯一例外是由已确认的 N launcher 交接的本次监督升级，保留同一操作 ID 和预约继续收尾。
 - Runtime 的 `sessions` 是活动 Pi 原生会话及附属状态；`sessions.pre-pi` 只在迁移已有会话时保留，是未经改写的迁移前目录，不参与搜索、追加、压缩或会话清理。Run、结果和 SSE journal 没有持久存储目录。
 - 品牌不改变机器身份。
 
@@ -95,14 +96,15 @@
 ## Manager 状态、快照与清理
 
 - `active-generation` 决定停止、日志和恢复的目标，不按目录时间猜测。
-- Manager 桥接保留 `manager/manager-binaries.json` 的 schema-1 当前、上一版本、候选和激活字段，以及旧 `operations/` 和激活计划；旧操作结算前不得改写为新格式。
-- 监督模式的 `manager/manager-binaries/launcher` 是已验证的独立可执行文件，不随候选更新覆盖；同目录的 owner-only `launcher-state.json` 原子记录 launcher 身份、选择、上一版本和启动/接力结果。正常自更新保存当前和一个上一份已验证二进制的版本、SHA-256 与受管路径；启动失败时只回退一次。监督接力完成的持久证明是接受后续更新的前提。全新安装没有历史上一版本时，以已经健康的当前版本作为首次监督启动的恢复选择，不伪造候选或旧激活。
+- N+1 在第一次加载时只接受已完成监督接力、无在途旧激活或操作的 N 数据；不确定状态必须先由 N 结算。允许由 N launcher 精确绑定的本次监督升级沿原操作 ID 继续收尾。旧 `state.json`、`operations/` 和 `manager-binaries.json` 保留供离线回退读取，不再作为 N+1 的可变权威。
+- N+1 将状态、操作幂等身份和预约结算写入同一 owner-only `manager/update.json`，原子替换并 fsync；进程服务锁串行化操作。
+- `manager/manager-binaries/launcher` 是已验证的独立可执行文件，不随候选更新覆盖；同目录的 owner-only `launcher-state.json` 原子记录 launcher 身份、选择、上一版本和启动结果。自更新保存当前和一个上一份已验证二进制的版本、SHA-256 与受管路径；启动失败时只回退一次。监督接力完成的持久证明是接受后续更新的前提。
 - 可能修改数据库或附属文件的操作，在停止写入者之后建立绑定到该版本的快照：写入只有属主可访问的暂存目录 → 文件、清单和父目录落盘 → 原子发布为 `backups/<operation-id>/`。失败时只清理本次的暂存目录。
 
 **清理规则**
 
-- 始终保护：当前、上一个和候选版本，活动中或正在收尾的操作，未完成的操作日志，关联的快照，以及运行中的容器引用的发布和镜像。
-- 只在稳定空闲时，根据同一份受保护快照删除过期且未被引用的对象；每个删除点都复验纪元、属主、类型、inode、标签和摘要。禁止全局 prune 或通配符递归删除。
+- 始终保留当前、上一版本及其回滚快照；在途候选和快照受保护。旧桥接记录不自动删除。
+- 只在稳定空闲时清理明确不再引用的受管发布物。不自动删除 Docker 镜像、容器或网络，不影响独立沙箱；禁止全局 prune。
 - 保留策略见[自动更新](../operations/auto-update.md)；临时文件的删除授权见[安全设计 · 管理器与更新](../design/security-and-trust.md#管理器与更新)。日志会轮转，不包含密钥、执行凭据或镜像仓库凭据。
 
 ## 备份与恢复

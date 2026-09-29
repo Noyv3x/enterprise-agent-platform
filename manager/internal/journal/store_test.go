@@ -1,17 +1,13 @@
 package journal
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
@@ -126,113 +122,10 @@ func TestStateWithReferencedOperationFailsClosedOnInvalidReference(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err = os.Remove(store.operationPath(operation.ID)); err != nil {
-		t.Fatal(err)
-	}
+	delete(store.records, operation.ID)
 	if _, _, err = store.StateWithReferencedOperation(); err == nil ||
 		!strings.Contains(err.Error(), "read manager state operation") {
 		t.Fatalf("missing referenced operation was accepted: %v", err)
-	}
-}
-
-func TestOversizedPersistedDiagnosticsConvergeOnlyOnSubsequentWrites(t *testing.T) {
-	dir := t.TempDir()
-	seed, err := Open(dir, time.Unix(100, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := seed.Begin(model.OperationRequest{
-		Kind:               model.OperationUpdate,
-		IdempotencyKey:     "oversized-persisted-diagnostic",
-		ExpectedGeneration: seed.State().Generation,
-	}, time.Unix(101, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	persistedDiagnostic := strings.Repeat("retry reservation release\n", 110000)
-	state := seed.State()
-	state.LastError = persistedDiagnostic
-	op.Error = persistedDiagnostic
-	for i := 0; i < MaxOperationHistoryEntries+20; i++ {
-		op.History = append(op.History, model.PhaseEvent{
-			Phase: model.PhaseDraining,
-			At:    time.Unix(int64(200+i), 0).UTC(),
-			Note:  "history-note-" + strconv.Itoa(i) + ":" + strings.Repeat("x", MaxHistoryNoteBytes*2),
-		})
-	}
-	statePath := filepath.Join(dir, "state.json")
-	opPath := filepath.Join(dir, "operations", op.ID+".json")
-	if err := atomicfile.WriteJSON(statePath, state, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicfile.WriteJSON(opPath, op, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	stateBefore, err := os.ReadFile(statePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opBefore, err := os.ReadFile(opPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	reopened, err := Open(dir, time.Unix(102, 0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := BoundDiagnostic(persistedDiagnostic)
-	if got := reopened.State().LastError; got != want {
-		t.Fatalf("State did not bound the persisted diagnostic: %d bytes", len(got))
-	}
-	readOp, err := reopened.Operation(op.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if readOp.Error != want || len(readOp.History) != MaxOperationHistoryEntries {
-		t.Fatalf("Operation did not bound persisted diagnostics: error=%d history=%d", len(readOp.Error), len(readOp.History))
-	}
-	markedNotes := 0
-	for _, event := range readOp.History {
-		if len(event.Note) > MaxHistoryNoteBytes {
-			t.Fatalf("history note was not safely bounded: %d bytes", len(event.Note))
-		}
-		if strings.Contains(event.Note, "[diagnostic truncated;") {
-			markedNotes++
-		}
-	}
-	if markedNotes == 0 {
-		t.Fatal("oversized history notes were not marked as truncated")
-	}
-	stateAfterRead, _ := os.ReadFile(statePath)
-	opAfterRead, _ := os.ReadFile(opPath)
-	if !bytes.Equal(stateBefore, stateAfterRead) || !bytes.Equal(opBefore, opAfterRead) {
-		t.Fatal("opening or reading a journal rewrote durable evidence")
-	}
-	recoveryOp, err := reopened.RecoverActive()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if recoveryOp == nil || recoveryOp.Error != persistedDiagnostic {
-		t.Fatal("internal recovery lost the original diagnostic before its first bounded write")
-	}
-
-	if _, err := reopened.MutateState(time.Unix(103, 0), func(*model.ManagerState) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := reopened.UpdateOperation(op.ID, func(*model.Operation) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	var persistedState model.ManagerState
-	if err := atomicfile.ReadJSON(statePath, &persistedState); err != nil {
-		t.Fatal(err)
-	}
-	var persistedOp model.Operation
-	if err := atomicfile.ReadJSON(opPath, &persistedOp); err != nil {
-		t.Fatal(err)
-	}
-	if persistedState.LastError != want || persistedOp.Error != want || len(persistedOp.History) != MaxOperationHistoryEntries {
-		t.Fatalf("subsequent writes did not converge diagnostics: state=%d operation=%d want=%d", len(persistedState.LastError), len(persistedOp.Error), len(want))
 	}
 }
 
@@ -390,105 +283,6 @@ func TestBeginRejectsAnotherOperationWhileFinalizeIsPending(t *testing.T) {
 	}
 }
 
-func TestCompletePersistsTerminalOperationBeforeStateAndLeavesRecoverableWindow(t *testing.T) {
-	dir := t.TempDir()
-	store, err := Open(dir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{
-		Kind:               model.OperationUpdate,
-		IdempotencyKey:     "terminal-before-state",
-		ExpectedGeneration: store.State().Generation,
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	injected := false
-	store.beforePersistState = func(next model.ManagerState) error {
-		if next.ActiveOperationID == "" && !injected {
-			injected = true
-			return errors.New("injected state fsync failure")
-		}
-		return nil
-	}
-	if _, err = store.Complete(op.ID, false, nil, "pull failed", time.Now()); err == nil {
-		t.Fatal("expected state persistence failure")
-	}
-
-	// Simulate a process restart. The terminal operation is durable while the
-	// old state still points at it, giving Recover an exact, non-resumable case.
-	reopened, err := Open(dir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, err := reopened.RecoverActive()
-	if err != nil || active == nil {
-		t.Fatalf("terminal/state split was not recoverable: %#v %v", active, err)
-	}
-	if active.ID != op.ID || active.Status != model.OperationFailed || active.Error != "pull failed" {
-		t.Fatalf("terminal operation was not persisted first: %#v", active)
-	}
-}
-
-func TestCompletePreparedCleanupTerminalizesMarkerBeforeState(t *testing.T) {
-	dir := t.TempDir()
-	store, err := Open(dir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{
-		Kind: model.OperationUpdate, IdempotencyKey: "prepared-cleanup-half", ExpectedGeneration: store.State().Generation,
-	}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationRunning
-		value.TargetGeneration = strings.Repeat("a", 40)
-		value.PreparedCleanupPending = true
-		value.Error = "original pull failure"
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	injected := false
-	store.beforePersistState = func(next model.ManagerState) error {
-		if next.ActiveOperationID == "" && !injected {
-			injected = true
-			return errors.New("injected prepared cleanup state fsync failure")
-		}
-		return nil
-	}
-	if _, err := store.CompletePreparedCleanup(op.ID, time.Now()); err == nil {
-		t.Fatal("expected prepared cleanup state persistence failure")
-	}
-
-	reopened, err := Open(dir, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, err := reopened.RecoverActive()
-	if err != nil || active == nil || active.Status != model.OperationFailed || !active.Finalized ||
-		active.PreparedCleanupPending || active.CompletedAt == nil || active.Error != "original pull failure" {
-		t.Fatalf("terminal cleanup half-commit retained a resumable marker: %#v %v", active, err)
-	}
-	completed, err := reopened.Complete(op.ID, false, func(state *model.ManagerState) {
-		state.Candidate = nil
-		state.PublicState = model.StateIdle
-		state.Maintenance = false
-		state.LastError = active.Error
-		state.RetryAfterSeconds = 0
-	}, active.Error, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if completed.PreparedCleanupPending || completed.Status != model.OperationFailed || !completed.Finalized ||
-		reopened.State().ActiveOperationID != "" || reopened.State().PublicState != model.StateIdle {
-		t.Fatalf("terminal cleanup half-commit did not converge: operation=%#v state=%#v", completed, reopened.State())
-	}
-}
-
 func TestUnfinishedOperationsFailsClosedAndExcludesFinalizedHistory(t *testing.T) {
 	store, err := Open(t.TempDir(), time.Now())
 	if err != nil {
@@ -511,11 +305,5 @@ func TestUnfinishedOperationsFailsClosedAndExcludesFinalizedHistory(t *testing.T
 	unfinished, err = store.UnfinishedOperations()
 	if err != nil || len(unfinished) != 0 {
 		t.Fatalf("finalized operation remained protected: %#v %v", unfinished, err)
-	}
-	if err := os.WriteFile(filepath.Join(store.operations, "unknown.tmp"), []byte("evidence"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UnfinishedOperations(); err == nil || !strings.Contains(err.Error(), "unknown operation journal entry") {
-		t.Fatalf("unknown operation evidence was ignored: %v", err)
 	}
 }

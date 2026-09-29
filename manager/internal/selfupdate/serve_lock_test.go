@@ -123,23 +123,3 @@ func TestAcquireServeLockRejectsUnsafeRootAndLock(t *testing.T) {
 		})
 	}
 }
-
-func TestServeLockPrecedesBusyExternalRecoveryProbe(t *testing.T) {
-	fixture, _ := newExternalRecoveryProbeFixture(t)
-	releaseRecovery, err := acquireRecoveryLock(fixture.manager.Root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer releaseRecovery()
-
-	serveLease, err := fixture.manager.AcquireServeLock()
-	if err != nil {
-		t.Fatalf("acquire serve lock outside busy recovery lock: %v", err)
-	}
-	defer serveLease.Release()
-	startupLease, err := fixture.manager.AcquireStartupOwnership()
-	if err != nil || startupLease == nil || !startupLease.ExternalRecoveryProbe() {
-		t.Fatalf("busy external recovery admission = %#v, err=%v", startupLease, err)
-	}
-	startupLease.Release()
-}

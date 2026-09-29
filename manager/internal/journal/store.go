@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -84,41 +83,55 @@ func BoundOperation(op model.Operation) model.Operation {
 
 type Store struct {
 	dir                string
-	statePath          string
-	operations         string
+	checkpointPath     string
+	records            map[string]model.Operation
+	transition         *bridgeTransition
+	historyPruneAfter  time.Time
 	mu                 sync.Mutex
 	state              model.ManagerState
 	stateUncertain     bool
 	beforePersistState func(model.ManagerState) error
 }
 
+// Open imports settled bridge records once. Callers hold the service lock.
 func Open(dir string, now time.Time) (*Store, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "operations"), 0o700); err != nil {
-		return nil, fmt.Errorf("create manager state: %w", err)
-	}
-	store := &Store{
-		dir: dir, statePath: filepath.Join(dir, "state.json"),
-		operations: filepath.Join(dir, "operations"), state: model.NewState(now),
-	}
-	if err := atomicfile.ReadJSON(store.statePath, &store.state); err != nil && !os.IsNotExist(err) {
+	return OpenWithTransition(dir, now, "")
+}
+
+// OpenWithTransition permits only the supervised bridge's installing operation.
+// target must come from the immutable launcher's authenticated child proof, never
+// from a request or the legacy journal itself. Legacy files remain rollback input.
+func OpenWithTransition(dir string, now time.Time, target string) (*Store, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	if store.state.SchemaVersion != 1 {
-		return nil, fmt.Errorf("unsupported manager state schema %d", store.state.SchemaVersion)
+	store := &Store{dir: dir, checkpointPath: filepath.Join(dir, "update.json"),
+		state: model.NewState(now), records: make(map[string]model.Operation)}
+	if err := store.loadCheckpointLocked(); err == nil {
+		if store.transition != nil {
+			fresh := &Store{dir: dir, checkpointPath: store.checkpointPath,
+				state: model.NewState(now), records: make(map[string]model.Operation)}
+			if err := fresh.importBridgeLocked(target); err != nil {
+				return nil, fmt.Errorf("validate provisional bridge transition: %w", err)
+			}
+			if fresh.transition == nil {
+				return nil, errors.New("provisional checkpoint has no authenticated installing bridge operation")
+			}
+			if *fresh.transition != *store.transition {
+				if err := fresh.persistStateLocked(); err != nil {
+					return nil, err
+				}
+				return fresh, nil
+			}
+		}
+		return store, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
-	if _, err := os.Stat(store.statePath); os.IsNotExist(err) {
-		entries, readErr := os.ReadDir(store.operations)
-		if readErr != nil {
-			return nil, readErr
-		}
-		if len(entries) != 0 {
-			return nil, errors.New("operation journal exists without manager state")
-		}
-		if err := store.persistStateLocked(); err != nil {
-			return nil, err
-		}
+	if err := store.importBridgeLocked(target); err != nil {
+		return nil, err
 	}
-	if err := store.reconcileAdmissionLocked(); err != nil {
+	if err := store.persistStateLocked(); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -139,6 +152,9 @@ func (s *Store) State() model.ManagerState {
 func (s *Store) StateWithReferencedOperation() (model.ManagerState, *model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return model.ManagerState{}, nil, err
+	}
 	state := cloneState(s.state)
 	state.LastError = BoundDiagnostic(state.LastError)
 	if state.ActiveOperationID != "" && state.FinalizePendingOperationID != "" {
@@ -243,20 +259,13 @@ func (s *Store) BeginWithAdmission(req model.OperationRequest, now time.Time, ad
 		Status: model.OperationPending, Phase: model.PhaseValidating,
 		History: []model.PhaseEvent{{Phase: model.PhaseValidating, At: now.UTC()}}, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}
-	// Either publication can have committed before returning an error.
-	// Until both succeed, every state writer must reconcile before cloning.
-	s.stateUncertain = true
-	if err := s.persistOperationLocked(&op); err != nil {
-		return model.Operation{}, false, err
-	}
+	// Publish admission and its public projection in a single checkpoint.
 	next := cloneState(s.state)
 	next.Generation++
 	next.ActiveOperationID = op.ID
 	next.Phase = op.Phase
 	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
-	if err := s.persistStateValueLocked(&next); err != nil {
-		// A rename may have committed state before directory sync failed.
-		// Keep the operation evidence; the next admission reconciles disk state.
+	if err := s.persistCheckpointLocked(&next, &op); err != nil {
 		return model.Operation{}, false, err
 	}
 	s.state = next
@@ -285,6 +294,9 @@ func (s *Store) Operation(id string) (model.Operation, error) {
 func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return nil, err
+	}
 	operations, err := s.unfinishedOperationsLocked()
 	for index := range operations {
 		operations[index] = BoundOperation(operations[index])
@@ -293,43 +305,13 @@ func (s *Store) UnfinishedOperations() ([]model.Operation, error) {
 }
 
 func (s *Store) unfinishedOperationsLocked() ([]model.Operation, error) {
-	if err := s.cleanupOperationAtomicResiduesLocked(); err != nil {
-		return nil, err
-	}
-	entries, err := os.ReadDir(s.operations)
-	if err != nil {
-		return nil, err
-	}
 	unfinished := make([]model.Operation, 0)
-	for _, entry := range entries {
-		if entry.Type()&os.ModeSymlink != 0 || entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			return nil, fmt.Errorf("unknown operation journal entry %s", entry.Name())
-		}
-		id := strings.TrimSuffix(entry.Name(), ".json")
-		if !validID(id) {
-			return nil, fmt.Errorf("invalid operation journal entry %s", entry.Name())
-		}
-		op, err := s.readOperationLocked(id)
-		if err != nil {
-			return nil, err
-		}
-		if op.ID != id || op.SchemaVersion != 1 {
-			return nil, fmt.Errorf("operation journal identity mismatch for %s", entry.Name())
-		}
-		switch op.Status {
-		case model.OperationPending, model.OperationRunning:
+	for _, op := range s.records {
+		if op.Status == model.OperationPending || op.Status == model.OperationRunning || !op.Finalized {
 			unfinished = append(unfinished, op)
-		case model.OperationSucceeded, model.OperationFailed:
-			if !op.Finalized {
-				unfinished = append(unfinished, op)
-			}
-		default:
-			return nil, fmt.Errorf("operation journal %s has unknown status %q", entry.Name(), op.Status)
 		}
 	}
-	sort.Slice(unfinished, func(left, right int) bool {
-		return unfinished[left].CreatedAt.Before(unfinished[right].CreatedAt)
-	})
+	sort.Slice(unfinished, func(i, j int) bool { return unfinished[i].CreatedAt.Before(unfinished[j].CreatedAt) })
 	return unfinished, nil
 }
 
@@ -348,16 +330,13 @@ func (s *Store) SetPhase(id string, phase model.OperationPhase, public model.Pub
 	}
 	op.Status, op.Phase, op.UpdatedAt = model.OperationRunning, phase, now.UTC()
 	op.History = append(op.History, model.PhaseEvent{Phase: phase, At: now.UTC(), Note: note})
-	if err := s.persistOperationLocked(&op); err != nil {
-		return model.Operation{}, err
-	}
 	next := cloneState(s.state)
 	next.Generation++
 	next.PublicState = public
 	next.Maintenance = maintenance
 	next.Phase = phase
 	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
-	if err := s.persistStateValueLocked(&next); err != nil {
+	if err := s.persistCheckpointLocked(&next, &op); err != nil {
 		return model.Operation{}, err
 	}
 	s.state = next
@@ -409,20 +388,39 @@ func (s *Store) Complete(id string, success bool, stateFn func(*model.ManagerSta
 	if !op.Finalized || !success {
 		op.GateSettlementAction = ""
 	}
-	if err := s.persistOperationLocked(&op); err != nil {
-		return model.Operation{}, err
-	}
-	if err := s.persistStateValueLocked(&next); err != nil {
+	if err := s.persistCheckpointLocked(&next, &op); err != nil {
 		return model.Operation{}, err
 	}
 	s.state = next
 	return op, nil
 }
 
-// CompletePreparedCleanup closes the durable inverse-update protocol. The
-// terminal operation is persisted before the active Platform owner is cleared,
-// so a crash between the two files is recovered as an ordinary terminal/state
-// half-commit and can never re-enter runUpdate.
+// Finalize publishes settled gate evidence and clears maintenance atomically.
+func (s *Store) Finalize(id string, action model.GateSettlementAction, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	op, err := s.readOperationLocked(id)
+	if err != nil {
+		return err
+	}
+	if s.state.FinalizePendingOperationID != id || op.Status != model.OperationSucceeded {
+		return errors.New("operation is not awaiting gate settlement")
+	}
+	next := cloneState(s.state)
+	next.Generation++
+	next.FinalizePendingOperationID = ""
+	next.PublicState, next.Maintenance = model.StateIdle, false
+	next.LastError, next.RetryAfterSeconds = "", 0
+	next.UpdatedAt, next.HeartbeatAt = now.UTC(), now.UTC()
+	op.Finalized, op.GateSettlementAction, op.UpdatedAt = true, action, now.UTC()
+	if err := s.persistCheckpointLocked(&next, &op); err != nil {
+		return err
+	}
+	s.state = next
+	return nil
+}
+
+// CompletePreparedCleanup atomically closes the inverse-update operation.
 func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -451,12 +449,6 @@ func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operati
 	op.PreparedCleanupPending = false
 	op.UpdatedAt = completed
 	op.CompletedAt = &completed
-	// Clearing the marker is atomic with making the operation terminal. A crash
-	// after this write cannot re-enter runUpdate; RecoverActive observes failed
-	// and only clears the still-active Platform projection.
-	if err := s.persistOperationLocked(&op); err != nil {
-		return model.Operation{}, err
-	}
 	next := cloneState(s.state)
 	next.Generation++
 	next.ActiveOperationID = ""
@@ -466,7 +458,7 @@ func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operati
 	next.LastError = op.Error
 	next.RetryAfterSeconds = 0
 	next.UpdatedAt, next.HeartbeatAt = completed, completed
-	if err := s.persistStateValueLocked(&next); err != nil {
+	if err := s.persistCheckpointLocked(&next, &op); err != nil {
 		return model.Operation{}, err
 	}
 	s.state = next
@@ -476,6 +468,9 @@ func (s *Store) CompletePreparedCleanup(id string, now time.Time) (model.Operati
 func (s *Store) RecoverActive() (*model.Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.reconcileUncertainStateLocked(); err != nil {
+		return nil, err
+	}
 	if s.state.ActiveOperationID == "" {
 		return nil, nil
 	}
@@ -490,63 +485,77 @@ func (s *Store) RecoverActive() (*model.Operation, error) {
 	return &op, nil
 }
 
-func (s *Store) operationPath(id string) string {
-	return filepath.Join(s.operations, id+".json")
-}
-
 func (s *Store) persistStateLocked() error { return s.persistStateValueLocked(&s.state) }
 func (s *Store) persistStateValueLocked(value *model.ManagerState) error {
-	s.stateUncertain = true
-	value.LastError = BoundDiagnostic(value.LastError)
+	return s.persistCheckpointLocked(value, nil)
+}
+func (s *Store) persistCheckpointLocked(state *model.ManagerState, op *model.Operation) error {
+	state.LastError = BoundDiagnostic(state.LastError)
 	if s.beforePersistState != nil {
-		if err := s.beforePersistState(cloneState(*value)); err != nil {
+		if err := s.beforePersistState(cloneState(*state)); err != nil {
 			return err
 		}
 	}
-	if err := atomicfile.WriteJSON(s.statePath, *value, 0o600); err != nil {
+	records := s.records
+	pruneAt := state.UpdatedAt
+	if op != nil && op.UpdatedAt.After(pruneAt) {
+		pruneAt = op.UpdatedAt
+	}
+	if op != nil {
+		*op = BoundOperation(*op)
+		records = maps.Clone(records)
+		records[op.ID] = *op
+		pruneCheckpointHistory(records, *state, pruneAt)
+	}
+	if op == nil && len(records) > 128 && !pruneAt.Before(s.historyPruneAfter) {
+		records = maps.Clone(records)
+		pruneCheckpointHistory(records, *state, pruneAt)
+	}
+	transition := s.transition
+	if transition != nil {
+		imported := records[transition.OperationID]
+		if imported.GateSettlementAction == model.GateSettlementCommit {
+			// Launcher confirmation preceded commit intent. From this boundary
+			// onward N's frozen files can never replace the checkpoint.
+			transition = nil
+		}
+	}
+	s.stateUncertain = true
+	if err := atomicfile.WriteJSON(s.checkpointPath, checkpoint{1, *state, records, transition}, 0o600); err != nil {
 		return err
+	}
+	s.records = records
+	s.transition = transition
+	if op != nil || !pruneAt.Before(s.historyPruneAfter) {
+		s.historyPruneAfter = pruneAt.Add(time.Hour)
 	}
 	s.stateUncertain = false
 	return nil
 }
 func (s *Store) persistOperationLocked(op *model.Operation) error {
-	*op = BoundOperation(*op)
-	return atomicfile.WriteJSON(s.operationPath(op.ID), *op, 0o600)
+	return s.persistCheckpointLocked(&s.state, op)
 }
 func (s *Store) readOperationLocked(id string) (model.Operation, error) {
 	if !validID(id) {
 		return model.Operation{}, errors.New("invalid operation id")
 	}
-	var op model.Operation
-	if err := atomicfile.ReadJSON(s.operationPath(id), &op); err != nil {
+	if err := s.reconcileUncertainStateLocked(); err != nil {
 		return model.Operation{}, err
 	}
+	op, ok := s.records[id]
+	if !ok {
+		return model.Operation{}, os.ErrNotExist
+	}
+	op.History = append([]model.PhaseEvent(nil), op.History...)
 	return op, nil
 }
-
 func (s *Store) findByIdempotencyLocked(key string) (model.Operation, bool, error) {
-	if err := s.cleanupOperationAtomicResiduesLocked(); err != nil {
-		return model.Operation{}, false, err
-	}
-	entries, err := os.ReadDir(s.operations)
-	if err != nil {
-		return model.Operation{}, false, err
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() > entries[j].Name() })
 	var latest model.Operation
 	found := false
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		var op model.Operation
-		if err := atomicfile.ReadJSON(filepath.Join(s.operations, entry.Name()), &op); err != nil {
-			return model.Operation{}, false, err
-		}
-		if op.IdempotencyKey == key {
-			if !found || op.Attempt > latest.Attempt || op.Attempt == latest.Attempt && op.CreatedAt.After(latest.CreatedAt) {
-				latest, found = op, true
-			}
+	for _, op := range s.records {
+		if op.IdempotencyKey == key && (!found || op.Attempt > latest.Attempt ||
+			op.Attempt == latest.Attempt && op.CreatedAt.After(latest.CreatedAt)) {
+			latest, found = op, true
 		}
 	}
 	return latest, found, nil
@@ -590,4 +599,49 @@ func cloneGeneration(value model.Generation) model.Generation {
 	clone := value
 	clone.Images = maps.Clone(value.Images)
 	return clone
+}
+
+// Retention is part of checkpoint publication, never a separate cleanup owner.
+// Keep the legacy idempotency horizon: newest 128 terminals or seven days,
+// plus operations still linked to the two retained rollback generations.
+func pruneCheckpointHistory(records map[string]model.Operation, state model.ManagerState, now time.Time) {
+	if len(records) <= 128 {
+		return
+	}
+	terminal := make([]string, 0, len(records))
+	for _, op := range records {
+		if op.Finalized && op.CompletedAt != nil &&
+			(op.Status == model.OperationSucceeded || op.Status == model.OperationFailed) {
+			terminal = append(terminal, op.ID)
+		}
+	}
+	if len(terminal) <= 128 {
+		return
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		left, right := records[terminal[i]], records[terminal[j]]
+		if left.CompletedAt.Equal(*right.CompletedAt) {
+			return left.ID > right.ID
+		}
+		return left.CompletedAt.After(*right.CompletedAt)
+	})
+	cutoff := now.Add(-7 * 24 * time.Hour)
+	for _, id := range terminal[128:] {
+		op := records[id]
+		if !op.CompletedAt.Before(cutoff) || op.ID == state.ActiveOperationID ||
+			op.ID == state.FinalizePendingOperationID || op.PreparedCleanupPending {
+			continue
+		}
+		linked := false
+		for _, generation := range []*model.Generation{state.Current, state.Previous} {
+			if generation != nil && ((op.SnapshotPath != "" && op.SnapshotPath == generation.RollbackSnapshotPath) ||
+				(op.Status == model.OperationSucceeded && op.TargetGeneration == generation.ID &&
+					(op.Kind == model.OperationInstall || op.Kind == model.OperationUpdate))) {
+				linked = true
+			}
+		}
+		if !linked {
+			delete(records, op.ID)
+		}
+	}
 }

@@ -4,7 +4,7 @@
 
 ## 唯一拓扑
 
-- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。桥接完成后其主进程是独立的 Manager launcher，子进程独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。
+- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。主进程是独立且不可变的 Manager launcher，子进程独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。已有部署必须先运行 N 并完成监督接力，才能更新到 N+1。
 - Platform（含前端）、Runtime、Camoufox、SearXNG、Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。业务容器禁止访问或代理 Docker socket。
 - Platform 后端只发布到宿主机回环地址，其它服务只在私有网络里。固定的 Compose 使用 Manager 预先创建的外部网络，切换版本时不删除网络，也不中断沙箱。
 - 权威数据用显式的目录挂载，禁止匿名卷。
@@ -22,10 +22,11 @@ curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/d
 | --- | --- |
 | 验证 | 在 home 下一个随机的、只有属主可访问的临时目录里，从固定的可信来源下载当前架构的 Manager 及其 SHA-256 文件，核对文件名和摘要；运行 `inspect-release --manifest <path> --architecture <arch>` 验证完整的发布清单（包括其它架构）。这一步只输出目标地址和 SHA-256，不读配置、不开 socket、不建正式路径，也不启动服务。 |
 | 锁定 | 在产生正式副作用之前取得单实例锁，并确认是全新的根目录。清单被拒绝时，在建路径之前就停止；竞争失败时，在清理目标之前就停止。 |
-| 激活 | 原子写入配置、已验证的 Manager、systemd unit 和只有属主可访问的密钥，启动首次的 `install` 操作；核心服务健康后才开放入口。初始的当前版本见 [Manager 自更新](auto-update.md#manager-自更新)。 |
+| 激活 | 原子写入配置、已验证的 Manager、独立 launcher、systemd unit 和只有属主可访问的密钥；等待经 control token 认证的 `/v1/ready` 返回 204（代表监督启动已确认），再启动首次 `install` 操作。仅 socket 或 `status` 可用不代表可写；核心服务健康后才开放入口。初始版本见 [Manager 自更新](auto-update.md#manager-自更新)。 |
 
 - 安装脚本不复制 JSON/schema 校验逻辑。自定义清单只改变下载目标，不改变初始的信任来源；本地已有相同字节就复用，否则按验证结果下载并核对摘要。
 - 未验证的字节不会进入正式路径，也不增加辅助程序或资产协议。临时目录无论成功还是失败都会清理。
+- systemd unit 使用正常的 `0644`，稳定 Manager 命令使用 `0755`；它们必须属于部署用户、是普通非符号链接文件且组/其他用户不可写，不要求隐藏其内容。密钥、配置和状态仍只允许属主访问（文件 `0600`）；无需手工 chmod unit 才能启动监督模式。
 
 | 失败发生在 | 如何恢复 |
 | --- | --- |

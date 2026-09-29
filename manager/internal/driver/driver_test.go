@@ -243,7 +243,7 @@ func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
 	}
 }
 
-func TestPullRejectsSuccessfulCommandWithoutExactRepoDigestAndCleansCandidate(t *testing.T) {
+func TestPullRejectsSuccessfulCommandWithoutExactRepoDigest(t *testing.T) {
 	manifest := pullTestManifest()
 	platform := manifest.Images["platform"]
 	pulled := false
@@ -259,12 +259,6 @@ func TestPullRejectsSuccessfulCommandWithoutExactRepoDigestAndCleansCandidate(t 
 		case reflect.DeepEqual(args, []string{"pull", platform}):
 			pulled = true
 			return Result{}, nil
-		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
-			return Result{}, nil
-		case reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{.Id}}", platform}):
-			return Result{Stdout: "sha256:" + strings.Repeat("c", 64)}, nil
-		case reflect.DeepEqual(args, []string{"image", "rm", platform}):
-			return Result{}, nil
 		default:
 			return Result{}, fmt.Errorf("unexpected command: %v", args)
 		}
@@ -273,9 +267,6 @@ func TestPullRejectsSuccessfulCommandWithoutExactRepoDigestAndCleansCandidate(t 
 	err := docker.Pull(context.Background(), manifest)
 	if err == nil || !strings.Contains(err.Error(), "exact RepoDigest is absent") {
 		t.Fatalf("post-pull proof error = %v", err)
-	}
-	if got := runner.calls[len(runner.calls)-1].args; !reflect.DeepEqual(got, []string{"image", "rm", platform}) {
-		t.Fatalf("unproven pulled image was not cleaned: %v", got)
 	}
 }
 
@@ -387,7 +378,7 @@ func TestPullFailureRedactsCredentialsAndBoundsPersistedDiagnostic(t *testing.T)
 	}
 }
 
-func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T) {
+func TestPullFailureDoesNotRemoveImagesHeldByOtherLifecycles(t *testing.T) {
 	manifest := pullTestManifest()
 	platform := manifest.Images["platform"]
 	runtimeImage := manifest.Images["agent-runtime"]
@@ -406,15 +397,6 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 			return Result{}, nil
 		case reflect.DeepEqual(args, []string{"pull", runtimeImage}):
 			return Result{ExitCode: 1, Stderr: "registry unavailable"}, errors.New("docker exited with 1")
-		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
-			return Result{}, nil
-		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{.Id}}":
-			if args[4] == platform && platformPulled {
-				return Result{Stdout: "sha256:" + strings.Repeat("c", 64)}, nil
-			}
-			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
-		case reflect.DeepEqual(args, []string{"image", "rm", platform}):
-			return Result{}, nil
 		default:
 			return Result{}, fmt.Errorf("unexpected command: %v", args)
 		}
@@ -424,17 +406,13 @@ func TestPullFailureRemovesOnlyNewExactCandidateImagesWithoutForce(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "managed image agent-runtime") {
 		t.Fatalf("pull failure = %v", err)
 	}
-	foundRemoval := false
 	for _, call := range runner.calls {
-		if reflect.DeepEqual(call.args, []string{"image", "rm", platform}) {
-			foundRemoval = true
+		if len(call.args) > 1 && call.args[0] == "image" && call.args[1] == "rm" {
+			t.Fatalf("failed pull removed an image another lifecycle may hold: %v", call.args)
 		}
-		if strings.Contains(strings.Join(call.args, " "), "--force") {
-			t.Fatalf("candidate cleanup forced a removal: %v", call.args)
+		if slicesContain(call.args, "prune") {
+			t.Fatalf("failed pull invoked global prune: %v", call.args)
 		}
-	}
-	if !foundRemoval {
-		t.Fatalf("new candidate image was not cleaned after the later pull failed: %#v", runner.calls)
 	}
 }
 
@@ -579,9 +557,6 @@ func TestStopFixedNeverRemovesLifecycleIndependentNetwork(t *testing.T) {
 	if err := docker.StopFixed(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 4 {
-		t.Fatalf("expected migration recheck, stop and rm, got %#v", runner.calls)
-	}
 	commands := strings.Join(append(runner.calls[2].args, runner.calls[3].args...), " ")
 	if strings.Contains(commands, "down") || strings.Contains(commands, "network") || strings.Contains(commands, "--remove-orphans") {
 		t.Fatalf("fixed-stack stop can disturb independent sandboxes: %s", commands)
@@ -621,6 +596,26 @@ func TestStopFixedRemovesManagedMigrationWriterBeforeCompose(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(runner.calls[3].args, " "), " stop --timeout 30") {
 		t.Fatalf("fixed stack stopped before migration cleanup completed: %#v", runner.calls)
+	}
+}
+
+func TestStopFixedRejectsUnstoppedWriters(t *testing.T) {
+	for _, inspectError := range []bool{false, true} {
+		t.Run(fmt.Sprint(inspectError), func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) {
+				if len(args) > 1 && args[0] == "ps" && args[1] == "--quiet" {
+					if inspectError {
+						return Result{}, errors.New("Docker unavailable")
+					}
+					return Result{Stdout: strings.Repeat("a", 64)}, nil
+				}
+				return Result{}, nil
+			}}
+			docker := DockerCLI{Profile: testActiveProfile, Runner: runner, ComposeFile: "/release/compose.yaml", ComposeProject: "agent-platform"}
+			if err := docker.StopFixed(context.Background()); err == nil {
+				t.Fatal("stop admitted a snapshot without proving all fixed writers stopped")
+			}
+		})
 	}
 }
 
@@ -1603,64 +1598,5 @@ func TestCheckCapacityDeduplicatesSnapshotAndDockerOnSameFilesystem(t *testing.T
 	}
 	if err := docker.CheckCapacity(context.Background(), CapacityPreCutover, release.Manifest{}); err != nil {
 		t.Fatalf("same-filesystem requirements were summed twice: %v", err)
-	}
-}
-
-func TestPruneManagedImagesKeepsContainerReferencesAndNeverForces(t *testing.T) {
-	inUse := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
-	obsolete := "registry.example/runtime@sha256:" + strings.Repeat("b", 64)
-	containerID := strings.Repeat("c", 64)
-	inUseImageID := "sha256:" + strings.Repeat("d", 64)
-	obsoleteImageID := "sha256:" + strings.Repeat("e", 64)
-	runner := &recordingRunner{results: func(args []string) (Result, error) {
-		switch {
-		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
-			return Result{Stdout: containerID + "\n"}, nil
-		case len(args) > 0 && args[0] == "inspect":
-			return Result{Stdout: inUse + "\t" + inUseImageID + "\n"}, nil
-		case len(args) > 1 && args[0] == "image" && args[1] == "inspect":
-			return Result{Stdout: obsoleteImageID + "\n"}, nil
-		}
-		return Result{}, nil
-	}}
-	disposition, err := (DockerCLI{Profile: testActiveProfile, Runner: runner}).PruneManagedImages(context.Background(), []string{inUse, obsolete}, map[string]struct{}{}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if disposition[inUse] || !disposition[obsolete] {
-		t.Fatalf("unexpected image dispositions: %#v", disposition)
-	}
-	if len(runner.calls) != 4 || !reflect.DeepEqual(runner.calls[3].args, []string{"image", "rm", obsolete}) {
-		t.Fatalf("cleanup used an unsafe command sequence: %#v", runner.calls)
-	}
-}
-
-func TestPruneManagedImagesProtectsContainerByResolvedImageID(t *testing.T) {
-	candidate := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
-	containerID := strings.Repeat("b", 64)
-	imageID := "sha256:" + strings.Repeat("c", 64)
-	runner := &recordingRunner{results: func(args []string) (Result, error) {
-		switch {
-		case reflect.DeepEqual(args, []string{"ps", "--all", "--quiet", "--no-trunc"}):
-			return Result{Stdout: containerID + "\n"}, nil
-		case len(args) > 0 && args[0] == "inspect":
-			return Result{Stdout: "registry.example/platform:local\t" + imageID + "\n"}, nil
-		case len(args) > 1 && args[0] == "image" && args[1] == "inspect":
-			return Result{Stdout: imageID + "\n"}, nil
-		default:
-			return Result{}, errors.New("unexpected mutation")
-		}
-	}}
-	disposition, err := (DockerCLI{Profile: testActiveProfile, Runner: runner}).PruneManagedImages(context.Background(), []string{candidate}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if disposition[candidate] {
-		t.Fatalf("container image ID consumer was ignored: %#v", disposition)
-	}
-	for _, call := range runner.calls {
-		if len(call.args) > 1 && call.args[0] == "image" && call.args[1] == "rm" {
-			t.Fatalf("in-use image was removed: %#v", runner.calls)
-		}
 	}
 }

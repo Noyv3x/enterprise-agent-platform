@@ -68,6 +68,13 @@ rm "$TMPDIR/exec-probe"
 cat > "$installer_test/fake-manager" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
+  bootstrap-launcher)
+    # Model the verified target's fresh-bootstrap filesystem effect. Actual
+    # launcher execution and startup proof are covered by the systemd fixture.
+    launcher="$FAKE_DATA_ROOT/manager/manager-binaries/launcher"
+    mkdir -p "$(dirname "$launcher")"
+    install -m 0700 "$0" "$launcher"
+    ;;
   preflight)
     if [[ "${FAKE_FAIL_STAGE:-preflight}" == preflight ]]; then
       mkdir -p "$FAKE_DATA_ROOT/manager/secrets"
@@ -330,6 +337,12 @@ cat install.sh | env \
   || fail "schema-2 fresh install did not create the target config path"
 [[ -f "$happy_home/.config/systemd/user/agent-platform-manager.service" ]] \
   || fail "schema-2 fresh install did not create the target unit"
+[[ "$(stat -c '%a' "$happy_home/.local/bin/agent-platform-manager")" == 755 ]] \
+  || fail "fresh install changed the stable Manager executable mode"
+[[ "$(stat -c '%a' "$happy_home/.config/systemd/user/agent-platform-manager.service")" == 644 ]] \
+  || fail "fresh install changed the systemd unit mode"
+[[ -x "$happy_data/manager/manager-binaries/launcher" ]] \
+  || fail "fresh install did not retain the verified immutable launcher"
 grep -Fq "$installer_test/happy-runtime/agent-platform-manager/manager.sock" \
   "$happy_home/.config/agent-platform/manager.toml" \
   || fail "schema-2 fresh install did not bind the target runtime socket"

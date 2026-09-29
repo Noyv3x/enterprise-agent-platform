@@ -171,76 +171,6 @@ func (e *capacityEngine) CheckCapacity(ctx context.Context, stage string, manife
 	return e.capacity.CheckCapacity(ctx, stage, manifest)
 }
 
-type capacityPullEngine struct {
-	*fakeEngine
-	errors []error
-	calls  int
-}
-
-func (e *capacityPullEngine) Pull(context.Context, release.Manifest) error {
-	index := e.calls
-	e.calls++
-	if index < len(e.errors) {
-		return e.errors[index]
-	}
-	return nil
-}
-
-func TestCapacityShortfallRunsOneControlledMaintenanceThenRechecks(t *testing.T) {
-	checker := &scriptedCapacityChecker{errors: []error{
-		&driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/var/lib/docker", Resource: "space", Have: 1, Require: 2},
-		nil,
-	}}
-	reclaims := 0
-	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40)}
-	orchestrator := &Orchestrator{ReclaimCapacity: func(_ context.Context, operationID string, protected release.Manifest) error {
-		reclaims++
-		if operationID != "op_capacity" || protected.ID() != manifest.ID() {
-			t.Fatalf("capacity reclaim identity = %q/%q", operationID, protected.ID())
-		}
-		return nil
-	}}
-	if err := orchestrator.checkCapacity(context.Background(), checker, "op_capacity", driver.CapacityPreDownload, manifest); err != nil {
-		t.Fatal(err)
-	}
-	if checker.calls != 2 || reclaims != 1 {
-		t.Fatalf("capacity checks/reclaims = %d/%d, want 2/1", checker.calls, reclaims)
-	}
-}
-
-func TestNonCapacityFailureDoesNotRunMaintenance(t *testing.T) {
-	checker := &scriptedCapacityChecker{errors: []error{errors.New("Docker unavailable")}}
-	reclaims := 0
-	orchestrator := &Orchestrator{ReclaimCapacity: func(context.Context, string, release.Manifest) error {
-		reclaims++
-		return nil
-	}}
-	err := orchestrator.checkCapacity(context.Background(), checker, "op_error", driver.CapacityPreDownload, release.Manifest{})
-	if err == nil || err.Error() != "Docker unavailable" || checker.calls != 1 || reclaims != 0 {
-		t.Fatalf("non-capacity failure = %v, checks=%d reclaims=%d", err, checker.calls, reclaims)
-	}
-}
-
-func TestAtomicImagePullCapacityShortfallRunsOneControlledMaintenanceRetry(t *testing.T) {
-	capacityErr := &driver.CapacityError{Stage: driver.CapacityPreDownload, Path: "/var/lib/docker", Resource: "space", Have: 1, Require: 2}
-	engine := &capacityPullEngine{fakeEngine: &fakeEngine{}, errors: []error{capacityErr, nil}}
-	reclaims := 0
-	manifest := release.Manifest{SourceCommit: strings.Repeat("a", 40)}
-	orchestrator := &Orchestrator{Engine: engine, ReclaimCapacity: func(_ context.Context, operationID string, protected release.Manifest) error {
-		reclaims++
-		if operationID != "op_pull" || protected.ID() != manifest.ID() {
-			t.Fatalf("pull reclaim identity = %q/%q", operationID, protected.ID())
-		}
-		return nil
-	}}
-	if err := orchestrator.pullWithCapacityRetry(context.Background(), "op_pull", manifest); err != nil {
-		t.Fatal(err)
-	}
-	if engine.calls != 2 || reclaims != 1 {
-		t.Fatalf("pull calls/reclaims = %d/%d, want 2/1", engine.calls, reclaims)
-	}
-}
-
 func TestCapacityGrowthAfterInitialCheckReleasesReservationBeforeRetryableFailure(t *testing.T) {
 	server, manifestURL := testReleaseServer(t)
 	defer server.Close()
@@ -1540,7 +1470,7 @@ func TestRestartAndRollbackStopWhenMaintenancePersistenceFails(t *testing.T) {
 		t.Run(string(kind), func(t *testing.T) {
 			dir := t.TempDir()
 			stateDir := filepath.Join(dir, "state")
-			statePath := filepath.Join(stateDir, "state.json")
+			statePath := filepath.Join(stateDir, "update.json")
 			store, _ := journal.Open(stateDir, time.Now())
 			aID, bID := strings.Repeat("a", 40), strings.Repeat("b", 40)
 			aPath := writeRollbackManifest(t, dir, aID)
@@ -2104,7 +2034,7 @@ func TestReservationIntentJournalFailureDoesNotInventMaintenance(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
 	stateDir := t.TempDir()
-	operationsDir := filepath.Join(stateDir, "operations")
+	operationsDir := stateDir
 	store, _ := journal.Open(stateDir, time.Now())
 	engine := &fakeEngine{}
 	gate := &scriptedGate{
@@ -2351,77 +2281,6 @@ func TestCheckClearsCandidateWhenReleaseMatchesCurrentGeneration(t *testing.T) {
 	}
 }
 
-func TestRecoverFinalizesCrashBetweenOperationAndStateCommit(t *testing.T) {
-	server, url := testReleaseServer(t)
-	defer server.Close()
-	store, _ := journal.Open(t.TempDir(), time.Now())
-	gate := &recordingGate{}
-	selfUpdate := &recordingSelfUpdate{}
-	commits := 0
-	finalized := 0
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: gate, Snapshots: fakeSnapshot{}, SelfUpdate: selfUpdate, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}, OnCommit: func(release.Manifest) { commits++ }, OnFinalized: func(release.Manifest) { finalized++ }}
-	manifest, err := orchestrator.Check(context.Background(), url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state := store.State()
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "crash-window", ExpectedGeneration: state.Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationSucceeded
-		value.TargetGeneration = manifest.ID()
-		value.SnapshotPath = "/backup/before-update"
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	state = store.State()
-	if state.Current == nil || state.Current.ID != manifest.ID() || state.Current.RollbackSnapshotPath != "/backup/before-update" || state.Candidate != nil || state.ActiveOperationID != "" {
-		t.Fatalf("recovery did not finish durable state commit: %#v", state)
-	}
-	if gate.releases != 2 || gate.commits != 2 || selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 || finalized != 1 {
-		t.Fatalf("recovery skipped finalize hooks: gate=%d self=%#v commits=%d finalized=%d", gate.releases, selfUpdate, commits, finalized)
-	}
-}
-
-func TestRecoverFailedTerminalOperationClearsHalfCommittedActiveState(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "failed-half-commit", ExpectedGeneration: store.State().Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = store.UpdateOperation(op.ID, func(value *model.Operation) error {
-		value.Status = model.OperationFailed
-		value.Phase = model.PhasePulling
-		value.Error = "injected pull failure"
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	orchestrator := &Orchestrator{Store: store, Engine: &fakeEngine{}, Gate: fakeGate{}, Snapshots: fakeSnapshot{}}
-	if err := orchestrator.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	state := store.State()
-	if state.ActiveOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle || state.LastError != "injected pull failure" {
-		t.Fatalf("failed half-commit did not converge without re-execution: %#v", state)
-	}
-	final, err := store.Operation(op.ID)
-	if err != nil || final.Status != model.OperationFailed {
-		t.Fatalf("failed operation terminal state changed: %#v %v", final, err)
-	}
-}
-
 func TestRecoverRetriesDurableFinalizePendingAfterStateCommit(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
@@ -2475,7 +2334,7 @@ func TestRecoverRetriesDurableFinalizePendingAfterStateCommit(t *testing.T) {
 	if state.FinalizePendingOperationID != "" || state.Maintenance || state.PublicState != model.StateIdle {
 		t.Fatalf("retried finalize did not open the committed generation: %#v", state)
 	}
-	if gate.releases != 3 || gate.commits != 3 || selfUpdate.activated != 2 || commits != 2 {
+	if gate.releases != 3 || gate.commits != 3 || selfUpdate.activated != 1 || commits != 1 {
 		t.Fatalf("unexpected idempotent finalize calls: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
 	}
 }
@@ -2907,7 +2766,7 @@ func TestRecoverFinalizeRequiresFreshCoreReadiness(t *testing.T) {
 	}
 }
 
-func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *testing.T) {
+func TestActivationPreflightWaitsForLauncherBeforeGateCommit(t *testing.T) {
 	server, url := testReleaseServer(t)
 	defer server.Close()
 	store, _ := journal.Open(t.TempDir(), time.Now())
@@ -2917,7 +2776,7 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 		sequence = append(sequence, "platform_schema_commit_release")
 	}}
 	selfUpdate := &recordingSelfUpdate{onCommitCheck: func() {
-		sequence = append(sequence, "watchdog_durable_commit")
+		sequence = append(sequence, "launcher_durable_commit")
 	}}
 	commits := 0
 	orchestrator := &Orchestrator{
@@ -2942,13 +2801,21 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.Complete(op.ID, true, func(state *model.ManagerState) {
+		state.Previous, state.Current = state.Current, state.Candidate
+		state.Candidate = nil
+		state.FinalizePendingOperationID = op.ID
+		state.Maintenance = true
+	}, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := orchestrator.RecoverBeforeActivation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	state := store.State()
 	if state.Current == nil || state.Current.ID != manifest.ID() || state.FinalizePendingOperationID != op.ID || !state.Maintenance || state.ActiveOperationID != "" {
-		t.Fatalf("activation preflight did not converge the independent journal commit: %#v", state)
+		t.Fatalf("activation preflight lost the closed target checkpoint: %#v", state)
 	}
 	if gate.releases != 0 || selfUpdate.marked != 0 || selfUpdate.activated != 0 || commits != 0 {
 		t.Fatalf("activation preflight ran post-watchdog hooks: gate=%d self=%#v commits=%d", gate.releases, selfUpdate, commits)
@@ -2969,7 +2836,7 @@ func TestActivationPreflightCommitsJournalStateWithoutRunningFinalizeHooks(t *te
 		selfUpdate.marked != 1 || selfUpdate.activated != 1 || commits != 1 {
 		t.Fatalf("post-watchdog hooks were not run exactly once: gate=%#v self=%#v commits=%d", gate, selfUpdate, commits)
 	}
-	if want := []string{"watchdog_durable_commit", "platform_schema_commit_release", "platform_schema_commit_release"}; !reflect.DeepEqual(sequence, want) {
+	if want := []string{"launcher_durable_commit", "platform_schema_commit_release", "platform_schema_commit_release"}; !reflect.DeepEqual(sequence, want) {
 		t.Fatalf("schema commit release crossed the watchdog durability boundary: got %v, want %v", sequence, want)
 	}
 }
@@ -2990,7 +2857,7 @@ func TestRollbackDoesNotRestoreWhenRescueSnapshotCannotBeJournaled(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	operationsDir := filepath.Join(stateDir, "operations")
+	operationsDir := stateDir
 	snapshots := &readOnlyJournalSnapshot{operationsDir: operationsDir}
 	t.Cleanup(func() { _ = os.Chmod(operationsDir, 0o700) })
 	engine := &fakeEngine{}
@@ -2999,9 +2866,20 @@ func TestRollbackDoesNotRestoreWhenRescueSnapshotCannotBeJournaled(t *testing.T)
 	if len(snapshots.restores) != 0 {
 		t.Fatalf("rollback restored data without a durable rescue snapshot journal: %v", snapshots.restores)
 	}
-	state := store.State()
-	if state.PublicState != model.StateFailed || !state.Maintenance || !strings.Contains(state.LastError, "persist rollback rescue snapshot") {
-		t.Fatalf("snapshot journal failure did not halt behind maintenance: %#v", state)
+	// No error projection can be persisted while the single checkpoint is
+	// unwritable. Its last durable owner must remain closed across restart.
+	reopened, err := journal.Open(stateDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := reopened.State()
+	pending, err := reopened.Operation(op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.Maintenance || state.ActiveOperationID != op.ID || state.Current == nil ||
+		state.Current.ID != bID || pending.Finalized || pending.SnapshotPath != "" {
+		t.Fatalf("snapshot journal failure lost its durable closed owner: state=%#v operation=%#v", state, pending)
 	}
 	engine.mu.Lock()
 	calls := append([]string(nil), engine.calls...)

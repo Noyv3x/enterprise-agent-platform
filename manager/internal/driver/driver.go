@@ -206,10 +206,9 @@ type CapacityChecker interface {
 	CheckCapacity(context.Context, string, release.Manifest) error
 }
 
-// ManagedImagePreparer is the narrow capability used by asynchronous
-// capability and Sandbox reconcilers. Implementations must apply the same
-// immutable-reference, capacity, pull, and failed-attempt cleanup policy as the
-// fixed update path.
+// ManagedImagePreparer is the narrow capability used by asynchronous capability
+// and Sandbox reconcilers. Implementations apply the fixed update path's
+// immutable-reference, capacity, and pull verification policy.
 type ManagedImagePreparer interface {
 	PrepareManagedImage(context.Context, string, string) error
 }
@@ -464,126 +463,12 @@ func defaultCapacityFilesystemStat(ctx context.Context, path string) (CapacityFi
 	}, nil
 }
 
-// PruneManagedImages removes only immutable digest references supplied by
-// verified historical release manifests. The method rechecks every Docker
-// container and never uses --force. A true result means that the caller may
-// discard the manifest which supplied that image reference; false means the
-// manifest must be retained for a later retry.
-func (d DockerCLI) PruneManagedImages(ctx context.Context, candidates []string, protected map[string]struct{}, guard release.RemovalGuard) (map[string]bool, error) {
-	result := make(map[string]bool, len(candidates))
-	containers, err := d.runner().Run(ctx, d.binary(), []string{"ps", "--all", "--quiet", "--no-trunc"}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("list containers before image cleanup: %w", err)
-	}
-	inUseReferences := map[string]struct{}{}
-	inUseImageIDs := map[string]struct{}{}
-	for _, id := range strings.Fields(containers.Stdout) {
-		if !validContainerID(id) {
-			return nil, errors.New("Docker returned an invalid container ID during image cleanup")
-		}
-		inspection, inspectErr := d.runner().Run(ctx, d.binary(), []string{"inspect", "--format", "{{.Config.Image}}\t{{.Image}}", id}, nil)
-		if inspectErr != nil {
-			return nil, fmt.Errorf("inspect container image reference %s before cleanup: %w", id, inspectErr)
-		}
-		fields := strings.Split(strings.TrimSpace(inspection.Stdout), "\t")
-		if len(fields) != 2 || !validDockerImageID(fields[1]) {
-			return nil, errors.New("Docker returned invalid container image metadata during cleanup")
-		}
-		if release.IsDigestReference(fields[0]) {
-			inUseReferences[fields[0]] = struct{}{}
-		}
-		inUseImageIDs[fields[1]] = struct{}{}
-	}
-	unique := map[string]struct{}{}
-	for _, image := range candidates {
-		if !release.IsDigestReference(image) {
-			return nil, fmt.Errorf("refusing non-immutable image cleanup candidate %q", image)
-		}
-		unique[image] = struct{}{}
-	}
-	images := make([]string, 0, len(unique))
-	for image := range unique {
-		images = append(images, image)
-	}
-	sort.Strings(images)
-	var cleanupErr error
-	for _, image := range images {
-		select {
-		case <-ctx.Done():
-			return result, errors.Join(ctx.Err(), cleanupErr)
-		default:
-		}
-		if _, keep := protected[image]; keep {
-			result[image] = true
-			continue
-		}
-		if _, used := inUseReferences[image]; used {
-			result[image] = false
-			continue
-		}
-		identity, inspectErr := d.runner().Run(ctx, d.binary(), []string{"image", "inspect", "--format", "{{.Id}}", image}, nil)
-		if inspectErr != nil {
-			if dockerObjectMissing(identity, inspectErr) {
-				result[image] = true
-				continue
-			}
-			result[image] = false
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect obsolete managed image %s: %w", image, inspectErr))
-			continue
-		}
-		imageID := strings.TrimSpace(identity.Stdout)
-		if !validDockerImageID(imageID) {
-			result[image] = false
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("inspect obsolete managed image %s: Docker returned an invalid image ID", image))
-			continue
-		}
-		if _, used := inUseImageIDs[imageID]; used {
-			result[image] = false
-			continue
-		}
-		releaseGuard := func() {}
-		if guard != nil {
-			var ok bool
-			releaseGuard, ok = guard()
-			if !ok {
-				result[image] = false
-				continue
-			}
-		}
-		_, removeErr := d.runner().Run(ctx, d.binary(), []string{"image", "rm", image}, nil)
-		releaseGuard()
-		if removeErr == nil || dockerObjectMissing(Result{}, removeErr) {
-			result[image] = true
-			continue
-		}
-		result[image] = false
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove obsolete managed image %s: %w", image, removeErr))
-	}
-	return result, cleanupErr
-}
-
 func dockerObjectMissing(result Result, err error) bool {
 	if err == nil {
 		return false
 	}
 	message := strings.ToLower(err.Error() + "\n" + result.Stderr)
 	return strings.Contains(message, "no such image") || strings.Contains(message, "no such object")
-}
-
-func validDockerImageID(value string) bool {
-	if !strings.HasPrefix(value, "sha256:") {
-		return false
-	}
-	digest := strings.TrimPrefix(value, "sha256:")
-	if len(digest) != 64 {
-		return false
-	}
-	for _, character := range digest {
-		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return false
-		}
-	}
-	return true
 }
 
 func (d DockerCLI) runner() Runner {
@@ -624,8 +509,8 @@ func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
 	return d.prepareManagedImages(ctx, manifest, coreUpdateImageNames, true)
 }
 
-// PrepareManagedImage applies the canonical capacity and exact-cleanup policy
-// to one immutable image outside the fixed update path.
+// PrepareManagedImage applies the canonical capacity and digest verification
+// policy to one immutable image outside the fixed update path.
 func (d DockerCLI) PrepareManagedImage(ctx context.Context, name, image string) error {
 	return d.prepareManagedImages(ctx, release.Manifest{Images: map[string]string{name: image}}, []string{name}, true)
 }
@@ -657,7 +542,6 @@ func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Ma
 			return err
 		}
 	}
-	pulledByAttempt := make([]string, 0, len(missing))
 	for _, name := range missing {
 		image := manifest.Images[name]
 		if enforceCapacity {
@@ -669,7 +553,6 @@ func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Ma
 				continue
 			}
 		}
-		pulledByAttempt = append(pulledByAttempt, image)
 		pullErr := d.pullImage(ctx, name, image)
 		if pullErr == nil {
 			present, verifyErr := d.imagePresent(ctx, name, image)
@@ -680,12 +563,6 @@ func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Ma
 			}
 		}
 		if pullErr != nil {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			_, cleanupErr := d.PruneManagedImages(cleanupCtx, pulledByAttempt, nil, nil)
-			cancel()
-			if cleanupErr != nil {
-				return errors.Join(pullErr, fmt.Errorf("clean failed managed image pull artifacts: %w", cleanupErr))
-			}
 			return pullErr
 		}
 	}
@@ -855,7 +732,7 @@ func (d DockerCLI) StopFixed(ctx context.Context) error {
 	if d.ComposeFile == "" {
 		if _, err := d.activeEnvironment(); err != nil {
 			if os.IsNotExist(err) {
-				return nil
+				return d.verifyFixedStopped(ctx)
 			}
 			return err
 		}
@@ -867,8 +744,21 @@ func (d DockerCLI) StopFixed(ctx context.Context) error {
 	if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs("", "stop", "--timeout", "30"), nil); err != nil {
 		return err
 	}
-	_, err := d.runner().Run(ctx, d.binary(), d.composeArgs("", "rm", "--force", "--stop"), nil)
-	return err
+	if _, err := d.runner().Run(ctx, d.binary(), d.composeArgs("", "rm", "--force", "--stop"), nil); err != nil {
+		return err
+	}
+	return d.verifyFixedStopped(ctx)
+}
+
+func (d DockerCLI) verifyFixedStopped(ctx context.Context) error {
+	remaining, err := d.runner().Run(ctx, d.binary(), []string{"ps", "--quiet", "--filter", "label=com.docker.compose.project=" + d.ComposeProject}, nil)
+	if err != nil {
+		return fmt.Errorf("verify fixed writers stopped: %w", err)
+	}
+	if strings.TrimSpace(remaining.Stdout) != "" {
+		return errors.New("fixed project containers remain active after stop")
+	}
+	return nil
 }
 
 func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) error {

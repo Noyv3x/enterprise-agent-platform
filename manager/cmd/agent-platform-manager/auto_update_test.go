@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,11 +14,15 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/operation"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type retryOncePullEngine struct {
@@ -233,5 +238,227 @@ func TestAutoUpdateUsesCurrentObservedAfterBlockedManifestFetch(t *testing.T) {
 	}
 	if app.pendingAutoUpdate.targetID != targetID || app.pendingAutoUpdate.operationID != "" {
 		t.Fatalf("active Current transition cleared the accepted target: pending=%#v", app.pendingAutoUpdate)
+	}
+}
+
+type blockedReapEngine struct {
+	wiringEngine
+	started chan struct{}
+}
+
+func (e blockedReapEngine) StopSandbox(ctx context.Context, _ string) error {
+	close(e.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func newPeriodicUpdateApplication(t *testing.T) (*application, string) {
+	t.Helper()
+	targetID := strings.Repeat("7", 40)
+	var fixture releasetest.Fixture
+	var manifestData []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/manifest.json":
+			_, _ = w.Write(manifestData)
+		case "/agent-platform-compose.yaml":
+			_, _ = w.Write(fixture.Compose)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	fixture = releasetest.NewTarget(targetID, releasetest.WithArtifactBaseURL(server.URL))
+	var err error
+	manifestData, err = json.Marshal(fixture.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	store, err := journal.Open(filepath.Join(root, "journal"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: strings.Repeat("6", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{UpdateEnabled: true, UpdateInterval: time.Second, ReleaseURL: server.URL + "/manifest.json"}
+	orchestrator := &operation.Orchestrator{
+		Store: store, Engine: wiringEngine{}, Gate: autoUpdateGate{}, Snapshots: autoUpdateSnapshot{},
+		ReleasesDir: filepath.Join(root, "releases"), ManifestURL: cfg.ReleaseURL,
+		Channel: fixture.Manifest.Channel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	return &application{
+		configs: config.NewManager(cfg), state: store, operations: orchestrator,
+		audit: logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2),
+	}, targetID
+}
+
+func TestPeriodicAutoUpdateCommitsWhileSandboxReapingIsBlocked(t *testing.T) {
+	app, targetID := newPeriodicUpdateApplication(t)
+	app.operations.MaintenanceMu = &sync.Mutex{}
+	root := t.TempDir()
+	engine := blockedReapEngine{started: make(chan struct{})}
+	var err error
+	app.sandboxes, err = sandbox.Open(identity.CompileTimeActiveProfile(), engine,
+		filepath.Join(root, "data"), filepath.Join(root, "sandboxes.json"),
+		"registry.invalid/sandbox@sha256:"+strings.Repeat("a", 64), "agent-platform_core", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sandboxes.Ensure(context.Background(), "private-1", "user-1", time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sandboxTicks := make(chan time.Time)
+	updateTicks := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		app.runBackground(ctx, sandboxTicks, updateTicks)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	select {
+	case sandboxTicks <- time.Now():
+	case <-time.After(5 * time.Second):
+		t.Fatal("sandbox loop did not start")
+	}
+	select {
+	case <-engine.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sandbox reaping did not enter blocked engine")
+	}
+	select {
+	case updateTicks <- time.Now().Add(time.Minute):
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked sandbox reaping starved automatic release polling")
+	}
+	deadline := time.After(5 * time.Second)
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		state := app.state.State()
+		if state.Current != nil && state.Current.ID == targetID && state.ActiveOperationID == "" && state.FinalizePendingOperationID == "" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("periodic update did not commit while sandbox cleanup blocked: %#v", state)
+		case <-poll.C:
+		}
+	}
+}
+
+func TestPeriodicAutoUpdateDefersAdmissionUntilRecoverySettles(t *testing.T) {
+	app, _ := newPeriodicUpdateApplication(t)
+	if _, err := app.state.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.FinalizePendingOperationID = "pending-recovery"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admitted := make(chan struct{})
+	app.operations.AdmissionCheck = func(model.ManagerState) error {
+		close(admitted)
+		return errors.New("test admission rejection after recovery")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ticks := make(chan time.Time)
+	done := make(chan struct{})
+	go func() {
+		app.runAutoUpdateLoop(ctx, ticks)
+		close(done)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	tick := func() {
+		t.Helper()
+		select {
+		case ticks <- time.Now().Add(time.Hour):
+		case <-time.After(5 * time.Second):
+			t.Fatal("periodic update loop stopped accepting ticks")
+		}
+	}
+	// Receiving the second tick proves the first was fully processed.
+	tick()
+	tick()
+	if state := app.state.State(); state.Candidate != nil || state.ActiveOperationID != "" {
+		t.Fatalf("periodic update crossed pending recovery: %#v", state)
+	}
+	if _, err := app.state.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.FinalizePendingOperationID = ""
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tick()
+	select {
+	case <-admitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("settled recovery did not resume automatic update admission")
+	}
+}
+
+func TestAutoUpdateAuditsCheckAndStartFailuresWithoutCredentials(t *testing.T) {
+	t.Run("check", func(t *testing.T) {
+		app, _ := newPeriodicUpdateApplication(t)
+		app.operations.ReleaseClient.HTTP = &http.Client{Transport: autoUpdateFailingTransport{}}
+		app.autoUpdate(context.Background())
+		assertAutoUpdateAudit(t, app, "auto_update.check_failed", "transport unavailable", "password", "query-secret")
+	})
+	t.Run("start", func(t *testing.T) {
+		app, _ := newPeriodicUpdateApplication(t)
+		cfg := app.configs.Config()
+		cfg.InternalToken = "internal-secret"
+		app.configs = config.NewManager(cfg)
+		app.api = &control.API{ControlToken: "control-secret", ExecutorToken: "executor-secret"}
+		app.operations.AdmissionCheck = func(model.ManagerState) error {
+			return errors.New("admission blocked internal-secret control-secret executor-secret " + cfg.ReleaseURL + strings.Repeat(" diagnostic", 5000))
+		}
+		app.autoUpdate(context.Background())
+		assertAutoUpdateAudit(t, app, "auto_update.start_failed", "admission blocked", "internal-secret", "control-secret", "executor-secret", cfg.ReleaseURL)
+		if app.state.State().ActiveOperationID != "" {
+			t.Fatal("rejected automatic update created an active operation")
+		}
+	})
+}
+
+type autoUpdateFailingTransport struct{}
+
+func (autoUpdateFailingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, &url.Error{Op: "Get", URL: "https://user:password@release.invalid/manifest.json?token=query-secret", Err: errors.New("transport unavailable")}
+}
+
+func assertAutoUpdateAudit(t *testing.T, app *application, eventType, cause string, secrets ...string) {
+	t.Helper()
+	events, err := app.audit.Tail(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("automatic update failure events = %d, want 1", len(events))
+	}
+	var event logstore.Event
+	if err := json.Unmarshal(events[0], &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != eventType || !strings.Contains(event.Error, cause) {
+		t.Fatalf("automatic update error lost stage or cause: %#v", event)
+	}
+	if event.Error != journal.BoundDiagnostic(event.Error) {
+		t.Fatal("automatic update error was not bounded")
+	}
+	for _, secret := range secrets {
+		if strings.Contains(string(events[0]), secret) {
+			t.Fatalf("automatic update audit exposed credential %q", secret)
+		}
 	}
 }

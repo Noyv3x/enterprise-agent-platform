@@ -27,6 +27,7 @@ type launcherState struct {
 	SchemaVersion             int      `json:"schema_version"`
 	Launcher                  Version  `json:"launcher"`
 	Proven                    bool     `json:"proven"`
+	Bootstrap                 bool     `json:"bootstrap,omitempty"`
 	Selected                  Version  `json:"selected"`
 	Previous                  *Version `json:"previous,omitempty"`
 	Pending                   bool     `json:"pending"`
@@ -125,70 +126,6 @@ func (m *Manager) verifyLauncherVersion(v Version, launcher bool) error {
 	return nil
 }
 
-// StageLauncher never overwrites an existing launcher, even during later updates.
-func (m *Manager) StageLauncher() (Version, error) {
-	releaseLock, err := acquireRecoveryLock(m.Root)
-	if err != nil {
-		return Version{}, err
-	}
-	defer releaseLock()
-	if s, err := m.readLauncher(); err == nil {
-		return s.Launcher, m.verifyLauncherVersion(s.Launcher, true)
-	} else if !os.IsNotExist(err) {
-		return Version{}, err
-	}
-	state, err := m.load()
-	if err != nil {
-		return Version{}, err
-	}
-	if err := m.cleanupVersionAtomicResiduesLocked(m.now(), state); err != nil {
-		return Version{}, err
-	}
-	if mode, err := m.validateStartupOwnershipState(false); err != nil {
-		return Version{}, err
-	} else if mode != startupOwnershipNormal {
-		return Version{}, errors.New("legacy recovery has not settled before launcher staging")
-	}
-	if state.Current == nil || state.Candidate != nil || state.Activation != nil {
-		return Version{}, errors.New("legacy Manager activation is not settled")
-	}
-	if err := m.verifyLauncherVersion(*state.Current, false); err != nil {
-		return Version{}, err
-	}
-	if !binaryMatches(m.InstallPath, state.Current.SHA256) || !binaryMatches("/proc/self/exe", state.Current.SHA256) || m.RunningVersion != state.Current.Version {
-		return Version{}, errors.New("bridge Current does not match stable and running executable")
-	}
-	previous := state.Previous
-	if previous == nil {
-		previous = state.Current
-	}
-	if err := m.verifyLauncherVersion(*previous, false); err != nil {
-		return Version{}, err
-	}
-	v := *state.Current
-	v.Path = filepath.Join(m.Root, "launcher")
-	if _, err := os.Lstat(v.Path); err == nil {
-		if err := m.verifyLauncherVersion(v, true); err != nil {
-			return Version{}, err
-		}
-	} else if os.IsNotExist(err) {
-		data, err := os.ReadFile(state.Current.Path)
-		if err != nil {
-			return Version{}, err
-		}
-		if sha256Hex(data) != v.SHA256 {
-			return Version{}, errors.New("launcher source changed")
-		}
-		if err := atomicfile.WriteFile(v.Path, data, 0o700); err != nil {
-			return Version{}, err
-		}
-	} else {
-		return Version{}, err
-	}
-	s := launcherState{SchemaVersion: 1, Launcher: v, Selected: *state.Current, Previous: previous}
-	return v, atomicfile.WriteJSON(m.launcherPath(), s, 0o600)
-}
-
 // LauncherEnabled means the independent handoff has been proven, not staged.
 func (m *Manager) LauncherEnabled() (bool, error) {
 	s, err := m.readLauncher()
@@ -196,37 +133,6 @@ func (m *Manager) LauncherEnabled() (bool, error) {
 		return false, nil
 	}
 	return s.Proven, err
-}
-func (m *Manager) ConfirmLauncherHandoff(ctx context.Context) error {
-	return m.mutateLauncher(func(s *launcherState) error {
-		if !s.BootReady || s.Pending || s.Failed || s.LauncherPID <= 1 || s.ChildPID <= 1 {
-			return errors.New("launcher handoff has not reached healthy startup")
-		}
-		if err := m.verifyLauncherVersion(s.Launcher, true); err != nil {
-			return err
-		}
-		out, err := exec.CommandContext(ctx, "systemctl", "--user", "show", m.recoveryUnitName(), "--property=MainPID", "--value").Output()
-		if err != nil || strings.TrimSpace(string(out)) != strconv.Itoa(s.LauncherPID) {
-			return errors.New("systemd MainPID is not the immutable launcher")
-		}
-		active, err := exec.CommandContext(ctx, "systemctl", "--user", "is-active", m.recoveryUnitName()).Output()
-		if err != nil || strings.TrimSpace(string(active)) != "active" {
-			return errors.New("launcher unit is not active")
-		}
-		if _, _, found, err := recoveryAnyWatchdogProcess(); err != nil {
-			return err
-		} else if found {
-			return errors.New("legacy watchdog remains live during handoff")
-		}
-		if !binaryMatches(fmt.Sprintf("/proc/%d/exe", s.LauncherPID), s.Launcher.SHA256) || !binaryMatches(fmt.Sprintf("/proc/%d/exe", s.ChildPID), s.Selected.SHA256) {
-			return errors.New("launcher handoff process identity mismatch")
-		}
-		if !managerHealthy(ctx, m.SocketPath, m.ControlTokenFile, s.Selected.Version, s.Selected.SHA256) {
-			return errors.New("launcher handoff child identity is unhealthy")
-		}
-		s.Proven = true
-		return nil
-	})
 }
 func (m *Manager) SupervisedStartup() (bool, error) {
 	if os.Getenv("AGENT_PLATFORM_LAUNCHER_PID") == "" {
@@ -343,9 +249,6 @@ func (m *Manager) activateLauncher(manifest release.Manifest) error {
 		if err != nil {
 			return err
 		}
-		if err := m.cleanupVersionAtomicResiduesLocked(m.now(), state); err != nil {
-			return err
-		}
 		if state.Candidate == nil || !state.Candidate.PlatformCommitted || state.Candidate.SourceCommit != manifest.SourceCommit {
 			return errors.New("launcher candidate is not prepared")
 		}
@@ -369,13 +272,6 @@ func (m *Manager) activateLauncher(manifest release.Manifest) error {
 // selectLauncherFallback is a one-way transition. A rejected startup never
 // becomes eligible again, including after the service itself restarts.
 func (m *Manager) selectLauncherFallback(s *launcherState) error {
-	state, err := m.load()
-	if err != nil {
-		return err
-	}
-	if err := m.cleanupVersionAtomicResiduesLocked(m.now(), state); err != nil {
-		return err
-	}
 	if !s.Pending || s.Previous == nil {
 		return errors.New("no uncommitted launcher fallback")
 	}
@@ -428,13 +324,6 @@ func (m *Manager) verifyLauncherSelection() error {
 	defer release()
 	s, err := m.readLauncher()
 	if err != nil {
-		return err
-	}
-	state, err := m.load()
-	if err != nil {
-		return err
-	}
-	if err := m.cleanupVersionAtomicResiduesLocked(m.now(), state); err != nil {
 		return err
 	}
 	return m.verifyLauncherVersion(s.Selected, false)
@@ -628,6 +517,9 @@ func (m *Manager) RunLauncher(ctx context.Context, coreReady func(context.Contex
 				latest.Pending = false
 			}
 			latest.BootReady = true
+			if latest.Bootstrap {
+				latest.Proven = true
+			}
 			return nil
 		}); err != nil {
 			stop()

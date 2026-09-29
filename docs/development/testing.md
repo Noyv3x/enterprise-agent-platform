@@ -69,7 +69,7 @@ scripts/container-smoke.sh
 用户级 systemd 需要可用的用户管理器、linger、`XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；在 `manager/` 运行：
 
 ```sh
-AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -run '^Test(RecoverySystemdQuiescenceIntegration|OrdinarySystemdActivationRestartIntegration)$' ./internal/selfupdate
+AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -timeout=12m -run '^TestBridgeSystemdBinaryUpgradeIntegration$' ./internal/selfupdate
 ```
 
-修改 Manager 候选 API 切换时另运行 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`。发布前按[发布通道](../operations/auto-update.md#发布通道)和[兼容性清单](documentation-workflow.md#发布兼容性清单)检查，不用本地门禁代替发布证据。
+该检查使用真实 N 与 N+1 二进制，覆盖独立 launcher、监督升级、重启保留选择和失败启动回退；核心容器是健康检查夹具，不能替代真实 Platform 迁移/预约/数据回滚验收。修改 Manager 控制 API 时另运行 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`。发布前按[发布通道](../operations/auto-update.md#发布通道)和[兼容性清单](documentation-workflow.md#发布兼容性清单)检查，不用本地门禁代替发布证据。

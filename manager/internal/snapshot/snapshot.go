@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 type Entry struct {
@@ -34,8 +33,6 @@ type Manifest struct {
 type Store struct {
 	DataDir, BackupDir string
 	Retention          time.Duration
-	StagingRetention   time.Duration
-	RemovalGuard       release.RemovalGuard
 	renamePath         func(string, string) error
 	syncDir            func(string) error
 	copyPath           func(string, string, os.FileMode) (string, error)
@@ -642,18 +639,13 @@ func (s Store) syncDirectory(path string) error {
 	return dir.Sync()
 }
 
-// Prune removes only expired, fully validated snapshots that are not referenced
-// by a current generation or unfinished operation. Unknown or damaged entries
-// are retained so maintenance can never turn a diagnostic anomaly into data
-// loss.
+// Prune removes expired, fully validated backups except referenced rollback
+// snapshots. The caller holds the update lifecycle lock, with no unfinished
+// transaction. Unknown, staging, or damaged entries are retained.
 func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]struct{}) (int, error) {
 	retention := s.Retention
 	if retention <= 0 {
 		retention = 7 * 24 * time.Hour
-	}
-	stagingRetention := s.StagingRetention
-	if stagingRetention <= 0 {
-		stagingRetention = time.Hour
 	}
 	entries, err := os.ReadDir(s.BackupDir)
 	if os.IsNotExist(err) {
@@ -679,41 +671,6 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 		case <-ctx.Done():
 			return removed, ctx.Err()
 		default:
-		}
-		if _, staging := snapshotStagingOperationID(entry.Name()); staging {
-			path := filepath.Join(s.BackupDir, entry.Name())
-			info, infoErr := entry.Info()
-			if infoErr != nil || now.Sub(info.ModTime()) <= stagingRetention {
-				continue
-			}
-			plan, planErr := atomicfile.PlanDirectoryRemoval(path, func() error {
-				current, err := os.Lstat(path)
-				if err != nil || !os.SameFile(info, current) || now.Sub(current.ModTime()) <= stagingRetention {
-					return errors.New("snapshot staging identity or age changed")
-				}
-				return validateSnapshotStaging(path)
-			})
-			if planErr != nil {
-				continue
-			}
-			releaseGuard := func() {}
-			if s.RemovalGuard != nil {
-				var ok bool
-				releaseGuard, ok = s.RemovalGuard()
-				if !ok {
-					continue
-				}
-			}
-			err := ctx.Err()
-			if err == nil {
-				err = plan.Remove()
-			}
-			releaseGuard()
-			if err != nil {
-				return removed, err
-			}
-			removed++
-			continue
 		}
 		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || !safeID(entry.Name()) {
 			continue
@@ -742,19 +699,10 @@ func (s Store) Prune(ctx context.Context, now time.Time, protected map[string]st
 		if manifest.CreatedAt.IsZero() || now.Sub(manifest.CreatedAt) <= retention {
 			continue
 		}
-		releaseGuard := func() {}
-		if s.RemovalGuard != nil {
-			var ok bool
-			releaseGuard, ok = s.RemovalGuard()
-			if !ok {
-				continue
-			}
-		}
 		err := ctx.Err()
 		if err == nil {
 			err = plan.Remove()
 		}
-		releaseGuard()
 		if err != nil {
 			return removed, err
 		}

@@ -23,27 +23,24 @@ type startupArgumentSpec struct {
 
 type startupArguments struct {
 	ConfigPath   string
-	PlanPath     string
 	ManifestPath string
 	Architecture string
 }
 
 var startupCommandArguments = map[string]startupArgumentSpec{
-	"inspect-release":      {options: startupOptions("manifest", startupArgumentValue, "architecture", startupArgumentValue), required: []string{"manifest", "architecture"}},
-	"serve":                {options: startupOptions("config", startupArgumentValue)},
-	"launcher":             {options: startupOptions("config", startupArgumentValue), requireConfig: true},
-	"bridge-handoff":       {options: startupOptions("config", startupArgumentValue, "retry", startupArgumentBool), requireConfig: true},
-	"preflight":            {options: startupOptions("config", startupArgumentValue, "probe-user-systemd-transient", startupArgumentBool)},
-	"install":              {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"status":               {options: startupOptions("config", startupArgumentValue)},
-	"check":                {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"update":               {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"restart":              {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"rollback":             {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"repair":               {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
-	"logs":                 {options: startupOptions("config", startupArgumentValue, "service", startupArgumentValue, "tail", startupArgumentValue)},
-	"recover-current":      {options: startupOptions("config", startupArgumentValue, "expected-sha256", startupArgumentValue, "yes", startupArgumentBool), requireConfig: true, required: []string{"expected-sha256", "yes"}},
-	"self-update-watchdog": {options: startupOptions("config", startupArgumentValue, "plan", startupArgumentValue), requireConfig: true, required: []string{"plan"}},
+	"inspect-release":    {options: startupOptions("manifest", startupArgumentValue, "architecture", startupArgumentValue), required: []string{"manifest", "architecture"}},
+	"serve":              {options: startupOptions("config", startupArgumentValue)},
+	"launcher":           {options: startupOptions("config", startupArgumentValue), requireConfig: true},
+	"bootstrap-launcher": {options: startupOptions("config", startupArgumentValue), requireConfig: true},
+	"preflight":          {options: startupOptions("config", startupArgumentValue)},
+	"install":            {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"status":             {options: startupOptions("config", startupArgumentValue)},
+	"check":              {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"update":             {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"restart":            {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"rollback":           {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"repair":             {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
+	"logs":               {options: startupOptions("config", startupArgumentValue, "service", startupArgumentValue, "tail", startupArgumentValue)},
 }
 
 func startupOptions(values ...any) map[string]startupArgumentShape {
@@ -106,7 +103,7 @@ func parseStartupArguments(command string, arguments []string) (startupArguments
 			return startupArguments{}, errors.New("invalid startup argument contract")
 		}
 	}
-	result := startupArguments{ConfigPath: values["config"], PlanPath: values["plan"], ManifestPath: values["manifest"], Architecture: values["architecture"]}
+	result := startupArguments{ConfigPath: values["config"], ManifestPath: values["manifest"], Architecture: values["architecture"]}
 	if spec.requireConfig && result.ConfigPath == "" {
 		return startupArguments{}, fmt.Errorf("%s requires an explicit --config path", command)
 	}
@@ -118,7 +115,7 @@ func parseStartupArguments(command string, arguments []string) (startupArguments
 			return startupArguments{}, fmt.Errorf("%s requires --%s=true", command, name)
 		}
 	}
-	for label, path := range map[string]string{"config": result.ConfigPath, "plan": result.PlanPath, "manifest": result.ManifestPath} {
+	for label, path := range map[string]string{"config": result.ConfigPath, "manifest": result.ManifestPath} {
 		if path != "" && (!filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0)) {
 			return startupArguments{}, fmt.Errorf("%s path must be canonical and absolute", label)
 		}

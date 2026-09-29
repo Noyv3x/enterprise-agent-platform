@@ -7,14 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strings"
-	"syscall"
-	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
@@ -26,419 +21,106 @@ const (
 	maxComposeBytes  = 5 << 20
 )
 
-type ImagePruner interface {
-	PruneManagedImages(context.Context, []string, map[string]struct{}, RemovalGuard) (map[string]bool, error)
-}
-
-// RemovalGuard is called only after slow candidate validation. A successful
-// guard keeps the admission lock until its returned release function is
-// invoked, so publication cannot race the exact destructive boundary.
-type RemovalGuard = release.RemovalGuard
-
+// ReleasePolicy selects the two committed generations. Callers hold the update
+// lifecycle lock and must not run retention while a transaction is unfinished.
 type ReleasePolicy struct {
-	Root            string
-	Channel         string
-	Profile         identity.ActiveProfile
-	Retention       time.Duration
-	ProtectedIDs    map[string]struct{}
-	ProtectedImages map[string]struct{}
-	HeldImages      map[string]struct{}
-	Images          ImagePruner
-	RemovalGuard    RemovalGuard
+	Root       string
+	Channel    string
+	Profile    identity.ActiveProfile
+	CurrentID  string
+	PreviousID string
 }
 
-type verifiedRelease struct {
-	path     string
-	manifest release.Manifest
-	images   []string
-	removal  *atomicfile.DirectoryRemoval
-}
-
-// PruneReleases removes only expired immutable release directories whose
-// manifest and Compose checksum are valid and whose managed image digests are
-// either protected elsewhere or have been removed without force. Unknown,
-// malformed and runtime-held generations remain untouched.
-func PruneReleases(ctx context.Context, now time.Time, policy ReleasePolicy) (int, error) {
+// PruneReleases retains the verified current and previous generations. Unknown
+// directories and damaged artifacts are left alone. Docker images are never
+// removed: a sandbox may still hold an older release's image.
+func PruneReleases(ctx context.Context, policy ReleasePolicy) (int, error) {
 	active := policy.Profile
 	if active.Validate() != nil {
 		active = identity.CompileTimeActiveProfile()
 	}
-	retention := policy.Retention
-	if retention <= 0 {
-		retention = 7 * 24 * time.Hour
+	if !validCommit(policy.CurrentID) || (policy.PreviousID != "" && !validCommit(policy.PreviousID)) {
+		return 0, errors.New("retention requires committed release identities")
+	}
+	for _, id := range []string{policy.CurrentID, policy.PreviousID} {
+		if id == "" {
+			continue
+		}
+		if err := verifyRelease(filepath.Join(policy.Root, id), id, policy.Channel, active); err != nil {
+			return 0, fmt.Errorf("verify retained release %s: %w", id, err)
+		}
 	}
 	entries, err := os.ReadDir(policy.Root)
-	if os.IsNotExist(err) {
-		return 0, nil
-	}
 	if err != nil {
 		return 0, err
 	}
-	candidates := make([]verifiedRelease, 0)
-	staging := make(map[string]*atomicfile.DirectoryRemoval)
-	allImages := map[string]struct{}{}
-	protectedImages := cloneStringSet(policy.ProtectedImages)
-	var pruneErr error
+	removed := 0
 	for _, entry := range entries {
-		select {
-		case <-ctx.Done():
-			return 0, errors.Join(ctx.Err(), pruneErr)
-		default:
+		if err := ctx.Err(); err != nil {
+			return removed, err
 		}
-		if validReleaseStagingName(entry.Name()) && entry.Type()&os.ModeSymlink == 0 && entry.IsDir() {
-			info, infoErr := entry.Info()
-			path := filepath.Join(policy.Root, entry.Name())
-			if infoErr == nil && now.Sub(info.ModTime()) > retention {
-				plan, planErr := atomicfile.PlanDirectoryRemoval(path, func() error {
-					current, err := os.Lstat(path)
-					if err != nil || !os.SameFile(info, current) || now.Sub(current.ModTime()) <= retention {
-						return errors.New("release staging identity or age changed")
-					}
-					return validateReleaseStaging(path)
-				})
-				if planErr == nil {
-					staging[path] = plan
-				}
-			}
-			continue
-		}
-		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() || !validCommit(entry.Name()) {
-			continue
-		}
-		if _, keep := policy.ProtectedIDs[entry.Name()]; keep {
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !validCommit(entry.Name()) ||
+			entry.Name() == policy.CurrentID || entry.Name() == policy.PreviousID {
 			continue
 		}
 		path := filepath.Join(policy.Root, entry.Name())
-		containsAtomicResidue, residueScanErr := releaseContainsAtomicResidue(path)
-		if residueScanErr != nil {
-			pruneErr = errors.Join(pruneErr, fmt.Errorf("inspect release %s for atomic residues: %w", entry.Name(), residueScanErr))
-			protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
-			continue
-		}
-		if containsAtomicResidue {
-			directoryInfo, infoErr := entry.Info()
-			if infoErr != nil {
-				pruneErr = errors.Join(pruneErr, fmt.Errorf("inspect release %s directory identity before atomic cleanup: %w", entry.Name(), infoErr))
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
-				continue
-			}
-			result, admitted, cleanupErr := cleanupReleaseAtomicResidues(path, entry.Name(), directoryInfo, now, retention, policy.RemovalGuard)
-			if cleanupErr != nil {
-				pruneErr = errors.Join(pruneErr, fmt.Errorf("clean release %s atomic residues: %w", entry.Name(), cleanupErr))
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
-				continue
-			}
-			if !admitted || result.Retained != 0 {
-				protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
-				continue
-			}
-		}
-		var item verifiedRelease
-		plan, verifyErr := atomicfile.PlanDirectoryRemoval(path, func() error {
-			var err error
-			item, err = verifyRelease(path, entry.Name(), policy.Channel, active)
-			return err
+		plan, err := atomicfile.PlanDirectoryRemoval(path, func() error {
+			return verifyRelease(path, entry.Name(), policy.Channel, active)
 		})
-		if verifyErr != nil {
-			protectReleaseCoreImages(path, entry.Name(), policy.Channel, active, protectedImages)
-			continue
-		}
-		item.removal = plan
-		if item.manifest.GeneratedAt.IsZero() || now.Sub(item.manifest.GeneratedAt) <= retention {
-			protectImages(item.images, protectedImages)
-			continue
-		}
-		held := false
-		for _, image := range item.images {
-			if _, isHeld := policy.HeldImages[image]; isHeld {
-				held = true
-				break
-			}
-		}
-		if held {
-			protectImages(item.images, protectedImages)
-			continue
-		}
-		for _, image := range item.images {
-			allImages[image] = struct{}{}
-		}
-		candidates = append(candidates, item)
-	}
-	removed := 0
-	for path, plan := range staging {
-		select {
-		case <-ctx.Done():
-			return removed, errors.Join(ctx.Err(), pruneErr)
-		default:
-		}
-		releaseGuard := func() {}
-		if policy.RemovalGuard != nil {
-			var ok bool
-			releaseGuard, ok = policy.RemovalGuard()
-			if !ok {
-				continue
-			}
-		}
-		err := ctx.Err()
-		if err == nil {
-			err = plan.Remove()
-		}
-		releaseGuard()
 		if err != nil {
-			pruneErr = errors.Join(pruneErr, fmt.Errorf("remove abandoned release staging %s: %w", filepath.Base(path), err))
 			continue
+		}
+		if err := plan.Remove(); err != nil {
+			return removed, err
 		}
 		removed++
-	}
-	if len(candidates) > 0 && policy.Images != nil {
-		images := make([]string, 0, len(allImages))
-		for image := range allImages {
-			images = append(images, image)
-		}
-		sort.Strings(images)
-		disposition, imageErr := policy.Images.PruneManagedImages(ctx, images, protectedImages, policy.RemovalGuard)
-		pruneErr = errors.Join(pruneErr, imageErr)
-		for _, item := range candidates {
-			safe := true
-			for _, image := range item.images {
-				if !disposition[image] {
-					safe = false
-					break
-				}
-			}
-			if !safe {
-				continue
-			}
-			releaseGuard := func() {}
-			if policy.RemovalGuard != nil {
-				var ok bool
-				releaseGuard, ok = policy.RemovalGuard()
-				if !ok {
-					continue
-				}
-			}
-			err := ctx.Err()
-			if err == nil {
-				err = item.removal.Remove()
-			}
-			releaseGuard()
-			if err != nil {
-				pruneErr = errors.Join(pruneErr, fmt.Errorf("remove obsolete release %s: %w", item.manifest.ID(), err))
-				continue
-			}
-			removed++
-		}
-	}
-	if removed > 0 {
 		if err := syncDirectory(policy.Root); err != nil {
-			pruneErr = errors.Join(pruneErr, fmt.Errorf("sync release root after cleanup: %w", err))
+			return removed, err
 		}
 	}
-	return removed, pruneErr
+	return removed, nil
 }
 
-// releaseContainsAtomicResidue is an advisory, non-destructive prefilter. The
-// authoritative directory and candidate checks happen again after the
-// maintenance admission guard is held by cleanupReleaseAtomicResidues.
-func releaseContainsAtomicResidue(path string) (bool, error) {
-	contents, err := os.ReadDir(path)
-	if err != nil {
-		return false, err
-	}
-	for _, content := range contents {
-		if strings.HasPrefix(content.Name(), ".tmp-") {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func cleanupReleaseAtomicResidues(
-	path string,
-	expectedID string,
-	expectedDirectory os.FileInfo,
-	now time.Time,
-	grace time.Duration,
-	guard RemovalGuard,
-) (atomicfile.ManagedTempCleanupResult, bool, error) {
-	var empty atomicfile.ManagedTempCleanupResult
-	if !validCommit(expectedID) || path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) != expectedID {
-		return empty, false, errors.New("release atomic cleanup path is not an absolute canonical generation directory")
-	}
-	if expectedDirectory == nil || !expectedDirectory.IsDir() || expectedDirectory.Mode()&os.ModeSymlink != 0 {
-		return empty, false, errors.New("release atomic cleanup directory identity is invalid")
-	}
-	if guard == nil {
-		return empty, false, errors.New("release atomic cleanup requires a maintenance removal guard")
-	}
-	releaseAdmission, ok := guard()
-	if !ok {
-		return empty, false, nil
-	}
-	if releaseAdmission == nil {
-		return empty, false, errors.New("release atomic cleanup guard returned a nil release function")
-	}
-	defer releaseAdmission()
-
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return empty, true, fmt.Errorf("inspect release atomic cleanup directory: %w", err)
-	}
-	if !os.SameFile(expectedDirectory, pathInfo) {
-		return empty, true, errors.New("release atomic cleanup directory changed before admission")
-	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return empty, true, fmt.Errorf("open release atomic cleanup directory: %w", err)
-	}
-	directory := os.NewFile(uintptr(fd), path)
-	if directory == nil {
-		_ = syscall.Close(fd)
-		return empty, true, errors.New("open release atomic cleanup directory: invalid file descriptor")
-	}
-	openedInfo, err := directory.Stat()
-	if err != nil {
-		_ = directory.Close()
-		return empty, true, fmt.Errorf("inspect opened release atomic cleanup directory: %w", err)
-	}
-	if !os.SameFile(expectedDirectory, openedInfo) || !os.SameFile(pathInfo, openedInfo) {
-		_ = directory.Close()
-		return empty, true, errors.New("release atomic cleanup directory changed while it was opened")
-	}
-
-	result, cleanupErr := atomicfile.CleanupManagedTemps(directory, path, atomicfile.ManagedTempCleanupPolicy{
-		Now:   now,
-		Grace: grace,
-		DurableReferences: []string{
-			filepath.Join(path, "manifest.json"),
-			filepath.Join(path, "compose.yaml"),
-			filepath.Join(path, "compose.env"),
-		},
-	})
-	closeErr := directory.Close()
-	if cleanupErr != nil {
-		return result, true, cleanupErr
-	}
-	if closeErr != nil {
-		return result, true, fmt.Errorf("close release atomic cleanup directory: %w", closeErr)
-	}
-	return result, true, nil
-}
-
-func validReleaseStagingName(name string) bool {
-	const prefix = ".release-"
-	if !strings.HasPrefix(name, prefix) {
-		return false
-	}
-	remainder := strings.TrimPrefix(name, prefix)
-	if len(remainder) < 42 || !validCommit(remainder[:40]) || remainder[40] != '-' {
-		return false
-	}
-	for _, character := range remainder[41:] {
-		if character < '0' || character > '9' {
-			return false
-		}
-	}
-	return len(remainder[41:]) > 0
-}
-
-func validateReleaseStaging(path string) error {
+func verifyRelease(path, expectedID, channel string, active identity.ActiveProfile) error {
 	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !validReleaseStagingName(filepath.Base(path)) {
-		return errors.New("release staging path is not a recognized regular directory")
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("release path is not a regular directory")
 	}
 	contents, err := os.ReadDir(path)
 	if err != nil {
 		return err
 	}
-	limits := map[string]int64{"manifest.json": maxManifestBytes, "compose.yaml": maxComposeBytes}
 	for _, content := range contents {
-		limit, ok := limits[content.Name()]
-		if !ok {
-			return fmt.Errorf("unknown file in release staging directory: %s", content.Name())
-		}
-		if _, err := readRegularFile(filepath.Join(path, content.Name()), limit); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func verifyRelease(path, expectedID, channel string, active identity.ActiveProfile) (verifiedRelease, error) {
-	item, err := verifyReleaseCore(path, expectedID, channel, active)
-	if err != nil {
-		return verifiedRelease{}, err
-	}
-	contents, err := os.ReadDir(path)
-	if err != nil {
-		return verifiedRelease{}, err
-	}
-	allowed := map[string]struct{}{"manifest.json": {}, "compose.yaml": {}, "compose.env": {}}
-	for _, content := range contents {
-		if _, ok := allowed[content.Name()]; !ok {
-			return verifiedRelease{}, fmt.Errorf("unknown file in release directory: %s", content.Name())
-		}
-		if content.Name() == "compose.env" {
+		switch content.Name() {
+		case "manifest.json", "compose.yaml":
+		case "compose.env":
 			if _, err := readRegularFile(filepath.Join(path, content.Name()), maxManifestBytes); err != nil {
-				return verifiedRelease{}, fmt.Errorf("validate release Compose environment: %w", err)
+				return fmt.Errorf("validate release Compose environment: %w", err)
 			}
+		default:
+			return fmt.Errorf("unknown file in release directory: %s", content.Name())
 		}
 	}
-	return item, nil
-}
-
-func verifyReleaseCore(path, expectedID, channel string, active identity.ActiveProfile) (verifiedRelease, error) {
-	info, err := os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return verifiedRelease{}, errors.New("release path is not a regular directory")
-	}
-	manifestPath := filepath.Join(path, "manifest.json")
-	manifestData, err := readRegularFile(manifestPath, maxManifestBytes)
+	manifestData, err := readRegularFile(filepath.Join(path, "manifest.json"), maxManifestBytes)
 	if err != nil {
-		return verifiedRelease{}, err
+		return err
 	}
 	manifest, err := release.DecodeManifestForProfile(manifestData, channel, runtime.GOOS, runtime.GOARCH, active)
 	if err != nil {
-		return verifiedRelease{}, err
+		return err
 	}
 	if manifest.ID() != expectedID {
-		return verifiedRelease{}, errors.New("release identity does not match its directory")
+		return errors.New("release identity does not match its directory")
 	}
 	compose, err := readRegularFile(filepath.Join(path, "compose.yaml"), maxComposeBytes)
 	if err != nil {
-		return verifiedRelease{}, err
+		return err
 	}
 	digest := sha256.Sum256(compose)
 	if hex.EncodeToString(digest[:]) != manifest.Compose.SHA256 {
-		return verifiedRelease{}, errors.New("release Compose checksum mismatch")
+		return errors.New("release Compose checksum mismatch")
 	}
-	images := make([]string, 0, len(manifest.Images))
-	for name, image := range manifest.Images {
-		if release.IsManagedImageName(name) {
-			images = append(images, image)
-		}
-	}
-	sort.Strings(images)
-	return verifiedRelease{path: path, manifest: manifest, images: images}, nil
-}
-
-func cloneStringSet(source map[string]struct{}) map[string]struct{} {
-	result := make(map[string]struct{}, len(source))
-	maps.Copy(result, source)
-	return result
-}
-
-func protectImages(images []string, protected map[string]struct{}) {
-	for _, image := range images {
-		protected[image] = struct{}{}
-	}
-}
-
-func protectReleaseCoreImages(path, expectedID, channel string, active identity.ActiveProfile, protected map[string]struct{}) {
-	item, err := verifyReleaseCore(path, expectedID, channel, active)
-	if err == nil {
-		protectImages(item.images, protected)
-	}
+	return nil
 }
 
 func readRegularFile(path string, limit int64) ([]byte, error) {

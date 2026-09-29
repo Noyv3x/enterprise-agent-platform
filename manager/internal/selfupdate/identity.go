@@ -22,11 +22,3 @@ func (m *Manager) technicalProfile() identity.Profile {
 }
 
 func (m *Manager) managerBinaryName() string { return m.technicalProfile().ManagerBinary }
-
-func (m *Manager) managerUnitName() string { return m.technicalProfile().ManagerUnit }
-
-func (m *Manager) watchdogUnitPrefix() string { return m.technicalProfile().WatchdogUnitPrefix }
-
-func (m *Manager) recoveryWatchdogUnitPrefix() string {
-	return m.technicalProfile().RecoveryWatchdogUnitPrefix
-}

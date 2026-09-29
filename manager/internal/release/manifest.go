@@ -70,10 +70,6 @@ func IsManagedImageName(name string) bool {
 // code can never act on tags, IDs, or broad repository names.
 func IsDigestReference(value string) bool { return digestPattern.MatchString(value) }
 
-// RemovalGuard holds the Manager admission boundary around one exact removal.
-// Candidate discovery and checksum work must happen before acquiring it.
-type RemovalGuard func() (release func(), ok bool)
-
 type Artifact struct {
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`
