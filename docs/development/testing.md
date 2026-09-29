@@ -49,6 +49,23 @@
 - Firecrawl 冷启动后写入 PostgreSQL 哨兵，保留数据目录重建，再确认新容器、精确读回和真实抓取。
 - 清理只删除受控临时目录和已确认的精确镜像 ID，不能使用 prune 或忽略清理失败。
 
+### 发布检查
+
+`scripts/container-smoke.sh` 负责隔离的安装器和 Compose 配置检查，不固定 Dockerfile 层顺序、工作流文本或页面标题。真实发布栈只有一个入口：`scripts/release-compose-smoke.sh`。在仓库根目录运行，先准备本次构建的 `artifacts/managed-images.json`（十个摘要固定的镜像），并设置 `RUNNER_TEMP`、`GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`、`GITHUB_WORKSPACE`；需要 Docker、Compose、免密 sudo 和脚本调用的标准工具。
+
+真实脚本保留冷启动、Platform 健康与登录、浏览器控制路径、沙箱执行，以及 Firecrawl PostgreSQL 哨兵在保留数据重建后的读回和抓取。它使用临时状态和本地绑定，不访问产品数据。仅通过本地配置检查不能宣称这些路径或双架构发布已通过。
+
+发布按 prepare → 镜像/Manager 构建 → smoke → publish 执行；每个同仓库 main push 的成功 Quality commit 都进入发布，不再按说明文件差异跳过。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。本地检查命令：
+
+```sh
+bash -n scripts/container-smoke.sh scripts/release-compose-smoke.sh scripts/verify-release-images-anonymous.sh
+python3 -m unittest discover -s scripts/tests
+python3 -c 'import pathlib,yaml; [yaml.safe_load(p.read_text()) for p in pathlib.Path(".github/workflows").glob("*.yml")]'
+scripts/container-smoke.sh
+```
+
+真实 GitHub 发布才能证明令牌权限、GHCR 匿名摘要读取、双架构镜像、完整公开资产下载和 latest 推进；还需要当前已安装 Manager 的真实更新与回滚验证，不能用工作流源文本断言或模拟 GitHub CLI 代替。
+
 用户级 systemd 需要可用的用户管理器、linger、`XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；在 `manager/` 运行：
 
 ```sh

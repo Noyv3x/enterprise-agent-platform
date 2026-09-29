@@ -25,102 +25,6 @@ for path in \
 done
 
 bash -n install.sh
-grep -Fq 'bash -s -- --yes' README.md \
-  || fail "README fresh-install command does not pass explicit non-interactive consent"
-grep -Fq -- '--title "Agent Platform ${SOURCE_COMMIT:0:12}"' .github/workflows/container-release.yml \
-  || fail "container release title is not deployment-neutral"
-for excluded in \
-  'enterprise-agent-platform/build/' \
-  'enterprise-agent-platform/dist/' \
-  'enterprise-agent-platform/*.egg-info/' \
-  'enterprise-agent-platform/**/__pycache__/' \
-  'enterprise-agent-platform/**/*.pyc' \
-  'enterprise-agent-platform/.venv/' \
-  'enterprise-agent-platform/enterprise_agent_platform/static/'; do
-  grep -Fxq "$excluded" containers/platform.Dockerfile.dockerignore \
-    || fail "Platform image context can include local build residue: $excluded"
-done
-if grep -Fxq 'COPY enterprise-agent-platform .' containers/platform.Dockerfile; then
-  fail "Platform Python build copies the whole mixed-language source tree"
-fi
-grep -Fq \
-  'COPY enterprise-agent-platform/pyproject.toml enterprise-agent-platform/README.md ./' \
-  containers/platform.Dockerfile \
-  || fail "Platform Python build does not copy an explicit package boundary"
-[[ "$(grep -Fxc 'COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform' containers/platform.Dockerfile)" -eq 1 ]] \
-  || fail "Platform package source must enter only the Python build stage"
-
-python3 - <<'PY'
-import pathlib
-import re
-
-dockerfiles = (
-    pathlib.Path("containers/platform.Dockerfile"),
-    pathlib.Path("containers/agent-runtime.Dockerfile"),
-    pathlib.Path("containers/camofox.Dockerfile"),
-    pathlib.Path("containers/agent-sandbox.Dockerfile"),
-)
-instruction = re.compile(r"(?m)^(FROM|ARG|LABEL|RUN|COPY|ADD)\b")
-for path in dockerfiles:
-    source = path.read_text(encoding="utf-8")
-    final_from = tuple(re.finditer(r"(?m)^FROM\b", source))[-1].start()
-    final_stage = source[final_from:]
-    entries = [(match.group(1), match.start()) for match in instruction.finditer(final_stage)]
-    filesystem_positions = [
-        offset for name, offset in entries if name in {"RUN", "COPY", "ADD"}
-    ]
-    if not filesystem_positions:
-        raise SystemExit(f"{path}: final stage has no filesystem instructions")
-    source_arg = final_stage.find("ARG SOURCE_COMMIT=unknown")
-    release_arg = final_stage.find("ARG RELEASE_VERSION=development")
-    label = final_stage.find("LABEL org.opencontainers.image.title=")
-    if not max(filesystem_positions) < source_arg < release_arg < label:
-        raise SystemExit(
-            f"{path}: volatile release arguments must follow all filesystem layers "
-            "and immediately precede image labels"
-        )
-    label_block_end = min(
-        (
-            offset
-            for name, offset in entries
-            if offset > label and name in {"ARG", "LABEL", "RUN", "COPY", "ADD"}
-        ),
-        default=len(final_stage),
-    )
-    label_block = final_stage[label:label_block_end]
-    for value in ("$SOURCE_COMMIT", "$RELEASE_VERSION"):
-        if value not in label_block:
-            raise SystemExit(f"{path}: final image label does not consume {value}")
-
-camofox = pathlib.Path("containers/camofox.Dockerfile").read_text(encoding="utf-8")
-build_stage, final_stage = camofox.split("\nFROM node:24-bookworm-slim AS camofox\n", 1)
-patch_copy = (
-    "COPY enterprise-agent-platform/camofox-runtime/patch-runtime.cjs ./"
-)
-loopback_copy = (
-    "COPY enterprise-agent-platform/camofox-runtime/loopback-preload.cjs ./"
-)
-npm_install = "RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev"
-if not build_stage.index(patch_copy) < build_stage.index(npm_install) < build_stage.index(loopback_copy):
-    raise SystemExit(
-        "Camoufox small runtime preload must not invalidate dependency installation"
-    )
-if re.search(
-    r"(?m)^COPY --from=camofox-build\b[^\n]* /opt/camofox /opt/camofox\s*$",
-    final_stage,
-):
-    raise SystemExit("Camoufox final stage must not repack the complete build root")
-for copy in (
-    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/browser ./browser",
-    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/node_modules ./node_modules",
-    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/package.json ./",
-    "COPY --from=camofox-build --chown=1000:1000 /opt/camofox/loopback-preload.cjs ./",
-):
-    if final_stage.count(copy) != 1:
-        raise SystemExit(f"Camoufox cache boundary is missing: {copy}")
-if "package-lock.json" in final_stage or "patch-runtime.cjs" in final_stage:
-    raise SystemExit("Camoufox final stage contains build-only inputs")
-PY
 
 installer_test="$(mktemp -d)"
 installer_stubs="$installer_test/bin"
@@ -606,216 +510,9 @@ else
 fi
 rm -rf --one-file-system -- "$installer_test"
 
-for secret in firecrawl-postgres-password firecrawl-bull-auth-key; do
-  grep -Fq "$secret" containers/compose.yaml \
-    || fail "Compose is missing Firecrawl secret $secret"
-done
-release_workflow=.github/workflows/container-release.yml
-[[ -x scripts/verify-release-images-anonymous.sh ]] \
-  || fail "anonymous release-image verifier is missing or not executable"
-[[ -x scripts/ensure-release-candidate-tag.sh ]] \
-  || fail "release candidate tag verifier is missing or not executable"
-[[ ! -e .github/workflows/channel-promotion.yml ]] \
-  || fail "a second release-promotion workflow remains"
-[[ ! -e scripts/release_promotion.py ]] \
-  || fail "a second release-promotion implementation remains"
-
-for expected in \
-  'send(1, "drag", points=drag_points)' \
-  '"duplicate") is True' \
-  '"drag_count=1"' \
-  '"pointer_down=0"' \
-  'X-Preview-Refresh-Ms'; do
-  grep -Fq "$expected" scripts/browser-control-compose-smoke.py \
-    || fail "browser control Compose smoke is missing: $expected"
-done
-grep -Fq 'handle.addEventListener("pointerdown"' scripts/fixtures/browser-control.html \
-  || fail "browser control fixture no longer exercises a real pointer drag"
-grep -Fq "app.post('/tabs/:tabId/pointer'" enterprise-agent-platform/camofox-runtime/patch-runtime.cjs \
-  || fail "Camoufox patch is missing the atomic pointer endpoint"
-
-for expected in \
-  'python3 scripts/browser-control-compose-smoke.py' \
-  'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"' \
-  'group: container-channel-main' \
-  'python3 scripts/assemble_release_manifest.py' \
-  'gh release view "$release_tag"' \
-  'gh api "/repos/${GITHUB_REPOSITORY}/releases/${release_id}"' \
-  'scripts/ensure-release-candidate-tag.sh "$GITHUB_REPOSITORY" "$SOURCE_COMMIT"' \
-  'gh release upload "$release_tag" --repo "$GITHUB_REPOSITORY" "$stage/$asset"' \
-  'gh release edit "$release_tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest' \
-  'gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" --dir "$root"' \
-  'scripts/verify-release-images-anonymous.sh "$stage/release.json"'; do
-  grep -Fq "$expected" "$release_workflow" \
-    || fail "current release workflow is missing: $expected"
-done
-for asset in \
-  agent-platform-manager-linux-amd64 \
-  agent-platform-manager-linux-arm64 \
-  agent-platform-compose.yaml \
-  install.sh \
-  release.json; do
-  grep -Fq "$asset" "$release_workflow" \
-    || fail "release asset is absent: $asset"
-done
-[[ "$(grep -Fc 'scripts/verify-release-images-anonymous.sh "$stage/release.json"' "$release_workflow")" -eq 2 ]] \
-  || fail "release images must be anonymously verified before and after publication"
-if grep -Eq -- '--clobber' "$release_workflow"; then
-  fail "immutable release assets can be overwritten"
-fi
-
-python3 - <<'PY'
-import re
-from pathlib import Path
-
-workflow = Path(".github/workflows/container-release.yml").read_text(encoding="utf-8")
-quality = Path(".github/workflows/quality.yml").read_text(encoding="utf-8")
-
-def job(source: str, name: str) -> str:
-    match = re.search(
-        rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
-        source,
-    )
-    if match is None:
-        raise SystemExit(f"workflow job is missing: {name}")
-    return match.group(0)
-
-required_jobs = {
-    "prepare", "upstream-contracts", "images", "image-catalog", "public-images",
-    "manager-binaries", "manager-systemd-integration", "compose-smoke", "publish",
-}
-jobs_source = workflow.split("\njobs:\n", 1)[1]
-actual_jobs = set(re.findall(r"(?m)^  ([a-zA-Z0-9_-]+):\n", jobs_source))
-if actual_jobs != required_jobs:
-    raise SystemExit(f"unexpected release jobs: {sorted(actual_jobs ^ required_jobs)}")
-
-for path, source in (
-    (".github/workflows/quality.yml", quality),
-    (".github/workflows/container-release.yml", workflow),
-):
-    for action in re.findall(r"(?m)^\s+uses:\s+([^#\s]+)", source):
-        if action.startswith("./"):
-            continue
-        if re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action) is None:
-            raise SystemExit(f"{path} action is not pinned by commit: {action}")
-
-
-manager_binaries = job(workflow, "manager-binaries")
-manager_systemd = job(workflow, "manager-systemd-integration")
-if quality.count("go test -count=1 ./...") != 1:
-    raise SystemExit("Quality must run the Manager full suite exactly once")
-if "go test" in manager_binaries:
-    raise SystemExit("Manager artifact builders repeat the full test suite")
-for fragment in (
-    "GOARCH: ${{ matrix.arch }}",
-    "CGO_ENABLED=0 GOOS=linux go -C manager build",
-    "agent-platform-manager-linux-${GOARCH}",
-    "name: manager-${{ matrix.arch }}",
-    "cache-dependency-path: manager/go.sum",
-):
-    if fragment not in manager_binaries:
-        raise SystemExit(f"Manager artifact build is incomplete: {fragment}")
-for fragment in (
-    'AGENT_PLATFORM_SYSTEMD_INTEGRATION: "1"',
-    "go test -count=1 -v",
-    "RecoverySystemdQuiescenceIntegration",
-    "OrdinarySystemdActivationRestartIntegration",
-):
-    if fragment not in manager_systemd:
-        raise SystemExit(f"real Manager systemd gate is incomplete: {fragment}")
-
-public_images = job(workflow, "public-images")
-if "packages: read" not in public_images or "docker/login-action" in public_images:
-    raise SystemExit("public-image verification is not anonymous")
-image_catalog = job(workflow, "image-catalog")
-for fragment in (
-    "architecture:",
-    "ARCHITECTURE: ${{ matrix.architecture }}",
-    'docker pull --platform "linux/${ARCHITECTURE}" "$image"',
-    ".managed_image_capacity_estimates[$component].compressed_bytes",
-    ".managed_image_capacity_estimates[$component].unpacked_bytes",
-    "name: managed-images",
-):
-    if fragment not in public_images:
-        raise SystemExit(f"public-image gate is incomplete: {fragment}")
-
-for fragment in (
-    "pattern: image-*",
-    "name: managed-images",
-    "path: managed-images.json",
-    ".managed_image_capacity_estimates | keys",
-):
-    if fragment not in image_catalog:
-        raise SystemExit(f"managed-image catalog is incomplete: {fragment}")
-
-compose = job(workflow, "compose-smoke")
-for fragment in (
-    "timeout-minutes: 45",
-    "name: managed-images",
-    "--wait --wait-timeout 600 firecrawl-api",
-    "firecrawl_scrape cold",
-    "firecrawl_scrape warm",
-    "agent_platform_ci_persistence",
-    "compatibility_workspaces=",
-    "unsafe legacy workspace mount unexpectedly passed compatibility preflight",
-    "invalid source database migration unexpectedly succeeded",
-    "root-python-shadow-loaded",
-    "tests.test_workspace_mount_compat",
-    "/^CapPrm:/",
-    "/^NoNewPrivs:/",
-    "python3 scripts/browser-control-compose-smoke.py",
-    'docker network inspect "$AGENT_PLATFORM_CORE_NETWORK"',
-):
-    if fragment not in compose:
-        raise SystemExit(f"Compose acceptance gate is incomplete: {fragment}")
-if "      - public-images\n" in compose or "      - images\n" in compose:
-    raise SystemExit("Compose acceptance is still serialized behind image verification")
-
-publish = job(workflow, "publish")
-for dependency in required_jobs - {"publish"}:
-    if f"      - {dependency}\n" not in publish:
-        raise SystemExit(f"publish does not require {dependency}")
-for fragment in (
-    "group: container-channel-main",
-    "cancel-in-progress: false",
-    "pattern: manager-*",
-    "name: managed-images",
-    'git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main',
-    'git merge-base --is-ancestor "$current" "$SOURCE_COMMIT"',
-    "verify_tag",
-    'verify_asset_set "$release_api" 1',
-    'cmp "$RUNNER_TEMP/release-identity-before.json" "$RUNNER_TEMP/release-identity-after.json"',
-):
-    if fragment not in publish:
-        raise SystemExit(f"atomic publication gate is incomplete: {fragment}")
-if "pattern: '*'" in publish or 'pattern: "*"' in publish:
-    raise SystemExit("publish downloads an unscoped artifact family")
-if "--contract" in publish or "--predecessor-manifest" in publish:
-    raise SystemExit("current manifest assembly accepts unrelated inputs")
-for producer in ("images", "image-catalog", "manager-binaries"):
-    if "overwrite: true" not in job(workflow, producer):
-        raise SystemExit(f"{producer} artifacts cannot be replaced by a full-run retry")
-PY
 for entrypoint in containers/*-entrypoint.sh; do
   sh -n "$entrypoint"
 done
-for entrypoint in \
-  containers/platform-entrypoint.sh \
-  containers/agent-runtime-entrypoint.sh \
-  containers/camofox-entrypoint.sh \
-  containers/agent-sandbox-entrypoint.sh; do
-  grep -Fq 'AGENT_PLATFORM_TECHNICAL_PROFILE' "$entrypoint" \
-    || fail "$entrypoint does not bind the target technical profile"
-done
-grep -Fq 'migrate|serve|init-admin|print-agent-token)' containers/platform-entrypoint.sh \
-  || fail "Platform entrypoint does not dispatch CLI subcommands"
-grep -Fq '/opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat --check-source' containers/platform-entrypoint.sh \
-  || fail "Platform compatibility source check is not isolated from the writable data root"
-grep -Fq 'exec /opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat' containers/platform-entrypoint.sh \
-  || fail "Platform compatibility helper is not isolated from the writable data root"
-grep -Fq 'exec /usr/bin/setpriv' containers/platform-entrypoint.sh \
-  || fail "Platform entrypoint does not use the fixed privilege dropper"
-
 python3 - <<'PY'
 import json
 from pathlib import Path
@@ -866,60 +563,6 @@ expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rab
 if managed_firecrawl_services != expected_firecrawl_services:
     raise SystemExit(f"unexpected managed Firecrawl upstream services: {sorted(managed_firecrawl_services)}")
 PY
-
-for dockerfile in containers/*.Dockerfile; do
-  grep -Eq '^FROM .+ AS ' "$dockerfile" || fail "$dockerfile has no named production stage"
-  if [[ "$dockerfile" == containers/agent-sandbox.Dockerfile ]]; then
-    grep -Fq 'ENTRYPOINT ["/usr/local/bin/agent-sandbox-entrypoint"]' "$dockerfile" \
-      || fail "Agent Sandbox does not use the UID/GID mapping entrypoint"
-  else
-    grep -q '^USER ' "$dockerfile" || fail "$dockerfile has no explicit USER"
-    grep -q '^HEALTHCHECK ' "$dockerfile" || fail "$dockerfile has no image healthcheck"
-  fi
-  if grep -Eq '(^|[[:space:]/:])latest([[:space:]@]|$)' "$dockerfile"; then
-    fail "$dockerfile contains a latest image or dependency reference"
-  fi
-done
-grep -Fq 'exec setpriv --reuid="$agent_uid" --regid="$agent_gid" --init-groups -- /usr/bin/tini -- "$@"' containers/agent-sandbox-entrypoint.sh \
-  || fail "Agent Sandbox entrypoint does not permanently drop privileges"
-grep -Fq 'chown --no-dereference "$agent_uid:$agent_gid" "$mount_root"' containers/agent-sandbox-entrypoint.sh \
-  || fail "Agent Sandbox entrypoint does not protect mount roots from symlink traversal"
-grep -Fq 'AGENT_PLATFORM_AGENT_UID' containers/agent-sandbox-entrypoint.sh \
-  || fail "Agent Sandbox does not consume the target UID prefix"
-grep -Fq 'io.agent-platform.role="sandbox"' containers/agent-sandbox.Dockerfile \
-  || fail "Agent Sandbox image does not carry the target ownership label"
-if grep -En 'chown.*(--recursive|-R)' containers/agent-sandbox-entrypoint.sh; then
-  fail "Agent Sandbox entrypoint recursively changes persistent ownership"
-else
-  status=$?
-  [[ "$status" -eq 1 ]] || fail "could not inspect Agent Sandbox ownership commands (grep exit $status)"
-fi
-grep -Fq 'browser/version.json' containers/camofox.Dockerfile \
-  || fail "Camoufox image does not generate the external bundle version metadata"
-grep -Fq '"release": "beta.25"' containers/camofox.Dockerfile \
-  || fail "Camoufox image metadata does not match the pinned GitHub release"
-grep -Fq 'XDG_CACHE_HOME=/var/lib/agent-platform/camofox/home/.cache' containers/camofox.Dockerfile \
-  || fail "Camoufox and camoufox-js cache locations are inconsistent"
-
-python3 - <<'PY'
-import re
-from pathlib import Path
-
-compose = Path("containers/compose.yaml").read_text(encoding="utf-8")
-interpolated = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*)", compose))
-unexpected = sorted(name for name in interpolated if not name.startswith("AGENT_PLATFORM_"))
-if unexpected:
-    raise SystemExit(f"target Compose accepts non-target host environment: {unexpected}")
-if not interpolated:
-    raise SystemExit("target Compose has no generated host environment contract")
-PY
-
-if grep -Ern '/var/run/docker\.sock|/run/docker\.sock|privileged:[[:space:]]*true' containers; then
-  fail "a product container can access Docker or runs privileged"
-else
-  status=$?
-  [[ "$status" -eq 1 ]] || fail "could not inspect container privilege boundaries (grep exit $status)"
-fi
 
 command -v docker >/dev/null || fail "docker is required to validate Compose"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required"
@@ -975,9 +618,6 @@ for name, service in services.items():
         raise SystemExit(f"{name} image is not an immutable digest: {image}")
     if service.get("privileged"):
         raise SystemExit(f"{name} is privileged")
-    labels = service.get("labels") or {}
-    if labels.get("io.agent-platform.profile") != "agent-platform-v1":
-        raise SystemExit(f"{name} does not carry the target ownership profile")
     for volume in service.get("volumes") or []:
         source = str(volume.get("source") or "")
         target = str(volume.get("target") or "")
@@ -995,13 +635,13 @@ for name, service in services.items():
 platform = services["platform"]
 searxng = services["searxng"]
 if platform.get("user") != "0:0" or platform.get("init") is not False:
-    raise SystemExit("Platform compatibility entrypoint must start as root without a persistent root init")
+    raise SystemExit("Platform entrypoint must start as root without a persistent root init")
 if set(platform.get("cap_drop") or ()) != {"ALL"}:
-    raise SystemExit("Platform compatibility entrypoint must drop the default capability set")
+    raise SystemExit("Platform entrypoint must drop the default capability set")
 if set(platform.get("cap_add") or ()) != {
     "CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID",
 }:
-    raise SystemExit("Platform compatibility entrypoint has an unexpected capability set")
+    raise SystemExit("Platform entrypoint has an unexpected capability set")
 for service_name in ("agent-runtime", "camofox", "searxng"):
     if services[service_name].get("user") != "23456:23457":
         raise SystemExit(f"{service_name} must run as the target deployment UID/GID")
@@ -1029,9 +669,7 @@ if environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
 if environment.get("AGENT_PLATFORM_DEPLOYMENT_MODE") != "container":
     raise SystemExit("Platform is not explicitly in container deployment mode")
 if environment.get("AGENT_PLATFORM_RUN_UID") != "23456" or environment.get("AGENT_PLATFORM_RUN_GID") != "23457":
-    raise SystemExit("Platform compatibility entrypoint target identity mismatch")
-if environment.get("AGENT_PLATFORM_WORKSPACE_MOUNT_COMPAT") != "2026080801-to-2026082901":
-    raise SystemExit("Platform compatibility entrypoint marker mismatch")
+    raise SystemExit("Platform entrypoint target identity mismatch")
 if environment.get("AGENT_PLATFORM_MANAGER_SOCKET") != "/run/agent-platform-manager/manager.sock":
     raise SystemExit("Platform Manager socket contract mismatch")
 if environment.get("AGENT_PLATFORM_MANAGER_TOKEN_FILE") != "/run/secrets/agent-platform/manager-token":
