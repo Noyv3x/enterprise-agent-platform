@@ -48,10 +48,8 @@ export const CURRENT_MODEL_CONTENT_SECURITY_VERSION = 1;
 
 export class SessionStore {
   private readonly sessionsRoot: string;
-  private readonly writeQueues = new Map<string, Promise<void>>();
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly mutationQueues = new Map<string, Promise<void>>();
-  private readonly archiveQueues = new Map<string, Promise<void>>();
   private readonly approvalQueues = new Map<string, Promise<void>>();
   private readonly todos: TodoStore;
   private readonly backgroundTasks: BackgroundTaskStore;
@@ -143,7 +141,6 @@ export class SessionStore {
       await this.appendRaw(file, header);
       const tracked: TrackedSessionMessage[] = [];
       for (const message of history) {
-        await this.repairJsonlTail(file, "Agent session journal", MAX_SESSION_JOURNAL_BYTES);
         const entry = this.entry(identity, "message", durableSessionMessage(message));
         await this.appendRaw(file, entry);
         tracked.push({ entry_id: entry.id, message });
@@ -361,28 +358,24 @@ export class SessionStore {
 
   private async appendArchiveEntries(identity: SessionIdentity, entries: SessionEntry[]): Promise<void> {
     if (entries.length === 0) return;
+    // The caller holds this session's mutation queue through the archive-first
+    // commit; a second archive/write queue would guard the same operation twice.
     const file = this.archivePath(identity);
     await mkdir(dirname(file), { recursive: true, mode: 0o700 });
-    await this.withQueue(this.archiveQueues, file, async () => {
-      await this.repairJsonlTail(file, "Agent session archive", this.maxSessionArchiveBytes);
-      const archived = await this.readArchiveEntries(identity);
-      const known = new Set(archived.map((entry) => entry.id));
-      const pending = entries.flatMap((entry) => {
-        if (known.has(entry.id)) return [];
-        return [entry.type === "message"
-          ? { ...entry, payload: durableSessionMessage(entry.payload as AgentMessage) }
-          : entry];
-      });
-      const combined = [...archived, ...pending];
-      const combinedSize = Buffer.byteLength(
-        `${combined.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-        "utf8",
-      );
-      if (combinedSize > this.maxSessionArchiveBytes) {
-        throw new Error(`Agent session archive exceeds ${this.maxSessionArchiveBytes} bytes`);
-      }
-      if (pending.length > 0) await this.replaceRaw(file, combined);
-    });
+    await this.repairJsonlTail(file, "Agent session archive", this.maxSessionArchiveBytes);
+    const archived = await this.readArchiveEntries(identity);
+    const known = new Set(archived.map((entry) => entry.id));
+    const pending = entries.filter((entry) => !known.has(entry.id)).map((entry) => (
+      entry.type === "message"
+        ? { ...entry, payload: durableSessionMessage(entry.payload as AgentMessage) }
+        : entry
+    ));
+    if (pending.length === 0) return;
+    const text = `${[...archived, ...pending].map((entry) => JSON.stringify(entry)).join("\n")}\n`;
+    if (Buffer.byteLength(text, "utf8") > this.maxSessionArchiveBytes) {
+      throw new Error(`Agent session archive exceeds ${this.maxSessionArchiveBytes} bytes`);
+    }
+    await this.replaceText(file, text);
   }
 
   async deleteScope(scopeKey: string, lifecycleId?: string): Promise<void> {
@@ -398,20 +391,18 @@ export class SessionStore {
     const manifest = file.replace(/\.jsonl$/, ".manifest.json");
     const directory = dirname(file);
     await this.withQueue(this.mutationQueues, file, async () => {
-      await this.withQueue(this.archiveQueues, archive, async () => {
-        await Promise.all([
-          rm(file, { force: true }),
-          rm(archive, { force: true }),
-          rm(manifest, { force: true }),
-          this.todos.deleteSession(identity),
-          this.backgroundTasks.deleteSession(identity),
-        ]);
-        try {
-          await this.syncDirectory(directory);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-      });
+      await Promise.all([
+        rm(file, { force: true }),
+        rm(archive, { force: true }),
+        rm(manifest, { force: true }),
+        this.todos.deleteSession(identity),
+        this.backgroundTasks.deleteSession(identity),
+      ]);
+      try {
+        await this.syncDirectory(directory);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     });
   }
 
@@ -597,22 +588,12 @@ export class SessionStore {
   }
 
   private async appendRaw(file: string, entry: object): Promise<void> {
-    const previous = this.writeQueues.get(file) ?? Promise.resolve();
-    const next = previous.then(async () => {
-      const handle = await open(file, "a", 0o600);
-      try {
-        await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf8");
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-    });
-    const tracked = next.catch(() => undefined);
-    this.writeQueues.set(file, tracked);
+    const handle = await open(file, "a", 0o600);
     try {
-      await next;
+      await handle.writeFile(`${JSON.stringify(entry)}\n`, "utf8");
+      await handle.sync();
     } finally {
-      if (this.writeQueues.get(file) === tracked) this.writeQueues.delete(file);
+      await handle.close();
     }
   }
 
@@ -699,36 +680,7 @@ export class SessionStore {
   }
 
   private async replaceRaw(file: string, entries: object[]): Promise<void> {
-    const previous = this.writeQueues.get(file) ?? Promise.resolve();
-    const next = previous.then(async () => {
-      const temporary = `${file}.${id("compact")}.tmp`;
-      let handle: Awaited<ReturnType<typeof open>> | undefined;
-      try {
-        handle = await open(temporary, "wx", 0o600);
-        await handle.writeFile(`${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        await rename(temporary, file);
-        await chmod(file, 0o600);
-        const directory = await open(dirname(file), "r");
-        try {
-          await directory.sync();
-        } finally {
-          await directory.close();
-        }
-      } finally {
-        await handle?.close().catch(() => undefined);
-        await rm(temporary, { force: true }).catch(() => undefined);
-      }
-    });
-    const tracked = next.catch(() => undefined);
-    this.writeQueues.set(file, tracked);
-    try {
-      await next;
-    } finally {
-      if (this.writeQueues.get(file) === tracked) this.writeQueues.delete(file);
-    }
+    await this.replaceText(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
   }
 
   private async replaceText(file: string, text: string): Promise<void> {

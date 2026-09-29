@@ -52,3 +52,14 @@ test("EventJournal bounds retained bytes and marks an oversized event", () => {
   const retainedBytes = journal.list().reduce((total, event) => total + Buffer.byteLength(JSON.stringify(event)), 0);
   assert.ok(retainedBytes <= maxBytes, `${retainedBytes} retained bytes exceeded ${maxBytes}`);
 });
+
+test("EventJournal snapshots nested producer data before replay", () => {
+  const journal = new EventJournal("run_snapshot");
+  const data = { nested: { text: "original", approval_key: "private" }, values: [null, "original"] };
+  journal.publish("tool.updated", data);
+  data.nested.text = "changed";
+  data.values[1] = "changed";
+  const replayed: unknown[] = [];
+  journal.subscribe(0, (event) => replayed.push(event.data));
+  assert.deepEqual(replayed, [{ nested: { text: "original" }, values: [null, "original"] }]);
+});

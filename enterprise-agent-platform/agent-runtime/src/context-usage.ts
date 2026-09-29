@@ -1,4 +1,4 @@
-import { estimateTokens, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import { calculateContextTokens, estimateTokens, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ContextUsage } from "./types.js";
 
@@ -33,7 +33,7 @@ export class RequestContextUsage {
     if (!usage) return;
     const components = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.totalTokens];
     if (!components.every((value) => Number.isFinite(value) && value >= 0)) return;
-    const tokens = usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    const tokens = calculateContextTokens(usage);
     if (!Number.isFinite(tokens) || tokens <= 0) return;
     this.anchor = { prefix: [...prefix, message], tokens };
   }

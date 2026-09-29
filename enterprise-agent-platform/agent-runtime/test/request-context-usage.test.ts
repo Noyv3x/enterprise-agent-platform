@@ -97,8 +97,8 @@ test("large system request triggers automatic compaction despite tiny restored u
   const home = await temporaryDirectory("agent-request-system-");
   const workspace = await temporaryDirectory("agent-request-system-workspace-");
   let summaries = 0;
-  const streamFn: StreamFn = (_model, context) => {
-    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
+  const streamFn: StreamFn = (_model, _context, options) => {
+    if (options?.cacheRetention === "none") {
       summaries += 1;
       return responseStream(measuredAnswer(1));
     }
@@ -130,8 +130,8 @@ test("post-compaction zero usage measures only the active projection without rep
   let summaries = 0;
   let turns = 0;
   let expectedUsage = 0;
-  const streamFn: StreamFn = (_model, context) => {
-    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
+  const streamFn: StreamFn = (_model, context, options) => {
+    if (options?.cacheRetention === "none") {
       summaries += 1;
       return responseStream(measuredAnswer(0));
     }
@@ -175,8 +175,8 @@ test("available tool schemas alone push a short request over the automatic thres
   let summaries = 0;
   let calibrating = true;
   const history = Array.from({ length: 9 }, () => user("short"));
-  const streamFn: StreamFn = (model, context) => {
-    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
+  const streamFn: StreamFn = (model, context, options) => {
+    if (options?.cacheRetention === "none") {
       summaries += 1;
     } else if (calibrating) {
       const messages = [...history, ...context.messages];
@@ -218,8 +218,8 @@ test("each post-compaction provider response establishes a fresh exact usage anc
   const home = await temporaryDirectory("agent-request-fresh-anchor-");
   let summaries = 0;
   let turns = 0;
-  const streamFn: StreamFn = (_model, context) => {
-    if (getCurrentSystemPrompt(context.messages)?.startsWith("Create a concise continuation handoff")) {
+  const streamFn: StreamFn = (_model, _context, options) => {
+    if (options?.cacheRetention === "none") {
       summaries += 1;
       return responseStream(measuredAnswer(9_000));
     }

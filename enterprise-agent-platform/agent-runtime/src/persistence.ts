@@ -147,7 +147,7 @@ export class IdempotencyStore {
     return structuredClone(record);
   }
 
-  create(scopeKey: string, idempotencyKey: string, runId: string, sessionId: string, retentionMs: number): PersistentIdempotencyRecord {
+  create(scopeKey: string, idempotencyKey: string, runId: string, sessionId: string, retentionMs: number): void {
     if (this.commitError) throw this.commitError;
     const timestamp = Date.now();
     const record: PersistentIdempotencyRecord = {
@@ -162,7 +162,6 @@ export class IdempotencyStore {
     const candidate = new Map(this.records);
     candidate.set(record.lookup_hash, record);
     this.flush(candidate);
-    return structuredClone(record);
   }
 
   update(

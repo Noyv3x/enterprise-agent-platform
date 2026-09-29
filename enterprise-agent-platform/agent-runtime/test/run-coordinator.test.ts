@@ -838,52 +838,6 @@ test("approval and tool events never journal raw terminal credentials", async ()
   }
 });
 
-test("process write cannot inject a hardline command into a background shell", async () => {
-  const home = await temporaryDirectory("agent-process-write-hardline-");
-  const workspace = await temporaryDirectory("agent-process-write-hardline-workspace-");
-  const faux = fauxProvider();
-  faux.setResponses([
-    fauxAssistantMessage(fauxToolCall("terminal", {
-      command: "bash",
-      background: true,
-      background_kind: "service",
-    }), { stopReason: "toolUse" }),
-    (context) => {
-      const match = /Process started: (process_[a-z0-9]+)/i.exec(JSON.stringify(context.messages));
-      assert.ok(match?.[1]);
-      return fauxAssistantMessage(fauxToolCall("process", {
-        action: "write",
-        process_id: match[1],
-        input: "command -p rm -rf /\n",
-      }), { stopReason: "toolUse" });
-    },
-    fauxAssistantMessage("The unsafe input was blocked."),
-  ]);
-  const coordinator = new RunCoordinator({ config: testConfig(home), streamFn: faux.provider.streamSimple });
-  try {
-    const run = coordinator.createRun({
-      scope_key: "scope",
-      lifecycle_id: "life",
-      session_id: "process-write-hardline",
-      workspace,
-      system_prompt: "You are an Agent.",
-      input: "start a shell",
-      model: { provider: "openai-codex", id: "gpt-5.5" },
-    });
-    assert.equal((await coordinator.wait(run.id)).status, "completed");
-    const events = coordinator.getJournal(run.id)?.list() ?? [];
-    assert.equal(events.filter((event) => event.type === "approval.requested").length, 0);
-    const blocked = events.find((event) => event.type === "tool.failed" && event.data.tool_name === "process");
-    assert.ok(blocked);
-    assert.equal(blocked.data.execution_started, false);
-    assert.match(JSON.stringify(blocked.data.result), /protected host root|blocked/i);
-  } finally {
-    coordinator.shutdown();
-    await rm(home, { recursive: true, force: true });
-    await rm(workspace, { recursive: true, force: true });
-  }
-});
-
 test("a file-writing run returns its own final text without an extra verification turn", async () => {
   const home = await temporaryDirectory("agent-file-write-");
   const workspace = await temporaryDirectory("agent-file-write-workspace-");

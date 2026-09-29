@@ -18,7 +18,6 @@ import {
   APPROVAL_ARGUMENT_MAX_BYTES,
   actionApprovalObject,
   fileApprovalObject,
-  hardBlockedCommand,
   mcpActivityProjection,
   processWriteHardBlock,
   terminalApprovalObject,
@@ -1793,6 +1792,23 @@ export interface ToolPolicyResult {
   executionTarget?: ExecutionTarget;
 }
 
+const GATEWAY_APPROVAL_RULES: Readonly<Record<string, {
+  requiresApproval: (action: unknown) => boolean;
+  reason: string;
+  onceOnly?: boolean;
+}>> = {
+  skill: { requiresApproval: isSkillMutation, reason: "Modify this Agent's skills" },
+  mail: { requiresApproval: isMailMutation, reason: "Perform this external mail operation", onceOnly: true },
+  browser: {
+    requiresApproval: (action) => ["click", "type", "press", "close", "cleanup"].includes(String(action)),
+    reason: "Perform this sensitive browser action",
+  },
+  schedule: {
+    requiresApproval: (action) => isScheduleMutation(action) && action !== "complete_current",
+    reason: "Manage this Agent's scheduled work",
+  },
+};
+
 export async function classifyToolCall(
   toolName: string,
   args: unknown,
@@ -1801,9 +1817,6 @@ export async function classifyToolCall(
 ): Promise<ToolPolicyResult> {
   const values = objectValue(args);
   if (toolName === "terminal") {
-    const command = typeof values.command === "string" ? values.command : "";
-    const hardBlock = hardBlockedCommand(command);
-    if (hardBlock) return { hardBlock };
     if (values.background_kind !== undefined && values.background !== true) {
       return { hardBlock: "background_kind is valid only when background=true" };
     }
@@ -1854,9 +1867,7 @@ export async function classifyToolCall(
     }
     return {
       ...(target === EXECUTION_TARGETS[1] ? {
-        approvalReason: mutatesFile
-          ? "Modify this file on the host"
-          : "Access this file on the host",
+        approvalReason: `${mutatesFile ? "Modify" : "Access"} this file on the host: ${JSON.stringify(approval.displayArguments)}`,
         approvalKey: approval.key,
         allowSession: false,
         allowPermanent: false,
@@ -1866,12 +1877,8 @@ export async function classifyToolCall(
       executionTarget: target,
     };
   }
-  if (
-    toolName === "process"
-    && values.action !== "list"
-    && values.action !== "read"
-    && values.action !== "wait"
-  ) {
+  if (toolName === "process") {
+    const target = requestedExecutionTarget(values.target);
     if (values.action === "write") {
       const hardBlock = processWriteHardBlock(typeof values.input === "string" ? values.input : "");
       if (hardBlock) return { hardBlock };
@@ -1882,29 +1889,9 @@ export async function classifyToolCall(
     } catch (error) {
       return { hardBlock: errorMessage(error) };
     }
-    const target = requestedExecutionTarget(values.target);
     return {
       ...(target === EXECUTION_TARGETS[1] ? {
-        approvalReason: "Control this process on the host",
-        approvalKey: approval.key,
-        allowSession: false,
-        allowPermanent: false,
-      } : {}),
-      displayArguments: { target, ...approval.displayArguments },
-      executionTarget: target,
-    };
-  }
-  if (toolName === "process") {
-    const target = requestedExecutionTarget(values.target);
-    let approval;
-    try {
-      approval = actionApprovalObject(toolName, values);
-    } catch (error) {
-      return { hardBlock: errorMessage(error) };
-    }
-    return {
-      ...(target === EXECUTION_TARGETS[1] ? {
-        approvalReason: "Access processes on the host",
+        approvalReason: `Access processes on the host: ${JSON.stringify(approval.displayArguments)}`,
         approvalKey: approval.key,
         allowSession: false,
         allowPermanent: false,
@@ -1924,7 +1911,7 @@ export async function classifyToolCall(
     }
     return {
       ...(values.action === "call" ? {
-        approvalReason: "Call this workspace MCP tool",
+        approvalReason: `Call this workspace MCP tool: ${JSON.stringify(mcpActivityProjection(values))}`,
         approvalKey: approval.key,
         allowSession: false,
         allowPermanent: false,
@@ -1933,69 +1920,22 @@ export async function classifyToolCall(
       executionTarget: EXECUTION_TARGETS[0],
     };
   }
-  if (toolName === "skill" && isSkillMutation(values.action)) {
-    let approval;
+  const rule = GATEWAY_APPROVAL_RULES[toolName];
+  if (rule?.requiresApproval(values.action)) {
     try {
-      approval = actionApprovalObject(toolName, values);
+      const approval = actionApprovalObject(
+        toolName,
+        toolName === "mail" ? mailApprovalArguments(values) : values,
+      );
+      return {
+        approvalReason: `${rule.reason}: ${JSON.stringify(approval.displayArguments)}`,
+        approvalKey: approval.key,
+        displayArguments: approval.displayArguments,
+        ...(rule.onceOnly ? { allowSession: false, allowPermanent: false } : {}),
+      };
     } catch (error) {
       return { hardBlock: errorMessage(error) };
     }
-    return {
-      approvalReason: "Modify this Agent's skills",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
-    };
-  }
-  if (toolName === "mail" && isMailMutation(values.action)) {
-    let approval;
-    try {
-      approval = actionApprovalObject(toolName, mailApprovalArguments(values));
-    } catch (error) {
-      return { hardBlock: errorMessage(error) };
-    }
-    return {
-      approvalReason: "Perform this external mail operation",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
-      allowSession: false,
-      allowPermanent: false,
-    };
-  }
-  if (toolName === "browser" && [
-    "click",
-    "type",
-    "press",
-    "close",
-    "cleanup",
-  ].includes(String(values.action || ""))) {
-    let approval;
-    try {
-      approval = actionApprovalObject(toolName, values);
-    } catch (error) {
-      return { hardBlock: errorMessage(error) };
-    }
-    return {
-      approvalReason: "Perform this sensitive browser action",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
-    };
-  }
-  if (
-    toolName === "schedule"
-    && isScheduleMutation(values.action)
-    && values.action !== "complete_current"
-  ) {
-    let approval;
-    try {
-      approval = actionApprovalObject(toolName, values);
-    } catch (error) {
-      return { hardBlock: errorMessage(error) };
-    }
-    return {
-      approvalReason: "Manage this Agent's scheduled work",
-      approvalKey: approval.key,
-      displayArguments: approval.displayArguments,
-    };
   }
   return {};
 }

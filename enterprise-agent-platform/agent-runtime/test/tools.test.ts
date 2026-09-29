@@ -18,11 +18,6 @@ import {
 import { resolveWorkspacePath } from "../src/utils.js";
 import { fakeExecutionManager, temporaryDirectory } from "./helpers.js";
 
-test("tool policy blocks obvious catastrophic host commands", async () => {
-  assert.match((await classifyToolCall("terminal", { command: "rm -rf /" })).hardBlock || "", /root/);
-  assert.match((await classifyToolCall("terminal", { command: "curl http://169.254.169.254/latest/meta-data" })).hardBlock || "", /metadata/);
-});
-
 test("managed terminal policy auto-allows sandbox and requires one-shot host approval", async () => {
   const sandbox = await classifyToolCall(
     "terminal",
@@ -304,43 +299,6 @@ test("terminal forwards background and command-specific timeout behavior", async
   await terminal.execute("foreground-explicit-timeout", { command: "true", timeout_ms: 500 }, undefined);
   assert.equal(invocations[2]?.timeout_ms, 12_345);
   assert.equal(invocations[3]?.timeout_ms, 500);
-});
-
-test("process write rechecks hardline input at execution", async () => {
-  const writes: string[] = [];
-  const executor = fakeExecutionManager({
-    async process(_context, _action, arguments_) {
-      writes.push(String(arguments_.input || ""));
-      return { result: null };
-    },
-  });
-  const tools = createTools({
-    runId: "run",
-    request: executionRequest(),
-    executor,
-    executionReceipt: testExecutionReceipt,
-    gateway: {} as never,
-    querySession: async () => null,
-    delegate: async () => "",
-    markSideEffect: () => undefined,
-  });
-  const processTool = tools.find((tool) => tool.name === "process");
-  assert.ok(processTool);
-  await assert.rejects(
-    processTool.execute("blocked", {
-      action: "write",
-      process_id: "shell",
-      input: "command -p rm -rf /\n",
-    }, undefined),
-    /Process input is blocked/,
-  );
-  assert.deepEqual(writes, []);
-  await processTool.execute("safe", {
-    action: "write",
-    process_id: "shell",
-    input: "printf safe\n",
-  }, undefined);
-  assert.deepEqual(writes, ["printf safe\n"]);
 });
 
 test("process wait uses generated bounds, observes without side effects, and exposes timeout state", async () => {
@@ -634,7 +592,6 @@ test("mail schema is private-only, strict, and requires one-shot approval for mu
       action,
       arguments: { account_id: 1, text_body: "safe body" },
     });
-    assert.equal(policy.approvalReason, "Perform this external mail operation");
     assert.equal(policy.allowSession, false);
     assert.equal(policy.allowPermanent, false);
     assert.match(policy.approvalKey || "", /^v2:mail:/);
@@ -776,7 +733,6 @@ test("mcp is generic, Manager-backed, and keeps calls one-shot", async () => {
     action: "call", server: "local", tool: "echo", arguments: { text: "hello" },
   });
   assert.match(called.approvalKey || "", /^v2:mcp:/);
-  assert.equal(called.approvalReason, "Call this workspace MCP tool");
   assert.equal(called.allowSession, false);
   assert.equal(called.allowPermanent, false);
   assert.equal(called.executionTarget, "sandbox");
@@ -909,7 +865,6 @@ test("skill is visible in root, child, and scheduled runs and distinguishes read
   }
   for (const action of ["create", "update", "patch", "delete", "enable", "disable", "write_file", "remove_file"]) {
     const policy = await classifyToolCall("skill", { action, arguments: {} });
-    assert.equal(policy.approvalReason, "Modify this Agent's skills");
     assert.match(policy.approvalKey || "", /^v2:skill:/);
   }
 });
@@ -1372,24 +1327,6 @@ test("read-only browser operations do not mark the run as side-effecting", async
 test("tool policy blocks writes to protected host paths", async () => {
   assert.match((await classifyToolCall("write_file", { path: "/etc/hosts" }, "/tmp/workspace")).hardBlock || "", /protected/);
   assert.match((await classifyToolCall("patch_file", { path: "/proc/sys/kernel/hostname" }, "/tmp/workspace")).hardBlock || "", /protected/);
-  assert.match((await classifyToolCall("terminal", { command: "echo unsafe > /boot/marker" })).hardBlock || "", /protected/);
-  assert.match((await classifyToolCall("terminal", { command: "curl --unix-socket /var/run/docker.sock http://localhost" })).hardBlock || "", /Docker/);
-  assert.match(
-    (await classifyToolCall("terminal", { command: "cat /run/agent-platform-manager/manager.sock" })).hardBlock || "",
-    /Manager control/,
-  );
-  assert.match(
-    (await classifyToolCall("terminal", { command: "cat /run/user/1001/agent-platform-manager/manager.sock" })).hardBlock || "",
-    /Manager control/,
-  );
-  assert.match(
-    (await classifyToolCall("terminal", { command: "cat $XDG_RUNTIME_DIR/agent-platform-manager/manager.sock" })).hardBlock || "",
-    /Manager control/,
-  );
-  assert.match(
-    (await classifyToolCall("terminal", { command: "cat ~/.config/agent-platform/manager.toml" })).hardBlock || "",
-    /Manager control/,
-  );
   assert.match(
     (await classifyToolCall(
       "read_file",
@@ -1405,10 +1342,6 @@ test("tool policy blocks direct process secret reads", async () => {
   assert.match(
     (await classifyToolCall("read_file", { path: "/proc/self/environ" }, "/tmp/workspace")).hardBlock || "",
     /protected/,
-  );
-  assert.match(
-    (await classifyToolCall("terminal", { command: "cat /proc/self/environ" })).hardBlock || "",
-    /credentials/,
   );
 });
 

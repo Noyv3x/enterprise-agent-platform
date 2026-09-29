@@ -14,7 +14,7 @@ const MIN_MAX_BYTES = 512;
 
 export class EventJournal {
   readonly runId: string;
-  private readonly events: RuntimeEvent[] = [];
+  private readonly events = new Map<RuntimeEvent, number>();
   private readonly listeners = new Set<EventListener>();
   private readonly maxEvents: number;
   readonly maxBytes: number;
@@ -30,20 +30,20 @@ export class EventJournal {
   }
 
   publish(type: string, data: JsonObject = {}): RuntimeEvent {
-    const event = boundedEvent({
+    const [event, bytes] = boundedEvent({
       sequence: this.nextSequence++,
       type,
       run_id: this.runId,
       timestamp: nowIso(),
       data: cloneData(data),
     }, this.maxBytes);
-    const bytes = serializedBytes(event);
-    this.events.push(event);
+    this.events.set(event, bytes);
     this.retainedBytes += bytes;
-    while (this.events.length > this.maxEvents || this.retainedBytes > this.maxBytes) {
-      const removed = this.events.shift();
-      if (!removed) break;
-      this.retainedBytes -= serializedBytes(removed);
+    while (this.events.size > this.maxEvents || this.retainedBytes > this.maxBytes) {
+      const oldest = this.events.entries().next().value;
+      if (!oldest) break;
+      this.events.delete(oldest[0]);
+      this.retainedBytes -= oldest[1];
     }
     if (type === "run.completed" || type === "run.failed" || type === "run.cancelled" || type === "run.needs_review") {
       this.terminal = true;
@@ -54,7 +54,11 @@ export class EventJournal {
   }
 
   list(afterSequence = 0): RuntimeEvent[] {
-    return this.events.filter((event) => event.sequence > afterSequence);
+    const events: RuntimeEvent[] = [];
+    for (const event of this.events.keys()) {
+      if (event.sequence > afterSequence) events.push(event);
+    }
+    return events;
   }
 
   subscribe(afterSequence: number, listener: EventListener): () => void {
@@ -68,9 +72,9 @@ export class EventJournal {
   }
 }
 
-function boundedEvent(event: RuntimeEvent, maxBytes: number): RuntimeEvent {
+function boundedEvent(event: RuntimeEvent, maxBytes: number): [RuntimeEvent, number] {
   const originalBytes = serializedBytes(event);
-  if (originalBytes <= maxBytes) return event;
+  if (originalBytes <= maxBytes) return [event, originalBytes];
   const bounded: RuntimeEvent = {
     ...event,
     data: {
@@ -97,7 +101,7 @@ function boundedEvent(event: RuntimeEvent, maxBytes: number): RuntimeEvent {
     if (typeof value === "string") addBoundedString(bounded, key, value, maxBytes);
     else addIfFits(bounded, key, value, maxBytes);
   }
-  return bounded;
+  return [bounded, serializedBytes(bounded)];
 }
 
 function addIfFits(event: RuntimeEvent, key: string, value: unknown, maxBytes: number): void {
@@ -130,21 +134,12 @@ function addBoundedString(event: RuntimeEvent, key: string, value: string, maxBy
 
 function cloneData(data: JsonObject): JsonObject {
   try {
-    return omitInternalApprovalKeys(JSON.parse(JSON.stringify(data))) as JsonObject;
+    return JSON.parse(JSON.stringify(data, (key, value) =>
+      key === "approval_key" || key === "approvalKey" ? undefined : value,
+    )) as JsonObject;
   } catch {
     return { truncated: true, error: "Event payload was not JSON-serializable" };
   }
-}
-
-function omitInternalApprovalKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((item) => omitInternalApprovalKeys(item));
-  if (!value || typeof value !== "object") return value;
-  const sanitized: JsonObject = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (key === "approval_key" || key === "approvalKey") continue;
-    sanitized[key] = omitInternalApprovalKeys(item);
-  }
-  return sanitized;
 }
 
 function serializedBytes(value: unknown): number {

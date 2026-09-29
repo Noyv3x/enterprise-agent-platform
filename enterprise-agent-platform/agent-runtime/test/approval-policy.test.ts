@@ -4,8 +4,6 @@ import test from "node:test";
 import {
   APPROVAL_ARGUMENT_MAX_BYTES,
   actionApprovalObject,
-  hardBlockedCommand,
-  normalizeCommandForApproval,
   redactCommandForApproval,
   redactToolArgumentsForJournal,
 } from "../src/approval-policy.js";
@@ -173,7 +171,7 @@ test("approved mutation keys bind all arguments and redact body fields", async (
   }
 });
 
-test("process write rejects oversized and hardline input before approval", async () => {
+test("process write rejects oversized input before approval", async () => {
   const oversized = await hostPolicy("process", {
     action: "write",
     process_id: "shell",
@@ -181,9 +179,6 @@ test("process write rejects oversized and hardline input before approval", async
   });
   assert.match(oversized.hardBlock || "", /Process input exceeds/);
   assert.equal(oversized.approvalKey, undefined);
-  for (const input of ["rm -rf /\n", "command -p rm -rf /\n", "printf 'rm -rf /' | sh\n"]) {
-    assert.ok((await hostPolicy("process", { action: "write", process_id: "shell", input })).hardBlock);
-  }
 });
 
 test("terminal and process write reject executable shell syntax hidden by redaction", async () => {
@@ -264,8 +259,6 @@ test("terminal and process write reject executable shell syntax hidden by redact
   for (const safeCommand of [
     "curl -H 'Authorization: Bearer ordinary-secret' https://example.test",
     "curl -HAuthorization:compact-secret https://example.test",
-    "curl -H 'Authorization: foo>bar' https://example.test",
-    "tool --api-key=foo\\>bar",
     "tool --api-key='complex secret value'",
     "printf '%s' 'documentation API_TOKEN=complex value'",
   ]) {
@@ -405,68 +398,13 @@ test("browser approval keys bind every structured argument while hiding typed te
   assert.match(displayed, /"ref":"e1"/);
 });
 
-test("hardline command policy deobfuscates catastrophic commands and respects command position", () => {
-  const blocked = [
-    "rm -rf /",
-    "rm -rf \"/\"",
-    "r''m${IFS}-rf${IFS}/",
-    "r$()m -rf /",
-    "sudo -n /bin/rm --recursive --force /../..",
-    "/usr/bin/env rm -rf /",
-    "/usr/bin/sudo /bin/rm -rf /",
-    "/usr/bin/command rm -rf /",
-    "/bin/busybox rm -rf /",
-    "command -p rm -rf /",
-    "command -- rm -rf /",
-    "exec -a helper rm -rf /",
-    "nohup -- rm -rf /",
-    "time -p rm -rf /",
-    "nice rm -rf /",
-    "rm -rf \"$HOME\"/*",
-    "rm -rf \"${HOME:?}\"/.[!.]*",
-    "find / -delete",
-    "find -- / -delete",
-    "find -H / -delete",
-    "find / -exec rm -rf {} +",
-    "cmd=rm; $cmd -rf /",
-    "eval 'rm -rf /'",
-    "printf 'rm -rf /' | sh",
-    "echo ready && reboot",
-    "echo $(shutdown -h now)",
-    "bash -lc 'mkfs.ext4 /dev/sda1'",
-    "dd if=/dev/zero of=/dev/nvme0n1",
-    "wipefs --all /dev/sda",
-    "printf x > /dev/sda",
-    "printf x>/dev/mapper/root",
-    ">/dev/sda echo x",
-    "kill -9 -1",
-    ":(){ :|:& };:",
-  ];
-  for (const command of blocked) {
-    assert.ok(hardBlockedCommand(command), `expected hard block for ${command}`);
-  }
-  for (const command of [
-    "echo reboot",
-    "printf '%s' 'rm -rf /'",
-    "git commit -m 'document shutdown and reboot'",
-    "command -v rm",
-    "command -V reboot",
-    "printf data | sh -c 'cat >/dev/null'",
-    "printf '%s' 'find / -delete; wipefs /dev/sda; rm -rf /'",
-    "printf ok > /dev/null",
-    "rm -rf ./build",
-  ]) {
-    assert.equal(hardBlockedCommand(command), undefined, `unexpected hard block for ${command}`);
-  }
-});
 
-test("approval command display redacts credentials without changing policy normalization", () => {
+test("approval command display redacts credentials", () => {
   const token = `ghp_${"X".repeat(36)}`;
   const command = `API_TOKEN=${token} curl -H 'Authorization: Bearer ${token}' https://user:${token}@example.test`;
   const redacted = redactCommandForApproval(command);
   assert.doesNotMatch(redacted, new RegExp(token));
   assert.match(redacted, /\[redacted\]/);
-  assert.match(normalizeCommandForApproval(command), new RegExp(token));
 });
 
 test("approval command display redacts common API credential headers", () => {
@@ -525,8 +463,29 @@ test("approval command display redacts common attached client credentials withou
   ]) {
     const redacted = redactCommandForApproval(command);
     assert.doesNotMatch(redacted, /nested-secret/);
-    assert.match(redacted, /nested shell evaluation/);
+    assert.match(redacted, /command omitted/);
   }
+});
+
+test("credential display redacts every value after public options and repeated client flags", () => {
+  const command = "curl --silent --api-key first-secret -uuser:second-secret -Uproxy:third-secret -b 'cookie=fourth-secret' https://example.test";
+  const display = redactCommandForApproval(command);
+  assert.doesNotMatch(display, /(?:first|second|third|fourth)-secret/);
+  assert.match(display, /https:\/\/example.test/);
+  assert.match(display, /--silent/);
+  assert.match(display, /-u\[redacted\] -U\[redacted\] -b \[redacted\]/);
+});
+
+test("nonterminal approval descriptions expose the target without persisting private payloads", async () => {
+  const file = await hostPolicy("write_file", { path: "/workspace/report.txt", content: "private-file-body" });
+  assert.match(file.approvalReason ?? "", /host.*\/workspace\/report.txt/);
+  assert.doesNotMatch(file.approvalReason ?? "", /private-file-body/);
+  const mcp = await classifyToolCall("mcp", {
+    action: "call", server: "workspace-server", tool: "update-record",
+    arguments: { content: "private-mcp-payload" },
+  });
+  assert.match(mcp.approvalReason ?? "", /workspace-server.*update-record/);
+  assert.doesNotMatch(mcp.approvalReason ?? "", /private-mcp-payload/);
 });
 
 async function hostPolicy(

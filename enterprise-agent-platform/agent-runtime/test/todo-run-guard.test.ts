@@ -197,9 +197,7 @@ test("context compaction keeps Runtime-owned active todos outside the summarized
   summaries.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage(
     "Current objective: preserve the active task and continue after context compaction.",
   )));
-  const streamFn: StreamFn = (model, context, options) => getCurrentSystemPrompt(context.messages)?.startsWith(
-    "Create a concise continuation handoff",
-  )
+  const streamFn: StreamFn = (model, context, options) => options?.cacheRetention === "none"
     ? summaries.provider.streamSimple(model, context, options)
     : faux.provider.streamSimple(model, context, options);
   const coordinator = new RunCoordinator({
