@@ -705,10 +705,7 @@ class AgentScopeSessionTests(unittest.TestCase):
             connection.commit()
             connection.close()
 
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "does not match the current baseline marker",
-            ):
+            with self.assertRaises(sqlite3.DatabaseError):
                 Database(path)
 
             verification = sqlite3.connect(path)
@@ -759,61 +756,6 @@ class AgentScopeSessionTests(unittest.TestCase):
                     "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
                 ).fetchall()
             self.assertEqual(tables, [])
-
-    def test_current_marker_with_unknown_business_table_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = make_config(Path(td)).db_path
-            db = Database(path)
-            db.execute("CREATE TABLE unexpected_business_table(id INTEGER PRIMARY KEY)")
-            db.close()
-
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "outside the current baseline: unexpected_business_table",
-            ):
-                Database(path)
-    def test_current_marker_with_missing_job_table_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = make_config(Path(td)).db_path
-            db = Database(path)
-            db.execute("DROP TABLE agent_run_inputs")
-            db.close()
-
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "missing current baseline table agent_run_inputs",
-            ):
-                Database(path)
-
-    def test_current_marker_with_extra_column_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = make_config(Path(td)).db_path
-            db = Database(path)
-            db.execute("ALTER TABLE users ADD COLUMN retired_value TEXT")
-            db.close()
-
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "users has non-current columns: unexpected retired_value",
-            ):
-                Database(path)
-
-    def test_conflicting_baseline_marker_is_rejected(self):
-        with tempfile.TemporaryDirectory() as td:
-            path = make_config(Path(td)).db_path
-            db = Database(path)
-            db.execute(
-                "UPDATE schema_migrations SET name = 'unexpected-baseline' "
-                "WHERE version = ?",
-                (DATABASE_SCHEMA_VERSION,),
-            )
-            db.close()
-
-            with self.assertRaisesRegex(
-                sqlite3.DatabaseError,
-                "does not match the current baseline marker",
-            ):
-                Database(path)
 
     def test_repeated_ensure_uses_read_only_scope_fast_path(self):
         with tempfile.TemporaryDirectory() as td:

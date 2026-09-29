@@ -35,7 +35,7 @@
 | Docker 与网络 | 只有 Manager 能访问 Docker socket，其它服务不能挂载或代理它。Manager 持有一个持久的私有网络，Compose 只引用这个外部网络；Manager 只接管带契约标签和驱动的网络，不覆盖同名的未知网络。只有 Platform 后端发布到宿主机回环地址，其它服务都不公开。 |
 | 技术身份 | 发布清单精确列出十个现役镜像，没有辅助镜像、历史解码、额外描述、可变 tag 或任意 shell。机器身份在编译时固定，品牌、命令行参数或清单都不能换成另一套。 |
 | 沙箱的 root 阶段 | 只在 PID 1 的映射阶段使用 root：检查 UID/GID 为正整数且不与其它账号冲突；工作区、HOME、环境三个挂载根不能是符号链接；只修改根目录的属主和权限，不递归，不碰只读附件。之后切换为部署的 agent 身份，`docker exec` 也显式使用同一 UID/GID，没有以 root 运行的业务进程。 |
-| Platform 的 root 阶段 | 只有入口脚本和固定的健康检查降权程序以 root 运行。serve、init-admin、print-agent-token、健康检查在创建目录、读取密钥、加载业务之前清除附加组、设置 no-new-privs 并降为部署 UID/GID；其它以 root 执行的命令一律拒绝。root 下的 Python 只能用镜像内的绝对路径解释器、隔离模式和 root 所有的工作目录，不从数据目录或环境导入代码。migrate 是唯一例外，见[受控迁移](../reference/data-layout.md#受控迁移)。 |
+| Platform 的 root 阶段 | 只有入口脚本和固定的健康检查降权程序以 root 运行。migrate、serve、init-admin、print-agent-token、健康检查在创建目录、读取密钥、加载业务之前清除附加组、设置 no-new-privs 并降为部署 UID/GID；其它以 root 执行的命令一律拒绝。迁移不再以 root 检查数据库或转换旧工作区的属主和权限，Python 业务始终以部署身份运行。 |
 | 内部认证 | Platform 和 Runtime 的内部 HTTP（包括内部健康检查）需要独立 token，浏览器会话不能替代。Manager socket 同时验证同 UID 的对端和严格的 Bearer；路径、地址、对话范围或容器名都不构成授权。 |
 | 权限令牌 | manager-token 用于 Platform 和命令行控制及回调；manager-executor-token 只能访问 Runtime 用的 `/v1/executor/*`。两者不能互换，也不能交叉挂载。只读挂载独立的 control 目录，而不是 socket 文件本身或整个状态根目录；这样 socket 可以重建，又不暴露其它状态。 |
 

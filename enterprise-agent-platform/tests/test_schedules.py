@@ -1492,6 +1492,39 @@ class ScheduleServiceTests(unittest.TestCase):
             finally:
                 service.close()
 
+    def test_recovery_rejects_scheduled_job_without_durable_run_link(self):
+        with tempfile.TemporaryDirectory() as td:
+            agent = RecordingAgent()
+            service = EnterpriseService(make_config(Path(td)), agent_client=agent)
+            try:
+                _, admin = service.authenticate("admin", "admin")
+                schedule = self._create(service, admin)
+                with mock.patch.object(
+                    service, "_schedule_agent_task", side_effect=RuntimeError("hold durable job")
+                ):
+                    accepted = service.run_private_schedule_now(admin, schedule["id"])["run"]
+                run = service.schedules.get_run(accepted["id"])
+                job_id = int(run["durable_job_id"])
+                service.db.execute(
+                    "UPDATE agent_schedule_runs SET durable_job_id = NULL WHERE id = ?",
+                    (run["id"],),
+                )
+
+                service._recover_durable_work()
+                service.wait_for_agent_idle("private", str(admin["id"]), timeout=5)
+
+                job = service.jobs.get(job_id)
+                self.assertEqual(job.status, "failed")
+                self.assertIn("no durable run link", job.last_error)
+                self.assertEqual(agent.calls, [])
+                self.assertIsNone(
+                    service.agent_message_replying_to(
+                        "private", str(admin["id"]), int(run["source_message_id"])
+                    )
+                )
+            finally:
+                service.close()
+
     def test_recovery_blocks_unsafe_queued_schedule_prompt_before_wakeup(self):
         with tempfile.TemporaryDirectory() as td:
             agent = RecordingAgent()

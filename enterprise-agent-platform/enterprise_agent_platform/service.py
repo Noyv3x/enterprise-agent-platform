@@ -58,7 +58,7 @@ from .config import OAUTH_SECRET_KEYS, PlatformConfig
 from .container_contract_generated import CONTAINER_PATHS
 from .db import (
     Database,
-    assert_existing_database_profile,
+    assert_existing_database_version,
     decode_json,
     encode_json,
     now_ts,
@@ -762,16 +762,6 @@ OAUTH_PROVIDER_SECRET_KEYS = {
     "openai-codex": ("CODEX_OAUTH_ACCESS_TOKEN", "CODEX_OAUTH_REFRESH_TOKEN"),
 }
 OAUTH_PROVIDER_EXPIRY_KEYS = {"openai-codex": "CODEX_OAUTH_EXPIRES_AT"}
-# Grok OAuth was retired. Its credentials, provider choice, and credential
-# revision are deleted on startup; see EnterpriseService._retire_grok_provider.
-RETIRED_AGENT_PROVIDER_SETTING = "agent_runtime_provider"
-RETIRED_GROK_SETTING_KEYS = (
-    "GROK_OAUTH_ACCESS_TOKEN",
-    "GROK_OAUTH_REFRESH_TOKEN",
-    "GROK_OAUTH_ID_TOKEN",
-    "GROK_OAUTH_EXPIRES_AT",
-    "AGENT_PLATFORM_OAUTH_CREDENTIAL_REVISION:xai-oauth",
-)
 
 
 PERMISSION_GROUPS: dict[str, dict[str, Any]] = {
@@ -867,9 +857,8 @@ class EnterpriseService:
         startup_schema_writes_committed = bool(
             not startup_reservation_id and startup_settlement_action != "abort"
         )
-        assert_existing_database_profile(
+        assert_existing_database_version(
             self.config.db_path,
-            self.config.technical_profile,
         )
         assert_existing_workspace_profile(self.config)
         self._fresh_initialization = not os.path.lexists(self.config.db_path)
@@ -1856,7 +1845,25 @@ class EnterpriseService:
             if task is None or not self._valid_recovered_agent_task(task):
                 self.jobs.mark_failed(job.id, "durable Agent payload is no longer valid")
                 continue
-            schedule_run_id = self._recovered_schedule_run_id(task, job_id=job.id)
+            schedule_run_id = self.db.scalar(
+                "SELECT id FROM agent_schedule_runs WHERE durable_job_id = ?",
+                (job.id,),
+            )
+            if schedule_run_id is None:
+                runtime_metadata = task.get("runtime_metadata")
+                message_metadata = task["user_message"].get("metadata")
+                if (
+                    task.get("schedule_run_id")
+                    or isinstance(runtime_metadata, dict)
+                    and (
+                        runtime_metadata.get("schedule_run_id")
+                        or runtime_metadata.get("trigger") == "scheduled"
+                    )
+                    or isinstance(message_metadata, dict)
+                    and "scheduled_task" in message_metadata
+                ):
+                    self.jobs.mark_failed(job.id, "scheduled Agent job has no durable run link")
+                    continue
             if schedule_run_id:
                 try:
                     task["content"] = validate_schedule_prompt(task.get("content"))
@@ -2114,41 +2121,6 @@ class EnterpriseService:
             )
         )
 
-    def _recovered_schedule_run_id(
-        self,
-        task: dict[str, Any],
-        *,
-        job_id: int = 0,
-    ) -> int:
-        """Return the authoritative schedule-run link for recovered work."""
-
-        if job_id > 0:
-            linked = self.db.scalar(
-                "SELECT id FROM agent_schedule_runs WHERE durable_job_id = ?",
-                (int(job_id),),
-            )
-            if linked is not None:
-                return int(linked)
-        candidates = [task.get("schedule_run_id")]
-        runtime_metadata = task.get("runtime_metadata")
-        if isinstance(runtime_metadata, dict):
-            candidates.append(runtime_metadata.get("schedule_run_id"))
-        user_message = task.get("user_message")
-        if isinstance(user_message, dict):
-            message_metadata = user_message.get("metadata")
-            if isinstance(message_metadata, dict):
-                scheduled_task = message_metadata.get("scheduled_task")
-                if isinstance(scheduled_task, dict):
-                    candidates.append(scheduled_task.get("schedule_run_id"))
-        for candidate in candidates:
-            try:
-                run_id = int(candidate or 0)
-            except (TypeError, ValueError):
-                continue
-            if run_id > 0 and self.schedules.get_run(run_id) is not None:
-                return run_id
-        return 0
-
     def _block_recovered_scheduled_job(self, job_id: int, run_id: int) -> None:
         """Atomically terminalize unsafe queued schedule work before wake-up."""
 
@@ -2227,10 +2199,6 @@ class EnterpriseService:
                 actor=None,
                 _allow_weak_password=allow_weak,
             )
-        if not self.get_setting("agent_tool_token"):
-            token = self.config.agent_tool_token or secrets.token_urlsafe(32)
-            self.set_setting("agent_tool_token", token, secret=True)
-        self._retire_grok_provider()
         defaults = {
             AGENT_SETTING_MODEL: self.config.agent_runtime_model,
             AGENT_SETTING_IDLE_TIMEOUT: str(
@@ -2243,28 +2211,6 @@ class EnterpriseService:
             if self.get_setting(key) is not None:
                 continue
             self.set_setting(key, default)
-
-    def _retire_grok_provider(self) -> None:
-        """Delete state left by the retired Grok OAuth provider.
-
-        A deployment that ran on Grok also stored Grok model ids as its
-        deployment and account model choices. Those return to automatic Codex
-        selection instead of being sent to a provider that never offered them.
-        The provider row is the marker and is deleted in the same transaction,
-        so this runs its model reset at most once and is otherwise a no-op.
-        """
-        keys = (RETIRED_AGENT_PROVIDER_SETTING, *RETIRED_GROK_SETTING_KEYS)
-        placeholders = ",".join("?" for _ in keys)
-        with self._auth_lock:
-            with self.db.transaction(immediate=True) as conn:
-                provider = conn.execute(
-                    "SELECT value FROM settings WHERE key = ?",
-                    (RETIRED_AGENT_PROVIDER_SETTING,),
-                ).fetchone()
-                if provider is not None and str(provider["value"]).strip() == "xai-oauth":
-                    self._write_setting(conn, AGENT_SETTING_MODEL, "")
-                    conn.execute("UPDATE users SET model_name = '' WHERE model_name != ''")
-                conn.execute(f"DELETE FROM settings WHERE key IN ({placeholders})", keys)
 
     def _bootstrap_admin_password(self) -> tuple[str, bool]:
         configured = os.getenv(
@@ -12056,7 +12002,6 @@ class EnterpriseService:
                 snapshot = self._agent_browser_snapshot(base_url, tab_id, user_id, headers)
                 created["snapshot"] = snapshot.get("snapshot", "")
                 created["refsCount"] = snapshot.get("refsCount", 0)
-                created["url"] = snapshot.get("url") or created.get("url")
                 created["url"] = self._agent_browser_validate_tab_url(
                     base_url,
                     tab_id,
@@ -12221,8 +12166,6 @@ class EnterpriseService:
         # from operating another Agent's guessed tab ID.
         payload["userId"] = user_id
         if route == "navigate":
-            if not payload.get("url") and not payload.get("macro"):
-                raise ServiceError(400, "browser navigate requires url or macro")
             payload["sessionKey"] = "agent"
             if payload.get("url"):
                 self._validate_browser_url(str(payload["url"]))
@@ -12235,7 +12178,6 @@ class EnterpriseService:
             snapshot = self._agent_browser_snapshot(base_url, tab_id, user_id, headers)
             result["snapshot"] = snapshot.get("snapshot", "")
             result["refsCount"] = snapshot.get("refsCount", 0)
-            result["url"] = snapshot.get("url") or result.get("url")
         result["url"] = self._agent_browser_validate_tab_url(
             base_url,
             tab_id,

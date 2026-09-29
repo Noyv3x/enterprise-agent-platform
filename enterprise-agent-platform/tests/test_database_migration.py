@@ -1,811 +1,143 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import shutil
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from enterprise_agent_platform import db as db_module
-from enterprise_agent_platform.agent_scopes import AgentScopeManager
-from enterprise_agent_platform.camofox_state import (
-    CAMOFOX_SIDECAR_NAME,
-    expected_camofox_sidecar,
-)
-from enterprise_agent_platform.config import PlatformConfig
-from enterprise_agent_platform.db import Database, migrate_database
-from enterprise_agent_platform.skills import (
-    SkillStore,
-    _default_usage_record,
-    _render_skill_document,
-    _render_sidecar,
-    _render_usage_state,
-    _validated_document,
-)
-from enterprise_agent_platform.workspace_mount_compat import (
-    normalize_legacy_workspace_mounts,
-)
-
-
-SOURCE_SCHEMA_VERSION = 2026080801
-TARGET_SCHEMA_VERSION = 2026082901
-SCOPE_KEY = "private:7"
-WORKSPACE_PATH = "user-7"
-SKILL_ID = "portable-workflow"
-
-RETIRED_SCHEMA = """
-CREATE TABLE knowledge_documents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    summary TEXT NOT NULL,
-    content TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT '',
-    created_by INTEGER REFERENCES users(id),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    content_hash TEXT NOT NULL DEFAULT ''
-);
-CREATE UNIQUE INDEX idx_knowledge_documents_content_hash
-    ON knowledge_documents(content_hash) WHERE content_hash != '';
-CREATE TABLE knowledge_index_generations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    config_hash TEXT NOT NULL,
-    embedding_base_url TEXT NOT NULL,
-    embedding_model TEXT NOT NULL,
-    embedding_dimensions INTEGER
-        CHECK(embedding_dimensions IS NULL OR embedding_dimensions BETWEEN 1 AND 65536),
-    chunker_version TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'building'
-        CHECK(status IN ('building', 'active', 'failed', 'superseded')),
-    document_count INTEGER NOT NULL DEFAULT 0 CHECK(document_count >= 0),
-    ready_document_count INTEGER NOT NULL DEFAULT 0
-        CHECK(ready_document_count >= 0 AND ready_document_count <= document_count),
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    activated_at INTEGER
-);
-CREATE INDEX idx_knowledge_index_generations_status
-    ON knowledge_index_generations(status, id DESC);
-CREATE UNIQUE INDEX uq_knowledge_index_generations_active
-    ON knowledge_index_generations(status) WHERE status = 'active';
-CREATE TABLE knowledge_document_index (
-    generation_id INTEGER NOT NULL
-        REFERENCES knowledge_index_generations(id) ON DELETE CASCADE,
-    document_id INTEGER NOT NULL
-        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
-    expected_hash TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending', 'ready', 'failed')),
-    chunk_count INTEGER NOT NULL DEFAULT 0 CHECK(chunk_count >= 0),
-    last_error TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    PRIMARY KEY(generation_id, document_id)
-);
-CREATE INDEX idx_knowledge_document_index_status
-    ON knowledge_document_index(generation_id, status, document_id);
-CREATE TABLE knowledge_chunks (
-    generation_id INTEGER NOT NULL
-        REFERENCES knowledge_index_generations(id) ON DELETE CASCADE,
-    chunk_id TEXT NOT NULL,
-    document_id INTEGER NOT NULL
-        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
-    chunk_index INTEGER NOT NULL CHECK(chunk_index >= 0),
-    title_path TEXT NOT NULL DEFAULT '',
-    content TEXT NOT NULL,
-    char_start INTEGER NOT NULL CHECK(char_start >= 0),
-    char_end INTEGER NOT NULL CHECK(char_end > char_start),
-    chunk_hash TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY(generation_id, chunk_id),
-    UNIQUE(generation_id, document_id, chunk_index)
-);
-CREATE INDEX idx_knowledge_chunks_document
-    ON knowledge_chunks(generation_id, document_id, chunk_index);
-CREATE TABLE knowledge_chunk_embeddings (
-    generation_id INTEGER NOT NULL,
-    chunk_id TEXT NOT NULL,
-    dimensions INTEGER NOT NULL CHECK(dimensions BETWEEN 1 AND 65536),
-    vector BLOB NOT NULL,
-    norm REAL NOT NULL CHECK(norm > 0),
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY(generation_id, chunk_id),
-    FOREIGN KEY(generation_id, chunk_id)
-        REFERENCES knowledge_chunks(generation_id, chunk_id) ON DELETE CASCADE
-);
-CREATE TABLE knowledge_document_files (
-    document_id INTEGER PRIMARY KEY
-        REFERENCES knowledge_documents(id) ON DELETE CASCADE,
-    filename TEXT NOT NULL CHECK(length(filename) BETWEEN 1 AND 255),
-    media_type TEXT NOT NULL CHECK(length(media_type) BETWEEN 1 AND 255),
-    size_bytes INTEGER NOT NULL CHECK(size_bytes > 0 AND size_bytes <= 52428800),
-    sha256 TEXT NOT NULL
-        CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
-    content BLOB NOT NULL CHECK(length(content) = size_bytes),
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE sylver_platform_connections (
-    owner_user_id INTEGER PRIMARY KEY
-        REFERENCES users(id) ON DELETE CASCADE,
-    base_url TEXT NOT NULL CHECK(length(base_url) > 0),
-    remote_user_id INTEGER NOT NULL CHECK(remote_user_id > 0),
-    username TEXT NOT NULL CHECK(length(username) > 0),
-    full_name TEXT NOT NULL DEFAULT '',
-    title TEXT NOT NULL DEFAULT '',
-    email TEXT NOT NULL DEFAULT '',
-    role TEXT NOT NULL DEFAULT '',
-    verified_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    UNIQUE(base_url, remote_user_id)
-);
-CREATE TABLE sylver_platform_credentials (
-    owner_user_id INTEGER PRIMARY KEY
-        REFERENCES sylver_platform_connections(owner_user_id) ON DELETE CASCADE,
-    token TEXT NOT NULL CHECK(length(token) > 0),
-    updated_at INTEGER NOT NULL
-);
-"""
-
-
-def write_private(path: Path, content: bytes) -> None:
-    path.write_bytes(content)
-    path.chmod(0o600)
-
-
-def create_source_database(
-    data_dir: Path,
-    *,
-    with_legacy_skill: bool = True,
-) -> tuple[Path, Path, Path]:
-    database_path = data_dir / "platform.db"
-    workspace = data_dir / "workspaces" / WORKSPACE_PATH
-    workspace.mkdir(mode=0o700, parents=True)
-    (data_dir / "workspaces").chmod(0o700)
-    database = Database(database_path)
-    try:
-        AgentScopeManager(
-            PlatformConfig(
-                data_dir=data_dir,
-                host="127.0.0.1",
-                port=8765,
-                public_base_url="http://127.0.0.1:8765",
-                token_secret="test-secret",
-                token_ttl_seconds=3600,
-                agent_tool_token=None,
-            ),
-            database,
-        ).ensure_private_scope(7)
-    finally:
-        database.close()
-
-    # The source is an existing deployment, not only an old schema. Keep its
-    # managed runtime identity present just as the migration snapshot does.
-    runtime = data_dir / "runtimes" / "camofox"
-    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (data_dir / "runtimes").chmod(0o700)
-    write_private(
-        runtime / CAMOFOX_SIDECAR_NAME,
-        (json.dumps(expected_camofox_sidecar(), sort_keys=True) + "\n").encode("utf-8"),
-    )
-
-    digest = hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
-    legacy_scope = data_dir / "agent-skills" / digest
-    legacy_scope.mkdir(mode=0o700, parents=True)
-    (data_dir / "agent-skills").chmod(0o700)
-    write_private(legacy_scope / ".lock", b"")
-    if with_legacy_skill:
-        package = legacy_scope / SKILL_ID
-        references = package / "references"
-        references.mkdir(mode=0o700, parents=True)
-        package.chmod(0o700)
-        document = _validated_document(
-            name="Portable Workflow",
-            description="A migrated workflow.",
-            instructions="Use the migrated workflow.",
-            version="1.0.0",
-            category="general",
-            tags=["migration"],
-        )
-        write_private(
-            package / "SKILL.md",
-            _render_skill_document(document).encode("utf-8"),
-        )
-        write_private(references / "guide.txt", b"portable support\n")
-        write_private(
-            package / ".skill.json",
-            _render_sidecar(
-                {
-                    "schema_version": 1,
-                    "id": SKILL_ID,
-                    "enabled": True,
-                    "created_at": "2026-08-01T00:00:00+00:00",
-                    "updated_at": "2026-08-02T00:00:00+00:00",
-                }
-            ),
-        )
-        usage = {
-            "schema_version": 1,
-            "skills": {SKILL_ID: _default_usage_record(created_by="agent")},
-        }
-        usage["skills"][SKILL_ID]["use_count"] = 3
-        write_private(legacy_scope / ".skill-usage.json", _render_usage_state(usage))
-
-    with sqlite3.connect(database_path) as connection:
-        connection.executescript(RETIRED_SCHEMA)
-        connection.execute(
-            "INSERT INTO settings(key, value, secret, updated_at) "
-            "VALUES ('knowledge_embedding_model', 'retired-model', 0, 1)"
-        )
-        connection.execute(
-            "INSERT INTO durable_jobs(kind, scope_type, scope_id, dedupe_key, "
-            "created_at, updated_at) VALUES "
-            "('knowledge_index', 'knowledge', '1', 'knowledge:1', 1, 1)"
-        )
-        connection.execute(
-            "UPDATE schema_migrations SET version = ?",
-            (SOURCE_SCHEMA_VERSION,),
-        )
-    return database_path, workspace, legacy_scope
-
-
-def marker(database_path: Path) -> int:
-    with sqlite3.connect(database_path) as connection:
-        return int(connection.execute("SELECT version FROM schema_migrations").fetchone()[0])
+from enterprise_agent_platform.container_contract_generated import DATABASE_SCHEMA_VERSION
+from enterprise_agent_platform.db import Database, assert_existing_database_version, migrate_database
 
 
 class DatabaseMigrationTests(unittest.TestCase):
-    def test_migrated_deployment_starts_with_preserved_runtime_identity(self):
-        from enterprise_agent_platform.service import EnterpriseService
-        from test_platform import RecordingAgent, make_config
-
+    def test_fresh_migration_and_current_retry_preserve_data(self):
         with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            runtime = data_dir / "runtimes" / "camofox"
-            runtime.mkdir(mode=0o700, parents=True)
-            database_path, workspace, _legacy = create_source_database(data_dir)
-            sidecar = runtime / CAMOFOX_SIDECAR_NAME
-            original = sidecar.read_bytes()
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-
-            self.assertEqual(
-                migrate_database(database_path, data_dir=data_dir),
-                TARGET_SCHEMA_VERSION,
-            )
-            service = EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
+            root = Path(directory)
+            path = root / "platform.db"
+            self.assertEqual(migrate_database(path, data_dir=root), DATABASE_SCHEMA_VERSION)
+            database = Database(path)
+            database.execute("INSERT INTO settings VALUES ('retained', 'value', 0, 1)")
+            before = list(database._conn.iterdump())
+            database.close()
+            self.assertEqual(migrate_database(path, data_dir=root), DATABASE_SCHEMA_VERSION)
+            database = Database(path)
             try:
-                self.assertIn(
-                    SKILL_ID,
-                    {skill["id"] for skill in service.skills.list(SCOPE_KEY)},
-                )
-                self.assertEqual(
-                    (workspace / ".agent-platform" / "skills" / SKILL_ID / "references" / "guide.txt").read_bytes(),
-                    b"portable support\n",
-                )
-                self.assertEqual(sidecar.read_bytes(), original)
+                self.assertEqual(list(database._conn.iterdump()), before)
+                self.assertEqual(database.scalar("PRAGMA journal_mode"), "wal")
+                self.assertEqual(database.scalar("PRAGMA foreign_keys"), 1)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             finally:
-                service.close()
+                database.close()
 
-    def test_migrated_existing_deployment_missing_sidecar_still_rejects_startup(self):
-        from enterprise_agent_platform.service import EnterpriseService
-        from test_platform import RecordingAgent, make_config
+    def test_unsupported_versions_are_rejected_without_writes(self):
+        for version in (2026080801, DATABASE_SCHEMA_VERSION + 1):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                path = root / "platform.db"
+                database = Database(path)
+                database.execute("UPDATE schema_migrations SET version = ?", (version,))
+                database.close()
+                original = path.read_bytes()
+                for action in (lambda: assert_existing_database_version(path),
+                               lambda: Database(path),
+                               lambda: migrate_database(path, data_dir=root)):
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        action()
+                    self.assertEqual(path.read_bytes(), original)
 
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, _workspace, _legacy = create_source_database(data_dir)
-            sidecar = data_dir / "runtimes" / "camofox" / CAMOFOX_SIDECAR_NAME
-            sidecar.unlink()
-            migrate_database(database_path, data_dir=data_dir)
-            with self.assertRaises(sqlite3.DatabaseError):
-                EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
-            self.assertFalse(sidecar.exists())
-            self.assertEqual(marker(database_path), TARGET_SCHEMA_VERSION)
+    def test_missing_or_malformed_version_is_not_fresh(self):
+        for statement in ("DROP TABLE schema_migrations", "DELETE FROM schema_migrations",
+                          "UPDATE schema_migrations SET version = 1"):
+            with self.subTest(statement=statement), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "platform.db"
+                database = Database(path)
+                database.execute(statement)
+                database.close()
+                original = path.read_bytes()
+                with self.assertRaises(sqlite3.DatabaseError):
+                    migrate_database(path, data_dir=path.parent)
+                self.assertEqual(path.read_bytes(), original)
 
-    def test_fresh_migrate_initializes_runtime_before_existing_service_startup(self):
-        from enterprise_agent_platform.service import EnterpriseService
-        from test_platform import RecordingAgent, make_config
+    def test_nonzero_unversioned_database_is_never_initialized(self):
+        for schema in (
+            "CREATE VIEW retained_view AS SELECT 7",
+            "CREATE TABLE discarded(id INTEGER PRIMARY KEY AUTOINCREMENT); DROP TABLE discarded",
+            "PRAGMA user_version = 7",
+        ):
+            with self.subTest(schema=schema), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "platform.db"
+                with sqlite3.connect(path) as connection:
+                    connection.executescript(schema)
+                path.chmod(0o600)
+                original = path.read_bytes()
+                self.assertGreater(len(original), 0)
+                for action in (lambda: assert_existing_database_version(path),
+                               lambda: Database(path),
+                               lambda: migrate_database(path, data_dir=path.parent)):
+                    with self.assertRaises(sqlite3.DatabaseError):
+                        action()
+                    self.assertEqual(path.read_bytes(), original)
+                    self.assertFalse(Path(str(path) + "-wal").exists())
+                    self.assertFalse(Path(str(path) + "-shm").exists())
 
-        for prepared_runtime in (False, True):
-            with self.subTest(prepared_runtime=prepared_runtime), tempfile.TemporaryDirectory() as directory:
-                data_dir = Path(directory) / "data"
-                runtime = data_dir / "runtimes" / "camofox"
-                if prepared_runtime:
-                    runtime.mkdir(mode=0o700, parents=True)
-                    (data_dir / "runtimes").chmod(0o700)
-                    data_dir.chmod(0o700)
-                self.assertEqual(
-                    migrate_database(data_dir / "platform.db", data_dir=data_dir),
-                    TARGET_SCHEMA_VERSION,
-                )
-                service = EnterpriseService(make_config(data_dir), agent_client=RecordingAgent())
-                try:
-                    self.assertEqual(
-                        json.loads((runtime / CAMOFOX_SIDECAR_NAME).read_text()),
-                        expected_camofox_sidecar(),
-                    )
-                    _, admin = service.authenticate("admin", "admin")
-                    self.assertEqual(admin["role"], "admin")
-                finally:
-                    service.close()
-
-    def test_legacy_mount_compatibility_prepares_skill_destination(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, _legacy = create_source_database(data_dir)
-            internal = workspace / ".agent-platform"
-            attachments = internal / "attachments"
-            attachments.mkdir(mode=0o755, parents=True)
-            internal.chmod(0o755)
-            with mock.patch(
-                "enterprise_agent_platform.workspace_mount_compat.os.geteuid",
-                return_value=0,
-            ):
-                normalize_legacy_workspace_mounts(
-                    data_dir,
-                    target_uid=os.getuid(),
-                    target_gid=os.getgid(),
-                )
-
-            self.assertEqual(
-                migrate_database(database_path, data_dir=data_dir),
-                TARGET_SCHEMA_VERSION,
-            )
-            self.assertEqual(internal.stat().st_mode & 0o777, 0o700)
-            self.assertTrue((internal / "skills" / SKILL_ID / "SKILL.md").is_file())
-
-    def test_copies_legacy_skill_to_portable_and_protected_layout(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            legacy_before = db_module._read_migration_tree(legacy)
-            old_snapshot = data_dir / "old-platform.db"
-            with (
-                sqlite3.connect(database_path) as source,
-                sqlite3.connect(old_snapshot) as destination,
-            ):
-                source.backup(destination)
-
-            self.assertEqual(
-                migrate_database(database_path, data_dir=data_dir),
-                TARGET_SCHEMA_VERSION,
-            )
-
-            destination = workspace / ".agent-platform" / "skills"
-            package = destination / SKILL_ID
-            state_scope = (
-                data_dir
-                / "agent-skill-state"
-                / hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
-            )
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-            self.assertFalse((destination / ".lock").exists())
-            self.assertFalse((state_scope / ".lock").exists())
-            self.assertEqual(
-                (package / "references" / "guide.txt").read_bytes(),
-                b"portable support\n",
-            )
-            self.assertFalse((package / ".skill.json").exists())
-            self.assertFalse((destination / ".skill-usage.json").exists())
-            package_info = package.stat()
-            sidecar = json.loads(
-                (state_scope / SKILL_ID / ".skill.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                (
-                    sidecar["package_dev"],
-                    sidecar["package_ino"],
-                    sidecar["package_ctime_ns"],
-                ),
-                (
-                    package_info.st_dev,
-                    package_info.st_ino,
-                    package_info.st_ctime_ns,
-                ),
-            )
-            usage = json.loads(
-                (state_scope / ".skill-usage.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(usage["skills"][SKILL_ID]["created_by"], "agent")
-            store = SkillStore(
-                data_dir / "workspaces",
-                lambda scope_key: workspace,
-                state_root=data_dir / "agent-skill-state",
-                bundled_skills_dir=None,
-            )
-            self.assertEqual(store.list(SCOPE_KEY)[0]["id"], SKILL_ID)
-            self.assertEqual(marker(old_snapshot), SOURCE_SCHEMA_VERSION)
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-            with sqlite3.connect(database_path) as connection:
-                tables = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table'"
-                    )
-                }
-                self.assertFalse(
-                    {name for name in tables if name.startswith(("knowledge_", "sylver_"))}
-                )
-                self.assertEqual(
-                    connection.execute(
-                        "SELECT count(*) FROM settings WHERE key LIKE 'knowledge_%'"
-                    ).fetchone()[0],
-                    0,
-                )
-                self.assertEqual(
-                    connection.execute(
-                        "SELECT count(*) FROM durable_jobs WHERE kind = 'knowledge_index'"
-                    ).fetchone()[0],
-                    0,
-                )
-
-    def test_conflicting_destination_has_no_database_or_copy_side_effect(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            destination = workspace / ".agent-platform" / "skills"
-            destination.mkdir(mode=0o700, parents=True)
-            destination.parent.chmod(0o700)
-            write_private(destination / "extra.txt", b"conflict\n")
-            legacy_before = db_module._read_migration_tree(legacy)
-
-            with self.assertRaisesRegex(sqlite3.DatabaseError, "differs"):
-                migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-            self.assertEqual((destination / "extra.txt").read_bytes(), b"conflict\n")
-            self.assertFalse((data_dir / "agent-skill-state").exists())
-
-    def test_schema_failure_keeps_durable_copy_for_exact_retry(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            original = db_module._execute_transactional_schema
-
-            def fail_after_schema(connection, schema):
-                original(connection, schema)
-                raise RuntimeError("simulated migration interruption")
-
-            with mock.patch.object(
-                db_module,
-                "_execute_transactional_schema",
-                side_effect=fail_after_schema,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "simulated"):
-                    migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertTrue(legacy.exists())
-            destination = workspace / ".agent-platform" / "skills"
-            self.assertTrue(destination.exists())
-            package_inode = (destination / SKILL_ID).stat().st_ino
-            with sqlite3.connect(database_path) as connection:
-                self.assertIsNotNone(
-                    connection.execute(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE type = 'table' AND name = 'knowledge_documents'"
-                    ).fetchone()
-                )
-            self.assertEqual(
-                migrate_database(database_path, data_dir=data_dir),
-                TARGET_SCHEMA_VERSION,
-            )
-            self.assertEqual((destination / SKILL_ID).stat().st_ino, package_inode)
-
-    def test_unknown_legacy_scope_is_preserved_and_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, _workspace, legacy = create_source_database(data_dir)
-            unknown = data_dir / "agent-skills" / ("f" * 64)
-            unknown.mkdir(mode=0o700)
-
-            with self.assertRaisesRegex(sqlite3.DatabaseError, "unknown scope"):
-                migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertTrue(legacy.exists())
-            self.assertTrue(unknown.exists())
-
-    def test_unsafe_or_oversized_source_tree_fails_before_copy(self):
-        for case in ("hardlink", "unknown", "directory-limit", "nonempty-lock"):
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                data_dir = Path(directory) / "data"
-                database_path, _workspace, legacy = create_source_database(data_dir)
-                package = legacy / SKILL_ID
-                if case == "hardlink":
-                    (package / "references" / "linked.txt").hardlink_to(
-                        package / "references" / "guide.txt"
-                    )
+    def test_invalid_queue_watermark_does_not_replay_history(self):
+        for watermark in ("-1", "not-an-integer", "1.5", None):
+            with self.subTest(watermark=watermark), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "platform.db"
+                database = Database(path)
+                database.execute("INSERT INTO users(id, username, display_name, password_hash, created_at) "
+                                 "VALUES (1, 'member', 'Member', 'unused', 1)")
+                database.execute("INSERT INTO messages(scope_type, scope_id, author_type, user_id, content, created_at) "
+                                 "VALUES ('private', '1', 'user', 1, 'historical request', 1)")
+                if watermark is None:
+                    database.execute("DELETE FROM settings WHERE key = 'durable_agent_jobs_start_message_id'")
                 else:
-                    if case == "unknown":
-                        write_private(package / "unexpected.txt", b"unknown\n")
-                    elif case == "directory-limit":
-                        for index in range(64):
-                            (package / "references" / f"empty-{index}").mkdir(
-                                mode=0o700
-                            )
-                    else:
-                        write_private(legacy / ".lock", b"unexpected\n")
-
+                    database.execute("UPDATE settings SET value = ? "
+                                     "WHERE key = 'durable_agent_jobs_start_message_id'", (watermark,))
+                before = list(database._conn.iterdump())
+                database.close()
                 with self.assertRaises(sqlite3.DatabaseError):
-                    migrate_database(database_path, data_dir=data_dir)
+                    migrate_database(path, data_dir=path.parent)
+                database = Database(path)
+                try:
+                    self.assertEqual(list(database._conn.iterdump()), before)
+                    self.assertEqual(database.scalar("SELECT COUNT(*) FROM durable_jobs"), 0)
+                    self.assertIsNone(database.scalar(
+                        "SELECT value FROM settings WHERE key = 'durable_work_queue_v1'"
+                    ))
+                finally:
+                    database.close()
 
-                self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-                self.assertFalse((data_dir / "agent-skill-state").exists())
-
-    def test_source_tree_entry_budget_fails_before_copy(self):
+    def test_current_queue_migration_rolls_back_and_can_retry(self):
         with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, _workspace, legacy = create_source_database(data_dir)
-            legacy_before = db_module._read_migration_tree(legacy)
-
-            with mock.patch.object(
-                db_module,
-                "_MAX_SKILL_MIGRATION_ENTRIES",
-                2,
-            ):
-                with self.assertRaisesRegex(sqlite3.DatabaseError, "entry limits"):
-                    migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-            self.assertFalse((data_dir / "agent-skill-state").exists())
-
-    def test_existing_protected_state_must_match_exactly(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, _workspace, _legacy = create_source_database(data_dir)
-            with mock.patch.object(
-                db_module,
-                "_execute_transactional_schema",
-                side_effect=RuntimeError("stop after copies"),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after copies"):
-                    migrate_database(database_path, data_dir=data_dir)
-            state_scope = (
-                data_dir
-                / "agent-skill-state"
-                / hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
-            )
-            write_private(state_scope / "extra.json", b"{}\n")
-
-            with self.assertRaisesRegex(sqlite3.DatabaseError, "differs"):
-                migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-
-    def test_rejects_noncanonical_duplicate_and_symlink_workspaces(self):
-        cases = ("noncanonical", "duplicate", "symlink")
-        for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                data_dir = Path(directory) / "data"
-                database_path, workspace, legacy = create_source_database(data_dir)
-                with sqlite3.connect(database_path) as connection:
-                    if case == "noncanonical":
-                        connection.execute(
-                            "UPDATE agent_scopes SET workspace_path = 'private-7' "
-                            "WHERE scope_key = ?",
-                            (SCOPE_KEY,),
-                        )
-                    elif case == "duplicate":
-                        duplicate_workspace = data_dir / "workspaces" / "channels" / "channel-a-b"
-                        duplicate_workspace.mkdir(mode=0o700, parents=True)
-                        (data_dir / "workspaces" / "channels").chmod(0o700)
-                        connection.executemany(
-                            "INSERT INTO agent_scopes(scope_key, scope_type, scope_id, "
-                            "session_id, lifecycle_id, workspace_path, sandbox_id, "
-                            "created_at, updated_at) VALUES (?, 'channel', ?, ?, '', ?, ?, 1, 1)",
-                            (
-                                ("channel:a/b:main-agent", "a/b", "s-a", "channels/channel-a-b", "b-a"),
-                                ("channel:a-b:main-agent", "a-b", "s-b", "channels/channel-a-b", "b-b"),
-                            ),
-                        )
-                if case == "symlink":
-                    moved = workspace.with_name("user-7-real")
-                    workspace.rename(moved)
-                    workspace.symlink_to(moved, target_is_directory=True)
-
-                with self.assertRaises(sqlite3.DatabaseError):
-                    migrate_database(database_path, data_dir=data_dir)
-
-                self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-                self.assertTrue(legacy.exists())
-                self.assertFalse((data_dir / "agent-skill-state").exists())
-
-    def test_scope_without_legacy_source_preserves_existing_canonical_skills(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(
-                data_dir, with_legacy_skill=False
-            )
-            (legacy / ".lock").unlink()
-            legacy.rmdir()
-            destination = workspace / ".agent-platform" / "skills"
-            destination.mkdir(mode=0o700, parents=True)
-            destination.parent.chmod(0o700)
-            write_private(destination / "user-file.txt", b"leave me alone\n")
-
-            self.assertEqual(
-                migrate_database(database_path, data_dir=data_dir),
-                TARGET_SCHEMA_VERSION,
-            )
-            self.assertEqual(
-                (destination / "user-file.txt").read_bytes(), b"leave me alone\n"
-            )
-
-    def test_apply_rejects_agent_platform_replacement_without_writing_victim(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            legacy_before = db_module._read_migration_tree(legacy)
-            victim = data_dir / "victim"
-            victim.mkdir(mode=0o700)
-            write_private(victim / "keep.txt", b"keep\n")
-            original = Database._publish_legacy_skill_copies
-
-            def replace_after_preflight(database, copies):
-                (workspace / ".agent-platform").symlink_to(
-                    victim, target_is_directory=True
-                )
-                return original(database, copies)
-
-            with mock.patch.object(
-                Database,
-                "_publish_legacy_skill_copies",
-                autospec=True,
-                side_effect=replace_after_preflight,
-            ):
-                with self.assertRaises((RuntimeError, sqlite3.DatabaseError)):
-                    migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertEqual((victim / "keep.txt").read_bytes(), b"keep\n")
-            self.assertEqual(set(victim.iterdir()), {victim / "keep.txt"})
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-
-    def test_staging_replacement_is_not_followed_or_cleaned(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            legacy_before = db_module._read_migration_tree(legacy)
-            victim = data_dir / "victim"
-            victim.mkdir(mode=0o700)
-            write_private(victim / "keep.txt", b"keep\n")
-            replaced = False
-
-            def replace_staging(_descriptor, _content):
-                nonlocal replaced
-                self.assertFalse(replaced)
-                replaced = True
-                parent = workspace / ".agent-platform"
-                staging = next(parent.glob(".skills.migration-*"))
-                staging.rename(parent / "detached-staging")
-                staging.symlink_to(victim, target_is_directory=True)
-                raise OSError("simulated staging race")
-
-            with mock.patch.object(
-                db_module.os,
-                "write",
-                side_effect=replace_staging,
-            ):
-                with self.assertRaises((RuntimeError, sqlite3.DatabaseError)):
-                    migrate_database(database_path, data_dir=data_dir)
-
-            self.assertTrue(replaced)
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertEqual((victim / "keep.txt").read_bytes(), b"keep\n")
-            self.assertEqual(set(victim.iterdir()), {victim / "keep.txt"})
-            self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-
-    def test_plan_keeps_only_compact_scope_metadata(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, _workspace, _legacy = create_source_database(data_dir)
-
-            def inspect_plan(_database, copies):
-                self.assertEqual(len(copies), 1)
-                self.assertEqual(
-                    set(copies[0]),
-                    {"digest", "source", "source_fingerprint", "workspace_parts"},
-                )
-                self.assertFalse(
-                    any(isinstance(value, bytes) for value in copies[0].values())
-                )
-                raise RuntimeError("plan inspected")
-
-            with mock.patch.object(
-                Database,
-                "_publish_legacy_skill_copies",
-                autospec=True,
-                side_effect=inspect_plan,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "plan inspected"):
-                    migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-
-    def test_final_verification_rejects_portable_or_state_leaf_drift(self):
-        for case in ("portable", "state"):
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                data_dir = Path(directory) / "data"
-                database_path, workspace, legacy = create_source_database(data_dir)
-                legacy_before = db_module._read_migration_tree(legacy)
-                digest = hashlib.sha256(SCOPE_KEY.encode("utf-8")).hexdigest()
-                original_fsync = db_module._fsync_migration_tree_fd
-                changed = False
-
-                def mutate_after_final_fsync(directory_fd):
-                    nonlocal changed
-                    original_fsync(directory_fd)
-                    names = set(db_module.os.listdir(directory_fd))
-                    if changed:
-                        return
-                    if case == "portable" and SKILL_ID in names:
-                        write_private(
-                            workspace
-                            / ".agent-platform"
-                            / "skills"
-                            / SKILL_ID
-                            / "SKILL.md",
-                            b"changed after publication\n",
-                        )
-                        changed = True
-                    elif case == "state" and ".skill-usage.json" in names:
-                        write_private(
-                            data_dir
-                            / "agent-skill-state"
-                            / digest
-                            / ".skill-usage.json",
-                            b'{"changed":true}\n',
-                        )
-                        changed = True
-
-                with mock.patch.object(
-                    db_module,
-                    "_fsync_migration_tree_fd",
-                    side_effect=mutate_after_final_fsync,
-                ):
-                    with self.assertRaisesRegex(sqlite3.DatabaseError, "differs"):
-                        migrate_database(database_path, data_dir=data_dir)
-
-                self.assertTrue(changed)
-                self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-                self.assertEqual(db_module._read_migration_tree(legacy), legacy_before)
-
-    def test_later_scope_preflight_conflict_creates_no_earlier_target(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            database_path, workspace, legacy = create_source_database(data_dir)
-            second_workspace = data_dir / "workspaces" / "user-8"
-            second_workspace.mkdir(mode=0o700)
-            with sqlite3.connect(database_path) as connection:
-                connection.execute(
-                    "INSERT INTO agent_scopes(scope_key, scope_type, scope_id, "
-                    "session_id, lifecycle_id, workspace_path, sandbox_id, "
-                    "created_at, updated_at) VALUES "
-                    "('private:8', 'private', '8', 'session-8', '', "
-                    "'user-8', 'sandbox-8', 1, 1)"
-                )
-            second_digest = hashlib.sha256(b"private:8").hexdigest()
-            shutil.copytree(
-                legacy,
-                data_dir / "agent-skills" / second_digest,
-            )
-            conflict = second_workspace / ".agent-platform" / "skills"
-            conflict.mkdir(mode=0o700, parents=True)
-            conflict.parent.chmod(0o700)
-            write_private(conflict / "extra.txt", b"conflict\n")
-
-            with self.assertRaisesRegex(sqlite3.DatabaseError, "differs"):
-                migrate_database(database_path, data_dir=data_dir)
-
-            self.assertEqual(marker(database_path), SOURCE_SCHEMA_VERSION)
-            self.assertFalse((workspace / ".agent-platform").exists())
+            root = Path(directory)
+            path = root / "platform.db"
+            database = Database(path)
+            database.execute("INSERT INTO users(id, username, display_name, password_hash, created_at) "
+                             "VALUES (1, 'member', 'Member', 'unused', 1)")
+            database.execute("INSERT INTO messages(scope_type, scope_id, author_type, user_id, content, created_at) "
+                             "VALUES ('private', '1', 'user', 1, 'pending request', 1)")
+            database.execute("CREATE TRIGGER reject_queue_marker BEFORE INSERT ON settings "
+                             "WHEN new.key = 'durable_work_queue_v1' BEGIN "
+                             "SELECT RAISE(ABORT, 'injected failure'); END")
+            database.close()
+            with self.assertRaises(sqlite3.IntegrityError):
+                migrate_database(path, data_dir=root)
+            database = Database(path)
+            self.assertEqual(database.scalar("SELECT COUNT(*) FROM durable_jobs"), 0)
+            self.assertIsNone(database.scalar("SELECT value FROM settings WHERE key = 'durable_work_queue_v1'"))
+            database.execute("DROP TRIGGER reject_queue_marker")
+            database.close()
+            migrate_database(path, data_dir=root)
+            database = Database(path)
+            try:
+                job = database.query_one("SELECT dedupe_key, status, payload_json FROM durable_jobs")
+                assert job is not None
+                self.assertEqual(job["dedupe_key"], "message:1")
+                self.assertEqual(job["status"], "queued")
+                self.assertIn('pending request', job["payload_json"])
+            finally:
+                database.close()
 
 
 if __name__ == "__main__":

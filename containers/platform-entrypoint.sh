@@ -46,37 +46,13 @@ if [ "$(/usr/bin/id -u)" -eq 0 ]; then
     root_command="${2:-}"
   fi
   case "$root_command" in
-    migrate)
-      require_exact AGENT_PLATFORM_WORKSPACE_MOUNT_COMPAT 2026080801-to-2026082901
-      if ! compatibility_action="$(
-        cd /
-        exec /usr/bin/setpriv \
-          --reuid="$run_uid" \
-          --regid="$run_gid" \
-          --clear-groups \
-          --no-new-privs \
-          -- /opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat --check-source
-      )"; then
-        fail "workspace compatibility source check failed"
-      fi
-      case "$compatibility_action" in
-        apply)
-          (
-            cd /
-            exec /opt/venv/bin/python -I -m enterprise_agent_platform.workspace_mount_compat
-          )
-          ;;
-        skip) ;;
-        *) fail "workspace compatibility source check returned an invalid action" ;;
-      esac
-      ;;
-    serve|init-admin|print-agent-token|__healthcheck)
+    migrate|serve|init-admin|print-agent-token|__healthcheck)
       ;;
     *)
       fail "root startup command is not allowed"
       ;;
   esac
-  unset AGENT_PLATFORM_RUN_UID AGENT_PLATFORM_RUN_GID AGENT_PLATFORM_WORKSPACE_MOUNT_COMPAT
+  unset AGENT_PLATFORM_RUN_UID AGENT_PLATFORM_RUN_GID
   exec /usr/bin/setpriv \
     --reuid="$run_uid" \
     --regid="$run_gid" \

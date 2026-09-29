@@ -4,7 +4,7 @@
 
 ## 唯一拓扑
 
-- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。它独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。
+- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。桥接完成后其主进程是独立的 Manager launcher，子进程独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。
 - Platform（含前端）、Runtime、Camoufox、SearXNG、Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。业务容器禁止访问或代理 Docker socket。
 - Platform 后端只发布到宿主机回环地址，其它服务只在私有网络里。固定的 Compose 使用 Manager 预先创建的外部网络，切换版本时不删除网络，也不中断沙箱。
 - 权威数据用显式的目录挂载，禁止匿名卷。
@@ -52,7 +52,7 @@ agent-platform-manager logs
 | --- | --- |
 | 等待中、空间不足、降级 | 用 `status`、`logs`、`preflight` 查看；Manager 会自动等待和重试。不要手动修改状态文件、操作日志、激活记录、Compose 或可变 tag。 |
 | 提交前迁移或核心服务失败 | 同一个操作会恢复快照和上一版本，[状态机](auto-update.md#提交回滚与能力降级)会自行收敛。Platform 不可用时使用宿主机命令行。 |
-| Manager 自身启动有缺陷、socket 一直连不上 | 只有这种情况才允许对同一个不可变发布执行 `recover-current`，需要显式提供 SHA-256，并完整绑定配置、unit、运行中的 inode 和 Platform 版本。它只替换登记的当前 Manager，不改 Platform 的数据、版本或容器；见[恢复身份](auto-update.md#恢复身份)。 |
+| Manager 自身启动有缺陷、socket 一直连不上 | 监督模式会在有界健康检查失败后自动恢复并启动上一份已验证的 Manager，不反复切换。若上一版本也失败，停止 unit、保留数据和日志，按[手动恢复](auto-update.md#手动恢复)核验并恢复可信二进制；不手工改写预约或回滚已开放业务的数据。 |
 
 ## 公共入口与维护
 
@@ -69,7 +69,7 @@ agent-platform-manager logs
 | 镜像 | Platform、Runtime、Camoufox 的 HEALTHCHECK 只在 Dockerfile 里定义，由 Compose 继承；上游服务的检查在 Compose 里声明。Platform 镜像只使用本次构建的前端产物，构建上下文排除本地的 `enterprise_agent_platform/static/`。 |
 | SearXNG | 以部署 UID/GID 读写 `0600` 的 settings，`0700` 的 config 和 cache 目录；完整的 config 目录以只读方式挂载到 `/etc/searxng`。不用单文件挂载（会产生匿名卷），也不依赖上游的 root 或递归 chown。 |
 | Firecrawl | 使用 PostgreSQL 队列、Redis、RabbitMQ 和 Playwright，禁止 FoundationDB；使用精确的项目标签、目录挂载和私有网络。Compose 启动后仍做 HTTP 探测；停止旧版本时移除它的受管容器。 |
-| 迁移 | 不启动写入者的预检 → 停止唯一的当前写入者 → 验证快照 → 运行固定命令 → 成功后才启动候选版本。失败时由同一个操作回滚。版本资格、旧 Skill 源的保护和 root 例外只在[受控迁移](../reference/data-layout.md#受控迁移)中定义。 |
+| 迁移 | 不启动写入者的预检 → 停止唯一的当前写入者 → 验证快照 → 运行固定命令 → 成功后才启动候选版本。失败时由同一个操作回滚；当前/全新数据库的版本边界见[受控迁移](../reference/data-layout.md#受控迁移)，不再执行已退役的 Skill、工作区或 root 权限转换。 |
 
 ```text
 enterprise-agent-platform migrate --data /var/lib/agent-platform
