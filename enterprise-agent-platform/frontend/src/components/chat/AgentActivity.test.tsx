@@ -40,7 +40,7 @@ describe("AgentActivity", () => {
       <ConfigProvider prefixCls="eap" theme={{ token: { motion: false } }}>
         <StoreContext.Provider value={store}>
           <I18nProvider>
-            <AgentActivity status={browserStatus} />
+            <AgentActivity status={browserStatus} mode="private" />
           </I18nProvider>
         </StoreContext.Provider>
       </ConfigProvider>,

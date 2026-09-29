@@ -3,7 +3,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
+import { sendMessage } from "../../data/chatActions";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
+import { resetApiSession } from "../../lib/api";
 import { createStore } from "../../lib/store";
 import { initialAppState, rootReducer } from "../../store/reducer";
 import { StoreContext } from "../../store/StoreProvider";
@@ -163,6 +165,7 @@ describe("MessageList Agent work records", () => {
 
     const record = screen.getByRole("region", { name: "AI work" });
     expect(within(record).getAllByRole("button")[0]).toHaveAttribute("aria-expanded", "true");
+    expect(within(record).getAllByRole("button")[0]).toHaveAccessibleDescription("Agent is replying to Administrator");
     expect(screen.queryByText("Unrelated lifecycle row")).toBeNull();
     const row = within(record).getByRole("listitem");
     expect(row).toHaveTextContent("Web search");
@@ -651,5 +654,115 @@ describe("MessageList Agent work records", () => {
     fireEvent.click(jump);
     expect(log.scrollTop).toBe(1_000);
     expect(screen.queryByRole("button", { name: /Jump to latest|new message/ })).toBeNull();
+  });
+});
+
+interface FakeResponse {
+  ok: boolean;
+  status: number;
+  text: () => Promise<string>;
+}
+
+function response(status: number, body: unknown): FakeResponse {
+  return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(body) };
+}
+
+function pendingMessage(mode: "channel" | "private", content: string): Message {
+  return {
+    id: `tmp-${content}`,
+    scope_type: mode,
+    scope_id: "1",
+    author_type: "user",
+    user_id: 1,
+    username: "Administrator",
+    content,
+    metadata: { local_pending: true },
+  };
+}
+
+describe("MessageList reply wait for a just-sent message", () => {
+  const wait = "Agent is preparing a reply";
+  const channelWait = "Agent is preparing a reply to Administrator";
+
+  beforeEach(() => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
+  });
+
+  afterEach(() => {
+    cleanup();
+    resetApiSession();
+    vi.unstubAllGlobals();
+  });
+
+  it("shows the Agent's wait as soon as a Personal AI message is sent and keeps it in place once the run is queued", async () => {
+    let respond!: (value: FakeResponse) => void;
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<FakeResponse>((resolve) => { respond = resolve; })));
+    const view = renderMessageList({ state: "idle" }, [], "private");
+
+    let sending!: Promise<boolean | null>;
+    act(() => { sending = sendMessage(view.store, "private", "1", "Summarize the report", []); });
+    const pendingWait = screen.getByText(wait);
+    expect(screen.getByText("Summarize the report")).toBeVisible();
+
+    await vi.waitFor(() => expect(respond).toBeTypeOf("function"));
+    await act(async () => {
+      respond(response(200, {
+        user_message: {
+          id: 31,
+          scope_type: "private",
+          scope_id: "1",
+          author_type: "user",
+          user_id: 1,
+          username: "Administrator",
+          content: "Summarize the report",
+          created_at: 100,
+        },
+        agent_status: { run_id: "run-1", state: "queued", replying_to: { username: "Administrator" }, started_at: 100, updated_at: 100 },
+      }));
+      await expect(sending).resolves.toBe(true);
+    });
+
+    expect(view.store.getState().pendingMessages).toEqual([]);
+    expect(screen.getByText(wait)).toBe(pendingWait);
+  });
+
+  it("lets the wait stand in for the last failure until the send itself fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => response(503, { error: "temporarily unavailable" })));
+    const view = renderMessageList({ state: "error", last_error: "Runtime unavailable" }, [], "private");
+    expect(screen.getByRole("alert")).toHaveTextContent("Runtime unavailable");
+
+    let sending!: Promise<boolean | null>;
+    act(() => { sending = sendMessage(view.store, "private", "1", "Try again", []); });
+    expect(screen.getByText(wait)).toBeVisible();
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    await act(async () => { await expect(sending).resolves.toBe(false); });
+    expect(screen.queryByText("Try again")).toBeNull();
+    expect(screen.queryByText(wait)).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent("Runtime unavailable");
+  });
+
+  it("leaves an Agent that is already working to its own status", () => {
+    renderMessageList(
+      { state: "replying", replying_to: { username: "Administrator" } },
+      [pendingMessage("private", "One more thing")],
+      "private",
+    );
+
+    expect(screen.getByText("Agent is replying")).toBeVisible();
+    expect(screen.queryByText(wait)).toBeNull();
+  });
+
+  it.each([
+    { content: "@agent summarize the thread", calls: true },
+    { content: "Can @Main Agent check this?", calls: true },
+    { content: "Lunch at noon", calls: false },
+    { content: "Mail ops@agent.example", calls: false },
+    { content: "Ask @agents later", calls: false },
+    { content: "请@agent 看看", calls: false },
+  ])("waits in a channel only when the Platform will call the Agent: $content", ({ content, calls }) => {
+    renderMessageList({ state: "idle" }, [pendingMessage("channel", content)]);
+
+    expect(Boolean(screen.queryByText(channelWait))).toBe(calls);
   });
 });

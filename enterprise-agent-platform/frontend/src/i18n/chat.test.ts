@@ -14,12 +14,16 @@ describe("chat translations", () => {
     expect(translate("en", "chat.work.steps", { count: 3 })).toBe("3 steps");
   });
 
-  it("localizes structured Agent state while preserving the user name", () => {
-    const status: AgentStatus = {
-      state: "queued",
-      replying_to: { username: "Alice" },
-    };
-    expect(agentStatusText(status, english)).toBe("Agent is preparing a reply to Alice");
+  it("names who the Agent is answering or waiting on in a channel but not in Personal AI", () => {
+    const queued: AgentStatus = { state: "queued", replying_to: { username: "Alice" } };
+    const replying: AgentStatus = { state: "replying", replying_to: { username: "Alice" } };
+    const approval: AgentStatus = { state: "approval", replying_to: { username: "Alice" } };
+    expect(agentStatusText(queued, "channel", english)).toBe("Agent is preparing a reply to Alice");
+    expect(agentStatusText(replying, "channel", english)).toBe("Agent is replying to Alice");
+    expect(agentStatusText(approval, "channel", english)).toBe("Waiting for Alice to approve access");
+    expect(agentStatusText(queued, "private", english)).toBe("Agent is preparing a reply");
+    expect(agentStatusText(replying, "private", english)).toBe("Agent is replying");
+    expect(agentStatusText(approval, "private", english)).toBe("Waiting for you to approve access");
   });
 
   it("does not create work records for lifecycle or approval activity without tools", () => {

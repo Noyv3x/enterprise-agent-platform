@@ -74,7 +74,6 @@ describe("AgentWorkCard", () => {
     expect(traceToggle()).toHaveAttribute("aria-expanded", "true");
     expect(within(workCard()).getAllByRole("listitem")).toHaveLength(3);
     expect(within(rowFor("File search")).queryByRole("button")).toBeNull();
-    expect(traceToggle()).toHaveAccessibleDescription("Agent is replying to Administrator");
     expect(workCard()).not.toHaveTextContent("ACTIVE_FULL_COMMAND_DETAIL");
 
     const commandToggle = within(rowFor("Command")).getByRole("button");

@@ -1,7 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type RefObject, type TransitionEvent } from "react";
 import { useElapsedSeconds } from "../../hooks/useElapsedSeconds";
 import { useI18n, type MessageKey, type Translator } from "../../i18n";
-import { agentStatusText } from "../../store/selectors";
 import { useDispatch, useStore, useStoreHandle } from "../../store/useStore";
 import type { ActivityStep, AgentStatus, AgentWork, AppState } from "../../types";
 import { formatElapsed } from "../../utils/format";
@@ -782,7 +781,13 @@ function useRunFocusHandoff(runId: string, replaceable: boolean, triggerRef: Ref
  * updates never re-collapse or re-open it. `settling` marks a finished run shown until its persisted
  * record replaces it; like a live record, it hands focus to that successor.
  */
-export function AgentWorkCard({ work, active, settling = false }: { work: Work; active: boolean; settling?: boolean }) {
+export function AgentWorkCard({ work, active, settling = false, statusText = "" }: {
+  work: Work;
+  active: boolean;
+  settling?: boolean;
+  /** Live status wording for the header's description; the caller knows the conversation. */
+  statusText?: string;
+}) {
   const { t } = useI18n();
   const dispatch = useDispatch();
   const runId = work.run_id || `${work.scope_type || "agent"}:${work.scope_id || ""}:${work.started_at || ""}`;
@@ -811,7 +816,6 @@ export function AgentWorkCard({ work, active, settling = false }: { work: Work; 
   const label = folded
     ? folded.title
     : active ? t(approval ? "chat.work.awaitingApproval" : "chat.work.working") : failed ? t("chat.work.failed") : summary;
-  const statusText = active ? agentStatusText(work, t) : "";
   const queued = Number(work.queued_count || 0);
   const waiting = active ? work.state === "replying" ? queued : Math.max(0, queued - 1) : 0;
   const meta: ReactNode[] = [];

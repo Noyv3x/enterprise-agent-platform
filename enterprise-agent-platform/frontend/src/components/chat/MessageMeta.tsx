@@ -27,10 +27,9 @@ export function MessageHeader({ message, isUser, showAuthor }: { message: Messag
   </>;
 }
 
-/** Live progress while sending/generating, otherwise the message time. */
-export function MessageFootnote({ message, pending, streaming }: { message: Message; pending: boolean; streaming: boolean }) {
+/** Live progress while generating, otherwise the message time. */
+export function MessageFootnote({ message, streaming }: { message: Message; streaming: boolean }) {
   const { t, locale } = useI18n();
-  if (pending) return <StatusMark subtle busy tone="info">{t("chat.message.sending")}</StatusMark>;
   if (streaming) return <StatusMark subtle busy tone="info">{t("chat.message.generating")}</StatusMark>;
   const time = formatMessageTime(message.created_at, locale);
   return time ? <time className="wf-message-time" dateTime={new Date(message.created_at! * 1000).toISOString()}>{time}</time> : null;

@@ -10,6 +10,7 @@ import type {
   Channel,
   ChatMode,
   Id,
+  Message,
   ScopeType,
   TopbarInfo,
 } from "../types";
@@ -65,20 +66,52 @@ export function isAgentActive(status: AgentStatus | null | undefined): boolean {
   return !!status && (status.state === "queued" || status.state === "replying" || status.state === "approval");
 }
 
+/** Live status wording. A channel names who the Agent is answering; Personal AI has only its owner. */
 export function agentStatusText(
   status: AgentStatus | null | undefined,
+  mode: ChatMode,
   translate: Translator = defaultTranslate,
 ): string {
   if (!isAgentActive(status)) return "";
-  const target = status?.replying_to?.username || translate("chat.userFallback");
-  if (status?.state === "approval") return translate("chat.status.approval", { target });
+  if (status?.state === "approval") {
+    if (mode === "private") return translate("chat.status.approvalSelf");
+    return translate("chat.status.approval", {
+      target: status.replying_to?.username || translate("chat.userFallback"),
+    });
+  }
   const inputCount = status?.active_input_group?.message_count || 0;
   if (inputCount > 1) {
     return translate("chat.status.merging", { count: inputCount });
   }
-  return status?.state === "queued"
-    ? translate("chat.status.queued", { target })
-    : translate("chat.status.replying", { target });
+  const queued = status?.state === "queued";
+  if (mode === "private") return translate(queued ? "chat.status.queued" : "chat.status.replying");
+  const target = status?.replying_to?.username || translate("chat.userFallback");
+  return translate(queued ? "chat.status.queuedTo" : "chat.status.replyingTo", { target });
+}
+
+/* The Platform's channel trigger (AGENT_MENTION_RE in service.py). Its
+   lookbehind becomes a check on the preceding character: Safari before 16.4
+   cannot parse lookbehind, and one such literal stops the whole bundle. */
+const AGENT_MENTION = /@(?:agent|main-agent|main_agent|main\s+agent)(?![A-Za-z0-9_-])/giu;
+const MENTION_BLOCKED_AFTER = /[\p{L}\p{N}_@]$/u;
+
+/** Whether a message reaches the Agent: every Personal AI message, and channel messages that mention it. */
+export function requestsAgentReply(mode: ChatMode, content: string | null | undefined): boolean {
+  if (mode === "private") return true;
+  const text = content || "";
+  for (const match of text.matchAll(AGENT_MENTION)) {
+    if (!MENTION_BLOCKED_AFTER.test(text.slice(0, match.index))) return true;
+  }
+  return false;
+}
+
+/** The wait a just-sent Agent request shows until the Platform reports its run. It carries the
+ *  queued state and reply target of the Platform's first status, so the hand-over keeps the same text. */
+export function pendingReplyStatus(mode: ChatMode, messages: readonly Message[]): AgentStatus | null {
+  const request = messages.find(
+    (message) => message.metadata?.local_pending && requestsAgentReply(mode, message.content),
+  );
+  return request ? { state: "queued", replying_to: { username: request.username } } : null;
 }
 
 /* ----------------------------------------------------------------- admin */
@@ -91,7 +124,7 @@ export function activeAdminPage(state: AppState): AdminPage {
 
 export function topbarInfo(state: AppState, translate: Translator = defaultTranslate): TopbarInfo {
   if (state.activeView === "private") {
-    const active = agentStatusText(agentStatusFor(state, "private"), translate);
+    const active = agentStatusText(agentStatusFor(state, "private"), "private", translate);
     return {
       title: translate("nav.privateAgent"),
       icon: "bot",
@@ -109,7 +142,7 @@ export function topbarInfo(state: AppState, translate: Translator = defaultTrans
     };
   }
   const ch = activeChannel(state);
-  const active = agentStatusText(agentStatusFor(state, "channel"), translate);
+  const active = agentStatusText(agentStatusFor(state, "channel"), "channel", translate);
   return {
     title: ch?.name || translate("nav.channel"),
     hash: true,

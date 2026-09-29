@@ -23,7 +23,7 @@ function MessageBubbleImpl({message,canWithdraw=false,withdrawing=false,hideAuth
  const showAuthor=!hideAuthorName;
  return <MessageEntry kind={isUser?"user":message.author_type==="agent"?"agent":"system"} streaming={streaming}
  header={showAuthor||message.metadata?.needs_review?<MessageHeader message={message} isUser={isUser} showAuthor={showAuthor}/>:undefined}
- footnote={<MessageFootnote message={message} pending={pending} streaming={streaming}/>}
+ footnote={<MessageFootnote message={message} streaming={streaming}/>}
  actions={message.content&&!streaming||canWithdraw&&onWithdraw?<>{message.content&&!streaming&&<CopyButton value={message.content} kind="message"/>}{canWithdraw&&onWithdraw&&<WithdrawMessageButton loading={withdrawing} onConfirm={()=>onWithdraw(message.id)}/>}</>:undefined}
  work={work&&hasAgentProcessSteps(work)?<AgentWorkCard work={work} active={false}/>:undefined}
  attachments={message.attachments?.length?<MessageAttachments attachments={message.attachments}/>:undefined}>

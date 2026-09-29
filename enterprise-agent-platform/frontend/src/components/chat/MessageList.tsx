@@ -5,7 +5,7 @@ import {loadOlderMessages} from "../../data/loaders";
 import {withdrawChannelMessage,navigateToView,selectChannel} from "../../data/chatActions";
 import {getApiSessionGeneration} from "../../lib/api";
 import {useI18n,type Translator} from "../../i18n";
-import {agentStatusFor,hasPermission,isAgentActive,scopeTypeFor} from "../../store/selectors";
+import {agentStatusFor,hasPermission,isAgentActive,pendingReplyStatus,scopeTypeFor} from "../../store/selectors";
 import {useStore,useStoreHandle} from "../../store/useStore";
 import type {AgentStatus,ChatMode,Message,ScopeType,StreamMsg,TypingUser} from "../../types";
 import {ConversationLayout,ConversationEmpty,ConversationJump,Notice} from "../ui/fieldwork";
@@ -165,6 +165,8 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
   );
 
   const active=isAgentActive(status);
+  // A just-sent Agent request waits in the reply slot at once; the Platform's status then takes over in place.
+  const liveStatus=active?status:pendingReplyStatus(mode,messages);
   const empty=!messages.length&&!active&&!settling&&status?.state!=="error";
   const streamMessages=status&&active?agentStreamingMessages(status,mode,scopeType,scopeId,t,currentStreams):[];
   const settlingMessages=settling?agentStreamingMessages(settling.status,mode,scopeType,scopeId,t,settling.streams).map(message=>({...message,metadata:{...message.metadata,streaming:false}})):[];
@@ -180,12 +182,12 @@ export function MessageList({mode,scopeId,noChannel,forceBottomToken,header,comp
       {hasAgentProcessSteps(settling.status)&&<AgentWorkCard work={settling.status} active={false} settling/>}
       {settlingMessages.map(message=><MessageBubble key={String(message.id)} message={message} hideAuthorName={mode==="private"}/>)}
     </>}
-    {active&&status&&<>
-      {hasAgentProcessSteps(status)?<AgentActivity status={status}/>:<AgentTyping status={status}/>}
-      {status.approval&&canApprove&&<AgentApprovalPrompt approval={status.approval} mode={mode} scopeId={scopeId}/>}
+    {liveStatus&&<>
+      {hasAgentProcessSteps(liveStatus)?<AgentActivity status={liveStatus} mode={mode}/>:<AgentTyping status={liveStatus} mode={mode}/>}
+      {liveStatus.approval&&canApprove&&<AgentApprovalPrompt approval={liveStatus.approval} mode={mode} scopeId={scopeId}/>}
       <div aria-live="polite" aria-relevant="additions text">{streamMessages.map(message=><MessageBubble key={String(message.id)} message={message} hideAuthorName={mode==="private"}/>)}</div>
     </>}
-    {!active&&status?.state==="error"&&(hasAgentProcessSteps(status)?<AgentWorkCard work={status} active={false}/>:<Notice tone="danger" title={t("chat.agent.replyFailed")}>{status.last_error||[...(status.activity||[])].reverse().find(step=>step.stage==="error")?.detail}</Notice>)}
+    {!liveStatus&&status?.state==="error"&&(hasAgentProcessSteps(status)?<AgentWorkCard work={status} active={false}/>:<Notice tone="danger" title={t("chat.agent.replyFailed")}>{status.last_error||[...(status.activity||[])].reverse().find(step=>step.stage==="error")?.detail}</Notice>)}
     {mode==="channel"&&typingUsers.length>0&&<TypingUsers users={typingUsers}/>}
   </>;
   const jumpLabel=unreadCount?t("chat.scroll.newMessages",{count:unreadCount}):t("chat.scroll.toBottom");

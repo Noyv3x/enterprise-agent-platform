@@ -416,7 +416,6 @@ export const chatMessages = defineMessages({
     "zh-TW": "個人 AI 訊息",
   },
   "chat.log.channelLabel": { "zh-CN": "公共频道消息", en: "Public channel messages", "zh-TW": "公共頻道訊息" },
-  "chat.message.sending": { "zh-CN": "发送中", en: "Sending", "zh-TW": "傳送中" },
   "chat.message.generating": { "zh-CN": "生成中", en: "Generating", "zh-TW": "產生中" },
   "chat.message.needsReview": { "zh-CN": "未完成 · 需要复核", en: "Unfinished · Needs review", "zh-TW": "未完成 · 需要複核" },
   "chat.withdraw.action": { "zh-CN": "撤回", en: "Withdraw", "zh-TW": "收回" },
@@ -499,12 +498,15 @@ export const chatMessages = defineMessages({
     en: "Waiting for {target} to approve access",
     "zh-TW": "等待 {target} 核准權限",
   },
-  "chat.status.queued": {
+  "chat.status.approvalSelf": { "zh-CN": "等待你审批权限", en: "Waiting for you to approve access", "zh-TW": "等待你核准權限" },
+  "chat.status.queued": { "zh-CN": "Agent 准备回复", en: "Agent is preparing a reply", "zh-TW": "Agent 準備回覆" },
+  "chat.status.replying": { "zh-CN": "Agent 正在回复", en: "Agent is replying", "zh-TW": "Agent 正在回覆" },
+  "chat.status.queuedTo": {
     "zh-CN": "Agent 准备回复 {target}",
     en: "Agent is preparing a reply to {target}",
     "zh-TW": "Agent 準備回覆 {target}",
   },
-  "chat.status.replying": {
+  "chat.status.replyingTo": {
     "zh-CN": "Agent 正在回复 {target}",
     en: "Agent is replying to {target}",
     "zh-TW": "Agent 正在回覆 {target}",
