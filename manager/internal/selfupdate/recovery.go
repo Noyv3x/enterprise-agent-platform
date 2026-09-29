@@ -47,6 +47,13 @@ func (m *Manager) RecoverCurrent(ctx context.Context, executablePath, platformSt
 		return err
 	}
 	defer releaseLock()
+	// The legacy recovery driver assumes systemd MainPID executes stable.
+	// Once launcher staging begins only the launcher owns binary selection.
+	if _, err := os.Lstat(m.launcherPath()); err == nil {
+		return errors.New("legacy recover-current is unavailable after launcher staging")
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	unit := m.UnitName
 	if unit == "" {
 		unit = m.managerUnitName()

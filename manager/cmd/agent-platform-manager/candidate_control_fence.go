@@ -46,3 +46,17 @@ func (h *atomicControlHandler) ServeHTTP(response http.ResponseWriter, request *
 func (h *atomicControlHandler) promote(full *control.API) {
 	h.active.Store(&controlHandlerSnapshot{handler: full})
 }
+
+// A committed or fallback Manager must let Platform inspect the durable gate
+// while recovering it. Only this authenticated read is opened before boot proof;
+// mutations, configuration and executor capabilities remain fenced.
+func (h *atomicControlHandler) allowRecoveryStatus(full *control.API) {
+	fenced := h.active.Load().handler
+	h.active.Store(&controlHandlerSnapshot{handler: http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet && request.URL.Path == "/v1/status" {
+			full.ServeHTTP(response, request)
+			return
+		}
+		fenced.ServeHTTP(response, request)
+	})})
+}

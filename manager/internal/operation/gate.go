@@ -21,7 +21,8 @@ type Reservation struct {
 type Gate interface {
 	Reserve(context.Context, string) (Reservation, error)
 	// Commit releases admission and commits generation-owned machine schemas.
-	// It is only callable after the Manager watchdog is durably committed.
+	// It is only callable after Manager startup is durably confirmed by the
+	// supervisor (or the legacy watchdog during the bridge upgrade).
 	Commit(context.Context, string) error
 	// Release aborts/cancels a reservation without committing machine schemas.
 	Release(context.Context, string) error

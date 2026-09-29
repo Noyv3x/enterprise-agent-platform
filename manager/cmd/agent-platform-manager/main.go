@@ -159,6 +159,8 @@ func run(arguments []string) int {
 		err = inspectReleaseCommand(arguments[1:], os.Stdout)
 	case "serve":
 		err = serveCommand(arguments[1:])
+	case "launcher", "bridge-handoff":
+		err = bridgeCommand(command, arguments[1:])
 	case "preflight":
 		err = preflightCommand(arguments[1:])
 	case "install":
@@ -348,6 +350,19 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 	maintenanceMu := &maintenance.Admission{}
 	ops := &operation.Orchestrator{Store: state, Engine: docker, Gate: operation.HTTPGate{BaseURL: cfg.PlatformGateURL, Token: cfg.InternalToken}, Snapshots: snapshots, SelfUpdate: selfUpdater, TechnicalProfile: active, DataRoot: cfg.DataRoot, ReleasesDir: filepath.Join(cfg.StateDir, "releases"), ManifestURL: cfg.ReleaseURL, Channel: cfg.ReleaseChannel, Log: audit, PollInterval: cfg.UpdateInterval, FixedStackMu: fixedStackMu, MaintenanceMu: maintenanceMu}
 	selfUpdater.Client = ops.ReleaseClient
+	ops.AdmissionCheck = func(snapshot model.ManagerState) error {
+		if snapshot.Current == nil {
+			return nil
+		}
+		proven, err := selfUpdater.BridgeAdmissionReady()
+		if err != nil {
+			return err
+		}
+		if !proven {
+			return errors.New("Manager launcher handoff is not proven; operation admission is closed")
+		}
+		return nil
+	}
 	image := cfg.SandboxImage
 	if current := state.State().Current; current != nil && current.Images["agent-sandbox"] != "" {
 		image = current.Images["agent-sandbox"]
@@ -490,15 +505,35 @@ func serveCommandWithBuild(arguments []string, cfg config.Config, builder func(c
 	go gatewayControl.Run()
 	defer gatewayControl.Stop()
 	if pendingActivation {
-		// Validate and converge every durable operation state that does not depend
-		// on watchdog promotion before acknowledging the candidate binary.  A bad
-		// journal or unhealthy committed Platform must leave the old watchdog able
-		// to restore the previous Manager.
+		supervised, err := app.selfUpdate.SupervisedStartup()
+		if err != nil {
+			return err
+		}
+		candidate, err := app.selfUpdate.SupervisedCandidateStartup()
+		if err != nil {
+			return err
+		}
+		// A true candidate must not resume work before promotion. A committed
+		// or fallback child restores/reconciles its original operation first,
+		// but keeps reservation settlement behind supervisor startup proof.
 		recoveryCtx, recoveryCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err = app.operations.RecoverBeforeActivation(recoveryCtx)
+		if supervised && !candidate {
+			controlHandler.allowRecoveryStatus(app.api)
+			err = app.operations.RecoverBeforeSupervisorProof(recoveryCtx)
+		} else {
+			err = app.operations.RecoverBeforeActivation(recoveryCtx)
+		}
 		recoveryCancel()
 		if err != nil {
 			return fmt.Errorf("validate operation recovery before Manager acknowledgement: %w", err)
+		}
+		if supervised {
+			coreCtx, coreCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = app.operations.ProbeCurrentGeneration(coreCtx)
+			coreCancel()
+			if err != nil {
+				return fmt.Errorf("prove supervised core readiness: %w", err)
+			}
 		}
 		healthCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err = gatewayControl.Health(healthCtx)
@@ -541,6 +576,7 @@ func serveCommandWithBuild(arguments []string, cfg config.Config, builder func(c
 		app.recoverCurrent,
 	)
 	go app.background(ctx)
+	go app.runBridgeHandoff(ctx)
 	select {
 	case <-ctx.Done():
 		if !app.processes.ShutdownHost() {
@@ -593,6 +629,14 @@ func acquireServeStartupOwnership(cfg config.Config) (*serveStartupAdmission, er
 			serveLease.Release()
 		}
 	}()
+	supervised, err := manager.SupervisedStartup()
+	if err != nil {
+		return nil, err
+	}
+	if supervised {
+		releaseServe = false
+		return &serveStartupAdmission{config: cfg, manager: manager, serveLease: serveLease}, nil
+	}
 	lease, err := manager.AcquireStartupOwnership()
 	if err != nil {
 		return nil, err
@@ -602,6 +646,13 @@ func acquireServeStartupOwnership(cfg config.Config) (*serveStartupAdmission, er
 }
 
 func ensureServeStartupOwnership(manager *selfupdate.Manager, lease *selfupdate.StartupOwnershipLease) (*selfupdate.StartupOwnershipLease, error) {
+	supervised, err := manager.SupervisedStartup()
+	if err != nil {
+		return lease, err
+	}
+	if supervised {
+		return lease, nil
+	}
 	if lease != nil && lease.RetainsRecoveryLock() {
 		if err := manager.ValidateStartupOwnershipWithLease(lease); err != nil {
 			return lease, err

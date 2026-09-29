@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
 func TestPendingCandidateControlHandlerOpensOnlyIdentityUntilPromotion(t *testing.T) {
@@ -47,6 +49,68 @@ func TestPendingCandidateControlHandlerOpensOnlyIdentityUntilPromotion(t *testin
 	handler.promote(full)
 	if code := candidateControlRequest(handler, http.MethodGet, "/v1/status", full.ControlToken); code != http.StatusOK {
 		t.Fatalf("full status after promotion = %d, want %d", code, http.StatusOK)
+	}
+}
+
+func TestRecoveryControlStatusAllowsPlatformGateReadWithoutOpeningMutations(t *testing.T) {
+	store, err := journal.Open(filepath.Join(t.TempDir(), "state"), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "fallback-recovery", ExpectedGeneration: store.State().Generation}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
+		state.Maintenance = true
+		state.Current = &model.Generation{ID: strings.Repeat("a", 40), SourceCommit: strings.Repeat("a", 40)}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	full := &control.API{Store: store, ControlToken: "control-token", ExecutorToken: "executor-token", ManagerVersion: strings.Repeat("a", 40), ManagerSHA256: strings.Repeat("b", 64)}
+	handler := newServeControlHandler(full, true)
+	handler.allowRecoveryStatus(full)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/v1/status", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+full.ControlToken)
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var status map[string]json.RawMessage
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("Platform recovery status = %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if settlement, present := status["gate_settlement"]; !present || string(settlement) != "null" {
+		t.Fatalf("recovery status lost explicit unsettled gate: %s", settlement)
+	}
+	var operationID string
+	if err := json.Unmarshal(status["active_operation_id"], &operationID); err != nil || operationID != op.ID || string(status["maintenance"]) != "true" {
+		t.Fatalf("recovery status lost original gate owner/maintenance: %+v error=%v", status, err)
+	}
+	for _, test := range []struct {
+		method, path, token string
+		code                int
+	}{
+		{http.MethodGet, "/v1/status", "wrong-token", http.StatusUnauthorized},
+		{http.MethodGet, "/v1/status", full.ExecutorToken, http.StatusUnauthorized},
+		{http.MethodPost, "/v1/status", full.ControlToken, http.StatusNotFound},
+		{http.MethodPost, "/v1/operations", full.ControlToken, http.StatusNotFound},
+		{http.MethodGet, "/v1/config", full.ControlToken, http.StatusNotFound},
+		{http.MethodPost, "/v1/executor/processes", full.ExecutorToken, http.StatusUnauthorized},
+	} {
+		if code := candidateControlRequest(handler, test.method, test.path, test.token); code != test.code {
+			t.Fatalf("recovery capability %s %s = %d, want %d", test.method, test.path, code, test.code)
+		}
 	}
 }
 

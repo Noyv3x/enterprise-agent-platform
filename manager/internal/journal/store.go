@@ -183,6 +183,13 @@ func (s *Store) MutateState(now time.Time, fn func(*model.ManagerState) error) (
 }
 
 func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operation, bool, error) {
+	return s.BeginWithAdmission(req, now, nil)
+}
+
+// BeginWithAdmission checks a new operation's admission after resolving exact
+// replays, but before publishing any journal mutation. The callback must not
+// call Store methods; its snapshot is protected by the Store lock.
+func (s *Store) BeginWithAdmission(req model.OperationRequest, now time.Time, admit func(model.ManagerState) error) (model.Operation, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if req.IdempotencyKey == "" {
@@ -219,6 +226,11 @@ func (s *Store) Begin(req model.OperationRequest, now time.Time) (model.Operatio
 	}
 	if s.state.ActiveOperationID != "" || s.state.FinalizePendingOperationID != "" {
 		return model.Operation{}, false, ErrOperationInProgress
+	}
+	if admit != nil {
+		if err := admit(cloneState(s.state)); err != nil {
+			return model.Operation{}, false, err
+		}
 	}
 	id, err := randomID("op_")
 	if err != nil {

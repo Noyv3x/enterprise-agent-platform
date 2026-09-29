@@ -156,10 +156,14 @@ type Manager struct {
 	RecoveryUnitFencer       func(context.Context, string, bool) error
 	RecoveryWatchdogVerifier func(context.Context, string, string, string, string) error
 	OrdinaryWatchdogVerifier func(context.Context, string, string, string, string) error
+	LauncherHealthTimeout    time.Duration
 	recoveryExecutableReader func(string, string) ([]byte, error)
 	// recoveryPollInterval is an in-package unit-test seam. Production callers
 	// cannot set it and therefore always retain each call site's default cadence.
 	recoveryPollInterval time.Duration
+	// launcherRegistrationPending synchronizes the registration-race unit test
+	// after an actual unregistered observation, with both mutation locks released.
+	launcherRegistrationPending func()
 }
 
 // ProbeTransientUnit proves that the current user-systemd session can host
@@ -174,6 +178,14 @@ func (m *Manager) ProbeTransientUnit(ctx context.Context) error {
 }
 
 func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error {
+	// Once staged, admission stays closed until the independent handoff proof.
+	if launcher, err := m.readLauncher(); err == nil {
+		if !launcher.Proven || launcher.Failed || launcher.Pending || launcher.Rejected == manifest.SourceCommit {
+			return errors.New("launcher handoff or activation is not settled")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	if len(manifest.SourceCommit) < 12 {
 		return errors.New("release source commit is invalid")
 	}
@@ -388,6 +400,11 @@ func (m *Manager) MarkPlatformCommitted(manifest release.Manifest) error {
 // Manager service restart and restores the previous binary if the candidate never
 // acknowledges startup and passes the control-socket health check.
 func (m *Manager) Activate(ctx context.Context, manifest release.Manifest) error {
+	if enabled, err := m.LauncherEnabled(); err != nil {
+		return err
+	} else if enabled {
+		return m.activateLauncher(manifest)
+	}
 	state, err := m.load()
 	if err != nil {
 		return err
@@ -653,6 +670,11 @@ func validManagerConfigPath(path string) bool {
 // owner-only control socket. Hashing /proc/self/exe prevents an old process
 // from acknowledging a candidate merely because the stable path was replaced.
 func (m *Manager) AcknowledgeStartup() error {
+	if supervised, err := m.SupervisedStartup(); err != nil {
+		return err
+	} else if supervised {
+		return m.acknowledgeLauncher()
+	}
 	return m.acknowledgeExecutable("/proc/self/exe")
 }
 
@@ -1702,6 +1724,12 @@ func validVersionDirectoryIdentity(name string, version Version) bool {
 }
 
 func (m *Manager) PendingActivation() (bool, error) {
+	if supervised, err := m.SupervisedStartup(); err != nil {
+		return false, err
+	} else if supervised {
+		s, err := m.readLauncher()
+		return !s.BootReady, err
+	}
 	state, err := m.load()
 	return err == nil && state.Activation != nil, err
 }
@@ -1711,6 +1739,19 @@ func (m *Manager) PendingActivation() (bool, error) {
 // only the independent active-binary watchdog can promote Candidate to Current
 // after repeated health checks.
 func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
+	if enabled, err := m.LauncherEnabled(); err != nil {
+		return false, err
+	} else if enabled {
+		s, err := m.readLauncher()
+		if err != nil {
+			return false, err
+		}
+		artifact, ok := manifest.Manager.Artifacts[runtime.GOARCH]
+		// Pending is cleared only by the launcher's authenticated activation
+		// promotion. That durable proof survives a later per-boot handshake;
+		// requiring BootReady here would deadlock pre-ack journal recovery.
+		return ok && !s.Pending && !s.Failed && s.Selected.SourceCommit == manifest.SourceCommit && s.Selected.Version == manifest.Manager.Version && s.Selected.SHA256 == artifact.SHA256, nil
+	}
 	state, err := m.load()
 	if err != nil {
 		return false, err
@@ -1826,6 +1867,12 @@ func (m *Manager) ActivationCommitted(manifest release.Manifest) (bool, error) {
 // rejected, both candidate references were cleared atomically, and the stable
 // executable is the still-registered previous Manager.
 func (m *Manager) ActivationRolledBack(manifest release.Manifest) (bool, error) {
+	if enabled, err := m.LauncherEnabled(); err != nil {
+		return false, err
+	} else if enabled {
+		s, err := m.readLauncher()
+		return s.Rejected == manifest.SourceCommit && !s.Pending && s.Selected.SourceCommit != manifest.SourceCommit, err
+	}
 	if len(manifest.SourceCommit) < 12 {
 		return false, errors.New("release source commit is invalid")
 	}
@@ -1963,6 +2010,11 @@ func (m *Manager) activationRejected(manifest release.Manifest) (bool, error) {
 // independent watchdog performs its consecutive health checks. It also proves
 // that this process, rather than a rolled-back predecessor, became Current.
 func (m *Manager) AwaitStartupCommit(ctx context.Context) error {
+	if supervised, err := m.SupervisedStartup(); err != nil {
+		return err
+	} else if supervised {
+		return m.awaitLauncher(ctx)
+	}
 	runningSHA, err := fileSHA256("/proc/self/exe")
 	if err != nil {
 		return err

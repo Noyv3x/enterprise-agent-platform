@@ -360,6 +360,8 @@ stable_installed=1
 
 "$stable_manager" preflight --config "$config_path"
 
+# Bootstrap with the legacy-compatible command. Once installation and its gate
+# settle, Manager atomically hands this same unit to its verified launcher.
 unit_incoming="$(mktemp "$unit_dir/.agent-platform-manager.service.XXXXXX")"
 cat > "$unit_incoming" <<EOF
 [Unit]

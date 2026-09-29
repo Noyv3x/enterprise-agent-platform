@@ -31,6 +31,8 @@ type startupArguments struct {
 var startupCommandArguments = map[string]startupArgumentSpec{
 	"inspect-release":      {options: startupOptions("manifest", startupArgumentValue, "architecture", startupArgumentValue), required: []string{"manifest", "architecture"}},
 	"serve":                {options: startupOptions("config", startupArgumentValue)},
+	"launcher":             {options: startupOptions("config", startupArgumentValue), requireConfig: true},
+	"bridge-handoff":       {options: startupOptions("config", startupArgumentValue, "retry", startupArgumentBool), requireConfig: true},
 	"preflight":            {options: startupOptions("config", startupArgumentValue, "probe-user-systemd-transient", startupArgumentBool)},
 	"install":              {options: startupOptions("config", startupArgumentValue, "release-manifest-url", startupArgumentValue)},
 	"status":               {options: startupOptions("config", startupArgumentValue)},

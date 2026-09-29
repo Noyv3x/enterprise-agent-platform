@@ -14,6 +14,8 @@ func TestParseStartupArgumentsAcceptsTargetCommandShapes(t *testing.T) {
 		args    []string
 	}{
 		{"serve", []string{"--config", configPath}},
+		{"launcher", []string{"--config", configPath}},
+		{"bridge-handoff", []string{"--config", configPath, "--retry"}},
 		{"preflight", []string{"--config=" + configPath, "--probe-user-systemd-transient=false"}},
 		{"install", []string{"-config", configPath, "--release-manifest-url", "https://example.invalid/release.json"}},
 		{"status", []string{"--config", configPath}},
@@ -53,6 +55,12 @@ func TestParseStartupArgumentsFailsClosedBeforeStateRead(t *testing.T) {
 		{"unclean config", "status", []string{"--config", filepath.Dir(absolute) + "/x/../manager.toml"}},
 		{"relative plan", "self-update-watchdog", []string{"--config", absolute, "--plan", "plan.json"}},
 		{"missing watchdog config", "self-update-watchdog", []string{"--plan", filepath.Join(t.TempDir(), "plan.json")}},
+		{"missing launcher config", "launcher", nil},
+		{"missing handoff config", "bridge-handoff", nil},
+		{"launcher command injection", "launcher", []string{"--config", absolute, "--plan", absolute}},
+		{"launcher cannot retry handoff", "launcher", []string{"--config", absolute, "--retry"}},
+		{"invalid retry boolean", "bridge-handoff", []string{"--config", absolute, "--retry=maybe"}},
+		{"retry requires config", "bridge-handoff", []string{"--retry"}},
 		{"missing recovery config", "recover-current", []string{"--yes", "--expected-sha256", strings.Repeat("a", 64)}},
 		{"false recovery confirmation", "recover-current", []string{"--config", absolute, "--yes=false", "--expected-sha256", strings.Repeat("a", 64)}},
 		{"positional", "status", []string{"unexpected"}},

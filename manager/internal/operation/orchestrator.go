@@ -60,6 +60,7 @@ type Orchestrator struct {
 	FixedStackMu          sync.Locker
 	MaintenanceMu         sync.Locker
 	ReclaimCapacity       func(context.Context, string, release.Manifest) error
+	AdmissionCheck        func(model.ManagerState) error
 	mu                    sync.Mutex
 	finalizeMu            sync.Mutex
 	rollbackMu            sync.Mutex
@@ -183,7 +184,7 @@ func (o *Orchestrator) Start(request model.OperationRequest) (model.Operation, b
 	}
 	defer unlockMaintenance()
 	o.mu.Lock()
-	op, reused, err := o.Store.Begin(request, o.now())
+	op, reused, err := o.Store.BeginWithAdmission(request, o.now(), o.AdmissionCheck)
 	_, running := o.running[op.ID]
 	if err != nil || reused && (running || op.Status != model.OperationPending || op.Phase != model.PhaseValidating || o.Store.State().ActiveOperationID != op.ID) {
 		o.mu.Unlock()
@@ -233,7 +234,88 @@ func (o *Orchestrator) RecoverBeforeActivation(ctx context.Context) error {
 		return err
 	}
 	defer unlockMaintenance()
-	return o.recover(ctx, false, true)
+	return o.recoverBeforeSupervisorProof(ctx, true)
+}
+
+// RecoverBeforeSupervisorProof restores interrupted Platform mutations without
+// settling their reservation or clearing maintenance. The supervised child must
+// call Recover only after its public/core readiness and launcher boot proof.
+func (o *Orchestrator) RecoverBeforeSupervisorProof(ctx context.Context) error {
+	unlockMaintenance, err := o.lockMaintenanceAdmission(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlockMaintenance()
+	return o.recoverBeforeSupervisorProof(ctx, false)
+}
+
+func (o *Orchestrator) recoverBeforeSupervisorProof(ctx context.Context, candidate bool) error {
+	state := o.Store.State()
+	id := state.FinalizePendingOperationID
+	if id == "" {
+		id = state.ActiveOperationID
+	}
+	if id == "" {
+		return nil
+	}
+	op, err := o.Store.Operation(id)
+	if err != nil {
+		return err
+	}
+	if op.ManagerActivationRollback {
+		return o.restoreManagerActivationRollback(ctx, op, false)
+	}
+	if state.FinalizePendingOperationID != "" {
+		if op.Status != model.OperationSucceeded || state.Current == nil || op.TargetGeneration != state.Current.ID {
+			return errors.New("pending finalize operation does not match current generation")
+		}
+		manifest, err := o.loadStateManifest(state.Current)
+		if err != nil {
+			return err
+		}
+		if !candidate && !op.Finalized && o.SelfUpdate != nil && op.Kind == model.OperationUpdate {
+			rejected, err := o.SelfUpdate.ActivationRolledBack(manifest)
+			if err != nil {
+				return err
+			}
+			if rejected {
+				return o.prepareManagerActivationRollback(ctx, op, manifest, false)
+			}
+		}
+		return o.probeCommittedGeneration(ctx, manifest)
+	}
+	// Inverse cleanup owns the operation even if its terminal write lagged.
+	if op.PreparedCleanupPending {
+		return nil
+	}
+	// Converge the journal-only half-commit so startup probes the target.
+	if op.Status == model.OperationSucceeded && state.Candidate != nil && op.TargetGeneration == state.Candidate.ID {
+		return o.recover(ctx, false, true)
+	}
+	// Reservation uncertainty and pre-mutation work wait for startup proof.
+	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed ||
+		op.ReservationStatus == model.ReservationReleaseUncertain {
+		return nil
+	}
+	if !state.Maintenance {
+		if candidate {
+			return fmt.Errorf("candidate Manager activation is blocked by unfinished operation %s in phase %s", op.ID, op.Phase)
+		}
+		return nil
+	}
+	o.restoreAfterMaintenance(ctx, op, nil, errors.New("manager restarted during a mutating phase"), false)
+	return o.preProofRollbackResult(op.ID)
+}
+
+func (o *Orchestrator) preProofRollbackResult(id string) error {
+	state := o.Store.State()
+	if state.ActiveOperationID != id || !state.Maintenance {
+		return errors.New("pre-proof rollback lost its maintenance boundary")
+	}
+	if state.PublicState == model.StateFailed {
+		return errors.New(state.LastError)
+	}
+	return nil
 }
 
 func (o *Orchestrator) Recover(ctx context.Context) error {
@@ -309,9 +391,6 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 		}, op.Error, o.now())
 		return err
 	}
-	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
-		return o.recoverUnconfirmedReservation(ctx, *op)
-	}
 	state = o.Store.State()
 	if op.Status == model.OperationSucceeded && state.Candidate != nil && op.TargetGeneration == state.Candidate.ID {
 		manifest, loadErr := o.loadManifest(state.Candidate.ManifestPath)
@@ -319,7 +398,10 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 			return loadErr
 		}
 		if probeErr := o.probeCommittedGeneration(ctx, manifest); probeErr != nil {
-			o.failAfterMaintenance(ctx, *op, &manifest, fmt.Errorf("recover half-committed generation: %w", probeErr))
+			o.restoreAfterMaintenance(ctx, *op, &manifest, fmt.Errorf("recover half-committed generation: %w", probeErr), runFinalizeHooks)
+			if !runFinalizeHooks {
+				return o.preProofRollbackResult(op.ID)
+			}
 			return nil
 		}
 		now := o.now()
@@ -338,6 +420,9 @@ func (o *Orchestrator) recover(ctx context.Context, runFinalizeHooks, activation
 			err = o.finalizeCommitted(ctx, *op, manifest)
 		}
 		return err
+	}
+	if op.ReservationStatus == model.ReservationConfirmationPending || op.ReservationStatus == model.ReservationConfirmed || op.ReservationStatus == model.ReservationReleaseUncertain {
+		return o.recoverUnconfirmedReservation(ctx, *op)
 	}
 	if !state.Maintenance && (op.Phase == model.PhaseValidating || op.Phase == model.PhasePulling || op.Phase == model.PhasePreparing || op.Phase == model.PhaseDraining) {
 		if activationPreflight {
@@ -406,6 +491,20 @@ func (o *Orchestrator) probeCommittedGeneration(ctx context.Context, manifest re
 		}
 	}
 	return nil
+}
+
+// ProbeCurrentGeneration is the supervised startup barrier, including ordinary
+// boots with no unfinished operation for RecoverBeforeActivation to inspect.
+func (o *Orchestrator) ProbeCurrentGeneration(ctx context.Context) error {
+	state := o.Store.State()
+	if state.Current == nil {
+		return errors.New("supervised Manager has no committed Platform generation")
+	}
+	manifest, err := o.loadStateManifest(state.Current)
+	if err != nil {
+		return err
+	}
+	return o.probeCommittedGeneration(ctx, manifest)
 }
 
 func (o *Orchestrator) run(ctx context.Context, op model.Operation) {
@@ -822,6 +921,10 @@ func (o *Orchestrator) settleGate(ctx context.Context, operationID string, kind 
 }
 
 func (o *Orchestrator) beginManagerActivationRollback(ctx context.Context, op model.Operation, manifest release.Manifest) error {
+	return o.prepareManagerActivationRollback(ctx, op, manifest, true)
+}
+
+func (o *Orchestrator) prepareManagerActivationRollback(ctx context.Context, op model.Operation, manifest release.Manifest, settle bool) error {
 	durable, err := o.Store.Operation(op.ID)
 	if err != nil {
 		return o.finalizeFailure("load Manager activation rollback operation", err)
@@ -855,10 +958,14 @@ func (o *Orchestrator) beginManagerActivationRollback(ctx context.Context, op mo
 	if err != nil {
 		return o.finalizeFailure("persist Manager activation rollback intent", err)
 	}
-	return o.recoverManagerActivationRollback(ctx, updated)
+	return o.restoreManagerActivationRollback(ctx, updated, settle)
 }
 
 func (o *Orchestrator) recoverManagerActivationRollback(ctx context.Context, op model.Operation) error {
+	return o.restoreManagerActivationRollback(ctx, op, true)
+}
+
+func (o *Orchestrator) restoreManagerActivationRollback(ctx context.Context, op model.Operation, settle bool) error {
 	if !op.ManagerActivationRollback || op.ManagerRollbackGeneration == "" || op.SnapshotPath == "" || op.Error == "" ||
 		(op.Status != model.OperationRunning && op.Status != model.OperationFailed) {
 		return errors.New("Manager activation rollback journal is incomplete")
@@ -907,7 +1014,10 @@ func (o *Orchestrator) recoverManagerActivationRollback(ctx context.Context, op 
 	if err != nil {
 		return err
 	}
-	o.failAfterMaintenance(ctx, current, nil, errors.New(current.Error))
+	o.restoreAfterMaintenance(ctx, current, nil, errors.New(current.Error), settle)
+	if !settle {
+		return o.preProofRollbackResult(op.ID)
+	}
 	completed, err := o.Store.Operation(op.ID)
 	if err != nil {
 		return err
@@ -1685,6 +1795,10 @@ func (o *Orchestrator) haltAfterSnapshotJournalFailure(ctx context.Context, op m
 }
 
 func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operation, target *release.Manifest, cause error) {
+	o.restoreAfterMaintenance(ctx, op, target, cause, true)
+}
+
+func (o *Orchestrator) restoreAfterMaintenance(ctx context.Context, op model.Operation, target *release.Manifest, cause error, settle bool) {
 	o.rollbackMu.Lock()
 	defer o.rollbackMu.Unlock()
 
@@ -1771,6 +1885,21 @@ func (o *Orchestrator) failAfterMaintenance(ctx context.Context, op model.Operat
 				readErr = o.Engine.Probe(ctx, previous)
 			}
 		}
+	}
+	if readErr == nil && !settle {
+		_, operationErr = o.Store.MutateState(o.now(), func(value *model.ManagerState) error {
+			value.ActiveOperationID = op.ID
+			value.Phase = model.PhaseRollingBack
+			value.PublicState = model.StateUpdating
+			value.Maintenance = true
+			value.LastError = originalError
+			value.RetryAfterSeconds = 0
+			return nil
+		})
+		if operationErr == nil {
+			return
+		}
+		readErr = fmt.Errorf("persist pre-proof rollback boundary: %w", operationErr)
 	}
 	if readErr == nil && state.Current != nil && !current.ReservationReleased {
 		gate := o.Gate

@@ -262,6 +262,41 @@ func TestOperationIdempotencyAndPersistence(t *testing.T) {
 	}
 }
 
+func TestAdmissionClosurePreservesReplayAndRejectsNewAttempt(t *testing.T) {
+	now := time.Unix(100, 0)
+	store, err := Open(t.TempDir(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "before-handoff", ExpectedGeneration: store.State().Generation}
+	first, _, err := store.Begin(request, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := errors.New("launcher handoff unproven")
+	reject := func(model.ManagerState) error { return closed }
+	replayed, reused, err := store.BeginWithAdmission(request, now, reject)
+	if err != nil || !reused || replayed.ID != first.ID {
+		t.Fatalf("closed admission hid active replay: op=%+v reused=%v err=%v", replayed, reused, err)
+	}
+	if _, err := store.Complete(first.ID, false, nil, "failed", now); err != nil {
+		t.Fatal(err)
+	}
+	replayed, reused, err = store.BeginWithAdmission(request, now, reject)
+	if err != nil || !reused || replayed.ID != first.ID || replayed.Status != model.OperationFailed {
+		t.Fatalf("closed admission hid terminal replay: op=%+v reused=%v err=%v", replayed, reused, err)
+	}
+	before := store.State()
+	request.ExpectedGeneration = before.Generation
+	if _, _, err := store.BeginWithAdmission(request, now, reject); !errors.Is(err, closed) {
+		t.Fatalf("new attempt crossed closed admission: %v", err)
+	}
+	after := store.State()
+	if after.Generation != before.Generation || after.ActiveOperationID != "" {
+		t.Fatalf("rejected admission mutated journal: %+v", after)
+	}
+}
+
 func TestFailedIdempotentOperationCreatesANewAttempt(t *testing.T) {
 	store, err := Open(t.TempDir(), time.Now())
 	if err != nil {
