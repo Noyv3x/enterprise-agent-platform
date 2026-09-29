@@ -567,10 +567,11 @@ class ServiceUpdateReservationTests(unittest.TestCase):
             finally:
                 service.close()
 
-    def test_message_persist_to_job_enqueue_gap_is_counted_as_admitted_work(self):
+    def test_reservation_during_message_admission_sees_the_admitted_work(self):
         with tempfile.TemporaryDirectory() as td:
+            # The agent stays blocked so the admitted work cannot finish before
+            # the reservation looks at it.
             agent = _BlockingAgent()
-            agent.release.set()
             service = EnterpriseService(
                 _config(Path(td)),
                 agent_client=agent,
@@ -586,6 +587,7 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                 return original_enqueue(*args, **kwargs)
 
             result: dict[str, object] = {}
+            reservation: dict[str, object] = {}
 
             def send() -> None:
                 try:
@@ -602,13 +604,23 @@ class ServiceUpdateReservationTests(unittest.TestCase):
                     sender = threading.Thread(target=send)
                     sender.start()
                     self.assertTrue(enqueue_entered.wait(timeout=2))
-                    blocked = service.try_reserve_auto_update("update-gap")
-                    self.assertFalse(blocked["reserved"])
-                    self.assertGreaterEqual(blocked["admissions_in_progress"], 1)
+                    # Admission is atomic, so the reservation waits for the
+                    # message and its job to commit instead of seeing a gap.
+                    reserver = threading.Thread(
+                        target=lambda: reservation.update(
+                            service.try_reserve_auto_update("update-gap")
+                        )
+                    )
+                    reserver.start()
                     allow_enqueue.set()
+                    reserver.join(timeout=5)
                     sender.join(timeout=5)
+                self.assertFalse(reserver.is_alive())
                 self.assertFalse(sender.is_alive())
                 self.assertNotIn("error", result)
+                self.assertFalse(reservation["reserved"])
+                self.assertTrue(service._auto_update_has_agent_blockers(reservation))
+                agent.release.set()
                 service.wait_for_agent_idle("private", str(actor["id"]), timeout=5)
             finally:
                 allow_enqueue.set()
