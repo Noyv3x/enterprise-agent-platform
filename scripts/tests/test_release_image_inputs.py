@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -76,7 +77,7 @@ class InputTests(unittest.TestCase):
         (self.root / "src/generated.js").write_text("untracked build output")
         self.assertEqual(self.fingerprint()[0], value)
         self.assertEqual(self.reuse(value), D1)
-        self.assertEqual(contexts, f"node:24=docker-image://node:24@{D1}")
+        self.assertEqual(contexts, f"node:24=docker-image://docker.io/library/node@{D1}")
 
     def test_runtime_base_salt_and_policy_changes_rebuild(self):
         original, _ = self.seed()
@@ -180,7 +181,14 @@ class InputTests(unittest.TestCase):
             return {"node:24": D1, "alpine:3": D2}[reference]
         with patch.object(self.registry, "resolve", side_effect=resolve):
             _, contexts = self.fingerprint()
-        self.assertEqual(contexts, f"alpine:3=docker-image://alpine:3@{D2}\nnode:24=docker-image://node:24@{D1}")
+        self.assertEqual(contexts, f"alpine:3=docker-image://docker.io/library/alpine@{D2}\nnode:24=docker-image://docker.io/library/node@{D1}")
+
+    def test_contexts_never_look_like_url_credentials(self):
+        # GitHub's runner masks `scheme://user:password@` and then drops the whole job output.
+        self.put("containers/agent-runtime.Dockerfile", "# syntax=docker/dockerfile:1.7\nFROM node:24.14.0-bookworm-slim AS build\nFROM python:3.11-slim-bookworm\nCOPY src /app\n")
+        _, contexts = self.fingerprint()
+        self.assertEqual(len(contexts.splitlines()), 3)
+        self.assertIsNone(re.search(r"://[^\s/:@]+:[^\s@]+@", contexts))
 
 
 class RegistryTests(unittest.TestCase):

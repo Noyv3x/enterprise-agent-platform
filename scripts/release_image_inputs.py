@@ -322,8 +322,11 @@ def fingerprint(root, component, salt, tracked, registry):
         add(base)
         add(digest)
         # Already immutable references need no override (and @ is not a context name).
+        # Target the digest by fully qualified repository only: the Actions runner treats
+        # `scheme://name:tag@...` as URL credentials and drops the whole job output.
         if "@" not in base:
-            contexts.append(f"{base}=docker-image://{base}@{digest}")
+            host, repository, _ = Registry.location(base)
+            contexts.append(f"{base}=docker-image://{'docker.io' if host == 'registry-1.docker.io' else host}/{repository}@{digest}")
     for path in sorted(selected):
         full = root / path
         for parent in full.relative_to(root).parents:
