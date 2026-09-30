@@ -18,6 +18,7 @@ class Settings:
     camofox_access_key: str = ''
     searxng_url: str = 'http://searxng:8080'
     public_base_url: str = 'http://127.0.0.1:8080'
+    trusted_proxy: bool = False
     frontend_dir: Path = Path(__file__).parent / 'static'
     host: str = '127.0.0.1'
     port: int = 8765
@@ -56,6 +57,7 @@ class Settings:
             camofox_access_key=secret('CAMOFOX_ACCESS_KEY'),
             searxng_url=value('SEARXNG_API_URL', 'http://searxng:8080').rstrip('/'),
             public_base_url=value('PUBLIC_BASE_URL', 'http://127.0.0.1:8080').rstrip('/'),
+            trusted_proxy=value('TRUSTED_PROXY').lower() in ('1', 'true', 'yes'),
             host=value('HOST', '127.0.0.1'), port=int(value('PORT', '8765')),
             deployment_mode=value('DEPLOYMENT_MODE', 'development'),
         )

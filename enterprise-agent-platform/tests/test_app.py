@@ -71,6 +71,48 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/bootstrap').status_code, 200)
 
 
+class GatewayOriginTests(unittest.TestCase):
+    """Browsers reach the Platform through the Manager gateway under any host name."""
+
+    def client(self, trusted_proxy):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        (root / 'static').mkdir()
+        (root / 'static/index.html').write_text('<html></html>')
+        client = TestClient(create_app(Settings(data_dir=root, frontend_dir=root / 'static',
+            manager_socket=str(root / 'missing.sock'), session_secret='test-secret',
+            public_base_url='http://127.0.0.1:8765', trusted_proxy=trusted_proxy)))
+        client.__enter__()
+        self.addCleanup(client.__exit__, None, None, None)
+        return client, (root / 'bootstrap-admin-password.txt').read_text().strip()
+
+    def test_login_accepts_origin_browser_used_through_gateway(self):
+        client, password = self.client(True)
+        gateway = {'X-Forwarded-Host': 'agents.lan:8081', 'X-Forwarded-Proto': 'http', 'X-Forwarded-For': '192.168.1.20'}
+        response = client.post('/api/auth/login', json={'username': 'admin', 'password': password},
+                               headers={**gateway, 'Origin': 'http://agents.lan:8081'})
+        self.assertEqual(response.status_code, 200, response.text)
+        rejected = client.post('/api/channels', json={'name': 'Injected'},
+                               headers={**gateway, 'Origin': 'http://attacker.example'})
+        self.assertEqual(rejected.status_code, 403)
+
+    def test_forwarded_host_ignored_without_trusted_proxy(self):
+        client, password = self.client(False)
+        response = client.post('/api/auth/login', json={'username': 'admin', 'password': password},
+                               headers={'X-Forwarded-Host': 'attacker.example', 'Origin': 'http://attacker.example'})
+        self.assertEqual(response.status_code, 403)
+
+    def test_login_throttle_is_per_forwarded_client(self):
+        client, password = self.client(True)
+        for _ in range(8):
+            client.post('/api/auth/login', json={'username': 'admin', 'password': 'wrong'}, headers={'X-Forwarded-For': '192.168.1.66'})
+        blocked = client.post('/api/auth/login', json={'username': 'admin', 'password': password}, headers={'X-Forwarded-For': '192.168.1.66'})
+        self.assertEqual(blocked.status_code, 429)
+        other = client.post('/api/auth/login', json={'username': 'admin', 'password': password}, headers={'X-Forwarded-For': '192.168.1.20'})
+        self.assertEqual(other.status_code, 200, other.text)
+
+
 class AdmissionRaceTests(unittest.IsolatedAsyncioTestCase):
     async def test_container_startup_fails_closed_without_manager_socket(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -28,7 +28,7 @@ class IdentityTests(unittest.TestCase):
         root = Path(self.temp.name)
         db = Database(root / 'platform.db')
         db.migrate(root)
-        self.p = SimpleNamespace(db=db, settings=SimpleNamespace(session_secret='test-secret', public_base_url='http://testserver', agent_tool_token='tool-secret'))
+        self.p = SimpleNamespace(db=db, settings=SimpleNamespace(session_secret='test-secret', public_base_url='http://testserver', agent_tool_token='tool-secret', trusted_proxy=False))
         self.p.oauth = oauth.OAuth(self.p)
         self.admin = admin.create_user(db, 'admin', 'admin-password', role='admin')
         self.user = admin.create_user(db, 'member', 'old-password')

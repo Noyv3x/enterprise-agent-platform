@@ -11,6 +11,7 @@ Use Manager's `agent` and `chat` resource profiles; identities bind a sandbox to
 ## Authentication and authorization
 
 - Platform authenticates signed cookies and checks active users and `token_version` on requests. Password/revocation changes invalidate prior tokens.
+- Cookie-authenticated mutations and login must be same-origin: the `Origin` must equal the configured public base URL or the origin the browser actually used. With `AGENT_PLATFORM_TRUSTED_PROXY=1` (container deployments, where the Manager gateway discards client-supplied forwarding headers and rebuilds them from the accepted connection), that request origin comes from `X-Forwarded-Proto`/`X-Forwarded-Host` and login throttling keys on `X-Forwarded-For`; otherwise `Host`, the public scheme and the TCP peer are used.
 - Server-side ownership protects personal scopes, chat conversations, files, schedules and browser takeover. Channel read/manage permissions come from permission groups; there is no implicit membership policy.
 - Runtime bearer, internal tool bearer, Manager control and Manager executor credentials are separate capabilities. Public APIs do not accept caller-supplied trusted scope identities.
 - Model policy is enforced server-side: chat model choices must be allowed for that user; personal model settings are separate.

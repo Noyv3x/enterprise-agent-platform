@@ -120,10 +120,39 @@ def permissions(db, user):
     return next((list(group['permissions']) for group in groups(db) if group['name'] == user['permission_group']), [])
 
 
+def origin_of(value):
+    """Canonical scheme://host[:port] with default ports dropped, or None."""
+    try:
+        parts = urlsplit(value.strip())
+        host, port = parts.hostname, parts.port
+    except (AttributeError, ValueError):
+        return None
+    if parts.scheme not in ('http', 'https') or not host:
+        return None
+    host = f'[{host}]' if ':' in host else host
+    return f"{parts.scheme}://{host}" if port in (None, 443 if parts.scheme == 'https' else 80) else f"{parts.scheme}://{host}:{port}"
+
+
+def forwarded(request, name):
+    """First value of a forwarding header, only behind the trusted Manager gateway."""
+    if not request.app.state.platform.settings.trusted_proxy:
+        return ''
+    return request.headers.get(name, '').split(',', 1)[0].strip()
+
+
+def client_address(request):
+    return forwarded(request, 'x-forwarded-for') or (request.client.host if request.client else '')
+
+
 def same_origin(request):
+    settings = request.app.state.platform.settings
+    scheme = forwarded(request, 'x-forwarded-proto').lower()
+    if scheme not in ('http', 'https'):
+        scheme = urlsplit(settings.public_base_url).scheme
+    host = forwarded(request, 'x-forwarded-host') or request.headers.get('host', '')
+    allowed = {origin_of(settings.public_base_url), origin_of(f'{scheme}://{host}') if host else None} - {None}
     origin = request.headers.get('origin')
-    expected = urlsplit(request.app.state.platform.settings.public_base_url)
-    if request.headers.get('sec-fetch-site') == 'cross-site' or (origin and origin.rstrip('/') != f'{expected.scheme}://{expected.netloc}'):
+    if request.headers.get('sec-fetch-site') == 'cross-site' or (origin and origin_of(origin) not in allowed):
         raise HTTPException(403, 'Cross-origin mutation rejected')
 
 
@@ -194,7 +223,7 @@ async def login(request):
     p = request.app.state.platform
     username = body.get('username', '')
     username = username.strip().lower()[:80] if isinstance(username, str) else ''
-    client = request.client.host if request.client else ''
+    client = client_address(request)
     if not hasattr(p, 'login_attempts'):
         p.login_attempts = LoginAttempts()
     attempts = p.login_attempts
