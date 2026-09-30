@@ -10,6 +10,8 @@ permissions:
   contents: read
 
 env:
+  # Bump to rebuild all built images (including unpinned package inputs).
+  BUILD_INPUTS_SALT: "1"
   PINNED_INTEGRATION_IMAGES: |
     {
       "searxng": "ghcr.io/searxng/searxng@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6"
@@ -57,7 +59,7 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$source_commit" origin/main
           image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
+          image_matrix="$(python3 scripts/release_image_inputs.py --repository "$GITHUB_REPOSITORY" --salt "$BUILD_INPUTS_SALT")"
           {
             echo "source_commit=$source_commit"
             echo "image_matrix=$image_matrix"
@@ -110,6 +112,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up QEMU
+        if: matrix.reuse_digest == ''
         uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3
 
       - name: Set up Docker Buildx
@@ -117,17 +120,20 @@ jobs:
 
       - name: Log in to GHCR
         uses: ./.github/actions/ghcr-login
+        if: matrix.reuse_digest == ''
         with:
           username: ${{ github.actor }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push multi-architecture image
         id: build
-        if: matrix.component != 'agent-sandbox'
+        if: matrix.reuse_digest == '' && matrix.component != 'agent-sandbox'
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          build-contexts: ${{ matrix.base_contexts }}
+          labels: io.agent-platform.build-inputs=${{ matrix.fingerprint }}
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: mode=max
@@ -136,33 +142,36 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ needs.prepare.outputs.source_commit }}
             RELEASE_VERSION=${{ needs.prepare.outputs.source_commit }}
-          cache-from: type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ env.BUILD_INPUTS_SALT }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ env.BUILD_INPUTS_SALT }}
 
-      # The sandbox is release-independent: no commit args, labels or attestations.
+      # The sandbox has only its stable build-input label, no commit labels/attestations.
       # Normalize config/layer timestamps and retain cache across release runners.
       - name: Build and push reproducible sandbox image
         id: sandbox
-        if: matrix.component == 'agent-sandbox'
+        if: matrix.reuse_digest == '' && matrix.component == 'agent-sandbox'
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          build-contexts: ${{ matrix.base_contexts }}
+          labels: io.agent-platform.build-inputs=${{ matrix.fingerprint }}
           platforms: linux/amd64,linux/arm64
           outputs: type=image,push=true,rewrite-timestamp=true
           provenance: false
           sbom: false
           tags: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:${{ needs.prepare.outputs.source_commit }}
           build-args: SOURCE_DATE_EPOCH=0
-          cache-from: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache
-          cache-to: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache-${{ env.BUILD_INPUTS_SALT }}
+          cache-to: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache-${{ env.BUILD_INPUTS_SALT }},mode=max
 
       - name: Record immutable image identity
         shell: bash
         env:
           COMPONENT: ${{ matrix.component }}
           IMAGE: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}
-          DIGEST: ${{ steps.build.outputs.digest || steps.sandbox.outputs.digest }}
+          DIGEST: ${{ matrix.reuse_digest || steps.build.outputs.digest || steps.sandbox.outputs.digest }}
+          REUSED: ${{ matrix.reuse_digest != '' }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -175,7 +184,8 @@ jobs:
             --arg component "$COMPONENT" \
             --arg reference "$IMAGE" \
             --arg digest "$DIGEST" \
-            '{component:$component,reference:$reference,digest:$digest}' \
+            --argjson reused "$REUSED" \
+            '{component:$component,reference:$reference,digest:$digest,reused:$reused}' \
             > "${COMPONENT}.json"
 
       - name: Upload image identity
@@ -245,12 +255,18 @@ jobs:
           jq -e --slurpfile catalog managed-images.json '
             (.managed_image_capacity_estimates | keys) == ($catalog[0] | keys)
           ' docs/contracts/container-platform.json >/dev/null
+          jq -se '
+            map(select(.reused == true) | {(.component): (.reference + "@" + .digest)})
+            | add // {}
+          ' image-metadata/*.json > reused-images.json
 
       - name: Upload managed image catalog
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: managed-images
-          path: managed-images.json
+          path: |
+            managed-images.json
+            reused-images.json
           if-no-files-found: error
           overwrite: true
           retention-days: 7
@@ -339,7 +355,7 @@ jobs:
             fi
           done
 
-      - name: Pull every final digest without registry credentials
+      - name: Verify final digests and pull newly built images anonymously
         shell: bash
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
@@ -444,6 +460,11 @@ jobs:
             if (( compressed_bytes > compressed_limit )); then
               echo "${component} linux/${ARCHITECTURE} compressed size ${compressed_bytes} exceeds contract limit ${compressed_limit}" >&2
               exit 1
+            fi
+            if jq -e --arg component "$component" --arg image "$image" \
+              '.[$component] == $image' artifacts/reused-images.json >/dev/null; then
+              echo "Verified reused ${component} linux/${ARCHITECTURE} manifest: ${image}"
+              continue
             fi
             remove_exact_local_image "$image"
             docker pull --platform "linux/${ARCHITECTURE}" "$image"

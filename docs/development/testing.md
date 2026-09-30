@@ -64,9 +64,9 @@ CI 在 Manager 外部控制边界使用小型 Unix socket 测试替身：0600 so
 
 浏览器冒烟访问公开的 `https://example.com/` 并点击进入 IANA，依赖外网可达和页面链接结构；不通过核心网络上的测试页面绕过浏览器导航策略。公开页面或网络故障应作为冒烟失败报告，不替换为模拟浏览器结果。
 
-每个同仓库 main push 直接启动发布工作流：完整的可复用 Quality 检查与 prepare → 镜像/Manager 构建 → smoke 并行；publish 必须等待全部 Quality、上游校验、双架构镜像和 Manager 构建、镜像目录、匿名拉取、Core Compose 冒烟与用户级 systemd 激活检查成功。PR 和手动 Quality 运行只做质量检查，不启动发布。每次均执行所有组件的构建与检查，不按未改动组件或说明文件差异跳过；Quality 完成前上传的提交标签镜像不是已授权的发布。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。
+每个同仓库 main push 直接启动发布工作流：完整的可复用 Quality 检查与 prepare → 镜像/Manager 构建 → smoke 并行；publish 必须等待全部 Quality、上游校验、双架构镜像验证和 Manager 构建、镜像目录、匿名验证、Core Compose 冒烟与用户级 systemd 激活检查成功。PR 和手动 Quality 运行只做质量检查，不启动发布。每次均执行全部质量检查和冒烟；四个构建镜像按完整输入指纹复用上一已发布 main 版本的精确摘要，Manager 始终按本次提交构建。新构建镜像匿名完整拉取，复用镜像匿名检查双架构清单和压缩容量；SearXNG 的检查不变。Quality 完成前上传的提交标签镜像不是已授权的发布。指纹规则、强制重建方法、发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。
 
-沙箱镜像使用摘要固定的 Node 基础镜像、Debian 软件包快照和固定版本的 Python 包；发布构建复用注册表缓存，不写入每次发布变化的版本/提交标签或证明附件。更新基础镜像或快照需要显式修改 Dockerfile。相同输入的摘要复用仍需真实 BuildKit/GHCR 发布构建验证，本地 Compose 配置检查不能证明可重复构建。
+沙箱镜像使用摘要固定的 Node 基础镜像、Debian 软件包快照和固定版本的 Python 包；需要构建时复用注册表缓存，不写入每次发布变化的版本/提交标签或证明附件，只加入稳定的构建输入指纹标签。更新基础镜像或快照需要显式修改 Dockerfile。相同输入直接复用已发布摘要；首次带标签构建、真实 BuildKit/GHCR 发布及后续复用仍需 main 发布验证，本地 Compose 配置检查不能证明可重复构建。
 
 沙箱通过同一 Debian 快照中的 `python-is-python3` 提供 `python` 命令；构建后在容器内运行 `python --version`，确认模型常用的命令可用且指向 Python 3。
 
