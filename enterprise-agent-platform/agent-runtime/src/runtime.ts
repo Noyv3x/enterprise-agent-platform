@@ -29,7 +29,10 @@ export interface RuntimeConfig {
 }
 type Event = {type:string;[key:string]:unknown};
 type Run = {id:string; sid:string; events:RunEvents; done:boolean; cancelled:boolean; sideEffects:boolean; controller:AbortController; stopping?:Promise<void>; stopConfirmed:Promise<void>; confirmStop:()=>void; finished:Promise<void>; finish:()=>void; endedAt:number; usage:{input:number;output:number;cache_read:number;cache_write:number;total:number}; text:string; error?:string};
-type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; runId:string; lastUsed:number};
+// `reload`: a compaction replaced the cached history, so the next run rebuilds the object with fresh resources.
+type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; runId:string; lastUsed:number; reload:boolean};
+// Upper bound of OpenAI in-memory prompt-cache retention; an older prefix has nothing left to preserve.
+const SESSION_IDLE_MS=60*60_000;
 type Cancellation = {cancelled:boolean;run_id:string|null};
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
 const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true};
@@ -69,11 +72,13 @@ export class Runtime {
   }
   private evict() {
     const now=Date.now();
-    for(const [sid,live] of this.sessions) if(!this.busy.has(sid)&&now-live.lastUsed>15*60_000){live.session.dispose();this.sessions.delete(sid);}
+    for(const [sid,live] of this.sessions) if(!this.busy.has(sid)&&now-live.lastUsed>SESSION_IDLE_MS){live.session.dispose();this.sessions.delete(sid);}
     for(const [id,run] of this.runs) if(run.done&&now-run.endedAt>10*60_000){run.events.dispose();this.runs.delete(id);}
   }
   private async open(sid:string,request:RunRequest,signal:AbortSignal):Promise<Live> {
-    const existing=this.sessions.get(sid); if(existing)return existing;
+    const existing=this.sessions.get(sid);
+    if(existing&&!existing.reload)return existing;
+    if(existing){existing.session.dispose();this.sessions.delete(sid);}
     const fixed=structuredClone(request);
     const skills=new Map(this.bundled.map(s=>[s.name,s]));
     for(const skill of fixed.resources.skills)skills.set(skill.name,skill);
@@ -92,7 +97,7 @@ export class Runtime {
     bindModelSession(models,sid,guard);
     const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
-    Object.assign(live,{session,manager,models,request:fixed,runId:'',lastUsed:Date.now()});
+    Object.assign(live,{session,manager,models,request:fixed,runId:'',lastUsed:Date.now(),reload:false});
     this.sessions.set(sid,live);return live;
   }
   async start(sid:string,request:RunRequest):Promise<{run_id:string}> {
@@ -133,6 +138,8 @@ export class Runtime {
       this.emit(run,{type:'compaction',phase:event.type==='compaction_start'?'start':'end',reason:event.reason});
       const usage=event.type==='compaction_end'?event.result?.usage:undefined;
       if(usage){run.usage.input+=usage.input;run.usage.output+=usage.output;run.usage.cache_read+=usage.cacheRead;run.usage.cache_write+=usage.cacheWrite;run.usage.total+=usage.totalTokens;}
+      const live=this.sessions.get(run.sid);
+      if(event.type==='compaction_end'&&event.result&&!event.aborted&&live)live.reload=true;
     }
     else if(event.type==='message_end'&&event.message.role==='assistant'){
       const message=event.message;
@@ -216,7 +223,9 @@ export class Runtime {
         const model=await resolveModel(live.models,selected,controller.signal);
         await live.session.setModel(model);
         live.session.setThinkingLevel(selected.thinking);
-        return await compactSession(live.session,controller.signal);
+        const outcome=await compactSession(live.session,controller.signal);
+        if(outcome.compacted)live.reload=true;
+        return outcome;
       }else return await compactStored(this.config.home,sid,this.config.platformUrl,this.config.platformToken,selected,this.config.modelRuntimeFactory,controller.signal);
     }catch(error){
       if(controller.signal.aborted)throw failure(409,'Session compaction cancelled');

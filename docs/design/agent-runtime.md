@@ -6,7 +6,7 @@ Runtime embeds `@earendil-works/pi-coding-agent@0.87.1`. The [Runtime API](../re
 
 Create one `AgentSession` with `createAgentSession`, a supplied model runtime, `SessionManager.open(file)`, an empty private agent directory and a custom resource loader. The loader returns only Platform-supplied resources: no host filesystem discovery, package discovery or tenant extensions.
 
-Platform chooses stable session IDs: `agent-private-<uid>`, `agent-channel-<cid>` and `chat-<conversation_id>`; reset may rotate an ID. Only one run can use an ID at a time. Platform queues later messages FIFO. Idle objects are disposed after 15 minutes; persisted history survives. Pi owns retries, default compaction and manual `/compact`.
+Platform chooses stable session IDs: `agent-private-<uid>`, `agent-channel-<cid>` and `chat-<conversation_id>`; reset may rotate an ID. Only one run can use an ID at a time. Platform queues later messages FIFO. Idle objects are disposed after 60 minutes; persisted history survives. Pi owns retries, default compaction and manual `/compact`.
 
 ## Tools and remote operations
 
@@ -24,7 +24,13 @@ Resolve file paths inside the workspace and reject escapes. Chat file tools enfo
 
 ## Prompt cache
 
-System prompt, context resources and tool definitions are fixed for the lifetime of each in-memory session object. Updated AGENTS.md or skill advertisements take effect when a new object is created, not by rewriting a live prompt. Branding controls the fixed product/agent wording.
+System prompt, context resources (AGENTS.md, skill advertisements) and tool definitions are fixed for the lifetime of each in-memory session object. Pi records the system prompt in the transcript: the first version is the request's leading instructions, and when a later object sees different resources Pi appends only the changed sections as a system update at the end of the conversation. The cached prefix is therefore never rewritten, but every reload with a changed AGENTS.md adds a copy of it to the context. A new object, picking up the resources supplied with the next run, is created only:
+
+- after 60 minutes idle, the upper bound of OpenAI's in-memory prompt-cache retention (usually 5–10 minutes of inactivity, at most one hour; Codex requests send no extended-retention option);
+- at the next run after a successful automatic or manual compaction, which already replaced the cached history;
+- after a Runtime restart or session reset/delete.
+
+The agent that edits AGENTS.md sees its own change in the conversation immediately; the file becomes system context at the next reload. Branding controls the fixed product/agent wording.
 
 Current time, display name and timezone go into a short user-message prefix, never the system prompt. History is append-only; Pi compaction appends its own entries. Use `SettingsManager.inMemory({cacheWarming: 'off'})` with Pi retry/compaction defaults. Keep the conversation session ID stable for Codex's `prompt_cache_key`; auxiliary LLM calls use stable prefixes and that same ID. Platform records input/output/cache-read/cache-write usage and exposes cache-hit ratio.
 

@@ -412,6 +412,15 @@ test('manual compaction requires a selected model and generates its summary usin
   assert.equal(f.faux.state.callCount,3);
   const history=await f.http('/v1/sessions/agent-private-1/history');
   assert.match(await history.text(),/Preserved summary of earlier work/);
+  // Compaction already replaced the cached history, so the next run loads the current AGENTS.md.
+  let systems:string[]=[];
+  f.faux.setResponses([context=>{systems=context.messages.filter(m=>m.role==='system').map(m=>JSON.stringify(m));return fauxAssistantMessage('After reload.');}]);
+  body.prompt.text='After compaction.';body.resources.agents_md={path:'/workspace/AGENTS.md',content:'UPDATED_CONTEXT_MARKER'};
+  assert.equal((await f.events(await f.start('agent-private-1',body))).at(-1)!.text,'After reload.');
+  // Pi appends the changed section as a later system update; the cached leading prompt is untouched.
+  assert.match(systems[0]!,/PRIVATE_CONTEXT_MARKER/);
+  assert.match(systems.at(-1)!,/UPDATED_CONTEXT_MARKER/);
+  assert.equal(systems.length,2);
 });
 
 test('cancellation deadline preserves admission fence until pending construction settles', {timeout:10_000}, async t=>{
