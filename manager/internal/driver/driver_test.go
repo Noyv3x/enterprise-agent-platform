@@ -378,23 +378,23 @@ func TestPullFailureRedactsCredentialsAndBoundsPersistedDiagnostic(t *testing.T)
 
 func TestPullFailureDoesNotRemoveImagesHeldByOtherLifecycles(t *testing.T) {
 	manifest := pullTestManifest()
-	platform := manifest.Images["platform"]
 	runtimeImage := manifest.Images["agent-runtime"]
-	platformPulled := false
+	// Core images pull concurrently; every image except the runtime succeeds.
+	var pulled sync.Map
 	runner := &recordingRunner{results: func(args []string) (Result, error) {
 		switch {
 		case reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}):
 			return Result{Stdout: os.TempDir() + "\n"}, nil
 		case len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .RepoDigests}}":
-			if args[4] == platform && platformPulled {
-				return Result{Stdout: fmt.Sprintf("[%q]", platform)}, nil
+			if _, ok := pulled.Load(args[4]); ok {
+				return Result{Stdout: fmt.Sprintf("[%q]", args[4])}, nil
 			}
 			return Result{ExitCode: 1, Stderr: "No such image"}, errors.New("docker exited with 1")
-		case reflect.DeepEqual(args, []string{"pull", platform}):
-			platformPulled = true
-			return Result{}, nil
 		case reflect.DeepEqual(args, []string{"pull", runtimeImage}):
 			return Result{ExitCode: 1, Stderr: "registry unavailable"}, errors.New("docker exited with 1")
+		case len(args) == 2 && args[0] == "pull":
+			pulled.Store(args[1], true)
+			return Result{}, nil
 		default:
 			return Result{}, fmt.Errorf("unexpected command: %v", args)
 		}
