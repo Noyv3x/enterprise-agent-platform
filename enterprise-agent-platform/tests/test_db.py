@@ -19,6 +19,16 @@ class DatabaseTests(unittest.TestCase):
         self.db = Database(self.root / 'platform.db')
         self.db.migrate(self.root)
 
+    def test_cli_migrate_creates_owner_only_files_under_permissive_umask(self):
+        data = self.root / 'fresh'
+        data.mkdir(mode=0o700)
+        script = 'import os,sys; os.umask(0o022); sys.argv=["enterprise-agent-platform","migrate","--data",sys.argv[1]]; from enterprise_agent_platform.__main__ import main; main()'
+        subprocess.run([sys.executable, '-c', script, str(data)], check=True, capture_output=True, text=True)
+        created = [path for path in data.iterdir() if path.is_file()]
+        self.assertIn(data / 'platform.db', created)
+        for path in created:
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, path.name)
+
     def seed(self):
         with self.db.connect() as conn:
             conn.execute('DELETE FROM pi_schema_migrations')

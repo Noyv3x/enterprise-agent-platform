@@ -2,6 +2,7 @@
 import argparse
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 
 from .config import Settings
@@ -9,6 +10,9 @@ from .db import Database
 
 
 def main():
+    # Everything the Platform creates (database, WAL/SHM, locks, uploads,
+    # workspace files) is private to the deployment account.
+    os.umask(0o077)
     parser = argparse.ArgumentParser(description='Agent Platform')
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('serve', 'migrate', 'init-admin', 'print-agent-token'):
