@@ -328,7 +328,7 @@ func (m *ProcessManager) releaseProcessSlotLocked(scope, lifecycle string) {
 }
 
 var sandboxProcessWrapper = sandboxOutputRedactorPython() + `
-import os, selectors, sys
+import fcntl, os, selectors, sys
 pid_file, stdout_file, stderr_file, exit_file, limit, private_output, command = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "private", sys.argv[7]
 out_r, out_w = os.pipe()
 err_r, err_w = os.pipe()
@@ -355,6 +355,8 @@ if child:
             else:
                 # Replace only the safe speculative suffix; never commit it to
                 # the streaming redactor or let it become input to clipping.
+                # Readers must not observe the truncated preview or clipped tail.
+                fcntl.flock(target_fd, fcntl.LOCK_EX)
                 os.ftruncate(target_fd, committed)
                 os.lseek(target_fd, committed, os.SEEK_SET)
                 os.write(target_fd, redactor.feed(chunk, final=not chunk))
@@ -366,6 +368,7 @@ if child:
                     os.ftruncate(target_fd, 0); os.lseek(target_fd, 0, os.SEEK_SET); os.write(target_fd, tail)
                 key.data[3] = os.lseek(target_fd, 0, os.SEEK_END)
                 os.write(target_fd, redactor.preview()[:limit] if chunk else b'')
+                fcntl.flock(target_fd, fcntl.LOCK_UN)
             if not chunk:
                 selector.unregister(key.fd); os.close(key.fd)
     if not private_output:
@@ -1225,6 +1228,12 @@ func readTailFile(path string, limit int64) (string, error) {
 	}
 	file := os.NewFile(uintptr(fd), filepath.Base(path))
 	defer file.Close()
+	// The wrapper replaces its speculative redaction suffix in place. Hold a
+	// shared lock across stat and read so snapshots only see complete rewrites.
+	if err := syscall.Flock(fd, syscall.LOCK_SH); err != nil {
+		return "", err
+	}
+	defer syscall.Flock(fd, syscall.LOCK_UN)
 	info, err := file.Stat()
 	if err != nil {
 		return "", err

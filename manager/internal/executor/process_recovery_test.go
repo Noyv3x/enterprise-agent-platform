@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -383,6 +384,53 @@ func (localSandboxEngine) ExecArgs(spec driver.SandboxSpec, _ string, command st
 		result[index] = value
 	}
 	return command, result
+}
+
+func TestReadTailFileWaitsForOutputRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "output")
+	writer, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := syscall.Flock(int(writer.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(writer.Fd()), syscall.LOCK_UN)
+	if _, err := writer.WriteString("previous preview"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		output string
+		err    error
+	}
+	read := make(chan result, 1)
+	go func() {
+		output, err := readTailFile(path, 6)
+		read <- result{output, err}
+	}()
+	select {
+	case got := <-read:
+		t.Fatalf("read observed an unfinished output rewrite: %q, %v", got.output, got.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := writer.WriteAt([]byte("complete output"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(writer.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-read:
+		if got.err != nil || got.output != "output" {
+			t.Fatalf("read did not observe the completed tail: %q, %v", got.output, got.err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("read did not resume after the output rewrite")
+	}
 }
 
 func TestSandboxProcessOutputAndControlSurviveManagerRestart(t *testing.T) {
