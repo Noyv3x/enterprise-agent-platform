@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate cross-language constants and check local Markdown links."""
+"""Generate Manager constants and check local Markdown links."""
 from __future__ import annotations
 
 import argparse
@@ -51,24 +51,13 @@ CONTRACTS: tuple[Contract, ...] = (
         source="docs/contracts/container-platform.json",
         targets=_targets(
             ("manager/internal/contract/generated.go", "go-container-platform"),
-            ("enterprise-agent-platform/enterprise_agent_platform/container_contract_generated.py", "python-container-platform"),
-            ("enterprise-agent-platform/agent-runtime/src/container-contract.generated.ts", "typescript-container-platform"),
-            ("enterprise-agent-platform/frontend/src/container-contract.generated.ts", "typescript-container-platform"),
         ),
-    ),
-    # Build scripts read this JSON directly; nothing is generated.
-    Contract(
-        identifier="upstream-sources",
-        source="docs/contracts/upstream-sources.json",
-        targets=(),
     ),
     Contract(
         identifier="technical-profiles",
         source="docs/contracts/technical-profiles.json",
         targets=_targets(
             ("manager/internal/identity/technical_profiles_generated.go", "go-technical-profiles"),
-            ("enterprise-agent-platform/enterprise_agent_platform/technical_profile_generated.py", "python-technical-profiles"),
-            ("enterprise-agent-platform/agent-runtime/src/technical-profile.generated.ts", "typescript-technical-profile"),
         ),
     ),
     Contract(
@@ -76,9 +65,6 @@ CONTRACTS: tuple[Contract, ...] = (
         source="docs/contracts/runtime-policy.json",
         targets=_targets(
             ("manager/internal/executor/runtime_policy_generated.go", "go-runtime-policy"),
-            ("enterprise-agent-platform/enterprise_agent_platform/design_contract_generated.py", "python-runtime-policy"),
-            ("enterprise-agent-platform/agent-runtime/src/design-contract.generated.ts", "typescript-runtime-policy"),
-            ("enterprise-agent-platform/frontend/src/design-contract.generated.ts", "typescript-runtime-policy"),
         ),
     ),
 )
@@ -170,54 +156,23 @@ def _camel(name: str) -> str:
     return ''.join(part.title() for part in name.split('_'))
 
 
-def _literal(value, language: str) -> str:
-    if language == 'python':
-        return repr(tuple(value) if isinstance(value, list) else value)
-    return json.dumps(value, ensure_ascii=False, indent=2 if isinstance(value, dict) else None)
+def _literal(value) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
-def _constants(values: list[tuple[str, object]], language: str, *, package: str = '') -> str:
-    """The three consumers differ only in declaration syntax and string literals."""
-    if language == 'go':
-        width = max(len(name) for name, _ in values)
-        lines = [f'\t{name:<{width}} = {_literal(value, language)}' for name, value in values]
-        return f'package {package}\n\nconst (\n' + '\n'.join(lines) + '\n)\n'
-    lines = []
-    for name, value in values:
-        if not name:
-            lines.append('')
-            continue
-        literal = _literal(value, language)
-        lines.append(f'{name} = {literal}' if language == 'python' else f'export const {name} = {literal} as const;')
-        if language == 'typescript' and name in TYPESCRIPT_TYPES:
-            lines.append(f'export type {TYPESCRIPT_TYPES[name]} = (typeof {name})[number];')
-    prefix = 'from __future__ import annotations\n\n' if language == 'python' else ''
-    return prefix + '\n'.join(lines) + '\n'
+def _constants(values: list[tuple[str, object]], *, package: str) -> str:
+    width = max(len(name) for name, _ in values)
+    lines = [f'\t{name:<{width}} = {_literal(value)}' for name, value in values]
+    return f'package {package}\n\nconst (\n' + '\n'.join(lines) + '\n)\n'
 
 
-TYPESCRIPT_TYPES = {
-    'EXECUTION_TARGETS': 'ExecutionTarget',
-    'PUBLIC_UPDATE_STATES': 'PublicUpdateState',
-    'MANAGER_OPERATIONS': 'ManagerOperation',
-    'MANAGER_OPERATION_PHASES': 'ManagerOperationPhase',
-}
 CONTAINER_FIELDS = (
-    ('CONTAINER_PLATFORM_SCHEMA_VERSION', 'schema_version'),
-    ('RELEASE_CHANNEL', 'release_channel'),
-    ('DATABASE_SCHEMA_VERSION', 'database_schema_version'),
-    ('CONTAINER_PATHS', 'container_paths'),
-    ('EXECUTION_TARGETS', 'execution_targets'),
-    ('PERSISTENT_DATA_OWNERS', 'persistent_data_owners'),
     ('SANDBOX_IDLE_SECONDS', 'sandbox_idle_seconds'),
     ('MIGRATION_BACKUP_RETENTION_SECONDS', 'migration_backup_retention_seconds'),
     ('OBSOLETE_ARTIFACT_RETENTION_SECONDS', 'obsolete_artifact_retention_seconds'),
     ('UPDATE_PRE_DOWNLOAD_MIN_FREE_BYTES', 'update_pre_download_min_free_bytes'),
     ('UPDATE_PRE_CUTOVER_MIN_FREE_BYTES', 'update_pre_cutover_min_free_bytes'),
     ('UPDATE_MIN_FREE_INODES', 'update_min_free_inodes'),
-    ('MANAGED_IMAGE_CAPACITY_ESTIMATES', 'managed_image_capacity_estimates'),
-    ('PUBLIC_UPDATE_STATES', 'public_update_states'),
-    ('MANAGER_OPERATIONS', 'operations'),
-    ('MANAGER_OPERATION_PHASES', 'operation_phases'),
 )
 GO_PROFILE_FIELDS = {
     'ProfileID': 'profile_id',
@@ -243,34 +198,6 @@ GO_PROFILE_FIELDS = {
     'RecoveryWatchdogUnitPrefix': 'labels.recovery_watchdog_unit_prefix',
     'InternalWorkspaceDirectory': 'workspace.internal_directory',
 }
-PYTHON_PROFILE_FIELDS = {
-    'profile_id': 'profile_id',
-    'selector_environment_variable': 'environment.keys.technical_profile',
-    'deployment_mode_environment_variable': 'environment.keys.deployment_mode',
-    'manager_socket_environment_variable': 'environment.keys.manager_socket',
-    'manager_token_file_environment_variable': 'environment.keys.manager_token_file',
-    'host_data_root_environment_variable': 'environment.keys.host_data_root',
-    'manager_environment_prefix': 'environment.manager_prefix',
-    'platform_environment_prefix': 'environment.platform_prefix',
-    'default_data_root': 'platform.default_data_root',
-    'default_manager_socket': 'manager.default_socket_path',
-    'default_manager_token_file': 'manager.default_token_file',
-    'database_baseline_name': 'platform.database_baseline',
-    'instance_lock_name': 'platform.instance_lock',
-    'scope_marker_name': 'workspace.scope_marker',
-    'camofox_sidecar_name': 'platform.camofox_sidecar',
-    'workspace_internal_directory': 'workspace.internal_directory',
-    'session_namespace': 'platform.session_namespace',
-    'session_cookie_name': 'platform.session_cookie',
-    'health_service': 'platform.health_service',
-    'search_health_service': 'platform.search_health_service',
-    'agent_runtime_health_service': 'platform.agent_runtime_health_service',
-}
-TS_PROFILE_FIELDS = {
-    'TARGET_TECHNICAL_PROFILE_ID': 'profile_id',
-    'TARGET_TECHNICAL_PROFILE_ENVIRONMENT_VARIABLE': 'environment.keys.technical_profile',
-    'TARGET_MANAGER_EXECUTOR_SOCKET_PATH': 'manager.default_socket_path',
-}
 RUNTIME_GROUPS = {
     'run_idle_timeout': ('_seconds', 0, ((1 << 53) - 1) // 1000),
     'max_turns_per_run': ('', 1, (1 << 53) - 1),
@@ -279,29 +206,26 @@ RUNTIME_GROUPS = {
 }
 
 
-def _runtime_values(data: dict, language: str) -> list[tuple[str, object]]:
+def _runtime_values(data: dict) -> list[tuple[str, object]]:
     values = [('RUNTIME_POLICY_SCHEMA_VERSION', data['schema_version'])]
     for group, (suffix, minimum, maximum) in RUNTIME_GROUPS.items():
         policy = data[group]
         bounds = [policy[key + suffix] for key in ('minimum', 'default', 'maximum')]
         if any(type(value) is not int for value in bounds) or not minimum <= bounds[0] <= bounds[1] <= bounds[2] <= maximum:
             raise DocsSyncError(f'{group}: invalid minimum/default/maximum bounds (allowed {minimum}..{maximum})')
-        if language != 'go':
-            values.append(('', None))
-        for key in ('default', 'minimum', 'maximum', 'platform_environment_variable', 'runtime_environment_variable'):
-            field = key + suffix if key in ('default', 'minimum', 'maximum') else key
-            if field in policy and not (language == 'go' and key.endswith('environment_variable')):
+        for key in ('default', 'minimum', 'maximum'):
+            field = key + suffix
+            if field in policy:
                 values.append((f'{group}_{field}'.upper(), policy[field]))
-    if language == 'go':
-        values = [(name[0].lower() + name[1:], value) for key, value in values for name in [_camel(key)]]
+    values = [(name[0].lower() + name[1:], value) for key, value in values for name in [_camel(key)]]
     return values
 
 
 def _container_go(data: dict) -> str:
     values = [('SchemaVersion', data['schema_version']), ('ReleaseChannel', data['release_channel']), ('DatabaseSchemaVersion', data['database_schema_version'])]
     values.extend(('Container' + _camel(key), value) for key, value in data['container_paths'].items())
-    values.extend((_camel(name), data[path]) for name, path in CONTAINER_FIELDS[6:12])
-    text = _constants(values, 'go', package='contract')
+    values.extend((_camel(name), data[path]) for name, path in CONTAINER_FIELDS)
+    text = _constants(values, package='contract')
     text += '\ntype ImageCapacityEstimate struct {\n\tCompressedBytes uint64\n\tUnpackedBytes   uint64\n}\n\nvar ManagedImageCapacityEstimates = map[string]ImageCapacityEstimate{\n'
     for name, value in sorted(data['managed_image_capacity_estimates'].items()):
         text += f'\t{json.dumps(name)}: {{\n\t\tCompressedBytes: {value["compressed_bytes"]},\n\t\tUnpackedBytes:   {value["unpacked_bytes"]},\n\t}},\n'
@@ -314,13 +238,8 @@ def _container_go(data: dict) -> str:
     return text + '}\n'
 
 
-def _profile(data: dict, language: str) -> str:
+def _profile(data: dict) -> str:
     profile = data['profiles']['target']
-    if language == 'typescript':
-        return _constants([(name, _lookup(profile, path)) for name, path in TS_PROFILE_FIELDS.items()], language)
-    if language == 'python':
-        lines = ''.join(f'        {name!r}: {_lookup(profile, path)!r},\n' for name, path in PYTHON_PROFILE_FIELDS.items())
-        return "from __future__ import annotations\n\nTECHNICAL_PROFILES: dict[str, dict[str, object]] = {\n    'target': {\n" + lines + '    },\n}\n'
     width = max(map(len, GO_PROFILE_FIELDS)) + 1
     lines = ''.join(f'\t{name + ":":<{width}} {json.dumps(_lookup(profile, path) or "", ensure_ascii=False)},\n' for name, path in GO_PROFILE_FIELDS.items())
     return 'package identity\n\nvar generatedTargetProfile = Profile{\n' + lines + '}\n'
@@ -333,19 +252,16 @@ def render_contract(root: Path, contract: Contract) -> dict[str, str]:
     rendered = {}
     try:
         for target in contract.targets:
-            language = target.format.split('-', 1)[0]
             if contract.identifier == 'runtime-policy':
-                body = _constants(_runtime_values(data, language), language, package='executor')
+                body = _constants(_runtime_values(data), package='executor')
             elif contract.identifier == 'container-platform':
-                body = _container_go(data) if language == 'go' else _constants([(name, data[path]) for name, path in CONTAINER_FIELDS], language)
+                body = _container_go(data)
             elif contract.identifier == 'technical-profiles':
-                body = _profile(data, language)
+                body = _profile(data)
             else:
                 raise DocsSyncError(f'unsupported contract: {contract.identifier}')
-            banner = f'Generated from {contract.source} by scripts/docs_sync.py; do not edit.'
-            if language == 'go':
-                banner = f'Code generated from {contract.source} by scripts/docs_sync.py; DO NOT EDIT.'
-            rendered[target.path] = ('# ' if language == 'python' else '// ') + banner + '\n' + body
+            banner = f'Code generated from {contract.source} by scripts/docs_sync.py; DO NOT EDIT.'
+            rendered[target.path] = '// ' + banner + '\n' + body
     except (KeyError, TypeError, ValueError) as exc:
         raise DocsSyncError(f'{contract.source}: cannot generate contract: {exc}') from exc
     return rendered

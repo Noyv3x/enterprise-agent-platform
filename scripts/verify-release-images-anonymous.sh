@@ -24,11 +24,6 @@ expected_components=(
   agent-runtime
   agent-sandbox
   camofox
-  firecrawl-api
-  firecrawl-playwright
-  firecrawl-postgres
-  firecrawl-rabbitmq
-  firecrawl-redis
   platform
   searxng
 )
@@ -63,18 +58,6 @@ verify_registry_digest() {
       registry=https://ghcr.io
       service=ghcr.io
       token_url=https://ghcr.io/token
-      ;;
-    redis)
-      repository=library/redis
-      registry=https://registry-1.docker.io
-      service=registry.docker.io
-      token_url=https://auth.docker.io/token
-      ;;
-    rabbitmq)
-      repository=library/rabbitmq
-      registry=https://registry-1.docker.io
-      service=registry.docker.io
-      token_url=https://auth.docker.io/token
       ;;
     *)
       echo "Unsupported anonymous registry reference for ${component}: ${image}" >&2

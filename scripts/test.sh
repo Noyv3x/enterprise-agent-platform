@@ -41,7 +41,7 @@ for component in "${components[@]}"; do
         npm ci
         npm run check
         npm run build
-        npm run test:compiled
+        npm test
         ;;
       camofox)
         cd enterprise-agent-platform/camofox-runtime

@@ -14,11 +14,6 @@ COMPONENTS = (
     "agent-runtime",
     "agent-sandbox",
     "camofox",
-    "firecrawl-api",
-    "firecrawl-playwright",
-    "firecrawl-postgres",
-    "firecrawl-rabbitmq",
-    "firecrawl-redis",
     "platform",
     "searxng",
 )
@@ -66,12 +61,7 @@ fi
     def images() -> dict[str, str]:
         values: dict[str, str] = {}
         for index, component in enumerate(COMPONENTS, start=1):
-            if component == "firecrawl-redis":
-                reference = "redis"
-            elif component == "firecrawl-rabbitmq":
-                reference = "rabbitmq"
-            else:
-                reference = f"ghcr.io/example/{component}"
+            reference = f"ghcr.io/example/{component}"
             values[component] = f"{reference}@sha256:{index:064x}"
         return values
 
@@ -106,7 +96,7 @@ fi
             env=env,
         )
 
-    def test_exact_ten_public_digests_are_verified_without_credentials(self) -> None:
+    def test_exact_five_public_digests_are_verified_without_credentials(self) -> None:
         result = self.run_verifier(self.images())
         self.assertEqual(result.returncode, 0, result.stderr)
 

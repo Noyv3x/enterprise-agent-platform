@@ -26,11 +26,6 @@ MANAGED_IMAGES = {
     "camofox",
     "agent-sandbox",
     "searxng",
-    "firecrawl-api",
-    "firecrawl-playwright",
-    "firecrawl-postgres",
-    "firecrawl-redis",
-    "firecrawl-rabbitmq",
 }
 
 
@@ -98,7 +93,7 @@ def assemble(args: argparse.Namespace) -> dict[str, Any]:
         not isinstance(value, str) or IMAGE.fullmatch(value) is None
         for value in images.values()
     ):
-        _fail("images must be the exact ten-image immutable digest set")
+        _fail("images must be the exact five-image immutable digest set")
 
     artifacts = {
         architecture: _artifact(

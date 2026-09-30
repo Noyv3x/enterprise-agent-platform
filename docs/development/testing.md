@@ -22,7 +22,7 @@
 | scripts | 仓库根目录 | `python3 -m unittest discover -s scripts/tests` |
 | manager | `manager/` | `go test ./... && go vet ./... && go build -buildvcs=false ./cmd/agent-platform-manager` |
 | python | `enterprise-agent-platform/` | `python3 -m unittest discover -s tests && python3 -m compileall -q enterprise_agent_platform tests` |
-| runtime | `enterprise-agent-platform/agent-runtime/` | `npm ci && npm run check && npm run build && npm run test:compiled` |
+| runtime | `enterprise-agent-platform/agent-runtime/` | `npm ci && npm run check && npm run build && npm test` |
 | camofox | `enterprise-agent-platform/camofox-runtime/` | `npm ci && npm test` |
 | frontend | `enterprise-agent-platform/frontend/` | `npm ci && npm run check && npm test && npm run build` |
 | containers | 仓库根目录 | `scripts/container-smoke.sh` |
@@ -37,7 +37,7 @@
 
 ## Agent Runtime
 
-一轮只 build 一次，再运行 `test:compiled`，不要追加会重新编译的 `npm test`。覆盖执行隔离、审批、取消、恢复、限额和持久化；确定性的模型流不能代替真实模型验证。容器内 MCP 的协议和安全测试也属于 Runtime 检查。
+一轮只 build 一次，再运行 `npm test`（直接执行编译后的 node:test）。覆盖 Pi 会话、迁移、取消、工具执行隔离与持久化；确定性的模型流不能代替真实模型验证。容器内 MCP 的协议和安全测试也属于 Runtime 检查。
 
 ## 前端
 
@@ -52,16 +52,25 @@
 - 全新安装、同版本重复操作、预检拒绝、失败清理和原路径重试。
 - 登录、消息、SSE、附件、搜索、浏览器接管与释放、沙箱与 MCP，以及凭据不泄漏。
 - 更新维护门、迁移和快照、候选确认、失败回滚；超时或响应丢失不得造成不安全重放。
-- Firecrawl 冷启动后写入 PostgreSQL 哨兵，保留数据目录重建，再确认新容器、精确读回和真实抓取。
 - 清理只删除受控临时目录和已确认的精确镜像 ID，不能使用 prune 或忽略清理失败。
 
 ### 发布检查
 
-`scripts/container-smoke.sh` 负责隔离的安装器和 Compose 配置检查，不固定 Dockerfile 层顺序、工作流文本或页面标题。真实发布栈只有一个入口：`scripts/release-compose-smoke.sh`。在仓库根目录运行，先准备本次构建的 `artifacts/managed-images.json`（十个摘要固定的镜像），并设置 `RUNNER_TEMP`、`GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`、`GITHUB_WORKSPACE`；需要 Docker、Compose、免密 sudo 和脚本调用的标准工具。
+`scripts/container-smoke.sh` 负责隔离的安装器和 Compose 配置检查，不固定 Dockerfile 层顺序、工作流文本或页面标题。真实发布栈只有一个入口：`scripts/release-compose-smoke.sh`。在仓库根目录运行，先准备本次构建的 `artifacts/managed-images.json`（五个摘要固定的镜像：platform、agent-runtime、camofox、agent-sandbox、searxng），并设置 `RUNNER_TEMP`、`GITHUB_RUN_ID`、`GITHUB_RUN_ATTEMPT`、`GITHUB_WORKSPACE`；需要 Docker、Compose、免密 sudo 和脚本调用的标准工具。此版本要求先安装兼容五键与十键目录的 Manager M1。
 
-真实脚本保留冷启动、Platform 健康与登录、浏览器控制路径、沙箱执行，以及 Firecrawl PostgreSQL 哨兵在保留数据重建后的读回和抓取。它使用临时状态和本地绑定，不访问产品数据。仅通过本地配置检查不能宣称这些路径或双架构发布已通过。
+真实脚本检查冷启动、Platform 健康与登录、Runtime 健康、浏览器控制路径和沙箱执行。它使用临时状态和本地绑定，不访问产品数据，不启动 Firecrawl，也不用假模型响应冒充端到端 agent 验证。CI 没有模型凭据时不能证明聊天、工具选择、上下文迁移后的回忆、压缩或缓存命中；发布前必须用生产数据副本和真实模型另行演练个人 AI、频道、标准聊天、网页搜索与抓取、浏览器、计划和 MCP。仅通过本地配置检查不能宣称真实服务或双架构发布已通过。
 
-发布按 prepare → 镜像/Manager 构建 → smoke → publish 执行；每个同仓库 main push 的成功 Quality commit 都进入发布，不再按说明文件差异跳过。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。本地检查命令：
+CI 在 Manager 外部控制边界使用小型 Unix socket 测试替身：0600 socket、真实 token 校验，仅响应只读的 `/v1/status` 和 `/v1/config`，让 Platform 执行正常的启动恢复。它不提供 executor 或更新操作，不证明真实 Manager 的维护门恢复、沙箱生命周期或升级流程；这些仍需真实 Manager 的独立验证。
+
+浏览器冒烟访问公开的 `https://example.com/` 并点击进入 IANA，依赖外网可达和页面链接结构；不通过核心网络上的测试页面绕过浏览器导航策略。公开页面或网络故障应作为冒烟失败报告，不替换为模拟浏览器结果。
+
+发布按 prepare → 镜像/Manager 构建 → smoke → publish 执行；每个同仓库 main push 的成功 Quality commit 都进入发布，不再按说明文件差异跳过。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。
+
+沙箱镜像使用摘要固定的 Node 基础镜像、Debian 软件包快照和固定版本的 Python 包；发布构建复用注册表缓存，不写入每次发布变化的版本/提交标签或证明附件。更新基础镜像或快照需要显式修改 Dockerfile。相同输入的摘要复用仍需真实 BuildKit/GHCR 发布构建验证，本地 Compose 配置检查不能证明可重复构建。
+
+沙箱通过同一 Debian 快照中的 `python-is-python3` 提供 `python` 命令；构建后在容器内运行 `python --version`，确认模型常用的命令可用且指向 Python 3。
+
+本地检查命令：
 
 ```sh
 bash -n scripts/container-smoke.sh scripts/release-compose-smoke.sh scripts/verify-release-images-anonymous.sh

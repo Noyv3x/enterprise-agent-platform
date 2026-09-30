@@ -1,98 +1,40 @@
-# 产品设计
+# Product boundaries
 
-本文定义产品做什么、给谁用、不做什么。组件与数据流见[系统架构](system-architecture.md)。
+The platform is a shared, browser-based product built around plain Pi. Platform owns users and product state; Pi owns the agent session. Deployment requires the host Manager. See [architecture](system-architecture.md) and the [Platform API](../reference/platform-api.md).
 
-## 产品目标
+## Conversation modes
 
-平台服务于彼此信任的小规模内部团队，提供两类 AI：
-
-- **个人 AI**：每个成员自己的助手。
-- **公共频道 Agent**：频道里的共享助手。"公共"指平台内有读取权限的成员都能看到，不是对互联网公开；发消息还需要聊天权限。
-
-每个主 Agent 独享自己的工作区、会话、记忆、Skill/MCP、浏览器状态和沙箱；它委派出去的子任务共用父 Agent 的环境。
-
-沙箱的作用是减少互相污染和误操作，**不是防御恶意用户的多租户安全边界**。显式的宿主机执行可以获得部署用户的权限，包括免密 sudo；接受这一风险是部署的前提，详见[安全设计](security-and-trust.md)。
-
-## 角色与权限
-
-只有服务端的权限判断才算授权。账号保存姓名、职位、模型、思考深度、时区和启用状态；权限组不能用来充当姓名下的副标题。
-
-| 权限组 | 能做什么 |
+| Mode | Ownership and tools |
 | --- | --- |
-| 管理员 | 管理账号、模型授权、运行时、更新、Telegram、审计和系统设置 |
-| 经理 | 管理公共频道，使用个人 AI 和频道 Agent |
-| 成员 | 参与公共频道，使用个人 AI |
-| 只读 | 查看公共频道，不能发消息 |
+| Personal AI | One persistent workspace and sandbox per user; Pi file/shell tools, web search/fetch, browser with human takeover, schedules and workspace-configured MCP. |
+| Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch. Visibility and management use existing permission groups, not a new membership table. |
+| Standard chat | Many conversations per user, each with its own working directory, history and model selection. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP, skills or AGENTS.md context. |
 
-## 核心能力
+Standard chat supports create, rename and delete. Automatic titles are optional. Administrators set each user's allowed chat models and default; users choose only among allowed models. The personal AI retains its separate per-user model and thinking depth.
 
-**对话与文件**
+Chat conversations share one network-disabled sandbox per user. File tools restrict the active conversation directory; bash starts there but may access that user's other chat files. The security boundary is per user, not per conversation.
 
-- 公共和个人对话、附件、连续短消息合并处理、流式回复、上下文用量。本地 `/compact` 命令不会成为产品消息，也不会发给模型。
-- Agent 能处理文件、执行命令、浏览网页。交付的文档必须是经过结构、内容和视觉检查的真实文件，不能用 Markdown 冒充文件，也不能套用机械的默认样式。
-- XLSX、DOCX、PPTX、PDF 可以在站内只读预览，其它附件提供下载。
+Messages sent during a run queue FIFO; they are not joined into the active input. Failed or lost runs are visibly interrupted, not automatically resubmitted. Users can resend deliberately.
 
-**知识与扩展**
+## Kept features
 
-- 自动记忆、用户资料记忆、跨会话搜索；个人 AI 回复后会进行低优先级的学习复盘。
-- 每个工作区独立的 Skill 和 MCP，每次调用时重新读取，改完无需重启。
-- 技能分为只读的预置技能、用户技能，以及 Agent 自建的技能（只有自建技能会被自动维护）。外部服务按其安装说明自行接入。
-- Skill 以工作区中的 `SKILL.md` 目录为内容来源，不另建成员注册表；直接安装的技能在发现时只写入小型身份与启用元数据，首次实际使用前不创建使用记录。来源归属、使用次数、维护状态和固定状态继续保留，以限制自动维护权限；目录被替换或身份元数据丢失时，旧的 Agent 归属不能继承。用户技能按同名或同 ID 优先于只读预置技能；现有技能与元数据格式仍可由旧版本读取。工作区私有边界和拒绝符号链接的文件打开不因实现精简而改变。
+- Login, users, administrators and permission groups.
+- Attachment upload/download, document previews, generated-file links and personal workspace files.
+- Model settings, Codex device OAuth, token usage and cache-hit reporting.
+- Branding, theme and three locales.
+- Schedule management and history; occurrences run in the owner's personal AI.
+- Host Manager update status and controls.
 
-**计划与通信**
+## Pi-native resources
 
-- 个人 AI 支持一次性、固定间隔和 cron 定时任务。每次触发保留一条执行历史；手动运行不改变原定时间，一次性任务触发或错过后完成，重复任务跳过积压周期并继续计算下一次时间。cron 使用任务时区，跳过夏令时不存在的时刻，重复时刻只执行第一次。结果不确定时暂停仍由该次执行控制的任务；修改后的任务不会被旧执行覆盖。
-- IMAP/SMTP 邮箱，收到新邮件可以唤醒 Agent：积压有上限、预览有长度限制、去重可以在重启后恢复。
-- Telegram 只支持私聊。
-- 回复完成时可以发浏览器系统通知。
+Long-term memory is workspace `AGENTS.md`, editable by the agent using ordinary tools. Skills are `SKILL.md` packages advertised through Pi. There is no dedicated memory or skill administration system. Retry, compaction and transcript persistence use Pi's `AgentSession` and `SessionManager`.
 
-**工作可见性**
+## Removed features
 
-- 每次工具调用都会产生工作记录。
-- 当前对话的"AI 的电脑"展示真实的文件、终端、浏览器、搜索结果或 HTML 页面。默认只读；接管浏览器需要用户另外明确操作一次。
+No Telegram, mail, approvals, host execution, todo system, delegation/subagents, background processes, live file drafts, input joining, learning reviews, dedicated memory/skill management, execution-review or `needs_review` machinery. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
 
-**运营**
+Removed-feature tables and files remain untouched for rollback; they are not active product interfaces. Historical messages remain readable. Retention does not imply continued support for their old actions.
 
-- 模型只通过 Codex OAuth 接入（唯一的模型供应商），产品不提供填写模型 API key 的入口。
-- 管理账号、频道、消息和 token 用量。
-- 可信局域网访问默认关闭。
-- 沙箱停止后重建时保留工作目录、HOME 和环境。
-- 自动更新会等待系统空闲、更新期间阻止使用，失败时自动回滚。
+## Delivery boundary
 
-细节见[集成](integrations.md)、[数据](data-memory-sessions.md)、[前端](frontend.md)和[自动更新](../operations/auto-update.md)。
-
-## 对话模型
-
-- 主 Agent 的身份和工作区长期不变，会话可以轮换。
-- 登录后默认进入个人 AI；没有个人 AI 权限时才进入第一个可读频道。进入频道必须由用户主动导航，界面始终标明"成员可见"。
-- 个人消息按到达顺序保存；即使多条被合并处理，每条仍保留自己的处理状态。产品里的历史以平台消息库为准。
-- Agent 交付文件时，平台把文件标记转成结构化附件，界面不从正文里解析路径。
-- 频道里撤回自己已保存的消息只改变可见性，不会取消回复，也不会删除 Runtime 历史、附件或审计记录。
-- 管理员和经理可以删除公共频道：产品中移除访问并停止频道工作，但保留历史、附件、Agent 工作区和会话。这不是永久擦除数据，也没有恢复入口，频道名称继续被占用。权限和清理失败后的重试见[数据与会话](data-memory-sessions.md#产品消息与-runtime-会话)。
-
-**Agent 的说话方式**
-
-- 个人和频道的提示词都会带上用户的姓名、职位和当前说话人信息。
-- Agent 使用配置的展示名称，默认自称 `Agent`。不提 Pi、Runtime、模型供应商、源码维护方或其它内部实现。
-- 默认使用用户当前的语言，说大白话：结论在前、句子简短，不用套话、官话、无意义的标题或重复。用户明确要求的语气和格式优先。
-
-## 品牌配置
-
-- 默认产品名 `Agent Platform`，Agent 名 `Agent`，使用组件库默认主色，没有 Logo。
-- 管理员可以随时修改名称、主色和一个 Logo，立即全局生效。它们只是经过校验的展示数据，不产生身份、权限或指令。
-- 前端怎么获取和显示品牌见[前端 · 品牌](frontend.md#品牌与部署定制)。Manager 的离线维护页始终保持中性，不复制品牌。
-
-**品牌不改变技术身份。** 程序名、系统服务名、配置和数据目录、容器及网络名称、环境变量、密钥挂载、Cookie、内部 API、数据库标记、工作区和会话标识、包名、发布资产名都不从品牌派生。精确标识见[数据布局](../reference/data-layout.md)。源码仓库名、Python 包名、Go 模块名属于开发坐标；如果要改名，必须和持久协议分开评估。
-
-## 界面范围
-
-- 界面面向长时间阅读和操作，保留说明、权限提示和错误反馈，不用宣传语或装饰性大标题。
-- 使用完整的可用视口。
-- 支持简体中文、English、繁體中文，只翻译界面本身，不翻译消息、文件、工具结果或日志。
-- 用词、引导、布局和无障碍要求见[前端设计](frontend.md)。
-
-## 明确不做
-
-- "AI 的电脑"不是独立操作系统、应用分区、加密磁盘，也不是隔绝宿主机、sudo 或内网的隔离舱。不提供通用桌面、窗口管理、会话回放、固定的电脑主页或交互式终端。
-- 不内置 Sylver Lining 这类专用连接器；不把记忆、Skill、MCP、定时任务、邮件或 `/compact` 包装成操作系统功能。Pi 和 Firecrawl 的上游修改边界见[集成](integrations.md)。
-- 只读预览不授予执行权；浏览器接管不能越过用户、对话和标签页的授权；未提交的草稿不是持久事实；OAuth 在线发现的模型不能绕过 Runtime 的能力目录。
+R1 installs Manager M1 while retaining the legacy application and ten-image release. R2 installs this Pi-native product with five images and requires M1 first. Full local checks and isolated production-host staging with copied data and a real model precede release; see [deployment](../operations/deployment.md).

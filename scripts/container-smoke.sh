@@ -39,7 +39,7 @@ export TMPDIR="$installer_test/noexec-tmp"
 mkdir -m 0700 "$TMPDIR"
 # Only the side-effecting target is fake. Manifest inspection executes the
 # actual Manager downloaded from the fixed bootstrap source by the curl stub.
-go -C manager build -o "$installer_test/bootstrap-manager" ./cmd/agent-platform-manager
+go -C manager build -buildvcs=false -o "$installer_test/bootstrap-manager" ./cmd/agent-platform-manager
 for command in bash sha256sum install uname awk stat realpath id mktemp find grep rm rmdir flock mv mkdir dirname cat cp sleep; do
   ln -s "$(command -v "$command")" "$installer_stubs/$command"
 done
@@ -111,8 +111,6 @@ image_sha = "b" * 64
 manifest_path = pathlib.Path(sys.argv[2])
 managed_images = {
     "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq",
 }
 images = {
     name: f"registry.example/{name}@sha256:{image_sha}"
@@ -531,7 +529,6 @@ import json
 from pathlib import Path
 
 schema = json.loads(Path("containers/release-manifest.schema.json").read_text(encoding="utf-8"))
-upstream = json.loads(Path("docs/contracts/upstream-sources.json").read_text(encoding="utf-8"))
 properties = schema.get("properties", {})
 if properties.get("schema_version", {}).get("const") != 2:
     raise SystemExit("target release manifest schema must require schema version 2")
@@ -547,10 +544,27 @@ if required != expected:
 image_pattern = schema.get("$defs", {}).get("image", {}).get("pattern", "")
 if "@sha256:" not in image_pattern:
     raise SystemExit("release images are not constrained to immutable digests")
-managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
-expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
-if managed_firecrawl_services != expected_firecrawl_services:
-    raise SystemExit(f"unexpected managed Firecrawl upstream services: {sorted(managed_firecrawl_services)}")
+expected_images = {
+    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+}
+if properties.get("images", {}).get("$ref") != "#/$defs/images":
+    raise SystemExit("target release manifest does not bind its image directory")
+images_schema = schema.get("$defs", {}).get("images", {})
+catalogs = images_schema.get("oneOf", [images_schema])
+if not any(
+    set(catalog.get("required", ())) == expected_images
+    and catalog.get("minProperties") == len(expected_images)
+    and catalog.get("maxProperties") == len(expected_images)
+    for catalog in catalogs
+):
+    raise SystemExit("release schema does not accept the exact Pi-native five-image catalog")
+if images_schema.get("additionalProperties") is not False:
+    raise SystemExit("target image directory is not a closed set")
+image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
+if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
+    raise SystemExit("target image names are not lowercase kebab-case")
+if schema.get("allOf") is not None:
+    raise SystemExit("current release schema must have one closed shape")
 PY
 
 command -v docker >/dev/null || fail "docker is required to validate Compose"
@@ -590,11 +604,7 @@ if document.get("name") != "agent-platform":
     raise SystemExit(f"target Compose project mismatch: {document.get('name')}")
 if core.get("name") != "agent-platform_core" or core.get("external") is not True:
     raise SystemExit(f"core network must be the Manager-owned external network: {core}")
-required = {
-    "platform", "agent-runtime", "camofox", "searxng", "firecrawl-api",
-    "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq",
-    "firecrawl-postgres",
-}
+required = {"platform", "agent-runtime", "camofox", "searxng"}
 if set(services) != required:
     raise SystemExit(f"fixed Compose service set mismatch: {sorted(set(services) ^ required)}")
 if "agent-sandbox" in services:
@@ -703,38 +713,6 @@ platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == 
 if len(platform_data) != 1 or not str(platform_data[0].get("source") or "").endswith("/data"):
     raise SystemExit("Platform data must map <manager data root>/data to /var/lib/agent-platform")
 
-firecrawl = services["firecrawl-api"]
-firecrawl_environment = firecrawl.get("environment") or {}
-if firecrawl_environment.get("NUQ_BACKEND") != "pg":
-    raise SystemExit("Firecrawl must explicitly use the PostgreSQL queue backend")
-if "FDB_CLUSTER_FILE" in firecrawl_environment:
-    raise SystemExit("Firecrawl must not receive a FoundationDB cluster file")
-for service_name, service in services.items():
-    if "foundationdb" in service_name.lower():
-        raise SystemExit(f"retired FoundationDB service remains: {service_name}")
-    for volume in service.get("volumes") or []:
-        source = str(volume.get("source") or "").lower()
-        target = str(volume.get("target") or "").lower()
-        if "foundationdb" in source or "foundationdb" in target or target.startswith("/var/fdb"):
-            raise SystemExit(f"{service_name} still mounts retired FoundationDB state")
-api_dependencies = firecrawl.get("depends_on") or {}
-expected_dependencies = {
-    "firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres",
-}
-if set(api_dependencies) != expected_dependencies:
-    raise SystemExit(f"Firecrawl API dependency set mismatch: {sorted(api_dependencies)}")
-postgres_volumes = [
-    volume for volume in services["firecrawl-postgres"].get("volumes") or []
-    if volume.get("target") == "/var/lib/postgresql/data"
-]
-if (
-    len(postgres_volumes) != 1
-    or postgres_volumes[0].get("type") != "bind"
-    or not str(postgres_volumes[0].get("source") or "").endswith(
-        "/data/runtimes/firecrawl/postgres"
-    )
-):
-    raise SystemExit("Firecrawl PostgreSQL data must use its managed host bind")
 PY
 
 docker compose \

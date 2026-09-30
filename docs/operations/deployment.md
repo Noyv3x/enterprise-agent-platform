@@ -1,112 +1,62 @@
-# 部署
+# Deployment
 
-生产环境只支持"宿主机 Manager + 受管 Docker"这一种方式。版本切换见[自动更新](auto-update.md)，路径和迁移见[数据布局](../reference/data-layout.md)，鉴权和文件边界见[安全设计](../design/security-and-trust.md)。
+Production uses a host Manager with managed Docker containers. See [automatic updates](auto-update.md), [data layout](../reference/data-layout.md) and [security](../design/security-and-trust.md).
 
-## 唯一拓扑
+## Prerequisites and release order
 
-- 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。主进程是独立且不可变的 Manager launcher，子进程独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。已有部署必须先运行 N 并完成监督接力，才能更新到 N+1。
-- Platform（含前端）、Runtime、Camoufox、SearXNG、目录中存在时的 Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。M1 发布仍包含原十镜像；后续五镜像版本必须先升级到 M1 才可安装。业务容器禁止访问或代理 Docker socket。
-- Platform 后端只发布到宿主机回环地址，其它服务只在私有网络里。固定的 Compose 使用 Manager 预先创建的外部网络，切换版本时不删除网络，也不中断沙箱。
-- 权威数据用显式的目录挂载，禁止匿名卷。
-- 部署机不需要源码、Git、Python 虚拟环境、Node/npm 或上游源码。不支持从源码启动、第二套 Compose 栈或旧技术身份的转换。
+Linux, Docker Engine, Compose v2, user-level systemd and a deployment user permitted to use Docker are required. The user's account home must exist, be owned by that user, not be a symlink and not be group/world writable. The production host needs no source checkout, Python virtualenv or Node installation.
 
-## 全新安装
+**Install R1 / Manager M1 before R2.** Current N+1 installs M1 through its normal self-update while R1 still ships ten images and the legacy application. Confirm the M1 update is settled and healthy before accepting R2's five-image catalog. R2 must not be offered directly to an older Manager. Manager simplification beyond M1 is a later release.
 
-**前提**：Linux、Docker Engine、Compose v2、用户级 systemd、一个能使用 Docker 的部署用户。操作系统账户的 home 目录必须已存在、可进入、不是符号链接、属于当前 UID，并且组和其他用户不可写。`/tmp` 或 `TMPDIR` 可以是 `noexec`。精确路径和环境变量规则见[唯一根目录](../reference/data-layout.md#唯一根目录)。
+## Topology
 
-```bash
+The independent launcher and Manager run under `agent-platform-manager.service`. Manager owns public ingress, maintenance mode, Docker and audited execution. Platform contains the frontend; Runtime, Camofox and SearXNG remain private. Business containers never receive the Docker socket. Persistent state uses bind mounts, not anonymous volumes.
+
+R2 image keys: `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`. Firecrawl services are absent, not unavailable dependencies. Platform binds to host loopback; publish through Manager, optionally behind a TLS reverse proxy. Explicit LAN/CIDR configuration is required for direct network access.
+
+## Installation and management
+
+```sh
 curl -fsSL https://github.com/Noyv3x/enterprise-agent-platform/releases/latest/download/install.sh | bash -s -- --yes
-```
-
-| 步骤 | 做什么 |
-| --- | --- |
-| 验证 | 在 home 下一个随机的、只有属主可访问的临时目录里，从固定的可信来源下载当前架构的 Manager 及其 SHA-256 文件，核对文件名和摘要；运行 `inspect-release --manifest <path> --architecture <arch>` 验证完整的发布清单（包括其它架构）。这一步只输出目标地址和 SHA-256，不读配置、不开 socket、不建正式路径，也不启动服务。 |
-| 锁定 | 在产生正式副作用之前取得单实例锁，并确认是全新的根目录。清单被拒绝时，在建路径之前就停止；竞争失败时，在清理目标之前就停止。 |
-| 激活 | 原子写入配置、已验证的 Manager、独立 launcher、systemd unit 和只有属主可访问的密钥；等待经 control token 认证的 `/v1/ready` 返回 204（代表监督启动已确认），再启动首次 `install` 操作。仅 socket 或 `status` 可用不代表可写；核心服务健康后才开放入口。初始版本见 [Manager 自更新](auto-update.md#manager-自更新)。 |
-
-- 安装脚本不复制 JSON/schema 校验逻辑。自定义清单只改变下载目标，不改变初始的信任来源；本地已有相同字节就复用，否则按验证结果下载并核对摘要。
-- 未验证的字节不会进入正式路径，也不增加辅助程序或资产协议。临时目录无论成功还是失败都会清理。
-- systemd unit 使用正常的 `0644`，稳定 Manager 命令使用 `0755`；它们必须属于部署用户、是普通非符号链接文件且组/其他用户不可写，不要求隐藏其内容。密钥、配置和状态仍只允许属主访问（文件 `0600`）；无需手工 chmod unit 才能启动监督模式。
-
-| 失败发生在 | 如何恢复 |
-| --- | --- |
-| 激活之前 | 只删除本进程创建且身份仍匹配的对象，可以重新运行同一条命令；校验失败只清理私有临时文件。 |
-| 激活之后 | 由操作日志接管；用 Manager 恢复，不要重新运行安装器或手动删除数据根目录。 |
-
-## 日常管理
-
-```bash
 agent-platform-manager status
 agent-platform-manager preflight
 agent-platform-manager check
 agent-platform-manager update
-agent-platform-manager restart
-agent-platform-manager rollback
-agent-platform-manager repair
-agent-platform-manager logs
 ```
 
-- 命令行通过只有属主可访问的 Unix socket 通信，每次请求结束后释放连接。
-- 修改类命令的幂等、版本和唯一持有者规则见[排队与维护](auto-update.md#排队与维护)。`check` 可以保存候选版本，但不会开始更新。
+The installer validates the immutable manifest and Manager bytes before activation. It is for a new data root, not repair of an existing installation. Commands `restart`, `rollback`, `repair` and `logs` operate through the existing authenticated local control socket. `check` discovers a candidate; it does not install it. Never manually edit update reservations or replace image digests with mutable tags.
 
-| 现象 | 怎么处理 |
-| --- | --- |
-| 等待中、空间不足、降级 | 用 `status`、`logs`、`preflight` 查看；Manager 会自动等待和重试。不要手动修改状态文件、操作日志、激活记录、Compose 或可变 tag。 |
-| 提交前迁移或核心服务失败 | 同一个操作会恢复其管理的快照和上一版本，[状态机](auto-update.md#提交回滚与能力降级)会自行收敛。Runtime 的 Pi 会话转换不由数据库快照撤销，须遵循下文的手动回滚边界。Platform 不可用时使用宿主机命令行。 |
-| Manager 自身启动有缺陷、socket 一直连不上 | 监督模式会在有界健康检查失败后自动恢复并启动上一份已验证的 Manager，不反复切换。若上一版本也失败，停止 unit、保留数据和日志，按[手动恢复](auto-update.md#手动恢复)核验并恢复可信二进制；不手工改写预约或回滚已开放业务的数据。 |
+## 发布物启动与健康
 
-## 公共入口与维护
+Release manifests remain schema 2 / protocol 2. Manager owns the reservation/snapshot/migration/start/probe/commit sequence; at most one Platform writer runs. Its fixed migration entry point remains:
 
-- Manager 始终持有监听端口：正常时代理当前版本；更新、回滚或 Platform 不可用时显示中性的维护页。
-- 默认只监听回环地址。局域网访问需要显式开启并限制 CIDR；推荐用 TLS 反向代理接到回环地址。
-- 按真实的远端地址准入并重建转发头，不信任客户端发来的 `Forwarded` 或 `X-Forwarded-*`。
-
-## 发布物、启动与健康
-
-发布的八个资产、十个镜像以及就绪和降级规则见[更新协议](auto-update.md)。其它部署约束：
-
-| 对象 | 约束 |
-| --- | --- |
-| 镜像 | Platform、Runtime、Camoufox 的 HEALTHCHECK 只在 Dockerfile 里定义，由 Compose 继承；上游服务的检查在 Compose 里声明。Platform 镜像只使用本次构建的前端产物，构建上下文排除本地的 `enterprise_agent_platform/static/`。 |
-| SearXNG | 以部署 UID/GID 读写 `0600` 的 settings，`0700` 的 config 和 cache 目录；完整的 config 目录以只读方式挂载到 `/etc/searxng`。不用单文件挂载（会产生匿名卷），也不依赖上游的 root 或递归 chown。 |
-| Firecrawl | 仅十镜像目录启用；使用 PostgreSQL 队列、Redis、RabbitMQ 和 Playwright，禁止 FoundationDB；使用精确的项目标签、目录挂载和私有网络。Compose 启动后仍做 HTTP 探测；停止旧版本时移除它的受管容器。五镜像目录不启动或探测，也不报告其不可用。 |
-| 迁移 | 不启动写入者的预检 → 停止唯一的当前写入者 → 验证快照 → 运行固定命令 → 成功后才启动候选版本。失败时由同一个操作回滚；当前/全新数据库的版本边界见[受控迁移](../reference/data-layout.md#受控迁移)，不再执行已退役的 Skill、工作区或 root 权限转换。 |
-
-```text
+```sh
 enterprise-agent-platform migrate --data /var/lib/agent-platform
 ```
 
-## 本次 Runtime 升级的备份与手动回滚
+Platform health is `/healthz` on 8765; Runtime health is authenticated `/health` on 8766. Exact payloads and internal Manager contracts belong in the [Platform API](../reference/platform-api.md) and [Runtime API](../reference/runtime-api.md). An open port alone is not release readiness. Camofox/search failures degrade those capabilities rather than core login/conversations.
 
-- **升级前必须人工备份完整数据**：停止唯一写入者，在部署目录之外保存同一恢复点的完整 `<data_root>`，包含数据库及其一致的 WAL 状态、工作区、附件、环境、Runtime 数据和 Manager 状态；校验备份完整性、权限和可恢复性。不能只备份 SQLite，也不能把自动更新的数据库快照当作完整数据备份。
-- 新 Runtime 在接受请求前，将已有 `data/runtimes/agent/sessions` 原目录原封不动保留为 `sessions.pre-pi`，在独立暂存目录完成 Pi 原生格式转换后原子发布新的 `sessions`。启动中断后可安全重试；已有备份不覆盖，未完成转换不开流量。普通会话清理不修改备份。
-- **回滚旧 Runtime 需要人工处理**：旧版本不能假定可读取新会话格式，Manager 的数据库恢复或镜像回滚不自动恢复 `sessions.pre-pi`。运维必须先停止写入者并额外保存当前完整数据，再选择一致的升级前恢复点恢复旧程序与数据；只有确认其它状态兼容且没有需保留的新写入时，才可从 untouched 的 `sessions.pre-pi` 恢复旧会话目录。
-- `sessions.pre-pi` 只是迁移前会话的原样副本，不是整个 Runtime 或平台的完整备份，也不包含升级后的新历史。已开放业务后的新写入不能由旧副本覆盖；此时优先向前修复，确需回退须人工评估和保全数据。不要编辑原始备份、混搭不同时间点的数据或把回滚当作 Run 重放。
+## Sandbox profiles
 
+| Profile | Memory / swap | CPUs | PIDs | Network | Idle stop |
+| --- | --- | --- | --- | --- | --- |
+| `agent` (personal/channel) | 2 GiB / 2 GiB | 2 | 1024 | Core | 10 min |
+| `chat` (one per user) | 768 MiB / 768 MiB | 1 | 256 | None | 3 min |
 
-## Agent Sandbox
+Defaults are configurable in M1's `manager.toml`; see [exact keys and types](../reference/data-layout.md#sandbox-profiles). Profile and workspace are bound at creation; omitted `execution_context.profile` defaults to `agent`. Chat has no attachments mount; Platform copies uploads into each conversation directory. Chat file tools enforce that directory; bash starts there but may access the user's other conversations. No per-conversation containers are created.
 
-- 个人 AI 和每个频道主 Agent 各有独立的沙箱，委派共用父 Agent 的沙箱。首次调用时创建；没有任务和后台进程、达到空闲期限后只停止，不删除数据。
-- 挂载见[数据布局](../reference/data-layout.md)。入口程序只在 UID/GID 映射阶段短暂以 root 运行，随后降权，不递归修改挂载的目录树。
-- 不可变镜像预装了固定版本的 XLSX/DOCX/PPTX/PDF 生成库，以及只支持 `tools/list` 和 `tools/call` 的一次性 stdio MCP 客户端；不包含第三方 MCP 服务，不依赖临时联网或用户 HOME 里的缓存。
-- 部署、重置、目录回收和停止都必须等进程、控制器和持久输出的清理屏障完成；完整规则见 Runtime 的[停止与恢复](../design/agent-runtime.md#停止与恢复)和[有限后台任务](../design/agent-runtime.md#有限后台任务)。
+M1 prefetches the sandbox image during update pulls. Idle stop preserves data. The sandbox image includes office-document tools and the stdio MCP helper; installing workspace dependencies must not require host execution or host credentials.
 
-### 沙箱资源 profile
+The image keeps its existing tini entrypoint and sudo capability: no additional Docker `--init` or `no-new-privileges` flag is added, preserving pip/npm installs that need system dependencies or global paths inside the sandbox.
 
-执行请求可附加 `execution_context.profile: "agent" | "chat"`，省略时为 `agent`，已有调用方无需改动。profile 与工作区在首次创建时绑定，不能复用同一 `sandbox_id` 切换。配置保存在 `manager.toml`；旧配置继续可读，显式 `sandbox_idle` 保留其原值。
+## Backup and rollback
 
-| profile | 默认 Docker 资源 | 网络 | 空闲停止 |
-| --- | --- | --- | --- |
-| agent | memory `2g`、memory-swap `2g`、cpus `2`、pids-limit `1024` | 现有核心私有网络 | `10m` |
-| chat | memory `768m`、memory-swap `768m`、cpus `1`、pids-limit `256` | `none` | `3m` |
+Before upgrading, stop the sole writer and take a verified full data backup outside the deployment root. Include consistent SQLite/WAL, workspaces, attachments, environments, Runtime sessions and Manager state/configuration/secrets. Automatic DB snapshots are not full backups.
 
-使用 `sandbox_agent_memory`、`sandbox_agent_memory_swap`、`sandbox_agent_cpus`、`sandbox_agent_pids_limit` 修改 agent 限额，`sandbox_idle` 修改其空闲期限；chat 对应 `sandbox_chat_memory`、`sandbox_chat_memory_swap`、`sandbox_chat_cpus`、`sandbox_chat_pids_limit`、`sandbox_chat_idle`。网络隔离不由请求方配置。CPU 和内存值为字符串，pids 为整数，期限为 Go duration 字符串。
+R2 writes new sessions only to `sessions-v3/`; `sessions/` and `sessions.pre-pi/` remain untouched. Database migration is additive. Old releases remain able to read old data but will not see new v3 turns. Preserve post-release writes before rollback; never replace live data blindly with the pre-upgrade snapshot. See [recovery](../reference/data-layout.md#备份与恢复).
 
-Chat 沙箱按用户复用，工作区映射和附件处理见[数据布局](../reference/data-layout.md#sandbox)。用户级沙箱是隔离边界；同一用户的会话子目录不是安全边界：Runtime 文件工具限制在会话目录，bash 仅以该目录为 cwd，可以访问该用户自己的其它文件。会话删除只删除对应目录。
+## Acceptance before R2 release
 
-沙箱沿用镜像入口的 tini，不增加 Docker `--init`。保留镜像中的 sudo 能力，不加 `no-new-privileges`，以免破坏需要系统依赖或全局路径的 pip/npm 安装；资源限额不改变现有软件安装权限。
+Run the [full local gate](../development/testing.md), then isolated staging on the production host with separate project/ports/network and a copied DB, workspaces and Runtime data (exclude the large music folder). Use the copied real Codex OAuth credentials; never mount production data writable or copy credentials into a sandbox.
 
-## 验收
-
-- 按[部署与冒烟](../development/testing.md#部署与冒烟)执行真实的 Compose、用户级 systemd、鉴权交互和恢复门检查；静态检查和单元测试不能替代。
-- 常规生产恢复通过 Manager 的操作、快照和当前/上一版本完成；本次 Pi 会话格式迁移的手动恢复例外与完整数据备份要求见上文。
+Exercise personal bash/edit, search/fetch, browser takeover, schedule and MCP list; channel conversation; chat create/delete/code/model policy; migrated context recall; compaction; consecutive-turn cache usage and sandbox resource usage. Tear staging down after preserving evidence. Container health/cookie/screenshot smoke does not prove real-model migration or agent execution.

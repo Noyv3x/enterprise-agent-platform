@@ -56,26 +56,6 @@ export const chatMessages = defineMessages({
   "nav.menu.open": { "zh-CN": "打开菜单", en: "Open menu", "zh-TW": "開啟選單" },
   "nav.logout": { "zh-CN": "退出登录", en: "Sign out", "zh-TW": "登出" },
   "nav.userFallback": { "zh-CN": "用户", en: "User", "zh-TW": "使用者" },
-  "nav.telegram.linked": {
-    "zh-CN": "Telegram 私聊已绑定",
-    en: "Telegram direct messages linked",
-    "zh-TW": "Telegram 私訊已綁定",
-  },
-  "nav.telegram.configure": {
-    "zh-CN": "配置 Telegram 私聊",
-    en: "Set up Telegram direct messages",
-    "zh-TW": "設定 Telegram 私訊",
-  },
-  "nav.telegram.disabled": {
-    "zh-CN": "Telegram 私聊未启用",
-    en: "Telegram direct messages are disabled",
-    "zh-TW": "Telegram 私訊未啟用",
-  },
-  "nav.telegram.settings": {
-    "zh-CN": "Telegram 私聊设置",
-    en: "Telegram direct message settings",
-    "zh-TW": "Telegram 私訊設定",
-  },
   "nav.topbar.privateSubtitle": {
     "zh-CN": "在下方输入消息或添加附件。",
     en: "Enter a message or attach files below.",
@@ -362,18 +342,6 @@ export const chatMessages = defineMessages({
     "zh-CN": "请先发送或清空当前草稿",
     en: "Send or clear the current draft first",
     "zh-TW": "請先傳送或清空目前草稿",
-  },
-  "chat.approvalSubmitted": {
-    "zh-CN": "权限审批已提交",
-    en: "Access approval submitted",
-    "zh-TW": "權限核准已提交",
-  },
-  "chat.approvalProcessed": { "zh-CN": "已处理", en: "Processed", "zh-TW": "已處理" },
-  "chat.approvalFailed": { "zh-CN": "审批失败", en: "Approval failed", "zh-TW": "核准失敗" },
-  "chat.approvalOutdated": {
-    "zh-CN": "该审批请求已被处理或替换，未应用你的选择；状态已刷新",
-    en: "This approval request was already resolved or replaced; your choice was not applied and the status has been refreshed",
-    "zh-TW": "該核准請求已被處理或取代，未套用你的選擇；狀態已重新整理",
   },
   "chat.composer.sendTitle": { "zh-CN": "发送 (Enter)", en: "Send (Enter)", "zh-TW": "傳送 (Enter)" },
   "chat.composer.newLine": { "zh-CN": "换行", en: "New line", "zh-TW": "換行" },

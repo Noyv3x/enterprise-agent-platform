@@ -11,9 +11,14 @@ requires-python = ">=3.11"
 authors = [{ name = "Agent Platform contributors" }]
 license = { text = "MIT" }
 dependencies = [
-  "Pillow>=10.4.0,<13",
-  "pypdf>=6.0.0,<7",
-  "Werkzeug==3.1.9",
+  "starlette==1.7.0",
+  "uvicorn==0.35.0",
+  "httpx==0.28.1",
+  "python-multipart==0.0.32",
+  "croniter==6.0.0",
+  "markdownify==1.2.0",
+  "Pillow==12.3.0",
+  "pypdf==6.19.0",
 ]
 
 [project.scripts]
@@ -24,13 +29,7 @@ include = ["enterprise_agent_platform*"]
 
 [tool.setuptools.package-data]
 enterprise_agent_platform = [
+  "static/**/*",
   "static/*",
-  "bundled_skills/**/*",
 ]
 
-[tool.setuptools.exclude-package-data]
-enterprise_agent_platform = [
-  "bundled_skills/**/__pycache__/*",
-  "bundled_skills/**/*.pyc",
-  "bundled_skills/**/*.pyo",
-]

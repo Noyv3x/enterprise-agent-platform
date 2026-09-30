@@ -1,162 +1,63 @@
-# 自动更新
+# Automatic updates
 
-- 本次 M1 发布保持 schema 2 / protocol 2、十个镜像和八个资产，可由当前生产 N+1 Manager（`6889bf6`）通过正常自更新安装。M1 同时接受下述五镜像目录，为后续精简发布准备；生产必须先完成 M1 升级，才能安装五镜像发布。旧激活、恢复、接力或操作未结算时仍拒绝更新。
-- Manager 自动检测、切换和恢复，不依赖部署机上的 Git、中心推送或 webhook 密钥。
-- 安装见[部署](deployment.md)，持久边界见[数据布局](../reference/data-layout.md)。
+Manager owns discovery, pulls, maintenance, snapshots, migration, activation and recovery. See [deployment](deployment.md) for installation and R2 staging, and [data layout](../reference/data-layout.md) for retained state.
 
 ## 发布通道
 
-### 发布资格
+Release manifests remain schema 2 / protocol 2. `Container release` is authorized only by a successful `Quality gates` run for the same repository's `main` push and exact commit. PRs, failed checks and manual Quality runs do not authorize releases. Every eligible commit is released, including documentation-only changes.
 
-所有候选版本都要先通过**完整的 Quality 检查**（当前树的文档、Python、Runtime、前端、Manager、容器）。`Container release` 只接收同仓库 `main` push 的成功 `Quality gates` 完成事件，检出事件中的精确 commit，并确认它仍属于远端 main 历史。PR 和手动 Quality 运行不授权发布，没有手动发布旁路。
+Images use immutable digests; Manager and Compose bytes have verified SHA-256 identities. Publish the complete immutable release, verify its public assets/images, then advance latest under the existing serialized channel/ancestry rules. Never move an existing release tag or fill a half-published generation with different bytes.
 
-每个合格 commit 都进入发布，包括只改说明文件的提交；不再计算文件白名单或累计差异，避免跳过此前未发布的产品变更。发布时读取现有公开 latest，读取失败、tag 格式非法或缺少祖先关系均拒绝；不提供首发引导或 API 失败时的回退。
+The eight public assets remain `release.json`, `agent-platform-compose.yaml`, `install.sh`, `install.sh.sha256`, and `agent-platform-manager-linux-{amd64,arm64}` with their `.sha256` files.
 
-### 构建与工件封存
+| Release | Manager prerequisite | Image catalog |
+| --- | --- | --- |
+| R1 / M1 | Existing N+1, settled normal self-update | Legacy ten-image catalog; application unchanged. |
+| R2 / Pi-native | M1 installed and healthy | Exactly `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`. |
 
-| 环节 | 证据 |
-| --- | --- |
-| 来源 | GitHub `workflow_run` 完成事件的仓库、push/main、成功结论和 `head_sha`；准备步骤输出固定 commit，后续 job 均检出它。不使用发布工作流自身的 head，也不维护重复的 Actions REST run/attempt 复验。 |
-| 镜像目录 | 四个自有镜像一次汇总成封闭的 `managed-images` 目录，由双架构检查、Compose 和发布清单共用，不重新拼接。只下载当前仓库和 run 中必需的镜像与 Manager 工件；禁止全量 `*` 或 `.dockerbuild`，缺少任何一类就失败。同一 run 的重跑可以覆盖中间产物，但不授权跨 run 使用。 |
-| 检查 | Manager 和镜像构建完成后，并行执行：AMD64 和 ARM64 的匿名按摘要拉取与压缩/展开容量检查、真实的 AMD64 Compose 启动。发布必须等同一目录和这三项检查都完成。真实的 Compose/用户级 systemd 检查与本地全量检查不能互相替代，命令见[部署与冒烟](../development/testing.md#部署与冒烟)。 |
-| 发布清单 | 固定 commit、数据库版本、Manager 和 Compose 的 SHA-256、全部镜像摘要；schema 2 / protocol 2、main 通道、Manager version 等于 source commit。不执行清单里的 shell，不使用可变镜像 tag。 |
+M1 accepts only these two complete catalogs, not arbitrary subsets. The legacy ten are the R2 five plus `firecrawl-api`, `firecrawl-playwright`, `firecrawl-postgres`, `firecrawl-redis` and `firecrawl-rabbitmq`. Firecrawl entries absent from a release are not pulled, started, probed or reported unavailable. Retained Firecrawl data is not an instruction to restart the old stack.
 
-**八个公开资产**：`release.json`、`agent-platform-compose.yaml`、`install.sh`、`install.sh.sha256`、`agent-platform-manager-linux-amd64`、`agent-platform-manager-linux-amd64.sha256`、`agent-platform-manager-linux-arm64`、`agent-platform-manager-linux-arm64.sha256`。
+## Detection and pulls
 
-**镜像目录**：M1 接受且只接受两个完整集合：原十个镜像 `platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`、`firecrawl-api`、`firecrawl-playwright`、`firecrawl-postgres`、`firecrawl-redis`、`firecrawl-rabbitmq`；或精简五个镜像 `platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`。本次发布仍输出原十镜像清单以兼容已部署的 Manager；不是任意子集或部分 Firecrawl 集合。重复、多出、技术身份不匹配仍拒绝。五镜像版本不拉取、启动、探测或报告 Firecrawl 不可用；残留对象或日志不会使其复活。
+Manager polls the configured channel; `check` may persist a candidate but never creates an update operation. Candidate protocol, identities, digests and schema boundaries must validate before disruption. Network/space failures leave the current generation running.
 
-- Firecrawl 构建直接读取[上游契约](../contracts/upstream-sources.json)里的地址、版本和全部 `required_paths`，缺一项就失败。
-- 登录 GHCR 只使用同一个最小权限的 `GITHUB_TOKEN`，最多重试三次、短退避；失败即停止，不扩大权限，也不遗漏镜像。
-
-### 通道提交
-
-1. 构建按 commit 串行；`publish` 独占全局 `container-channel-main`，在同一个锁内完成祖先检查、公开验证和 latest 推进。
-2. 当前 latest 必须是候选的 Git 祖先，候选必须属于远端 main 历史；较旧或分叉候选失败，不能覆盖较新的 latest。
-3. 一次创建精确指向候选的 `container-<40 位十六进制 commit>` tag，再创建并上传八个资产到草稿。已有 tag 会失败，不移动 tag、不覆盖资产，也不自动修复半成品发布。
-4. 上传成功后将完整 release 公开但不设为 latest。通过匿名公开 URL 下载每个资产一次，与本次组装字节比较，并按清单匿名验证全部镜像摘要；只有全部成功，才把该 release 设为 latest。
-5. 公开验证失败时保留原 latest；候选可能已公开但不是通道目标。不得把此失败报告为成功，也不能靠重跑覆盖同代资产。排查后通过新的合格 commit 发布下一代；已公开的不可变版本保留用于回滚。
-
-- 品牌不影响网址、commit、摘要、Manager 路径或幂等键。
-- 安装器只运行同一 release 中已校验的 Manager；更新过程不下载执行网络脚本。
-
-## 检测与预拉取
-
-**轮询与缓存**
-
-- 轮询设置见[配置](../reference/configuration.md)。只有发布清单网址、通道和技术身份都相同时，才复用上次成功响应的 `ETag`/`Last-Modified`；配置变化、响应没有验证器或网络失败，都不代表"没有变化"。
-- `304` 只省去解码和落盘：如果目标还没提交且与当前版本不同，仍然对同一目标做有限次的幂等重试；只有与当前版本相同、明确不可重试或收到新的合法清单时，才清除旧目标。
-- "上次更新成功时间"只显示当前版本的 `activated_at`；回滚后保留原值。
-- 周期更新检查独立于沙箱回收和镜像对账，后者阻塞不能停止发布轮询；监督子进程重启后仍按配置间隔运行。检查或启动更新失败会写入经过脱敏且有大小上限的审计事件，不再静默丢弃。
-
-**候选校验**（接受候选前，以及预拉取、准备 Manager、进入维护前都要复验）
-
-- 当前的 schema、协议、技术身份和镜像集合完全匹配；
-- 40 位小写十六进制的 commit，不能降级；
-- Manager 和 Compose 的网址只能是 HTTPS 或精确的回环 HTTP，不含凭据、查询或片段；
-- Manager 的 version 等于 commit，文件名、SHA-256 和只读的 `version` 一致；Compose 的校验和与镜像摘要固定；
-- 数据库 schema 不低于当前版本；相同 schema 的先后由发布通道证明，不按字符串或时间猜测。显式回滚走经过验证的快照。
-
-**`/v1/check`**
-
-- **可以保存发布清单和持久的候选版本，但不创建更新操作，也不安装或切换。**
-- 有一个容量有上限的内存缓存，条目保留期间把 key 绑定到精确的 `manifest_url`：命中时复用结果，网址不同返回 `409`。缓存判定、候选刷新和结果选择共用一个串行边界，命中、冲突或同键并发都不会重复修改。
-- 条目被淘汰或重启后，同一个 key 算作新的检查，`reused` 只在实际命中时为真。没有持久的检查日志，也不会无限积累 key 或墓碑；它不能替代操作的持久幂等。
-
-**预拉取**
-
-- 进入维护前预拉取 Platform、Runtime 和 agent-sandbox 镜像，避免更新后的第一次命令才拉取沙箱；本地已有精确的 RepoDigest 时不访问镜像仓库。
-- 拉取同时受"无进展期限"和较大的绝对上限约束，一直有进展的拉取不会被固定的短时限截断。原始输出只刷新内存里的进度；长期状态和日志只保存有上限的脱敏诊断。目录中存在的能力服务另走受限的拉取路径。
-- 预拉取前和切换前检查磁盘空间和 inode。不足或超时可以重试：不进入维护、保留当前版本，条件恢复后再试。
+M1 prefetches Platform, Runtime and `agent-sandbox` before maintenance, avoiding a first-command sandbox image pull after release. An already-present exact RepoDigest is reused. Pulls and maintenance are separate phases; do not interpret download success as readiness.
 
 ## 排队与维护
 
-**操作的幂等**
+Operations retain their idempotency key, request identity, generation and persistent phase. Reusing a key with different input is a conflict; an uncertain response is reconciled with the same operation, never blindly retried as a new operation.
 
-- 所有 install、update、restart、rollback、repair 都带有 key、期望的版本号和持久化的阶段。
-- 先核对不可变的请求指纹，再判断版本号：原样重放只观察原来的操作；同一个 key 但请求不同就拒绝；永远不会出现第二个持有者。
-- 响应为空、被截断、超限或非法的 2xx，要用原 key 和日志对账，不能当作成功，也不能认定修改没有执行。
-- 状态、当前操作、请求指纹、版本和预约结算共同保存在一份 owner-only、原子替换并 fsync 的更新记录中；同一服务锁串行化变更。不再先写独立操作文件再发布所有权。首次转换只接受已结算的旧记录，保留旧文件供上一版本读取；遇到在途或不确定记录时失败关闭，不猜测或删除证据。
+While waiting for an operation, the CLI tolerates a restarting Manager's missing/refused/reset socket or EOF by retrying only its status GET, with backoff from 500 ms to 4 seconds and a ten-minute deadline. It never replays the operation POST. The command reports the actual terminal success/failure; loss of the polling connection is not evidence that the operation failed or should be submitted again.
 
-**进入维护**
+1. Wait for the Platform's natural idle boundary: no active/queued agent work or admissions.
+2. Reserve with the existing operation ID, persist maintenance, and reconfirm the same reservation before stopping writers. Manager remains the ingress and serves maintenance.
+3. Stop the old writer, verify a snapshot and run the fixed migration command. Start and probe the candidate with admissions still frozen.
+4. Settle the owner-bound commit/abort reservation and restore ingress only after core and Manager readiness are confirmed.
 
-- 只要还有运行或排队中的任务、审批、文件提交、浏览器接管、后台学习等副作用，就保持 `waiting_for_tasks`，不停服务，也不另找持有者。自然空闲后：
+The exact readiness fields are preserved, including compatibility field `active_learning_reviews=0`; removed learning/approval systems are not recreated. See the [Platform contract](../reference/platform-api.md).
 
-1. 用同一个 ID 预约 → 持久写入 `maintenance=true` → 再用同一个 ID 预约一次。关闭新准入、入口切到维护页、等短操作退出后，才开始破坏性的操作。响应不确定时，只有明确的释放才能解除；Manager 不可达或身份不符时，管理写入一律失败关闭。
-2. 停止当前写入者和需要切换的固定服务，验证版本快照，再执行[固定迁移](deployment.md#发布物启动与健康)。数据库版本边界见[受控迁移](../reference/data-layout.md#受控迁移)；普通操作不查找历史库存，也不扩大读写范围。
-3. 启动候选版本，做只读的核心探测，必要时激活新的 Manager；原子提交当前版本并结算预约后，才恢复入口。Platform 先恢复持久的预约，再启动有副作用的后台处理；候选版本的全部后台处理冻结，直到明确释放。
-4. 在后台恢复能力服务，做安全清理。
+## 提交回滚与能力降级
 
-- 任何时候最多只有一个可写的 Platform；维护标志、阶段、当前/候选版本和快照身份都持久保存。
-- 重启后按同一份日志和精确的归属标签对账，不猜容器名，也不另开新的更新。
+Core readiness covers Manager, Platform, Runtime and public ingress. Camofox and SearXNG may be degraded independently; MCP is workspace configuration, not a managed release service.
 
-## 提交、回滚与能力降级
+Before commit, a failed candidate is stopped and the validated snapshot/previous generation restored by the same operation. After commit, preserve new business writes and settle forward; do not automatically overwrite them with old data. A failed response does not prove an operation had no effect. Manager control and maintenance remain available for diagnosis.
 
-**核心与非核心**
-
-- 核心只有：Manager 控制面、Platform、Runtime 和公共入口。
-- Camoufox、SearXNG、以及目录中存在时的 Firecrawl 失败时标为降级并指数退避恢复，不拖住健康的核心；工作区 MCP 不参与。目录不包含 Firecrawl 时，它不是待恢复或不可用的能力。
-- 候选版本只读地验证：工作区、标记文件、Runtime 别名、Camoufox 附属文件从启动起就符合当前 schema；缺失、未物化、旧格式或漂移都拒绝，普通更新不做修复。
-
-**开放业务的前提**：快照验证、核心就绪、Manager 启动确认和预约释放全部完成。
-
-- `commit-release` 和 `abort-release` 各自独立认证，JSON 有大小上限，拒绝重复、未知字段和尾随内容。commit 只在普通更新的 Manager 启动已被持久确认之后使用；abort 只恢复准入。失败、取消、restart、repair、rollback 都没有 schema 提交。
-- install 和 update 只有在独立 launcher 持久确认 Manager 启动后才记录 commit 意图，没有自更新时记录实际的 abort，非版本类操作不记录 commit。commit 意图先落盘，再请求准入门；响应不确定时只沿原操作 ID 向前恢复，不自动恢复旧数据库。
-- 成功响应后持久保存 `Finalized=true` 的结算回执；`gate_settlement` 只投影确认回执，不把意图当作成功。回执落盘后重放同一幂等动作，再清除维护和引用，覆盖 Platform 在首次响应与回执之间重启的竞态；请求可以重放，但逻辑提交只能生效一次。不重复自更新，也不猜测旧日志。
-
-| 失败发生在 | 如何收敛 |
-| --- | --- |
-| 提交前的迁移或核心失败 | 停止候选、恢复快照和上一版本、结算预约，记录为可重试的失败。只恢复快照覆盖的数据，不转换历史工作区或反向放宽权限。 |
-| 当前版本已提交、未收尾 | 保持维护，重试核心探测和准入门。新业务可能已经产生分叉，不自动退回上一版本的数据；之后的恢复必须走新的快照操作。 |
-| 已保存失败、活动 ID 未清理 | 只补做失败的收尾。 |
-| 已保存收尾、待处理未清理 | 重放原来的准入门动作，再清除引用。 |
-| 无法恢复 | control 和维护页保持在线，不让 systemd 陷入崩溃循环。 |
-
-**诊断信息**
-
-- 就绪检查失败时，在删除候选之前依次收集 healthcheck 和有上限的日志；替换掉精确的 Manager 权限令牌和通用凭据后再截断。收集失败不阻止回滚。
-- 外部错误在写入状态、操作或激活记录之前限制大小；重试只替换最近一次失败，不递归拼接。control 只保存有上限的诊断。
-- `auto_update.check_failed` 和 `auto_update.start_failed` 分别记录周期检查、操作准入的失败；`status.checked_at` 当前投影的是持久状态心跳，不是每次 HTTP 轮询时间，未修改的 `304` 响应不会推进它。
-- `/v1/status` 不能输出发布清单、快照或任何其它宿主机绝对路径。
-
-**模型设置不迁移**
-
-- 逐字保留非空的明确选择和表示"自动"的空字符串。旧 Runtime 历史里缓存的 OAuth 默认值只在重新加载目录时归一化，不改动生产设置、账号或会话，也不需要人工修数据。
+R2's DB migration is additive and old Runtime journals remain untouched. New v3 history is not mirrored into old sessions. A binary rollback is not a full-data rollback; see [backup and recovery](../reference/data-layout.md#备份与恢复).
 
 ## Manager 自更新
 
-- 正常自更新只保留当前 Manager 和一个经过验证的上一版本；下载候选后验证 SHA-256 与 `version`，不执行未验证的候选。
-- 独立且不随候选替换的 launcher 是原用户级 systemd unit 的主进程，启动 Manager 子进程。在固定期限内，通过已认证的 `/v1/identity` 核对版本、SHA 和进程身份，并验证核心就绪，成功后才允许原 Platform 操作提交预约。
-- 子进程确认会等待父进程持久登记精确的 PID；短期状态锁竞争在有界期限内等待，不立即判定候选失败。确认时的二进制身份校验在写锁之外完成，再在锁内复验身份绑定；真正的外部恢复归属竞争仍立即拒绝。
-- 候选启动退出、身份错误或健康检查超时时，launcher 停止并回收候选，原子恢复经过验证的上一版本并启动它。回退只执行一次；上一版本也失败时关闭准入并报告诊断，不在两个版本之间反复切换。已经提交的版本之后发生普通进程崩溃时只重启当前版本，不自动回滚业务数据。
-- Manager 二进制回退不等于 Platform 数据回退：提交预约前的失败仍由原操作停止写入者、恢复必要的快照和上一 Platform 版本。恢复期间保持维护和原预约；只有回退 Manager 的核心、公共入口及监督启动证明全部成功后，才执行原预约的 abort。两次启动都失败时不释放预约；提交后的数据不恢复旧快照。
-- N+1 不再提供旧候选看门狗、激活计划、`recover-current` 或监督接力 worker。升级前必须确认 N 已在监督模式运行、接力处于终态且没有旧协议在途操作；不满足时继续运行 N 完成结算。
-- 稳定命令路径、配置、socket 和数据根不变；launcher 与当前/上一二进制独立保留，不随候选覆盖。
+The independent launcher verifies and supervises the selected Manager. Keep the current and one verified previous binary. Startup identity/health failure triggers the existing single rollback to the previous binary; repeated switching is not recovery. Once committed, ordinary process restart uses the selected version, not an automatic business-data rollback.
 
-开发机上的 N→N+1 验收（需要可用的用户级 systemd、Docker Compose 和 N commit 对象；在 `manager/` 运行）：
-
-```sh
-AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -timeout=12m -run '^TestBridgeSystemdBinaryUpgradeIntegration$' ./internal/selfupdate
-```
-
-该测试隔离 unit、socket、二进制和 Compose 项目，运行真实 N launcher、N 与 N+1 Manager，验证监督升级、持久选择和失败启动后的单次回退。它从已完成监督接力的 N 检查点开始，核心容器是摘要固定的健康检查夹具；不能替代完整发布下载、数据库迁移和快照回滚的应用级验收。
+R1/M1 uses this existing N+1 protocol. Stable command/config/socket paths and launcher ownership remain unchanged. Do not replace the launcher as part of the Pi-native application rewrite.
 
 ## 手动恢复
 
-自动回退也失败时，停止 `agent-platform-manager.service` 并保留数据和日志。先修复核心服务或启动失败的原因；二进制损坏时，按 `manager/manager-binaries/launcher-state.json` 的 `selected` 路径、版本和 SHA-256，从同一不可变发布重新取得并校验**完全相同的**二进制，以部署用户原子恢复该文件，保留原元数据和权限。launcher 损坏时同样只恢复记录中 `launcher` 对应的原始字节。再启动 unit，检查 `status`、日志和核心健康；显式启动只重试当前选择，不重新尝试被拒绝的候选。只覆盖稳定路径不会改变监督选择；不要改写选择、操作或预约记录，也不要把旧数据库快照覆盖到已经开放业务的新版本。涉及数据恢复时按[备份与恢复](../reference/data-layout.md#备份与恢复)操作。
+Use `agent-platform-manager status`, `logs`, `preflight` and the operation controls first. If Manager cannot start, stop its unit and preserve state/logs. Recover only the exact verified binary selected by `manager/manager-binaries/launcher-state.json` from its immutable release, retaining permissions and identity. Do not hand-edit selection, operation or reservation records. Restore data only from a consistent recovery point after preserving newer writes.
 
-## 自动清理
+## Cleanup
 
-**前提与范围**
+After a successful update, retain images referenced by current and previous generations plus running sandboxes. Delete only other deployment-owned images by exact ID; never blanket-prune Docker or touch unrelated workloads. Current/previous metadata, binaries, snapshots and in-flight candidates stay protected. Unknown ownership or damaged metadata is not deletion authority.
 
-- 只在 `idle`、非维护、没有活动或正在收尾的操作时进行。
-- 保留当前和上一版本的已验证发布物、二进制，以及它们引用的回滚快照；在途候选和其快照始终受保护。
-- 未被当前/上一版本引用的普通快照默认保留七天；只删除已验证的过期快照。未知、损坏和暂存工件保留，不按目录名猜测。
-- 更新记录是唯一可变的操作权威；其中终态幂等记录保留最新 128 条或七天以内的记录，并额外保护在途操作和当前/上一代关联记录。旧桥接记录只为离线回退保留，不继续累积独立操作日志。
-- 成功更新后保留当前和上一代引用的镜像，以及运行中沙箱引用的镜像；只按精确 ID 删除已经确认属于本部署且不再引用的镜像，不使用 blanket prune，不清理无归属镜像或网络。删除失败会报告并保留可重试状态，不影响已提交版本。
-- 运行沙箱仍引用旧代镜像时，保留该代经验证的发布目录作为镜像归属证据，待引用消失后再清理；不强制删除被容器占用的镜像。
-- 对无法验证、仍被引用或归属不明的文件不执行删除。
+While a running sandbox references an older generation's image, retain that generation's verified release directory as ownership evidence. Do not force-delete images used by containers. Cleanup failure is reported and remains retryable without invalidating an already committed release.
 
-**空间与日志**
-
-- 空间预警时先安全清理；仍然不足就保留当前版本，报告可重试的错误。日志按大小和数量轮转。
-- 其余阈值见[容器契约](../contracts/container-platform.json)，验收见[测试与验证](../development/testing.md#部署与冒烟)。
+Removed-feature tables/files are retained for rollback. Idle sandbox stop does not delete user workspaces. Keep diagnostics bounded and free of credentials. Verification requirements live in [testing](../development/testing.md).

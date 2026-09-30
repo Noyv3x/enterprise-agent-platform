@@ -1,0 +1,113 @@
+/* Conversation, chat and computer surfaces. Domain styles sit in the `app` cascade layer (see src/app.css) and use
+   only Fieldwork / Beautiful UI tokens. */
+@layer app {
+/* Markdown replies: Beautiful UI ink ramp, hairlines, 15px body at 1.6. Preflight clears every default. */
+.cv-prose { min-inline-size: 0; overflow-wrap: anywhere; color: var(--ink); }
+.cv-prose > :first-child { margin-block-start: 0; }
+.cv-prose > :last-child { margin-block-end: 0; }
+.cv-prose :is(p, ul, ol, blockquote, figure, .cv-table, .katex-display) { margin-block: var(--wf-space-3); }
+.cv-prose :is(h1, h2, h3, h4, h5, h6) { margin-block: var(--wf-space-5) var(--wf-space-2); font-weight: 600; line-height: 1.35; text-wrap: balance; }
+.cv-prose h1 { font-size: 1.25em; }
+.cv-prose h2 { font-size: 1.125em; }
+.cv-prose h3 { font-size: 1em; }
+.cv-prose :is(h4, h5, h6) { font-size: .9375em; color: var(--ink-2); }
+.cv-prose :is(strong, b) { font-weight: 600; }
+.cv-prose :is(ul, ol) { padding-inline-start: 1.375em; }
+.cv-prose ul { list-style: disc; }
+.cv-prose ol { list-style: decimal; }
+.cv-prose li { margin-block: var(--wf-space-1); }
+.cv-prose li::marker { color: var(--ink-3); }
+.cv-prose .contains-task-list { list-style: none; padding-inline-start: 0; }
+.cv-prose .task-list-item input { margin-inline-end: .5em; accent-color: var(--wf-accent); }
+.cv-prose hr { margin-block: var(--wf-space-5); border-block-start: var(--wf-border) solid var(--line); }
+.cv-prose blockquote { padding-inline-start: var(--wf-space-3); border-inline-start: 2px solid var(--line-strong); color: var(--ink-2); }
+.cv-prose :not(pre) > code { padding: .0625em .375em; border-radius: var(--radius-chip); background: var(--field); box-shadow: var(--shadow-hairline); font-size: .8125em; }
+.cv-prose .katex-display { overflow: auto; max-inline-size: 100%; }
+.cv-table { overflow: auto; max-inline-size: 100%; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow-card); }
+.cv-table table { border-collapse: collapse; min-inline-size: 100%; font-size: var(--wf-text-sm); }
+.cv-table :is(th, td) { text-align: start; padding: var(--wf-space-2) var(--wf-space-3); border-block-end: var(--wf-border) solid var(--line); }
+.cv-table tr:last-child > td { border-block-end: 0; }
+.cv-table th { background: var(--inset); color: var(--ink-2); font-weight: 500; white-space: nowrap; }
+/* Beautiful UI code block: file-style header with copy, then a wrapping listing that scrolls past 32rem. */
+.cv-code { margin-inline: 0; min-inline-size: 0; overflow: hidden; border-radius: var(--radius-card); background: var(--surface); box-shadow: var(--shadow-card); }
+.cv-code figcaption { display: flex; align-items: center; justify-content: space-between; gap: var(--wf-space-2); padding: var(--wf-space-1) var(--wf-space-2) var(--wf-space-1) var(--wf-space-3); border-block-end: var(--wf-border) solid var(--line); font-size: var(--wf-text-xs); color: var(--ink-2); }
+.cv-code pre { margin: 0; max-block-size: 32rem; overflow: auto; padding: var(--wf-space-3); font-size: var(--wf-text-sm); line-height: 1.65; color: var(--ink-2); }
+.cv-code-line { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+/* Streaming caret: a slim ink bar after the last received characters. */
+.wf-message--streaming .wf-message-body > .cv-prose:last-of-type > :last-child:not(ul, ol, figure, table, .cv-table)::after { content: ""; display: inline-block; inline-size: 2px; block-size: 1.05em; margin-inline-start: 2px; vertical-align: text-bottom; border-radius: 1px; background: var(--ink); }
+.cv-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
+.cv-footnote { display: inline-flex; align-items: center; flex-wrap: wrap; gap: var(--wf-space-2); }
+.cv-error-text { color: var(--wf-danger); font-size: var(--wf-text-sm); overflow-wrap: anywhere; }
+.cv-working { display: flex; align-items: center; gap: var(--wf-space-2); margin-block-start: var(--wf-space-2); color: var(--ink-3); font-size: var(--wf-text-sm); }
+.cv-older { display: flex; justify-content: center; padding-block-end: var(--wf-space-4); }
+/* Tool activity: one quiet row per call; opening it shows the command/content and its output. */
+.cv-tool { margin-block: var(--wf-space-2); border-radius: var(--radius-card); background: var(--inset); box-shadow: var(--shadow-hairline); overflow: hidden; }
+.cv-tool > summary { display: flex; align-items: center; gap: var(--wf-space-2); min-block-size: var(--wf-control); padding: var(--wf-space-1) var(--wf-space-3); cursor: pointer; list-style: none; color: var(--ink-2); font-size: var(--wf-text-sm); }
+.cv-tool > summary::-webkit-details-marker { display: none; }
+.cv-tool > summary > svg { flex: none; color: var(--ink-3); }
+.cv-tool[open] > summary { border-block-end: var(--wf-border) solid var(--line); }
+.cv-tool-label { flex: none; font-weight: 500; color: var(--ink); }
+.cv-tool-summary { flex: 1; min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: var(--wf-text-xs); }
+.cv-tool .wf-output-body { max-block-size: 20rem; }
+.cv-thinking { margin-block-end: var(--wf-space-2); color: var(--ink-3); font-size: var(--wf-text-sm); }
+.cv-thinking > summary { cursor: pointer; }
+.cv-thinking > div { margin-block-start: var(--wf-space-1); padding-inline-start: var(--wf-space-3); border-inline-start: 2px solid var(--line); max-block-size: 12rem; overflow: auto; }
+.cv-document { display: block; inline-size: 100%; block-size: 20rem; border: 0; }
+.cv-link-button { color: var(--wf-accent); font-size: var(--wf-text-sm); text-decoration-line: underline; text-decoration-color: color-mix(in srgb, currentColor 35%, transparent); text-underline-offset: 3px; }
+.cv-link-button:hover { text-decoration-color: currentColor; }
+.cv-link-button[aria-current="page"] { color: var(--ink); text-decoration-line: none; }
+/* Composer. */
+.cv-input { display: block; inline-size: 100%; min-block-size: 1.5em; max-block-size: 12rem; resize: none; field-sizing: content; background: transparent; color: var(--ink); font-size: var(--wf-text-reading); line-height: 1.5; outline: none; }
+.cv-input::placeholder { color: var(--ink-3); }
+.wf-root .cv-input:focus-visible { outline: none; }
+.cv-icon-button { inline-size: var(--wf-control); padding-inline: 0; }
+.cv-chips { display: flex; flex-wrap: wrap; gap: var(--wf-space-1); list-style: none; margin: 0; padding: 0; }
+.cv-chip { display: inline-flex; align-items: center; gap: var(--wf-space-1); max-inline-size: 100%; padding: 2px var(--wf-space-1) 2px var(--wf-space-2); border-radius: var(--wf-radius-pill); background: var(--field); box-shadow: var(--shadow-hairline); font-size: var(--wf-text-xs); color: var(--ink-2); }
+.cv-chip[data-error] { color: var(--wf-danger); }
+.cv-chip-name { min-inline-size: 0; max-inline-size: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.cv-chip-meta { color: inherit; }
+.cv-chip-remove { display: inline-flex; padding: 2px; border-radius: var(--wf-radius-pill); color: var(--ink-3); }
+.cv-chip-remove:hover { background: var(--hover-2); color: var(--ink); }
+/* Shared small controls for the computer and chat surfaces. */
+.cv-pad { padding: var(--wf-space-2) var(--wf-space-3); }
+.cv-push { margin-inline-start: auto; }
+.cv-field { display: flex; flex-direction: column; gap: var(--wf-space-1); }
+.cv-select, .cv-text-input { min-block-size: var(--wf-control); padding: 0 var(--wf-space-3); border-radius: var(--radius-control); background: var(--field); box-shadow: var(--shadow-hairline); color: var(--ink); font-size: var(--wf-text-sm); max-inline-size: 100%; }
+.cv-text-input { flex: 1 1 12rem; min-inline-size: 0; }
+/* Personal AI: the computer docks beside the thread on wide screens and stacks below it on narrow ones. */
+.cv-with-computer { display: grid; grid-template-columns: minmax(0, 1fr) minmax(22rem, 45%); block-size: 100%; min-block-size: 0; }
+.cv-computer { min-inline-size: 0; min-block-size: 0; border-inline-start: var(--wf-border) solid var(--wf-line); }
+.cv-computer .wf-computer-content { display: flex; flex-direction: column; overflow: auto; }
+.cv-browser, .cv-files { display: flex; flex-direction: column; min-block-size: 0; }
+.cv-browser-inputs { display: grid; gap: var(--wf-space-2); }
+.cv-screen { position: relative; min-inline-size: 0; background: var(--wf-inset); }
+.cv-screen img { display: block; inline-size: 100%; block-size: auto; user-select: none; }
+.cv-screen[data-controlling] img { cursor: crosshair; }
+.cv-screen-meta { padding: var(--wf-space-1) var(--wf-space-3); color: var(--ink-3); font-size: var(--wf-text-xs); }
+.cv-files { gap: var(--wf-space-3); padding: var(--wf-space-3); }
+.cv-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: var(--wf-space-1); font-size: var(--wf-text-sm); }
+/* Standard chat: conversation list beside the open conversation. */
+.cv-chat { display: grid; grid-template-columns: 16rem minmax(0, 1fr); block-size: 100%; min-block-size: 0; }
+.cv-chat-list { display: flex; flex-direction: column; gap: var(--wf-space-2); min-block-size: 0; overflow: auto; padding: var(--wf-space-3); border-inline-end: var(--wf-border) solid var(--wf-line); }
+.cv-chat-list > ul { display: flex; flex-direction: column; gap: 1px; list-style: none; margin: 0; padding: 0; }
+.cv-chat-row { display: flex; align-items: center; gap: var(--wf-space-1); border-radius: var(--radius-control); }
+.cv-chat-row:hover, .cv-chat-row[data-active] { background: var(--hover-2); }
+.cv-chat-open { flex: 1; min-inline-size: 0; padding: var(--wf-space-1) var(--wf-space-2); text-align: start; }
+.cv-chat-open > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-chat-title { font-size: var(--wf-text-base); font-weight: 500; color: var(--ink); }
+.cv-chat-meta { font-size: var(--wf-text-xs); color: var(--ink-3); }
+.cv-chat-confirm { display: flex; align-items: center; flex-wrap: wrap; gap: var(--wf-space-1); padding: var(--wf-space-1) var(--wf-space-2); font-size: var(--wf-text-xs); color: var(--ink-2); }
+.cv-chat-main { min-inline-size: 0; min-block-size: 0; }
+.cv-chat-back { display: none; }
+@media (max-width: 1039px) {
+  .cv-with-computer { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .cv-computer { border-inline-start: 0; border-block-start: var(--wf-border) solid var(--wf-line); }
+}
+@media (max-width: 759px) {
+  .cv-chat { grid-template-columns: minmax(0, 1fr); }
+  .cv-chat-list { border-inline-end: 0; }
+  .cv-chat[data-open] .cv-chat-list { display: none; }
+  .cv-chat:not([data-open]) .cv-chat-main { display: none; }
+  .cv-chat-back { display: inline-flex; }
+}
+}

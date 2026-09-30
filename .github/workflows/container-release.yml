@@ -14,12 +14,7 @@ permissions:
 env:
   PINNED_INTEGRATION_IMAGES: |
     {
-      "searxng": "ghcr.io/searxng/searxng@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6",
-      "firecrawl-api": "ghcr.io/firecrawl/firecrawl@sha256:966ef7f9a385e1f27844d2d5a7037e9c01558481c3a94614df147002596c6f87",
-      "firecrawl-playwright": "ghcr.io/firecrawl/playwright-service@sha256:df1a393ce8bfc3801570a826a9b0dcc400ae48789adb4a0ad9d6cbf0229b059b",
-      "firecrawl-postgres": "ghcr.io/firecrawl/nuq-postgres@sha256:9b638af78d99873bc0ba2b57c9cbcd01df6ce96efeaa72d36cfbe0f76521e8fc",
-      "firecrawl-redis": "redis@sha256:3811787313eba226a2ef38658c6ccb91cd5e110edc89c37767de373120a0e5a0",
-      "firecrawl-rabbitmq": "rabbitmq@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69"
+      "searxng": "ghcr.io/searxng/searxng@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6"
     }
 
 concurrency:
@@ -59,7 +54,6 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$source_commit" origin/main
           image_namespace="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          jq -e '.sources.firecrawl.revision | test("^[0-9a-f]{40}$")' docs/contracts/upstream-sources.json >/dev/null
           image_matrix='{"include":[{"component":"platform","dockerfile":"containers/platform.Dockerfile","image":"platform","tag_suffix":""},{"component":"agent-runtime","dockerfile":"containers/agent-runtime.Dockerfile","image":"agent-runtime","tag_suffix":""},{"component":"camofox","dockerfile":"containers/camofox.Dockerfile","image":"camofox","tag_suffix":""},{"component":"agent-sandbox","dockerfile":"containers/agent-sandbox.Dockerfile","image":"agent-sandbox","tag_suffix":""}]}'
           {
             echo "source_commit=$source_commit"
@@ -78,32 +72,6 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           persist-credentials: false
-
-      - name: Validate exact Firecrawl revision
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$(mktemp -d)"
-          trap 'rm -rf "$root"' EXIT
-          repository_url="$(jq -er '.sources.firecrawl.repository_url' docs/contracts/upstream-sources.json)"
-          revision="$(jq -er '.sources.firecrawl.revision' docs/contracts/upstream-sources.json)"
-          git -C "$root" init firecrawl
-          git -C "$root/firecrawl" remote add origin "$repository_url"
-          git -C "$root/firecrawl" fetch --depth=1 origin "$revision"
-          git -C "$root/firecrawl" checkout --detach FETCH_HEAD
-          test "$(git -C "$root/firecrawl" rev-parse HEAD)" = "$revision"
-          jq -er '.sources.firecrawl.required_paths[]' docs/contracts/upstream-sources.json |
-            while IFS= read -r required_path; do
-              test -e "$root/firecrawl/$required_path"
-            done
-          docker compose -f "$root/firecrawl/docker-compose.yaml" config --services | sort > "$root/actual-services"
-          jq -r '.sources.firecrawl.compose_services[]' docs/contracts/upstream-sources.json |
-            while IFS= read -r service; do
-              grep -Fxq "$service" "$root/actual-services" || {
-                echo "Managed Firecrawl service is absent from the locked upstream revision: $service" >&2
-                exit 1
-              }
-            done
 
       - name: Verify immutable integration image indexes exist
         shell: bash
@@ -152,6 +120,7 @@ jobs:
 
       - name: Build and push multi-architecture image
         id: build
+        if: matrix.component != 'agent-sandbox'
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
         with:
           context: .
@@ -167,12 +136,30 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.component }}
           cache-to: type=gha,mode=max,scope=${{ matrix.component }}
 
+      # The sandbox is release-independent: no commit args, labels or attestations.
+      # Normalize config/layer timestamps and retain cache across release runners.
+      - name: Build and push reproducible sandbox image
+        id: sandbox
+        if: matrix.component == 'agent-sandbox'
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          outputs: type=image,push=true,rewrite-timestamp=true
+          provenance: false
+          sbom: false
+          tags: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:${{ needs.prepare.outputs.source_commit }}
+          build-args: SOURCE_DATE_EPOCH=0
+          cache-from: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ needs.prepare.outputs.image_namespace }}/agent-sandbox:buildcache,mode=max
+
       - name: Record immutable image identity
         shell: bash
         env:
           COMPONENT: ${{ matrix.component }}
           IMAGE: ghcr.io/${{ needs.prepare.outputs.image_namespace }}/${{ matrix.image }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          DIGEST: ${{ steps.build.outputs.digest || steps.sandbox.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
@@ -243,7 +230,7 @@ jobs:
             images["$component"]="$image"
           done <<<"$integrations"
           mapfile -t components < <(jq -er '.managed_image_capacity_estimates | keys[]' docs/contracts/container-platform.json)
-          [[ "${#components[@]}" -eq 10 && "${#images[@]}" -eq "${#components[@]}" ]]
+          [[ "${#components[@]}" -eq 5 && "${#images[@]}" -eq "${#components[@]}" ]]
           for component in "${components[@]}"; do
             image="${images[$component]-}"
             [[ "$image" =~ ^[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || {
@@ -409,7 +396,7 @@ jobs:
           mapfile -t components < <(jq -er '
             .managed_image_capacity_estimates | keys[]
           ' docs/contracts/container-platform.json)
-          expected_count=10
+          expected_count=5
           [[ "${#components[@]}" -eq "$expected_count" && "${#images[@]}" -eq "${#components[@]}" ]]
 
           for component in "${components[@]}"; do
@@ -702,12 +689,10 @@ jobs:
           (cd "$stage" && sha256sum install.sh > install.sh.sha256)
 
           jq -ecS '
-            select(length == 10) |
+            select(length == 5) |
             select(
               keys == [
-                "agent-runtime", "agent-sandbox", "camofox", "firecrawl-api",
-                "firecrawl-playwright", "firecrawl-postgres",
-                "firecrawl-rabbitmq", "firecrawl-redis", "platform", "searxng"
+                "agent-runtime", "agent-sandbox", "camofox", "platform", "searxng"
               ]
             ) |
             select(all(.[]; test("^[^@\\s]+@sha256:[0-9a-f]{64}$")))

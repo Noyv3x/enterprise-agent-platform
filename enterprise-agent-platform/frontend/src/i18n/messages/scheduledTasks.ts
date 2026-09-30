@@ -59,11 +59,6 @@ export const scheduledTaskMessages = defineMessages({
   },
   "scheduledTasks.rule.cron": { "zh-CN": "Cron · {expression}", en: "Cron · {expression}", "zh-TW": "Cron · {expression}" },
   "scheduledTasks.delivery.chat": { "zh-CN": "发送到个人 AI", en: "Deliver to Personal AI", "zh-TW": "傳送至個人 AI" },
-  "scheduledTasks.delivery.telegram": {
-    "zh-CN": "发送到个人 AI 和 Telegram",
-    en: "Deliver to Personal AI and Telegram",
-    "zh-TW": "傳送至個人 AI 和 Telegram",
-  },
   "scheduledTasks.state.active": { "zh-CN": "已启用", en: "Active", "zh-TW": "已啟用" },
   "scheduledTasks.state.paused": { "zh-CN": "已暂停", en: "Paused", "zh-TW": "已暫停" },
   "scheduledTasks.state.completed": { "zh-CN": "已完成", en: "Completed", "zh-TW": "已完成" },

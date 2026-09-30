@@ -1,0 +1,656 @@
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import httpx
+from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
+
+from enterprise_agent_platform.db import Database, now
+from enterprise_agent_platform.auth import issue_session
+from enterprise_agent_platform.queue import Queue, authenticated_events, routes
+
+
+class Gate:
+    @asynccontextmanager
+    async def admit(self):
+        yield
+
+
+class Files:
+    def bind(self, user, info, mid, ids, conn=None):
+        if ids:
+            raise HTTPException(404, "Attachment not found")
+
+    def prompt(self, user, info, ids):
+        return {"text": "", "images": []}
+
+    def for_message(self, info, mid):
+        return []
+
+    async def deliver(self, user, info, mid, text):
+        return []
+
+
+class QueueTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        db = Database(root / "platform.db")
+        db.migrate(root)
+        with db.connect() as conn:
+            for uid in (1, 2):
+                conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,model_name,created_at) VALUES (?,?,?,?,?,?,?)",
+                             (uid, f"u{uid}", f"User {uid}", "unused", "admin", "model-a", 1))
+                conn.execute("INSERT INTO chat_model_policies VALUES (?,?,?,?)", (uid, '["model-a","model-b"]', "model-a", now()))
+        self.calls = []
+        self.requests = []
+        self.compactions = []
+        self.compact_hold = asyncio.Event()
+        self.compact_hold.set()
+        self.compact_started = asyncio.Event()
+        self.compact_result = {"compacted": True, "model": "model-a",
+                               "usage": {"input": 10, "output": 2, "cache_read": 8, "cache_write": 1, "total": 21}}
+        self.compact_timeout = None
+        self.hold = asyncio.Event()
+        self.hold.set()
+        self.loss = False
+
+        async def runtime(request):
+            self.calls.append((request.method, request.url.path))
+            if request.url.path.endswith("/runs"):
+                self.requests.append(json.loads(request.content))
+                await self.hold.wait()
+                return httpx.Response(202, json={"run_id": f"r{len(self.requests)}"})
+            if request.url.path.endswith("/events"):
+                events = [{"seq": 1, "type": "text_delta", "delta": "answer"}]
+                if not self.loss:
+                    events.append({"seq": 2, "type": "run_end", "status": "completed", "text": "answer", "model": "model-a",
+                                   "usage": {"input": 10, "output": 2, "cache_read": 8, "cache_write": 1, "total": 21}})
+                return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
+            if request.url.path.endswith("/compact"):
+                self.compactions.append(json.loads(request.content))
+                self.compact_timeout = request.extensions["timeout"]["read"]
+                self.compact_started.set()
+                await self.compact_hold.wait()
+                return httpx.Response(200, json=self.compact_result)
+            return httpx.Response(200, json={"ok": True})
+
+        self.http = httpx.AsyncClient(transport=httpx.MockTransport(runtime))
+        self.p = SimpleNamespace(db=db, http=self.http, gate=Gate(), files=Files(), settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test"))
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}, {"id": "model-b"}]}))
+        self.q = self.p.queue = Queue(self.p)
+        self.user = self.q.user(1)
+
+    async def asyncTearDown(self):
+        await self.q.stop()
+        await self.http.aclose()
+        self.temp.cleanup()
+
+    async def drain(self):
+        while self.q.tasks:
+            await asyncio.gather(*list(self.q.tasks.values()))
+
+    async def test_fifo_single_submit_and_stable_session(self):
+        self.hold.clear()
+        await self.q.enqueue(self.user, "private", "first")
+        await asyncio.sleep(0)
+        await self.q.enqueue(self.user, "private", "second")
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["first"])
+        self.hold.set()
+        await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["first", "second"])
+        self.assertEqual([path for method, path in self.calls if path.endswith("/runs")], ["/v1/sessions/agent-private-1/runs"] * 2)
+        page = self.q.messages(self.user, "private")
+        self.assertEqual([m["content"] for m in page["messages"]], ["first", "second", "answer", "answer"])
+        self.assertIsNone(page["next_before_id"])
+        self.assertEqual(page["messages"][0]["metadata"]["author_display_name"], "User 1")
+        with self.p.db.connect() as conn:
+            self.assertEqual([r[0] for r in conn.execute("SELECT status FROM durable_jobs ORDER BY id")], ["succeeded", "succeeded"])
+            usage = json.loads(conn.execute("SELECT raw_usage_json FROM token_usage_events LIMIT 1").fetchone()[0])
+            self.assertEqual(usage["cacheRead"], 8)
+
+    async def test_loss_interrupted_without_resubmission(self):
+        self.loss = True
+        await self.q.enqueue(self.user, "private", "uncertain")
+        await self.drain()
+        await self.q.start()
+        await self.drain()
+        self.assertEqual(len(self.requests), 1)
+        message = self.q.messages(self.user, "private")["messages"][-1]
+        self.assertEqual(message["metadata"]["status"], "interrupted")
+        self.assertIn("without run_end", message["metadata"]["error"])
+        self.assertIn(("POST", "/v1/sessions/agent-private-1/cancel"), self.calls)
+        self.assertEqual(self.q.active, 0)
+
+    async def test_restart_resumes_queued_never_running(self):
+        self.q.stopping = True
+        await self.q.enqueue(self.user, "private", "already submitted")
+        await self.q.enqueue(self.user, "private", "not submitted")
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE durable_jobs SET status='running' WHERE id=(SELECT MIN(id) FROM durable_jobs)")
+        await self.q.start()
+        await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["not submitted"])
+        self.assertEqual([m["metadata"]["status"] for m in self.q.messages(self.user, "private")["messages"] if m["role"] == "assistant"], ["interrupted", "completed"])
+
+    async def test_attachment_failure_rolls_back_message_and_job(self):
+        with self.assertRaises(HTTPException):
+            await self.q.enqueue(self.user, "private", "invalid", [999])
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM durable_jobs").fetchone()[0], 0)
+
+    async def test_cancel_during_submit_and_reset(self):
+        self.hold.clear()
+        await self.q.enqueue(self.user, "private", "active")
+        await asyncio.sleep(0)
+        await self.q.enqueue(self.user, "private", "queued")
+        await self.q.cancel(self.user, "private")
+        self.hold.set()
+        await self.drain()
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn(("POST", "/v1/runs/r1/cancel"), self.calls)
+        self.assertIn("cancelled", [m["metadata"]["status"] for m in self.q.messages(self.user, "private")["messages"]])
+        await self.q.compact(self.user, "private")
+        await self.drain()
+        await self.q.reset(self.user, "private")
+        self.assertEqual(self.q.messages(self.user, "private")["messages"], [])
+        self.assertNotEqual(self.q.scope(self.user, "private")["sid"], "agent-private-1")
+
+    async def test_chat_policy_ownership_create_delete_and_shared_sandbox(self):
+        app = Starlette(routes=routes())
+        app.state.platform = self.p
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                forbidden = await client.post("/api/chat/conversations", json={"model_id": "forbidden"})
+                self.assertEqual(forbidden.status_code, 403)
+                first = (await client.post("/api/chat/conversations", json={})).json()["conversation"]
+                second = (await client.post("/api/chat/conversations", json={"model_id": "model-b"})).json()["conversation"]
+                info = self.q.scope(self.user, "chat-" + first["id"])
+                other = self.q.scope(self.user, "chat-" + second["id"])
+                self.assertEqual(info["sandbox"]["sandbox_id"], other["sandbox"]["sandbox_id"])
+                self.assertNotEqual(info["sandbox"]["cwd"], other["sandbox"]["cwd"])
+                await self.q.enqueue(self.user, "chat-" + first["id"], "hello")
+                await self.drain()
+                self.assertIsNone(self.requests[0]["resources"]["agents_md"])
+                self.assertIn(f"MEDIA: {info['sandbox']['cwd']}/path", self.requests[0]["resources"]["system_prompt"])
+                self.assertEqual(self.requests[0]["resources"]["skills"], [])
+                self.assertNotIn("browser", self.requests[0]["tools"])
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.q.user(2)):
+                self.assertEqual((await client.get("/api/chat/conversations/" + first["id"])).status_code, 404)
+                self.assertEqual((await client.delete("/api/chat/conversations/" + first["id"])).status_code, 404)
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                self.assertEqual((await client.delete("/api/chat/conversations/" + first["id"])).status_code, 200)
+                self.assertFalse(info["workspace"].exists())
+                self.assertEqual((await client.get("/api/chat/conversations/" + first["id"])).status_code, 404)
+                with self.p.db.connect() as conn:
+                    self.assertIsNotNone(conn.execute("SELECT deleted_at FROM chat_conversations WHERE id=?", (first["id"],)).fetchone()[0])
+
+    async def test_durable_events_reconnect(self):
+        await self.q.enqueue(self.user, "private", "hello")
+        await self.drain()
+        stream = self.q.events(self.user, "private", 0)
+        first = await anext(stream)
+        seq = int(first.splitlines()[0].split(b": ")[1])
+        await stream.aclose()
+        stream = self.q.events(self.user, "private", seq)
+        next_event = await anext(stream)
+        self.assertGreater(int(next_event.splitlines()[0].split(b": ")[1]), seq)
+        event = json.loads(next_event.split(b"data: ")[1])
+        self.assertEqual(event["message"]["metadata"]["status"], "running")
+        await stream.aclose()
+
+    async def test_reserved_startup_defers_until_resume(self):
+        self.q.stopping = True
+        await self.q.enqueue(self.user, "private", "after release")
+        self.p.gate.reserved = "update"
+        await self.q.start()
+        self.assertEqual(self.q.active, 0)
+        self.assertEqual(self.requests, [])
+        self.p.gate.reserved = None
+        self.q.resume()
+        await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["after release"])
+
+    async def test_legacy_queued_payload_resumes_trusted_message(self):
+        self.q.stopping = True
+        result = await self.q.enqueue(self.user, "private", "durable content")
+        legacy = {"actor": {"id": 1}, "user_message": {"id": result["message"]["id"]},
+                  "scope_type": "private", "scope_id": "1", "content": "stale content", "attachments": []}
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(legacy), result["job_id"]))
+        await self.q.start()
+        await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["durable content"])
+
+    async def test_resources_never_read_symlinks_or_symlinked_parents(self):
+        info = self.q.scope(self.user, "private")
+        secret = self.p.settings.data_dir / "host-secret"
+        secret.write_text("---\nname: leaked-secret\ndescription: host credential\n---\n")
+        (info["workspace"] / "AGENTS.md").symlink_to(secret)
+        skills = info["workspace"] / ".agent-platform" / "skills"
+        skills.mkdir(parents=True)
+        good = skills / "good"
+        good.mkdir()
+        (good / "SKILL.md").write_text("---\nname: safe\ndescription: safe workspace instructions\n---\n")
+        linked = skills / "linked"
+        linked.mkdir()
+        (linked / "SKILL.md").symlink_to(secret)
+        external = self.p.settings.data_dir / "outside-skill"
+        external.mkdir()
+        (external / "SKILL.md").write_text(secret.read_text())
+        (skills / "parent-link").symlink_to(external, target_is_directory=True)
+        await self.q.enqueue(self.user, "private", "Show available guidance")
+        await self.drain()
+        resources = self.requests[0]["resources"]
+        self.assertIsNone(resources["agents_md"])
+        self.assertEqual([skill["name"] for skill in resources["skills"]], ["safe"])
+
+    async def test_resource_swap_before_open_cannot_leak_secret(self):
+        from enterprise_agent_platform.files import open_workspace
+        info = self.q.scope(self.user, "private")
+        agents = info["workspace"] / "AGENTS.md"
+        agents.write_text("safe instructions")
+        secret = self.p.settings.data_dir / "host-secret"
+        secret.write_text("credential-must-not-reach-runtime")
+        def swap_before_open(root, value, directory=False):
+            if value == "AGENTS.md":
+                agents.unlink()
+                agents.symlink_to(secret)
+            return open_workspace(root, value, directory=directory)
+        with patch("enterprise_agent_platform.queue.open_workspace", side_effect=swap_before_open):
+            await self.q.enqueue(self.user, "private", "Show available guidance")
+            await self.drain()
+        self.assertIsNone(self.requests[0]["resources"]["agents_md"])
+        self.assertNotIn(secret.read_text(), json.dumps(self.requests))
+
+    async def check_uncertain_run(self, lose_submission):
+        cancelling, settle = asyncio.Event(), asyncio.Event()
+        submitted = []
+        async def runtime(request):
+            if request.url.path.endswith("/runs"):
+                submitted.append(json.loads(request.content)["prompt"]["text"])
+                if lose_submission and len(submitted) == 1:
+                    raise httpx.ReadError("Response lost after admission")
+                return httpx.Response(202, json={"run_id": "current"})
+            if request.url.path.endswith("/cancel"):
+                cancelling.set()
+                await settle.wait()
+                return httpx.Response(200, json={"cancelled": True, "run_id": "current"})
+            events = [] if len(submitted) == 1 else [{"type": "run_end", "status": "completed", "text": "second completed", "usage": {}, "model": "model-a"}]
+            return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(runtime)) as client:
+            self.p.http = client
+            await self.q.enqueue(self.user, "private", "uncertain first")
+            await self.q.enqueue(self.user, "private", "untouched second")
+            await asyncio.wait_for(cancelling.wait(), 2)
+            with self.p.db.connect() as conn:
+                rows = conn.execute("SELECT status,payload_json FROM durable_jobs ORDER BY id").fetchall()
+            self.assertEqual([row["status"] for row in rows], ["failed", "queued"])
+            self.assertTrue(json.loads(rows[0]["payload_json"])["runtime_unsettled"])
+            self.assertEqual(submitted, ["uncertain first"])
+            await self.q.stop()
+            self.q = self.p.queue = Queue(self.p)
+            cancelling.clear()
+            await self.q.start()
+            await asyncio.wait_for(cancelling.wait(), 2)
+            self.assertEqual(submitted, ["uncertain first"])
+            settle.set()
+            await self.drain()
+            self.assertEqual(submitted, ["uncertain first", "untouched second"])
+            self.assertEqual(self.q.messages(self.user, "private")["messages"][-1]["content"], "second completed")
+
+    async def test_stream_loss_preserves_backlog_until_durable_settlement(self):
+        await self.check_uncertain_run(False)
+
+    async def test_unknown_submission_preserves_backlog_until_durable_settlement(self):
+        await self.check_uncertain_run(True)
+
+    async def test_live_stream_revocation_and_role_changes(self):
+        app = Starlette()
+        app.state.platform = self.p
+        self.p.settings.session_secret = "test-stream-secret"
+        for mutation in ("active=0", "token_version=token_version+1", "role='user',permission_group='no-access'"):
+            with self.subTest(mutation=mutation):
+                with self.p.db.connect() as conn:
+                    conn.execute("UPDATE users SET active=1,role='admin',permission_group='member' WHERE id=1")
+                token = issue_session(self.p.settings, self.q.user(1))
+                request = Request({"type": "http", "method": "GET", "path": "/", "headers": [(b"cookie", ("agent_platform_session=" + token).encode())], "app": app})
+                self.q.emit("private:1", {"type": "text_delta", "delta": "authorized"})
+                self.q.emit("private:1", {"type": "text_delta", "delta": "must-not-arrive"})
+                stream = authenticated_events(request, "private", 0)
+                with patch.object(self.q, "scope", side_effect=AssertionError("SSE must not mutate scope")):
+                    self.assertIn(b"authorized", await anext(stream))
+                    with self.p.db.connect() as conn:
+                        conn.execute("UPDATE users SET " + mutation + " WHERE id=1")
+                    with self.assertRaises(StopAsyncIteration):
+                        await anext(stream)
+
+    async def test_legacy_default_model_and_thinking_execute(self):
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE users SET model_name='',thinking_depth='none' WHERE id=1")
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}]}))
+        await self.q.enqueue(self.q.user(1), "private", "Use inherited settings")
+        await self.drain()
+        self.assertEqual(self.requests[0]["model"], {"id": "catalog-default", "thinking": "off"})
+
+    async def test_compaction_uses_current_allowed_chat_model(self):
+        cid = "11111111-1111-1111-1111-111111111111"
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Switch models','model-a',?,?,NULL)", (cid, 1, now(), now()))
+        scope = "chat-" + cid
+        await self.q.enqueue(self.user, scope, "First turn on model A")
+        await self.drain()
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE chat_conversations SET model_id='model-b' WHERE id=?", (cid,))
+        await self.q.compact(self.user, scope)
+        await self.drain()
+        self.assertEqual(self.compactions, [{"model": {"id": "model-b", "thinking": "off"}}])
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE chat_model_policies SET allowed_models_json='[\"model-a\"]' WHERE user_id=1")
+        with self.assertRaises(HTTPException) as denied:
+            await self.q.compact(self.user, scope)
+        self.assertEqual(denied.exception.status_code, 403)
+        self.assertEqual(len(self.compactions), 1)
+
+    async def test_compact_cancel_before_runtime_submission(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def catalog():
+            entered.set()
+            await release.wait()
+            return {"models": [{"id": "model-a"}]}
+        self.p.oauth.catalog = catalog
+        await self.q.compact(self.user, "private")
+        await asyncio.wait_for(entered.wait(), 2)
+        await self.q.cancel(self.user, "private")
+        release.set()
+        await self.drain()
+        self.assertEqual(self.compactions, [])
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "cancelled")
+
+    async def test_compact_permission_and_execution_policy_revocation(self):
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE users SET role='user',permission_group='no-access' WHERE id=2")
+            conn.execute("INSERT INTO chat_conversations VALUES ('policy',1,'Policy','model-a',?,?,NULL)", (now(), now()))
+        with self.assertRaises(HTTPException) as denied:
+            await self.q.compact(self.q.user(2), "private")
+        self.assertEqual(denied.exception.status_code, 403)
+        with self.assertRaises(HTTPException) as ownership:
+            await self.q.compact(self.q.user(2), "chat-policy")
+        self.assertIn(ownership.exception.status_code, (403, 404))
+        self.q.stopping = True
+        await self.q.compact(self.user, "chat-policy")
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE chat_model_policies SET allowed_models_json='[]' WHERE user_id=1")
+        await self.q.start()
+        await self.drain()
+        self.assertEqual(self.compactions, [])
+        self.assertEqual(self.q.messages(self.user, "chat-policy")["compaction"]["status"], "interrupted")
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0], 0)
+
+    async def test_compact_fifo_and_accounting_without_phantom_messages(self):
+        self.hold.clear()
+        await self.q.enqueue(self.user, "private", "before")
+        await asyncio.sleep(0)
+        self.compact_hold.clear()
+        accepted = await self.q.compact(self.user, "private")
+        self.assertEqual(accepted["status"], "queued")
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "queued")
+        self.hold.set()
+        await asyncio.wait_for(self.compact_started.wait(), 2)
+        await self.q.enqueue(self.user, "private", "after one")
+        await self.q.enqueue(self.user, "private", "after two")
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["before"])
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "compacting")
+        self.compact_hold.set()
+        await self.drain()
+        self.assertEqual(self.compact_timeout, 900)
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["before", "after one", "after two"])
+        page = self.q.messages(self.user, "private")
+        self.assertEqual(page["compaction"], {"job_id": accepted["job_id"], "status": "done"})
+        self.assertEqual([m["content"] for m in page["messages"] if m["role"] == "user"], ["before", "after one", "after two"])
+        self.assertEqual([m["metadata"]["status"] for m in page["messages"] if m["role"] == "assistant"], ["completed"] * 3)
+        with self.p.db.connect() as conn:
+            events = [json.loads(row[0]) for row in conn.execute("SELECT event_json FROM queue_events")]
+            usage = conn.execute("SELECT * FROM token_usage_events WHERE json_extract(raw_usage_json,'$.kind')='compaction'").fetchone()
+        self.assertEqual([(e["phase"], e["status"]) for e in events if e["type"] == "compaction"], [("queued", "queued"), ("start", "compacting"), ("end", "done")])
+        self.assertIsNone(usage["request_message_id"])
+        self.assertIsNone(usage["response_message_id"])
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]), (10, 2, 21))
+        self.assertEqual(json.loads(usage["raw_usage_json"])["cacheRead"], 8)
+
+    async def test_compact_too_small_and_cancelled_queued_have_no_messages_or_usage(self):
+        self.compact_result = {"compacted": False, "reason": "too_small"}
+        await self.q.compact(self.user, "private")
+        await self.drain()
+        page = self.q.messages(self.user, "private")
+        self.assertEqual(page["compaction"]["status"], "nothing_to_compact")
+        self.assertEqual(page["compaction"]["reason"], "too_small")
+        self.q.stopping = True
+        await self.q.compact(self.user, "private")
+        await self.q.cancel(self.user, "private")
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "cancelled")
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0], 0)
+
+    async def test_compact_restart_settles_before_prompt_without_replay(self):
+        self.q.stopping = True
+        compact = await self.q.compact(self.user, "private")
+        await self.q.enqueue(self.user, "private", "after crash")
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE durable_jobs SET status='running' WHERE id=?", (compact["job_id"],))
+        await self.q.start()
+        await self.drain()
+        self.assertEqual(self.calls[0], ("POST", "/v1/sessions/agent-private-1/cancel"))
+        self.assertEqual(self.compactions, [])
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["after crash"])
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "interrupted")
+
+    async def test_compact_uncertain_blocks_until_sid_cancel_settles(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def runtime(request):
+            self.calls.append((request.method, request.url.path))
+            if request.url.path.endswith("/compact"):
+                raise httpx.ReadTimeout("lost compact response")
+            if request.url.path.endswith("/cancel"):
+                entered.set()
+                await release.wait()
+                return httpx.Response(200, json={"cancelled": True, "run_id": None})
+            return await self.http.send(request)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(runtime)) as client:
+            self.p.http = client
+            await self.q.compact(self.user, "private")
+            await asyncio.wait_for(entered.wait(), 2)
+            await self.q.enqueue(self.user, "private", "after uncertainty")
+            self.assertEqual(self.requests, [])
+            self.assertEqual(self.q.active, 1)
+            release.set()
+            await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["after uncertainty"])
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "interrupted")
+
+    async def test_cancel_running_compact_settles_before_following_prompt(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def runtime(request):
+            if request.url.path.endswith("/compact"):
+                entered.set()
+                await release.wait()
+                return httpx.Response(409, json={"error": "Session compaction cancelled"})
+            if request.url.path.endswith("/cancel"):
+                release.set()
+                return httpx.Response(200, json={"cancelled": True, "run_id": None})
+            return await self.http.send(request)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(runtime)) as client:
+            self.p.http = client
+            await self.q.compact(self.user, "private")
+            await asyncio.wait_for(entered.wait(), 2)
+            await self.q.cancel(self.user, "private")
+            await self.q.enqueue(self.user, "private", "after cancel")
+            await self.drain()
+        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "cancelled")
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["after cancel"])
+
+    async def test_cancelled_backlog_keeps_uncertain_runtime_blocking(self):
+        cancelling = asyncio.Event()
+        async def unavailable(request):
+            if request.url.path.endswith("/runs"):
+                raise httpx.ReadError("Runtime response lost")
+            cancelling.set()
+            return httpx.Response(503, json={"error": "Runtime unavailable"})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as client:
+            self.p.http = client
+            await self.q.enqueue(self.user, "private", "uncertain")
+            await self.q.enqueue(self.user, "private", "cancel this backlog")
+            await asyncio.wait_for(cancelling.wait(), 2)
+            await self.q.cancel(self.user, "private")
+            self.assertEqual(self.q.active, 1)
+            await self.q.stop()
+            self.assertEqual(self.q.active, 1)
+            with self.p.db.connect() as conn:
+                rows = conn.execute("SELECT status,payload_json FROM durable_jobs ORDER BY id").fetchall()
+            self.assertEqual([row["status"] for row in rows], ["failed", "failed"])
+            self.assertTrue(json.loads(rows[0]["payload_json"])["runtime_unsettled"])
+            self.assertEqual(self.q.messages(self.user, "private")["messages"][-1]["metadata"]["status"], "cancelled")
+
+    async def test_schedule_occurrence_deduplicates_recovery(self):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO agent_schedules(id,owner_user_id,name,prompt,schedule_json,created_at,updated_at) VALUES (1,1,'Once','scheduled','{}',1,1)")
+            conn.execute("INSERT INTO agent_schedule_runs(id,schedule_id,scheduled_for,created_at,updated_at) VALUES (1,1,1,1,1)")
+        self.q.stopping = True
+        first = await self.q.enqueue(self.user, "private", "scheduled", schedule_run_id=1)
+        recovered = await self.q.enqueue(self.user, "private", "scheduled", schedule_run_id=1)
+        self.assertEqual(first["job_id"], recovered["job_id"])
+        self.assertEqual(first["message"]["id"], recovered["message"]["id"])
+        await self.q.start()
+        await self.drain()
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["scheduled"])
+
+    async def test_legacy_author_metadata_preserves_historical_name(self):
+        info = self.q.scope(self.user, "private")
+        with self.p.db.connect() as conn:
+            mid = self.q.insert_message(conn, info, self.user, "user", "old message", {})
+            conn.execute("UPDATE messages SET username='Historical Name' WHERE id=?", (mid,))
+        message = self.q.message(info, mid)
+        self.assertEqual(message["metadata"]["author_display_name"], "Historical Name")
+        self.assertEqual(message["metadata"]["author_user_id"], 1)
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT metadata_json FROM messages WHERE id=?", (mid,)).fetchone()[0], "{}")
+
+    async def test_new_scope_publishes_rollback_identity_separate_from_pi(self):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+        for scope, expected in (("private", "user-1"), ("channel-1", "channels/channel-1")):
+            info = self.q.scope(self.user, scope)
+            with self.p.db.connect() as conn:
+                row = conn.execute("SELECT s.workspace_path,r.session_id,r.lifecycle_id FROM agent_scopes s JOIN agent_runtime_scopes r USING(scope_key) JOIN agent_runtime_scope_sessions a ON a.scope_key=r.scope_key AND a.lifecycle_id=r.lifecycle_id AND a.session_id=r.session_id WHERE s.scope_key=?", (info["scope_key"],)).fetchone()
+            self.assertEqual(row["workspace_path"], expected)
+            self.assertNotEqual(row["session_id"], info["sid"])
+            marker = json.loads((info["workspace"] / ".agent-platform-scope.json").read_text())
+            self.assertEqual(marker["lifecycle_id"], row["lifecycle_id"])
+            self.assertEqual(marker["workspace_relative_path"], "workspaces/" + expected)
+            await self.q.reset(self.user, scope)
+            with self.p.db.connect() as conn:
+                self.assertEqual(conn.execute("SELECT session_id FROM agent_runtime_scopes WHERE scope_key=?", (info["scope_key"],)).fetchone()[0], row["session_id"])
+
+    @unittest.skipUnless(os.environ.get("OLD_PLATFORM_ROOT"), "requires archived previous Platform")
+    def test_archived_platform_starts_after_new_personal_and_channel_scopes(self):
+        old_root = Path(os.environ["OLD_PLATFORM_ROOT"]).resolve()
+        root = self.p.settings.data_dir / "rollback-startup"
+        root.mkdir(mode=0o700)
+        (root / "workspaces").mkdir(mode=0o700)
+        script = """
+import sys
+from pathlib import Path
+from enterprise_agent_platform.config import PlatformConfig
+from enterprise_agent_platform.service import EnterpriseService
+config = PlatformConfig(
+    data_dir=Path(sys.argv[1]), host="127.0.0.1", port=8765,
+    public_base_url="http://localhost:8765", token_secret="rollback-test-secret",
+    token_ttl_seconds=3600, agent_tool_token="rollback-test-tool",
+    agent_runtime_url="http://127.0.0.1:1",
+)
+service = EnterpriseService(config)
+try:
+    assert service.agent_scopes._missing_current_runtime_aliases() == []
+    print("archived-startup-complete")
+finally:
+    service.close()
+"""
+        def start_archived():
+            result = subprocess.run(
+                [sys.executable, "-c", script, str(root)], cwd=old_root,
+                env={**os.environ, "PYTHONPATH": str(old_root)},
+                capture_output=True, text=True, timeout=40,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("archived-startup-complete", result.stdout)
+        start_archived()
+        db = Database(root / "platform.db")
+        db.migrate(root)
+        with db.connect() as conn:
+            uid = conn.execute(
+                "INSERT INTO users(username,display_name,password_hash,role,created_at) VALUES ('rollback-user','Rollback User','unused','admin',1)"
+            ).lastrowid
+            channel = conn.execute(
+                "INSERT INTO channels(name,created_at) VALUES ('Rollback Channel',1)"
+            ).lastrowid
+        queue = Queue(SimpleNamespace(db=db, settings=SimpleNamespace(data_dir=root)))
+        user = queue.user(uid)
+        queue.scope(user, "private")
+        queue.scope(user, f"channel-{channel}")
+        start_archived()
+
+    async def test_attachment_only_authorization_and_delivery(self):
+        from enterprise_agent_platform.files import Files as WorkspaceFiles
+        self.p.files = WorkspaceFiles(self.p)
+        info = self.q.scope(self.user, "private")
+        attachment = self.p.files.store(self.user, info, "report.txt", b"quarterly report")
+        with self.assertRaises(HTTPException):
+            await self.q.enqueue(self.q.user(2), "private", "", [attachment["id"]])
+        result = await self.q.enqueue(self.user, "private", "", [attachment["id"]])
+        await self.drain()
+        self.assertEqual(result["message"]["attachments"][0]["id"], attachment["id"])
+        self.assertIn("report.txt", self.requests[0]["prompt"]["text"])
+        with self.assertRaises(HTTPException):
+            await self.q.enqueue(self.user, "private", "")
+
+    async def test_single_uncertain_run_blocks_until_confirmed_without_successor(self):
+        from enterprise_agent_platform.gates import Gate as ManagerGate
+        self.p.gate = ManagerGate(self.p)
+        cancelling, confirmed = asyncio.Event(), asyncio.Event()
+        original = self.q.runtime
+        async def runtime(method, path, **kwargs):
+            if path.endswith("/cancel"):
+                cancelling.set()
+                await confirmed.wait()
+            return await original(method, path, **kwargs)
+        self.q.runtime = runtime
+        self.loss = True
+        await self.q.enqueue(self.user, "private", "uncertain only")
+        await asyncio.wait_for(cancelling.wait(), 2)
+        self.assertEqual(self.q.active, 1)
+        self.assertIsNone(self.q.pending("private:1"))
+        readiness = await self.p.gate.readiness("update")
+        self.assertFalse(readiness["reserved"])
+        self.assertEqual(readiness["active_agent_tasks"], 1)
+        confirmed.set()
+        await self.drain()
+        self.assertEqual(self.q.active, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue((await self.p.gate.readiness("update"))["reserved"])
+
+
+if __name__ == "__main__":
+    unittest.main()

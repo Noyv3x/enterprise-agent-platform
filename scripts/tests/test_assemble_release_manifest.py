@@ -24,7 +24,9 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         self.images_path = self.root / "images.json"
         self.images = {
             name: f"ghcr.io/example/{name}@sha256:{index:064x}"
-            for index, name in enumerate(sorted(assembler.MANAGED_IMAGES), 1)
+            for index, name in enumerate(
+                ("platform", "agent-runtime", "camofox", "agent-sandbox", "searxng"), 1
+            )
         }
         self.images_path.write_text(json.dumps(self.images), encoding="utf-8")
 
@@ -53,7 +55,7 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         self.assertEqual(manifest["protocol_version"], 2)
         self.assertEqual(manifest["source_commit"], CANDIDATE)
         self.assertEqual(manifest["manager"]["version"], CANDIDATE)
-        self.assertEqual(set(manifest["images"]), assembler.MANAGED_IMAGES)
+        self.assertEqual(manifest["images"], self.images)
         self.assertEqual(
             set(manifest),
             {
@@ -64,13 +66,19 @@ class AssembleReleaseManifestTests(unittest.TestCase):
         )
 
     def test_rejects_missing_unknown_or_mutable_image(self) -> None:
-        for mutation in ("missing", "unknown", "tag"):
+        for mutation in ("missing", "unknown", "tag", "legacy"):
             with self.subTest(mutation=mutation):
                 images = dict(self.images)
                 if mutation == "missing":
                     images.pop("platform")
                 elif mutation == "unknown":
                     images["unknown"] = images.pop("platform")
+                elif mutation == "legacy":
+                    for name in (
+                        "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+                        "firecrawl-redis", "firecrawl-rabbitmq",
+                    ):
+                        images[name] = f"ghcr.io/example/{name}@sha256:{1:064x}"
                 else:
                     images["platform"] = "ghcr.io/example/platform:latest"
                 self.images_path.write_text(json.dumps(images), encoding="utf-8")

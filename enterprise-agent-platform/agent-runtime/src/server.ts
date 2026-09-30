@@ -1,503 +1,73 @@
-import { mkdir } from "node:fs/promises";
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { fileURLToPath } from "node:url";
-import { resolve } from "node:path";
-import { loadConfig } from "./config.js";
-import type { EventJournal } from "./event-journal.js";
-import { productModelCatalogs } from "./model-resolver.js";
-import { RunCoordinator } from "./run-coordinator.js";
-import type { ApprovalDecision, RunInputRequest, RunRequest, RuntimeConfig, RuntimeEvent } from "./types.js";
-import { errorMessage, safeEqual } from "./utils.js";
+import { lstat, readFile } from 'node:fs/promises';
+import { once } from 'node:events';
+import { createServer } from './http.js';
+import { migrateSessions } from './migration.js';
+import { Runtime } from './runtime.js';
 
-const VERSION = "0.1.0";
-const TERMINAL_EVENTS = new Set(["run.completed", "run.failed", "run.cancelled", "run.needs_review"]);
-
-export interface RuntimeServer {
-  server: Server;
-  coordinator: RunCoordinator;
-  listen(): Promise<{ host: string; port: number }>;
-  close(): Promise<void>;
-}
-
-export function createRuntimeServer(config: RuntimeConfig, providedCoordinator?: RunCoordinator): RuntimeServer {
-  if (!config.bearerToken.trim()) {
-    throw new Error("Agent Runtime bearer token must be non-empty");
+async function secret(name: string, defaultFile: string): Promise<string> {
+  const direct = process.env[name];
+  const configuredFile = process.env[`${name}_FILE`];
+  if (direct !== undefined && configuredFile) throw new Error(`${name} and ${name}_FILE cannot both be set`);
+  let value = direct;
+  if (value === undefined) {
+    const file = configuredFile ?? defaultFile;
+    if (!(await lstat(file)).isFile()) throw new Error(`${name}_FILE must name a regular secret file`);
+    value = await readFile(file, 'utf8');
   }
-  const coordinator = providedCoordinator ?? new RunCoordinator({ config });
-  const server = createServer((request, response) => {
-    void route(config, coordinator, request, response).catch((error) => {
-      if (closesConnection(error)) {
-        response.shouldKeepAlive = false;
-        if (!response.headersSent) response.setHeader("connection", "close");
-      }
-      if (!response.headersSent) json(response, statusForError(error), { error: errorMessage(error) });
-      else response.destroy(error instanceof Error ? error : new Error(errorMessage(error)));
-    });
+  value = value.trim();
+  if (!value) throw new Error(`${name} is empty`);
+  return value;
+}
+function positiveInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
+}
+async function main(): Promise<void> {
+  const home = process.env.AGENT_RUNTIME_HOME ?? '/var/lib/agent-platform/runtime';
+  const port = positiveInteger('AGENT_RUNTIME_PORT', 8766);
+  if (port > 65535) throw new Error('AGENT_RUNTIME_PORT must be at most 65535');
+  const maximum = positiveInteger('AGENT_RUNTIME_MAX_BODY_BYTES', 33_554_432);
+  const [token, platformToken, executorToken] = await Promise.all([
+    secret('AGENT_RUNTIME_TOKEN', '/run/secrets/agent-platform/agent-runtime-token'),
+    secret('AGENT_PLATFORM_INTERNAL_TOKEN', '/run/secrets/agent-platform/agent-tool-token'),
+    secret('AGENT_MANAGER_EXECUTOR_TOKEN', '/run/secrets/agent-platform/manager-executor-token'),
+  ]);
+  await migrateSessions(home);
+  const runtime = new Runtime({
+    home,
+    platformUrl: process.env.AGENT_PLATFORM_INTERNAL_URL ?? 'http://platform:8765',
+    platformToken,
+    executorSocket: process.env.AGENT_MANAGER_EXECUTOR_SOCKET ?? '/run/agent-platform-manager/manager.sock',
+    executorToken,
+    skillsDirectory: process.env.AGENT_RUNTIME_SKILLS_DIRECTORY ?? '/app/skills',
   });
-  server.requestTimeout = 0;
-  server.headersTimeout = 30_000;
-  return {
-    server,
-    coordinator,
-    async listen() {
-      await mkdir(config.home, { recursive: true, mode: 0o700 });
-      await coordinator.sessions.initialize();
-      return await new Promise((resolvePromise, reject) => {
-        server.once("error", reject);
-        server.listen(config.port, config.host, () => {
-          server.off("error", reject);
-          const address = server.address();
-          const port = typeof address === "object" && address ? address.port : config.port;
-          resolvePromise({ host: config.host, port });
-        });
-      });
-    },
-    async close() {
-      coordinator.shutdown();
-      await new Promise<void>((resolvePromise, reject) => server.close((error) => error ? reject(error) : resolvePromise()));
-    },
-  };
-}
-
-async function route(config: RuntimeConfig, coordinator: RunCoordinator, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  applySecurityHeaders(response);
-  const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
-  authorize(config, request);
-  if (request.method === "GET" && url.pathname === "/health") {
-    assertQuery(url);
-    json(response, 200, {
-      status: "ok",
-      service: "agent-platform-runtime",
-      version: VERSION,
-      pid: process.pid,
-      uptime_seconds: Math.floor(process.uptime()),
-    });
-    return;
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/models") {
-    if ([...url.searchParams.keys()].length > 0) {
-      throw httpError(400, "Model catalog does not accept query parameters");
-    }
-    json(response, 200, {
-      version: 1,
-      source: "pi-runtime",
-      providers: productModelCatalogs(),
-    });
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/runs") {
-    assertQuery(url);
-    const body = await readJson<RunRequest>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);
-    const run = coordinator.createRun(body);
-    json(response, 202, { run_id: run.id, status: run.status, events_url: `/v1/runs/${run.id}/events` });
-    return;
-  }
-
-  const runMatch = /^\/v1\/runs\/([^/]+)(?:\/(events|approval|cancel|input))?$/.exec(url.pathname);
-  if (runMatch) {
-    const runId = decodeURIComponent(runMatch[1]!);
-    const action = runMatch[2];
-    const supported = request.method === "GET" ? !action || action === "events"
-      : request.method === "POST" && ["input", "approval", "cancel"].includes(action ?? "");
-    if (!supported) throw httpError(404, "Not found");
-    assertQuery(url, action === "events" ? ["after"] : []);
-    const run = coordinator.getRun(runId);
-    if (!run) throw httpError(404, "Run not found");
-    if (request.method === "GET" && !action) {
-      json(response, 200, publicRun(run));
-      return;
-    }
-    if (request.method === "GET" && action === "events") {
-      const headerSequence = eventCursor(request.headers["last-event-id"]);
-      const querySequence = eventCursor(url.searchParams.get("after") ?? undefined);
-      streamEvents(response, coordinator.getJournal(runId)!, Math.max(headerSequence, querySequence));
-      return;
-    }
-    if (request.method === "POST" && action === "input") {
-      const body = await readJson<RunInputRequest>(
-        request,
-        config.maxBodyBytes,
-        config.requestBodyTimeoutMs,
-      );
-      const accepted = await coordinator.submitInput(runId, body);
-      json(response, accepted.state === "injected" ? 200 : 202, accepted);
-      return;
-    }
-    if (request.method === "POST" && action === "approval") {
-      const body = await readJson<Record<string, unknown>>(
-        request,
-        config.maxBodyBytes,
-        config.requestBodyTimeoutMs,
-      );
-      if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "Invalid approval request");
-      const allowedKeys = new Set(["approval_id", "decision"]);
-      if (Object.keys(body).some((key) => !allowedKeys.has(key))) {
-        throw httpError(400, "Approval request accepts only approval_id and decision");
-      }
-      if (body.approval_id !== undefined && (typeof body.approval_id !== "string" || !body.approval_id.trim())) {
-        throw httpError(400, "approval_id must be a non-empty string when provided");
-      }
-      const decision = body.decision as ApprovalDecision | undefined;
-      if (!decision || !["once", "session", "always", "deny"].includes(decision)) throw httpError(400, "Invalid approval decision");
-      const approvalId = body.approval_id as string | undefined;
-      await coordinator.respondApproval(runId, approvalId, decision);
-      json(response, 200, { run_id: runId, approval_id: approvalId ?? null, decision, resolved: true });
-      return;
-    }
-    if (request.method === "POST" && action === "cancel") {
-      const body = await readJson<Record<string, unknown>>(request, config.maxBodyBytes, config.requestBodyTimeoutMs, true);
-      if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length > 0) {
-        throw httpError(400, "Cancel request accepts only an empty object");
-      }
-      const cancelled = coordinator.cancel(runId);
-      json(response, 202, { run_id: runId, status: cancelled.status, side_effects_started: cancelled.sideEffectsStarted });
-      return;
-    }
-    throw httpError(404, "Not found");
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/scopes/cleanup") {
-    assertQuery(url);
-    const body = await readJson<{ scope_key?: string; lifecycle_id?: string; delete_sessions?: boolean }>(
-      request,
-      config.maxBodyBytes,
-      config.requestBodyTimeoutMs,
-    );
-    const allowed = new Set(["scope_key", "lifecycle_id", "delete_sessions"]);
-    if (!body || typeof body !== "object" || Array.isArray(body)) throw httpError(400, "Invalid scope cleanup request");
-    if (Object.keys(body).some((key) => !allowed.has(key))) {
-      throw httpError(400, "Scope cleanup accepts only scope_key, lifecycle_id, and delete_sessions");
-    }
-    if (typeof body.scope_key !== "string" || !body.scope_key.trim() || body.scope_key.length > 512) {
-      throw httpError(400, "scope_key must be a non-empty string of at most 512 characters");
-    }
-    if (body.lifecycle_id !== undefined && (typeof body.lifecycle_id !== "string" || body.lifecycle_id.length > 512)) {
-      throw httpError(400, "lifecycle_id must be a string of at most 512 characters");
-    }
-    if (body.delete_sessions !== undefined && typeof body.delete_sessions !== "boolean") {
-      throw httpError(400, "delete_sessions must be a boolean");
-    }
-    const cancelled = await coordinator.cleanupScope(body.scope_key, body.lifecycle_id, body.delete_sessions ?? false);
-    json(response, 200, { scope_key: body.scope_key, cancelled_runs: cancelled, sessions_deleted: body.delete_sessions ?? false });
-    return;
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/sessions/compact") {
-    if ([...url.searchParams.keys()].length > 0) {
-      throw httpError(400, "Session compaction does not accept query parameters");
-    }
-    const body = await readJson<{
-      scope_key?: string;
-      lifecycle_id?: string;
-      session_id?: string;
-      model?: { provider: string; id: string; reasoning?: boolean };
-      gateway?: { base_url?: string; token?: string };
-    }>(request, config.maxBodyBytes, config.requestBodyTimeoutMs);
-    const allowed = new Set(["scope_key", "lifecycle_id", "session_id", "model", "gateway"]);
-    if (!body || typeof body !== "object" || Array.isArray(body)) {
-      throw httpError(400, "Invalid session compaction request");
-    }
-    if (Object.keys(body).some((key) => !allowed.has(key))) {
-      throw httpError(400, "Session compaction accepts only scope_key, lifecycle_id, session_id, model, and gateway");
-    }
-    if (!body.model || typeof body.model !== "object" || Array.isArray(body.model)) {
-      throw httpError(400, "Session compaction requires model");
-    }
-    const controller = new AbortController();
-    const abortCompaction = (): void => {
-      if (!response.writableEnded) controller.abort();
-    };
-    request.once("aborted", abortCompaction);
-    response.once("close", abortCompaction);
-    let result;
+  const server = createServer(runtime, token, maximum);
+  let stopping = false;
+  async function shutdown(): Promise<void> {
+    if (stopping) return;
+    stopping = true;
+    const deadline = setTimeout(() => { server.closeAllConnections(); process.exit(1); }, 40_000);
+    deadline.unref();
+    const closed = once(server, 'close');
+    server.close();
     try {
-      result = await coordinator.compactSession(
-        body.scope_key ?? "",
-        body.lifecycle_id ?? "",
-        body.session_id ?? "",
-        body.model,
-        body.gateway,
-        controller.signal,
-      );
-    } finally {
-      request.off("aborted", abortCompaction);
-      response.off("close", abortCompaction);
-    }
-    json(response, 200, result);
-    return;
+      await runtime.close();
+      server.closeAllConnections();
+      await closed;
+    } catch (error) {
+      console.error('Runtime shutdown failed', error);
+      process.exitCode = 1;
+      server.closeAllConnections();
+    } finally { clearTimeout(deadline); }
   }
-
-  if (request.method === "GET" && ["/v1/scopes/processes", "/v1/scopes/process-summary"].includes(url.pathname)) {
-    const summary = url.pathname.endsWith("/process-summary");
-    const allowed = summary ? ["scope_key", "lifecycle_id"] : ["scope_key", "lifecycle_id", "since_revision"];
-    if ([...url.searchParams.keys()].some((key) => !allowed.includes(key))) {
-      throw httpError(400, summary
-        ? "Process summary accepts only scope_key and lifecycle_id"
-        : "Process preview accepts only scope_key, lifecycle_id, and since_revision");
-    }
-    const scopeKeys = url.searchParams.getAll("scope_key");
-    const lifecycleIds = url.searchParams.getAll("lifecycle_id");
-    const scopeKey = scopeKeys.length === 1 ? scopeKeys[0]!.trim() : "";
-    const lifecycleId = lifecycleIds.length === 1 ? lifecycleIds[0]!.trim() : "";
-    if (!scopeKey || scopeKey.length > 512) {
-      throw httpError(400, "scope_key must be a non-empty string of at most 512 characters");
-    }
-    if (!lifecycleId || lifecycleId.length > 512) {
-      throw httpError(400, "lifecycle_id must be a non-empty string of at most 512 characters");
-    }
-    if (summary) {
-      json(response, 200, await coordinator.previewProcessSummary(scopeKey, lifecycleId));
-      return;
-    }
-    const sinceRevisions = url.searchParams.getAll("since_revision");
-    let sinceRevision: string | undefined;
-    if (sinceRevisions.length > 0) {
-      const value = sinceRevisions.length === 1 ? sinceRevisions[0]! : "";
-      const opaqueRevision = /^preview_[A-Za-z0-9._-]{1,96}:\d{1,20}$/.test(value);
-      if (!opaqueRevision) {
-        throw httpError(400, "since_revision must be one opaque revision token");
-      }
-      sinceRevision = value;
-    }
-    json(response, 200, await coordinator.previewProcesses(scopeKey, lifecycleId, sinceRevision));
-    return;
-  }
-
-  throw httpError(404, "Not found");
+  process.once('SIGTERM', () => { void shutdown(); });
+  process.once('SIGINT', () => { void shutdown(); });
+  server.listen(port, process.env.AGENT_RUNTIME_HOST ?? '0.0.0.0');
+  try { await once(server, 'listening'); }
+  catch (error) { await runtime.close(); throw error; }
+  console.log(`Agent Platform Runtime listening on port ${port}`);
 }
-
-function assertQuery(url: URL, allowed: readonly string[] = []): void {
-  for (const key of url.searchParams.keys()) {
-    if (!allowed.includes(key) || url.searchParams.getAll(key).length !== 1) {
-      throw httpError(400, "Unknown or repeated query parameter");
-    }
-  }
-}
-
-function eventCursor(value: string | string[] | undefined): number {
-  if (value === undefined) return 0;
-  if (typeof value !== "string" || !/^[0-9]+$/.test(value) || !Number.isSafeInteger(Number(value))) {
-    throw httpError(400, "Event cursor must be a non-negative safe integer");
-  }
-  return Number(value);
-}
-
-function streamEvents(response: ServerResponse, journal: EventJournal, after: number): void {
-  response.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-cache, no-transform",
-    connection: "keep-alive",
-    "x-accel-buffering": "no",
-  });
-  response.flushHeaders();
-  const queue: Buffer[] = [];
-  // SSE repeats the JSON sequence/type in its framing. That extra encoding is
-  // smaller than the envelope itself, so twice the JSON retention budget holds
-  // every valid retained replay, including many small frames, without treating
-  // synchronous replay as a slow reader. Live backlog remains strictly bounded.
-  const queueByteBudget = 2 * journal.maxBytes;
-  let queuedBytes = 0;
-  let blocked = false;
-  let closed = false;
-  let terminal = false;
-  let unsubscribe = (): void => undefined;
-  let heartbeat: NodeJS.Timeout | undefined;
-  const cleanup = (): void => {
-    closed = true;
-    clearInterval(heartbeat);
-    unsubscribe();
-    queue.length = 0;
-    queuedBytes = 0;
-    response.off("drain", drain);
-  };
-  const finish = (): void => {
-    if (terminal && !blocked && queue.length === 0 && !closed) {
-      cleanup();
-      response.end();
-    }
-  };
-  const enqueue = (frame: Buffer): void => {
-    if (closed || response.destroyed || response.writableEnded) return;
-    if (!blocked) {
-      // One complete frame may exceed the writable high-water mark. Keep it
-      // in flight until drain, rather than making large events unreplayable.
-      blocked = !response.write(frame);
-    } else {
-      if (queuedBytes + frame.length > queueByteBudget) {
-        cleanup();
-        response.destroy();
-        return;
-      }
-      queue.push(frame);
-      queuedBytes += frame.length;
-    }
-  };
-  function drain(): void {
-    if (closed) return;
-    blocked = false;
-    while (queue.length > 0 && !blocked) {
-      const frame = queue.shift()!;
-      queuedBytes -= frame.length;
-      blocked = !response.write(frame);
-    }
-    finish();
-  }
-  response.on("drain", drain);
-  response.once("close", cleanup);
-  enqueue(Buffer.from(": connected\n\n"));
-  heartbeat = setInterval(() => {
-    if (!closed && !terminal) enqueue(Buffer.from(": heartbeat\n\n"));
-  }, 15_000);
-  heartbeat.unref();
-  const send = (event: RuntimeEvent): void => {
-    if (closed || terminal) return;
-    enqueue(Buffer.from(`id: ${event.sequence}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-    if (TERMINAL_EVENTS.has(event.type)) {
-      terminal = true;
-      clearInterval(heartbeat);
-      unsubscribe();
-      finish();
-    }
-  };
-  unsubscribe = journal.subscribe(after, send);
-  // subscribe replays synchronously, possibly closing before it returns.
-  if (closed || terminal) unsubscribe();
-  if (journal.isTerminal) {
-    terminal = true;
-    clearInterval(heartbeat);
-    finish();
-  }
-}
-
-function authorize(config: RuntimeConfig, request: IncomingMessage): void {
-  const authorization = request.headers.authorization || "";
-  const supplied = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
-  if (!supplied || !safeEqual(supplied, config.bearerToken)) throw httpError(401, "Unauthorized");
-}
-
-async function readJson<T>(request: IncomingMessage, maxBytes: number, timeoutMs: number, allowEmpty = false): Promise<T> {
-  const contentType = request.headers["content-type"] || "";
-  const isJson = contentType.toLowerCase().startsWith("application/json");
-  if (!allowEmpty && !isJson) throw httpError(415, "Content-Type must be application/json");
-  return await new Promise<T>((resolvePromise, reject) => {
-    const chunks: Buffer[] = [];
-    let size = 0;
-    let settled = false;
-    const timer = setTimeout(() => {
-      request.pause();
-      fail(httpError(408, "Request body deadline exceeded", true));
-    }, timeoutMs);
-    timer.unref();
-
-    const cleanup = (): void => {
-      clearTimeout(timer);
-      request.off("data", onData);
-      request.off("end", onEnd);
-      request.off("error", onError);
-      request.off("aborted", onAborted);
-    };
-    const fail = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
-    const onData = (chunk: Buffer | string): void => {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      size += buffer.length;
-      if (size > maxBytes) {
-        request.pause();
-        fail(httpError(413, "Request body too large", true));
-        return;
-      }
-      chunks.push(buffer);
-    };
-    const onEnd = (): void => {
-      if (settled) return;
-      if (size > 0 && !isJson) {
-        fail(httpError(415, "Content-Type must be application/json"));
-        return;
-      }
-      try {
-        const parsed = (allowEmpty && size === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString("utf8"))) as T;
-        settled = true;
-        cleanup();
-        resolvePromise(parsed);
-      } catch {
-        fail(httpError(400, "Invalid JSON body"));
-      }
-    };
-    const onError = (): void => fail(httpError(400, "Request body stream failed", true));
-    const onAborted = (): void => fail(httpError(400, "Request body was aborted", true));
-
-    request.on("data", onData);
-    request.once("end", onEnd);
-    request.once("error", onError);
-    request.once("aborted", onAborted);
-  });
-}
-
-function publicRun(run: NonNullable<ReturnType<RunCoordinator["getRun"]>>): Record<string, unknown> {
-  return {
-    run_id: run.id,
-    status: run.status,
-    side_effects_started: run.sideEffectsStarted,
-    created_at: new Date(run.createdAt).toISOString(),
-    updated_at: new Date(run.updatedAt).toISOString(),
-    session_id: run.request.session_id,
-    scope_key: run.request.scope_key,
-    ...(run.result ? { result: run.result } : {}),
-    ...(run.error ? { error: run.error } : {}),
-  };
-}
-
-function applySecurityHeaders(response: ServerResponse): void {
-  response.setHeader("x-content-type-options", "nosniff");
-  response.setHeader("referrer-policy", "no-referrer");
-  response.setHeader("content-security-policy", "default-src 'none'");
-}
-
-function json(response: ServerResponse, status: number, body: unknown): void {
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-  response.end(`${JSON.stringify(body)}\n`);
-}
-
-interface HttpError extends Error {
-  statusCode: number;
-  closeConnection?: boolean;
-}
-
-function httpError(statusCode: number, message: string, closeConnection = false): HttpError {
-  return Object.assign(new Error(message), { statusCode, ...(closeConnection ? { closeConnection: true } : {}) });
-}
-
-function statusForError(error: unknown): number {
-  return typeof error === "object" && error !== null && "statusCode" in error ? Number((error as HttpError).statusCode) : 500;
-}
-
-function closesConnection(error: unknown): boolean {
-  return typeof error === "object" && error !== null && (error as HttpError).closeConnection === true;
-}
-
-export async function startRuntimeServer(config = loadConfig()): Promise<RuntimeServer> {
-  const runtime = createRuntimeServer(config);
-  const address = await runtime.listen();
-  process.stdout.write(`${JSON.stringify({ event: "ready", host: address.host, port: address.port, pid: process.pid })}\n`);
-  const shutdown = async (): Promise<void> => {
-    await runtime.close().catch((error) => process.stderr.write(`${errorMessage(error)}\n`));
-    process.exitCode = 0;
-  };
-  process.once("SIGTERM", () => void shutdown());
-  process.once("SIGINT", () => void shutdown());
-  return runtime;
-}
-
-const entrypoint = process.argv[1] ? resolve(process.argv[1]) : "";
-if (entrypoint && fileURLToPath(import.meta.url) === entrypoint) {
-  startRuntimeServer().catch((error) => {
-    process.stderr.write(`${errorMessage(error)}\n`);
-    process.exitCode = 1;
-  });
-}
+main().catch(error => { console.error('Runtime startup failed', error); process.exitCode = 1; });

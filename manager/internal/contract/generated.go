@@ -35,26 +35,6 @@ var ManagedImageCapacityEstimates = map[string]ImageCapacityEstimate{
 		CompressedBytes: 4294967296,
 		UnpackedBytes:   8589934592,
 	},
-	"firecrawl-api": {
-		CompressedBytes: 8589934592,
-		UnpackedBytes:   17179869184,
-	},
-	"firecrawl-playwright": {
-		CompressedBytes: 8589934592,
-		UnpackedBytes:   17179869184,
-	},
-	"firecrawl-postgres": {
-		CompressedBytes: 2147483648,
-		UnpackedBytes:   4294967296,
-	},
-	"firecrawl-rabbitmq": {
-		CompressedBytes: 1073741824,
-		UnpackedBytes:   2147483648,
-	},
-	"firecrawl-redis": {
-		CompressedBytes: 1073741824,
-		UnpackedBytes:   2147483648,
-	},
 	"platform": {
 		CompressedBytes: 8589934592,
 		UnpackedBytes:   17179869184,

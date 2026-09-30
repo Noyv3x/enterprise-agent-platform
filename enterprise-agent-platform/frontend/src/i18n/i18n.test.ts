@@ -6,9 +6,6 @@ import { coreMessages } from "./messages/core";
 import { workspaceMessages } from "./messages/workspace";
 import { previewMessages } from "./messages/preview";
 import { scheduledTaskMessages } from "./messages/scheduledTasks";
-import { memoryMessages } from "./messages/memory";
-import { skillMessages } from "./messages/skills";
-import { mailMessages } from "./messages/mail";
 import {
   LOCALE_STORAGE_KEY,
   applyDocumentLocale,
@@ -116,9 +113,6 @@ describe("translation catalogs", () => {
       workspaceMessages,
       previewMessages,
       scheduledTaskMessages,
-      memoryMessages,
-      skillMessages,
-      mailMessages,
       workroomMessages,
     ]) {
       for (const key of Object.keys(domain)) {

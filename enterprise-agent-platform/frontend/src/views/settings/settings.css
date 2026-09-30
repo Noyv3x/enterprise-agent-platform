@@ -1,0 +1,5 @@
+/* Domain styles sit in the `app` cascade layer (see src/app.css). */
+@layer app {
+.wf-settings-sections { min-inline-size: 0; max-inline-size: var(--wf-reading-width); }
+.wf-root .wf-settings-locale { inline-size: min(100%, 16rem); }
+}

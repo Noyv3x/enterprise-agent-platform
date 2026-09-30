@@ -1,6 +1,0 @@
-/* Domain styles sit in the `app` cascade layer (see src/app.css). The composer itself is the Beautiful UI Prompt Bar
-   (ComposerFrame, Tailwind utilities); only the form shell and the failed-send summary live here. */
-@layer app {
-.wf-chat-compose { min-width: 0; flex: 0 0 auto; margin: 0; }
-.wf-draft-recovery-text { overflow-wrap: anywhere; max-height: 6em; overflow: auto; }
-}

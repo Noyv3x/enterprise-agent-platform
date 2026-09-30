@@ -4,9 +4,6 @@ import { coreMessages } from "./messages/core";
 import { workspaceMessages } from "./messages/workspace";
 import { previewMessages } from "./messages/preview";
 import { scheduledTaskMessages } from "./messages/scheduledTasks";
-import { memoryMessages } from "./messages/memory";
-import { skillMessages } from "./messages/skills";
-import { mailMessages } from "./messages/mail";
 import { workroomMessages } from "./messages/workroom";
 
 export const messages = {
@@ -16,9 +13,6 @@ export const messages = {
   ...workspaceMessages,
   ...previewMessages,
   ...scheduledTaskMessages,
-  ...memoryMessages,
-  ...skillMessages,
-  ...mailMessages,
   ...workroomMessages,
 } as const;
 

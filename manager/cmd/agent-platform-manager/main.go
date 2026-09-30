@@ -1187,18 +1187,45 @@ func installCommand(arguments []string) error {
 }
 
 func awaitOperation(client control.Client, id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	return awaitOperationContext(ctx, client, id)
+}
+
+func awaitOperationContext(ctx context.Context, client control.Client, id string) error {
+	delay := 500 * time.Millisecond
 	for {
 		var op model.Operation
-		if err := client.Do(context.Background(), http.MethodGet, "/v1/operations/"+id, nil, &op); err != nil {
-			return err
+		err := client.Do(ctx, http.MethodGet, "/v1/operations/"+id, nil, &op)
+		if ctx.Err() != nil {
+			return fmt.Errorf("waiting for operation %s: %w", id, ctx.Err())
 		}
-		switch op.Status {
-		case model.OperationSucceeded:
-			return nil
-		case model.OperationFailed:
-			return errors.New(op.Error)
+		if err != nil {
+			// Only the read is replayed: a child swap must never resubmit the
+			// mutation. Missing sockets and interrupted responses are expected.
+			if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ECONNRESET) &&
+				!errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+				return err
+			}
+		} else {
+			switch op.Status {
+			case model.OperationSucceeded:
+				return nil
+			case model.OperationFailed:
+				return errors.New(op.Error)
+			}
+			delay = 500 * time.Millisecond
 		}
-		time.Sleep(500 * time.Millisecond)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for operation %s: %w", id, ctx.Err())
+		case <-timer.C:
+		}
+		if err != nil && delay < 4*time.Second {
+			delay *= 2
+		}
 	}
 }
 

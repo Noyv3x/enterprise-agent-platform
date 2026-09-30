@@ -9,7 +9,6 @@ import {
   type ReactNode,
 } from "react";
 import { useI18n } from "../i18n";
-import { endpoints } from "../lib/endpoints";
 import type { BrandingSnapshot } from "../types";
 
 export const BRANDING_CACHE_KEY = "agent-platform.branding:v1";
@@ -62,12 +61,13 @@ function currentOrigin(): string {
 function normalizedLogoUrl(value: unknown, revision: number, origin: string): string | null {
   if (value == null || value === "") return null;
   if (typeof value !== "string" || value.startsWith("//")) return null;
+  if (/^data:image\/(?:png|jpeg|webp|gif);base64,/.test(value)) return value;
   try {
     const parsed = new URL(value, origin);
     if (
       parsed.origin !== origin ||
-      parsed.pathname !== endpoints.platformBranding.path().replace(/\/branding$/, "/branding/logo") ||
-      parsed.searchParams.get("v") !== String(revision)
+      !parsed.pathname.startsWith("/api/") ||
+      (parsed.searchParams.has("v") && parsed.searchParams.get("v") !== String(revision))
     ) {
       return null;
     }
@@ -175,7 +175,7 @@ function writeBrandingCache(cache: BrandingCache): void {
 export async function fetchPublicBranding(
   signal?: AbortSignal,
 ): Promise<BrandingSnapshot | null> {
-  const response = await fetch(endpoints.platformBranding.path(), {
+  const response = await fetch("/api/branding", {
     method: "GET",
     credentials: "include",
     cache: "no-cache",
@@ -189,7 +189,10 @@ export async function fetchPublicBranding(
   } catch {
     return null;
   }
-  return parseBrandingSnapshot(payload);
+  if (!payload || typeof payload !== "object" || !("branding" in payload)) return null;
+  const value = payload.branding;
+  if (!value || typeof value !== "object" || !("logo" in value)) return null;
+  return parseBrandingSnapshot({ ...value, schema_version: 1, revision: 0, logo_url: value.logo || null });
 }
 
 export function BrandingProvider({ children }: { children: ReactNode }) {

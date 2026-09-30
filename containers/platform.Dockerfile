@@ -37,7 +37,6 @@ ENV PATH="/opt/venv/bin:$PATH" \
     AGENT_PLATFORM_AGENT_RUNTIME_URL=http://agent-runtime:8766 \
     AGENT_PLATFORM_CAMOFOX_URL=http://camofox:9377 \
     AGENT_PLATFORM_SEARXNG_API_URL=http://searxng:8080 \
-    AGENT_PLATFORM_FIRECRAWL_API_URL=http://firecrawl-api:3002 \
     AGENT_PLATFORM_DEPLOYMENT_MODE=container
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libmagic1 \

@@ -1,228 +1,43 @@
-# Agent Runtime 设计
+# Agent Runtime
 
-本文定义 Run 的生命周期、工具循环、完成守卫、委派和上下文压缩。接口字段见 [Runtime API](../reference/runtime-api.md)；跨组件规则以文中链接的文档为准。
+Runtime embeds `@earendil-works/pi-coding-agent@0.87.1`. The [Runtime API](../reference/runtime-api.md) is the wire contract; [Platform](../reference/platform-api.md) owns product-facing APIs.
 
-## 职责
+## One Pi session per conversation
 
-- Runtime 直接使用 lockfile 锁定版本的 Pi Core / Pi AI，不通过外部 CLI 或源码子模块。
-- 它负责：Run 与事件日志（journal）、工具策略、JSONL 会话与压缩、可执行的模型目录。
-- 它不负责：产品业务状态（归 Platform）、沙箱和宿主机执行及容器（归 Manager）。Runtime 不复制这些状态，也不访问 Docker。
-- 进程和文件工具只经过 Manager 执行器，没有本地或测试专用的后备路径。测试用的假执行器也必须实现同样的对账和确认流程，遵守同样的持久化顺序。
+Create one `AgentSession` with `createAgentSession`, a supplied model runtime, `SessionManager.open(file)`, an empty private agent directory and a custom resource loader. The loader returns only Platform-supplied resources: no host filesystem discovery, package discovery or tenant extensions.
 
-### 实现边界
+Platform chooses stable session IDs: `agent-private-<uid>`, `agent-channel-<cid>` and `chat-<conversation_id>`; reset may rotate an ID. Only one run can use an ID at a time. Platform queues later messages FIFO. Idle objects are disposed after 15 minutes; persisted history survives. Pi owns retries, default compaction and manual `/compact`.
 
-- 一个 Run 使用一个 Pi `Agent`，由 Pi 负责模型轮次、工具调用和消息队列；Runtime 不维护第二套模型循环。
-- `beforeToolCall` 负责审批和完整参数的执行授权绑定；`finishTurn` 只处理下文两项确定性完成责任。Agent 订阅事件投影为已有的 SSE journal，会话存储负责兼容旧版本的持久化。
-- 工具是 Manager 执行器或 Platform 产品网关的薄适配层。共享传输和存储逻辑不改变各自的身份、权限、取消及原子提交边界。
+## Tools and remote operations
 
-## 提示词组装
+Pi's `read`, `edit`, `write`, `find` and `ls` use remote operations. `grep` is a custom sandbox `rg` adapter because Pi 0.87.1's stock grep starts a local process. `bash` also uses a sandbox adapter so large output spills inside the sandbox rather than Pi's local temporary files. Runtime never executes tenant commands locally.
 
-每次请求只组装**一个**系统提示词，顺序固定：
+Each Manager file/terminal execution consumes a fresh audit receipt; terminal audit details contain the exact command. Commands run foreground with a finite timeout: bash defaults to 10 minutes and permits an explicit Pi timeout up to one hour. Edits use remote read/write. Never forward Pi BashOperations `options.env` into the sandbox.
 
-1. **Runtime 稳定策略**：只包含本次 Run 和已启用能力需要的执行、回复、记忆、Skill、追加输入和计划策略。同一组能力下逐字节不变，不含时间、召回内容、技能索引等变化数据。
-2. **Platform 提供的系统提示**：身份、模式、工作区，然后是精确时间。品牌、用户和频道信息作为不可信数据封装，不能从正文推断权限或身份（称呼和风格见[对话模型](product.md#对话模型)）。主 Agent 会得到逻辑工作区和宿主机路径映射，后者只用于理解，不改变默认执行目标，也不写入公共状态、数据库或普通工具元数据。
-3. **Runtime 动态状态**：记忆、进行中的 todo、有限后台任务、Skill 索引。其中的正文、历史和元数据都不可信；只有 Runtime 自己生成的 ID、状态和责任是权威的。没有动态内容时不加空块。
+- Personal AI: built-ins, web search/fetch, browser, schedule and MCP.
+- Channels: built-ins and web search/fetch.
+- Chat: built-ins and web search/fetch only; no AGENTS.md or skills.
 
-其它规则：
+Web/browser/schedule are thin Platform gateway tools. MCP invokes the image's stdio helper inside the personal sandbox. Bundled skills live in Runtime at `/app/skills/`; read-only `/platform-skills/` locations are served by Runtime's read adapter. Workspace skills are ordinary `SKILL.md` files.
 
-- 单个工具的使用建议写进稳定的工具 schema。不根据长度、关键词、供应商或工具调用次数推断任务复杂度，也不自动创建 todo。
-- 允许并行的独立工具并发执行；批次里有需要顺序执行的工具时按顺序执行。
-- 提示要求：适度自主、用工具取得证据、失败时换办法、完成前验证；不扩大权限，不强加用户没选的计划。
+Resolve file paths inside the workspace and reject escapes. Chat file tools enforce the conversation directory; bash starts there but can access other chat directories belonging to the same user. The per-user sandbox is the execution boundary.
 
-**提示词缓存**
+## Prompt cache
 
-- Codex 缓存 key 直接由 Pi AI 使用 `sessionId` 派生；Runtime 不重写供应商请求或维护第二套摘要算法。
-- 缓存只是提示：命中与否不影响语义、授权和结果，也不是就绪或发布条件。没有经过验证前，不向私有端点猜测添加缓存断点字段；单元测试不能证明真实缓存命中。
+System prompt, context resources and tool definitions are fixed for the lifetime of each in-memory session object. Updated AGENTS.md or skill advertisements take effect when a new object is created, not by rewriting a live prompt. Branding controls the fixed product/agent wording.
 
-## Run 状态机
+Current time, display name and timezone go into a short user-message prefix, never the system prompt. History is append-only; Pi compaction appends its own entries. Use `SettingsManager.inMemory({cacheWarming: 'off'})` with Pi retry/compaction defaults. Keep the conversation session ID stable for Codex's `prompt_cache_key`; auxiliary LLM calls use stable prefixes and that same ID. Platform records input/output/cache-read/cache-write usage and exposes cache-hit ratio.
 
-顶层 Run 按先进先出排队：`queued → running → completed | failed | cancelled | needs_review`。
+## Credentials and completion
 
-- 只有顶层 Run 占用全局并发名额。子 Run 共用父 Run 的名额、沙箱和工作区，但有自己派生的对话范围、会话和事件。
-- **进程内 Run**：队列、Run 状态、结果、追加输入登记和 SSE journal 只存在于当前 Runtime 进程；不持久化 Run 预留或结果，不提供幂等创建、终态重放或跨重启恢复。
-- **提交结果未知**：Platform 不重新提交可能已经被接受的请求。Run 丢失时，可能已经产生副作用的任务标为 `needs_review`；能确认没有副作用的标为 `failed`，不从会话历史推断成功。
-- `queued`/`running` 状态不按过期时间清理；进程内终态从提交时开始计算保留期。
-- 内存事件只保存有界后缀；工具数据先按安全策略投影，发布边界在一次 JSON 快照中去掉内部审批 key，补读不重复复制。审批授权和后台进程责任仍按各自协议持久化，不作为 Run 恢复记录。
-- **追加输入**：只有个人 AI 的顶层交互 Run 可以接收追加输入。只有状态为 `injected`（已注入模型）才算消费，`accepted` 不算。未消费的输入保持顺序退回原来的持久队列，不能谎报成功；具体事务见[数据设计](data-memory-sessions.md)。
-- **邮件唤醒**：任务的来源引用见[数据设计](data-memory-sessions.md#持久任务与追加输入)。Platform 在派发、重启或恢复时，在内存中重建有长度上限的预览后才提交给 Runtime。Runtime 不从任务 key 或正文推断账号或对话。
+Platform owns OAuth storage and refresh. Runtime resolves credentials through the authenticated Platform endpoint; forced Codex refresh returns to Platform rather than writing another credential store.
 
-**模型请求重试**
+Run completion follows Pi's settled/idle state, not a provisional end before retry. Stream tool, text, thinking, retry and compaction events; retain events for up to 10 minutes after completion within bounded replay storage. Expired/evicted cursors require explicit recovery, not silent truncation; exact limits are in the Runtime API. No drafts, completion guards, approvals, subagents or background-process controller. The side-effects flag becomes true when bash/write/edit, browser or schedule mutation, or an MCP call starts; cancellation cannot promise rollback.
 
-- 只有在单次请求**还没收到任何正文、思考或工具调用增量**时，才对过载、限流、可重试的服务端错误或瞬时网络错误做有限次指数退避（带随机抖动）。
-- 已经收到增量，或错误属于上下文/输出长度、额度/账单、认证、内容策略，一律不重试。
-- 工具执行后的下一次请求可以重试，但不重开 Run、不重放已完成的轮次或工具。
-- 退避可以被取消，并刷新活动时间。重试耗尽后，根据是否已有副作用标为 `failed` 或 `needs_review`。
-- 浏览器的视觉辅助只用自己的超时，超时后退回纯文本。
+Session cancellation waits for active admission/run work with a bounded HTTP response deadline and is idempotent when idle. Unconfirmed Manager termination keeps the session fenced and withholds terminal completion; retry cancellation against the same run rather than starting another. Runtime restart does not discover or clean up orphan sandbox commands; this is an accepted limitation, bounded by terminal execution deadlines. Manual compaction receives Platform's chosen summary model/thinking settings, including for a cold session. Exact requests and timeout responses belong in the [Runtime API](../reference/runtime-api.md).
 
-## 模型目录与授权
+## Migration
 
-- Runtime 按锁定的 Pi 元数据校验供应商、API 和端点，请求不能覆盖。
-- 账号授权与能力目录的交集、逐模型授权、默认和辅助模型的选择，唯一规范见[集成 · 模型 OAuth](integrations.md#模型-oauth)；接口见[模型目录](../reference/runtime-api.md#模型目录)。
-- 本文不固定模型 ID、版本或优先级。Token 不写入元数据、会话或事件。
+At startup, use Platform's `migration/active-sessions.json` to find active format-4 journals by identity. Write all message entries in order to `sessions-v3/<sha256(sid)>.jsonl`, including history predating compaction; append the latest old compaction summary with the first retained message ID. Stage each file and rename atomically; write `.migrated-from-v4` last. Never modify `sessions/` or `sessions.pre-pi/`. Old lifecycles and delegate journals remain on disk but are not imported. See [data and sessions](data-memory-sessions.md).
 
-## 工具与执行目标
-
-工具名和动作以[当前 schema](../../enterprise-agent-platform/agent-runtime/src/tools.ts) 为准，不兼容旧的浏览器动作、参数别名或展示用字段。
-
-- 终端、进程和文件工具默认在沙箱执行，目标只能是 `sandbox` 或 `host`。主 Agent 身份由 Platform 指定，子 Run 只能继承。Manager 执行规范化后的请求并返回有长度上限的结果或句柄；模型拿不到控制 socket 或容器身份。
-- 宿主机工作区沿用[物化准入](data-memory-sessions.md#agent-scope)规则。Runtime 不创建、修复或推断；缺失、旧格式或漂移都拒绝执行，更新和恢复时也一样。
-- 审批、重复调用的整批拒绝、授权清理、路径固定、成功与错误的格式、图片保留，全部遵循[安全设计](security-and-trust.md)。
-- Pi 原生 `beforeToolCall` 按工具、目标和网关修改动作表预检；不分类 shell 语义。审批等待前固定完整原始参数的身份，执行包装器只消费一次并复验，再向 Manager 申请审计回执；脱敏展示永远不能替代执行参数。宿主机仅逐次批准；沙箱免审批不代表网络副作用安全，具体风险、业务授权与无人值守规则见安全设计。既有审批 key 和持久授权文件格式不变。
-- 历史参数、审计信封和内存归一化遵循 [Journal 提交](data-memory-sessions.md#journal-提交)；脱敏后仍须符合当前 schema，工具名错误照样拒绝。浏览器的任意 JSON 提取同时限制深度、节点数、条目数和字符串长度。
-- Skill/MCP 的配置、安装、即时读取和文档交付见[集成](integrations.md)。本轮中途读取到的新配置不改变已经发出的 schema 和前缀。
-
-**文件交付（MEDIA 标记）**
-
-- 附件内联、只读挂载和成功交付遵循[安全 · 文件与附件](security-and-trust.md#文件与附件)。Runtime 不读 Platform 的文件系统，也不解析中央容器之外的宿主路径。
-- 文件先写入工作区，再在回复里单独一行写 `MEDIA: /workspace/<相对路径>`。只有 Platform 能把它授权转换成附件，不能用任意宿主路径或文件名代替。
-- Run 输出是 Pi 本轮最后一条助手回复的正文，不拼接中间回复，也不扣留或恢复 `MEDIA:` 行。Platform 仍只在成功 Run 上按原有权限检查交付附件。
-
-Pi 原生工具参数流的文件草稿见 [SSE journal](../reference/runtime-api.md#sse-journal)，它不构成执行或副作用授权。工作过程、电脑画面和文档预览归[前端](frontend.md#电脑画面)，Runtime 不新增呈现、桌面或静态站点工具。
-
-### 完成守卫
-
-"硬责任"没解除，Run 就不能算成功：
-
-| 硬责任 | 解除条件 |
-|---|---|
-| 有限后台任务 | 当前会话拿到该进程的权威终态，并已持久确认 |
-| 周期计划的本次执行 | 网关成功执行了本次的 continue 或 complete |
-
-- 两项确定性责任经过有限次延续仍未解除，Run 标为 `needs_review`（即使没有其它副作用），并单独给出阻塞原因。取消、超时或失败时，已开始的副作用无法确认安全终止，仍标为 `needs_review`。
-
-**有限延续**：
-
-- 仅为未观察到终态的有限后台任务和缺少周期计划决定注入提醒；这些 Runtime 提醒不持久化到会话。
-- 不根据 todo、普通文件变更、委派结果、承诺措辞或工具后的空回复增加轮次或阻止完成。最终正文直接取最后一条助手回复。
-
-**todo 的用法**
-
-- 只在有至少三个独立可追踪的步骤、或多个可分别完成的任务时使用。简单回答、一两个动作、同一个小改动的"读—改—验证"不凑清单；工作变复杂后可以再建。
-- 支持读取和整体替换；最多 256 项；状态为 `pending | in_progress | completed | cancelled`。
-- 每个会话用一个原子替换的 JSON 文件保存清单；旧版本的同名字段可读取，损坏的数据安全忽略，身份不符或文件不安全则拒绝。更新按会话文件串行执行。
-- Runtime 不自动建清单；进行中的项作为动态提示注入，压缩后仍可继续。todo 是模型的工作清单，不是完成责任，不触发延续或 `needs_review`。
-
-**计划任务**
-
-- 计划只用于未来的时间点，不做"监视"。
-- 周期计划的每次执行必须用空参数成功调用 `schedule.continue_current`（原子复验、保留下次执行、不改计划）或 `schedule.complete_current`（原子结束该计划并作废已排队的执行）。它拿不到计划 ID，也没有其它计划权限，不能从正文猜测。
-- 一次性计划派发后自动结束，没有这个守卫。
-- `needs_review` 或阻塞时按当前版本原子暂停，见[计划 occurrence](data-memory-sessions.md#计划-occurrence)。
-
-## 有限后台任务
-
-- 有明确终点、能在工具时限内结束的工作优先放在前台执行，并给足 `timeout_ms`；整个执行期间 Run 保持活动，不靠心跳和看门狗赛跑。
-- 只有需要独立句柄的长任务，或用户明确要求独立存活的服务，才使用后台模式：
-
-| `background_kind` | 含义 |
-|---|---|
-| `task`（默认） | 必须确认终点。在仅属主可访问的记录里原子登记对话范围、生命周期、会话、进程 ID、目标和登记时间 |
-| `service` | 不登记完成责任，不阻塞 Run，但仍须检查是否就绪 |
-
-- 分类只给 Runtime 用，前台调用不能带；Manager 只收到派生的"需要完成确认"标志和不可逆的会话归属摘要。
-- **只有同一会话、同一进程 ID 和目标的 `process.wait | read | kill` 返回 `completed | failed | cancelled`，才是终态证据。** 其它操作或状态、超时、重启或之前的 `needs_review` 都不能解除责任。责任可以跨 Run 可信恢复，记录损坏或身份漂移时拒绝执行。
-
-**持久化顺序（不能调换）**
-
-1. Manager 先把"需要完成确认"的意图写盘，再启动命令。
-2. 每个普通 Run 在读取任务记录和启动模型前，用精确的对话范围、生命周期、执行上下文和归属摘要与 Manager 对账，原子补齐责任。未确认的任务，其活动和终态记录不按时间或数量清理。
-3. Runtime 拿到权威终态后，先原子写入 `active → resolved` 标记，再请求 Manager 确认（ack）。收到 Manager 的成功确认后，Runtime 才删除本地标记。Manager 持久确认后即可正常清理该终态，不必等 Runtime。
-4. 崩溃后只重试"观察"和"确认"，不重跑命令，也不假装成功。前台和 service 不进入这个集合；宿主机任务同样适用。
-
-**等待结果**
-
-- 要结果用 `process.wait`，不要用间隔或 cron 计划轮询。会话里有进行中的 task 时，在调用 Platform 或审批之前就拒绝 `schedule.create`，全部解除后恢复；service 不触发这个限制。
-- wait 绑定对话范围、生命周期、目标和进程 ID：进程结束时返回同一份有长度上限的快照；超时返回 running 且不停止进程；取消只中断等待。读取、等待和预览都不会"消费"终态。
-- wait 期间暂停空闲检测，但不增加模型轮次上限或进程截止时间。
-
-**重启后的终态**
-
-- 不能凭 PID 消失就认为成功。沙箱的包装程序会原子保存 shell 的真实退出码，终态文件绑定进程记录；格式、类型和范围都有效时才恢复为 `completed` 或 `failed`。
-- 终态文件缺失、损坏、是符号链接或不可读时，视为退出码未知的 `failed`；停机时尚未确认的标为 `orphaned`。
-- 宿主机进程的控制器随 Manager 服务存活；Manager 异常重启丢失控制器时，从预先提交的意图恢复为退出码未知的 `failed`，通过同样的对账返回，绝不重新启动命令。
-
-## 会话与压缩
-
-会话是模型的 JSONL 历史，不是登录 Cookie。身份、持久化和附属记录遵循[数据设计](data-memory-sessions.md)。初始化、追加、压缩和删除共用同一条串行边界。
-
-活动会话由锁定版本 Pi 的原生会话存储管理，位于 `sessions`；不再维护自定义 v1 日志、归档、修复或会话清单。对话范围、生命周期和会话身份仍精确隔离，会话执行锁与短时文件变更锁分开。启动时的一次性迁移保留原封不动的 `sessions.pre-pi`，完整转换并原子发布后才接受请求；中断后可安全重复执行。迁移和手动回滚边界见[数据布局](../reference/data-layout.md#受控迁移)与[部署](../operations/deployment.md#本次-runtime-升级的备份与手动回滚)。
-
-**压缩算法**（自动和手动相同）
-
-1. 自动和手动压缩使用 Pi 的按 token 选择尾部算法，再对齐用户消息和完整工具调用边界，保留近期上下文。用当前已授权的模型发起有长度上限、不带工具的摘要请求；每次新增消息都重新计算阈值，同一 Run 里再次超限会再次压缩。
-2. 摘要使用 Pi 的结构化 checkpoint 提示，包含目标、约束、进展、决定、下一步和关键上下文。Runtime 继续限制并清洗摘要输入，优先保留最早目标和最新请求；历史中的旧摘要作为数据更新，不构成指令。模型上下文由 Pi 原生压缩记录和保留的尾部构建。
-3. 输入和输出都经过同一个清洗器，去掉 token、认证头、JWT、私钥、带密码的连接串、敏感配置和 URL 参数。摘要不覆盖原生会话中保留的历史消息；历史和摘要都不构成授权。
-4. 只有正常结束、没有工具调用、清洗后正文非空且不超过独立上限，才提交。因长度或工具调用结束、出错、中止、超长或被截短都算失败，保留原状态和之前已安全提交的内容。
-5. 使用 Pi 原生压缩条目提交摘要，不按正文识别摘要，也不创建独立归档或发出自定义修复事件。todo 单独可信地重新注入。`session` 工具查询本会话的原生历史，包括已被压缩出模型上下文的消息；Platform 的 `session_search` 查询跨产品会话，结果都不可信。
-
-**上下文用量**
-
-- 阈值计算和终态的 `context_usage` 用同一口径：使用 Pi 的 token 估算与用量计算，优先使用本 Run 同一请求前缀的供应商真实用量（已包含系统提示和工具，不重复加），新消息另外估算。
-- 没有真实用量时，估算消息、完整提示和本轮工具的名称、说明、schema；不计图片数据、执行器或审计字段。
-- 恢复、换 Run 或模型、压缩或前缀变化后，旧用量只用于审计；重新测量前按"摘要 + 尾部"估算，不计已压缩出上下文的历史。含估算的数值只是近似。
-
-**`/compact`**
-
-- 这是控制操作：不创建 Run 或命令消息，不删除历史消息。
-- 该会话有排队或运行中的 Run 时拒绝；没有可以安全省略的历史时直接成功、什么都不做，重复调用不增长会话文件。执行期间，同一会话的新 Run 被隔离等待。
-- 摘要超时或连接断开：在最终提交点之前取消，确认摘要停止后原样释放；已经过了提交点就忽略断开，完成原生压缩提交后再释放。
-- 压缩和删除共用串行边界和清理屏障：不能持着会阻碍压缩收尾的锁去等待，也不能在删除后用旧快照重建文件。
-
-## 记忆与技能注入
-
-- 记忆和用户资料的隔离、召回、注入、正式内容和免审写入资格见[数据设计](data-memory-sessions.md)。
-- Skill 只注入精简索引，正文和支持文件按需加载；路径、安装和工作区整理见[集成](integrations.md)。
-
-## 学习复盘 Run
-
-- 完整的 Platform 身份以及保留的会话命名空间见 [API · 创建 Run](../reference/runtime-api.md#创建-run)，在排队和初始化会话之前校验；普通 Run 不能占用该命名空间或拼字段提权。
-- 任务准入、取消、每次读写的复验、轨迹记录和跨重启的预算见[学习复盘](data-memory-sessions.md#学习复盘)。
-- 前台回复交付后，使用独立的临时会话和有限的近期历史。不接受追加输入、不委派、不展示流式输出、不写父会话；结束时精确删除临时会话。
-- 轮次上限为 `min(16, maxTurnsPerRun)`，不能靠调高普通上限来扩大免审批写入。
-- 只能用记忆和技能工具：
-  - memory：读取，以及 `store | replace | forget | reconcile`；禁止 clear。
-  - skill：`list | load | read | create | patch`。修改已有技能包之前必须在同一 Run 里先 load 或 read；patch 只能用于未固定、活动中、Agent 自建的包。
-- 读取免费；reconcile 的每个子动作和其它写入一起计入 Platform 的任务预算，提示和 schema 要写明，不能整次只算一次。
-- 复验、模型或清理失败都不影响前台回复，也不会递归触发学习。
-
-## 委派
-
-- 单个任务或有上限的 `tasks[]`，并发受限、结果按输入顺序合并，父 Run 等所有子 Run 结束。
-- 深度和总创建预算由可信的内存树从根节点原子共享，元数据不能重置。全局活动子 Run 达到上限时直接拒绝，不排队、不持有名额互相等待。
-- 默认子 Run 是叶子节点，没有委派工具；只有父 Run 显式选择且预算允许，才能作为编排者继续委派。
-- 系统提示和安全设置继承 Platform 的可信父上下文；父模型给出的 `prompt` 只是任务数据，不能替换或追加子 Run 的系统提示。
-- 子 Run 有独立的对话范围和会话，继承沙箱、工作区、HOME 和环境变量；临时记忆和浏览器按子范围隔离。并行的子 Run 不能修改同一个文件或共享外部对象。模型、工具、等待和压缩活动都会上报给父 Run；取消父 Run 会取消全部后代。
-- 子 Run 结束时清理其派生的范围和会话，所以子 Run 在产生副作用、审批或请求 Manager 之前就拒绝一切后台执行（包括 task 和 service），命令必须在前台等结果。
-- 子 Pi Agent 返回自己的最终正文，Runtime 同时返回子 Run ID、状态和是否开始副作用，不维护变更文件或未知变更证据，也不强制父 Run 增加复验轮次。
-- 子 Run 的副作用状态传播到父 Run；失败或取消后结果不确定时仍为 `needs_review`。成功的委派不额外阻止父 Run 完成。
-
-## 停止与恢复
-
-- 取消、对话清理、Manager 执行连接断开、空闲检测都会中止模型和当前前台工具，并等待有限时间的清理。有副作用且无法确认安全终止时，标为 `needs_review`。
-- 普通 Run 没有固定的总时长上限；空闲、轮次、终端和等待的限制见 [`runtime-policy.json`](../contracts/runtime-policy.json)，其它限额见[配置](../reference/configuration.md)。
-- 正常完成不会停止独立的 service；task 没看到终态就不能算成功。
-
-**`needs_review` 时保留哪些后台任务**
-
-- 只有因 task 或周期计划守卫而进入 `needs_review` 时，才可以保留 task：取可信记录中本 Run 仍在运行的精确集合。
-- Manager 逐项复验 Run、对话范围、生命周期、后台身份、数量和格式，任何一项不符就失败，并清理同一 Run 的其它进程。
-- 显式取消、空闲超时、对话清理、普通失败、记录无法验证时，保留集合为空。模型不能扩大集合，service 也不能借此保留。
-
-**对话清理（cleanup）**
-
-Manager 独占进程清单和"家族"并发上限。家族只包括根范围本身和 `根 + "/delegate/"` 下的后代，不包括前缀相似的其它范围。清理按以下顺序进行，不依赖内存缓存：
-
-1. Runtime 封锁并取消匹配的 Run 和审批。Manager 为该家族和生命周期安装"禁止启动"屏障，等已准入的启动完成登记或无副作用退出后，再取快照、预检证据上限并停止进程。屏障一直保持到 Manager 清理返回。等待时不持有登记锁，不阻塞其它家族；重叠的清理共享同一结果或被有限拒绝。
-2. 所有进程和控制器收敛后，Manager 返回有长度上限的未确认任务身份清单，并固定这些记录，暂不确认或清理。
-3. Runtime 在责任存储的串行边界内删除该家族和生命周期的任务记录。普通清理保留日志、todo 和会话；`delete_sessions=true` 删除整个会话家族。顺序是：**本地提交 → 逐项确认 → 全部成功后才删除内存上下文**。任何一步失败都不报告部分成功，重试时只对账已有的进程和剩余证据。
-
-**进程收尾的一致性**
-
-- 清理或 kill 返回之前，输出快照、持久状态、沙箱计数和终态清理都必须收敛；之后旧的 wait 和观察者不能再写入该范围。
-- 每个进程只有一个结算者；前台调用结束、后台计数和持久提交都在完成信号之前完成。准入落盘失败不留虚假计数；未结算或 `running | orphaned` 的记录不清理。
-- 宿主机前台命令被取消或到截止时间时，停止整个自有进程组并等待结算，而不只是杀掉 shell。
-- 计数查询不复制输出；预览先按范围和展示集合筛选，再读取有长度上限的输出。展示和版本号见 [Scope 与进程](../reference/runtime-api.md#scope-与进程)。
-
-## 验证稳定性
-
-命令和证据标准见 [Runtime 验证](../development/testing.md#agent-runtime)。测试机器的抖动不能成为放宽产品时序或终态规则的理由。
+Each startup reconciles import provenance against the old journal. If rollback changed that source and Pi has not appended to the imported v3 history, archive the prior import and re-import it. If Pi has added turns, or provenance cannot be established, preserve v3 history and warn rather than silently discarding turns. Old source journals remain untouched.

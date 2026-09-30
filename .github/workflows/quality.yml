@@ -130,7 +130,7 @@ jobs:
         run: npm run build
 
       - name: Run runtime tests
-        run: npm run test:compiled
+        run: npm test
 
       - name: Test Camoufox runtime patch
         working-directory: enterprise-agent-platform/camofox-runtime
@@ -140,7 +140,8 @@ jobs:
           npm test
 
       - name: Audit runtime dependencies
-        run: npm audit --audit-level=high
+        # Documented, path-specific exception: see audit-exceptions.json.
+        run: npm audit --json | python3 ../../scripts/npm-audit-gate.py audit-exceptions.json
 
   manager:
     name: Manager (Go)

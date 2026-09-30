@@ -72,26 +72,6 @@
     "searxng": {
       "compressed_bytes": 2147483648,
       "unpacked_bytes": 4294967296
-    },
-    "firecrawl-api": {
-      "compressed_bytes": 8589934592,
-      "unpacked_bytes": 17179869184
-    },
-    "firecrawl-playwright": {
-      "compressed_bytes": 8589934592,
-      "unpacked_bytes": 17179869184
-    },
-    "firecrawl-postgres": {
-      "compressed_bytes": 2147483648,
-      "unpacked_bytes": 4294967296
-    },
-    "firecrawl-redis": {
-      "compressed_bytes": 1073741824,
-      "unpacked_bytes": 2147483648
-    },
-    "firecrawl-rabbitmq": {
-      "compressed_bytes": 1073741824,
-      "unpacked_bytes": 2147483648
     }
   },
   "public_update_states": [

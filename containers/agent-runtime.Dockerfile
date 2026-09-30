@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24-bookworm-slim AS runtime-build
+FROM node:24.14.0-bookworm-slim AS runtime-build
 WORKDIR /build/agent-runtime
 ENV CI=1 \
     NPM_CONFIG_AUDIT=false \
@@ -12,7 +12,7 @@ COPY enterprise-agent-platform/agent-runtime/src ./src
 RUN npm run build \
     && npm prune --omit=dev
 
-FROM node:24-bookworm-slim AS agent-runtime
+FROM node:24.14.0-bookworm-slim AS agent-runtime
 ENV NODE_ENV=production \
     AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1 \
     HOME=/var/lib/agent-platform/runtime/home \
@@ -20,12 +20,14 @@ ENV NODE_ENV=production \
     AGENT_RUNTIME_HOST=0.0.0.0 \
     AGENT_RUNTIME_PORT=8766 \
     AGENT_RUNTIME_MAX_BODY_BYTES=33554432 \
-    AGENT_PLATFORM_INTERNAL_URL=http://platform:8765
+    AGENT_PLATFORM_INTERNAL_URL=http://platform:8765 \
+    AGENT_RUNTIME_SKILLS_DIRECTORY=/app/skills
 RUN install -d -o node -g node -m 0700 /var/lib/agent-platform/runtime
 WORKDIR /opt/agent-platform-runtime
 COPY --from=runtime-build /build/agent-runtime/package.json ./
 COPY --from=runtime-build /build/agent-runtime/node_modules ./node_modules
 COPY --from=runtime-build /build/agent-runtime/dist ./dist
+COPY enterprise-agent-platform/agent-runtime/skills /app/skills
 COPY containers/agent-runtime-entrypoint.sh /usr/local/bin/agent-runtime-entrypoint
 RUN chmod 0755 /usr/local/bin/agent-runtime-entrypoint
 ARG SOURCE_COMMIT=unknown

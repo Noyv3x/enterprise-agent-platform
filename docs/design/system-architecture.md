@@ -1,74 +1,39 @@
-# 系统架构
+# System architecture
 
-本文定义各组件负责什么，以及主要流程怎么走。部署步骤见[部署手册](../operations/deployment.md)，磁盘路径见[数据布局](../reference/data-layout.md)。
+The system embeds Pi rather than recreating an agent framework. [Product scope](product.md), [trust boundaries](security-and-trust.md), [Platform API](../reference/platform-api.md) and [Runtime API](../reference/runtime-api.md) define its boundaries.
 
-## 总览
+## Components
 
-```text
-浏览器 → Manager 网关 → Platform ↔ Telegram / IMAP / SMTP
-          └ 维护页        ├→ Runtime → 模型
-                          └→ Camoufox / SearXNG / Firecrawl
-Platform / Runtime → Manager 执行器 → 沙箱 → 工作区 MCP
-                                    └→ 宿主机（显式指定、逐次审批）
-```
-
-- Manager 以宿主机的 user-systemd 服务运行，持有唯一的对外端口：正常时把请求转给当前的 Platform，更新或故障时返回维护页。
-- 只有 Manager 能访问 Docker。它管理一个跨版本保留的私有网络；固定服务栈和沙箱都挂在这个网络上。停止 Compose 不会删除网络，也不会断开沙箱。
-
-## 组件边界
-
-| 组件 | 负责 | 不负责 |
-| --- | --- | --- |
-| Manager | 源码树外的单实例控制面：对外入口、执行器 socket（仅属主可访问）、容器和执行审计、发布、更新、快照、回滚及其日志 | 任何产品业务状态。它的操作由 Platform 管理面板认证后发起；Platform 不可用时用宿主机命令行 |
-| Platform | 登录与授权、SQLite 业务数据、消息与附件、对话与持久任务、业务工具、集成、预览 | 服务生命周期、依赖安装、拉取源码、管理 Compose |
-| Runtime | 基于 Node.js 和锁定版本的 Pi Core / Pi AI：执行模型与工具循环、推送事件、保存 Pi 原生会话；Run 状态、结果和事件只在进程内。业务工具回调 Platform，文件、终端、进程工具经 Manager 执行 | 访问 Docker；持久 Run 预留、结果恢复或重放 |
-| React 前端 | 随 Platform 镜像发布并由它提供；使用同源 API 和对话实时推送。维护页在登录和应用错误边界之外 | 授权判断或持久数据 |
-| 沙箱 | 每个主 Agent 一个：工作区、HOME、环境变量和进程；委派子任务继承父 Agent 的身份。首次执行时创建，任务和登记的后台进程会延长存活期，空闲时只停止不删除，重建后数据保留。Skill 和 MCP 放在工作区里，由固定的一次性 stdio 客户端在沙箱内执行 | — |
-| 外部能力 | Camoufox（每个 Agent 独立 Profile）、SearXNG、Firecrawl。CI 按锁定的地址和版本构建镜像，部署机上不保留上游源码 | 用户自己的 MCP（不属于固定服务） |
-
-Platform 内部按职责复用规则，而不复制一套业务入口：HTTP 层统一处理相同的对话范围路由，服务层集中资源属主读取、计划版本比较交换和记忆主体校验，存储层共用创建与更新的字段规则。共享校验不替代提交边界内的重新授权；实时状态、持久任务和文件身份仍各自承担不同的责任。
-
-数据归属：
-
-- SQLite 管业务数据，JSONL 管模型会话，工作区管文件；Manager 的日志和登记表管部署身份。预览只是派生结果。
-- 技术身份和模型供应商只有当前支持的一套，不自动发现旧身份，也不随[品牌](product.md#品牌配置)变化。启动只初始化当前必需的配置，不再重复执行已经完成的旧供应商清理或在多个位置初始化同一密钥。
-
-## 关键数据流
-
-### 交互回复
-
-1. Platform 确认没有待执行的更新预约，完成鉴权并在同一 SQLite 事务中保存消息和持久任务。触发 Agent 前，先按[接管规则](security-and-trust.md)释放发送者的浏览器接管。
-2. SQLite 持久任务表是唯一工作队列；每个会话按任务 ID 入队顺序串行调度，不保留第二份内存待办队列。队首尚未到 `available_at` 时，后面的任务不能越过它。经过全局并发上限后创建 Run，消费可恢复的事件，分别维护工作过程和最终内容。
-3. Runtime 调用 Platform 的业务工具，或带着可信的 Agent 身份经 Manager 执行命令。默认在沙箱里执行；每次执行先经过硬性拦截和审计，宿主机执行还需要逐次审批。
-4. 最终回复和用量写入数据库后才算成功。Platform 对所有 Runtime 终态的元数据只投影一次；仅成功终态的最终文本为空或全为空白时，使用该 Run 最后一条非空助手文本，不存在时显示中性的空结果提示。不会重新提示或创建新 Run；失败、取消、needs_review 和事件流提前结束仍作为错误处理。文件转成结构化附件；预览只展示当前有权访问的对话里真实、有长度上限的内容。
-
-用户在 AI 工作时追加的输入仍使用 Runtime 现有输入接口加入当前 Run，待合并、已提交和已消费阶段保存在同一持久任务的 payload 中；旧版追加输入记录只用于兼容读取和显式迁移，不再写入。定时执行的消息、执行记录和任务原子保存，不靠启动后的缺失任务修补维持正确性；恢复时只以执行记录的持久任务关联确定身份，不从多份消息或请求元数据猜测计划归属，缺失关联的计划工作不会按普通聊天执行。有限的后台进程在同一个 Run 里等待，不靠定时任务轮询。细节见 [Runtime](agent-runtime.md) 和 [API](../reference/runtime-api.md)。
-
-副作用结果不确定时，持久任务上的 `needs_review` 是唯一复核状态；定时任务、邮件和 Telegram 的展示从该任务派生。已开始但结果不明的外部发送不得自动重放。旧表和历史状态保留以支持受控迁移及旧版本回滚读取。
-
-消息、附件记录和任务共同提交。附件文件发布前，Platform 在私有的 `data_dir/attachment-commits` 中先持久化该次发布的精确文件身份清单；事务提交或回滚后清理清单。启动恢复只检查清单列出的文件：保留数据库已引用的文件，清除未引用的文件，不扫描整个附件树。该目录是可被旧版本忽略的增量恢复数据。
-
-### 后台学习复盘
-
-个人 AI 回复后的学习复盘是低优先级的持久任务，失败不影响已交付的回复。资格、授权、预算和恢复见[数据与会话](data-memory-sessions.md)。
-
-### 更新
-
-1. Manager 验证并预先下载新版本，等系统自然空闲后预约更新并进入维护模式。
-2. 停止旧的写入方、做快照、执行迁移、启动新版本。
-3. 新版本的后台处理先冻结，所有核心就绪检查通过且预约解除后才恢复业务；失败按操作恢复或回滚。Pi 会话转换不由数据库快照撤销，须遵守本次发布的[完整备份与手动回滚要求](../operations/deployment.md#本次-runtime-升级的备份与手动回滚)。
-
-详见[自动更新](../operations/auto-update.md)。
-
-普通启动按数据库版本检查兼容性，不对每张表、列和索引重复做完整结构比对。比代码更新的数据库拒绝启动；数据库结构演进只通过 Manager 停止写入方并保存快照后的版本迁移进行。`migrate` 支持全新初始化及当前版本的幂等运行；已经完成的旧基线、Skill 复制和 Docker 挂载权限转换不再提供。普通启动不补建持久身份。Runtime 会话例外地在启动准入前一次性迁移到 Pi 原生格式，完整原目录保留为 `sessions.pre-pi`；不能保证旧 Runtime 读取新格式，也不能只回滚数据库。见[受控迁移](../reference/data-layout.md#受控迁移)。
-
-## 故障边界
-
-| 组件 | 出错时怎么恢复 |
+| Component | Responsibility |
 | --- | --- |
-| Platform | 恢复持久任务，回滚失败的事务。不盲目重放已经开始的副作用，也不凭内存里的旧状态猜测已经成功 |
-| Runtime | 重启后不恢复旧 Run、结果或事件；Platform 不重新提交未知请求，可能已有副作用的丢失任务标为 needs_review，能确认没有副作用的标为 failed；会话历史不能证明 Run 成功 |
-| Manager | 依据日志和容器归属标签对账，而不是容器名；始终只有一个 Platform 在写数据；请求响应丢失或损坏时用原来的幂等身份对账 |
-| 外部能力 | 只降级出问题的那项能力，不破坏消息和文件。MCP 不会换个目录兜底；邮件和通知不阻塞对话；维护期间不开始新的副作用或唤醒 |
+| Frontend | Login, conversations, attachments, browser takeover, schedules, settings and administration. |
+| Platform | Python 3.11, Starlette/uvicorn/httpx and stdlib SQLite; authentication, authorization, durable product history, FIFO jobs, resources, tool gateways, OAuth and Manager integration. Serves frontend assets on port 8765. |
+| Runtime | Node ≥22.19, TypeScript and Pi coding-agent 0.87.1; one live `AgentSession` per conversation, streamed runs and append-only JSONL v3 transcripts. Port 8766 is private. |
+| Host Manager | Public ingress, maintenance/update coordination, Docker ownership and audited sandbox execution. It is not an agent tool for host commands. |
+| Agent sandbox | Personal or channel workspace, persistent home/environment and foreground tenant execution. |
+| Chat sandbox | One lightweight, network-disabled sandbox per user, shared by that user's chat conversations. |
+| Camofox / SearXNG | Managed browser and web search. Fetch uses Platform HTTP, not Firecrawl. |
 
-相关文档：认证、文件和审批见[安全设计](security-and-trust.md)；OAuth 凭据、模型目录及降级见[集成](integrations.md)；界面呈现见[前端](frontend.md)。超时和模型轮次以 [runtime-policy.json](../contracts/runtime-policy.json) 为准，容器和更新状态以 [container-platform.json](../contracts/container-platform.json) 为准。
+Only Manager owns Docker. Platform and Runtime do not execute tenant commands in their own containers. The five release image keys are `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`.
+
+## Message and tool flow
+
+1. Platform authenticates and authorizes a message, inserting it and a `durable_jobs` agent job in one transaction.
+2. A per-session FIFO worker selects the model, sandbox identity, stable resources and tool set, then submits one Runtime run.
+3. Runtime resumes or creates the conversation's Pi session. Pi owns model turns, retry and compaction; changing time/user/timezone context is prefixed to the user message.
+4. File and shell tools call Manager's audited executor. Web, browser and schedule tools call Platform's authenticated internal gateways; MCP runs its stdio client in the sandbox.
+5. Runtime emits text/thinking deltas, tool activity, retry/compaction events and a final result. Platform persists the final message and usage; the frontend displays Platform history and streaming updates.
+
+A lost Runtime run becomes interrupted. Platform never resubmits a run whose effects may already have occurred. Pi's model-call retry is not job replay.
+
+## State ownership
+
+SQLite is authoritative for product history, users, permissions, schedules, queue and usage. Pi JSONL is authoritative for model-visible session history. Workspaces hold user files, AGENTS.md and skills; Manager owns lifecycle and release records. These are separate stores, not competing copies of one state machine.
+
+Personal and channel sessions have stable scope/workspace identities. Chat has a per-user sandbox and a per-conversation directory: file tools reject paths outside that directory, while bash starts there but can reach the same user's other chat files. The security boundary is the user sandbox, not the chat directory.
+
+## Lifecycle and release
+
+One run is active per session; idle session objects expire after 15 minutes. Completed-run events are buffered for 10 minutes. Sessions survive object eviction in `sessions-v3/`; the UI uses SQLite rather than Runtime debug history.
+
+Manager M1 must precede R2. Database changes are additive; old runtime journals and removed-feature data remain untouched. See [migration and storage](data-memory-sessions.md) and [deployment](../operations/deployment.md).
