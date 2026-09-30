@@ -2,10 +2,14 @@ package release
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -166,6 +170,72 @@ func TestFetchValidatesChecksumAndAvailability(t *testing.T) {
 	}
 	if _, _, err := client.Fetch(context.Background(), server.URL+"/missing", contract.ReleaseChannel); err == nil || !IsTemporarilyUnavailable(err) {
 		t.Fatalf("temporary availability was not classified: %v", err)
+	}
+}
+
+func TestDefaultFetchUsesFreshTLSConnections(t *testing.T) {
+	for _, http2 := range []bool{false, true} {
+		name := "http1"
+		if http2 {
+			name = "http2"
+		}
+		t.Run(name, func(t *testing.T) {
+			var connections atomic.Int32
+			artifactData := []byte("manager")
+			sum := sha256.Sum256(artifactData)
+			var server *httptest.Server
+			server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if (r.ProtoMajor == 2) != http2 {
+					t.Errorf("request protocol = %s, HTTP/2 enabled = %t", r.Proto, http2)
+				}
+				switch r.URL.Path {
+				case "/manifest":
+					_ = json.NewEncoder(w).Encode(validManifest(server.URL))
+				case "/artifact":
+					_, _ = w.Write(artifactData)
+				}
+			}))
+			server.EnableHTTP2 = http2
+			server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+				if state == http.StateNew {
+					connections.Add(1)
+				}
+			}
+			server.StartTLS()
+			defer server.Close()
+
+			original := defaultHTTPTransport
+			transport := original.Clone()
+			transport.TLSClientConfig = server.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+			defaultHTTPTransport = transport
+			defer func() {
+				defaultHTTPTransport = original
+				transport.CloseIdleConnections()
+			}()
+
+			client := Client{}
+			for i := range 2 {
+				manifest, _, err := client.Fetch(context.Background(), server.URL+"/manifest", contract.ReleaseChannel)
+				if err != nil || manifest.ID() != strings.Repeat("a", 40) {
+					t.Fatalf("manifest fetch %d: id=%q err=%v", i, manifest.ID(), err)
+				}
+			}
+			if got := connections.Load(); got != 2 {
+				t.Errorf("two manifest fetches opened %d connections, want 2", got)
+			}
+			before := connections.Load()
+			for i := range 2 {
+				data, err := client.FetchArtifact(context.Background(), Artifact{
+					URL: server.URL + "/artifact", SHA256: hex.EncodeToString(sum[:]),
+				}, 1024)
+				if err != nil || string(data) != string(artifactData) {
+					t.Fatalf("artifact fetch %d: data=%q err=%v", i, data, err)
+				}
+			}
+			if got := connections.Load() - before; got != 2 {
+				t.Errorf("two artifact fetches opened %d connections, want 2", got)
+			}
+		})
 	}
 }
 

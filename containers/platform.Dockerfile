@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24-bookworm-slim AS frontend-build
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS frontend-build
 WORKDIR /build/enterprise-agent-platform
 ENV CI=1 \
     NPM_CONFIG_AUDIT=false \
@@ -20,9 +20,10 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 RUN python -m pip install --upgrade pip setuptools wheel
 WORKDIR /build/enterprise-agent-platform
 COPY enterprise-agent-platform/pyproject.toml enterprise-agent-platform/README.md ./
+RUN python -c 'import subprocess, tomllib; subprocess.check_call(["python", "-m", "pip", "install", *tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]])'
 COPY enterprise-agent-platform/enterprise_agent_platform ./enterprise_agent_platform
 COPY --from=frontend-build /build/enterprise-agent-platform/enterprise_agent_platform/static ./enterprise_agent_platform/static
-RUN python -m pip install . \
+RUN python -m pip install --no-deps . \
     && python -m compileall -q "$VIRTUAL_ENV/lib/python3.11/site-packages/enterprise_agent_platform"
 
 FROM python:3.11-slim-bookworm AS platform

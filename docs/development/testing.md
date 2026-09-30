@@ -64,7 +64,7 @@ CI 在 Manager 外部控制边界使用小型 Unix socket 测试替身：0600 so
 
 浏览器冒烟访问公开的 `https://example.com/` 并点击进入 IANA，依赖外网可达和页面链接结构；不通过核心网络上的测试页面绕过浏览器导航策略。公开页面或网络故障应作为冒烟失败报告，不替换为模拟浏览器结果。
 
-发布按 prepare → 镜像/Manager 构建 → smoke → publish 执行；每个同仓库 main push 的成功 Quality commit 都进入发布，不再按说明文件差异跳过。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。
+每个同仓库 main push 直接启动发布工作流：完整的可复用 Quality 检查与 prepare → 镜像/Manager 构建 → smoke 并行；publish 必须等待全部 Quality、上游校验、双架构镜像和 Manager 构建、镜像目录、匿名拉取、Core Compose 冒烟与用户级 systemd 激活检查成功。PR 和手动 Quality 运行只做质量检查，不启动发布。每次均执行所有组件的构建与检查，不按未改动组件或说明文件差异跳过；Quality 完成前上传的提交标签镜像不是已授权的发布。发布资产兼容性、公开验证及 latest 的祖先顺序约束见[发布通道](../operations/auto-update.md#发布通道)。
 
 沙箱镜像使用摘要固定的 Node 基础镜像、Debian 软件包快照和固定版本的 Python 包；发布构建复用注册表缓存，不写入每次发布变化的版本/提交标签或证明附件。更新基础镜像或快照需要显式修改 Dockerfile。相同输入的摘要复用仍需真实 BuildKit/GHCR 发布构建验证，本地 Compose 配置检查不能证明可重复构建。
 
@@ -76,10 +76,11 @@ CI 在 Manager 外部控制边界使用小型 Unix socket 测试替身：0600 so
 bash -n scripts/container-smoke.sh scripts/release-compose-smoke.sh scripts/verify-release-images-anonymous.sh
 python3 -m unittest discover -s scripts/tests
 python3 -c 'import pathlib,yaml; [yaml.safe_load(p.read_text()) for p in pathlib.Path(".github/workflows").glob("*.yml")]'
+actionlint .github/workflows/quality.yml .github/workflows/container-release.yml
 scripts/container-smoke.sh
 ```
 
-真实 GitHub 发布才能证明令牌权限、GHCR 匿名摘要读取、双架构镜像、完整公开资产下载和 latest 推进；还需要当前已安装 Manager 的真实更新与回滚验证，不能用工作流源文本断言或模拟 GitHub CLI 代替。
+本地 YAML/actionlint 与依赖图检查只能验证工作流定义，不能证明 GitHub 的可复用工作流调度和权限、main push 的实际并行运行、Quality 失败时发布被阻止，或串行发布下的过期提交拒绝；这些需要真实 main 发布运行观察，不能由 PR 替代。真实 GitHub 发布才能证明令牌权限、GHCR 匿名摘要读取、双架构镜像、完整公开资产下载和 latest 推进；还需要当前已安装 Manager 的真实更新与回滚验证，不能用工作流源文本断言或模拟 GitHub CLI 代替。
 
 用户级 systemd 需要可用的用户管理器、linger、`XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；在 `manager/` 运行：
 

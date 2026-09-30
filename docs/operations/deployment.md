@@ -36,6 +36,8 @@ enterprise-agent-platform migrate --data /var/lib/agent-platform
 
 Platform health is `/healthz` on 8765; Runtime health is authenticated `/health` on 8766. Exact payloads and internal Manager contracts belong in the [Platform API](../reference/platform-api.md) and [Runtime API](../reference/runtime-api.md). An open port alone is not release readiness. Camofox/search failures degrade those capabilities rather than core login/conversations.
 
+Image builds compile Runtime TypeScript and frontend static assets on the build host once for both architectures. Runtime production dependencies are installed separately for each target architecture and cached by the package manifests; Python third-party dependencies are cached from `pyproject.toml` before application source is copied. Native modules and the Python virtualenv never cross architectures. Entrypoints, users, health checks and runtime file layouts are unchanged.
+
 ## Sandbox profiles
 
 | Profile | Memory / swap | CPUs | PIDs | Network | Idle stop |

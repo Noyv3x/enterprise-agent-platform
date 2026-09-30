@@ -236,6 +236,12 @@ func validateReleaseURL(rawURL string) error {
 
 type Client struct{ HTTP *http.Client }
 
+var defaultHTTPTransport = func() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DisableKeepAlives = true
+	return transport
+}()
+
 // Validators retain bounded HTTP cache validators for a single immutable
 // release-catalog location. They are deliberately supplied by the caller so a
 // Client remains stateless and can still be copied safely into orchestrators.
@@ -463,7 +469,7 @@ func (c Client) fetchConditional(ctx context.Context, rawURL string, limit int64
 	}
 	client := c.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Transport: defaultHTTPTransport, Timeout: 30 * time.Second}
 	}
 	clientCopy := *client
 	previousRedirectPolicy := client.CheckRedirect

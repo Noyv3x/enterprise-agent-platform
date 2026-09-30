@@ -1,11 +1,9 @@
 name: Container release
 
 on:
-  workflow_run:
-    workflows:
-      - Quality gates
-    types:
-      - completed
+  push:
+    branches:
+      - main
 
 permissions:
   actions: read
@@ -18,19 +16,24 @@ env:
     }
 
 concurrency:
-  # Build each qualified commit once; the final publish job separately
+  # Build each main commit once; the final publish job separately
   # serializes the mutable main-channel pointer.
-  group: container-release-${{ github.event.workflow_run.head_sha }}
+  group: container-release-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
+  quality:
+    name: Quality gates
+    uses: ./.github/workflows/quality.yml
+    permissions:
+      contents: read
+
   prepare:
     name: Resolve release commit
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.repository.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -38,10 +41,10 @@ jobs:
       image_matrix: ${{ steps.release.outputs.image_matrix }}
       image_namespace: ${{ steps.release.outputs.image_namespace }}
     steps:
-      - name: Check out qualified source
+      - name: Check out pushed source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -624,6 +627,7 @@ jobs:
   publish:
     name: Publish atomic main release
     needs:
+      - quality
       - prepare
       - upstream-contracts
       - images

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24.14.0-bookworm-slim AS runtime-build
+FROM --platform=$BUILDPLATFORM node:24.14.0-bookworm-slim AS runtime-build
 WORKDIR /build/agent-runtime
 ENV CI=1 \
     NPM_CONFIG_AUDIT=false \
@@ -9,8 +9,15 @@ COPY enterprise-agent-platform/agent-runtime/package.json enterprise-agent-platf
 RUN --mount=type=cache,target=/root/.npm npm ci
 COPY enterprise-agent-platform/agent-runtime/tsconfig.json ./
 COPY enterprise-agent-platform/agent-runtime/src ./src
-RUN npm run build \
-    && npm prune --omit=dev
+RUN npm run build
+
+FROM node:24.14.0-bookworm-slim AS runtime-deps
+WORKDIR /build/agent-runtime
+ENV CI=1 \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_FUND=false
+COPY enterprise-agent-platform/agent-runtime/package.json enterprise-agent-platform/agent-runtime/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --omit=dev
 
 FROM node:24.14.0-bookworm-slim AS agent-runtime
 ENV NODE_ENV=production \
@@ -25,7 +32,7 @@ ENV NODE_ENV=production \
 RUN install -d -o node -g node -m 0700 /var/lib/agent-platform/runtime
 WORKDIR /opt/agent-platform-runtime
 COPY --from=runtime-build /build/agent-runtime/package.json ./
-COPY --from=runtime-build /build/agent-runtime/node_modules ./node_modules
+COPY --from=runtime-deps /build/agent-runtime/node_modules ./node_modules
 COPY --from=runtime-build /build/agent-runtime/dist ./dist
 COPY enterprise-agent-platform/agent-runtime/skills /app/skills
 COPY containers/agent-runtime-entrypoint.sh /usr/local/bin/agent-runtime-entrypoint

@@ -4,9 +4,9 @@ Manager owns discovery, pulls, maintenance, snapshots, migration, activation and
 
 ## 发布通道
 
-Release manifests remain schema 2 / protocol 2. `Container release` is authorized only by a successful `Quality gates` run for the same repository's `main` push and exact commit. PRs, failed checks and manual Quality runs do not authorize releases. Every eligible commit is released, including documentation-only changes.
+Release manifests remain schema 2 / protocol 2. Each same-repository `main` push starts `Container release`, which runs the reusable `Quality gates` workflow at the exact pushed commit in parallel with release preparation, image/Manager builds and user-systemd activation checks. PRs and manual Quality runs execute Quality checks only; they cannot start release builds or authorize publication. Every main commit takes the complete build/check path, including documentation-only changes; unchanged components are not skipped.
 
-Images use immutable digests; Manager and Compose bytes have verified SHA-256 identities. Publish the complete immutable release, verify its public assets/images, then advance latest under the existing serialized channel/ancestry rules. Never move an existing release tag or fill a half-published generation with different bytes.
+Publication requires every Quality check, upstream validation, both-architecture image and Manager builds, the closed image catalog, anonymous pulls, Core Compose smoke and user-systemd activation to succeed. Builds may upload commit-tagged images before Quality finishes; these are not an authorized release or channel promotion. Images use immutable digests; Manager and Compose bytes have verified SHA-256 identities. Publish the complete immutable release, verify its public assets/images, then advance latest under the existing serialized channel/ancestry rules. Never move an existing release tag or fill a half-published generation with different bytes. Recheck that the source remains an ancestor of main and that latest is an ancestor of the source while holding the publication lock; a superseded or divergent generation cannot rewind latest.
 
 The eight public assets remain `release.json`, `agent-platform-compose.yaml`, `install.sh`, `install.sh.sha256`, and `agent-platform-manager-linux-{amd64,arm64}` with their `.sha256` files.
 
@@ -20,6 +20,8 @@ M1 accepts only these two complete catalogs, not arbitrary subsets. The legacy t
 ## Detection and pulls
 
 Manager polls the configured channel; `check` may persist a candidate but never creates an update operation. Candidate protocol, identities, digests and schema boundaries must validate before disruption. Network/space failures leave the current generation running.
+
+Default manifest checks and artifact downloads use fresh HTTP connections, retaining the 30-second request timeout and environment-configured proxy support. Conditional checks still retain bounded cache validators; connection freshness does not bypass manifest validation or artifact checksum verification.
 
 M1 prefetches Platform, Runtime and `agent-sandbox` before maintenance, avoiding a first-command sandbox image pull after release. An already-present exact RepoDigest is reused. Pulls and maintenance are separate phases; do not interpret download success as readiness.
 
