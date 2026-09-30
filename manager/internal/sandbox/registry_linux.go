@@ -74,11 +74,26 @@ func (m *Manager) loadRegistry() error {
 	if version != sandboxRegistrySchemaVersion {
 		return fmt.Errorf("unsupported sandbox registry schema %d", version)
 	}
-	var current registry
+	// Existing schema-2 registries include background accounting. Accept it only
+	// at the decode boundary; startup stops containers instead of recovering it.
+	var current struct {
+		SchemaVersion    int    `json:"schema_version"`
+		TechnicalProfile string `json:"technical_profile"`
+		Records          map[string]struct {
+			Record
+			BackgroundProcesses json.RawMessage `json:"background_processes"`
+		} `json:"records"`
+	}
 	if err := decodeSandboxRegistryStrict(data, &current); err != nil {
 		return err
 	}
-	m.registry = current
+	m.registry = registry{SchemaVersion: current.SchemaVersion, TechnicalProfile: current.TechnicalProfile}
+	if current.Records != nil {
+		m.registry.Records = make(map[string]Record, len(current.Records))
+		for id, record := range current.Records {
+			m.registry.Records[id] = record.Record
+		}
+	}
 	return nil
 }
 

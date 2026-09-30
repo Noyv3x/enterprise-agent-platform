@@ -2,8 +2,6 @@ package executor
 
 import (
 	"bytes"
-	"encoding/json"
-	"os/exec"
 	"strings"
 	"testing"
 )
@@ -117,70 +115,6 @@ func TestOutputRedactorPreviewDoesNotConsumePending(t *testing.T) {
 	redactor.Flush(emit)
 	if strings.Contains(committed.String(), "partial") || strings.Contains(committed.String(), "credential") || !strings.HasSuffix(committed.String(), " done") {
 		t.Fatalf("preview advanced live stream: %q", committed.String())
-	}
-}
-
-func TestSandboxOutputRedactorSharesPolicy(t *testing.T) {
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Skip("python3 unavailable")
-	}
-	inputs := []string{
-		"Authorization: Bearer secret-header\nplain line\n",
-		`{"api_key":"secret json value"} plain`,
-		"https://user:secret-url@host/path?token=secret-query&n=4\n",
-		"sk-providerSecret12345\nCookie: one=secret-cookie; two=another\n",
-		"-----BEGIN PRIVATE KEY-----\nsecret-key\n-----END PRIVATE KEY-----\nordinary",
-		"TOKEN=" + strings.Repeat("long-secret", 1000) + " ordinary\n",
-		strings.Repeat("ordinary progress\n", 1000) + "last line",
-		strings.Repeat("x", 2048) + strings.Repeat("plain progress with spaces and tabs\t\n", 200),
-		strings.Repeat("plain ", 85) + "AIzaBareCredential gAAAABareCredential AKIABareCredential eyJBareCredential ordinary",
-		strings.Repeat("plain ", 85) + "aUtHoRiZaTiOn \tBearer mixed-header\nbEaReR\t mixed-value ordinary",
-		"CoOkIe\t: mixed-cookie\nX-Goog-Api-Key\t: mixed-key ordinary",
-		"?code=query-credential&ordinary=1 bot12345678:numeric-credential ordinary",
-		"ToKeN" + strings.Repeat(" \t", 128) + "space-credential ordinary",
-		"CoOkIe" + strings.Repeat("\t ", 128) + "space-cookie\nordinary",
-	}
-	encoded, err := json.Marshal(inputs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	program := sandboxOutputRedactorPython() + `
-import sys
-results = []
-for text in json.load(sys.stdin):
-    for width in (1, 7, 511, 512, 1024):
-        redactor = OutputRedactor()
-        value = text.encode('utf-8')
-        chunks = []
-        for i in range(0, len(value), width):
-            chunks.append(redactor.feed(value[i:i+width]))
-            redactor.preview()
-        result = b''.join(chunks)
-        result += redactor.feed(b'', final=True)
-        results.append(result.decode('utf-8'))
-json.dump(results, sys.stdout)
-`
-	cmd := exec.Command(python, "-I", "-c", program)
-	cmd.Stdin = bytes.NewReader(encoded)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Python redactor: %v: %s", err, out)
-	}
-	var results []string
-	if err := json.Unmarshal(out, &results); err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != len(inputs)*5 {
-		t.Fatal("missing sandbox stream results")
-	}
-	for i, input := range inputs {
-		want := redactRetainedText(input)
-		for j := range 5 {
-			if results[i*5+j] != want {
-				t.Fatalf("sandbox stream %d width case %d differs: %q / %q", i, j, results[i*5+j], want)
-			}
-		}
 	}
 }
 

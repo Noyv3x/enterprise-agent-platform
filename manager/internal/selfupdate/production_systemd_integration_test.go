@@ -25,7 +25,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
-const productionIntegrationVersion = "6889bf66dd63754e42de46f7048eed84a3f0768f"
+const productionIntegrationVersion = "a791405075e7bd4ea883274f5b4553bfabb5d379"
 
 // Unlike the historical bridge checkpoint test, this sends a normal update to
 // the production Manager API and waits for the entire transaction to settle.
@@ -86,13 +86,13 @@ func productionIntegrationRun(t *testing.T, ctx context.Context, binaries string
 	}))
 	defer releases.Close()
 	target := releasetest.NewTarget(bridgeIntegrationNext, releasetest.WithArtifactBaseURL(releases.URL), releasetest.WithManagerBinary(runtime.GOARCH, payload), releasetest.WithCompose(compose))
-	// R1 must remain consumable by production: all ten image keys, even though
-	// this fixture starts only the two required core services.
+	// Publish the current five-image catalog while this fixture starts only
+	// the two required core services.
 	for key := range target.Manifest.Images {
 		target.Manifest.Images[key] = generation.Images["platform"]
 	}
-	if len(target.Manifest.Images) != 10 {
-		t.Fatalf("R1 fixture must publish the legacy ten-image catalog: %v", target.Manifest.Images)
+	if len(target.Manifest.Images) != 5 {
+		t.Fatalf("fixture must publish the five-image catalog: %v", target.Manifest.Images)
 	}
 	manifestJSON, err = json.Marshal(target.Manifest)
 	if err != nil {

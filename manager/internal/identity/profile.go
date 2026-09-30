@@ -32,8 +32,6 @@ type Profile struct {
 	LabelPrefix                string
 	SandboxContainerPrefix     string
 	MigrationContainerPrefix   string
-	WatchdogUnitPrefix         string
-	RecoveryWatchdogUnitPrefix string
 	InternalWorkspaceDirectory string
 }
 
@@ -73,15 +71,6 @@ func (a ActiveProfile) Profile() (Profile, error) {
 		return Profile{}, err
 	}
 	return a.value, nil
-}
-
-// ProtectedHostProfiles returns the sole technical root that host execution
-// must protect.
-func (a ActiveProfile) ProtectedHostProfiles() ([]Profile, error) {
-	if err := a.Validate(); err != nil {
-		return nil, err
-	}
-	return []Profile{target}, nil
 }
 
 func (p Profile) DefaultConfigPath(configHome string) string {

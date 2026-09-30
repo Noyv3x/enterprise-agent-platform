@@ -47,8 +47,6 @@ type Config struct {
 	SandboxAgent        SandboxResources
 	SandboxChat         SandboxResources
 	SandboxChatIdle     time.Duration
-	HealthTimeout       time.Duration
-	DrainTimeout        time.Duration
 	LogMaxBytes         int64
 	LogBackups          int
 	CommandMaxBytes     int64
@@ -102,8 +100,6 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		SandboxAgent:        SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024},
 		SandboxChat:         SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256},
 		SandboxChatIdle:     3 * time.Minute,
-		HealthTimeout:       2 * time.Minute,
-		DrainTimeout:        5 * time.Minute,
 		LogMaxBytes:         10 << 20,
 		LogBackups:          5,
 		CommandMaxBytes:     1 << 20,
@@ -278,13 +274,11 @@ func set(c *Config, key, value string) error {
 		if err != nil || n < 1 {
 			return fmt.Errorf("health_timeout_seconds must be positive")
 		}
-		c.HealthTimeout = time.Duration(n) * time.Second
 	case "drain_timeout_seconds":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 {
 			return fmt.Errorf("drain_timeout_seconds must be positive")
 		}
-		c.DrainTimeout = time.Duration(n) * time.Second
 	case "log_max_size":
 		n, err := parseByteSize(value)
 		if err != nil || n < 1024 {

@@ -15,7 +15,6 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/control"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/journal"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
@@ -23,42 +22,6 @@ import (
 )
 
 var testActiveProfile = identity.CompileTimeActiveProfile()
-
-type observedFixedStackLocker struct {
-	mu        sync.Mutex
-	attempted chan struct{}
-	once      sync.Once
-}
-
-func newObservedFixedStackLocker() *observedFixedStackLocker {
-	locker := &observedFixedStackLocker{attempted: make(chan struct{})}
-	locker.mu.Lock()
-	return locker
-}
-
-func (l *observedFixedStackLocker) Lock() {
-	l.once.Do(func() { close(l.attempted) })
-	l.mu.Lock()
-}
-
-func (l *observedFixedStackLocker) Unlock() { l.mu.Unlock() }
-
-type firecrawlRunner struct{ calls chan []string }
-
-func (r firecrawlRunner) Run(_ context.Context, _ string, args []string, _ []string) (driver.Result, error) {
-	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
-		return driver.Result{Stdout: "[\"" + args[len(args)-1] + "\"]\n"}, nil
-	}
-	r.calls <- append([]string(nil), args...)
-	return driver.Result{}, nil
-}
-
-type blockingFirecrawlRunner struct {
-	started chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	calls   [][]string
-}
 
 func TestTriggeredReconciliationRunsBeforeThePeriodicDelay(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,30 +46,6 @@ func TestTriggeredReconciliationRunsBeforeThePeriodicDelay(t *testing.T) {
 	}
 }
 
-func (r *blockingFirecrawlRunner) Run(ctx context.Context, _ string, args []string, _ []string) (driver.Result, error) {
-	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
-		return driver.Result{Stdout: "[\"" + args[len(args)-1] + "\"]\n"}, nil
-	}
-	r.mu.Lock()
-	r.calls = append(r.calls, append([]string(nil), args...))
-	r.mu.Unlock()
-	if strings.Contains(strings.Join(args, " "), " up --detach --wait --wait-timeout 600 firecrawl-api") {
-		r.once.Do(func() { close(r.started) })
-		<-ctx.Done()
-		return driver.Result{}, ctx.Err()
-	}
-	return driver.Result{}, errors.New("unexpected diagnostic command after reconciliation cancellation")
-}
-
-func testFirecrawlImages(digestCharacter string) map[string]string {
-	image := "registry/firecrawl@sha256:" + strings.Repeat(digestCharacter, 64)
-	return map[string]string{
-		"firecrawl-api": image, "firecrawl-playwright": image,
-		"firecrawl-postgres": image, "firecrawl-redis": image,
-		"firecrawl-rabbitmq": image,
-	}
-}
-
 func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
 	last := time.Unix(100, 0)
 	if autoUpdateDue(last, last.Add(4*time.Minute+59*time.Second), 5*time.Minute) {
@@ -120,22 +59,6 @@ func TestAutoUpdateDueUsesConfiguredInterval(t *testing.T) {
 	}
 	if autoUpdateDue(last, last.Add(59*time.Second), 0) || !autoUpdateDue(last, last.Add(time.Minute), 0) {
 		t.Fatal("the fallback update interval is not one minute")
-	}
-}
-
-func TestFirecrawlRetryDelayBacksOffAndCaps(t *testing.T) {
-	tests := map[int]time.Duration{
-		0: time.Minute,
-		1: time.Minute,
-		2: 2 * time.Minute,
-		3: 4 * time.Minute,
-		6: 30 * time.Minute,
-		9: 30 * time.Minute,
-	}
-	for failures, expected := range tests {
-		if got := firecrawlRetryDelay(failures); got != expected {
-			t.Fatalf("firecrawlRetryDelay(%d) = %s, want %s", failures, got, expected)
-		}
 	}
 }
 
@@ -252,17 +175,17 @@ func TestCurrentRecoveryLoopRetriesUntilPendingStateConverges(t *testing.T) {
 func TestCapabilityReconciliationAllowsPreMaintenanceUpdate(t *testing.T) {
 	current := &model.Generation{
 		ID:     strings.Repeat("a", 40),
-		Images: map[string]string{"firecrawl-api": "registry/firecrawl@sha256:" + strings.Repeat("b", 64)},
+		Images: map[string]string{"camofox": "registry/camofox@sha256:" + strings.Repeat("b", 64)},
 	}
-	ready, ok := firecrawlManifest(model.ManagerState{Current: current})
-	if !ok || ready.SourceCommit != current.ID || ready.Images["firecrawl-api"] != current.Images["firecrawl-api"] {
+	ready, ok := capabilityManifest(model.ManagerState{Current: current})
+	if !ok || ready.SourceCommit != current.ID || ready.Images["camofox"] != current.Images["camofox"] {
 		t.Fatalf("idle generation was not eligible: manifest=%#v ok=%v", ready, ok)
 	}
-	ready.Images["firecrawl-api"] = "changed"
-	if current.Images["firecrawl-api"] == "changed" {
+	ready.Images["camofox"] = "changed"
+	if current.Images["camofox"] == "changed" {
 		t.Fatal("reconciliation manifest aliases durable state")
 	}
-	active, ok := firecrawlManifest(model.ManagerState{Current: current, ActiveOperationID: "op_pulling", Phase: model.PhasePulling})
+	active, ok := capabilityManifest(model.ManagerState{Current: current, ActiveOperationID: "op_pulling", Phase: model.PhasePulling})
 	if !ok || active.SourceCommit != current.ID {
 		t.Fatalf("pre-maintenance pull blocked current capability repair: manifest=%#v ok=%v", active, ok)
 	}
@@ -273,7 +196,7 @@ func TestCapabilityReconciliationAllowsPreMaintenanceUpdate(t *testing.T) {
 		{Current: current, Maintenance: true},
 	}
 	for _, state := range blocked {
-		if manifest, ok := firecrawlManifest(state); ok {
+		if manifest, ok := capabilityManifest(state); ok {
 			t.Fatalf("non-idle state was eligible: state=%#v manifest=%#v", state, manifest)
 		}
 	}
@@ -310,132 +233,6 @@ func TestReconciliationContextCancelsWhenMaintenanceBegins(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("maintenance did not cancel current-generation reconciliation")
-	}
-}
-
-func TestFirecrawlReconciliationCancellationYieldsToMaintenanceWithoutDiagnostics(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	generation := strings.Repeat("a", 40)
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: generation, Images: testFirecrawlImages("b")}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	root := t.TempDir()
-	runner := &blockingFirecrawlRunner{started: make(chan struct{})}
-	app := &application{
-		state: store,
-		docker: &driver.DockerCLI{Profile: testActiveProfile,
-			Runner: runner, Binary: "docker", ComposeProject: "test",
-			ComposeFile:   filepath.Join(root, "compose.yaml"),
-			GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data"),
-			StateDir: filepath.Join(root, "state"),
-		},
-		fixedStackMu: &sync.Mutex{},
-	}
-	result := make(chan error, 1)
-	go func() { result <- app.reconcileFirecrawl(context.Background()) }()
-	select {
-	case <-runner.started:
-	case <-time.After(time.Second):
-		t.Fatal("Firecrawl reconciliation did not start")
-	}
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Maintenance = true
-		state.PublicState = model.StateUpdating
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Fatalf("maintenance cancellation was reported as a reconciliation failure: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("maintenance cancellation did not promptly release Firecrawl reconciliation")
-	}
-	runner.mu.Lock()
-	defer runner.mu.Unlock()
-	if len(runner.calls) != 1 {
-		t.Fatalf("maintenance cancellation ran diagnostics or another mutation: %#v", runner.calls)
-	}
-}
-
-func TestFirecrawlReconciliationLocksBeforeReadingCurrentGeneration(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstID := strings.Repeat("a", 40)
-	secondID := strings.Repeat("b", 40)
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: firstID, Images: testFirecrawlImages("c")}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	locker := newObservedFixedStackLocker()
-	locked := true
-	defer func() {
-		if locked {
-			locker.mu.Unlock()
-		}
-	}()
-	calls := make(chan []string, 1)
-	root := t.TempDir()
-	app := &application{
-		state: store,
-		docker: &driver.DockerCLI{Profile: testActiveProfile,
-			Runner: firecrawlRunner{calls: calls}, ComposeProject: "test", ComposeFile: filepath.Join(root, "compose.yaml"),
-			GenerationDir: filepath.Join(root, "releases"), DataRoot: filepath.Join(root, "data"), StateDir: filepath.Join(root, "state"),
-		},
-		fixedStackMu: locker,
-	}
-	done := make(chan struct{})
-	go func() {
-		app.reconcileFirecrawl(context.Background())
-		close(done)
-	}()
-	select {
-	case <-locker.attempted:
-	case <-time.After(time.Second):
-		t.Fatal("Firecrawl reconciliation did not attempt to acquire the fixed-stack mutex")
-	}
-	select {
-	case args := <-calls:
-		t.Fatalf("Firecrawl touched Compose while the fixed-stack mutex was held: %v", args)
-	default:
-	}
-	if _, err := store.MutateState(time.Now(), func(state *model.ManagerState) error {
-		state.Current = &model.Generation{ID: secondID, Images: testFirecrawlImages("d")}
-		state.ActiveOperationID = "op_pulling"
-		state.Phase = model.PhasePulling
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	locker.mu.Unlock()
-	locked = false
-
-	select {
-	case args := <-calls:
-		joined := strings.Join(args, " ")
-		if !strings.Contains(joined, filepath.Join("releases", secondID, "compose.env")) || strings.Contains(joined, filepath.Join("releases", firstID, "compose.env")) {
-			t.Fatalf("reconciliation did not use the generation selected under the mutex: %s", joined)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Firecrawl reconciliation did not reach Compose after mutex release")
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("Firecrawl reconciliation did not finish")
 	}
 }
 

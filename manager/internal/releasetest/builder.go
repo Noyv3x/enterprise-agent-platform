@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -154,10 +153,7 @@ func managerRelease(version, baseURL string, binaries map[string][]byte) release
 func managedImages(sharedDigest string) map[string]string {
 	names := []string{
 		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-		"firecrawl-redis", "firecrawl-rabbitmq",
 	}
-	sort.Strings(names)
 	images := make(map[string]string, len(names))
 	for _, name := range names {
 		digest := sharedDigest

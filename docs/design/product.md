@@ -37,4 +37,4 @@ Removed-feature tables and files remain untouched for rollback; they are not act
 
 ## Delivery boundary
 
-R1 installs Manager M1 while retaining the legacy application and ten-image release. R2 installs this Pi-native product with five images and requires M1 first. Full local checks and isolated production-host staging with copied data and a real model precede release; see [deployment](../operations/deployment.md).
+The Pi-native product uses five images. Manager simplification requires a settled launcher-based installation and five-image retained generations; existing legacy data stays untouched. Full local checks and isolated staging with copied data and a real model precede release; see [deployment](../operations/deployment.md).

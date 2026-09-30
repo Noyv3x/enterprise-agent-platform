@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -69,11 +70,14 @@ type recordedCall struct {
 }
 
 type recordingRunner struct {
+	mu      sync.Mutex
 	calls   []recordedCall
 	results func([]string) (Result, error)
 }
 
 func (r *recordingRunner) Run(_ context.Context, name string, args []string, _ []string) (Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, recordedCall{name: name, args: append([]string(nil), args...)})
 	if r.results != nil {
 		return r.results(args)
@@ -82,12 +86,15 @@ func (r *recordingRunner) Run(_ context.Context, name string, args []string, _ [
 }
 
 type pullTestRunner struct {
+	mu      sync.Mutex
 	calls   [][]string
 	present map[string]bool
 	pull    func(context.Context, string, func()) (Result, error)
 }
 
 func (r *pullTestRunner) Run(_ context.Context, _ string, args []string, _ []string) (Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if reflect.DeepEqual(args, []string{"info", "--format", "{{.DockerRootDir}}"}) {
 		return Result{Stdout: os.TempDir() + "\n"}, nil
 	}
@@ -112,14 +119,18 @@ func pullTestDocker(runner Runner, idle, absolute time.Duration) DockerCLI {
 }
 
 func (r *pullTestRunner) RunWithActivity(ctx context.Context, _ string, args []string, _ []string, activity func()) (Result, error) {
+	r.mu.Lock()
 	r.calls = append(r.calls, append([]string(nil), args...))
-	if r.pull == nil {
-		r.present[args[len(args)-1]] = true
-		return Result{}, nil
+	r.mu.Unlock()
+	var result Result
+	var err error
+	if r.pull != nil {
+		result, err = r.pull(ctx, args[len(args)-1], activity)
 	}
-	result, err := r.pull(ctx, args[len(args)-1], activity)
 	if err == nil {
+		r.mu.Lock()
 		r.present[args[len(args)-1]] = true
+		r.mu.Unlock()
 	}
 	return result, err
 }
@@ -130,7 +141,6 @@ func pullTestManifest() release.Manifest {
 		"agent-runtime": "registry.example/runtime@sha256:" + strings.Repeat("b", 64),
 		"agent-sandbox": "registry.example/sandbox@sha256:" + strings.Repeat("c", 64),
 		"camofox":       "registry.example/camofox@sha256:" + strings.Repeat("d", 64),
-		"firecrawl-api": "registry.example/firecrawl@sha256:" + strings.Repeat("e", 64),
 		"searxng":       "registry.example/searxng@sha256:" + strings.Repeat("f", 64),
 	}}
 }
@@ -223,7 +233,7 @@ func TestPullPrefetchesSandboxAndSkipsPresentDigests(t *testing.T) {
 			pulled = append(pulled, call[1])
 		}
 	}
-	if !reflect.DeepEqual(pulled, []string{manifest.Images["agent-runtime"], manifest.Images["agent-sandbox"]}) {
+	if len(pulled) != 2 || !slicesContain(pulled, manifest.Images["agent-runtime"]) || !slicesContain(pulled, manifest.Images["agent-sandbox"]) {
 		t.Fatalf("update pulls = %v", pulled)
 	}
 	if !runner.present[manifest.Images["agent-sandbox"]] {
@@ -252,7 +262,7 @@ func TestPullRejectsSuccessfulCommandWithoutExactRepoDigest(t *testing.T) {
 		}
 	}}
 	docker := pullTestDocker(runner, time.Second, 2*time.Second)
-	err := docker.Pull(context.Background(), manifest)
+	err := docker.PrepareManagedImage(context.Background(), "platform", platform)
 	if err == nil || !strings.Contains(err.Error(), "exact RepoDigest is absent") {
 		t.Fatalf("post-pull proof error = %v", err)
 	}
@@ -271,7 +281,7 @@ func TestPullFailsAfterOutputIdleTimeoutWithLogicalImageName(t *testing.T) {
 	}
 	docker := pullTestDocker(runner, 250*time.Millisecond, 2*time.Second)
 	started := time.Now()
-	err := docker.Pull(context.Background(), manifest)
+	err := docker.PrepareManagedImage(context.Background(), "platform", manifest.Images["platform"])
 	if err == nil || !strings.Contains(err.Error(), "managed image platform") || !strings.Contains(err.Error(), "no output for 250ms") {
 		t.Fatalf("idle pull error = %v", err)
 	}
@@ -325,7 +335,7 @@ func TestPullAbsoluteLimitWinsDespiteContinuousProgress(t *testing.T) {
 		},
 	}
 	docker := pullTestDocker(runner, 250*time.Millisecond, 400*time.Millisecond)
-	err := docker.Pull(context.Background(), manifest)
+	err := docker.PrepareManagedImage(context.Background(), "platform", manifest.Images["platform"])
 	if err == nil || !strings.Contains(err.Error(), "managed image platform") || !strings.Contains(err.Error(), "exceeded absolute limit 400ms") {
 		t.Fatalf("absolute pull error = %v", err)
 	}
@@ -604,65 +614,6 @@ func TestStopFixedRejectsUnstoppedWriters(t *testing.T) {
 				t.Fatal("stop admitted a snapshot without proving all fixed writers stopped")
 			}
 		})
-	}
-}
-
-func TestReconcileFirecrawlStartsPostgreSQLStackOnce(t *testing.T) {
-	runner := &recordingRunner{}
-	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "agent-platform"}
-	if err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env"); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("Firecrawl reconciliation made %d calls, want one: %#v", len(runner.calls), runner.calls)
-	}
-	command := strings.Join(runner.calls[0].args, " ")
-	if !strings.Contains(command, "up --detach --wait --wait-timeout 600 firecrawl-api") {
-		t.Fatalf("unexpected Firecrawl start command: %s", command)
-	}
-	if strings.Contains(strings.ToLower(command), "foundationdb") {
-		t.Fatalf("PostgreSQL Firecrawl start referenced FoundationDB: %s", command)
-	}
-}
-
-func TestReconcileFirecrawlReportsFailureWithoutMutatingServices(t *testing.T) {
-	services := []string{
-		"firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq",
-		"firecrawl-postgres", "firecrawl-api",
-	}
-	ids := make(map[string]string, len(services))
-	for index, service := range services {
-		ids[service] = strings.Repeat(string("abcdef0123456789"[index]), 64)
-	}
-	starts := 0
-	runner := &recordingRunner{results: func(args []string) (Result, error) {
-		joined := strings.Join(args, " ")
-		switch {
-		case strings.Contains(joined, " up --detach --wait --wait-timeout 600 firecrawl-api"):
-			starts++
-			return Result{}, errors.New("Firecrawl API is unhealthy")
-		case slicesContain(args, "logs"):
-			return Result{Stdout: "api failed"}, nil
-		case slicesContain(args, "ps"):
-			return Result{Stdout: ids[args[len(args)-1]]}, nil
-		case len(args) > 0 && args[0] == "inspect":
-			return Result{Stdout: `{}`}, nil
-		}
-		return Result{}, nil
-	}}
-	docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker", ComposeFile: "/release/compose.yaml", ComposeProject: "agent-platform"}
-	err := docker.reconcileFirecrawl(context.Background(), "/state/compose.env")
-	if err == nil || !strings.Contains(err.Error(), "start Firecrawl PostgreSQL stack: Firecrawl API is unhealthy") || !strings.Contains(err.Error(), "api failed") {
-		t.Fatalf("reconcileFirecrawl() error = %v", err)
-	}
-	if starts != 1 {
-		t.Fatalf("failed Firecrawl start was attempted %d times in one reconciliation, want one", starts)
-	}
-	for _, call := range runner.calls {
-		joined := strings.Join(call.args, " ")
-		if strings.Contains(joined, " rm ") || strings.Contains(joined, " restart ") || strings.Contains(strings.ToLower(joined), "foundationdb") {
-			t.Fatalf("failed PostgreSQL Firecrawl reconciliation mutated services: %s", joined)
-		}
 	}
 }
 
@@ -1061,12 +1012,8 @@ func TestProbeInspectsExactlyOneHealthyRunningContainerPerCoreService(t *testing
 	}
 }
 
-func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T) {
-	services := []string{
-		"platform", "agent-runtime", "camofox", "searxng",
-		"firecrawl-playwright", "firecrawl-redis", "firecrawl-rabbitmq", "firecrawl-postgres",
-		"firecrawl-api",
-	}
+func TestFixedServiceStatusReportsCapabilitiesIndependently(t *testing.T) {
+	services := []string{"platform", "agent-runtime", "camofox", "searxng"}
 	ids := map[string]string{}
 	for index, service := range services {
 		ids[service] = strings.Repeat(string("abcdef0123456789"[index]), 64)
@@ -1078,7 +1025,7 @@ func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T)
 		if len(args) > 0 && args[0] == "inspect" {
 			id := args[len(args)-1]
 			switch id {
-			case ids["firecrawl-redis"]:
+			case ids["camofox"]:
 				return Result{Stdout: "running unhealthy"}, nil
 			default:
 				return Result{Stdout: "running healthy"}, nil
@@ -1099,11 +1046,10 @@ func TestFixedServiceStatusReportsFirecrawlComponentsIndependently(t *testing.T)
 			t.Fatalf("fixed service status exposed retired service %s", retired)
 		}
 	}
-	if status["firecrawl-redis"].Status != "unavailable" ||
-		status["firecrawl-api"].Status != "healthy" {
-		t.Fatalf("independent Firecrawl service status = %#v", status)
+	if status["camofox"].Status != "unavailable" {
+		t.Fatalf("independent capability service status = %#v", status)
 	}
-	for _, service := range []string{"platform", "agent-runtime", "camofox", "searxng", "firecrawl-playwright", "firecrawl-rabbitmq", "firecrawl-postgres"} {
+	for _, service := range []string{"platform", "agent-runtime", "searxng"} {
 		if status[service].Status != "healthy" {
 			t.Fatalf("service %s status = %#v", service, status[service])
 		}

@@ -57,7 +57,6 @@ type application struct {
 	sandboxes         *sandbox.Manager
 	selfUpdate        *selfupdate.Manager
 	snapshots         snapshot.Store
-	processes         *executor.ProcessManager
 	audit             *logstore.Store
 	api               *control.API
 	fixedStackMu      sync.Locker
@@ -182,23 +181,10 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 	if err := selfUpdater.RequireSupervisor(); err != nil {
 		return nil, err
 	}
-	supervised, err := selfUpdater.SupervisedStartup()
-	if err != nil {
+	if _, err := selfUpdater.SupervisedStartup(); err != nil {
 		return nil, err
 	}
-	var state *journal.Store
-	if supervised {
-		transition, err := selfUpdater.SupervisedTransition()
-		if err != nil {
-			return nil, err
-		}
-		state, err = journal.OpenWithTransition(cfg.StateDir, time.Now(), transition.SourceCommit)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		state, err = journal.Open(cfg.StateDir, time.Now())
-	}
+	state, err := journal.Open(cfg.StateDir, time.Now())
 	if err != nil {
 		return nil, err
 	}
@@ -234,32 +220,31 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 		default:
 		}
 	}
-	execution, processes, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes)
+	execution, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes)
 	if err != nil {
 		return nil, err
 	}
-	ops.LocalActiveProcesses = processes.ActiveBackgroundCount
 	configs := config.NewManager(cfg)
 	runningSHA, err := runningExecutableSHA256()
 	if err != nil {
 		return nil, fmt.Errorf("identify running Manager executable: %w", err)
 	}
 	api := &control.API{Store: state, Operations: ops, Engine: docker, Executor: execution, Config: configs, AuditLog: audit, ControlToken: controlToken, ExecutorToken: executorToken, ManagerVersion: version, ManagerSHA256: runningSHA}
-	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, processes: processes, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake}
+	app := &application{config: cfg, configs: configs, state: state, docker: docker, operations: ops, sandboxes: sandboxes, selfUpdate: selfUpdater, snapshots: snapshots, audit: audit, api: api, fixedStackMu: fixedStackMu, maintenanceMu: maintenanceMu, maintenanceWake: maintenanceWake}
 	sandboxes.ReclaimCapacity = app.reconcileMaintenance
 	return app, nil
 }
 
-func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64) (*executor.Service, *executor.ProcessManager, error) {
+func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64) (*executor.Service, error) {
 	processes, err := executor.NewProcessManager(active, engine, sandboxes, commandMaxBytes)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	files, err := executor.NewFileService(active, sandboxes, 10<<20)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return &executor.Service{Audits: executor.AuditStore{Dir: auditDir, Log: audit}, Processes: processes, Files: files}, processes, nil
+	return &executor.Service{Audits: executor.AuditStore{Dir: auditDir, Log: audit}, Processes: processes, Files: files}, nil
 }
 
 func preflightCommand(arguments []string) error {
@@ -319,6 +304,12 @@ func serveCommandWithBuild(arguments []string, cfg config.Config, builder func(c
 	app, err := builder(cfg)
 	if err != nil {
 		return err
+	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	err = app.sandboxes.StopRunning(cleanupCtx)
+	cleanupCancel()
+	if err != nil {
+		return fmt.Errorf("stop managed sandboxes before executor startup: %w", err)
 	}
 	listener, err := control.Listen(app.config.SocketPath)
 	if err != nil {
@@ -395,9 +386,6 @@ func serveCommandWithBuild(arguments []string, cfg config.Config, builder func(c
 	go app.background(ctx)
 	select {
 	case <-ctx.Done():
-		if !app.processes.ShutdownHost() {
-			return errors.New("one or more host process groups could not be terminated during Manager shutdown")
-		}
 		shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdown)
@@ -536,7 +524,6 @@ func (a *application) background(ctx context.Context) {
 	defer sandboxTicker.Stop()
 	defer updateTicker.Stop()
 	go runReconciliationLoop(ctx, 2*time.Second, capabilityRetryDelay, a.reconcileCapabilities)
-	go runReconciliationLoop(ctx, 5*time.Second, firecrawlRetryDelay, a.reconcileFirecrawl)
 	go runTriggeredReconciliationLoop(ctx, 3*time.Minute, maintenanceRetryDelay, a.maintenanceWake, a.reconcileMaintenance)
 	a.runBackground(ctx, sandboxTicker.C, updateTicker.C)
 }
@@ -637,7 +624,7 @@ func runTriggeredReconciliationLoop(
 	}
 }
 
-func firecrawlManifest(state model.ManagerState) (release.Manifest, bool) {
+func capabilityManifest(state model.ManagerState) (release.Manifest, bool) {
 	if state.Current == nil || state.FinalizePendingOperationID != "" || state.Maintenance {
 		return release.Manifest{}, false
 	}
@@ -680,49 +667,6 @@ func (a *application) reconciliationContext(parent context.Context, generation s
 	}
 }
 
-func (a *application) reconcileFirecrawl(ctx context.Context) error {
-	err := a.reconcileFirecrawlAttempt(ctx)
-	if driver.IsInsufficientCapacity(err) {
-		if reclaimErr := a.reconcileMaintenance(ctx); reclaimErr != nil {
-			err = errors.Join(err, fmt.Errorf("reclaim capacity before Firecrawl retry: %w", reclaimErr))
-		} else {
-			err = a.reconcileFirecrawlAttempt(ctx)
-		}
-	}
-	if err != nil && a.audit != nil {
-		state := a.state.State()
-		generation := ""
-		if state.Current != nil {
-			generation = state.Current.ID
-		}
-		_ = a.audit.Append(logstore.Event{
-			At:      time.Now().UTC(),
-			Type:    "firecrawl.reconcile_failed",
-			Details: map[string]any{"generation": generation},
-			Error:   journal.BoundDiagnostic(err.Error()),
-		})
-	}
-	return err
-}
-
-func (a *application) reconcileFirecrawlAttempt(ctx context.Context) error {
-	if a.fixedStackMu != nil {
-		a.fixedStackMu.Lock()
-		defer a.fixedStackMu.Unlock()
-	}
-	manifest, ready := firecrawlManifest(a.state.State())
-	if !ready {
-		return nil
-	}
-	reconcileCtx, finish := a.reconciliationContext(ctx, manifest.ID(), 25*time.Minute)
-	defer finish()
-	err := a.docker.ReconcileFirecrawl(reconcileCtx, manifest)
-	if errors.Is(reconcileCtx.Err(), context.Canceled) {
-		return nil
-	}
-	return err
-}
-
 func (a *application) reconcileCapabilities(ctx context.Context) error {
 	err := a.reconcileCapabilitiesAttempt(ctx)
 	if driver.IsInsufficientCapacity(err) {
@@ -753,7 +697,7 @@ func (a *application) reconcileCapabilitiesAttempt(ctx context.Context) error {
 		a.fixedStackMu.Lock()
 		defer a.fixedStackMu.Unlock()
 	}
-	manifest, ready := firecrawlManifest(a.state.State())
+	manifest, ready := capabilityManifest(a.state.State())
 	if !ready {
 		return nil
 	}
@@ -776,20 +720,6 @@ func capabilityRetryDelay(failures int) time.Duration {
 	}
 	if delay > 10*time.Minute {
 		return 10 * time.Minute
-	}
-	return delay
-}
-
-func firecrawlRetryDelay(failures int) time.Duration {
-	if failures <= 0 {
-		return time.Minute
-	}
-	delay := time.Minute
-	for attempt := 1; attempt < failures && delay < 30*time.Minute; attempt++ {
-		delay *= 2
-	}
-	if delay > 30*time.Minute {
-		return 30 * time.Minute
 	}
 	return delay
 }
@@ -1202,8 +1132,12 @@ func awaitOperationContext(ctx context.Context, client control.Client, id string
 		}
 		if err != nil {
 			// Only the read is replayed: a child swap must never resubmit the
-			// mutation. Missing sockets and interrupted responses are expected.
-			if !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ECONNRESET) &&
+			// mutation. Socket interruptions and the selected child's pending
+			// startup proof are transient; other HTTP failures are deterministic.
+			var responseErr *control.HTTPError
+			starting := errors.As(err, &responseErr) && responseErr.Status == http.StatusServiceUnavailable &&
+				strings.TrimSpace(responseErr.Message) == "launcher startup proof pending"
+			if !starting && !errors.Is(err, syscall.ECONNREFUSED) && !errors.Is(err, syscall.ECONNRESET) &&
 				!errors.Is(err, os.ErrNotExist) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				return err
 			}

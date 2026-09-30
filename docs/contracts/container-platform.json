@@ -10,41 +10,10 @@
     "agent_env": "/opt/agent-env"
   },
   "execution_targets": [
-    "sandbox",
-    "host"
+    "sandbox"
   ],
   "persistent_data_owners": {
-    "searxng": [],
-    "firecrawl-redis": [
-      {
-        "uid": 999,
-        "gid": 0
-      },
-      {
-        "uid": 999,
-        "gid": 1000
-      }
-    ],
-    "firecrawl-rabbitmq": [
-      {
-        "uid": 999,
-        "gid": 0
-      },
-      {
-        "uid": 999,
-        "gid": 999
-      }
-    ],
-    "firecrawl-postgres": [
-      {
-        "uid": 999,
-        "gid": 0
-      },
-      {
-        "uid": 999,
-        "gid": 999
-      }
-    ]
+    "searxng": []
   },
   "sandbox_idle_seconds": 1800,
   "migration_backup_retention_seconds": 604800,

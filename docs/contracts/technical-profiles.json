@@ -41,9 +41,7 @@
       "labels": {
         "prefix": "io.agent-platform",
         "sandbox_container_prefix": "agent-platform-sandbox-",
-        "migration_container_prefix": "agent-platform-migration-",
-        "watchdog_unit_prefix": "agent-platform-manager-watchdog-",
-        "recovery_watchdog_unit_prefix": "agent-platform-manager-watchdog-current-recovery-"
+        "migration_container_prefix": "agent-platform-migration-"
       },
       "workspace": {
         "internal_directory": ".agent-platform",

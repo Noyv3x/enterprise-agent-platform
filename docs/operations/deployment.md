@@ -6,13 +6,13 @@ Production uses a host Manager with managed Docker containers. See [automatic up
 
 Linux, Docker Engine, Compose v2, user-level systemd and a deployment user permitted to use Docker are required. The user's account home must exist, be owned by that user, not be a symlink and not be group/world writable. The production host needs no source checkout, Python virtualenv or Node installation.
 
-**Install R1 / Manager M1 before R2.** Current N+1 installs M1 through its normal self-update while R1 still ships ten images and the legacy application. Confirm the M1 update is settled and healthy before accepting R2's five-image catalog. R2 must not be offered directly to an older Manager. Manager simplification beyond M1 is a later release.
+**Install R1 / Manager M1 before R2.** M1 introduced five-image catalog support through the normal launcher self-update; R2 must not be offered directly to an older Manager. Before installing the simplified Manager, confirm the current and retained rollback releases both use five-image catalogs and the preceding update is settled and healthy. The simplified Manager rejects ten-image catalogs; legacy data remains untouched.
 
 ## Topology
 
 The independent launcher and Manager run under `agent-platform-manager.service`. Manager owns public ingress, maintenance mode, Docker and audited execution. Platform contains the frontend; Runtime, Camofox and SearXNG remain private. Business containers never receive the Docker socket. Persistent state uses bind mounts, not anonymous volumes.
 
-R2 image keys: `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`. Firecrawl services are absent, not unavailable dependencies. Platform binds to host loopback; publish through Manager, optionally behind a TLS reverse proxy. Explicit LAN/CIDR configuration is required for direct network access.
+The only accepted image keys are `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`; all five are required, and unknown keys are rejected. Firecrawl services are absent, not unavailable dependencies. Platform binds to host loopback; publish through Manager, optionally behind a TLS reverse proxy. Explicit LAN/CIDR configuration is required for direct network access.
 
 ## Installation and management
 

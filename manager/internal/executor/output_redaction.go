@@ -2,14 +2,12 @@ package executor
 
 import (
 	"bytes"
-	"encoding/json"
 	"regexp"
 	"strings"
 )
 
-// Introducers, rather than complete secrets, let both implementations suppress
-// arbitrarily long values without retaining them or exposing a partial token.
-// Patterns use the common Go/Python ASCII regex subset. Order breaks ties.
+// Introducers, rather than complete secrets, suppress arbitrarily long values
+// without retaining them or exposing a partial token. Order breaks ties.
 // RequiredAny contains a mandatory punctuation byte, or all case variants of
 // one mandatory letter (b/c/z have no non-ASCII Unicode simple-fold variants).
 // Provider prefixes all contain -/_/., except AIza/gAAAA/AKIA (A) and eyJ (J).
@@ -238,130 +236,3 @@ func redactRetainedText(value string) string {
 	redactor.Flush(emit)
 	return output.String()
 }
-
-// The wrapper receives policy as generated code, not a new protocol field.
-func sandboxOutputRedactorPython() string {
-	policy, _ := json.Marshal(outputRedactionRules)
-	return "import json, re\n_OUTPUT_RULES = [(re.compile(p['pattern'].encode('ascii')), p['mode'], p['keep'], p['required_any'].encode('ascii'), p['min_whitespace']) for p in json.loads(" + strconvPythonString(string(policy)) + ")]\n" + outputRedactorPython
-}
-
-func strconvPythonString(value string) string {
-	encoded, _ := json.Marshal(value)
-	return string(encoded)
-}
-
-const outputRedactorPython = `
-class OutputRedactor:
-    def __init__(self):
-        self.pending = b''
-        self.mode = ''
-        self.quote = 0
-        self.escaped = False
-        self.url_masked = False
-        self.previewing = False
-    def preview(self):
-        clone = OutputRedactor()
-        clone.__dict__.update(self.__dict__)
-        clone.previewing = True
-        return clone.feed(b'', final=True)
-    def feed(self, data, final=False):
-        output = []
-        for offset in range(0, len(data), 512):
-            self.pending += data[offset:offset + 512]
-            self.drain(False, output)
-        if final:
-            self.drain(True, output)
-        return b''.join(output)
-    def drain(self, final, output):
-        while self.pending:
-            if self.mode == 'pem':
-                end = re.search(b'-----END[A-Z ]*PRIVATE KEY-----', self.pending)
-                if end:
-                    self.pending = self.pending[end.end():]
-                    self.mode = ''
-                    continue
-                self.pending = b'' if final else self.pending[-512:]
-                return
-            if self.mode == 'url':
-                end = next((i for i, b in enumerate(self.pending) if b in b'/?# \t\r\n"\''), -1)
-                if end < 0 and self.previewing:
-                    if not self.url_masked:
-                        output.append(b'[redacted]')
-                    self.pending = b''
-                    return
-                if end < 0 and not final:
-                    if len(self.pending) > 512:
-                        if not self.url_masked:
-                            output.append(b'[redacted]')
-                            self.url_masked = True
-                        self.pending = b''
-                    return
-                if end < 0:
-                    end = len(self.pending)
-                authority = self.pending[:end]
-                if not self.url_masked:
-                    at = authority.rfind(b'@')
-                    colon = authority.rfind(b':')
-                    incomplete = colon >= 0 and not authority.startswith(b'[') and bool(authority[colon+1:].strip(b'0123456789'))
-                    output.append(b'[redacted]@' + authority[at+1:] if at >= 0 else b'[redacted]' if incomplete else authority)
-                self.pending = self.pending[end:]
-                self.mode = ''
-                self.url_masked = False
-                continue
-            if self.mode:
-                b = self.pending[0]
-                if self.mode == 'value':
-                    if b in b' \t=:':
-                        self.pending = self.pending[1:]
-                        continue
-                    if b in b'"\'':
-                        self.quote = b
-                        self.mode = 'quoted'
-                        output.append(self.pending[:1])
-                        self.pending = self.pending[1:]
-                        continue
-                    self.mode = 'token'
-                if self.mode == 'quoted':
-                    self.pending = self.pending[1:]
-                    if self.escaped:
-                        self.escaped = False
-                    elif b == 92:
-                        self.escaped = True
-                    elif b == self.quote:
-                        output.append(bytes([b]))
-                        self.mode = ''
-                    continue
-                stop = b in (b' \t\r\n,;"\'&|<>)}' if self.mode == 'token' else b'\r\n')
-                if stop:
-                    self.mode = ''
-                    continue
-                self.pending = self.pending[1:]
-                continue
-            selected = None
-            for pattern, mode, keep, required_any, min_whitespace in _OUTPUT_RULES:
-                if not any(b in self.pending for b in required_any):
-                    continue
-                if min_whitespace and self.pending.count(b' ') + self.pending.count(b'\t') < min_whitespace:
-                    continue
-                match = pattern.search(self.pending)
-                if match and (selected is None or match.start() < selected[0].start()):
-                    selected = (match, mode, keep)
-            safe = len(self.pending) if final else max(0, len(self.pending) - 512)
-            if selected is None or selected[0].start() >= safe:
-                output.append(self.pending[:safe])
-                self.pending = self.pending[safe:]
-                return
-            match, mode, keep = selected
-            output.append(self.pending[:match.start()])
-            if keep:
-                output.append(match.group())
-            if mode != 'url':
-                output.append(b'[redacted]')
-            self.pending = self.pending[match.end():]
-            self.mode = mode
-        if final:
-            self.mode = ''
-            self.quote = 0
-            self.escaped = False
-            self.url_masked = False
-`

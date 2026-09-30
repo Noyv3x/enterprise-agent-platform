@@ -19,22 +19,21 @@ import (
 )
 
 type Record struct {
-	SandboxID           string     `json:"sandbox_id"`
-	SandboxHash         string     `json:"sandbox_hash"`
-	WorkspaceID         string     `json:"workspace_id"`
-	Profile             string     `json:"profile,omitempty"`
-	UID                 int        `json:"uid"`
-	GID                 int        `json:"gid"`
-	WorkspacePath       string     `json:"workspace_path"`
-	HomePath            string     `json:"home_path"`
-	EnvironmentPath     string     `json:"environment_path"`
-	AttachmentsPath     string     `json:"attachments_path"`
-	ContainerName       string     `json:"container_name"`
-	Image               string     `json:"image"`
-	LastActivityAt      time.Time  `json:"last_activity_at"`
-	ActiveCalls         int        `json:"active_calls"`
-	BackgroundProcesses int        `json:"background_processes"`
-	StoppedAt           *time.Time `json:"stopped_at,omitempty"`
+	SandboxID       string     `json:"sandbox_id"`
+	SandboxHash     string     `json:"sandbox_hash"`
+	WorkspaceID     string     `json:"workspace_id"`
+	Profile         string     `json:"profile,omitempty"`
+	UID             int        `json:"uid"`
+	GID             int        `json:"gid"`
+	WorkspacePath   string     `json:"workspace_path"`
+	HomePath        string     `json:"home_path"`
+	EnvironmentPath string     `json:"environment_path"`
+	AttachmentsPath string     `json:"attachments_path"`
+	ContainerName   string     `json:"container_name"`
+	Image           string     `json:"image"`
+	LastActivityAt  time.Time  `json:"last_activity_at"`
+	ActiveCalls     int        `json:"active_calls"`
+	StoppedAt       *time.Time `json:"stopped_at,omitempty"`
 }
 
 type registry struct {
@@ -62,7 +61,6 @@ type Manager struct {
 	ensureMu        sync.Mutex
 	ensureByID      map[string]*sync.Mutex
 	profile         identity.Profile
-	protected       []identity.Profile
 }
 
 func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
@@ -70,11 +68,7 @@ func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePat
 	if err != nil {
 		return nil, fmt.Errorf("Sandbox technical profile: %w", err)
 	}
-	protected, err := active.ProtectedHostProfiles()
-	if err != nil {
-		return nil, fmt.Errorf("Sandbox protected technical profiles: %w", err)
-	}
-	manager := &Manager{Engine: engine, DataDir: filepath.Clean(dataDir), StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: sandboxRegistrySchemaVersion, TechnicalProfile: profile.ProfileID, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}, profile: profile, protected: protected}
+	manager := &Manager{Engine: engine, DataDir: filepath.Clean(dataDir), StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: sandboxRegistrySchemaVersion, TechnicalProfile: profile.ProfileID, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}, profile: profile}
 	manager.AgentResources = config.SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024}
 	manager.ChatResources = config.SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256}
 	manager.ChatIdle = 3 * time.Minute
@@ -175,9 +169,9 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 
 	var replacement *replacementState
 	if exists && existing.Image != "" && existing.Image != spec.Image {
-		if existing.ActiveCalls > 0 || existing.BackgroundProcesses > 0 {
+		if existing.ActiveCalls > 0 {
 			// A busy sandbox remains pinned to its recorded digest. The next Ensure
-			// after its managed processes drain will perform the replacement.
+			// after its active calls drain will perform the replacement.
 			spec.Image = existing.Image
 		} else {
 			wasRunning, runningErr := m.Engine.SandboxRunning(ctx, existing.ContainerName)
@@ -255,7 +249,7 @@ func (m *Manager) BeginCall(sandboxID string, now time.Time) error {
 	}
 	return nil
 }
-func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Time) error {
+func (m *Manager) EndCall(sandboxID string, now time.Time) error {
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
 	m.mu.Lock()
@@ -267,25 +261,6 @@ func (m *Manager) EndCall(sandboxID string, backgroundStarted bool, now time.Tim
 	if record.ActiveCalls > 0 {
 		record.ActiveCalls--
 	}
-	if backgroundStarted {
-		record.BackgroundProcesses++
-	}
-	record.LastActivityAt = now.UTC()
-	m.registry.Records[sandboxID] = record
-	return m.persistLocked()
-}
-func (m *Manager) ProcessExited(sandboxID string, now time.Time) error {
-	unlock := m.lockEnsure(sandboxID)
-	defer unlock()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	record, ok := m.registry.Records[sandboxID]
-	if !ok {
-		return errors.New("sandbox is not registered")
-	}
-	if record.BackgroundProcesses > 0 {
-		record.BackgroundProcesses--
-	}
 	record.LastActivityAt = now.UTC()
 	m.registry.Records[sandboxID] = record
 	return m.persistLocked()
@@ -295,7 +270,7 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 	m.mu.Lock()
 	candidates := make([]Record, 0)
 	for _, record := range m.registry.Records {
-		if record.StoppedAt == nil && record.ActiveCalls == 0 && record.BackgroundProcesses == 0 && now.Sub(record.LastActivityAt) >= m.idleFor(record.Profile) {
+		if record.StoppedAt == nil && record.ActiveCalls == 0 && now.Sub(record.LastActivityAt) >= m.idleFor(record.Profile) {
 			candidates = append(candidates, record)
 		}
 	}
@@ -305,7 +280,7 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 		unlock := m.lockEnsure(record.SandboxID)
 		m.mu.Lock()
 		current, exists := m.registry.Records[record.SandboxID]
-		eligible := exists && current.StoppedAt == nil && current.ActiveCalls == 0 && current.BackgroundProcesses == 0 && now.Sub(current.LastActivityAt) >= m.idleFor(current.Profile)
+		eligible := exists && current.StoppedAt == nil && current.ActiveCalls == 0 && now.Sub(current.LastActivityAt) >= m.idleFor(current.Profile)
 		m.mu.Unlock()
 		if !eligible {
 			unlock()
@@ -343,7 +318,7 @@ func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string,
 	desired := m.Image
 	candidates := make([]Record, 0)
 	for _, record := range m.registry.Records {
-		if desired != "" && record.Image != desired && record.ActiveCalls == 0 && record.BackgroundProcesses == 0 {
+		if desired != "" && record.Image != desired && record.ActiveCalls == 0 {
 			candidates = append(candidates, record)
 		}
 	}
@@ -366,7 +341,7 @@ func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string,
 		m.mu.Lock()
 		current, exists := m.registry.Records[candidate.SandboxID]
 		desired = m.Image
-		eligible := exists && desired != "" && current.Image != desired && current.ActiveCalls == 0 && current.BackgroundProcesses == 0
+		eligible := exists && desired != "" && current.Image != desired && current.ActiveCalls == 0
 		m.mu.Unlock()
 		if !eligible {
 			unlock()
@@ -389,7 +364,7 @@ func (m *Manager) ReconcileImages(ctx context.Context, now time.Time) ([]string,
 		}
 		m.mu.Lock()
 		latest, stillExists := m.registry.Records[candidate.SandboxID]
-		if !stillExists || latest.ActiveCalls != 0 || latest.BackgroundProcesses != 0 || latest.Image == desired {
+		if !stillExists || latest.ActiveCalls != 0 || latest.Image == desired {
 			m.mu.Unlock()
 			unlock()
 			continue
@@ -435,22 +410,35 @@ func (m *Manager) Records() []Record {
 	return records
 }
 
-// ReconcileProcesses replaces volatile call/process counters with facts rebuilt
-// from the persisted managed-process records after a Manager restart. Unknown
-// or uninspectable sandbox processes are counted conservatively by the caller.
-func (m *Manager) ReconcileProcesses(background map[string]int, now time.Time) error {
+// StopRunning is a startup barrier, called before accepting executor requests.
+// The engine must discover all managed containers, including those absent from
+// the registry, and prove they stopped before stale call accounting is cleared.
+// Persistent workspace, home and environment directories remain untouched.
+func (m *Manager) StopRunning(ctx context.Context) error {
+	stopper, ok := m.Engine.(interface {
+		StopRunningManagedSandboxes(context.Context) error
+	})
+	if !ok {
+		return errors.New("sandbox engine cannot stop all running managed containers")
+	}
+	if err := stopper.StopRunningManagedSandboxes(ctx); err != nil {
+		return fmt.Errorf("stop running managed sandboxes: %w", err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for id, record := range m.registry.Records {
+	previous := m.registry.Records
+	m.registry.Records = make(map[string]Record, len(previous))
+	now := time.Now().UTC()
+	for id, record := range previous {
 		record.ActiveCalls = 0
-		record.BackgroundProcesses = background[id]
-		if record.BackgroundProcesses > 0 {
-			record.StoppedAt = nil
-			record.LastActivityAt = now.UTC()
-		}
+		record.StoppedAt = &now
 		m.registry.Records[id] = record
 	}
-	return m.persistLocked()
+	if err := m.persistLocked(); err != nil {
+		m.registry.Records = previous
+		return fmt.Errorf("persist stopped sandbox accounting: %w", err)
+	}
+	return nil
 }
 func (m *Manager) SetImage(image string) {
 	if image == "" {

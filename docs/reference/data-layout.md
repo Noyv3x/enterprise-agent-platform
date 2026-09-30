@@ -48,6 +48,12 @@ The account database supplies `~`; installer/Manager do not trust HOME/XDG overr
 
 Removed-feature directories, including old skill sidecars and Firecrawl data, may remain for rollback. Their presence does not start retired services. Run event buffers are in memory, not a new durable event journal.
 
+Executor commands have no durable process registry or `.pid`/`.out`/`.err`/`.exit`
+output files. Old `manager/processes/` and sandbox process artifacts are left
+untouched, not adopted or replayed. Running managed sandboxes are stopped before
+Manager accepts executor requests after startup; workspace/home/environment
+remain persistent and sandboxes restart on demand.
+
 ## Workspaces and resources
 
 Personal `user-<id>` and channel `channels/channel-<id>` workspaces mount at `/workspace`. Chat workspace ID `chat-user-<id>` mounts `workspaces/chat/user-<id>` there; each conversation sets cwd to `/workspace/<conversation_id>`. One chat sandbox serves each user, not each conversation. File tools restrict the conversation directory; bash can reach that user's other chat files.
@@ -87,6 +93,8 @@ Platform exports old memories once, relocates disabled skills and writes the act
 ## Manager state and cleanup
 
 Manager's `update.json` remains the operation/reservation authority. Keep current and previous release metadata, validated Manager binaries and required snapshots; preserve in-flight candidates. After successful updates, M1 retains images referenced by current/previous generations or running sandboxes, deleting other deployment-owned images by exact ID only. Never run blanket prune or delete by guessed names.
+
+The schema-1 checkpoint includes Manager state and operation records. Legacy `manager/state.json` and `manager/operations/` may remain on disk but are never imported, changed or deleted. Missing `update.json` is accepted only for fresh state with neither legacy path present; damaged or provisional (`bridge_transition`) checkpoints fail closed rather than reconstructing state from old files. The immutable launcher retains its separate schema-1 `launcher-state.json`, `manager-binaries.json` and version-directory protocol.
 
 ## 备份与恢复
 

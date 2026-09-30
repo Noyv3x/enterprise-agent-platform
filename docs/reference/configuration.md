@@ -10,6 +10,8 @@ Container secret files live under `/run/secrets/agent-platform/`: session signin
 
 Manager configuration remains `~/.config/agent-platform/manager.toml`. Its public settings cover update enablement/interval/channel and LAN/ingress CIDRs. M1 adds configurable agent/chat sandbox resource profiles; defaults and mount layout are in [data layout](data-layout.md#sandbox-profiles).
 
+All historically accepted `manager.toml` keys still parse. `health_timeout_seconds` and `drain_timeout_seconds` are compatibility no-ops (positive integers remain required); lifecycle deadlines are owned by the update and readiness protocols. Existing Firecrawl data and secrets are left untouched, but Manager neither creates nor reconciles that retired stack.
+
 ## Models and account settings
 
 Personal AI uses `users.model_name` and `thinking_depth`. Standard chat uses each user's allowed model list/default and each conversation's selected model. Server-side policy restricts choices; a frontend model picker is not authorization.

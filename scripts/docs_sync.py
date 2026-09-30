@@ -194,15 +194,10 @@ GO_PROFILE_FIELDS = {
     'LabelPrefix': 'labels.prefix',
     'SandboxContainerPrefix': 'labels.sandbox_container_prefix',
     'MigrationContainerPrefix': 'labels.migration_container_prefix',
-    'WatchdogUnitPrefix': 'labels.watchdog_unit_prefix',
-    'RecoveryWatchdogUnitPrefix': 'labels.recovery_watchdog_unit_prefix',
     'InternalWorkspaceDirectory': 'workspace.internal_directory',
 }
 RUNTIME_GROUPS = {
-    'run_idle_timeout': ('_seconds', 0, ((1 << 53) - 1) // 1000),
-    'max_turns_per_run': ('', 1, (1 << 53) - 1),
     'terminal_timeout': ('_milliseconds', 1, 2_147_483_647),
-    'process_wait_timeout': ('_milliseconds', 1, 2_147_483_647),
 }
 
 

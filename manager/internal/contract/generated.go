@@ -51,8 +51,5 @@ type PersistentDataOwner struct {
 }
 
 var PersistentDataOwners = map[string][]PersistentDataOwner{
-	"firecrawl-postgres": {{UID: 999, GID: 0}, {UID: 999, GID: 999}},
-	"firecrawl-rabbitmq": {{UID: 999, GID: 0}, {UID: 999, GID: 999}},
-	"firecrawl-redis":    {{UID: 999, GID: 0}, {UID: 999, GID: 1000}},
-	"searxng":            {},
+	"searxng": {},
 }

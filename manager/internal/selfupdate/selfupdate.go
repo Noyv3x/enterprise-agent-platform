@@ -71,32 +71,17 @@ type Manager struct {
 	launcherRegistrationPending func()
 }
 
-// RequireSupervisor refuses an unsettled bridge without interpreting its journals.
+// RequireSupervisor verifies the installed immutable launcher and its selections.
 func (m *Manager) RequireSupervisor() error {
 	if err := validateRecoveryDirectory(m.Root, true); err != nil {
 		return fmt.Errorf("unsafe supervisor state root: %w", err)
 	}
 	s, err := m.readLauncher()
 	if err != nil {
-		return fmt.Errorf("N supervisor required; complete release N handoff first: %w", err)
+		return fmt.Errorf("installed supervisor required: %w", err)
 	}
 	if !s.Proven && !s.Bootstrap {
-		return errors.New("N supervisor handoff is not terminal; complete release N handoff first")
-	}
-	handoff, _, handoffErr := readRecoveryRegularFile(filepath.Join(m.Root, "bridge-handoff.json"), 3<<20, true)
-	if handoffErr == nil {
-		var terminal struct {
-			Status   string  `json:"status"`
-			Launcher Version `json:"launcher"`
-		}
-		if err := decodeRecoveryJSON(handoff, &terminal); err != nil {
-			return err
-		}
-		if terminal.Status != "proven" || terminal.Launcher.Path != s.Launcher.Path || terminal.Launcher.SHA256 != s.Launcher.SHA256 || terminal.Launcher.Version != s.Launcher.Version {
-			return errors.New("release N supervisor handoff is not terminal and bound; complete it using release N")
-		}
-	} else if !os.IsNotExist(handoffErr) || !s.Bootstrap {
-		return fmt.Errorf("release N terminal supervisor handoff is required: %w", handoffErr)
+		return errors.New("supervisor is neither proven nor bootstrapped")
 	}
 	if err := m.verifyLauncherVersion(s.Launcher, true); err != nil {
 		return err
@@ -118,27 +103,6 @@ func (m *Manager) RequireSupervisor() error {
 		return errors.New("legacy Manager activation remains; settle it using release N")
 	}
 	return nil
-}
-
-func (m *Manager) SupervisedTransition() (Version, error) {
-	if err := m.RequireSupervisor(); err != nil {
-		return Version{}, err
-	}
-	bound, err := m.SupervisedStartup()
-	if err != nil {
-		return Version{}, err
-	}
-	if !bound {
-		return Version{}, errors.New("Manager is not an authenticated supervisor child")
-	}
-	s, err := m.readLauncher()
-	if err != nil {
-		return Version{}, err
-	}
-	if !s.Selected.PlatformCommitted {
-		return Version{}, errors.New("selected Manager is not activation-ready")
-	}
-	return s.Selected, nil
 }
 
 func (m *Manager) Prepare(ctx context.Context, manifest release.Manifest) error {

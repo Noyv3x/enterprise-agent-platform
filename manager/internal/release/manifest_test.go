@@ -74,6 +74,15 @@ func TestTargetManifestValidationFailsClosed(t *testing.T) {
 		{name: "unknown image", mutate: func(m *Manifest) {
 			m.Images["unknown"] = "registry.example/unknown@sha256:" + strings.Repeat("f", 64)
 		}},
+		{name: "unknown replacement", mutate: func(m *Manifest) {
+			delete(m.Images, "platform")
+			m.Images["unknown"] = "registry.example/unknown@sha256:" + strings.Repeat("f", 64)
+		}},
+		{name: "ten image catalog", mutate: func(m *Manifest) {
+			for _, name := range []string{"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+				m.Images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("f", 64)
+			}
+		}},
 		{name: "mutable image", mutate: func(m *Manifest) { m.Images["platform"] = "registry.example/platform:latest" }},
 	}
 	for _, test := range tests {
@@ -97,17 +106,7 @@ func TestCatalogsRemainValidWithoutCapacityEstimates(t *testing.T) {
 	defer func() { contract.ManagedImageCapacityEstimates = estimates }()
 	manifest := validManifest("https://registry.example")
 	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err != nil {
-		t.Fatalf("legacy rollback without capacity map: %v", err)
-	}
-	for _, name := range managedImageNames[5:] {
-		delete(manifest.Images, name)
-	}
-	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err != nil {
-		t.Fatalf("reduced catalog: %v", err)
-	}
-	manifest.Images["firecrawl-api"] = "registry.example/firecrawl@sha256:" + strings.Repeat("a", 64)
-	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err == nil {
-		t.Fatal("partial Firecrawl stack accepted")
+		t.Fatalf("five-image catalog without capacity map: %v", err)
 	}
 }
 

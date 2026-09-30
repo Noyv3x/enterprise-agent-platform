@@ -21,7 +21,5 @@ var generatedTargetProfile = Profile{
 	LabelPrefix:                "io.agent-platform",
 	SandboxContainerPrefix:     "agent-platform-sandbox-",
 	MigrationContainerPrefix:   "agent-platform-migration-",
-	WatchdogUnitPrefix:         "agent-platform-manager-watchdog-",
-	RecoveryWatchdogUnitPrefix: "agent-platform-manager-watchdog-current-recovery-",
 	InternalWorkspaceDirectory: ".agent-platform",
 }

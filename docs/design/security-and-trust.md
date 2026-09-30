@@ -43,4 +43,13 @@ This check does not intercept every in-page link or redirect. Residual browser a
 
 Cancellation stops future work but cannot undo completed external effects. A lost/failed run becomes visibly interrupted; do not replay it automatically. Executor audit receipts are one-shot and identity-bound. Removed approval/background/review systems must not be recreated as retry or completion heuristics.
 
+Manager accepts only sandbox foreground terminal execution and confined file
+read/write. Timeout and cancellation terminate and confirm the sandbox command
+process group, including grandchildren; stopping the host Docker client alone is
+not confirmation. Commands have in-memory run ownership, not restart recovery.
+Before executor readiness on every Manager startup, all running managed sandbox
+containers are stopped. Failure to confirm cleanup prevents executor readiness.
+Sandbox workspace, home and environment are retained and restart on demand.
+MCP keeps its safe audit projection and private-output redaction.
+
 Manager update reservations block new work before migration and release only through the existing owner-bound commit/abort protocol. Keep migrations additive and original journals untouched. See [operations](../operations/auto-update.md) and [API contracts](../reference/platform-api.md).

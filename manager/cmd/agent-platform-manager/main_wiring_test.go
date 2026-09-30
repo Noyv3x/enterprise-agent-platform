@@ -68,7 +68,7 @@ func TestExecutionWiringRetainsTargetFileProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)
-	service, _, err := newExecutionService(active, engine, sandboxes, filepath.Join(root, "control"), audit, 1<<20)
+	service, err := newExecutionService(active, engine, sandboxes, filepath.Join(root, "control"), audit, 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}

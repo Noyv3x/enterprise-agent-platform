@@ -108,13 +108,34 @@ Pi appends the difference (see
 previous release can read newly appended Runtime entries. No new session
 directory or copy-migration is needed for this upgrade.
 
-All tenant execution uses Manager's Unix executor: audit receipt followed by
-terminal/file operation, with `execution_context.profile`. No host environment
-is forwarded.
-Every terminal request has a finite deadline. Bash uses its explicit Pi
-timeout when supplied, otherwise ten minutes; all terminal deadlines are
-capped at one hour. This bounds outstanding Manager commands after a
-Runtime restart without tracking or replaying old runs.
+All tenant execution uses Manager's Unix executor with its separate executor
+Bearer token. The only executor endpoints are POST `/v1/executor/audit`,
+`/v1/executor/terminal`, `/v1/executor/file` and `/v1/executor/runs/cancel`.
+An audit receipt is one-shot and binds the operation, arguments and complete
+identity, including `execution_context.profile`; terminal/file calls consume it.
+The only target is `sandbox`; host execution is rejected.
+
+Terminal supports foreground `action:run` with `command`, `cwd`, `timeout_ms`
+and `background:false`. It returns bounded `stdout`, `stderr`, `status` and
+`exit_code`. Bash uses its explicit Pi timeout when supplied, otherwise
+600000 ms; deadlines are capped at 3600000 ms. Timeout and run cancellation
+kill the whole command process group inside the sandbox, including grandchildren.
+Cancellation returns `{confirmed}` and must not claim success before termination
+is confirmed. Running commands and unconfirmed-termination identities are tracked
+only in memory, not persisted or recovered as background work. If the sandbox
+supervisor is lost or stopped and cleanup cannot be proved, cancellation retries
+remain `{confirmed:false}`; Manager restart's sandbox cleanup is the reset boundary.
+
+Foreground admission is limited to 16 pending/running calls per scope family
+and 128 globally. Admission counts begin before sandbox creation or process
+startup, and slots are released when execution settles. Over-limit calls return
+the ordinary executor conflict/error response; they never start a command.
+
+File supports `read` and `write`; read returns `content` and byte counts in
+`details.returned` and `details.total`. Process/task/scope-process APIs and
+patch/search file actions are not supported. Before accepting executor requests
+after startup, Manager stops running managed sandboxes; workspace, home and
+environment persist and sandboxes restart on demand. Idle stop remains active.
 File tool paths stay inside the sandbox root (chat inside its conversation directory).
 Chat sandboxes are shared by one user's conversations: the security boundary
 is the user, not the conversation. Bash starts in the conversation directory

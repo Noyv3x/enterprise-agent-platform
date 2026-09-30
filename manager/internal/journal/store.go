@@ -82,10 +82,8 @@ func BoundOperation(op model.Operation) model.Operation {
 }
 
 type Store struct {
-	dir                string
 	checkpointPath     string
 	records            map[string]model.Operation
-	transition         *bridgeTransition
 	historyPruneAfter  time.Time
 	mu                 sync.Mutex
 	state              model.ManagerState
@@ -93,43 +91,24 @@ type Store struct {
 	beforePersistState func(model.ManagerState) error
 }
 
-// Open imports settled bridge records once. Callers hold the service lock.
+// Open loads the sole checkpoint authority. Callers hold the service lock.
 func Open(dir string, now time.Time) (*Store, error) {
-	return OpenWithTransition(dir, now, "")
-}
-
-// OpenWithTransition permits only the supervised bridge's installing operation.
-// target must come from the immutable launcher's authenticated child proof, never
-// from a request or the legacy journal itself. Legacy files remain rollback input.
-func OpenWithTransition(dir string, now time.Time, target string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	store := &Store{dir: dir, checkpointPath: filepath.Join(dir, "update.json"),
+	store := &Store{checkpointPath: filepath.Join(dir, "update.json"),
 		state: model.NewState(now), records: make(map[string]model.Operation)}
 	if err := store.loadCheckpointLocked(); err == nil {
-		if store.transition != nil {
-			fresh := &Store{dir: dir, checkpointPath: store.checkpointPath,
-				state: model.NewState(now), records: make(map[string]model.Operation)}
-			if err := fresh.importBridgeLocked(target); err != nil {
-				return nil, fmt.Errorf("validate provisional bridge transition: %w", err)
-			}
-			if fresh.transition == nil {
-				return nil, errors.New("provisional checkpoint has no authenticated installing bridge operation")
-			}
-			if *fresh.transition != *store.transition {
-				if err := fresh.persistStateLocked(); err != nil {
-					return nil, err
-				}
-				return fresh, nil
-			}
-		}
 		return store, nil
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	if err := store.importBridgeLocked(target); err != nil {
-		return nil, err
+	for _, name := range []string{"state.json", "operations"} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return nil, errors.New("missing update checkpoint with legacy state present")
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 	if err := store.persistStateLocked(); err != nil {
 		return nil, err
@@ -511,21 +490,11 @@ func (s *Store) persistCheckpointLocked(state *model.ManagerState, op *model.Ope
 		records = maps.Clone(records)
 		pruneCheckpointHistory(records, *state, pruneAt)
 	}
-	transition := s.transition
-	if transition != nil {
-		imported := records[transition.OperationID]
-		if imported.GateSettlementAction == model.GateSettlementCommit {
-			// Launcher confirmation preceded commit intent. From this boundary
-			// onward N's frozen files can never replace the checkpoint.
-			transition = nil
-		}
-	}
 	s.stateUncertain = true
-	if err := atomicfile.WriteJSON(s.checkpointPath, checkpoint{1, *state, records, transition}, 0o600); err != nil {
+	if err := atomicfile.WriteJSON(s.checkpointPath, checkpoint{1, *state, records}, 0o600); err != nil {
 		return err
 	}
 	s.records = records
-	s.transition = transition
 	if op != nil || !pruneAt.Before(s.historyPruneAfter) {
 		s.historyPruneAfter = pruneAt.Add(time.Hour)
 	}

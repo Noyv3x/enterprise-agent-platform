@@ -26,6 +26,61 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func TestLoadSnapshotAcceptsHistoricalKeys(t *testing.T) {
+	root := t.TempDir()
+	content := `
+data_root = "` + root + `"
+state_dir = "` + filepath.Join(root, "manager") + `"
+socket_path = "` + filepath.Join(root, "manager.sock") + `"
+listen = "127.0.0.1:19090"
+lan_enabled = true
+lan_listen = "192.168.10.5:19091"
+direct_access_cidrs = ["192.168.10.0/24"]
+trusted_ingress_cidrs = ["127.0.0.0/8"]
+platform_url = "http://127.0.0.1:18080"
+platform_gate_url = "http://127.0.0.1:18080"
+internal_token_file = "` + filepath.Join(root, "token") + `"
+release_manifest_url = "https://releases.example/release.json"
+release_channel = "main"
+update_enabled = false
+update_interval = "7m"
+compose_file = "` + filepath.Join(root, "compose.yaml") + `"
+compose_project = "agent-platform"
+docker_binary = "docker"
+sandbox_image = "registry/sandbox:local"
+sandbox_network = "agent-platform_core"
+sandbox_idle = "45m"
+sandbox_chat_idle = "5m"
+health_timeout_seconds = 120
+drain_timeout_seconds = 300
+log_max_size = "20MiB"
+log_max_files = 7
+command_max_bytes = 1048576
+sandbox_agent_memory = "3g"
+sandbox_agent_memory_swap = "3g"
+sandbox_agent_cpus = "2"
+sandbox_agent_pids_limit = 512
+sandbox_chat_memory = "1g"
+sandbox_chat_memory_swap = "1g"
+sandbox_chat_cpus = "1"
+sandbox_chat_pids_limit = 128
+`
+	cfg, err := LoadSnapshot(testActiveProfile, filepath.Join(root, "manager.toml"), []byte(content), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateEnabled || cfg.UpdateInterval != 7*time.Minute || cfg.SandboxAgent.Memory != "3g" ||
+		cfg.SandboxChat.PidsLimit != 128 || cfg.SocketPath != filepath.Join(root, "manager.sock") ||
+		cfg.CommandMaxBytes != 1048576 || cfg.SandboxChatIdle != 5*time.Minute {
+		t.Fatalf("historical config changed active settings: %#v", cfg)
+	}
+	for _, key := range []string{"health_timeout_seconds", "drain_timeout_seconds"} {
+		if _, err := LoadSnapshot(testActiveProfile, filepath.Join(root, "manager.toml"), []byte(key+" = 0\n"), true); err == nil {
+			t.Fatalf("compatibility key %s lost positive-integer validation", key)
+		}
+	}
+}
+
 func TestDefaultsKeepLANClosedOnLoopback(t *testing.T) {
 	cfg, err := Defaults(testActiveProfile)
 	if err != nil {

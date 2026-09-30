@@ -37,6 +37,7 @@ func TestStartupReadinessPreservesAuthenticatedReadsAndBlocksSideEffects(t *test
 	}
 	for _, route := range []struct{ method, path, token string }{
 		{http.MethodPost, "/v1/operations", "control"},
+		{http.MethodGet, "/v1/operations/op_update", "control"},
 		{http.MethodPost, "/v1/check", "control"},
 		{http.MethodPatch, "/v1/config", "control"},
 		{http.MethodPost, "/v1/executor/process", "executor"},

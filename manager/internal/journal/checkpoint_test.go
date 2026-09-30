@@ -6,11 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
 )
 
@@ -84,186 +82,102 @@ func TestCheckpointFailureNeverPublishesHalfTransition(t *testing.T) {
 	}
 }
 
-func TestBridgeMigrationPreservesRollbackFilesAndImportsOnce(t *testing.T) {
+func TestCheckpointIsSoleAuthority(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Unix(100, 0)
-	state := model.NewState(now)
-	path := filepath.Join(dir, "state.json")
-	if err := atomicfile.WriteJSON(path, state, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := os.ReadFile(path)
 	store, err := Open(dir, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.MutateState(now, func(s *model.ManagerState) error { s.LastError = "new checkpoint"; return nil }); err != nil {
+	request := model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "settled", ExpectedGeneration: store.State().Generation}
+	op, _, err := store.Begin(request, now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(path)
-	if !bytes.Equal(before, after) {
-		t.Fatal("legacy rollback input changed")
+	if _, err := store.Complete(op.ID, true, func(s *model.ManagerState) {
+		s.FinalizePendingOperationID = op.ID
+		s.Maintenance = true
+	}, "", now); err != nil {
+		t.Fatal(err)
 	}
-	if err = os.WriteFile(path, []byte("invalid legacy bytes"), 0o600); err != nil {
+	if _, err := store.UpdateOperation(op.ID, func(op *model.Operation) error {
+		op.GateSettlementAction = model.GateSettlementCommit
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(legacy, []byte("unreadable legacy state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "operations"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := filepath.Join(dir, "operations", "op_old.json")
+	if err := os.WriteFile(record, []byte("unreadable legacy operation"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := Open(dir, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reopened.State().LastError != "new checkpoint" {
-		t.Fatal("legacy file became a second authority")
+	got, err := reopened.Operation(op.ID)
+	if err != nil || got.GateSettlementAction != model.GateSettlementCommit || reopened.State().FinalizePendingOperationID != op.ID || !reopened.State().Maintenance {
+		t.Fatalf("lost forward settlement: %#v %v", got, err)
 	}
-	info, err := os.Stat(filepath.Join(dir, "update.json"))
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("checkpoint permissions: %v %v", info, err)
+	replay, reused, err := reopened.Begin(request, now)
+	if err != nil || !reused || replay.ID != op.ID {
+		t.Fatalf("lost idempotency binding: %#v %t %v", replay, reused, err)
+	}
+	for path, want := range map[string]string{legacy: "unreadable legacy state", record: "unreadable legacy operation"} {
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != want {
+			t.Fatalf("legacy input changed: %s %v", path, err)
+		}
 	}
 }
 
-func TestBridgeMigrationOnlyAllowsAuthenticatedInstallingTransition(t *testing.T) {
-	for _, scenario := range []string{"settled", "pending", "authenticated", "wrong-target", "second-pending", "rollback", "commit-intent"} {
-		t.Run(scenario, func(t *testing.T) {
+func TestMissingCheckpointRefusesLegacyState(t *testing.T) {
+	for _, name := range []string{"state.json", "operations"} {
+		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			now := time.Unix(100, 0)
-			target := strings.Repeat("a", 40)
-			state := model.NewState(now)
-			state.Current = &model.Generation{ID: target, SourceCommit: target, RollbackSnapshotPath: "/private/snapshot"}
-			state.Previous = &model.Generation{ID: strings.Repeat("b", 40)}
-			op := model.Operation{SchemaVersion: 1, ID: "op_bridge", Kind: model.OperationUpdate, Status: model.OperationSucceeded, Finalized: true, CompletedAt: &now, TargetGeneration: target, SnapshotPath: "/private/snapshot", ReservationStatus: model.ReservationMutationStarted}
-			proof := ""
-			if scenario != "settled" {
-				op.Finalized = false
-				state.FinalizePendingOperationID = op.ID
-				state.Maintenance = true
-			}
-			if scenario != "pending" && scenario != "settled" {
-				proof = target
-			}
-			if scenario == "wrong-target" {
-				proof = strings.Repeat("c", 40)
-			}
-			if scenario == "rollback" {
-				op.ManagerActivationRollback = true
-			}
-			if scenario == "commit-intent" {
-				op.GateSettlementAction = model.GateSettlementCommit
-			}
-			if err := os.Mkdir(filepath.Join(dir, "operations"), 0o700); err != nil {
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, []byte("legacy bytes"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := atomicfile.WriteJSON(filepath.Join(dir, "state.json"), state, 0o600); err != nil {
-				t.Fatal(err)
+			if _, err := Open(dir, time.Now()); err == nil {
+				t.Fatal("accepted legacy state without a checkpoint")
 			}
-			if err := atomicfile.WriteJSON(filepath.Join(dir, "operations", op.ID+".json"), op, 0o600); err != nil {
-				t.Fatal(err)
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != "legacy bytes" {
+				t.Fatalf("legacy input changed: %v", err)
 			}
-			if scenario == "second-pending" {
-				other := op
-				other.ID = "op_other"
-				if err := atomicfile.WriteJSON(filepath.Join(dir, "operations", other.ID+".json"), other, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			store, err := OpenWithTransition(dir, now, proof)
-			allowed := scenario == "settled" || scenario == "authenticated"
-			if allowed {
-				if err != nil {
-					t.Fatal(err)
-				}
-				got, err := store.Operation(op.ID)
-				if err != nil || got.TargetGeneration != target {
-					t.Fatalf("lost operation: %#v %v", got, err)
-				}
-			} else {
-				if err == nil {
-					t.Fatal("accepted uncertain legacy transition")
-				}
-				if _, err := os.Stat(filepath.Join(dir, "update.json")); !os.IsNotExist(err) {
-					t.Fatal("rejected migration published checkpoint")
-				}
+			if _, err := os.Stat(filepath.Join(dir, "update.json")); !os.IsNotExist(err) {
+				t.Fatal("refusal published a checkpoint")
 			}
 		})
 	}
 }
 
-func TestRejectedProvisionalImportCannotOwnNextBridgeAttempt(t *testing.T) {
-	for _, sameTarget := range []bool{false, true} {
-		t.Run(fmt.Sprintf("same-target=%t", sameTarget), func(t *testing.T) {
+func TestUnsupportedCheckpointNeverFallsBack(t *testing.T) {
+	for _, document := range []string{
+		`invalid`,
+		`{"schema_version":2,"state":{"schema_version":1},"operations":{}}`,
+		`{"schema_version":1,"state":{"schema_version":1},"operations":{},"bridge_transition":{"target":"old"}}`,
+		`{"schema_version":1,"state":{"schema_version":1},"operations":{},"bridge_transition":null}`,
+	} {
+		t.Run(document, func(t *testing.T) {
 			dir := t.TempDir()
-			now := time.Unix(100, 0)
-			firstTarget := strings.Repeat("a", 40)
-			nextTarget := strings.Repeat("c", 40)
-			if sameTarget {
-				nextTarget = firstTarget
-			}
-			state := model.NewState(now)
-			state.Current = &model.Generation{ID: firstTarget, SourceCommit: firstTarget, RollbackSnapshotPath: "/snapshot/first"}
-			state.Previous = &model.Generation{ID: strings.Repeat("b", 40)}
-			state.Maintenance = true
-			state.FinalizePendingOperationID = "op_first"
-			first := model.Operation{SchemaVersion: 1, ID: "op_first", Kind: model.OperationUpdate,
-				Status: model.OperationSucceeded, CompletedAt: &now, TargetGeneration: firstTarget,
-				SnapshotPath: "/snapshot/first", ReservationStatus: model.ReservationMutationStarted}
-			if err := os.Mkdir(filepath.Join(dir, "operations"), 0o700); err != nil {
+			path := filepath.Join(dir, "update.json")
+			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			publish := func(op model.Operation) {
-				t.Helper()
-				if err := atomicfile.WriteJSON(filepath.Join(dir, "state.json"), state, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				if err := atomicfile.WriteJSON(filepath.Join(dir, "operations", op.ID+".json"), op, 0o600); err != nil {
-					t.Fatal(err)
-				}
+			if _, err := Open(dir, time.Now()); err == nil {
+				t.Fatal("accepted unsupported checkpoint")
 			}
-			publish(first)
-			if _, err := OpenWithTransition(dir, now, firstTarget); err != nil {
-				t.Fatal(err)
-			}
-			// N's launcher rejects the child; N restores and settles its own
-			// immutable-format records, then installs a fresh operation.
-			first.Status, first.Finalized = model.OperationFailed, true
-			publish(first)
-			next := first
-			next.ID, next.TargetGeneration, next.SnapshotPath = "op_next", nextTarget, "/snapshot/next"
-			next.Status, next.Finalized = model.OperationSucceeded, false
-			state.Generation++
-			state.FinalizePendingOperationID = next.ID
-			state.Current = &model.Generation{ID: nextTarget, SourceCommit: nextTarget, RollbackSnapshotPath: next.SnapshotPath}
-			publish(next)
-			before, _ := os.ReadFile(filepath.Join(dir, "update.json"))
-			if _, err := Open(dir, now); err == nil {
-				t.Fatal("provisional checkpoint accepted without authenticated proof")
-			}
-			after, _ := os.ReadFile(filepath.Join(dir, "update.json"))
-			if !bytes.Equal(before, after) {
-				t.Fatal("refused provisional import changed checkpoint")
-			}
-			store, err := OpenWithTransition(dir, now, nextTarget)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if store.State().FinalizePendingOperationID != next.ID || store.State().Current.ID != nextTarget {
-				t.Fatal("rejected checkpoint retained the former installing operation")
-			}
-			old, err := store.Operation(first.ID)
-			if err != nil || !old.Finalized || old.Status != model.OperationFailed {
-				t.Fatalf("N fallback settlement was not imported: %#v %v", old, err)
-			}
-			if _, err := store.UpdateOperation(next.ID, func(op *model.Operation) error {
-				op.GateSettlementAction = model.GateSettlementCommit
-				return nil
-			}); err != nil {
-				t.Fatal(err)
-			}
-			// Once launcher-confirmed commit intent is durable, stale N files
-			// are never again an authority, even if they later become unreadable.
-			if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("obsolete"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			reopened, err := Open(dir, now)
-			if err != nil || reopened.State().FinalizePendingOperationID != next.ID {
-				t.Fatalf("confirmed checkpoint lost authority: %v", err)
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != document {
+				t.Fatalf("refusal rewrote checkpoint: %v", err)
 			}
 		})
 	}

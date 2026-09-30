@@ -3,15 +3,10 @@ package executor
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"runtime"
 	"strings"
 	"testing"
-
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 func executeSandboxFile(t *testing.T, service *Service, action string, arguments any) (string, map[string]any, error) {
@@ -23,20 +18,6 @@ func executeSandboxFile(t *testing.T, service *Service, action string, arguments
 	return service.Files.Execute(context.Background(), Call{
 		Identity:  identity(),
 		Target:    "sandbox",
-		Action:    action,
-		Arguments: raw,
-	})
-}
-
-func executeHostFile(t *testing.T, service *Service, action string, arguments any) (string, map[string]any, error) {
-	t.Helper()
-	raw, err := json.Marshal(arguments)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return service.Files.Execute(context.Background(), Call{
-		Identity:  identity(),
-		Target:    "host",
 		Action:    action,
 		Arguments: raw,
 	})
@@ -57,82 +38,6 @@ func TestSandboxFileActionsSupportNestedRegularFiles(t *testing.T) {
 		t.Fatalf("unexpected file content %q", content)
 	}
 
-	if _, _, err := executeSandboxFile(t, service, "patch", filePatchArguments{Path: path, OldText: "alpha", NewText: "beta"}); err != nil {
-		t.Fatal(err)
-	}
-	result, details, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/nested", Query: "beta"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(result, "file.txt:1:beta") || details["count"] != 1 {
-		t.Fatalf("unexpected search result %q (%#v)", result, details)
-	}
-}
-
-func TestPatchRejectsExpansionBeforeAllocatingResult(t *testing.T) {
-	service, _ := newTestService(t)
-	path := "/workspace/expansion.txt"
-	original := strings.Repeat("x", 10*1024)
-	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: path, Content: original}); err != nil {
-		t.Fatal(err)
-	}
-	arguments := filePatchArguments{Path: path, OldText: "x", NewText: strings.Repeat("y", 2000), ExpectedReplacements: len(original)}
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	_, _, err := executeSandboxFile(t, service, "patch", arguments)
-	runtime.ReadMemStats(&after)
-	if err == nil || !strings.Contains(err.Error(), "patched file exceeds manager limit") {
-		t.Fatalf("expanding patch error = %v", err)
-	}
-	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
-		t.Fatalf("rejected 10 KiB patch allocated %d bytes", allocated)
-	}
-	content, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: path})
-	if err != nil || content != original {
-		t.Fatalf("rejected patch changed original: content %q, error %v", content, err)
-	}
-}
-
-func TestPatchSizeBoundaryAndReplacementCount(t *testing.T) {
-	for _, item := range []struct {
-		name     string
-		oldText  string
-		newText  string
-		expected int
-		want     string
-		wantErr  string
-	}{
-		{name: "exact limit", oldText: "aa", newText: "bbbb", expected: 2, want: "bbbbbbbb"},
-		{name: "shrinking", oldText: "aa", newText: "b", expected: 2, want: "bb"},
-		{name: "count precedes size", oldText: "aa", newText: "bbbbbbbb", expected: 1, want: "aaaa", wantErr: "expected 1 replacements, found 2"},
-		{name: "default count", oldText: "aaaa", newText: "b", want: "b"},
-	} {
-		t.Run(item.name, func(t *testing.T) {
-			service, _ := newTestService(t)
-			service.Files.MaxBytes = 8
-			path := "/workspace/boundary.txt"
-			if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: path, Content: "aaaa"}); err != nil {
-				t.Fatal(err)
-			}
-			_, details, err := executeSandboxFile(t, service, "patch", filePatchArguments{Path: path, OldText: item.oldText, NewText: item.newText, ExpectedReplacements: item.expected})
-			if item.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), item.wantErr) {
-					t.Fatalf("patch error = %v, want %q", err, item.wantErr)
-				}
-			} else {
-				if err != nil {
-					t.Fatal(err)
-				}
-				if details["replacements"] != strings.Count("aaaa", item.oldText) {
-					t.Fatalf("replacement count = %#v", details)
-				}
-			}
-			content, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: path})
-			if err != nil || content != item.want {
-				t.Fatalf("patch result = %q, %v; want %q", content, err, item.want)
-			}
-		})
-	}
 }
 
 func TestSandboxFileActionsRejectSymlinkEscape(t *testing.T) {
@@ -168,25 +73,10 @@ func TestSandboxFileActionsRejectSymlinkEscape(t *testing.T) {
 				t.Fatal("write followed a symbolic link")
 			}
 		})
-		t.Run("patch_"+filepath.Base(path), func(t *testing.T) {
-			if _, _, err := executeSandboxFile(t, service, "patch", filePatchArguments{Path: path, OldText: "outside-secret", NewText: "overwritten"}); err == nil {
-				t.Fatal("patch followed a symbolic link")
-			}
-		})
 	}
 
-	if _, _, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/escape", Query: "outside-secret"}); err == nil {
-		t.Fatal("search followed a symbolic-link root")
-	}
 	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/escape/new.txt", Content: "created outside"}); err == nil {
 		t.Fatal("write created a file through a parent symbolic link")
-	}
-	result, _, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace", Query: "outside-secret"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result != "No matches" {
-		t.Fatalf("search escaped through a child symbolic link: %q", result)
 	}
 	secret, err := os.ReadFile(secretPath)
 	if err != nil {
@@ -200,93 +90,21 @@ func TestSandboxFileActionsRejectSymlinkEscape(t *testing.T) {
 	}
 }
 
-func TestHostFileActionsRejectParentSymlinksAndManagerPaths(t *testing.T) {
+func TestManagedWriteKeepsTheVerifiedParentDirectoryPinned(t *testing.T) {
 	service, root := newTestService(t)
-	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
+	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/target/file.txt", Content: "original"}); err != nil {
 		t.Fatal(err)
 	}
-
-	workspace := filepath.Join(root, "data", "workspaces", "user-1")
-	outside := filepath.Join(root, "outside")
-	if err := os.MkdirAll(outside, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	secretPath := filepath.Join(outside, "secret.txt")
-	if err := os.WriteFile(secretPath, []byte("outside-secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(workspace, "escape")); err != nil {
-		t.Fatal(err)
-	}
-
-	for action, arguments := range map[string]any{
-		"read":   fileReadArguments{Path: "/workspace/escape/secret.txt"},
-		"write":  fileWriteArguments{Path: "/workspace/escape/new.txt", Content: "created outside"},
-		"patch":  filePatchArguments{Path: "/workspace/escape/secret.txt", OldText: "outside", NewText: "changed"},
-		"search": fileSearchArguments{Path: "/workspace/escape", Query: "outside-secret"},
-	} {
-		t.Run(action+"_parent_symlink", func(t *testing.T) {
-			if _, _, err := executeHostFile(t, service, action, arguments); err == nil || !strings.Contains(err.Error(), "symbolic link") {
-				t.Fatalf("host %s followed a parent symlink: %v", action, err)
-			}
-		})
-	}
-	if content, err := os.ReadFile(secretPath); err != nil || string(content) != "outside-secret" {
-		t.Fatalf("outside file changed: %q %v", content, err)
-	}
-	if _, err := os.Stat(filepath.Join(outside, "new.txt")); !os.IsNotExist(err) {
-		t.Fatalf("host write escaped through symlink: %v", err)
-	}
-
-	managerSecret := filepath.Join(root, "manager", "secrets", "manager-token")
-	if err := os.MkdirAll(filepath.Dir(managerSecret), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(managerSecret, []byte("manager-secret"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for action, arguments := range map[string]any{
-		"read":   fileReadArguments{Path: managerSecret},
-		"write":  fileWriteArguments{Path: managerSecret, Content: "changed"},
-		"patch":  filePatchArguments{Path: managerSecret, OldText: "manager", NewText: "changed"},
-		"search": fileSearchArguments{Path: filepath.Dir(managerSecret), Query: "manager-secret"},
-	} {
-		t.Run(action+"_manager_path", func(t *testing.T) {
-			if _, _, err := executeHostFile(t, service, action, arguments); err == nil || !strings.Contains(err.Error(), "protected") {
-				t.Fatalf("host %s accessed Manager state: %v", action, err)
-			}
-		})
-	}
-
-	result, _, err := executeHostFile(t, service, "search", fileSearchArguments{Path: root, Query: "manager-secret"})
+	call := Call{Identity: identity(), Target: "sandbox"}
+	path, err := service.Files.sandboxPath(call, "/workspace/target/file.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result != "No matches" {
-		t.Fatalf("broad host search entered protected Manager state: %q", result)
-	}
-}
-
-func TestManagedPatchKeepsTheVerifiedParentDirectoryPinned(t *testing.T) {
-	service, root := newTestService(t)
-	if _, _, err := executeHostFile(t, service, "write", fileWriteArguments{Path: "/workspace/target/file.txt", Content: "original"}); err != nil {
-		t.Fatal(err)
-	}
-	call := Call{Identity: identity(), Target: "host"}
-	path, err := service.Files.hostPath(call, "/workspace/target/file.txt", sandbox.HostPathWrite)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, parent, leaf, err := openManagedRegularForUpdate(path)
+	parent, leaf, err := openManagedParent(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer parent.Close()
-	data, err := io.ReadAll(file)
-	_ = file.Close()
-	if err != nil || string(data) != "original" {
-		t.Fatalf("read pinned file: %q %v", data, err)
-	}
 
 	workspace := filepath.Join(root, "data", "workspaces", "user-1")
 	target := filepath.Join(workspace, "target")
@@ -338,19 +156,8 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	if content != "actual-attachment" {
 		t.Fatalf("attachment overlay did not take precedence: %q", content)
 	}
-	result, _, err := executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.agent-platform/attachments", Query: "actual-attachment"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(result, "note.txt:1:actual-attachment") {
-		t.Fatalf("attachment search used the wrong root: %q", result)
-	}
-
 	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: logicalPath, Content: "overwritten"}); err == nil || !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("attachment write was not rejected as read-only: %v", err)
-	}
-	if _, _, err := executeSandboxFile(t, service, "patch", filePatchArguments{Path: logicalPath, OldText: "actual", NewText: "changed"}); err == nil || !strings.Contains(err.Error(), "read-only") {
-		t.Fatalf("attachment patch was not rejected as read-only: %v", err)
 	}
 	attachmentBytes, err := os.ReadFile(attachmentPath)
 	if err != nil {
@@ -372,123 +179,5 @@ func TestSandboxAttachmentsAreMappedBeforeWorkspaceAndRemainReadOnly(t *testing.
 	}
 	if _, _, err := executeSandboxFile(t, service, "read", fileReadArguments{Path: "/workspace/.agent-platform/attachments/escape/secret.txt"}); err == nil {
 		t.Fatal("attachment read followed a parent symbolic link")
-	}
-	result, _, err = executeSandboxFile(t, service, "search", fileSearchArguments{Path: "/workspace/.agent-platform/attachments", Query: "attachment-outside-secret"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result != "No matches" {
-		t.Fatalf("attachment search escaped through a symbolic link: %q", result)
-	}
-}
-
-func TestSandboxAncestorSearchUsesAttachmentOverlay(t *testing.T) {
-	for _, mountpoint := range []string{"directory", "absent", "symlink", "missing-parent"} {
-		t.Run(mountpoint, func(t *testing.T) {
-			service, root := newTestService(t)
-			if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
-				t.Fatal(err)
-			}
-			actual := filepath.Join(root, "data", "attachments", "private", "1")
-			shadow := filepath.Join(root, "data", "workspaces", "user-1", ".agent-platform", "attachments")
-			if err := os.WriteFile(filepath.Join(actual, "note.txt"), []byte("overlay-actual"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.MkdirAll(shadow, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(shadow, "note.txt"), []byte("overlay-shadow"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			outside := filepath.Join(root, "outside")
-			if err := os.Mkdir(outside, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("overlay-outside"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(outside, filepath.Join(actual, "escape")); err != nil {
-				t.Fatal(err)
-			}
-			switch mountpoint {
-			case "absent", "symlink":
-				if err := os.Rename(shadow, filepath.Join(root, "hidden-attachments")); err != nil {
-					t.Fatal(err)
-				}
-			case "missing-parent":
-				if err := os.Rename(filepath.Dir(shadow), filepath.Join(root, "hidden-internal")); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if mountpoint == "symlink" {
-				if err := os.Symlink(outside, shadow); err != nil {
-					t.Fatal(err)
-				}
-			}
-			for _, path := range []string{"/workspace/.agent-platform/attachments", "/workspace/.agent-platform", "/workspace"} {
-				var result string
-				var err error
-				if mountpoint == "directory" {
-					result, _, err = executeSandboxFile(t, service, "search", fileSearchArguments{Path: path, Query: "overlay-"})
-				} else {
-					// Exercise traversal after a mountpoint disappears or is
-					// replaced, without Ensure recreating or rejecting it first.
-					var mapped managedFilePath
-					mapped, err = service.Files.sandboxPath(Call{Identity: identity(), Target: "sandbox"}, path)
-					if err == nil {
-						var matches []string
-						matches, err = searchManaged(context.Background(), mapped, regexp.MustCompile("overlay-"), 10)
-						result = strings.Join(matches, "\n")
-					}
-				}
-				if err != nil {
-					t.Fatalf("search %s: %v", path, err)
-				}
-				prefix := strings.TrimPrefix("/workspace/.agent-platform/attachments/note.txt", path+"/")
-				if result != prefix+":1:overlay-actual" {
-					t.Fatalf("search %s violated attachment overlay: %q", path, result)
-				}
-			}
-		})
-	}
-}
-
-func TestAncestorSearchKeepsAttachmentRootPinned(t *testing.T) {
-	service, root := newTestService(t)
-	if _, _, err := executeSandboxFile(t, service, "write", fileWriteArguments{Path: "/workspace/inside.txt", Content: "inside"}); err != nil {
-		t.Fatal(err)
-	}
-	path, err := service.Files.sandboxPath(Call{Identity: identity(), Target: "sandbox"}, "/workspace")
-	if err != nil {
-		t.Fatal(err)
-	}
-	attachments, err := openManagedDirectory(managedFilePath{root: path.attachmentRoot, relative: "."})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer attachments.Close()
-	if err := os.WriteFile(filepath.Join(path.attachmentRoot, "note.txt"), []byte("overlay-original"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(path.attachmentRoot, filepath.Join(root, "pinned-attachments")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(path.attachmentRoot, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(path.attachmentRoot, "note.txt"), []byte("overlay-replacement"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	workspace, err := openManagedNode(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer workspace.Close()
-	var results []string
-	if err := searchManagedNode(context.Background(), path, workspace, attachments, ".", regexp.MustCompile("overlay-"), 10, &results); err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 || results[0] != ".agent-platform/attachments/note.txt:1:overlay-original" {
-		t.Fatalf("search reopened attachment pathname instead of using pinned fd: %v", results)
 	}
 }

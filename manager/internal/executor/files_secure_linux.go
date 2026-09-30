@@ -3,35 +3,26 @@
 package executor
 
 import (
-	"bufio"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"syscall"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/contract"
-	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
-// managedFilePath keeps the trusted mount/host root separate from the
+// managedFilePath keeps the trusted mount root separate from the
 // untrusted relative path. All filesystem access below walks from an open root
 // fd with O_NOFOLLOW, so a process cannot redirect a later Manager file call
 // through a parent symlink.
 type managedFilePath struct {
-	root           string
-	relative       string
-	readOnly       bool
-	host           *sandbox.HostPath
-	attachmentRoot string
-	attachmentPath string
+	root     string
+	relative string
+	readOnly bool
 }
 
 func (s FileService) sandboxPath(call Call, value string) (managedFilePath, error) {
@@ -74,30 +65,9 @@ func (s FileService) sandboxPath(call Call, value string) (managedFilePath, erro
 			continue
 		}
 		path := managedFilePath{root: candidate.host, relative: relative, readOnly: candidate.readOnly}
-		if candidate.logical == contract.ContainerWorkspace && spec.Attachments != "" {
-			if overlay, ancestor := relativeBelow(logical, attachmentRoot); ancestor {
-				path.attachmentRoot = spec.Attachments
-				path.attachmentPath = overlay
-			}
-		}
 		return path, nil
 	}
 	return managedFilePath{}, errors.New("sandbox file tools can access only persistent mounted paths")
-}
-
-func (s FileService) hostPath(call Call, value string, access sandbox.HostPathAccess) (managedFilePath, error) {
-	if call.Target != "host" {
-		return managedFilePath{}, errors.New("secure host path requires target=host")
-	}
-	resolved, err := s.Sandboxes.ResolveHostPath(call.ExecutionContext.SandboxID, value, access)
-	if err != nil {
-		return managedFilePath{}, err
-	}
-	return managedHostPath(resolved), nil
-}
-
-func managedHostPath(path sandbox.HostPath) managedFilePath {
-	return managedFilePath{root: path.Root, relative: path.Relative, host: &path}
 }
 
 func relativeBelow(root, path string) (string, bool) {
@@ -123,45 +93,33 @@ func (path managedFilePath) rejectMutation() error {
 }
 
 func openManagedRegular(path managedFilePath) (*os.File, error) {
-	file, parent, _, err := openManagedRegularForUpdate(path)
-	if parent != nil {
-		_ = parent.Close()
-	}
-	return file, err
-}
-
-func openManagedRegularForUpdate(path managedFilePath) (*os.File, *os.File, string, error) {
 	parent, leaf, err := openManagedParent(path, false)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, err
 	}
+	defer parent.Close()
 	if leaf == "." {
-		_ = parent.Close()
-		return nil, nil, "", errors.New("path is not a regular file")
+		return nil, errors.New("path is not a regular file")
 	}
 	fd, err := syscall.Openat(int(parent.Fd()), leaf, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		_ = parent.Close()
-		return nil, nil, "", managedOpenError(err)
+		return nil, managedOpenError(err)
 	}
 	file := os.NewFile(uintptr(fd), leaf)
 	if file == nil {
 		_ = syscall.Close(fd)
-		_ = parent.Close()
-		return nil, nil, "", errors.New("open managed file failed")
+		return nil, errors.New("open managed file failed")
 	}
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
-		_ = parent.Close()
-		return nil, nil, "", err
+		return nil, err
 	}
 	if !info.Mode().IsRegular() {
 		_ = file.Close()
-		_ = parent.Close()
-		return nil, nil, "", errors.New("path is not a regular file")
+		return nil, errors.New("path is not a regular file")
 	}
-	return file, parent, leaf, nil
+	return file, nil
 }
 
 // openManagedParent returns an fd pinned to the final parent directory. Every
@@ -333,236 +291,4 @@ func createTemporaryAt(parent *os.File, temporaryPrefix string) (string, *os.Fil
 		return name, file, nil
 	}
 	return "", nil, errors.New("could not allocate temporary managed file")
-}
-
-func searchManaged(ctx context.Context, path managedFilePath, matcher *regexp.Regexp, max int) ([]string, error) {
-	var attachments *os.File
-	if path.attachmentRoot != "" {
-		var err error
-		attachments, err = openManagedDirectory(managedFilePath{root: path.attachmentRoot, relative: "."})
-		if err != nil {
-			return nil, err
-		}
-		defer attachments.Close()
-	}
-	root, err := openManagedNode(path)
-	if err != nil && !(attachments != nil && errors.Is(err, syscall.ENOENT)) {
-		return nil, err
-	}
-	if root != nil {
-		defer root.Close()
-	}
-	results := make([]string, 0, max)
-	if err := searchManagedNode(ctx, path, root, attachments, ".", matcher, max, &results); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
-
-func openManagedNode(path managedFilePath) (*os.File, error) {
-	if path.relative == "." {
-		fd, err := syscall.Open(path.root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		if err != nil {
-			return nil, managedOpenError(err)
-		}
-		file := os.NewFile(uintptr(fd), "sandbox-root")
-		if file == nil {
-			_ = syscall.Close(fd)
-			return nil, errors.New("open managed search root failed")
-		}
-		return file, nil
-	}
-	parent, leaf, err := openManagedParent(path, false)
-	if err != nil {
-		return nil, err
-	}
-	defer parent.Close()
-	fd, err := syscall.Openat(int(parent.Fd()), leaf, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, managedOpenError(err)
-	}
-	file := os.NewFile(uintptr(fd), leaf)
-	if file == nil {
-		_ = syscall.Close(fd)
-		return nil, errors.New("open managed search path failed")
-	}
-	return file, nil
-}
-
-func searchManagedNode(ctx context.Context, path managedFilePath, node, attachments *os.File, relative string, matcher *regexp.Regexp, max int, results *[]string) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-	if len(*results) >= max {
-		return nil
-	}
-	if matcher.MatchString(relative) {
-		*results = append(*results, relative+": filename match")
-		if len(*results) >= max {
-			return nil
-		}
-	}
-	var names []string
-	if node != nil {
-		info, err := node.Stat()
-		if err != nil {
-			return err
-		}
-		if info.Mode().IsRegular() {
-			if info.Size() > 2<<20 {
-				return nil
-			}
-			return scanManagedFile(node, relative, matcher, max, results)
-		}
-		if !info.IsDir() {
-			return nil
-		}
-		// Enumerate from the pinned fd, not from the display-only node.Name().
-		names, err = node.Readdirnames(-1)
-		if err != nil {
-			return err
-		}
-	}
-	// The mount is visible even when its workspace mountpoint is absent.
-	// Inject only the next component on the route to the exact overlay.
-	overlayBelow := path.attachmentPath
-	if relative != "." {
-		overlayBelow, _ = relativeBelow(relative, path.attachmentPath)
-	}
-	if attachments != nil && overlayBelow != "" && overlayBelow != "." {
-		name, _, _ := strings.Cut(overlayBelow, string(filepath.Separator))
-		found := false
-		for _, existing := range names {
-			if existing == name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if len(*results) >= max {
-			return nil
-		}
-		if name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) {
-			continue
-		}
-		childRelative := name
-		if relative != "." {
-			childRelative = filepath.Join(relative, name)
-		}
-		if !path.allowsSearchDescendant(childRelative) {
-			continue
-		}
-		if attachments != nil && childRelative == path.attachmentPath {
-			if err := searchManagedNode(ctx, path, attachments, nil, childRelative, matcher, max, results); err != nil {
-				return err
-			}
-			continue
-		}
-		if node == nil {
-			if err := searchManagedNode(ctx, path, nil, attachments, childRelative, matcher, max, results); err != nil {
-				return err
-			}
-			continue
-		}
-		fd, openErr := syscall.Openat(int(node.Fd()), name, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		if attachments != nil && errors.Is(openErr, syscall.ENOENT) {
-			if _, ancestor := relativeBelow(childRelative, path.attachmentPath); ancestor {
-				if err := searchManagedNode(ctx, path, nil, attachments, childRelative, matcher, max, results); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		if errors.Is(openErr, syscall.ELOOP) || errors.Is(openErr, syscall.ENOENT) {
-			// Match symlink names for parity with filepath.WalkDir, but never
-			// follow their content or a concurrently replaced entry.
-			if matcher.MatchString(childRelative) {
-				*results = append(*results, childRelative+": filename match")
-			}
-			continue
-		}
-		if openErr != nil {
-			return managedOpenError(openErr)
-		}
-		child := os.NewFile(uintptr(fd), name)
-		if child == nil {
-			_ = syscall.Close(fd)
-			return errors.New("open managed search entry failed")
-		}
-		err := searchManagedNode(ctx, path, child, attachments, childRelative, matcher, max, results)
-		_ = child.Close()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func scanManagedFile(file *os.File, relative string, matcher *regexp.Regexp, max int, results *[]string) error {
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 2<<20)
-	line := 0
-	for scanner.Scan() && len(*results) < max {
-		line++
-		text := scanner.Text()
-		if !matcher.MatchString(text) {
-			continue
-		}
-		if len(text) > 500 {
-			text = text[:500]
-		}
-		*results = append(*results, fmt.Sprintf("%s:%d:%s", relative, line, text))
-	}
-	return scanner.Err()
-}
-
-func (path managedFilePath) allowsSearchDescendant(relative string) bool {
-	if path.host == nil {
-		return true
-	}
-	return path.host.Allows(filepath.Join(path.host.Canonical, relative))
-}
-
-func openManagedDirectory(path managedFilePath) (*os.File, error) {
-	if path.relative == "." {
-		fd, err := syscall.Open(path.root, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-		if err != nil {
-			return nil, managedOpenError(err)
-		}
-		file := os.NewFile(uintptr(fd), "managed-directory")
-		if file == nil {
-			_ = syscall.Close(fd)
-			return nil, errors.New("open managed directory failed")
-		}
-		return file, nil
-	}
-	parent, leaf, err := openManagedParent(path, false)
-	if err != nil {
-		return nil, err
-	}
-	defer parent.Close()
-	fd, err := syscall.Openat(int(parent.Fd()), leaf, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, managedOpenError(err)
-	}
-	file := os.NewFile(uintptr(fd), leaf)
-	if file == nil {
-		_ = syscall.Close(fd)
-		return nil, errors.New("open managed directory failed")
-	}
-	return file, nil
-}
-
-func openHostWorkingDirectory(path sandbox.HostPath) (*os.File, error) {
-	return openManagedDirectory(managedHostPath(path))
 }

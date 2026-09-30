@@ -117,8 +117,8 @@ func TestAuditReceiptRejectsPathAndActionTamperingWithoutBeingConsumed(t *testin
 
 func TestAuditReceiptConcurrentConsumptionAllowsExactlyOneCaller(t *testing.T) {
 	store := AuditStore{Dir: filepath.Join(t.TempDir(), "control")}
-	request, receipt := recordAuditForTest(t, store, "process", "list", json.RawMessage(`{}`))
-	call := callForReceipt(request, receipt, "list", request.Arguments)
+	request, receipt := recordAuditForTest(t, store, "read_file", "read", json.RawMessage(`{"path":"/workspace/safe.txt"}`))
+	call := callForReceipt(request, receipt, "read", request.Arguments)
 
 	const callers = 32
 	var successes atomic.Int32
@@ -127,7 +127,7 @@ func TestAuditReceiptConcurrentConsumptionAllowsExactlyOneCaller(t *testing.T) {
 	for range callers {
 		go func() {
 			defer wait.Done()
-			if _, err := store.Consume(call, "process"); err == nil {
+			if _, err := store.Consume(call, "read_file"); err == nil {
 				successes.Add(1)
 			}
 		}()

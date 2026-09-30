@@ -25,7 +25,7 @@ func TestTargetFixtureUsesCanonicalCatalogAndExactBytes(t *testing.T) {
 		manifest.ProtocolVersion != release.ManifestSchemaVersion ||
 		manifest.Channel != contract.ReleaseChannel ||
 		manifest.DatabaseSchemaVersion != contract.DatabaseSchemaVersion ||
-		manifest.SourceCommit != generation || len(manifest.Images) != 10 {
+		manifest.SourceCommit != generation || len(manifest.Images) != 5 {
 		t.Fatalf("fixture drifted from canonical contract: %#v", manifest)
 	}
 	wantCompose := sha256.Sum256(compose)

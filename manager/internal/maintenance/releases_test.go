@@ -100,6 +100,38 @@ func TestImageRetentionPreservesDeferredOwnershipEvidence(t *testing.T) {
 	}
 }
 
+func TestPruneReleasesLeavesTenImageCatalogUntouched(t *testing.T) {
+	root := t.TempDir()
+	current, old := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	writeRelease(t, root, current)
+	writeRelease(t, root, old)
+	manifest := releasetest.NewTarget(old).Manifest
+	for _, name := range []string{"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres", "firecrawl-redis", "firecrawl-rabbitmq"} {
+		manifest.Images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("c", 64)
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, old, "manifest.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy := ReleasePolicy{Root: root, Channel: "main", CurrentID: current}
+	removed, err := PruneReleases(context.Background(), policy)
+	if err != nil || removed != 0 {
+		t.Fatalf("old catalog retention = %d, %v", removed, err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("old catalog changed: %s, %v", got, err)
+	}
+	policy.PreviousID = old
+	if removed, err := PruneReleases(context.Background(), policy); err == nil || removed != 0 {
+		t.Fatalf("ten-image rollback catalog accepted: %d, %v", removed, err)
+	}
+}
+
 func writeRelease(t *testing.T, root, id string) {
 	t.Helper()
 	compose := []byte("services: {}\n")

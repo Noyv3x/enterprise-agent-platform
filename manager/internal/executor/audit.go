@@ -33,8 +33,8 @@ func (s AuditStore) Record(request AuditRequest) (AuditReceipt, error) {
 	if !validID(request.AuditID) || request.Operation == "" {
 		return AuditReceipt{}, errors.New("audit_id and operation are required")
 	}
-	if request.Target != "sandbox" && request.Target != "host" {
-		return AuditReceipt{}, errors.New("target must be sandbox or host")
+	if request.Target != "sandbox" {
+		return AuditReceipt{}, errors.New("target must be sandbox")
 	}
 	if err := validateOperationAction(request.Operation, request.Action); err != nil {
 		return AuditReceipt{}, err
@@ -78,6 +78,9 @@ func (s AuditStore) Record(request AuditRequest) (AuditReceipt, error) {
 func (s AuditStore) Consume(call Call, operation string) (receiptRecord, error) {
 	if err := validateIdentity(call.Identity); err != nil {
 		return receiptRecord{}, err
+	}
+	if call.Target != "sandbox" {
+		return receiptRecord{}, errors.New("target must be sandbox")
 	}
 	if !validID(call.ExecutorID) || !validID(call.AuditID) {
 		return receiptRecord{}, errors.New("invalid execution receipt")
@@ -131,16 +134,10 @@ func validateOperationAction(operation, action string) error {
 	switch operation {
 	case "terminal":
 		valid = action == "run"
-	case "process":
-		valid = action == "list" || action == "read" || action == "write" || action == "kill" || action == "wait"
 	case "read_file":
 		valid = action == "read"
 	case "write_file":
 		valid = action == "write"
-	case "patch_file":
-		valid = action == "patch"
-	case "search_files":
-		valid = action == "search"
 	}
 	if !valid {
 		return errors.New("operation and action are not a supported execution binding")
@@ -224,18 +221,6 @@ func validID(value string) bool {
 	}
 	for _, r := range value {
 		if !(r == '_' || r == '-' || r == '.' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
-			return false
-		}
-	}
-	return true
-}
-
-func validCompletionOwner(value string) bool {
-	if len(value) != 64 {
-		return false
-	}
-	for _, r := range value {
-		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
 			return false
 		}
 	}

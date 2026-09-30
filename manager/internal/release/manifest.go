@@ -26,7 +26,6 @@ var errReleaseURLPolicy = errors.New("URL must use https or loopback http")
 
 var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var digestPattern = regexp.MustCompile(`^[^@[:space:]]+@sha256:[0-9a-f]{64}$`)
-var imageNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var canonicalManifestJSONKeys = func() map[string]string {
@@ -46,8 +45,6 @@ const ManifestSchemaVersion = 2
 
 var managedImageNames = []string{
 	"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-	"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-	"firecrawl-redis", "firecrawl-rabbitmq",
 }
 
 var managedImageNameSet = func() map[string]struct{} {
@@ -127,27 +124,13 @@ func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identi
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	names := managedImageNames
-	if len(m.Images) == 5 {
-		names = managedImageNames[:5]
-	} else if len(m.Images) != len(managedImageNames) {
-		return fmt.Errorf("manifest schema %d images must contain exactly five or ten managed entries", m.SchemaVersion)
+	if len(m.Images) != len(managedImageNames) {
+		return fmt.Errorf("manifest schema %d images must contain exactly five managed entries", m.SchemaVersion)
 	}
-	for _, name := range names {
+	for _, name := range managedImageNames {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q must use a complete registry sha256 digest", name)
-		}
-	}
-	for name, digest := range m.Images {
-		if _, ok := managedImageNameSet[name]; !ok {
-			return fmt.Errorf("image %q is outside the managed release set", name)
-		}
-		if !imageNamePattern.MatchString(name) {
-			return fmt.Errorf("image name %q must use lowercase kebab-case", name)
-		}
-		if !digestPattern.MatchString(digest) {
-			return fmt.Errorf("image %q has invalid digest", name)
 		}
 	}
 	if m.Manager.Version == "" {

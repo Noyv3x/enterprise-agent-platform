@@ -65,29 +65,18 @@ func TestRetainImagesProtectsCommittedAndRunningImages(t *testing.T) {
 	}
 }
 
-func TestFirecrawlAbsentDoesNotInvokeDocker(t *testing.T) {
-	runner := &recordingRunner{}
-	docker := DockerCLI{Runner: runner}
-	if err := docker.ReconcileFirecrawl(context.Background(), release.Manifest{Images: map[string]string{"platform": "unused"}}); err != nil {
-		t.Fatal(err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("absent Firecrawl invoked Docker: %v", runner.calls)
-	}
-}
-
-func TestLegacyImageCapacityFallbackWithoutGeneratedMap(t *testing.T) {
+func TestMissingCapacityEstimateRejectsPull(t *testing.T) {
 	estimates := contract.ManagedImageCapacityEstimates
 	contract.ManagedImageCapacityEstimates = nil
 	defer func() { contract.ManagedImageCapacityEstimates = estimates }()
-	image := "registry.example/firecrawl@sha256:" + strings.Repeat("a", 64)
+	image := "registry.example/platform@sha256:" + strings.Repeat("a", 64)
 	runner := &pullTestRunner{present: map[string]bool{}}
 	docker := pullTestDocker(runner, time.Second, 2*time.Second)
-	if err := docker.PrepareManagedImage(context.Background(), "firecrawl-api", image); err != nil {
-		t.Fatal(err)
+	if err := docker.PrepareManagedImage(context.Background(), "platform", image); err == nil || !strings.Contains(err.Error(), "no valid capacity estimate") {
+		t.Fatalf("missing capacity estimate accepted: %v", err)
 	}
-	if !runner.present[image] {
-		t.Fatal("legacy image not prepared without generated capacity entries")
+	if runner.present[image] {
+		t.Fatal("image pulled without a capacity estimate")
 	}
 }
 

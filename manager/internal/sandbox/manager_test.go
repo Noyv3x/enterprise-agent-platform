@@ -311,7 +311,7 @@ func TestReapSerializesContainerStopWithANewCall(t *testing.T) {
 	}
 }
 
-func TestSandboxImageUpgradeWaitsForProcessesThenRecreates(t *testing.T) {
+func TestSandboxImageUpgradeWaitsForCallsThenRecreates(t *testing.T) {
 	engine := &sandboxEngine{}
 	root := t.TempDir()
 	oldImage := "registry/sandbox@sha256:" + strings.Repeat("a", 64)
@@ -326,9 +326,6 @@ func TestSandboxImageUpgradeWaitsForProcessesThenRecreates(t *testing.T) {
 	if err := manager.BeginCall("private-1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.EndCall("private-1", true, time.Now()); err != nil {
-		t.Fatal(err)
-	}
 	manager.SetImage(newImage)
 	busy, err := manager.Ensure(context.Background(), "private-1", "user-1", time.Now())
 	if err != nil {
@@ -337,7 +334,7 @@ func TestSandboxImageUpgradeWaitsForProcessesThenRecreates(t *testing.T) {
 	if busy.Image != oldImage || len(engine.removed) != 0 {
 		t.Fatalf("busy sandbox was replaced instead of deferred: %#v %#v", busy, engine.removed)
 	}
-	if err := manager.ProcessExited("private-1", time.Now()); err != nil {
+	if err := manager.EndCall("private-1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	upgraded, err := manager.Ensure(context.Background(), "private-1", "user-1", time.Now())

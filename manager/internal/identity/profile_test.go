@@ -27,8 +27,6 @@ func TestTargetProfileMatchesCurrentProtocol(t *testing.T) {
 		LabelPrefix:                "io.agent-platform",
 		SandboxContainerPrefix:     "agent-platform-sandbox-",
 		MigrationContainerPrefix:   "agent-platform-migration-",
-		WatchdogUnitPrefix:         "agent-platform-manager-watchdog-",
-		RecoveryWatchdogUnitPrefix: "agent-platform-manager-watchdog-current-recovery-",
 		InternalWorkspaceDirectory: ".agent-platform",
 	}
 	if got := TargetProfile(); !reflect.DeepEqual(got, want) {

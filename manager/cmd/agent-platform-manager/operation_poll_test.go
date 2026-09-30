@@ -110,3 +110,81 @@ func TestAwaitOperationConnectionRefused(t *testing.T) {
 		t.Fatalf("connection refusal was not retried: %v", err)
 	}
 }
+
+func TestAwaitOperationLauncherProofPending(t *testing.T) {
+	for _, outcome := range []string{"succeeded", "failed"} {
+		t.Run(outcome, func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "manager.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requests := 0
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/operations/op_update" {
+					t.Errorf("mutation replay or identity drift: %s %s", r.Method, r.URL.Path)
+				}
+				requests++
+				if requests == 1 {
+					http.Error(w, "launcher startup proof pending", http.StatusServiceUnavailable)
+					return
+				}
+				io.WriteString(w, `{"status":"`+outcome+`","error":"candidate rejected"}`)
+			})}
+			go server.Serve(listener)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			err = awaitOperationContext(ctx, control.Client{SocketPath: socket, Token: "valid-token"}, "op_update")
+			if outcome == "succeeded" && err != nil {
+				t.Fatal(err)
+			}
+			if outcome == "failed" && (err == nil || err.Error() != "candidate rejected") {
+				t.Fatalf("lost terminal failure: %v", err)
+			}
+		})
+	}
+}
+
+func TestAwaitOperationHTTPFailuresDoNotRetry(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			socket := filepath.Join(t.TempDir(), "manager.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "deterministic failure", status)
+			})}
+			go server.Serve(listener)
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			err = awaitOperationContext(ctx, control.Client{SocketPath: socket, Token: "valid-token"}, "op_update")
+			var failure *control.HTTPError
+			if !errors.As(err, &failure) || failure.Status != status {
+				t.Fatalf("deterministic HTTP error was retried or lost: %v", err)
+			}
+		})
+	}
+}
+
+func TestAwaitOperationLauncherProofPendingDeadline(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "manager.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "launcher startup proof pending", http.StatusServiceUnavailable)
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	err = awaitOperationContext(ctx, control.Client{SocketPath: socket, Token: "valid-token"}, "op_update")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("proof-pending deadline error = %v", err)
+	}
+}

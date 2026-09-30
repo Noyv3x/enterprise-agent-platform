@@ -246,7 +246,6 @@ const (
 	candidateLogsMaxBytes       = 32 << 10
 	candidateHealthMaxBytes     = 12 << 10
 	candidateDiagnosticTimeout  = 10 * time.Second
-	firecrawlComposeWaitSeconds = 600
 	defaultPullIdleTimeout      = 15 * time.Minute
 	defaultPullAbsoluteTimeout  = 6 * time.Hour
 	imageInspectTimeout         = 30 * time.Second
@@ -254,14 +253,6 @@ const (
 )
 
 var coreUpdateImageNames = []string{"platform", "agent-runtime", "agent-sandbox"}
-
-var firecrawlHealthyServices = []string{
-	"firecrawl-playwright",
-	"firecrawl-redis",
-	"firecrawl-rabbitmq",
-	"firecrawl-postgres",
-	"firecrawl-api",
-}
 
 var capabilityServices = []string{"camofox", "searxng"}
 
@@ -346,13 +337,7 @@ func (d DockerCLI) checkCapacity(ctx context.Context, stage string, manifest rel
 			}
 			estimate, ok := contract.ManagedImageCapacityEstimates[name]
 			if !ok || estimate.CompressedBytes == 0 || estimate.UnpackedBytes == 0 {
-				if !release.IsManagedImageName(name) {
-					return fmt.Errorf("managed image %s has no valid capacity estimate", name)
-				}
-				// Catalog compatibility must survive removal of legacy estimates.
-				// Reserve a conservative 8 GiB per missing legacy image.
-				estimate.CompressedBytes = 2 << 30
-				estimate.UnpackedBytes = 6 << 30
+				return fmt.Errorf("managed image %s has no valid capacity estimate", name)
 			}
 			for _, addition := range []uint64{estimate.CompressedBytes, estimate.UnpackedBytes} {
 				if dockerMinimumBytes > ^uint64(0)-addition {
@@ -516,16 +501,16 @@ func (d DockerCLI) Preflight(ctx context.Context) error {
 }
 
 func (d DockerCLI) Pull(ctx context.Context, manifest release.Manifest) error {
-	return d.prepareManagedImages(ctx, manifest, coreUpdateImageNames, true)
+	return d.prepareManagedImages(ctx, manifest, coreUpdateImageNames)
 }
 
 // PrepareManagedImage applies the canonical capacity and digest verification
 // policy to one immutable image outside the fixed update path.
 func (d DockerCLI) PrepareManagedImage(ctx context.Context, name, image string) error {
-	return d.prepareManagedImages(ctx, release.Manifest{Images: map[string]string{name: image}}, []string{name}, true)
+	return d.prepareManagedImages(ctx, release.Manifest{Images: map[string]string{name: image}}, []string{name})
 }
 
-func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Manifest, names []string, enforceCapacity bool) error {
+func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Manifest, names []string) error {
 	if d.ManagedImageMu != nil {
 		d.ManagedImageMu.Lock()
 		defer d.ManagedImageMu.Unlock()
@@ -547,36 +532,52 @@ func (d DockerCLI) prepareManagedImages(ctx context.Context, manifest release.Ma
 	if len(missing) == 0 {
 		return nil
 	}
-	if enforceCapacity {
-		if err := d.checkCapacity(ctx, CapacityPreDownload, manifest, missing, false, true); err != nil {
-			return err
-		}
+	if err := d.checkCapacity(ctx, CapacityPreDownload, manifest, missing, false, true); err != nil {
+		return err
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var workers sync.WaitGroup
+	var failure sync.Once
+	var firstErr error
+	jobs := make(chan string, len(missing))
 	for _, name := range missing {
-		image := manifest.Images[name]
-		if enforceCapacity {
-			present, err := d.imagePresent(ctx, name, image)
-			if err != nil {
-				return err
-			}
-			if present {
-				continue
-			}
-		}
-		pullErr := d.pullImage(ctx, name, image)
-		if pullErr == nil {
-			present, verifyErr := d.imagePresent(ctx, name, image)
-			if verifyErr != nil {
-				pullErr = fmt.Errorf("verify pulled managed image %s: %w", name, verifyErr)
-			} else if !present {
-				pullErr = fmt.Errorf("verify pulled managed image %s: exact RepoDigest is absent", name)
-			}
-		}
-		if pullErr != nil {
-			return pullErr
-		}
+		jobs <- name
 	}
-	return nil
+	close(jobs)
+	for range min(3, len(missing)) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for name := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				image := manifest.Images[name]
+				err := d.pullImage(ctx, name, image)
+				if err == nil {
+					present, verifyErr := d.imagePresent(ctx, name, image)
+					if verifyErr != nil {
+						err = fmt.Errorf("verify pulled managed image %s: %w", name, verifyErr)
+					} else if !present {
+						err = fmt.Errorf("verify pulled managed image %s: exact RepoDigest is absent", name)
+					}
+				}
+				if err != nil {
+					failure.Do(func() {
+						firstErr = err
+						cancel()
+					})
+					return
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 func (d DockerCLI) imagePresent(ctx context.Context, name, image string) (bool, error) {
@@ -802,9 +803,9 @@ func (d DockerCLI) StartFixed(ctx context.Context, manifest release.Manifest) er
 // capability service for one immutable generation. Services are attempted
 // independently so one failure does not prevent the others from starting. The
 // caller decides how to report and retry the joined error; generation readiness
-// never depends on this method. Firecrawl uses its own bounded reconciler.
+// never depends on this method.
 func (d DockerCLI) ReconcileCapabilities(ctx context.Context, manifest release.Manifest) error {
-	if err := d.prepareManagedImages(ctx, manifest, capabilityServices, true); err != nil {
+	if err := d.prepareManagedImages(ctx, manifest, capabilityServices); err != nil {
 		return fmt.Errorf("prepare capability images: %w", err)
 	}
 	env, err := d.writeGenerationEnvironment(manifest)
@@ -822,63 +823,6 @@ func (d DockerCLI) reconcileCapabilities(ctx context.Context, env string) error 
 		}
 	}
 	return errors.Join(failures...)
-}
-
-// ReconcileFirecrawl converges the PostgreSQL-backed extraction stack for the
-// active generation. It is safe to call again after Manager activation because
-// Compose is idempotent and the Manager never removes or rewrites service data.
-func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Manifest) error {
-	if manifest.Images["firecrawl-api"] == "" {
-		return nil
-	}
-	if err := d.prepareManagedImages(ctx, manifest, firecrawlHealthyServices, true); err != nil {
-		return fmt.Errorf("prepare Firecrawl images: %w", err)
-	}
-	env, err := d.writeGenerationEnvironment(manifest)
-	if err != nil {
-		return err
-	}
-	return d.reconcileFirecrawl(ctx, env)
-}
-
-func (d DockerCLI) reconcileFirecrawl(ctx context.Context, env string) error {
-	startArgs := d.composeArgs(env, "up", "--detach", "--wait", "--wait-timeout", strconv.Itoa(firecrawlComposeWaitSeconds), "firecrawl-api")
-	_, err := d.runner().Run(ctx, d.binary(), startArgs, nil)
-	if err == nil {
-		return nil
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return errors.Join(
-		fmt.Errorf("start Firecrawl PostgreSQL stack: %w", err),
-		errors.New(d.firecrawlFailureDiagnostics(env)),
-	)
-}
-
-func (d DockerCLI) firecrawlFailureDiagnostics(env string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), candidateDiagnosticTimeout)
-	defer cancel()
-	logServices := append([]string{"logs", "--no-color", "--timestamps", "--tail", "120"}, firecrawlHealthyServices...)
-	logsResult, logsErr := d.runner().Run(
-		ctx,
-		d.binary(),
-		d.composeArgs(env, logServices...),
-		nil,
-	)
-	parts := []string{"Firecrawl compose logs:\n" + d.boundedCommandDiagnostic(logsResult, logsErr, candidateLogsMaxBytes)}
-	services := append([]string{}, firecrawlHealthyServices...)
-	for _, service := range services {
-		id, err := d.composeServiceContainerID(ctx, env, service)
-		if err != nil {
-			parts = append(parts, service+" Docker state:\n"+err.Error())
-			continue
-		}
-		state, inspectErr := d.runner().Run(ctx, d.binary(), []string{"inspect", "--format", "{{json .State}}", id}, nil)
-		parts = append(parts, service+" Docker state:\n"+d.boundedCommandDiagnostic(state, inspectErr, candidateHealthMaxBytes))
-	}
-	diagnostic := d.redactCandidateDiagnostic(strings.Join(parts, "\n"))
-	return journal.BoundDiagnosticWithLimit(diagnostic, candidateDiagnosticMaxBytes)
 }
 
 func (d DockerCLI) Migrate(ctx context.Context, manifest release.Manifest) error {
@@ -982,9 +926,8 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 }
 
 func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServiceState {
-	result := make(map[string]FixedServiceState, 9)
+	result := make(map[string]FixedServiceState, 4)
 	env, envErr := d.activeEnvironment()
-	manifestEnv := env
 	if d.ComposeFile != "" {
 		env = ""
 		envErr = nil
@@ -994,17 +937,6 @@ func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServi
 		"agent-runtime",
 		"camofox",
 		"searxng",
-	}
-	includeFirecrawl := d.ComposeFile != ""
-	if manifestEnv != "" {
-		data, err := os.ReadFile(filepath.Join(filepath.Dir(manifestEnv), "manifest.json"))
-		var manifest release.Manifest
-		if err == nil && json.Unmarshal(data, &manifest) == nil {
-			includeFirecrawl = manifest.Images["firecrawl-api"] != ""
-		}
-	}
-	if includeFirecrawl {
-		services = append(services, firecrawlHealthyServices...)
 	}
 	for _, service := range services {
 		status := "unknown"
@@ -1162,7 +1094,6 @@ func (d DockerCLI) redactCandidateDiagnostic(value string) string {
 	for _, name := range []string{
 		"session-secret", "agent-tool-token", "agent-runtime-token",
 		"camofox-access-key", "manager-token", "manager-executor-token",
-		"firecrawl-postgres-password", "firecrawl-bull-auth-key",
 	} {
 		secret, err := ReadOwnerSecret(filepath.Join(d.StateDir, "secrets", name))
 		if err == nil && secret != "" {
@@ -1286,6 +1217,102 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 		return SandboxEnsureResult{Created: true}, errors.Join(err, cleanupErr)
 	}
 	return SandboxEnsureResult{Created: true, Started: true}, nil
+}
+
+// StopRunningManagedSandboxes fences commands left by a previous Manager before
+// executor readiness, including containers absent from the in-memory registry.
+func (d DockerCLI) StopRunningManagedSandboxes(ctx context.Context) error {
+	// Reserve CommandRunner's five-second cancellation/reap window within the
+	// whole cleanup's fifteen-second budget, rather than per container.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	d.Runner = startupCleanupRunner{Runner: d.runner()}
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return err
+	}
+	listArgs := []string{"ps", "--no-trunc", "--quiet", "--filter", "label=" + profile.Label("sandbox") + "=true"}
+	result, err := d.runner().Run(ctx, d.binary(), listArgs, nil)
+	if err != nil {
+		return fmt.Errorf("list running managed sandboxes: %w", err)
+	}
+	type sandboxIdentity struct {
+		id   string
+		hash string
+	}
+	var sandboxes []sandboxIdentity
+	stopArgs := []string{"stop", "--time", "0"}
+	for _, id := range strings.Fields(result.Stdout) {
+		if !validContainerID(id) {
+			return errors.New("Docker returned invalid managed sandbox container ID")
+		}
+		metadata, err := d.runner().Run(ctx, d.binary(), []string{"inspect", "--format",
+			fmt.Sprintf("{{index .Config.Labels %q}}\t{{index .Config.Labels %q}}", profile.Label("sandbox"), profile.Label("id")), id}, nil)
+		if err != nil {
+			if dockerObjectMissing(metadata, err) {
+				continue
+			}
+			return fmt.Errorf("inspect startup sandbox %s: %w", id, err)
+		}
+		fields := strings.Split(strings.TrimSpace(metadata.Stdout), "\t")
+		if len(fields) != 2 || fields[0] != "true" || !validAgentHash(fields[1]) {
+			return errors.New("refusing to stop a sandbox without Manager ownership labels")
+		}
+		sandboxes = append(sandboxes, sandboxIdentity{id: id, hash: fields[1]})
+		stopArgs = append(stopArgs, id)
+	}
+	// Validate every identity before any mutation, then force-stop in one batch:
+	// a sandbox ignoring SIGTERM must not consume a separate grace period.
+	if len(sandboxes) > 0 {
+		if _, err := d.runner().Run(ctx, d.binary(), stopArgs, nil); err != nil {
+			return fmt.Errorf("stop startup sandboxes: %w", err)
+		}
+	}
+	for _, sandbox := range sandboxes {
+		state, err := d.InspectManagedSandbox(ctx, sandbox.id, sandbox.hash)
+		if err != nil {
+			return err
+		}
+		if state.Exists && (!state.Owned || state.Running) {
+			return fmt.Errorf("startup sandbox %s did not remain owned and stopped", sandbox.id)
+		}
+	}
+	result, err = d.runner().Run(ctx, d.binary(), listArgs, nil)
+	if err != nil {
+		return fmt.Errorf("confirm managed sandboxes stopped: %w", err)
+	}
+	if strings.TrimSpace(result.Stdout) != "" {
+		return errors.New("managed sandboxes remain running after startup cleanup")
+	}
+	return nil
+}
+
+// Only command failures are retried. Successful but malformed output and
+// ownership mismatches are rejected by the caller without another attempt.
+type startupCleanupRunner struct {
+	Runner
+}
+
+func (r startupCleanupRunner) Run(ctx context.Context, name string, args []string, env []string) (Result, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		result, err := r.Runner.Run(ctx, name, args, env)
+		if ctx.Err() != nil {
+			return result, errors.Join(err, ctx.Err())
+		}
+		if err == nil || dockerObjectMissing(result, err) {
+			return result, err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return result, errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 func (d DockerCLI) StopSandbox(ctx context.Context, name string) error {
@@ -1602,7 +1629,7 @@ func (d DockerCLI) EnsureHostLayout() error {
 			return err
 		}
 	}
-	for _, name := range []string{"session-secret", "agent-tool-token", "agent-runtime-token", "camofox-access-key", "manager-token", "manager-executor-token", "firecrawl-postgres-password", "firecrawl-bull-auth-key"} {
+	for _, name := range []string{"session-secret", "agent-tool-token", "agent-runtime-token", "camofox-access-key", "manager-token", "manager-executor-token"} {
 		if _, err := ensureSecret(filepath.Join(d.StateDir, "secrets", name)); err != nil {
 			return err
 		}
@@ -1618,7 +1645,7 @@ func (d DockerCLI) controlDirectory() string {
 }
 func (d DockerCLI) ensureDataLayout() error {
 	workspaceRoot := filepath.Join(d.DataRoot, "data", "workspaces")
-	directories := []string{filepath.Join(d.DataRoot, "data"), filepath.Join(d.DataRoot, "data", "runtimes", "agent"), filepath.Join(d.DataRoot, "data", "runtimes", "camofox"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "config"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "cache"), filepath.Join(d.DataRoot, "data", "runtimes", "firecrawl")}
+	directories := []string{filepath.Join(d.DataRoot, "data"), filepath.Join(d.DataRoot, "data", "runtimes", "agent"), filepath.Join(d.DataRoot, "data", "runtimes", "camofox"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "config"), filepath.Join(d.DataRoot, "data", "runtimes", "searxng", "cache")}
 	for _, path := range directories {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			return err

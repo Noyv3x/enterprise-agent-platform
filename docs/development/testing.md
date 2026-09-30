@@ -31,7 +31,7 @@
 
 ## Manager M1
 
-本次兼容发布仍生成十镜像清单。Manager 回归需要同时覆盖十镜像和五镜像的接受、拒绝不完整集合、Firecrawl 缺席时不拉取/启动/探测或降级、更新前沙箱预拉取，以及当前/上一代和运行沙箱镜像的精确 ID 保留。容量表不含 Firecrawl 条目时，仍须接受旧十镜像版本以便回滚。
+Manager 简化版只接受五镜像清单：`platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`。回归须覆盖完整五镜像集合的接受，十镜像、未知镜像和不完整集合的拒绝，严格 schema 2 / protocol 2 解码、发布物传输和哈希验证，以及更新前沙箱预拉取和当前/上一代、运行沙箱镜像的精确 ID 保留。清单校验不依赖容量估算表；不再接受旧十镜像版本用于回滚。
 
 在 `manager/` 执行 `go test -count=1 ./...`、`go vet ./...`、`go build -buildvcs=false ./cmd/agent-platform-manager`；沙箱测试必须观察 `docker create` 的 agent/chat 限额、chat 的 `--network none` 和无附件挂载，验证省略 profile 的旧请求及已绑定 profile 的漂移拒绝。安装器与发布目录检查执行根目录的 `scripts/container-smoke.sh`。真实生产二进制到 M1 的用户级 systemd 更新不能由单元测试代替，命令见下文。
 
@@ -88,4 +88,4 @@ scripts/container-smoke.sh
 AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -timeout=20m -run '^(TestBridgeSystemdBinaryUpgradeIntegration|TestProductionSystemdBinaryUpgradeIntegration)$' ./internal/selfupdate
 ```
 
-两项检查分别保留真实 N→N+1 桥接/失败启动回退覆盖，并以生产 `6889bf66dd63754e42de46f7048eed84a3f0768f` 二进制通过正常 `/v1/operations` 自更新到当前 M1，确认提交收尾、生产版本作为回退、不可变 launcher 和服务重启后选择。使用真实用户级 systemd、真实 Manager 二进制和 Alpine 核心容器；Platform 维护门为认证夹具，不能替代真实 Platform 迁移/预约/数据回滚验收。修改 Manager 控制 API 时另运行 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`。发布前按[发布通道](../operations/auto-update.md#发布通道)和[兼容性清单](documentation-workflow.md#发布兼容性清单)检查，不用本地门禁代替发布证据。
+两项检查保留真实已安装 launcher 的失败启动回退、checkpoint 收尾和重启覆盖，并以生产 `a791405075e7bd4ea883274f5b4553bfabb5d379` 二进制通过正常 `/v1/operations` 自更新到当前 Manager，确认提交收尾、生产版本作为回退、不可变 launcher 和服务重启后选择。不再导入旧 `state.json` / `operations/` 桥接状态。使用真实用户级 systemd、真实 Manager 二进制和 Alpine 核心容器；Platform 维护门为认证夹具，不能替代真实 Platform 迁移/预约/数据回滚验收。修改 Manager 控制 API 时另运行 `go test -race -count=1 ./cmd/agent-platform-manager ./internal/control`。发布前按[发布通道](../operations/auto-update.md#发布通道)和[兼容性清单](documentation-workflow.md#发布兼容性清单)检查，不用本地门禁代替发布证据。

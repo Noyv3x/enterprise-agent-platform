@@ -100,7 +100,7 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 }
 
 // identity is the constant-time, owner-authenticated process probe used by the
-// self-update watchdog and the external Current recovery path. It deliberately
+// immutable launcher. It deliberately
 // does not read the operation journal or call Docker: process identity and the
 // health of managed child services are separate signals.
 func (a *API) identity(response http.ResponseWriter) {
@@ -124,11 +124,6 @@ func (a *API) status(response http.ResponseWriter, requestContext context.Contex
 		"agent-runtime",
 		"camofox",
 		"searxng",
-		"firecrawl-playwright",
-		"firecrawl-redis",
-		"firecrawl-rabbitmq",
-		"firecrawl-postgres",
-		"firecrawl-api",
 	} {
 		services[name] = map[string]any{"status": "unknown"}
 	}
@@ -530,13 +525,6 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 		}
 		result, err := a.Executor.Terminal(request.Context(), body)
 		a.executorResult(response, result, err)
-	case "/v1/executor/process":
-		var body executor.Call
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		result, err := a.Executor.Process(request.Context(), body)
-		a.executorResult(response, result, err)
 	case "/v1/executor/file":
 		var body executor.Call
 		if !a.decodeExecutor(response, request, &body) {
@@ -550,38 +538,6 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 			return
 		}
 		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.CancelRun(body)})
-	case "/v1/executor/tasks/reconcile":
-		var body executor.TaskIdentity
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		processes, err := a.Executor.ReconcileTasks(body)
-		a.executorResult(response, map[string]any{"processes": processes}, err)
-	case "/v1/executor/tasks/acknowledge":
-		var body executor.TaskProcessIdentity
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.AcknowledgeTask(body)})
-	case "/v1/executor/scopes/cleanup":
-		var body executor.ScopeCleanupIdentity
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		result, err := a.Executor.CleanupScope(request.Context(), body)
-		a.executorResult(response, result, err)
-	case "/v1/executor/scopes/processes":
-		var body executor.ScopeIdentity
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		writeJSON(response, http.StatusOK, a.Executor.Preview(body))
-	case "/v1/executor/scopes/process-summary":
-		var body executor.ScopeIdentity
-		if !a.decodeExecutor(response, request, &body) {
-			return
-		}
-		writeJSON(response, http.StatusOK, a.Executor.Summary(body))
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}

@@ -16,12 +16,7 @@ Preparation resolves the four components and independent base/architecture metad
 
 Newly built digests receive full anonymous pulls on both architectures. Reused digests receive anonymous index and platform-manifest availability checks on both architectures, including compressed-size limits; their previously verified unpacked size remains valid for the identical digest. Core Compose smoke always runs against the final catalog. Reuse metadata is an internal CI artifact, not an additional release asset.
 
-| Release | Manager prerequisite | Image catalog |
-| --- | --- | --- |
-| R1 / M1 | Existing N+1, settled normal self-update | Legacy ten-image catalog; application unchanged. |
-| R2 / Pi-native | M1 installed and healthy | Exactly `platform`, `agent-runtime`, `camofox`, `agent-sandbox`, `searxng`. |
-
-M1 accepts only these two complete catalogs, not arbitrary subsets. The legacy ten are the R2 five plus `firecrawl-api`, `firecrawl-playwright`, `firecrawl-postgres`, `firecrawl-redis` and `firecrawl-rabbitmq`. Firecrawl entries absent from a release are not pulled, started, probed or reported unavailable. Retained Firecrawl data is not an instruction to restart the old stack.
+Manager accepts exactly `platform`, `agent-runtime`, `camofox`, `agent-sandbox` and `searxng`, not arbitrary subsets or the retired ten-image catalog. Firecrawl is not pulled, started, probed or reported in service status. Retained Firecrawl data stays untouched.
 
 ## Detection and pulls
 
@@ -29,13 +24,13 @@ Manager polls the configured channel; `check` may persist a candidate but never 
 
 Default manifest checks and artifact downloads use fresh HTTP connections, retaining the 30-second request timeout and environment-configured proxy support. Conditional checks still retain bounded cache validators; connection freshness does not bypass manifest validation or artifact checksum verification.
 
-M1 prefetches Platform, Runtime and `agent-sandbox` before maintenance, avoiding a first-command sandbox image pull after release. An already-present exact RepoDigest is reused. Pulls and maintenance are separate phases; do not interpret download success as readiness.
+Manager prefetches Platform, Runtime and `agent-sandbox` before maintenance, avoiding a first-command sandbox image pull after release. An already-present exact RepoDigest is reused. Missing images are pulled with at most three concurrent workers after reserving their combined capacity once; each exact digest is verified. Failure cancels and joins the remaining workers before returning. Pulls and maintenance are separate phases; do not interpret download success as readiness.
 
 ## 排队与维护
 
 Operations retain their idempotency key, request identity, generation and persistent phase. Reusing a key with different input is a conflict; an uncertain response is reconciled with the same operation, never blindly retried as a new operation.
 
-While waiting for an operation, the CLI tolerates a restarting Manager's missing/refused/reset socket or EOF by retrying only its status GET, with backoff from 500 ms to 4 seconds and a ten-minute deadline. It never replays the operation POST. The command reports the actual terminal success/failure; loss of the polling connection is not evidence that the operation failed or should be submitted again.
+While waiting for an operation, the CLI tolerates a restarting Manager's missing/refused/reset socket, EOF, or HTTP 503 specifically reporting `launcher startup proof pending`. It retries only its status GET, with backoff from 500 ms to 4 seconds and a ten-minute deadline; deterministic errors and unrelated HTTP failures still fail immediately. It never replays the operation POST. The command reports the actual terminal success/failure; loss of the polling connection is not evidence that the operation failed or should be submitted again.
 
 1. Wait for the Platform's natural idle boundary: no active/queued agent work or admissions.
 2. Reserve with the existing operation ID, persist maintenance, and reconfirm the same reservation before stopping writers. Manager remains the ingress and serves maintenance.
@@ -56,7 +51,20 @@ R2's DB migration is additive and old Runtime journals remain untouched. New v3 
 
 The independent launcher verifies and supervises the selected Manager. Keep the current and one verified previous binary. Startup identity/health failure triggers the existing single rollback to the previous binary; repeated switching is not recovery. Once committed, ordinary process restart uses the selected version, not an automatic business-data rollback.
 
-R1/M1 uses this existing N+1 protocol. Stable command/config/socket paths and launcher ownership remain unchanged. Do not replace the launcher as part of the Pi-native application rewrite.
+The simplified Manager is installed through the existing launcher's normal self-update protocol. Stable command/config/socket paths, binary metadata and launcher ownership remain unchanged; the immutable launcher is not replaced.
+
+Startup sandbox cleanup force-stops the complete ownership-validated running set
+in one batch, within a 15-second total deadline including transient Docker retries
+and stopped-state confirmation. This leaves room inside the installed launcher's
+60-second child-proof deadline; cleanup uncertainty still prevents readiness.
+Before launcher proof, authenticated `/v1/status` remains available for gate
+recovery, but operation reads remain unavailable: their durable `succeeded`
+record can still precede Manager activation and be rolled back by startup recovery.
+An older CLI that does not retry the proof-pending 503 may report a polling error
+during this transition even though the update later succeeds; inspect status
+without resubmitting the operation.
+
+`update.json` schema 1 is the sole state and operations authority. Existing installations require a checkpoint without a provisional `bridge_transition`; legacy `state.json` and `operations/` are neither imported nor modified. A missing checkpoint initializes only a fresh installation with neither legacy path present. Malformed, unsupported or provisional checkpoints fail closed. Operation identities, generation CAS, idempotency bindings and forward-only gate settlement intent remain unchanged.
 
 ## 手动恢复
 

@@ -131,7 +131,8 @@ func TestStateWithReferencedOperationFailsClosedOnInvalidReference(t *testing.T)
 
 func TestOperationIdempotencyAndPersistence(t *testing.T) {
 	now := time.Unix(100, 0)
-	store, err := Open(t.TempDir(), now)
+	dir := t.TempDir()
+	store, err := Open(dir, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +146,7 @@ func TestOperationIdempotencyAndPersistence(t *testing.T) {
 	if err != nil || !reused || again.ID != first.ID {
 		t.Fatalf("idempotency failed: %#v %v", again, err)
 	}
-	reopened, err := Open(store.dir, now)
+	reopened, err := Open(dir, now)
 	if err != nil {
 		t.Fatal(err)
 	}

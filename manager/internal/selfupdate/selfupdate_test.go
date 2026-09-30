@@ -76,31 +76,24 @@ func TestSupervisorStateRejectsPublicPermissions(t *testing.T) {
 	}
 }
 
-func TestSupervisorRequiresTerminalBoundHandoffReceipt(t *testing.T) {
-	for _, status := range []string{"prepared", "switching", "recovering", "failed", ""} {
-		t.Run(status, func(t *testing.T) {
-			m, s := launcherFixture(t)
-			if err := atomicfile.WriteJSON(filepath.Join(m.Root, "bridge-handoff.json"), map[string]any{"status": status, "launcher": s.Launcher}, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := m.RequireSupervisor(); err == nil {
-				t.Fatal("nonterminal or failed handoff accepted")
-			}
-		})
-	}
-	m, s := launcherFixture(t)
-	s.Launcher.SHA256 = "wrong"
-	if err := atomicfile.WriteJSON(filepath.Join(m.Root, "bridge-handoff.json"), map[string]any{"status": "proven", "launcher": s.Launcher}, 0o600); err != nil {
+func TestSupervisorIgnoresRetiredHandoffReceipt(t *testing.T) {
+	m, _ := launcherFixture(t)
+	path := filepath.Join(m.Root, "bridge-handoff.json")
+	if err := os.WriteFile(path, []byte("retained legacy bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.RequireSupervisor(); err == nil {
-		t.Fatal("unbound handoff receipt accepted")
-	}
-	if err := os.Remove(filepath.Join(m.Root, "bridge-handoff.json")); err != nil {
+	if err := m.RequireSupervisor(); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.RequireSupervisor(); err == nil {
-		t.Fatal("missing handoff receipt accepted")
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "retained legacy bytes" {
+		t.Fatalf("retired receipt changed: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequireSupervisor(); err != nil {
+		t.Fatalf("retired receipt required: %v", err)
 	}
 }
 

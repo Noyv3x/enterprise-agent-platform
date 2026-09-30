@@ -56,7 +56,6 @@ type Orchestrator struct {
 	OnCommit              func(release.Manifest)
 	OnFinalized           func(release.Manifest)
 	PublicProbe           func(context.Context) error
-	LocalActiveProcesses  func() int
 	FixedStackMu          sync.Locker
 	MaintenanceMu         sync.Locker
 	AdmissionCheck        func(model.ManagerState) error
@@ -1200,21 +1199,6 @@ func (o *Orchestrator) reserve(ctx context.Context, id string) error {
 		return errors.New("platform admission gate is not configured")
 	}
 	for {
-		if o.LocalActiveProcesses != nil {
-			if o.LocalActiveProcesses() > 0 {
-				const retry = 5
-				if _, err := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
-					state.RetryAfterSeconds = retry
-					return nil
-				}); err != nil {
-					return fmt.Errorf("persist local task wait state: %w", err)
-				}
-				if err := o.wait(ctx, retry*time.Second); err != nil {
-					return err
-				}
-				continue
-			}
-		}
 		reservation, err := gate.Reserve(ctx, id)
 		if err != nil {
 			cause := fmt.Errorf("reserve Platform admission: %w", err)
@@ -1230,27 +1214,6 @@ func (o *Orchestrator) reserve(ctx context.Context, id string) error {
 			return o.resolveReservationUncertainty(gate, id, cause)
 		}
 		if reservation.Reserved {
-			// The Platform reservation freezes new Agent admissions, so this
-			// second local inventory closes the race where a background terminal
-			// was registered after the first local check but before Platform idle.
-			if o.LocalActiveProcesses != nil {
-				if o.LocalActiveProcesses() > 0 {
-					if releaseErr := o.releaseReservation(gate, id, errors.New("a local task appeared while Platform admission was being reserved")); releaseErr != nil {
-						return releaseErr
-					}
-					const retry = 5
-					if _, stateErr := o.Store.MutateState(o.now(), func(state *model.ManagerState) error {
-						state.RetryAfterSeconds = retry
-						return nil
-					}); stateErr != nil {
-						return fmt.Errorf("persist local post-reservation wait state: %w", stateErr)
-					}
-					if waitErr := o.wait(ctx, retry*time.Second); waitErr != nil {
-						return waitErr
-					}
-					continue
-				}
-			}
 			break
 		}
 		retry := reservation.RetryAfterSeconds

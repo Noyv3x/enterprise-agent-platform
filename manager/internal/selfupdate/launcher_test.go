@@ -54,9 +54,6 @@ func launcherFixture(t *testing.T) (*Manager, launcherState) {
 	if err := atomicfile.WriteJSON(m.launcherPath(), s, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := atomicfile.WriteJSON(filepath.Join(m.Root, "bridge-handoff.json"), map[string]any{"status": "proven", "launcher": launcher}, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if err := atomicfile.WriteJSON(m.StatePath, State{SchemaVersion: 1, Current: &previous, Candidate: &candidate}, 0o600); err != nil {
 		t.Fatal(err)
 	}

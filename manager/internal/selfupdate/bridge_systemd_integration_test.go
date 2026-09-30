@@ -34,7 +34,7 @@ import (
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
-const bridgeIntegrationN = "770add1e3f4dc63d88e37597c9f7b2dd85a96c45"
+const bridgeIntegrationN = "a791405075e7bd4ea883274f5b4553bfabb5d379"
 const bridgeIntegrationNext = "3333333333333333333333333333333333333333"
 const bridgeIntegrationRejected = "4444444444444444444444444444444444444444"
 const bridgeIntegrationPeriodic = "5555555555555555555555555555555555555555"
@@ -43,10 +43,10 @@ const bridgeIntegrationInner = "AGENT_PLATFORM_BRIDGE_INTEGRATION_BINARIES"
 // TestBridgeSystemdBinaryUpgradeIntegration exercises real CLI executables, not
 // test-process identity responders. Only their compiled technical namespace is
 // changed, in disposable source trees, to avoid touching the installed service.
-// The fixture starts the actual release-N immutable supervisor and child from
-// a settled deployment checkpoint. It exercises binary activation and migration
-// of N's seeded pending finalization through authenticated mock gate settlement,
-// not Docker migrations, real Platform gate behavior, or the full update CLI.
+// The fixture starts the installed immutable supervisor and child from a
+// settled checkpoint. It exercises binary activation and pending finalization
+// through authenticated mock gate settlement, not Docker migrations, real
+// Platform gate behavior, or the full update CLI.
 func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 	bridgeIntegrationBuildAndRun(t, bridgeIntegrationN, bridgeIntegrationRun)
 }
@@ -229,7 +229,7 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 	bridgeIntegrationWrite(t, filepath.Join(stateDir, "secrets", "manager-executor-token"), []byte("bridge-integration-executor-token\n"), 0o600)
 	journalState := model.NewState(time.Now())
 	journalState.Current = &generation
-	if err := atomicfile.WriteJSON(filepath.Join(stateDir, "state.json"), journalState, 0o600); err != nil {
+	if err := atomicfile.WriteJSON(filepath.Join(stateDir, "update.json"), map[string]any{"schema_version": 1, "state": journalState, "operations": map[string]model.Operation{}}, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	manager := &Manager{Profile: identity.CompileTimeActiveProfile(), ConfigPath: configPath, Root: root, StatePath: filepath.Join(stateDir, "manager-binaries.json"), InstallPath: stable, SocketPath: socketPath, ControlTokenFile: tokenPath, UnitName: profile.ManagerUnit, RunningVersion: bridgeIntegrationN}
@@ -337,14 +337,8 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 				state.FinalizePendingOperationID = transitionID
 				state.Maintenance, state.PublicState, state.Phase = true, model.StateUpdating, model.PhaseProbing
 				op := model.Operation{SchemaVersion: 1, ID: transitionID, Kind: model.OperationUpdate, IdempotencyKey: transitionID, Attempt: 1, TargetGeneration: target.ID, Status: model.OperationSucceeded, Phase: model.PhaseProbing, ReservationStatus: model.ReservationMutationStarted, SnapshotPath: snapshotPath, CreatedAt: now, UpdatedAt: now, CompletedAt: &now}
-				if err := atomicfile.WriteJSON(filepath.Join(stateDir, "operations", transitionID+".json"), op, 0o600); err != nil {
+				if err := atomicfile.WriteJSON(filepath.Join(stateDir, "update.json"), map[string]any{"schema_version": 1, "state": state, "operations": map[string]model.Operation{op.ID: op}}, 0o600); err != nil {
 					t.Fatal(err)
-				}
-				if err := atomicfile.WriteJSON(filepath.Join(stateDir, "state.json"), state, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := os.Lstat(filepath.Join(stateDir, "update.json")); !os.IsNotExist(err) {
-					t.Fatalf("N unexpectedly owns the N+1 transaction record: %v", err)
 				}
 			}
 			if err := manager.Activate(ctx, manifest); err != nil {
@@ -487,7 +481,7 @@ func bridgeIntegrationRun(t *testing.T, ctx context.Context, binaries string) {
 		// healthy core checkpoint only afterward to exercise supervised readiness.
 		checkpoint := model.NewState(time.Now())
 		checkpoint.Current = &generation
-		if err := atomicfile.WriteJSON(filepath.Join(freshStateDir, "state.json"), checkpoint, 0o600); err != nil {
+		if err := atomicfile.WriteJSON(filepath.Join(freshStateDir, "update.json"), map[string]any{"schema_version": 1, "state": checkpoint, "operations": map[string]model.Operation{}}, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		bridgeIntegrationCommand(t, ctx, "", "systemctl", "--user", "daemon-reload")

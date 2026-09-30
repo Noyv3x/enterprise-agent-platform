@@ -582,7 +582,7 @@ func TestCheckConsumesCurrentSchemaOnTargetProfile(t *testing.T) {
 	}
 	state := store.State()
 	if manifest.SchemaVersion != release.ManifestSchemaVersion || state.Candidate == nil ||
-		state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 10 {
+		state.Candidate.ID != manifest.ID() || len(state.Candidate.Images) != 5 {
 		t.Fatalf("operation did not retain current schema: manifest=%#v state=%#v", manifest, state)
 	}
 }
@@ -1278,92 +1278,6 @@ func TestPreparedManagerCandidateIsDiscardedAfterPlatformRollback(t *testing.T) 
 	}
 	if state := store.State(); selfUpdate.discarded != 1 || state.Candidate != nil || state.ActiveOperationID != "" {
 		t.Fatalf("rollback left prepared Manager ownership: self=%#v state=%#v", selfUpdate, state)
-	}
-}
-
-func TestReserveWaitsForLocalHostAndSandboxTerminalsBeforePlatformGate(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "local-terminal-readiness", ExpectedGeneration: store.State().Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	gate := &reserveCountingGate{}
-	checks, waits := 0, 0
-	orchestrator := &Orchestrator{
-		Store: store,
-		Gate:  gate,
-		LocalActiveProcesses: func() int {
-			checks++
-			if checks == 1 {
-				// Both the host and Sandbox terminals delay cutover. The Manager
-				// never kills either one to make an update proceed.
-				return 2
-			}
-			return 0
-		},
-		Sleep: func(context.Context, time.Duration) error {
-			waits++
-			if gate.reservations != 0 {
-				t.Fatal("platform reservation was attempted while a local terminal was running")
-			}
-			state := store.State()
-			if state.PublicState != model.StateWaitingForTasks || state.Maintenance || state.RetryAfterSeconds != 5 {
-				t.Fatalf("local terminal wait did not remain publicly available: %#v", state)
-			}
-			return nil
-		},
-	}
-	if err := orchestrator.reserve(context.Background(), op.ID); err != nil {
-		t.Fatal(err)
-	}
-	if checks != 3 || waits != 1 || gate.reservations != 2 {
-		t.Fatalf("unexpected local readiness sequence: checks=%d waits=%d reservations=%d", checks, waits, gate.reservations)
-	}
-	if state := store.State(); !state.Maintenance || state.PublicState != model.StateUpdating {
-		t.Fatalf("confirmed reservation was not durably closed: %#v", state)
-	}
-}
-
-func TestReserveRechecksLocalProcessesAfterPlatformAdmissionIsFrozen(t *testing.T) {
-	store, err := journal.Open(t.TempDir(), time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := store.Begin(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "post-gate-local-terminal", ExpectedGeneration: store.State().Generation}, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	gate := &scriptedGate{}
-	checks, waits := 0, 0
-	orchestrator := &Orchestrator{
-		Store: store,
-		Gate:  gate,
-		LocalActiveProcesses: func() int {
-			checks++
-			if checks == 2 {
-				return 1
-			}
-			return 0
-		},
-		Sleep: func(context.Context, time.Duration) error {
-			waits++
-			if len(gate.reserveIDs) != 1 || len(gate.releaseIDs) != 1 || store.State().Maintenance {
-				t.Fatalf("post-reservation process race was not released before waiting: gate=%#v state=%#v", gate, store.State())
-			}
-			return nil
-		},
-	}
-	if err := orchestrator.reserve(context.Background(), op.ID); err != nil {
-		t.Fatal(err)
-	}
-	if checks != 4 || waits != 1 || len(gate.reserveIDs) != 3 || len(gate.releaseIDs) != 1 {
-		t.Fatalf("unexpected two-control-plane reservation sequence: checks=%d waits=%d gate=%#v", checks, waits, gate)
-	}
-	if state := store.State(); !state.Maintenance || state.PublicState != model.StateUpdating {
-		t.Fatalf("replacement reservation was not durably confirmed: %#v", state)
 	}
 }
 
