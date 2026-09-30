@@ -8,7 +8,7 @@ The system embeds Pi rather than recreating an agent framework. [Product scope](
 | --- | --- |
 | Frontend | Login, conversations, attachments, browser takeover, schedules, settings and administration. |
 | Platform | Python 3.11, Starlette/uvicorn/httpx and stdlib SQLite; authentication, authorization, durable product history, FIFO jobs, resources, tool gateways, OAuth and Manager integration. Serves frontend assets on port 8765. |
-| Runtime | Node ≥22.19, TypeScript and Pi coding-agent 0.87.1; one live `AgentSession` per conversation, streamed runs and append-only JSONL v3 transcripts. Port 8766 is private. |
+| Runtime | Node ≥22.19, TypeScript and Pi coding-agent 0.99.2; one live `AgentSession` per conversation, streamed runs and append-only Pi transcripts. Port 8766 is private. |
 | Host Manager | Public ingress, maintenance/update coordination, Docker ownership and audited sandbox execution. It is not an agent tool for host commands. |
 | Agent sandbox | Personal or channel workspace, persistent home/environment and foreground tenant execution. |
 | Chat sandbox | One lightweight, network-disabled sandbox per user, shared by that user's chat conversations. |

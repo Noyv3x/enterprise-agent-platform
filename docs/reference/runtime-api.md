@@ -25,14 +25,16 @@ account catalog. Runtime accepts those Codex IDs even when absent from Pi's
 static catalog, using native Codex transport metadata and supplied token
 limits (or native template defaults).
 
-Resources, tools and kind are fixed when a live session is constructed;
-subsequent runs cannot change that prefix. Volatile context is prepended to
-the user message, never the system prompt. Pi cache warming is disabled;
-compaction and retry use Pi defaults. Normal and summarization requests share
-the conversation session ID and enabled prompt caching. Credentials come from
-Platform's `POST /api/agent/tools/credentials/resolve`; refresh uses
-`force_refresh`. Credential and tool-gateway requests have finite deadlines
-combined with SDK cancellation.
+Resources, tools and kind are fixed when a live session is constructed.
+Unchanged inputs reuse that object; changed inputs reopen the same transcript
+and Pi appends changed system-prompt sections without rewriting its leading
+prompt. Volatile context is prepended to the user message, never the system
+prompt. Pi cache warming is disabled; compaction and retry use Pi defaults.
+Normal and summarization requests share the conversation session ID and
+enabled prompt caching. Credentials come from Platform's
+`POST /api/agent/tools/credentials/resolve`; refresh uses `force_refresh`.
+Credential and tool-gateway requests have finite deadlines combined with
+SDK cancellation.
 
 `GET /v1/runs/{run_id}/events?after=<seq>` streams SSE JSON objects with
 monotonic `seq` and `type`. Omit `after` to replay from the beginning.
@@ -101,9 +103,14 @@ Sessions idle for fifteen minutes are disposed. A run whose kind, sandbox,
 resources or tools differ from the live object's opens a new Pi session object;
 Pi appends the difference (see
 [prompt cache](../design/agent-runtime.md#prompt-cache)). Files are Pi JSONL v3 at
-`<home>/sessions-v3/<sha256(sid)>.jsonl`. All tenant execution uses Manager's
-Unix executor: audit receipt followed by terminal/file operation, with
-`execution_context.profile`. No host environment is forwarded.
+`<home>/sessions-v3/<sha256(sid)>.jsonl`. Pi 0.99.2 uses the same format as
+0.87.1: existing v3 files are opened without migration or rewrite, and the
+previous release can read newly appended Runtime entries. No new session
+directory or copy-migration is needed for this upgrade.
+
+All tenant execution uses Manager's Unix executor: audit receipt followed by
+terminal/file operation, with `execution_context.profile`. No host environment
+is forwarded.
 Every terminal request has a finite deadline. Bash uses its explicit Pi
 timeout when supplied, otherwise ten minutes; all terminal deadlines are
 capped at one hour. This bounds outstanding Manager commands after a

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createTools } from "../src/tools.js";
 import { createExecutorTransport, createGatewayTransport, type ExecutorTransport, type Sandbox } from "../src/transport.js";
 
@@ -71,7 +71,7 @@ test("remote Pi tools audit exact operations and never forward host environment"
     const gateway = createGatewayTransport({ baseUrl: `http://127.0.0.1:${address.port}`, token: "gateway-secret" });
     const dependencies = { sandbox, executor, gateway, context: () => ({ sid: "agent-private-1", scope_key: sandbox.scope_key, run_id: "run-1", owner_user_id: 1 }), names: ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "browser", "schedule", "mcp"], skillsDirectory: join(directory, "skills") };
     const tools = createTools("/workspace", dependencies);
-    const invoke = async (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("call-1", args, undefined, undefined, {} as ExtensionContext);
+    const invoke = async (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("call-1", args, undefined, undefined, {} as ExtensionToolContext);
     assert.match(JSON.stringify(await invoke("read", { path: "a.txt" })), /old/);
     await invoke("edit", { path: "a.txt", edits: [{ oldText: "old", newText: "new" }] });
     assert.equal(contents.get("/workspace/a.txt"), "new\n");
@@ -117,7 +117,7 @@ test("remote Pi tools audit exact operations and never forward host environment"
     assert.equal(chatTools.some(tool => ["browser", "schedule", "mcp"].includes(tool.name)), false);
     for (const name of ["read", "write", "edit", "grep", "find", "ls"]) {
       const tool = chatTools.find(value => value.name === name)!;
-      await assert.rejects(tool.execute("chat-call", { path: "../conversation-b", content: "x", edits: [{ oldText: "x", newText: "y" }], pattern: "x" }, undefined, undefined, {} as ExtensionContext), /outside/);
+      await assert.rejects(tool.execute("chat-call", { path: "../conversation-b", content: "x", edits: [{ oldText: "x", newText: "y" }], pattern: "x" }, undefined, undefined, {} as ExtensionToolContext), /outside/);
     }
     assert.equal(calls.length, before);
   } finally {
@@ -148,7 +148,7 @@ test("remote reads preserve large UTF-8 and binary bytes and reject clipped chun
   };
   const tools = createTools("/workspace", { sandbox, executor, gateway: { async call() { throw new Error("unused"); } },
     context: () => ({ sid: "files", scope_key: sandbox.scope_key, run_id: "files" }), names: ["read", "edit", "bash"] });
-  const invoke = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("files", args, undefined, undefined, {} as ExtensionContext);
+  const invoke = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("files", args, undefined, undefined, {} as ExtensionToolContext);
   try {
     for (const original of ["prefix\n" + "a".repeat(999_992) + "🙂suffix\n", "prefix\n\ufffd" + "b".repeat(1_100_000) + "\nsuffix\n"]) {
       await writeFile(join(directory, "large.txt"), original);
@@ -181,7 +181,7 @@ test("browser screenshot and vision deliver image content without image details"
     gateway: { async call() { return { content: "tab preview", data: { tabId: "tab", screenshot: image, snapshot: "page" }, is_error: false }; } },
     context: () => ({ sid: "images", scope_key: sandbox.scope_key, run_id: "images" }), names: ["browser"] });
   for (const action of ["screenshot", "vision"]) {
-    const result = await tools[0]!.execute("image", { action, tab_id: "tab" }, undefined, undefined, {} as ExtensionContext);
+    const result = await tools[0]!.execute("image", { action, tab_id: "tab" }, undefined, undefined, {} as ExtensionToolContext);
     assert.deepEqual(result.content, [{ type: "text", text: "tab preview" }, { type: "image", mimeType: image.mimeType, data: image.data }]);
     assert.deepEqual(result.details, { tabId: "tab", snapshot: "page" });
   }

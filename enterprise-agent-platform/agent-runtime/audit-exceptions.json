@@ -1,5 +1,5 @@
 {
-  "reason": "brace-expansion 5.0.9 is pinned by @earendil-works/pi-coding-agent's own npm-shrinkwrap (0.87.1 and 0.99.1), so it cannot be overridden. Pi uses minimatch only in its package manager (disabled: the Runtime supplies its own resource loader) and in model-pattern resolution (fed only our configuration), so the vulnerable brace patterns are not reachable from model or user input.",
+  "reason": "brace-expansion 5.0.9 is pinned by @earendil-works/pi-coding-agent's own npm-shrinkwrap (0.99.2), so it cannot be overridden. Pi uses minimatch only in its package manager (disabled: the Runtime supplies its own resource loader) and in model-pattern resolution (fed only our configuration), so the vulnerable brace patterns are not reachable from model or user input.",
   "remove_when": "pi-coding-agent ships brace-expansion >= 5.0.12",
   "package": "brace-expansion",
   "path": "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion",

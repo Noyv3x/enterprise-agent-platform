@@ -62,7 +62,9 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     void stream.result().then(message=>usage.push(structuredClone(message.usage)));
     return stream;
   }});
+  let modelRuntimeConstructions=0;
   const newRuntime = () => new Runtime({home,platformUrl,platformToken:'tools-secret',executorSocket:socket,executorToken:'executor-secret',skillsDirectory:join(home,'skills'),modelRuntimeFactory:async()=>{
+    modelRuntimeConstructions++;
     constructionGate?.entered();await constructionGate?.ready;return models;
   }});
   let runtime = newRuntime();
@@ -88,7 +90,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     server = createServer(runtime,'runtime-secret');
     url = await listen(server);
   }
-  return {faux,http,start,events,reopen,executorCalls,gatewayCalls,usage,server,cancelOutcomes,onCancel(callback:()=>void){onCancel=callback;}};
+  return {faux,http,start,events,reopen,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;}};
 }
 
 test('HTTP rejects invalid optional model limits before admitting a run or compaction', {timeout:20_000}, async t=>{
@@ -152,6 +154,7 @@ test('unchanged resources add no prompt update; an edited AGENTS.md is appended 
   const second = structuredClone(body);
   second.context_prefix = '<context time="second"/>';second.prompt.text='Second question';
   assert.equal((await f.events(await f.start('agent-private-1',second))).at(-1)!.status,'completed');
+  assert.equal(f.modelRuntimeConstructions,1,'unchanged resources must reuse the live AgentSession, not reopen its transcript');
   prefixKept(1);
   const leading = JSON.stringify(systems(1));
   assert.equal(systems(1).length,1);
@@ -166,6 +169,7 @@ test('unchanged resources add no prompt update; an edited AGENTS.md is appended 
   const edited = structuredClone(second);
   edited.resources.agents_md = {path:'/workspace/AGENTS.md',content:'UPDATED_CONTEXT_MARKER'};edited.prompt.text='Third question';
   await f.events(await f.start('agent-private-1',edited));
+  assert.equal(f.modelRuntimeConstructions,2,'changed resources must rebuild the session on its existing transcript');
   prefixKept(2);
   assert.equal(systems(2).length,2);
   assert.equal(JSON.stringify(systems(2)[0]),JSON.stringify(systems(1)[0]));
@@ -176,6 +180,7 @@ test('unchanged resources add no prompt update; an edited AGENTS.md is appended 
   await f.events(await f.start('agent-private-1',edited));
   prefixKept(3);
   assert.equal(systems(3).length,2,'a restart with unchanged resources must not append another copy');
+  assert.equal(f.modelRuntimeConstructions,3,'closing the runtime must construct a new session on the next run');
 });
 
 test('chat strips private resources and privileged tools and forces chat execution profile', {timeout:20_000}, async t=>{
@@ -324,6 +329,60 @@ test('session cancellation covers admitted runs still constructing their Pi sess
   assert.deepEqual(await response.json(),{cancelled:false,run_id:null});
   assert.equal(f.faux.state.callCount,0);
   assert.deepEqual(await (await f.http('/v1/sessions/agent-private-1/cancel',{})).json(),{cancelled:false,run_id:null});
+});
+
+test('automatic threshold compaction streams its lifecycle, accounts for summary usage, and preserves continuation context', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const summary='Automatic checkpoint: the historical question was answered.';
+  f.faux.setResponses([
+    fauxAssistantMessage('Historical answer.'),
+    context=>{
+      const messages=JSON.stringify(context.messages);
+      assert.match(messages,/Historical answer/);
+      assert.match(messages,/Recent question/);
+      return fauxAssistantMessage('Answer before automatic compaction.');
+    },
+    context=>{
+      assert.match(JSON.stringify(context.messages),/Historical answer/);
+      return fauxAssistantMessage(summary);
+    },
+  ]);
+  const body=request('runtime-proof');
+  // Keep Pi's default 16,384-token reserve and 20,000-token recent suffix.
+  // Each prompt fits alone; together they cross this model's compaction threshold.
+  body.model.contextWindow=64_000;
+  body.prompt.text='Historical question. '.repeat(5_000);
+  const first=await f.events(await f.start('agent-private-1',body));
+  assert.equal(first.at(-1)!.status,'completed');
+  assert.deepEqual(first.filter(event=>event.type==='compaction'),[]);
+  assert.equal(f.usage.length,1);
+  body.prompt.text='Recent question. '.repeat(6_500);
+  const id=await f.start('agent-private-1',body);
+  const events=await f.events(id);
+  assert.deepEqual(events.filter(event=>event.type==='compaction').map(({seq,...event})=>event),[
+    {type:'compaction',phase:'start',reason:'threshold'},
+    {type:'compaction',phase:'end',reason:'threshold'},
+  ]);
+  assert.equal(f.usage.length,3,'the second run must make one summary request and one answer request');
+  const currentUsage=f.usage.slice(1);
+  const sum=(key:keyof Pick<Usage,'input'|'output'|'cacheRead'|'cacheWrite'|'totalTokens'>)=>currentUsage.reduce((total,usage)=>total+usage[key],0);
+  assert(f.usage[2]!.input>0 && f.usage[2]!.output>0,'summary usage must contribute to the run total');
+  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Answer before automatic compaction.',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:'runtime-proof',side_effects:false});
+  assert.equal(events.filter(event=>event.type==='text_delta').map(event=>event.delta).join(''),'Answer before automatic compaction.','summary text must not leak into assistant output');
+  assert.deepEqual(await f.events(id),events,'SSE replay must preserve the compaction lifecycle and final usage');
+  const history=await f.http('/v1/sessions/agent-private-1/history');
+  assert.match(await history.text(),/Automatic checkpoint: the historical question was answered/);
+  f.faux.setResponses([context=>{
+    assert.match(JSON.stringify(context.messages),/Automatic checkpoint: the historical question was answered/);
+    assert.match(JSON.stringify(context.messages),/Answer before automatic compaction/);
+    return fauxAssistantMessage('Continued from the checkpoint.');
+  }]);
+  body.prompt.text='Continue from the checkpoint.';
+  const continuation=await f.events(await f.start('agent-private-1',body));
+  assert.equal(continuation.at(-1)!.text,'Continued from the checkpoint.');
+  assert.deepEqual(continuation.filter(event=>event.type==='compaction'),[]);
+  const usage=f.usage[3]!;
+  assert.deepEqual(continuation.at(-1)!.usage,{input:usage.input,output:usage.output,cache_read:usage.cacheRead,cache_write:usage.cacheWrite,total:usage.totalTokens},'a later run must not charge the previous summary again');
 });
 
 for(const cold of [false,true]){

@@ -35,6 +35,8 @@ Standard chat loads neither skills nor AGENTS.md. Files with those names in a ch
 
 Runtime stores each conversation at `data/runtimes/agent/sessions-v3/<sha256(sid)>.jsonl`. Pi `SessionManager` owns append-only message, model/thinking and compaction entries. Compaction changes model-visible context without deleting original messages. Platform history, not Runtime debug/export history, drives the UI.
 
+Pi 0.99.2 retains the same JSONL version 3 as 0.87.1. Opening an existing v3 file does not migrate or rewrite it, so this upgrade keeps `sessions-v3/` and needs no copy-migration. The previous Pi release can read the upgraded Runtime's supported message, structured system-prompt, model/thinking and compaction entries, including newly appended turns. This is distinct from the earlier format-4 import below; no new MCP/codemode or virtual-model features are enabled.
+
 Platform's migration writes `data/runtimes/agent/migration/active-sessions.json` from active scope identities. Runtime imports matching production format-4 journals into the separate v3 tree, preserving all messages and the latest compaction's retained context. Temporary output is atomically renamed and the migration marker is written last. Retrying is idempotent; old `sessions/` and `sessions.pre-pi/` are never modified. Inactive lifecycles and delegate children stay archived, not imported.
 
 ## Chat files and deletion

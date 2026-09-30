@@ -38,7 +38,7 @@ export async function compactSession(session: AgentSession, signal?: AbortSignal
     };
   } catch (error) {
     if (signal?.aborted) throw new DOMException('Compaction cancelled', 'AbortError');
-    // Pi 0.87.1 reports this expected no-work outcome as an untyped Error.
+    // Pi reports this expected no-work outcome as an untyped Error.
     if (error instanceof Error && error.message === 'Nothing to compact (session too small)') return { compacted: false, reason: 'too_small' };
     throw error;
   } finally {

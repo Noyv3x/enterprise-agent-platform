@@ -1,6 +1,6 @@
 # Agent Runtime
 
-Runtime embeds `@earendil-works/pi-coding-agent@0.87.1`. The [Runtime API](../reference/runtime-api.md) is the wire contract; [Platform](../reference/platform-api.md) owns product-facing APIs.
+Runtime embeds `@earendil-works/pi-coding-agent@0.99.2`. The [Runtime API](../reference/runtime-api.md) is the wire contract; [Platform](../reference/platform-api.md) owns product-facing APIs.
 
 ## One Pi session per conversation
 
@@ -10,7 +10,7 @@ Platform chooses stable session IDs: `agent-private-<uid>`, `agent-channel-<cid>
 
 ## Tools and remote operations
 
-Pi's `read`, `edit`, `write`, `find` and `ls` use remote operations. `grep` is a custom sandbox `rg` adapter because Pi 0.87.1's stock grep starts a local process. `bash` also uses a sandbox adapter so large output spills inside the sandbox rather than Pi's local temporary files. Runtime never executes tenant commands locally.
+Pi's `read`, `edit`, `write`, `find` and `ls` use remote operations. `grep` is a custom sandbox `rg` adapter because Pi 0.99.2's stock grep still starts a local process. `bash` also uses a sandbox adapter so large output spills inside the sandbox rather than Pi's local temporary files. Runtime never executes tenant commands locally.
 
 Each Manager file/terminal execution consumes a fresh audit receipt; terminal audit details contain the exact command. Commands run foreground with a finite timeout: bash defaults to 10 minutes and permits an explicit Pi timeout up to one hour. Edits use remote read/write. Never forward Pi BashOperations `options.env` into the sandbox.
 
@@ -37,6 +37,8 @@ Run completion follows Pi's settled/idle state, not a provisional end before ret
 Session cancellation waits for active admission/run work with a bounded HTTP response deadline and is idempotent when idle. Unconfirmed Manager termination keeps the session fenced and withholds terminal completion; retry cancellation against the same run rather than starting another. Runtime restart does not discover or clean up orphan sandbox commands; this is an accepted limitation, bounded by terminal execution deadlines. Manual compaction receives Platform's chosen summary model/thinking settings, including for a cold session. Exact requests and timeout responses belong in the [Runtime API](../reference/runtime-api.md).
 
 ## Migration
+
+The 0.87.1 → 0.99.2 upgrade retains Pi JSONL version 3: existing files open without rewriting, and 0.87.1 can read the supported entries appended by 0.99.2. Keep the same `sessions-v3/` tree; no copy-migration is required. Built-in MCP/codemode and virtual models remain disabled by the supplied resource loader. The older format-4 import below is unchanged.
 
 At startup, use Platform's `migration/active-sessions.json` to find active format-4 journals by identity. Write all message entries in order to `sessions-v3/<sha256(sid)>.jsonl`, including history predating compaction; append the latest old compaction summary with the first retained message ID. Stage each file and rename atomically; write `.migrated-from-v4` last. Never modify `sessions/` or `sessions.pre-pi/`. Old lifecycles and delegate journals remain on disk but are not imported. See [data and sessions](data-memory-sessions.md).
 
