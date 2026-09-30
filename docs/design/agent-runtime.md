@@ -26,7 +26,7 @@ Resolve file paths inside the workspace and reject escapes. Chat file tools enfo
 
 System prompt, context resources (AGENTS.md, skill advertisements) and tool definitions are fixed for the lifetime of each in-memory session object. Pi records the system prompt in the transcript: the first version is the request's leading instructions, and when a later object sees different resources Pi appends only the changed sections as a system update at the end of the conversation. The cached prefix is therefore never rewritten, but every reload with a changed AGENTS.md adds a copy of it to the context. A new object, picking up the resources supplied with the next run, is created only:
 
-- after 60 minutes idle, the upper bound of OpenAI's in-memory prompt-cache retention (usually 5–10 minutes of inactivity, at most one hour; Codex requests send no extended-retention option);
+- after 60 minutes idle. OpenAI documents a minimum 30-minute retention after the last use for GPT-5.6 and later (possibly longer), and 5–10 minutes, at most one hour, for earlier in-memory caching; Codex requests set no retention option;
 - at the next run after a successful automatic or manual compaction, which already replaced the cached history;
 - after a Runtime restart or session reset/delete.
 
