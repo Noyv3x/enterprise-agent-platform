@@ -1,11 +1,13 @@
 """Consumer-visible release reuse and constrained Docker input behavior."""
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from threading import Barrier, Lock
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("release_image_inputs", Path(__file__).parents[1] / "release_image_inputs.py")
@@ -148,6 +150,38 @@ class InputTests(unittest.TestCase):
         (self.root / "src/output.js").write_text("untracked")
         self.assertEqual(helper.tracked_paths(self.root), self.tracked)
 
+    def test_concurrent_matrix_matches_sequential_rows(self):
+        previous = {}
+        expected = []
+        for component in helper.COMPONENTS:
+            self.put(f"containers/{component}.Dockerfile", "FROM node:24 AS build\nCOPY src /app\nFROM alpine:3\nCOPY --from=build /app /app\n")
+            value, contexts = helper.fingerprint(self.root, component, "1", self.tracked, self.registry)
+            reference = f"ghcr.io/owner/repo/{component}@{D1}"
+            previous[component] = reference
+            self.registry.by_reference[reference] = {"amd64": value, "arm64": value}
+            expected.append(dict(component=component, dockerfile=f"containers/{component}.Dockerfile", image=component, tag_suffix="", fingerprint=value, reuse_digest=D1, base_contexts=contexts))
+        # One differing architecture must still rebuild only its own component.
+        self.registry.by_reference[previous["camofox"]]["arm64"] = "different"
+        expected[2]["reuse_digest"] = ""
+        fingerprint = helper.fingerprint
+        started = Barrier(4, timeout=5)
+        def concurrent_fingerprint(*args):
+            started.wait()
+            return fingerprint(*args)
+        with patch.object(helper, "tracked_paths", return_value=self.tracked), patch.object(helper, "fingerprint", side_effect=concurrent_fingerprint):
+            actual = helper.matrix(self.root, "Owner/Repo", "1", previous, self.registry)
+        self.assertEqual(actual, {"include": expected})
+
+    def test_independent_base_resolutions_overlap(self):
+        self.put("containers/agent-runtime.Dockerfile", "FROM node:24 AS build\nFROM alpine:3\nCOPY src /app\n")
+        started = Barrier(2, timeout=5)
+        def resolve(reference):
+            started.wait()
+            return {"node:24": D1, "alpine:3": D2}[reference]
+        with patch.object(self.registry, "resolve", side_effect=resolve):
+            _, contexts = self.fingerprint()
+        self.assertEqual(contexts, f"alpine:3=docker-image://alpine:3@{D2}\nnode:24=docker-image://node:24@{D1}")
+
 
 class RegistryTests(unittest.TestCase):
     def index_registry(self, architectures):
@@ -173,6 +207,77 @@ class RegistryTests(unittest.TestCase):
         with patch.object(helper, "fetch", return_value=b"{}"):
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 helper.Registry().get("ghcr.io/owner/image@" + D1)
+
+    def test_shared_reference_requests_and_failures_are_single_flight(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                registry = helper.Registry()
+                started = Barrier(4, timeout=5)
+                calls = []
+                lock = Lock()
+                error = OSError("offline")
+                def fetch(url, headers):
+                    with lock:
+                        calls.append(url)
+                    if failure:
+                        raise error
+                    return b"{}"
+                def resolve(reference):
+                    started.wait()
+                    return registry.resolve(reference)
+                # Equivalent spellings, as used by different Dockerfiles, share a URL.
+                references = ("node:24", "docker.io/library/node:24", "index.docker.io/node:24", "registry-1.docker.io/library/node:24")
+                with patch.object(helper, "fetch", side_effect=fetch), ThreadPoolExecutor(max_workers=4) as executor:
+                    futures = [executor.submit(resolve, reference) for reference in references]
+                    if failure:
+                        for future in futures:
+                            with self.assertRaises(OSError) as raised:
+                                future.result(timeout=5)
+                            self.assertIs(raised.exception, error)
+                    else:
+                        expected = "sha256:" + helper.hashlib.sha256(b"{}").hexdigest()
+                        self.assertEqual([future.result(timeout=5) for future in futures], [expected] * 4)
+                self.assertEqual(calls, ["https://registry-1.docker.io/v2/library/node/manifests/24"])
+
+    def test_parallel_requests_share_bearer_token(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                registry = helper.Registry()
+                unauthorized = Barrier(2, timeout=5)
+                token_calls = []
+                lock = Lock()
+                def fetch(url, headers=None):
+                    if url.startswith("https://auth.docker.io/"):
+                        with lock:
+                            token_calls.append(url)
+                        if failure:
+                            raise OSError("token unavailable")
+                        return b'{"token":"shared"}'
+                    if "Authorization" not in headers:
+                        unauthorized.wait()
+                        raise helper.urllib.error.HTTPError(url, 401, "unauthorized", {"WWW-Authenticate": 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'}, None)
+                    self.assertEqual(headers["Authorization"], "Bearer shared")
+                    return b"{}"
+                with patch.object(helper, "fetch", side_effect=fetch), ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(registry.get, "node:" + tag) for tag in ("22", "24")]
+                    for future in futures:
+                        if failure:
+                            with self.assertRaisesRegex(OSError, "token unavailable"):
+                                future.result(timeout=5)
+                        else:
+                            self.assertEqual(future.result(timeout=5)[1], {})
+                self.assertEqual(len(token_calls), 1)
+
+    def test_architecture_config_chains_overlap(self):
+        registry = self.index_registry(["amd64", "arm64"])
+        get = registry.get
+        started = Barrier(2, timeout=5)
+        def concurrent_get(reference, kind="manifests", identity=None):
+            if kind == "manifests" and identity is not None:
+                started.wait()
+            return get(reference, kind, identity)
+        registry.get = concurrent_get
+        self.assertEqual(registry.labels("image"), {"amd64": "fingerprint", "arm64": "fingerprint"})
 
 
 if __name__ == "__main__":

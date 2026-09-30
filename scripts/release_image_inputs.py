@@ -8,6 +8,7 @@ Package/network inputs inside RUN are invalidated explicitly with --salt.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import shlex
 import stat
 import subprocess
 import sys
+from threading import Lock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +54,21 @@ class Registry:
     def __init__(self):
         self.tokens = {}
         self.cache = {}
+        self.lock = Lock()
+
+    def _singleflight(self, cache, key, load):
+        # Publish ownership before doing I/O; waiters never hold the cache lock.
+        with self.lock:
+            future = cache.get(key)
+            owner = future is None
+            if owner:
+                future = cache[key] = Future()
+        if owner:
+            try:
+                future.set_result(load())
+            except BaseException as error:
+                future.set_exception(error)
+        return future.result()
 
     @staticmethod
     def location(reference):
@@ -78,12 +95,15 @@ class Registry:
         host, repository, ref = self.location(reference)
         identity = identity or ref
         url = f"https://{host}/v2/{repository}/{kind}/{urllib.parse.quote(identity, safe=':')}"
-        if url in self.cache:
-            return self.cache[url]
+        return self._singleflight(self.cache, url, lambda: self._get(reference, host, repository, identity, url))
+
+    def _get(self, reference, host, repository, identity, url):
         key = (host, repository)
         headers = {"Accept": ACCEPT}
-        if key in self.tokens:
-            headers["Authorization"] = "Bearer " + self.tokens[key]
+        with self.lock:
+            previous_token = self.tokens.get(key)
+        if previous_token is not None:
+            headers["Authorization"] = "Bearer " + previous_token.result()
         try:
             raw = fetch(url, headers)
         except urllib.error.HTTPError as error:
@@ -99,16 +119,18 @@ class Registry:
             if parsed.scheme != "https" or parsed.netloc != allowed[host]:
                 raise ValueError("untrusted registry token endpoint")
             query = urllib.parse.urlencode({"service": fields.get("service", host), "scope": f"repository:{repository}:pull"})
-            token = strict_json(fetch(realm + "?" + query))
-            self.tokens[key] = token.get("token") or token["access_token"]
-            headers["Authorization"] = "Bearer " + self.tokens[key]
+            def load_token():
+                token = strict_json(fetch(realm + "?" + query))
+                return token.get("token") or token["access_token"]
+            with self.lock:
+                if previous_token is not None and self.tokens.get(key) is previous_token:
+                    del self.tokens[key]
+            headers["Authorization"] = "Bearer " + self._singleflight(self.tokens, key, load_token)
             raw = fetch(url, headers)
         actual = "sha256:" + hashlib.sha256(raw).hexdigest()
         if DIGEST.fullmatch(identity) and actual != identity:
             raise ValueError(f"registry content digest mismatch: {reference}")
-        result = (actual, strict_json(raw))
-        self.cache[url] = result
-        return result
+        return actual, strict_json(raw)
 
     def resolve(self, reference):
         return self.get(reference)[0]
@@ -131,6 +153,12 @@ class Registry:
             digest = descriptor.get("digest", "")
             if not DIGEST.fullmatch(digest):
                 raise ValueError("invalid platform manifest digest")
+            platforms[arch] = digest
+        if set(platforms) != {"amd64", "arm64"}:
+            raise ValueError("image index lacks both Linux architectures")
+
+        def platform_label(item):
+            arch, digest = item
             _, manifest = self.get(reference, identity=digest)
             config_digest = manifest["config"]["digest"]
             if not DIGEST.fullmatch(config_digest):
@@ -138,10 +166,11 @@ class Registry:
             _, config = self.get(reference, "blobs", config_digest)
             if config.get("os") != "linux" or config.get("architecture") != arch:
                 raise ValueError("image config platform disagrees with index")
-            platforms[arch] = (config.get("config", {}).get("Labels") or {}).get(LABEL)
-        if set(platforms) != {"amd64", "arm64"}:
-            raise ValueError("image index lacks both Linux architectures")
-        return platforms
+            return arch, (config.get("config", {}).get("Labels") or {}).get(LABEL)
+
+        # Separate leaf pool: component workers never wait on their own pool.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return dict(executor.map(platform_label, platforms.items()))
 
 
 def docker_inputs(text):
@@ -286,8 +315,10 @@ def fingerprint(root, component, salt, tracked, registry):
     add("linux/amd64,linux/arm64")
     add("SOURCE_DATE_EPOCH=0" if component == "agent-sandbox" else "")
     contexts = []
-    for base in sorted(bases):
-        digest = registry.resolve(base)
+    bases = sorted(bases)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        digests = list(executor.map(registry.resolve, bases))
+    for base, digest in zip(bases, digests):
         add(base)
         add(digest)
         # Already immutable references need no override (and @ is not a context name).
@@ -339,13 +370,13 @@ def reuse_digest(reference, previous, expected, registry):
 
 def matrix(root, repository, salt, previous, registry):
     tracked = tracked_paths(root)
-    rows = []
-    for component in COMPONENTS:
+    def row(component):
         value, contexts = fingerprint(root, component, salt, tracked, registry)
         reference = f"ghcr.io/{repository.lower()}/{component}"
         reuse = reuse_digest(reference, previous.get(component), value, registry)
-        rows.append(dict(component=component, dockerfile=f"containers/{component}.Dockerfile", image=component, tag_suffix="", fingerprint=value, reuse_digest=reuse, base_contexts=contexts))
-    return {"include": rows}
+        return dict(component=component, dockerfile=f"containers/{component}.Dockerfile", image=component, tag_suffix="", fingerprint=value, reuse_digest=reuse, base_contexts=contexts)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        return {"include": list(executor.map(row, COMPONENTS))}
 
 
 def main():
