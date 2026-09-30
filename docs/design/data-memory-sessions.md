@@ -23,7 +23,7 @@ Removed-feature tables are retained but no longer consumed as active features. E
 
 Personal/channel long-term context is workspace `AGENTS.md`. The agent reads or edits it through normal tools; there is no separate memory API, search index or learning review.
 
-During `migrate`, export old `agent_memories` into a `## Memory (migrated)` section once per destination workspace. User-target memories go only to that user's private workspace. Preserve existing content and old tables. The session captures supplied AGENTS.md when its in-memory object is created; edits do not mutate an active system prompt and are loaded after 60 idle minutes or after compaction (see [prompt cache](agent-runtime.md#prompt-cache)).
+During `migrate`, export old `agent_memories` into a `## Memory (migrated)` section once per destination workspace. User-target memories go only to that user's private workspace. Preserve existing content and old tables. Platform supplies the current AGENTS.md with every run; after an edit, Pi appends the changed file as a system update on the next message rather than rewriting the prompt (see [prompt cache](agent-runtime.md#prompt-cache)).
 
 ## SKILL.md skills
 

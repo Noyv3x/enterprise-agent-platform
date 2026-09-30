@@ -97,8 +97,9 @@ messages for debugging/export, not UI message storage.
 
 ## Execution and persistence
 
-Sessions idle for sixty minutes are disposed; the next run after a successful
-compaction also starts a fresh object with that run's resources (see
+Sessions idle for fifteen minutes are disposed. A run whose kind, sandbox,
+resources or tools differ from the live object's opens a new Pi session object;
+Pi appends the difference (see
 [prompt cache](../design/agent-runtime.md#prompt-cache)). Files are Pi JSONL v3 at
 `<home>/sessions-v3/<sha256(sid)>.jsonl`. All tenant execution uses Manager's
 Unix executor: audit receipt followed by terminal/file operation, with

@@ -140,30 +140,42 @@ test('HTTP runs stream real Pi text, thinking, sandbox and gateway tools, aggreg
   assert.equal(f.gatewayCalls[0].body.context.owner_user_id,1);
 });
 
-test('two real Pi runs retain resources and tools while appending volatile user context', {timeout:20_000}, async t=>{
+test('unchanged resources add no prompt update; an edited AGENTS.md is appended by Pi without rewriting the prefix', {timeout:20_000}, async t=>{
   const f = await fixture(t);
   const captured: TranscriptContext[] = [];
-  f.faux.setResponses([context=>{captured.push(structuredClone(context));return fauxAssistantMessage('First answer');},context=>{captured.push(structuredClone(context));return fauxAssistantMessage('Second answer');}]);
+  const answer = (text:string) => (context:TranscriptContext) => {captured.push(structuredClone(context));return fauxAssistantMessage(text);};
+  f.faux.setResponses([answer('First answer'),answer('Second answer'),answer('Third answer'),answer('Fourth answer')]);
+  const systems = (index:number) => captured[index]!.messages.filter(m=>m.role==='system');
+  const prefixKept = (later:number) => assert.deepEqual(captured[later]!.messages.slice(0,captured[later-1]!.messages.length),captured[later-1]!.messages);
   const body = request(f.faux.getModel().id);
   await f.events(await f.start('agent-private-1',body));
-  const changed = structuredClone(body);
-  changed.resources = {system_prompt:'MUST_NOT_REPLACE_PREFIX',skills:[],agents_md:null};
-  changed.tools = ['write']; changed.context_prefix = '<context time="second"/>';changed.prompt.text='Second question';
-  const end = (await f.events(await f.start('agent-private-1',changed))).at(-1)!;
-  assert.equal(end.status,'completed');
-  assert(captured[0] && captured[1]);
-  assert.deepEqual(captured[1].messages.slice(0,captured[0].messages.length),captured[0].messages);
-  const systems = captured[1].messages.filter(m=>m.role==='system');
-  assert.equal(systems.length,1);
-  assert.match(JSON.stringify(systems),/PRIVATE_CONTEXT_MARKER/);
-  assert.match(JSON.stringify(systems),/SKILL.md/);
-  assert.match(JSON.stringify(systems),/platform-skills\/bundled-example\/SKILL.md/);
-  assert.doesNotMatch(JSON.stringify(systems),/MUST_NOT_REPLACE_PREFIX|time=/);
-  assert.deepEqual(systems.flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort(),['bash','web_search']);
-  const last = captured[1].messages.at(-1)!;
+  const second = structuredClone(body);
+  second.context_prefix = '<context time="second"/>';second.prompt.text='Second question';
+  assert.equal((await f.events(await f.start('agent-private-1',second))).at(-1)!.status,'completed');
+  prefixKept(1);
+  const leading = JSON.stringify(systems(1));
+  assert.equal(systems(1).length,1);
+  assert.match(leading,/PRIVATE_CONTEXT_MARKER/);
+  assert.match(leading,/platform-skills\/bundled-example\/SKILL.md/);
+  assert.doesNotMatch(leading,/time=/);
+  assert.deepEqual(systems(1).flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort(),['bash','web_search']);
+  const last = captured[1]!.messages.at(-1)!;
   assert.equal(last.role,'user');
   assert.match(JSON.stringify(last),/second/);
   assert.match(JSON.stringify(last),/Second question/);
+  const edited = structuredClone(second);
+  edited.resources.agents_md = {path:'/workspace/AGENTS.md',content:'UPDATED_CONTEXT_MARKER'};edited.prompt.text='Third question';
+  await f.events(await f.start('agent-private-1',edited));
+  prefixKept(2);
+  assert.equal(systems(2).length,2);
+  assert.equal(JSON.stringify(systems(2)[0]),JSON.stringify(systems(1)[0]));
+  assert.match(JSON.stringify(systems(2)[1]),/UPDATED_CONTEXT_MARKER/);
+  assert.doesNotMatch(JSON.stringify(systems(2)[1]),/PRIVATE_CONTEXT_MARKER/);
+  await f.reopen();
+  edited.prompt.text='Fourth question';
+  await f.events(await f.start('agent-private-1',edited));
+  prefixKept(3);
+  assert.equal(systems(3).length,2,'a restart with unchanged resources must not append another copy');
 });
 
 test('chat strips private resources and privileged tools and forces chat execution profile', {timeout:20_000}, async t=>{
@@ -412,15 +424,6 @@ test('manual compaction requires a selected model and generates its summary usin
   assert.equal(f.faux.state.callCount,3);
   const history=await f.http('/v1/sessions/agent-private-1/history');
   assert.match(await history.text(),/Preserved summary of earlier work/);
-  // Compaction already replaced the cached history, so the next run loads the current AGENTS.md.
-  let systems:string[]=[];
-  f.faux.setResponses([context=>{systems=context.messages.filter(m=>m.role==='system').map(m=>JSON.stringify(m));return fauxAssistantMessage('After reload.');}]);
-  body.prompt.text='After compaction.';body.resources.agents_md={path:'/workspace/AGENTS.md',content:'UPDATED_CONTEXT_MARKER'};
-  assert.equal((await f.events(await f.start('agent-private-1',body))).at(-1)!.text,'After reload.');
-  // Pi appends the changed section as a later system update; the cached leading prompt is untouched.
-  assert.match(systems[0]!,/PRIVATE_CONTEXT_MARKER/);
-  assert.match(systems.at(-1)!,/UPDATED_CONTEXT_MARKER/);
-  assert.equal(systems.length,2);
 });
 
 test('cancellation deadline preserves admission fence until pending construction settles', {timeout:10_000}, async t=>{
