@@ -30,8 +30,6 @@
     "images": {
       "type": "object",
       "additionalProperties": false,
-      "minProperties": 10,
-      "maxProperties": 10,
       "propertyNames": { "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$" },
       "properties": {
         "platform": { "$ref": "#/$defs/image" },
@@ -45,17 +43,21 @@
         "firecrawl-redis": { "$ref": "#/$defs/image" },
         "firecrawl-rabbitmq": { "$ref": "#/$defs/image" }
       },
-      "required": [
-        "platform",
-        "agent-runtime",
-        "camofox",
-        "agent-sandbox",
-        "searxng",
-        "firecrawl-api",
-        "firecrawl-playwright",
-        "firecrawl-postgres",
-        "firecrawl-redis",
-        "firecrawl-rabbitmq"
+      "oneOf": [
+        {
+          "minProperties": 5,
+          "maxProperties": 5,
+          "required": ["platform", "agent-runtime", "camofox", "agent-sandbox", "searxng"]
+        },
+        {
+          "minProperties": 10,
+          "maxProperties": 10,
+          "required": [
+            "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+            "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+            "firecrawl-redis", "firecrawl-rabbitmq"
+          ]
+        }
       ]
     },
     "artifact": {

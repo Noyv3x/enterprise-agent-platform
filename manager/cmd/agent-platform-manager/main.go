@@ -223,6 +223,7 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 	if err != nil {
 		return nil, err
 	}
+	sandboxes.AgentResources, sandboxes.ChatResources, sandboxes.ChatIdle = cfg.SandboxAgent, cfg.SandboxChat, cfg.SandboxChatIdle
 	// Retention only owns release artifacts and rollback snapshots. Sandbox
 	// lifecycle locks must not block release admission on Docker I/O.
 	maintenanceWake := make(chan struct{}, 1)

@@ -1,6 +1,6 @@
 # 自动更新
 
-- 发布保持 schema 2 / protocol 2、十个镜像和八个资产。N+1 只能由已完成监督接力的桥接版本 N 安装；旧激活、恢复、接力或操作未结算时拒绝更新，必须先用 N 完成结算。
+- 本次 M1 发布保持 schema 2 / protocol 2、十个镜像和八个资产，可由当前生产 N+1 Manager（`6889bf6`）通过正常自更新安装。M1 同时接受下述五镜像目录，为后续精简发布准备；生产必须先完成 M1 升级，才能安装五镜像发布。旧激活、恢复、接力或操作未结算时仍拒绝更新。
 - Manager 自动检测、切换和恢复，不依赖部署机上的 Git、中心推送或 webhook 密钥。
 - 安装见[部署](deployment.md)，持久边界见[数据布局](../reference/data-layout.md)。
 
@@ -23,7 +23,7 @@
 
 **八个公开资产**：`release.json`、`agent-platform-compose.yaml`、`install.sh`、`install.sh.sha256`、`agent-platform-manager-linux-amd64`、`agent-platform-manager-linux-amd64.sha256`、`agent-platform-manager-linux-arm64`、`agent-platform-manager-linux-arm64.sha256`。
 
-**十个镜像**：`platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`、`firecrawl-api`、`firecrawl-playwright`、`firecrawl-postgres`、`firecrawl-redis`、`firecrawl-rabbitmq`。缺少、重复、多出或已退役的镜像、迁移描述、身份不匹配都会被拒绝；残留的对象或日志不能让退役的服务复活。
+**镜像目录**：M1 接受且只接受两个完整集合：原十个镜像 `platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`、`firecrawl-api`、`firecrawl-playwright`、`firecrawl-postgres`、`firecrawl-redis`、`firecrawl-rabbitmq`；或精简五个镜像 `platform`、`agent-runtime`、`camofox`、`agent-sandbox`、`searxng`。本次发布仍输出原十镜像清单以兼容已部署的 Manager；不是任意子集或部分 Firecrawl 集合。重复、多出、技术身份不匹配仍拒绝。五镜像版本不拉取、启动、探测或报告 Firecrawl 不可用；残留对象或日志不会使其复活。
 
 - Firecrawl 构建直接读取[上游契约](../contracts/upstream-sources.json)里的地址、版本和全部 `required_paths`，缺一项就失败。
 - 登录 GHCR 只使用同一个最小权限的 `GITHUB_TOKEN`，最多重试三次、短退避；失败即停止，不扩大权限，也不遗漏镜像。
@@ -64,8 +64,8 @@
 
 **预拉取**
 
-- 进入维护前只预拉取 Platform 和 Runtime 镜像；本地已有精确的 RepoDigest 时不访问镜像仓库。
-- 拉取同时受"无进展期限"和较大的绝对上限约束，一直有进展的拉取不会被固定的短时限截断。原始输出只刷新内存里的进度；长期状态和日志只保存有上限的脱敏诊断。能力服务和沙箱另走受限的拉取路径。
+- 进入维护前预拉取 Platform、Runtime 和 agent-sandbox 镜像，避免更新后的第一次命令才拉取沙箱；本地已有精确的 RepoDigest 时不访问镜像仓库。
+- 拉取同时受"无进展期限"和较大的绝对上限约束，一直有进展的拉取不会被固定的短时限截断。原始输出只刷新内存里的进度；长期状态和日志只保存有上限的脱敏诊断。目录中存在的能力服务另走受限的拉取路径。
 - 预拉取前和切换前检查磁盘空间和 inode。不足或超时可以重试：不进入维护、保留当前版本，条件恢复后再试。
 
 ## 排队与维护
@@ -94,7 +94,7 @@
 **核心与非核心**
 
 - 核心只有：Manager 控制面、Platform、Runtime 和公共入口。
-- Camoufox、SearXNG、Firecrawl 失败时标为降级并指数退避恢复，不拖住健康的核心；工作区 MCP 不参与。
+- Camoufox、SearXNG、以及目录中存在时的 Firecrawl 失败时标为降级并指数退避恢复，不拖住健康的核心；工作区 MCP 不参与。目录不包含 Firecrawl 时，它不是待恢复或不可用的能力。
 - 候选版本只读地验证：工作区、标记文件、Runtime 别名、Camoufox 附属文件从启动起就符合当前 schema；缺失、未物化、旧格式或漂移都拒绝，普通更新不做修复。
 
 **开放业务的前提**：快照验证、核心就绪、Manager 启动确认和预约释放全部完成。
@@ -152,7 +152,8 @@ AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 go test -count=1 -v -timeout=12m -run '^Tes
 - 保留当前和上一版本的已验证发布物、二进制，以及它们引用的回滚快照；在途候选和其快照始终受保护。
 - 未被当前/上一版本引用的普通快照默认保留七天；只删除已验证的过期快照。未知、损坏和暂存工件保留，不按目录名猜测。
 - 更新记录是唯一可变的操作权威；其中终态幂等记录保留最新 128 条或七天以内的记录，并额外保护在途操作和当前/上一代关联记录。旧桥接记录只为离线回退保留，不继续累积独立操作日志。
-- 不自动清理 Docker 镜像、容器或网络，不触碰沙箱持有的镜像；禁止 blanket prune。磁盘空间不足时保留当前版本并报告错误，由部署用户检查并按归属清理。
+- 成功更新后保留当前和上一代引用的镜像，以及运行中沙箱引用的镜像；只按精确 ID 删除已经确认属于本部署且不再引用的镜像，不使用 blanket prune，不清理无归属镜像或网络。删除失败会报告并保留可重试状态，不影响已提交版本。
+- 运行沙箱仍引用旧代镜像时，保留该代经验证的发布目录作为镜像归属证据，待引用消失后再清理；不强制删除被容器占用的镜像。
 - 对无法验证、仍被引用或归属不明的文件不执行删除。
 
 **空间与日志**

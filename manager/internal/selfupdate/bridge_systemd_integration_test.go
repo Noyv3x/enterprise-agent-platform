@@ -48,6 +48,11 @@ const bridgeIntegrationInner = "AGENT_PLATFORM_BRIDGE_INTEGRATION_BINARIES"
 // of N's seeded pending finalization through authenticated mock gate settlement,
 // not Docker migrations, real Platform gate behavior, or the full update CLI.
 func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
+	bridgeIntegrationBuildAndRun(t, bridgeIntegrationN, bridgeIntegrationRun)
+}
+
+func bridgeIntegrationBuildAndRun(t *testing.T, baseline string, run func(*testing.T, context.Context, string)) {
+	t.Helper()
 	if os.Getenv("AGENT_PLATFORM_SYSTEMD_INTEGRATION") != "1" {
 		t.Skip("set AGENT_PLATFORM_SYSTEMD_INTEGRATION=1 to run the user-systemd integration test")
 	}
@@ -57,7 +62,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 	if binaries := os.Getenv(bridgeIntegrationInner); binaries != "" {
 		inner, innerCancel := context.WithTimeout(ctx, 180*time.Second)
 		defer innerCancel()
-		bridgeIntegrationRun(t, inner, binaries)
+		run(t, inner, binaries)
 		return
 	}
 
@@ -69,7 +74,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	bridgeIntegrationCopyTree(t, module, currentTree)
-	archive := bridgeIntegrationCommand(t, ctx, filepath.Dir(module), "git", "archive", bridgeIntegrationN, "manager")
+	archive := bridgeIntegrationCommand(t, ctx, filepath.Dir(module), "git", "archive", baseline, "manager")
 	reader := tar.NewReader(bytes.NewReader(archive))
 	for {
 		header, err := reader.Next()
@@ -107,7 +112,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, binary := range []struct{ tree, name, version string }{
-		{oldTree, "bridge", bridgeIntegrationN},
+		{oldTree, "bridge", baseline},
 		{currentTree, "next", bridgeIntegrationNext},
 		{currentTree, "periodic", bridgeIntegrationPeriodic},
 		{currentTree, "rejected", bridgeIntegrationRejected},
@@ -148,7 +153,7 @@ func TestBridgeSystemdBinaryUpgradeIntegration(t *testing.T) {
 			bridgeIntegrationWrite(t, mainPath, mainSource, 0o600)
 		}
 	}
-	command := exec.CommandContext(ctx, "go", "test", "-count=1", "-v", "-timeout=240s", "-run=^TestBridgeSystemdBinaryUpgradeIntegration$", "./internal/selfupdate")
+	command := exec.CommandContext(ctx, "go", "test", "-count=1", "-v", "-timeout=240s", "-run=^"+t.Name()+"$", "./internal/selfupdate")
 	command.Dir = currentTree
 	command.Env = append(os.Environ(), bridgeIntegrationInner+"="+binaries)
 	output, err := command.CombinedOutput()

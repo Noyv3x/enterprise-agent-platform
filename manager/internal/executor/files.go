@@ -33,7 +33,7 @@ func (s FileService) Execute(ctx context.Context, call Call) (string, map[string
 	if s.MaxBytes <= 0 {
 		s.MaxBytes = 10 << 20
 	}
-	if _, err := s.Sandboxes.Ensure(ctx, call.ExecutionContext.SandboxID, call.ExecutionContext.WorkspaceID, time.Now()); err != nil {
+	if _, err := s.Sandboxes.Ensure(ctx, call.ExecutionContext.SandboxID, call.ExecutionContext.WorkspaceID, time.Now(), call.ExecutionContext.Profile); err != nil {
 		return "", nil, err
 	}
 	switch call.Action {

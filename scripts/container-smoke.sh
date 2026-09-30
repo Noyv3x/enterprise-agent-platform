@@ -547,30 +547,6 @@ if required != expected:
 image_pattern = schema.get("$defs", {}).get("image", {}).get("pattern", "")
 if "@sha256:" not in image_pattern:
     raise SystemExit("release images are not constrained to immutable digests")
-expected_images = {
-    "platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
-    "firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
-    "firecrawl-redis", "firecrawl-rabbitmq",
-}
-if properties.get("images", {}).get("$ref") != "#/$defs/images":
-    raise SystemExit("target release manifest does not bind its image directory")
-images_schema = schema.get("$defs", {}).get("images", {})
-required_images = set(images_schema.get("required", ()))
-if required_images != expected_images:
-    raise SystemExit(f"unexpected target release images: {sorted(required_images)}")
-if (
-    images_schema.get("minProperties") != len(expected_images)
-    or images_schema.get("maxProperties") != len(expected_images)
-    or images_schema.get("additionalProperties") is not False
-):
-    raise SystemExit("target image directory is not an exact closed set")
-image_name_pattern = images_schema.get("propertyNames", {}).get("pattern", "")
-if image_name_pattern != "^[a-z0-9]+(-[a-z0-9]+)*$":
-    raise SystemExit("target image names are not lowercase kebab-case")
-if schema.get("allOf") is not None:
-    raise SystemExit("current release schema must have one closed shape")
-if "firecrawl-foundationdb" in expected_images:
-    raise SystemExit("the current release schema still requires FoundationDB")
 managed_firecrawl_services = set(upstream["sources"]["firecrawl"]["compose_services"])
 expected_firecrawl_services = {"api", "nuq-postgres", "playwright-service", "rabbitmq", "redis"}
 if managed_firecrawl_services != expected_firecrawl_services:

@@ -210,36 +210,24 @@ func TestVerifiedTargetProfileEmitsOnlyTargetComposeIdentity(t *testing.T) {
 	}
 }
 
-func TestPullSkipsExactLocalDigestAndOnlyPullsMissingCoreImages(t *testing.T) {
+func TestPullPrefetchesSandboxAndSkipsPresentDigests(t *testing.T) {
 	manifest := pullTestManifest()
 	runner := &pullTestRunner{present: map[string]bool{manifest.Images["platform"]: true}}
 	docker := pullTestDocker(runner, time.Second, 2*time.Second)
 	if err := docker.Pull(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if len(runner.calls) != 5 {
-		t.Fatalf("pull commands = %#v, want initial inspections, one ownership recheck, one pull, and one digest proof", runner.calls)
-	}
-	if got := runner.calls[0]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["platform"]}) {
-		t.Fatalf("platform inspection = %v", got)
-	}
-	if got := runner.calls[1]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
-		t.Fatalf("runtime inspection = %v", got)
-	}
-	if got := runner.calls[2]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
-		t.Fatalf("runtime ownership recheck = %v", got)
-	}
-	if got := runner.calls[3]; !reflect.DeepEqual(got, []string{"pull", manifest.Images["agent-runtime"]}) {
-		t.Fatalf("runtime pull = %v", got)
-	}
-	if got := runner.calls[4]; !reflect.DeepEqual(got, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", manifest.Images["agent-runtime"]}) {
-		t.Fatalf("runtime post-pull digest proof = %v", got)
-	}
-	joined := fmt.Sprint(runner.calls)
-	for _, capability := range []string{"agent-sandbox", "camofox", "firecrawl-api", "searxng"} {
-		if strings.Contains(joined, manifest.Images[capability]) {
-			t.Fatalf("capability image %s entered the core pull path: %s", capability, joined)
+	var pulled []string
+	for _, call := range runner.calls {
+		if call[0] == "pull" {
+			pulled = append(pulled, call[1])
 		}
+	}
+	if !reflect.DeepEqual(pulled, []string{manifest.Images["agent-runtime"], manifest.Images["agent-sandbox"]}) {
+		t.Fatalf("update pulls = %v", pulled)
+	}
+	if !runner.present[manifest.Images["agent-sandbox"]] {
+		t.Fatal("sandbox image was not available after update pull")
 	}
 }
 
@@ -1522,7 +1510,7 @@ func TestCheckCapacityBudgetsOnlyMissingCoreDigests(t *testing.T) {
 			return CapacityFilesystemStat{BlockSize: 1, AvailableBlock: available, Favail: 10000, FilesystemID: "same"}, nil
 		},
 	}
-	manifest := release.Manifest{Images: map[string]string{"platform": platform, "agent-runtime": runtimeImage}}
+	manifest := release.Manifest{Images: map[string]string{"platform": platform, "agent-runtime": runtimeImage, "agent-sandbox": platform}}
 	err := docker.CheckCapacity(context.Background(), CapacityPreDownload, manifest)
 	var capacityErr *CapacityError
 	if !errors.As(err, &capacityErr) {

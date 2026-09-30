@@ -143,6 +143,10 @@ type SandboxSpec struct {
 	Home          string
 	Environment   string
 	Attachments   string
+	Memory        string
+	MemorySwap    string
+	CPUs          string
+	PidsLimit     int
 	UID           int
 	GID           int
 }
@@ -249,7 +253,7 @@ const (
 	pullDiagnosticMaxBytes      = 8 << 10
 )
 
-var coreUpdateImageNames = []string{"platform", "agent-runtime"}
+var coreUpdateImageNames = []string{"platform", "agent-runtime", "agent-sandbox"}
 
 var firecrawlHealthyServices = []string{
 	"firecrawl-playwright",
@@ -342,7 +346,13 @@ func (d DockerCLI) checkCapacity(ctx context.Context, stage string, manifest rel
 			}
 			estimate, ok := contract.ManagedImageCapacityEstimates[name]
 			if !ok || estimate.CompressedBytes == 0 || estimate.UnpackedBytes == 0 {
-				return fmt.Errorf("managed image %s has no valid capacity estimate", name)
+				if !release.IsManagedImageName(name) {
+					return fmt.Errorf("managed image %s has no valid capacity estimate", name)
+				}
+				// Catalog compatibility must survive removal of legacy estimates.
+				// Reserve a conservative 8 GiB per missing legacy image.
+				estimate.CompressedBytes = 2 << 30
+				estimate.UnpackedBytes = 6 << 30
 			}
 			for _, addition := range []uint64{estimate.CompressedBytes, estimate.UnpackedBytes} {
 				if dockerMinimumBytes > ^uint64(0)-addition {
@@ -818,6 +828,9 @@ func (d DockerCLI) reconcileCapabilities(ctx context.Context, env string) error 
 // active generation. It is safe to call again after Manager activation because
 // Compose is idempotent and the Manager never removes or rewrites service data.
 func (d DockerCLI) ReconcileFirecrawl(ctx context.Context, manifest release.Manifest) error {
+	if manifest.Images["firecrawl-api"] == "" {
+		return nil
+	}
 	if err := d.prepareManagedImages(ctx, manifest, firecrawlHealthyServices, true); err != nil {
 		return fmt.Errorf("prepare Firecrawl images: %w", err)
 	}
@@ -971,6 +984,7 @@ func (d DockerCLI) Probe(ctx context.Context, manifest release.Manifest) error {
 func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServiceState {
 	result := make(map[string]FixedServiceState, 9)
 	env, envErr := d.activeEnvironment()
+	manifestEnv := env
 	if d.ComposeFile != "" {
 		env = ""
 		envErr = nil
@@ -981,7 +995,17 @@ func (d DockerCLI) FixedServiceStatus(ctx context.Context) map[string]FixedServi
 		"camofox",
 		"searxng",
 	}
-	services = append(services, firecrawlHealthyServices...)
+	includeFirecrawl := d.ComposeFile != ""
+	if manifestEnv != "" {
+		data, err := os.ReadFile(filepath.Join(filepath.Dir(manifestEnv), "manifest.json"))
+		var manifest release.Manifest
+		if err == nil && json.Unmarshal(data, &manifest) == nil {
+			includeFirecrawl = manifest.Images["firecrawl-api"] != ""
+		}
+	}
+	if includeFirecrawl {
+		services = append(services, firecrawlHealthyServices...)
+	}
 	for _, service := range services {
 		status := "unknown"
 		if envErr == nil {
@@ -1230,6 +1254,19 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 	args := []string{"create", "--name", spec.ContainerName, "--label", profile.Label("sandbox") + "=true", "--label", profile.Label("id") + "=" + spec.AgentHash,
 		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("%s_AGENT_UID=%d", profile.EnvironmentPrefix, spec.UID), "--env", fmt.Sprintf("%s_AGENT_GID=%d", profile.EnvironmentPrefix, spec.GID), "--workdir", contract.ContainerWorkspace,
 		"--mount", bindMount(spec.Workspace, contract.ContainerWorkspace), "--mount", bindMount(spec.Home, contract.ContainerAgentHome), "--mount", bindMount(spec.Environment, contract.ContainerAgentEnv)}
+	if spec.Memory == "" {
+		spec.Memory = "2g"
+	}
+	if spec.MemorySwap == "" {
+		spec.MemorySwap = spec.Memory
+	}
+	if spec.CPUs == "" {
+		spec.CPUs = "2"
+	}
+	if spec.PidsLimit == 0 {
+		spec.PidsLimit = 1024
+	}
+	args = append(args, "--memory", spec.Memory, "--memory-swap", spec.MemorySwap, "--cpus", spec.CPUs, "--pids-limit", strconv.Itoa(spec.PidsLimit))
 	if spec.Attachments != "" {
 		args = append(args, "--mount", bindMount(spec.Attachments, contract.ContainerWorkspace+"/"+profile.InternalWorkspaceDirectory+"/attachments")+",readonly")
 	}

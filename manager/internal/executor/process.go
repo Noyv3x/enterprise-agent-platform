@@ -71,6 +71,7 @@ type managedProcess struct {
 	context                context.Context
 	sandboxID              string
 	workspaceID            string
+	profile                string
 	spec                   driver.SandboxSpec
 	pidFile                string
 	hostPIDFile            string
@@ -98,6 +99,7 @@ type persistedProcess struct {
 	Snapshot               ProcessSnapshot `json:"snapshot"`
 	SandboxID              string          `json:"sandbox_id"`
 	WorkspaceID            string          `json:"workspace_id"`
+	Profile                string          `json:"profile,omitempty"`
 	PIDFile                string          `json:"pid_file"`
 	HostPIDFile            string          `json:"host_pid_file"`
 	StdoutFile             string          `json:"stdout_file"`
@@ -466,7 +468,7 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 			m.releaseProcessSlot(call.ScopeID, call.LifecycleID)
 		}
 	}()
-	spec, err := m.Sandboxes.Ensure(requestContext, call.ExecutionContext.SandboxID, call.ExecutionContext.WorkspaceID, time.Now())
+	spec, err := m.Sandboxes.Ensure(requestContext, call.ExecutionContext.SandboxID, call.ExecutionContext.WorkspaceID, time.Now(), call.ExecutionContext.Profile)
 	if err != nil {
 		return ProcessSnapshot{}, err
 	}
@@ -579,6 +581,7 @@ func (m *ProcessManager) runAdmitted(requestContext context.Context, call Call, 
 		displayCommand = args.DisplayCommand
 	}
 	process := &managedProcess{snapshot: ProcessSnapshot{ID: id, RunID: call.RunID, ScopeKey: call.ScopeID, LifecycleID: call.LifecycleID, Target: call.Target, Command: displayCommand, CWD: cwd, Status: "running", Stdout: "", Stderr: "", StartedAt: now, Background: args.Background}, command: command, stdin: stdin, cancel: cancel, context: executionContext, sandboxID: call.ExecutionContext.SandboxID, workspaceID: call.ExecutionContext.WorkspaceID, spec: spec, pidFile: pidFile, hostPIDFile: hostPIDFile, hostStdoutFile: hostStdoutFile, hostStderrFile: hostStderrFile, hostExitFile: hostExitFile, stateFile: stateFile, completionOwnerID: call.CompletionOwnerID, completionToolCallID: call.ToolCallID, privateOutput: args.PrivateOutput, starting: true, done: make(chan struct{}), stdout: stdout, stderr: stderr}
+	process.profile = storedProfile(call.ExecutionContext.Profile)
 	if process.completionOwnerID != "" {
 		if err := m.persistProcess(process); err != nil {
 			cancel()
@@ -790,6 +793,7 @@ func (m *ProcessManager) persistProcess(process *managedProcess) error {
 	snapshot := m.snapshot(process)
 	process.mu.Lock()
 	value := persistedProcess{Snapshot: snapshot, SandboxID: process.sandboxID, WorkspaceID: process.workspaceID, PIDFile: process.pidFile, HostPIDFile: process.hostPIDFile, StdoutFile: process.hostStdoutFile, StderrFile: process.hostStderrFile, ExitFile: process.hostExitFile, CompletionOwnerID: process.completionOwnerID, CompletionToolCallID: process.completionToolCallID, CompletionAcknowledged: process.completionAcknowledged, PrivateOutput: process.privateOutput, Starting: process.starting}
+	value.Profile = storedProfile(process.profile)
 	process.mu.Unlock()
 	return atomicfile.WriteJSON(process.stateFile, value, 0o600)
 }
@@ -911,10 +915,14 @@ func (m *ProcessManager) recoverSandboxProcesses() {
 			if err := atomicfile.ReadJSON(stateFile, &state); err != nil || state.SandboxID != record.SandboxID || state.Snapshot.Target != "sandbox" || state.Snapshot.ID == "" {
 				continue
 			}
+			if !sameProfile(state.Profile, record.Profile) || state.WorkspaceID != "" && state.WorkspaceID != record.WorkspaceID {
+				continue
+			}
 			stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
 			_, _ = stdout.Write([]byte(state.Snapshot.Stdout))
 			_, _ = stderr.Write([]byte(state.Snapshot.Stderr))
 			process := &managedProcess{snapshot: state.Snapshot, cancel: func() {}, context: context.Background(), sandboxID: state.SandboxID, workspaceID: record.WorkspaceID, spec: spec, pidFile: state.PIDFile, hostPIDFile: state.HostPIDFile, hostStdoutFile: state.StdoutFile, hostStderrFile: state.StderrFile, hostExitFile: state.ExitFile, stateFile: stateFile, completionOwnerID: state.CompletionOwnerID, completionToolCallID: state.CompletionToolCallID, completionAcknowledged: state.CompletionAcknowledged, privateOutput: state.PrivateOutput, starting: state.Starting, done: make(chan struct{}), stdout: stdout, stderr: stderr}
+			process.profile = storedProfile(state.Profile)
 			if activeProcessStatus(process.snapshot.Status) {
 				if process.starting {
 					if recoveredPID, waitErr := waitForPIDFile(process.hostPIDFile, 2*time.Second); waitErr != nil {
@@ -973,6 +981,9 @@ func (m *ProcessManager) recoverHostCompletionTasks() {
 			state.SandboxID == "" || state.WorkspaceID == "" {
 			continue
 		}
+		if _, err := sandbox.NormalizeProfile(state.Profile); err != nil {
+			continue
+		}
 		stdout, stderr := &boundedBuffer{limit: m.MaxOutput}, &boundedBuffer{limit: m.MaxOutput}
 		_, _ = stdout.Write([]byte(state.Snapshot.Stdout))
 		_, _ = stderr.Write([]byte(state.Snapshot.Stderr))
@@ -983,6 +994,7 @@ func (m *ProcessManager) recoverHostCompletionTasks() {
 			completionAcknowledged: state.CompletionAcknowledged, privateOutput: state.PrivateOutput, starting: false,
 			done: make(chan struct{}), stdout: stdout, stderr: stderr,
 		}
+		process.profile = storedProfile(state.Profile)
 		if activeProcessStatus(process.snapshot.Status) || state.Starting {
 			now := time.Now().UTC()
 			process.snapshot.Status = "failed"
@@ -1386,7 +1398,7 @@ func (m *ProcessManager) Wait(
 		snapshot.LifecycleID != lifecycle ||
 		snapshot.Target != target ||
 		process.sandboxID != executionContext.SandboxID ||
-		process.workspaceID != executionContext.WorkspaceID {
+		process.workspaceID != executionContext.WorkspaceID || !sameProfile(process.profile, executionContext.Profile) {
 		return ProcessWaitResult{}, errors.New("process not found")
 	}
 	if !activeProcessStatus(snapshot.Status) {
@@ -1475,10 +1487,37 @@ func (m *ProcessManager) Kill(scope, lifecycle, target, id string) (ProcessSnaps
 	}
 	return m.snapshot(p), nil
 }
+
+// Process operations retain the original sandbox profile even when no Ensure
+// call is needed (for example, reading a completed process after recovery).
+func (m *ProcessManager) validateProcessExecution(call Call, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, process := range m.processes {
+		process.mu.Lock()
+		matches := process.snapshot.ScopeKey == call.ScopeID &&
+			process.snapshot.LifecycleID == call.LifecycleID &&
+			process.snapshot.Target == call.Target &&
+			(id == "" || process.snapshot.ID == id)
+		bound := sameExecutionContext(
+			ExecutionContext{SandboxID: process.sandboxID, WorkspaceID: process.workspaceID, Profile: process.profile},
+			call.ExecutionContext,
+		)
+		process.mu.Unlock()
+		if matches && !bound {
+			return errors.New("process execution context does not match")
+		}
+	}
+	return nil
+}
+
 func (m *ProcessManager) CancelRun(identity RunIdentity) bool {
 	if identity.RunID == "" || identity.ScopeID == "" || identity.LifecycleID == "" ||
 		identity.ExecutionContext.SandboxID == "" || identity.ExecutionContext.WorkspaceID == "" ||
 		len(identity.PreserveProcessIDs) > 256 {
+		return false
+	}
+	if _, err := sandbox.NormalizeProfile(identity.ExecutionContext.Profile); err != nil {
 		return false
 	}
 	preserve := make(map[string]struct{}, len(identity.PreserveProcessIDs))
@@ -1511,7 +1550,7 @@ func (m *ProcessManager) CancelRun(identity RunIdentity) bool {
 		sandboxID, workspaceID := process.sandboxID, process.workspaceID
 		process.mu.Unlock()
 		if s.RunID != identity.RunID || s.ScopeKey != identity.ScopeID || s.LifecycleID != identity.LifecycleID ||
-			!s.Background || !completionOwned || sandboxID != identity.ExecutionContext.SandboxID || workspaceID != identity.ExecutionContext.WorkspaceID {
+			!s.Background || !completionOwned || sandboxID != identity.ExecutionContext.SandboxID || workspaceID != identity.ExecutionContext.WorkspaceID || !sameProfile(process.profile, identity.ExecutionContext.Profile) {
 			return false
 		}
 	}
@@ -1519,6 +1558,9 @@ func (m *ProcessManager) CancelRun(identity RunIdentity) bool {
 		s := m.snapshot(p)
 		if s.RunID == identity.RunID && s.ScopeKey == identity.ScopeID && s.LifecycleID == identity.LifecycleID &&
 			p.sandboxID == identity.ExecutionContext.SandboxID && p.workspaceID == identity.ExecutionContext.WorkspaceID {
+			if !sameProfile(p.profile, identity.ExecutionContext.Profile) {
+				return false
+			}
 			if _, keep := preserve[s.ID]; keep {
 				continue
 			}
@@ -1548,7 +1590,8 @@ func (m *ProcessManager) ReconcileTasks(identity TaskIdentity) ([]ProcessSnapsho
 			process.completionOwnerID == identity.CompletionOwnerID &&
 			!process.completionAcknowledged &&
 			process.sandboxID == identity.ExecutionContext.SandboxID &&
-			process.workspaceID == identity.ExecutionContext.WorkspaceID
+			process.workspaceID == identity.ExecutionContext.WorkspaceID &&
+			sameProfile(process.profile, identity.ExecutionContext.Profile)
 		process.mu.Unlock()
 		if matches {
 			result = append(result, m.snapshot(process))
@@ -1575,7 +1618,8 @@ func (m *ProcessManager) AcknowledgeTask(identity TaskProcessIdentity) bool {
 		process.completionOwnerID == identity.CompletionOwnerID &&
 		!process.completionAcknowledged &&
 		process.sandboxID == identity.ExecutionContext.SandboxID &&
-		process.workspaceID == identity.ExecutionContext.WorkspaceID
+		process.workspaceID == identity.ExecutionContext.WorkspaceID &&
+		sameProfile(process.profile, identity.ExecutionContext.Profile)
 	if matches {
 		process.completionAcknowledged = true
 	}
@@ -1654,7 +1698,7 @@ func (m *ProcessManager) CleanupScopeWithEvidenceContext(ctx context.Context, sc
 		if process.completionOwnerID != "" && !process.completionAcknowledged {
 			evidence = append(evidence, CompletionTaskCleanupEvidence{
 				ScopeID: process.snapshot.ScopeKey, LifecycleID: process.snapshot.LifecycleID,
-				ExecutionContext:  ExecutionContext{SandboxID: process.sandboxID, WorkspaceID: process.workspaceID},
+				ExecutionContext:  ExecutionContext{SandboxID: process.sandboxID, WorkspaceID: process.workspaceID, Profile: process.profile},
 				CompletionOwnerID: process.completionOwnerID, ProcessID: process.snapshot.ID,
 				Target: process.snapshot.Target,
 			})

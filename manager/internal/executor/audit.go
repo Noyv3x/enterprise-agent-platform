@@ -16,6 +16,7 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/logstore"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type AuditStore struct {
@@ -28,6 +29,7 @@ func (s AuditStore) Record(request AuditRequest) (AuditReceipt, error) {
 	if err := validateIdentity(request.Identity); err != nil {
 		return AuditReceipt{}, err
 	}
+	request.ExecutionContext.Profile = storedProfile(request.ExecutionContext.Profile)
 	if !validID(request.AuditID) || request.Operation == "" {
 		return AuditReceipt{}, errors.New("audit_id and operation are required")
 	}
@@ -102,7 +104,7 @@ func (s AuditStore) Consume(call Call, operation string) (receiptRecord, error) 
 		record.ScopeID != call.ScopeID ||
 		record.LifecycleID != call.LifecycleID ||
 		record.ToolCallID != call.ToolCallID ||
-		record.ExecutionContext != call.ExecutionContext ||
+		!sameExecutionContext(record.ExecutionContext, call.ExecutionContext) ||
 		record.Operation != operation ||
 		record.Action != call.Action ||
 		subtle.ConstantTimeCompare([]byte(record.ArgumentsSHA256), []byte(argumentsSHA256)) != 1 {
@@ -206,7 +208,8 @@ func validateIdentity(value Identity) error {
 	if value.RunID == "" || value.ScopeID == "" || value.LifecycleID == "" || value.ToolCallID == "" || value.ExecutionContext.SandboxID == "" || value.ExecutionContext.WorkspaceID == "" {
 		return errors.New("execution identity is incomplete")
 	}
-	return nil
+	_, err := sandbox.NormalizeProfile(value.ExecutionContext.Profile)
+	return err
 }
 func randomID(prefix string) (string, error) {
 	value := make([]byte, 16)

@@ -3,12 +3,35 @@ package executor
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/sandbox"
 )
 
 type ExecutionContext struct {
 	SandboxID   string `json:"sandbox_id"`
 	WorkspaceID string `json:"workspace_id"`
+	Profile     string `json:"profile,omitempty"`
 }
+
+// Agent is the legacy profile; omit it from durable identity records.
+func storedProfile(profile string) string {
+	if profile == "agent" {
+		return ""
+	}
+	return profile
+}
+
+func sameProfile(left, right string) bool {
+	l, leftErr := sandbox.NormalizeProfile(left)
+	r, rightErr := sandbox.NormalizeProfile(right)
+	return leftErr == nil && rightErr == nil && l == r
+}
+
+func sameExecutionContext(left, right ExecutionContext) bool {
+	return left.SandboxID == right.SandboxID && left.WorkspaceID == right.WorkspaceID &&
+		sameProfile(left.Profile, right.Profile)
+}
+
 type Identity struct {
 	RunID            string           `json:"run_id"`
 	ScopeID          string           `json:"scope_id"`

@@ -24,16 +24,17 @@ const (
 // ReleasePolicy selects the two committed generations. Callers hold the update
 // lifecycle lock and must not run retention while a transaction is unfinished.
 type ReleasePolicy struct {
-	Root       string
-	Channel    string
-	Profile    identity.ActiveProfile
-	CurrentID  string
-	PreviousID string
+	Root         string
+	Channel      string
+	Profile      identity.ActiveProfile
+	CurrentID    string
+	PreviousID   string
+	RetainImages func(context.Context, []release.Manifest, []release.Manifest) (map[string]bool, error)
 }
 
-// PruneReleases retains the verified current and previous generations. Unknown
-// directories and damaged artifacts are left alone. Docker images are never
-// removed: a sandbox may still hold an older release's image.
+// PruneReleases retains verified current and previous generations. Unknown
+// directories and damaged artifacts are left alone. Image retention completes
+// before deleting the manifests that establish deployment ownership.
 func PruneReleases(ctx context.Context, policy ReleasePolicy) (int, error) {
 	active := policy.Profile
 	if active.Validate() != nil {
@@ -54,13 +55,43 @@ func PruneReleases(ctx context.Context, policy ReleasePolicy) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	deferred := map[string]bool{}
+	if policy.RetainImages != nil {
+		var retained, obsolete []release.Manifest
+		for _, entry := range entries {
+			if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !validCommit(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(policy.Root, entry.Name())
+			if err := verifyRelease(path, entry.Name(), policy.Channel, active); err != nil {
+				continue
+			}
+			data, err := readRegularFile(filepath.Join(path, "manifest.json"), maxManifestBytes)
+			if err != nil {
+				return 0, err
+			}
+			manifest, err := release.DecodeManifestForProfile(data, policy.Channel, runtime.GOOS, runtime.GOARCH, active)
+			if err != nil {
+				return 0, err
+			}
+			if entry.Name() == policy.CurrentID || entry.Name() == policy.PreviousID {
+				retained = append(retained, manifest)
+			} else {
+				obsolete = append(obsolete, manifest)
+			}
+		}
+		deferred, err = policy.RetainImages(ctx, retained, obsolete)
+		if err != nil {
+			return 0, err
+		}
+	}
 	removed := 0
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return removed, err
 		}
 		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !validCommit(entry.Name()) ||
-			entry.Name() == policy.CurrentID || entry.Name() == policy.PreviousID {
+			entry.Name() == policy.CurrentID || entry.Name() == policy.PreviousID || deferred[entry.Name()] {
 			continue
 		}
 		path := filepath.Join(policy.Root, entry.Name())

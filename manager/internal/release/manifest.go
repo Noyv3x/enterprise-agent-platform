@@ -127,10 +127,13 @@ func (m Manifest) ValidateForProfile(channel, goos, goarch string, active identi
 	if m.GeneratedAt.IsZero() {
 		return errors.New("manifest generated_at is required")
 	}
-	if len(m.Images) != len(managedImageNames) {
-		return fmt.Errorf("manifest schema %d images must contain exactly %d managed entries", m.SchemaVersion, len(managedImageNames))
+	names := managedImageNames
+	if len(m.Images) == 5 {
+		names = managedImageNames[:5]
+	} else if len(m.Images) != len(managedImageNames) {
+		return fmt.Errorf("manifest schema %d images must contain exactly five or ten managed entries", m.SchemaVersion)
 	}
-	for _, name := range managedImageNames {
+	for _, name := range names {
 		digest, ok := m.Images[name]
 		if !ok || !digestPattern.MatchString(digest) {
 			return fmt.Errorf("image %q must use a complete registry sha256 digest", name)

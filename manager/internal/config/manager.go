@@ -181,7 +181,16 @@ sandbox_network = %q
 health_timeout_seconds = %d
 drain_timeout_seconds = %d
 command_max_bytes = %d
-`, c.DataRoot, c.GatewayAddress, c.LANEnabled, c.LANAddress, formatStringArray(c.DirectAccessCIDRs), formatStringArray(c.TrustedIngressCIDRs), c.ReleaseURL, c.ReleaseChannel, c.UpdateEnabled, c.UpdateInterval.String(), c.SandboxIdle.String(), formatByteSize(c.LogMaxBytes), c.LogBackups, c.SocketPath, c.PlatformURL, c.PlatformGateURL, c.InternalTokenFile, c.ComposeFile, c.ComposeProject, c.DockerBinary, c.SandboxImage, c.SandboxNetwork, int(c.HealthTimeout/time.Second), int(c.DrainTimeout/time.Second), c.CommandMaxBytes)
+`, c.DataRoot, c.GatewayAddress, c.LANEnabled, c.LANAddress, formatStringArray(c.DirectAccessCIDRs), formatStringArray(c.TrustedIngressCIDRs), c.ReleaseURL, c.ReleaseChannel, c.UpdateEnabled, c.UpdateInterval.String(), c.SandboxIdle.String(), formatByteSize(c.LogMaxBytes), c.LogBackups, c.SocketPath, c.PlatformURL, c.PlatformGateURL, c.InternalTokenFile, c.ComposeFile, c.ComposeProject, c.DockerBinary, c.SandboxImage, c.SandboxNetwork, int(c.HealthTimeout/time.Second), int(c.DrainTimeout/time.Second), c.CommandMaxBytes) + fmt.Sprintf(`sandbox_agent_memory = %q
+sandbox_agent_memory_swap = %q
+sandbox_agent_cpus = %q
+sandbox_agent_pids_limit = %d
+sandbox_chat_memory = %q
+sandbox_chat_memory_swap = %q
+sandbox_chat_cpus = %q
+sandbox_chat_pids_limit = %d
+sandbox_chat_idle = %q
+`, c.SandboxAgent.Memory, c.SandboxAgent.MemorySwap, c.SandboxAgent.CPUs, c.SandboxAgent.PidsLimit, c.SandboxChat.Memory, c.SandboxChat.MemorySwap, c.SandboxChat.CPUs, c.SandboxChat.PidsLimit, c.SandboxChatIdle.String())
 }
 
 func formatStringArray(values []string) string {

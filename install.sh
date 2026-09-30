@@ -339,7 +339,16 @@ release_manifest_url = "$manifest_url"
 release_channel = "main"
 update_enabled = true
 update_interval = "5m"
-sandbox_idle = "30m"
+sandbox_idle = "10m"
+sandbox_agent_memory = "2g"
+sandbox_agent_memory_swap = "2g"
+sandbox_agent_cpus = "2"
+sandbox_agent_pids_limit = 1024
+sandbox_chat_memory = "768m"
+sandbox_chat_memory_swap = "768m"
+sandbox_chat_cpus = "1"
+sandbox_chat_pids_limit = 256
+sandbox_chat_idle = "3m"
 log_max_size = "20MiB"
 log_max_files = 5
 EOF

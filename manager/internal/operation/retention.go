@@ -7,10 +7,11 @@ import (
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/maintenance"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/model"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 )
 
 // Retain runs only between transactions under the same admission lock used to
-// publish them. It never removes Docker images or independent sandbox state.
+// publish them. Independent sandbox state is never removed.
 func (o *Orchestrator) Retain(ctx context.Context) error {
 	unlock, err := o.lockMaintenanceAdmission(ctx)
 	if err != nil {
@@ -35,6 +36,11 @@ func (o *Orchestrator) Retain(ctx context.Context) error {
 	policy := maintenance.ReleasePolicy{
 		Root: o.ReleasesDir, Channel: o.Channel, Profile: o.TechnicalProfile,
 		CurrentID: state.Current.ID,
+	}
+	if images, ok := o.Engine.(interface {
+		RetainImages(context.Context, []release.Manifest, []release.Manifest) (map[string]bool, error)
+	}); ok {
+		policy.RetainImages = images.RetainImages
 	}
 	protected := make(map[string]struct{}, 2)
 	for _, generation := range []*model.Generation{state.Current, state.Previous} {

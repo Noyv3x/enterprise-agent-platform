@@ -23,7 +23,7 @@ func validManifest(base string) Manifest {
 		}
 	}
 	images := map[string]string{}
-	for name := range contract.ManagedImageCapacityEstimates {
+	for _, name := range managedImageNames {
 		images[name] = "registry.example/" + name + "@sha256:" + strings.Repeat("c", 64)
 	}
 	return Manifest{
@@ -45,9 +45,6 @@ func TestTargetManifestValidation(t *testing.T) {
 		if err := manifest.Validate(contract.ReleaseChannel, "linux", arch); err != nil {
 			t.Fatalf("linux/%s: %v", arch, err)
 		}
-	}
-	if len(manifest.Images) != len(contract.ManagedImageCapacityEstimates) {
-		t.Fatalf("managed image count = %d", len(manifest.Images))
 	}
 }
 
@@ -87,6 +84,26 @@ func TestTargetManifestValidationFailsClosed(t *testing.T) {
 	manifest := validManifest("http://127.0.0.1")
 	if err := manifest.Validate(contract.ReleaseChannel, "darwin", "amd64"); err == nil {
 		t.Fatal("unsupported operating system was accepted")
+	}
+}
+
+func TestCatalogsRemainValidWithoutCapacityEstimates(t *testing.T) {
+	estimates := contract.ManagedImageCapacityEstimates
+	contract.ManagedImageCapacityEstimates = nil
+	defer func() { contract.ManagedImageCapacityEstimates = estimates }()
+	manifest := validManifest("https://registry.example")
+	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err != nil {
+		t.Fatalf("legacy rollback without capacity map: %v", err)
+	}
+	for _, name := range managedImageNames[5:] {
+		delete(manifest.Images, name)
+	}
+	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err != nil {
+		t.Fatalf("reduced catalog: %v", err)
+	}
+	manifest.Images["firecrawl-api"] = "registry.example/firecrawl@sha256:" + strings.Repeat("a", 64)
+	if err := manifest.Validate(contract.ReleaseChannel, "linux", "amd64"); err == nil {
+		t.Fatal("partial Firecrawl stack accepted")
 	}
 }
 

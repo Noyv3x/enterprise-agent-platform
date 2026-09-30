@@ -216,6 +216,9 @@ func (s *Service) Process(ctx context.Context, call Call) (map[string]any, error
 		return nil, errors.New("process_id is required")
 	}
 	record, err := s.Audits.Consume(call, "process")
+	if err == nil {
+		err = s.Processes.validateProcessExecution(call, processID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -289,6 +292,7 @@ func (s *Service) AcknowledgeTask(identity TaskProcessIdentity) bool {
 func validTaskIdentity(identity TaskIdentity) bool {
 	return identity.ScopeID != "" && identity.LifecycleID != "" &&
 		identity.ExecutionContext.SandboxID != "" && identity.ExecutionContext.WorkspaceID != "" &&
+		sameProfile(identity.ExecutionContext.Profile, identity.ExecutionContext.Profile) &&
 		validCompletionOwner(identity.CompletionOwnerID)
 }
 func (s *Service) CleanupScope(ctx context.Context, identity ScopeCleanupIdentity) (ScopeCleanupResult, error) {

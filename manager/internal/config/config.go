@@ -44,6 +44,9 @@ type Config struct {
 	SandboxImage        string
 	SandboxNetwork      string
 	SandboxIdle         time.Duration
+	SandboxAgent        SandboxResources
+	SandboxChat         SandboxResources
+	SandboxChatIdle     time.Duration
 	HealthTimeout       time.Duration
 	DrainTimeout        time.Duration
 	LogMaxBytes         int64
@@ -95,7 +98,10 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		ComposeProject:      profile.ComposeProject,
 		DockerBinary:        "docker",
 		SandboxNetwork:      profile.CoreNetwork,
-		SandboxIdle:         time.Duration(contract.SandboxIdleSeconds) * time.Second,
+		SandboxIdle:         10 * time.Minute,
+		SandboxAgent:        SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024},
+		SandboxChat:         SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256},
+		SandboxChatIdle:     3 * time.Minute,
 		HealthTimeout:       2 * time.Minute,
 		DrainTimeout:        5 * time.Minute,
 		LogMaxBytes:         10 << 20,
@@ -175,6 +181,12 @@ func loadReader(cfg Config, reader io.Reader) (Config, error) {
 }
 
 func set(c *Config, key, value string) error {
+	if strings.HasPrefix(key, "sandbox_agent_") {
+		return setSandboxResource(&c.SandboxAgent, strings.TrimPrefix(key, "sandbox_agent_"), value)
+	}
+	if strings.HasPrefix(key, "sandbox_chat_") && key != "sandbox_chat_idle" {
+		return setSandboxResource(&c.SandboxChat, strings.TrimPrefix(key, "sandbox_chat_"), value)
+	}
 	switch key {
 	case "data_root":
 		root := expandHome(value)
@@ -255,6 +267,12 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("sandbox_idle must be between 1m and 24h")
 		}
 		c.SandboxIdle = duration
+	case "sandbox_chat_idle":
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration < time.Minute || duration > 24*time.Hour {
+			return fmt.Errorf("sandbox_chat_idle must be between 1m and 24h")
+		}
+		c.SandboxChatIdle = duration
 	case "health_timeout_seconds":
 		n, err := strconv.Atoi(value)
 		if err != nil || n < 1 {

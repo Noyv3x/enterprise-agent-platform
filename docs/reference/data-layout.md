@@ -66,6 +66,7 @@
 | 状态 | 位置与身份 |
 | --- | --- |
 | 个人 / 频道工作区 | `data/workspaces/user-<id>/` 或 `data/workspaces/channels/channel-<id>/`，挂载为 `/workspace`；委派共用父目录 |
+| Chat 工作区 | 逻辑身份 `chat-user-<id>` 对应 `data/workspaces/chat/user-<id>/`，整个目录挂载为 `/workspace`；同一用户的会话复用一个 chat 沙箱，会话文件位于各自的 `<conversation-id>/` |
 | 用户环境 | `agent-envs/<scope-hash>/{home,env}`，挂载为 `/home/agent` 和 `/opt/agent-env`；系统层在重建时丢弃 |
 | Skill 包 | 工作区内的 `.agent-platform/skills/<skill-id>/`，只能包含 `SKILL.md`、`references/`、`templates/`、`scripts/`、`assets/` |
 | Skill 状态 | 只在 Platform 的 `agent-skill-state/<scope-hash>/`，不挂载到沙箱；工作区里的附属文件不构成授权 |
@@ -79,9 +80,10 @@
 
 ## Sandbox
 
-- 登记表记录沙箱和工作区身份、UID/GID、相对挂载路径和镜像摘要。容器名或镜像层不构成身份；首次分配的 `sandbox_id` 不会改绑。
-- 每次创建或启动之前，Manager 验证工作区、HOME、环境和附件的源与目标：位于数据目录内、没有符号链接、属于部署 UID/GID、权限 `0700`。缺少的挂载目标在调用 Docker 之前自行创建，不让以 root 运行的 Docker 守护进程代建。
+- 登记表记录沙箱和工作区身份、资源 profile、UID/GID、相对挂载路径和镜像摘要。容器名或镜像层不构成身份；首次分配的 `sandbox_id` 不会改绑工作区或 profile。旧记录和省略 profile 的请求按 `agent` 解释。
+- 每次创建或启动之前，Manager 验证工作区、HOME、环境和适用的附件源与目标：位于数据目录内、没有符号链接、属于部署 UID/GID、权限 `0700`。缺少的挂载目标在调用 Docker 之前自行创建，不让以 root 运行的 Docker 守护进程代建。`chat` 使用同样的 HOME/环境目录规则，但不挂载附件；Platform 将上传复制到会话目录。
 - 登记表的原子写入是"确保沙箱存在"这一操作的提交点；写入失败时停止并删除本次新建的容器，恢复原来的记录。
+- 执行审计回执、持久进程和恢复后的操作同样绑定 profile；不能用 `agent` 的回执或进程身份操作 `chat` 沙箱，反之亦然。
 
 ## Runtime 与集成服务
 
@@ -104,7 +106,7 @@
 **清理规则**
 
 - 始终保留当前、上一版本及其回滚快照；在途候选和快照受保护。旧桥接记录不自动删除。
-- 只在稳定空闲时清理明确不再引用的受管发布物。不自动删除 Docker 镜像、容器或网络，不影响独立沙箱；禁止全局 prune。
+- 只在稳定空闲时清理明确不再引用的受管发布物和本部署拥有的镜像；保留当前、上一代及运行中沙箱引用的镜像，只按精确镜像 ID 删除。归属或引用无法确认时不删除，不自动清理网络；禁止全局 prune。
 - 保留策略见[自动更新](../operations/auto-update.md)；临时文件的删除授权见[安全设计 · 管理器与更新](../design/security-and-trust.md#管理器与更新)。日志会轮转，不包含密钥、执行凭据或镜像仓库凭据。
 
 ## 备份与恢复

@@ -5,7 +5,7 @@
 ## 唯一拓扑
 
 - 宿主机上只常驻一个用户级 systemd 服务 `agent-platform-manager`。主进程是独立且不可变的 Manager launcher，子进程独占对外入口、维护页、Docker socket、操作管理、宿主机执行和恢复。已有部署必须先运行 N 并完成监督接力，才能更新到 N+1。
-- Platform（含前端）、Runtime、Camoufox、SearXNG、Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。业务容器禁止访问或代理 Docker socket。
+- Platform（含前端）、Runtime、Camoufox、SearXNG、目录中存在时的 Firecrawl 和按需创建的沙箱，都按不可变的镜像摘要管理。M1 发布仍包含原十镜像；后续五镜像版本必须先升级到 M1 才可安装。业务容器禁止访问或代理 Docker socket。
 - Platform 后端只发布到宿主机回环地址，其它服务只在私有网络里。固定的 Compose 使用 Manager 预先创建的外部网络，切换版本时不删除网络，也不中断沙箱。
 - 权威数据用显式的目录挂载，禁止匿名卷。
 - 部署机不需要源码、Git、Python 虚拟环境、Node/npm 或上游源码。不支持从源码启动、第二套 Compose 栈或旧技术身份的转换。
@@ -69,7 +69,7 @@ agent-platform-manager logs
 | --- | --- |
 | 镜像 | Platform、Runtime、Camoufox 的 HEALTHCHECK 只在 Dockerfile 里定义，由 Compose 继承；上游服务的检查在 Compose 里声明。Platform 镜像只使用本次构建的前端产物，构建上下文排除本地的 `enterprise_agent_platform/static/`。 |
 | SearXNG | 以部署 UID/GID 读写 `0600` 的 settings，`0700` 的 config 和 cache 目录；完整的 config 目录以只读方式挂载到 `/etc/searxng`。不用单文件挂载（会产生匿名卷），也不依赖上游的 root 或递归 chown。 |
-| Firecrawl | 使用 PostgreSQL 队列、Redis、RabbitMQ 和 Playwright，禁止 FoundationDB；使用精确的项目标签、目录挂载和私有网络。Compose 启动后仍做 HTTP 探测；停止旧版本时移除它的受管容器。 |
+| Firecrawl | 仅十镜像目录启用；使用 PostgreSQL 队列、Redis、RabbitMQ 和 Playwright，禁止 FoundationDB；使用精确的项目标签、目录挂载和私有网络。Compose 启动后仍做 HTTP 探测；停止旧版本时移除它的受管容器。五镜像目录不启动或探测，也不报告其不可用。 |
 | 迁移 | 不启动写入者的预检 → 停止唯一的当前写入者 → 验证快照 → 运行固定命令 → 成功后才启动候选版本。失败时由同一个操作回滚；当前/全新数据库的版本边界见[受控迁移](../reference/data-layout.md#受控迁移)，不再执行已退役的 Skill、工作区或 root 权限转换。 |
 
 ```text
@@ -90,6 +90,21 @@ enterprise-agent-platform migrate --data /var/lib/agent-platform
 - 挂载见[数据布局](../reference/data-layout.md)。入口程序只在 UID/GID 映射阶段短暂以 root 运行，随后降权，不递归修改挂载的目录树。
 - 不可变镜像预装了固定版本的 XLSX/DOCX/PPTX/PDF 生成库，以及只支持 `tools/list` 和 `tools/call` 的一次性 stdio MCP 客户端；不包含第三方 MCP 服务，不依赖临时联网或用户 HOME 里的缓存。
 - 部署、重置、目录回收和停止都必须等进程、控制器和持久输出的清理屏障完成；完整规则见 Runtime 的[停止与恢复](../design/agent-runtime.md#停止与恢复)和[有限后台任务](../design/agent-runtime.md#有限后台任务)。
+
+### 沙箱资源 profile
+
+执行请求可附加 `execution_context.profile: "agent" | "chat"`，省略时为 `agent`，已有调用方无需改动。profile 与工作区在首次创建时绑定，不能复用同一 `sandbox_id` 切换。配置保存在 `manager.toml`；旧配置继续可读，显式 `sandbox_idle` 保留其原值。
+
+| profile | 默认 Docker 资源 | 网络 | 空闲停止 |
+| --- | --- | --- | --- |
+| agent | memory `2g`、memory-swap `2g`、cpus `2`、pids-limit `1024` | 现有核心私有网络 | `10m` |
+| chat | memory `768m`、memory-swap `768m`、cpus `1`、pids-limit `256` | `none` | `3m` |
+
+使用 `sandbox_agent_memory`、`sandbox_agent_memory_swap`、`sandbox_agent_cpus`、`sandbox_agent_pids_limit` 修改 agent 限额，`sandbox_idle` 修改其空闲期限；chat 对应 `sandbox_chat_memory`、`sandbox_chat_memory_swap`、`sandbox_chat_cpus`、`sandbox_chat_pids_limit`、`sandbox_chat_idle`。网络隔离不由请求方配置。CPU 和内存值为字符串，pids 为整数，期限为 Go duration 字符串。
+
+Chat 沙箱按用户复用，工作区映射和附件处理见[数据布局](../reference/data-layout.md#sandbox)。用户级沙箱是隔离边界；同一用户的会话子目录不是安全边界：Runtime 文件工具限制在会话目录，bash 仅以该目录为 cwd，可以访问该用户自己的其它文件。会话删除只删除对应目录。
+
+沙箱沿用镜像入口的 tini，不增加 Docker `--init`。保留镜像中的 sudo 能力，不加 `no-new-privileges`，以免破坏需要系统依赖或全局路径的 pip/npm 安装；资源限额不改变现有软件安装权限。
 
 ## 验收
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -29,7 +30,11 @@ type persistentBinding struct {
 }
 
 func (b persistentBinding) relativePaths() []string {
-	return []string{b.WorkspacePath, b.HomePath, b.EnvironmentPath, b.AttachmentsPath}
+	paths := []string{b.WorkspacePath, b.HomePath, b.EnvironmentPath}
+	if b.AttachmentsPath != "" {
+		paths = append(paths, b.AttachmentsPath)
+	}
+	return paths
 }
 
 func bindingFromRecord(record Record) persistentBinding {
@@ -81,14 +86,19 @@ func (m *Manager) expectedBinding(workspaceID, sandboxHash string) (persistentBi
 	if sandboxHash == "" {
 		return persistentBinding{}, errors.New("sandbox hash is required")
 	}
-	if _, err := m.workspacePath(workspaceID); err != nil {
+	workspacePath, err := m.workspacePath(workspaceID)
+	if err != nil {
 		return persistentBinding{}, err
 	}
 	attachments, ok := attachmentRelativePath(workspaceID)
-	if !ok {
+	if !ok && !strings.HasPrefix(workspaceID, "chat-user-") {
 		return persistentBinding{}, errors.New("workspace has no canonical attachment binding")
 	}
-	workspace := pathpkg.Join("workspaces", filepath.ToSlash(filepath.Clean(workspaceID)))
+	relative, err := filepath.Rel(m.DataDir, workspacePath)
+	if err != nil {
+		return persistentBinding{}, err
+	}
+	workspace := filepath.ToSlash(relative)
 	envRoot := pathpkg.Join("agent-envs", sandboxHash)
 	return persistentBinding{
 		UID:             m.UID,
@@ -101,6 +111,13 @@ func (m *Manager) expectedBinding(workspaceID, sandboxHash string) (persistentBi
 }
 
 func (m *Manager) validateRecordBinding(record Record) error {
+	profile, err := NormalizeProfile(record.Profile)
+	if err != nil {
+		return err
+	}
+	if err := validateWorkspaceProfile(record.WorkspaceID, profile); err != nil {
+		return err
+	}
 	expected, err := m.expectedBinding(record.WorkspaceID, record.SandboxHash)
 	if err != nil {
 		return fmt.Errorf("sandbox %q has an invalid persistent binding: %w", record.SandboxID, err)

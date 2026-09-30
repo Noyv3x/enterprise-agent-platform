@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/atomicfile"
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/config"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/identity"
 )
@@ -21,6 +22,7 @@ type Record struct {
 	SandboxID           string     `json:"sandbox_id"`
 	SandboxHash         string     `json:"sandbox_hash"`
 	WorkspaceID         string     `json:"workspace_id"`
+	Profile             string     `json:"profile,omitempty"`
 	UID                 int        `json:"uid"`
 	GID                 int        `json:"gid"`
 	WorkspacePath       string     `json:"workspace_path"`
@@ -42,13 +44,16 @@ type registry struct {
 }
 
 type Manager struct {
-	Engine    driver.Engine
-	DataDir   string
-	StatePath string
-	Image     string
-	Network   string
-	Idle      time.Duration
-	UID, GID  int
+	Engine         driver.Engine
+	DataDir        string
+	StatePath      string
+	Image          string
+	Network        string
+	Idle           time.Duration
+	AgentResources config.SandboxResources
+	ChatResources  config.SandboxResources
+	ChatIdle       time.Duration
+	UID, GID       int
 	// ReclaimCapacity performs one controlled maintenance pass before a missing
 	// Sandbox image is retried, before acquiring any sandbox lifecycle lock.
 	ReclaimCapacity func(context.Context) error
@@ -70,6 +75,9 @@ func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePat
 		return nil, fmt.Errorf("Sandbox protected technical profiles: %w", err)
 	}
 	manager := &Manager{Engine: engine, DataDir: filepath.Clean(dataDir), StatePath: statePath, Image: image, Network: network, Idle: idle, UID: os.Getuid(), GID: os.Getgid(), registry: registry{SchemaVersion: sandboxRegistrySchemaVersion, TechnicalProfile: profile.ProfileID, Records: map[string]Record{}}, ensureByID: map[string]*sync.Mutex{}, profile: profile, protected: protected}
+	manager.AgentResources = config.SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024}
+	manager.ChatResources = config.SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256}
+	manager.ChatIdle = 3 * time.Minute
 	if err := manager.loadRegistry(); err != nil {
 		return nil, err
 	}
@@ -79,7 +87,21 @@ func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePat
 	return manager, nil
 }
 
-func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now time.Time) (driver.SandboxSpec, error) {
+func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now time.Time, profiles ...string) (driver.SandboxSpec, error) {
+	requested := ""
+	if len(profiles) > 1 {
+		return driver.SandboxSpec{}, errors.New("only one sandbox profile is allowed")
+	}
+	if len(profiles) == 1 {
+		requested = profiles[0]
+	}
+	resourceProfile, err := NormalizeProfile(requested)
+	if err != nil {
+		return driver.SandboxSpec{}, err
+	}
+	if err := validateWorkspaceProfile(workspaceID, resourceProfile); err != nil {
+		return driver.SandboxSpec{}, err
+	}
 	if sandboxID == "" {
 		return driver.SandboxSpec{}, errors.New("sandbox_id is required")
 	}
@@ -105,7 +127,7 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	imageStillCurrent := m.Image == desiredImage
 	m.mu.Unlock()
 	if !imageStillCurrent {
-		return m.Ensure(ctx, sandboxID, workspaceID, now)
+		return m.Ensure(ctx, sandboxID, workspaceID, now, resourceProfile)
 	}
 	unlock := m.lockEnsure(sandboxID)
 	defer unlock()
@@ -116,6 +138,12 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	m.mu.Unlock()
 	if exists && existing.WorkspaceID != workspaceID {
 		return driver.SandboxSpec{}, fmt.Errorf("sandbox_id %q is already bound to workspace_id %q", sandboxID, existing.WorkspaceID)
+	}
+	if exists {
+		existingProfile, err := NormalizeProfile(existing.Profile)
+		if err != nil || existingProfile != resourceProfile {
+			return driver.SandboxSpec{}, fmt.Errorf("sandbox_id %q is already bound to profile %q", sandboxID, existingProfile)
+		}
 	}
 	workspacePath, err := m.workspacePath(workspaceID)
 	if err != nil {
@@ -128,6 +156,7 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	}
 	envRoot := filepath.Join(m.DataDir, "agent-envs", hash)
 	spec := driver.SandboxSpec{ContainerName: m.profile.SandboxContainerPrefix + hash[:16], AgentHash: hash, Image: image, Network: network, Workspace: workspacePath, Home: filepath.Join(envRoot, "home"), Environment: filepath.Join(envRoot, "env"), UID: uid, GID: gid}
+	m.applyResources(&spec, resourceProfile)
 	if attachmentPath, ok := m.attachmentPath(workspaceID); ok {
 		spec.Attachments = attachmentPath
 	}
@@ -179,6 +208,9 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	m.mu.Lock()
 	record := m.registry.Records[sandboxID]
 	record.SandboxID, record.SandboxHash, record.WorkspaceID, record.ContainerName, record.Image = sandboxID, hash, workspaceID, spec.ContainerName, spec.Image
+	if resourceProfile == "chat" {
+		record.Profile = "chat"
+	}
 	record.UID, record.GID = binding.UID, binding.GID
 	record.WorkspacePath, record.HomePath = binding.WorkspacePath, binding.HomePath
 	record.EnvironmentPath, record.AttachmentsPath = binding.EnvironmentPath, binding.AttachmentsPath
@@ -263,7 +295,7 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 	m.mu.Lock()
 	candidates := make([]Record, 0)
 	for _, record := range m.registry.Records {
-		if record.StoppedAt == nil && record.ActiveCalls == 0 && record.BackgroundProcesses == 0 && now.Sub(record.LastActivityAt) >= m.Idle {
+		if record.StoppedAt == nil && record.ActiveCalls == 0 && record.BackgroundProcesses == 0 && now.Sub(record.LastActivityAt) >= m.idleFor(record.Profile) {
 			candidates = append(candidates, record)
 		}
 	}
@@ -273,7 +305,7 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 		unlock := m.lockEnsure(record.SandboxID)
 		m.mu.Lock()
 		current, exists := m.registry.Records[record.SandboxID]
-		eligible := exists && current.StoppedAt == nil && current.ActiveCalls == 0 && current.BackgroundProcesses == 0 && now.Sub(current.LastActivityAt) >= m.Idle
+		eligible := exists && current.StoppedAt == nil && current.ActiveCalls == 0 && current.BackgroundProcesses == 0 && now.Sub(current.LastActivityAt) >= m.idleFor(current.Profile)
 		m.mu.Unlock()
 		if !eligible {
 			unlock()
@@ -461,6 +493,13 @@ func (m *Manager) validateRegistry() error {
 		if actual != expected {
 			return fmt.Errorf("sandbox registry %q persistent binding does not match the trusted data layout", key)
 		}
+		resourceProfile, err := NormalizeProfile(record.Profile)
+		if err != nil {
+			return err
+		}
+		if err := validateWorkspaceProfile(record.WorkspaceID, resourceProfile); err != nil {
+			return err
+		}
 		for _, relative := range expected.relativePaths() {
 			path, err := m.dataPath(relative)
 			if err != nil {
@@ -502,11 +541,15 @@ func (m *Manager) specForRecord(record Record) (driver.SandboxSpec, error) {
 	if err != nil {
 		return driver.SandboxSpec{}, err
 	}
-	attachments, err := m.dataPath(record.AttachmentsPath)
-	if err != nil {
-		return driver.SandboxSpec{}, err
+	attachments := ""
+	if record.AttachmentsPath != "" {
+		attachments, err = m.dataPath(record.AttachmentsPath)
+		if err != nil {
+			return driver.SandboxSpec{}, err
+		}
 	}
 	spec := driver.SandboxSpec{ContainerName: record.ContainerName, AgentHash: record.SandboxHash, Image: record.Image, Network: m.Network, Workspace: workspace, Home: home, Environment: environment, Attachments: attachments, UID: record.UID, GID: record.GID}
+	m.applyResources(&spec, record.Profile)
 	return spec, nil
 }
 
@@ -581,6 +624,13 @@ func compensationContext(parent context.Context) (context.Context, context.Cance
 func (m *Manager) workspacePath(id string) (string, error) {
 	if id == "" {
 		return "", errors.New("workspace_id is required")
+	}
+	if strings.HasPrefix(id, "chat-user-") {
+		user := strings.TrimPrefix(id, "chat-user-")
+		if !safeSegment(user) {
+			return "", errors.New("invalid chat workspace_id")
+		}
+		return filepath.Join(m.DataDir, "workspaces", "chat", "user-"+user), nil
 	}
 	clean := filepath.Clean(id)
 	if filepath.IsAbs(clean) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {

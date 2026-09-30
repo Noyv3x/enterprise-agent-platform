@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/release"
 	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/releasetest"
 )
 
@@ -63,6 +64,39 @@ func TestPruneReleasesRequiresVerifiedCommittedPair(t *testing.T) {
 				t.Fatalf("obsolete evidence removed before verifying retained pair: %v", err)
 			}
 		})
+	}
+}
+
+func TestImageRetentionPreservesDeferredOwnershipEvidence(t *testing.T) {
+	root := t.TempDir()
+	current, previous, running, obsolete, damaged := strings.Repeat("a", 40), strings.Repeat("b", 40), strings.Repeat("c", 40), strings.Repeat("d", 40), strings.Repeat("e", 40)
+	for _, id := range []string{current, previous, running, obsolete, damaged} {
+		writeRelease(t, root, id)
+	}
+	if err := os.WriteFile(filepath.Join(root, damaged, "compose.yaml"), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	policy := ReleasePolicy{Root: root, Channel: "main", CurrentID: current, PreviousID: previous}
+	policy.RetainImages = func(_ context.Context, retained, candidates []release.Manifest) (map[string]bool, error) {
+		for _, manifest := range candidates {
+			if manifest.ID() != running && manifest.ID() != obsolete {
+				t.Fatalf("unverified or committed image offered for removal: %s", manifest.ID())
+			}
+		}
+		if len(retained) != 2 || len(candidates) != 2 {
+			t.Fatalf("wrong retention catalogs: retained=%v candidates=%v", retained, candidates)
+		}
+		return map[string]bool{running: true}, nil
+	}
+	removed, err := PruneReleases(context.Background(), policy)
+	if err != nil || removed != 1 {
+		t.Fatalf("retention = %d, %v", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, running, "manifest.json")); err != nil {
+		t.Fatalf("running sandbox ownership evidence lost: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, obsolete)); !os.IsNotExist(err) {
+		t.Fatalf("obsolete release not removed: %v", err)
 	}
 }
 

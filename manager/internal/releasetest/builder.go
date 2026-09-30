@@ -152,9 +152,10 @@ func managerRelease(version, baseURL string, binaries map[string][]byte) release
 }
 
 func managedImages(sharedDigest string) map[string]string {
-	names := make([]string, 0, len(contract.ManagedImageCapacityEstimates))
-	for name := range contract.ManagedImageCapacityEstimates {
-		names = append(names, name)
+	names := []string{
+		"platform", "agent-runtime", "camofox", "agent-sandbox", "searxng",
+		"firecrawl-api", "firecrawl-playwright", "firecrawl-postgres",
+		"firecrawl-redis", "firecrawl-rabbitmq",
 	}
 	sort.Strings(names)
 	images := make(map[string]string, len(names))
