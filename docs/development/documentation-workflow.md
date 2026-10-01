@@ -18,8 +18,8 @@ The link checker ignores fenced code and external URLs. It validates inline loca
 
 - Preserve `Quality gates` and release authorization by successful same-repository main-push commit. PRs or manual/failed runs do not authorize release.
 - Keep schema 2 / protocol 2, immutable image digests, both Manager architectures and eight public assets. Manager accepts exactly the five-image catalog for candidates and retained generations; upgrade only from a settled launcher-based installation with five-image rollback generations.
-- Keep migrations additive and old data readable. Write Pi v3 sessions to a new directory, never over old journals.
+- Add database changes as new entries at the end of the ordered migration list (`schema_migrations`, one version each); never edit an applied migration.
 - Preserve Manager operation identity, reservation and rollback contracts; do not add removed approval/review mechanisms back into the gate.
 - Publish every eligible main commit and advance latest only after public asset/image verification. See [release channel](../operations/auto-update.md#发布通道).
 
-Real deployment/model/browser evidence and local checks are separate; see [testing](testing.md). Design and operations docs describe R2, while retained legacy machine fields/data exist only for compatibility where specified.
+Real deployment/model/browser evidence and local checks are separate; see [testing](testing.md). Design and operations docs describe R2, while retained legacy machine fields exist only for compatibility where specified.

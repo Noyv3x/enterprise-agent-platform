@@ -57,6 +57,25 @@ def open_workspace(root, value, directory=False):
         raise
 
 
+def ensure_workspace(root, path):
+    """Create path under root one pinned component at a time, never following links."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(root, flags)
+    try:
+        for name in Path(path).relative_to(root).parts:
+            if name in ('.', '..'):
+                raise ValueError('Invalid workspace directory')
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+
+
 def bounded_read(fd):
     with os.fdopen(fd, 'rb') as stream:
         data = stream.read(MAX_FILE + 1)

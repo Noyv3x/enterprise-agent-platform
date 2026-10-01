@@ -36,4 +36,4 @@ Personal and channel sessions have stable scope/workspace identities. Chat has a
 
 One run is active per session; idle session objects expire after 15 minutes. Completed-run events are buffered for 10 minutes. Sessions survive object eviction in `sessions-v3/`; the UI uses SQLite rather than Runtime debug history.
 
-Manager M1 must precede R2. Database changes are additive; old runtime journals and removed-feature data remain untouched. See [migration and storage](data-memory-sessions.md) and [deployment](../operations/deployment.md).
+Manager M1 must precede R2. Database changes are ordered forward migrations; no pre-Pi data is retained. See [migration and storage](data-memory-sessions.md) and [deployment](../operations/deployment.md).

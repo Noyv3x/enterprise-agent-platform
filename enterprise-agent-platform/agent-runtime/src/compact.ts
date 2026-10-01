@@ -5,7 +5,7 @@ import {
   type AgentSession, type ModelRuntime, type ResourceLoader,
 } from '@earendil-works/pi-coding-agent';
 import { createModelRuntime } from './credentials.js';
-import { sessionPath } from './migration.js';
+import { sessionPath } from './session-path.js';
 import { bindModelSession, resolveModel, type ModelSelection } from './models.js';
 
 export type CompactionOutcome = {

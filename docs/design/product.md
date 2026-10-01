@@ -33,8 +33,8 @@ Long-term memory is workspace `AGENTS.md`, editable by the agent using ordinary 
 
 No Telegram, mail, approvals, host execution, todo system, delegation/subagents, background processes, live file drafts, input joining, learning reviews, dedicated memory/skill management, execution-review or `needs_review` machinery. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
 
-Removed-feature tables and files remain untouched for rollback; they are not active product interfaces. Historical messages remain readable. Retention does not imply continued support for their old actions.
+Tables of removed features are dropped by migration. Historical messages remain readable, including old `agent_work` activity rendered read-only; this does not imply continued support for their old actions.
 
 ## Delivery boundary
 
-The Pi-native product uses five images. Manager simplification requires a settled launcher-based installation and five-image retained generations; existing legacy data stays untouched. Full local checks and isolated staging with copied data and a real model precede release; see [deployment](../operations/deployment.md).
+The Pi-native product uses five images. Manager simplification requires a settled launcher-based installation and five-image retained generations. Full local checks and isolated staging with copied data and a real model precede release; see [deployment](../operations/deployment.md).

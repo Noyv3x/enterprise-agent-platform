@@ -1,7 +1,6 @@
 import { lstat, readFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { createServer } from './http.js';
-import { migrateSessions } from './migration.js';
 import { Runtime } from './runtime.js';
 
 async function secret(name: string, defaultFile: string): Promise<string> {
@@ -35,7 +34,6 @@ async function main(): Promise<void> {
     secret('AGENT_PLATFORM_INTERNAL_TOKEN', '/run/secrets/agent-platform/agent-tool-token'),
     secret('AGENT_MANAGER_EXECUTOR_TOKEN', '/run/secrets/agent-platform/manager-executor-token'),
   ]);
-  await migrateSessions(home);
   const runtime = new Runtime({
     home,
     platformUrl: process.env.AGENT_PLATFORM_INTERNAL_URL ?? 'http://platform:8765',

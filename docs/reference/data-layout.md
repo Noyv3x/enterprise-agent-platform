@@ -36,17 +36,15 @@ The account database supplies `~`; installer/Manager do not trust HOME/XDG overr
     agent-envs/<scope-hash>/{home,env}/
     runtimes/
       agent/
-        migration/active-sessions.json
         sessions-v3/<sha256(sid)>.jsonl
-        sessions-v3/.migrated-from-v4
-        sessions/                 # previous format, untouched
-        sessions.pre-pi/          # earlier archive if present, untouched
+        sessions/                 # previous format, not read
+        sessions.pre-pi/          # earlier archive if present, not read
       camofox/
       searxng/{config,cache,logs}/
   backups/
 ```
 
-Removed-feature directories, including old skill sidecars and Firecrawl data, may remain for rollback. Their presence does not start retired services. Run event buffers are in memory, not a new durable event journal.
+Directories of removed features, including old skill sidecars and Firecrawl data, may remain on disk; nothing reads them and their presence does not start retired services. Run event buffers are in memory, not a new durable event journal.
 
 Executor commands have no durable process registry or `.pid`/`.out`/`.err`/`.exit`
 output files. Old `manager/processes/` and sandbox process artifacts are left
@@ -58,7 +56,7 @@ remain persistent and sandboxes restart on demand.
 
 Personal `user-<id>` and channel `channels/channel-<id>` workspaces mount at `/workspace`. Chat workspace ID `chat-user-<id>` mounts `workspaces/chat/user-<id>` there; each conversation sets cwd to `/workspace/<conversation_id>`. One chat sandbox serves each user, not each conversation. File tools restrict the conversation directory; bash can reach that user's other chat files.
 
-Workspace memory is `AGENTS.md`. Enabled skills use `.agent-platform/skills/<name>/SKILL.md`; migrated disabled packages use `.agent-platform/skills-disabled/`. MCP uses `.agent-platform/mcp.json` and `.agent-platform/mcp/<server>/`. No dedicated memory/skill state system is active.
+Workspace memory is `AGENTS.md`. Enabled skills use `.agent-platform/skills/<name>/SKILL.md`. MCP uses `.agent-platform/mcp.json` and `.agent-platform/mcp/<server>/`. No dedicated memory/skill state system is active.
 
 Persistent home and environment mount at `/home/agent` and `/opt/agent-env`. Agent attachment mounts remain scope-specific and read-only. Chat has no attachment mount: Platform copies uploads into its conversation directory. Database attachment paths remain relative; downloads require ownership and path validation.
 
@@ -86,9 +84,7 @@ Stopping an idle sandbox preserves its workspace/home/environment. Image inputs 
 
 ## 受控迁移
 
-Manager stops the sole writer, verifies a snapshot and runs `enterprise-agent-platform migrate --data /var/lib/agent-platform` before starting the candidate. Preserve `schema_migrations` and add tables/columns only; do not drop removed-feature data.
-
-Platform exports old memories once, relocates disabled skills and writes the active-session identity map. Runtime imports matching format-4 journals into the separate v3 directory using temporary files and atomic rename, then writes the migration marker last. Old journals are never renamed, modified or deleted. This differs from the previous release's `sessions.pre-pi` conversion.
+Manager stops the sole writer, verifies a snapshot and runs `enterprise-agent-platform migrate --data /var/lib/agent-platform` before starting the candidate. `migrate` applies the ordered forward migrations recorded in `schema_migrations` once each; see the [Platform API](platform-api.md#migration). No pre-Pi data is retained and Runtime performs no session import.
 
 ## Manager state and cleanup
 
@@ -100,4 +96,4 @@ The schema-1 checkpoint includes Manager state and operation records. Legacy `ma
 
 Before upgrade, stop the sole writer and save a verified full recovery point outside the deployment root: database with consistent WAL state, attachments, workspaces, environments, Runtime data, Manager configuration/secrets/state and release metadata. A SQLite-only snapshot is not a full backup.
 
-R2's additive data and untouched old journals keep the previous release readable, but previous Runtime history excludes new v3 turns. Preserve new writes before any rollback; prefer forward repair after traffic has resumed. Never mix recovery points or treat conversation replay as recovery. See [automatic updates](../operations/auto-update.md).
+After a release rollback the restored database snapshot does not contain writes made after the snapshot, and Runtime history of the rolled-back generation excludes later v3 turns. Preserve new writes before any rollback; prefer forward repair after traffic has resumed. Never mix recovery points or treat conversation replay as recovery. See [automatic updates](../operations/auto-update.md).

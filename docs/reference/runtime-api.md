@@ -103,10 +103,8 @@ Sessions idle for fifteen minutes are disposed. A run whose kind, sandbox,
 resources or tools differ from the live object's opens a new Pi session object;
 Pi appends the difference (see
 [prompt cache](../design/agent-runtime.md#prompt-cache)). Files are Pi JSONL v3 at
-`<home>/sessions-v3/<sha256(sid)>.jsonl`. Pi 0.99.2 uses the same format as
-0.87.1: existing v3 files are opened without migration or rewrite, and the
-previous release can read newly appended Runtime entries. No new session
-directory or copy-migration is needed for this upgrade.
+`<home>/sessions-v3/<sha256(sid)>.jsonl`. Existing v3 files are opened without
+rewrite.
 
 All tenant execution uses Manager's Unix executor with its separate executor
 Bearer token. The only executor endpoints are POST `/v1/executor/audit`,
@@ -154,21 +152,6 @@ and `{action,arguments,context:{sid,scope_key,run_id,owner_user_id?,channel_id?}
 MCP invokes `/usr/local/bin/agent-platform-mcp <base64url-json>` through the
 sandbox executor with Manager's MCP audit projection/private-output handling;
 encoded call arguments are not presented as ordinary audited shell commands.
-
-Startup reads `<home>/migration/active-sessions.json` entries
-`{sid,scope_key,lifecycle_id,session_id}`. Matching v4 journal identities are
-converted losslessly, preserving all messages and the latest compaction's
-model context. Only newline-terminated source transactions are committed;
-torn suffixes are ignored without editing the source. Session and marker
-publication fsync both files and parent directories.
-
-Every startup reconciles each imported sid's source identity, last committed
-sequence and source digest. If rollback changed or extended the old journal,
-a migration-owned v3 import is archived as `<file>.superseded-<timestamp>`
-and re-imported. If Pi has appended entries since import, its history wins:
-Runtime keeps the v3 file and logs a warning instead of silently discarding
-turns. Unprovable older imports without provenance are also retained with a
-warning. `sessions/` and `sessions.pre-pi/` are never modified.
 
 Runtime environment/secret mount contracts remain the deployed ones:
 `AGENT_RUNTIME_HOME`, `AGENT_RUNTIME_HOST`, `AGENT_RUNTIME_PORT`,

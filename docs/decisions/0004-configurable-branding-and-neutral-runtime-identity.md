@@ -14,7 +14,7 @@
 
 内部运行身份是固定、不可配置的机器协议。Manager、systemd unit、配置和数据根、Compose project、network、环境变量、label、Cookie、数据库 marker、workspace/session identity 与 release asset 都只使用当前 `agent-platform` 技术命名空间。品牌值不能派生、覆盖或迁移这些对象。
 
-当前仓库、安装器、发布物和运行时保持这一套技术身份。Pi-native R2 的分阶段发布（先 Manager M1）与 additive 数据迁移不改变身份命名空间；具体顺序见[部署](../operations/deployment.md)。品牌变更不触发路径转换、双写或身份迁移。
+当前仓库、安装器、发布物和运行时保持这一套技术身份。Pi-native R2 的分阶段发布（先 Manager M1）与数据迁移不改变身份命名空间；具体顺序见[部署](../operations/deployment.md)。品牌变更不触发路径转换、双写或身份迁移。
 
 ## 后果
 

@@ -36,10 +36,6 @@ Run completion follows Pi's settled/idle state, not a provisional end before ret
 
 Session cancellation waits for active admission/run work with a bounded HTTP response deadline and is idempotent when idle. Unconfirmed Manager termination keeps the session fenced and withholds terminal completion; retry cancellation against the same run rather than starting another. Runtime restart does not discover or clean up orphan sandbox commands; this is an accepted limitation, bounded by terminal execution deadlines. Manual compaction receives Platform's chosen summary model/thinking settings, including for a cold session. Exact requests and timeout responses belong in the [Runtime API](../reference/runtime-api.md).
 
-## Migration
+## Session storage
 
-The 0.87.1 → 0.99.2 upgrade retains Pi JSONL version 3: existing files open without rewriting, and 0.87.1 can read the supported entries appended by 0.99.2. Keep the same `sessions-v3/` tree; no copy-migration is required. Built-in MCP/codemode and virtual models remain disabled by the supplied resource loader. The older format-4 import below is unchanged.
-
-At startup, use Platform's `migration/active-sessions.json` to find active format-4 journals by identity. Write all message entries in order to `sessions-v3/<sha256(sid)>.jsonl`, including history predating compaction; append the latest old compaction summary with the first retained message ID. Stage each file and rename atomically; write `.migrated-from-v4` last. Never modify `sessions/` or `sessions.pre-pi/`. Old lifecycles and delegate journals remain on disk but are not imported. See [data and sessions](data-memory-sessions.md).
-
-Each startup reconciles import provenance against the old journal. If rollback changed that source and Pi has not appended to the imported v3 history, archive the prior import and re-import it. If Pi has added turns, or provenance cannot be established, preserve v3 history and warn rather than silently discarding turns. Old source journals remain untouched.
+Sessions are Pi JSONL version 3 files under `sessions-v3/<sha256(sid)>.jsonl`; existing files open without rewriting and custom entries already in them stay readable. Built-in MCP/codemode and virtual models remain disabled by the supplied resource loader. Runtime performs no session migration or import at startup. See [data and sessions](data-memory-sessions.md).

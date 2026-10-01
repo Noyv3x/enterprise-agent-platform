@@ -37,7 +37,7 @@ While waiting for an operation, the CLI tolerates a restarting Manager's missing
 3. Stop the old writer, verify a snapshot and run the fixed migration command. Start and probe the candidate with admissions still frozen.
 4. Settle the owner-bound commit/abort reservation and restore ingress only after core and Manager readiness are confirmed.
 
-The exact readiness fields are preserved, including compatibility field `active_learning_reviews=0`; removed learning/approval systems are not recreated. See the [Platform contract](../reference/platform-api.md).
+The exact readiness fields are `reserved`, `active_agent_tasks`, `queued_agent_jobs`, `running_agent_jobs`, `admissions_in_progress` and `blocker_error`. See the [Platform contract](../reference/platform-api.md).
 
 ## 提交回滚与能力降级
 
@@ -45,7 +45,7 @@ Core readiness covers Manager, Platform, Runtime and public ingress. Camofox and
 
 Before commit, a failed candidate is stopped and the validated snapshot/previous generation restored by the same operation. After commit, preserve new business writes and settle forward; do not automatically overwrite them with old data. A failed response does not prove an operation had no effect. Manager control and maintenance remain available for diagnosis.
 
-R2's DB migration is additive and old Runtime journals remain untouched. New v3 history is not mirrored into old sessions. A binary rollback is not a full-data rollback; see [backup and recovery](../reference/data-layout.md#备份与恢复).
+Platform migrations only move forward; they run once per version on `schema_migrations`. A binary rollback is not a full-data rollback; see [backup and recovery](../reference/data-layout.md#备份与恢复).
 
 ## Manager 自更新
 
@@ -76,4 +76,4 @@ After a successful update, retain images referenced by current and previous gene
 
 While a running sandbox references an older generation's image, retain that generation's verified release directory as ownership evidence. Do not force-delete images used by containers. Cleanup failure is reported and remains retryable without invalidating an already committed release.
 
-Removed-feature tables/files are retained for rollback. Idle sandbox stop does not delete user workspaces. Keep diagnostics bounded and free of credentials. Verification requirements live in [testing](../development/testing.md).
+Idle sandbox stop does not delete user workspaces. Keep diagnostics bounded and free of credentials. Verification requirements live in [testing](../development/testing.md).

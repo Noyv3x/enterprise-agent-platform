@@ -6,7 +6,7 @@ import type { ServerResponse } from 'node:http';
 import { createAgentSession, createExtensionRuntime, loadSkillsFromDir, SettingsManager, SessionManager, type AgentSession, type AgentSessionEvent, type ModelRuntime, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import { createModelRuntime } from './credentials.js';
-import { sessionPath } from './migration.js';
+import { sessionPath } from './session-path.js';
 import { compactSession, compactStored, type CompactionOutcome } from './compact.js';
 import { createTools } from './tools.js';
 import { createExecutorTransport, createGatewayTransport } from './transport.js';

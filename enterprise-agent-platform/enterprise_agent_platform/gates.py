@@ -110,7 +110,6 @@ class Gate:
         return {
             "reserved": False,
             "active_agent_tasks": self.platform.queue.active,
-            "active_learning_reviews": 0,
             "queued_agent_jobs": counts.get("queued", 0),
             "running_agent_jobs": counts.get("running", 0),
             "admissions_in_progress": self.admissions,

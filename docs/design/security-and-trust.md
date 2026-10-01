@@ -53,4 +53,4 @@ containers are stopped. Failure to confirm cleanup prevents executor readiness.
 Sandbox workspace, home and environment are retained and restart on demand.
 MCP keeps its safe audit projection and private-output redaction.
 
-Manager update reservations block new work before migration and release only through the existing owner-bound commit/abort protocol. Keep migrations additive and original journals untouched. See [operations](../operations/auto-update.md) and [API contracts](../reference/platform-api.md).
+Manager update reservations block new work before migration and release only through the existing owner-bound commit/abort protocol. Migrations are ordered and forward-only. See [operations](../operations/auto-update.md) and [API contracts](../reference/platform-api.md).

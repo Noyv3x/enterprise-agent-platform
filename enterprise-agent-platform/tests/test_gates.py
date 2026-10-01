@@ -44,7 +44,7 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.client.aclose)
 
     def idle(self, reserved=False):
-        return dict(reserved=reserved, active_agent_tasks=0, active_learning_reviews=0,
+        return dict(reserved=reserved, active_agent_tasks=0,
                     queued_agent_jobs=0, running_agent_jobs=0, admissions_in_progress=0, blocker_error="")
 
     async def test_exact_json_and_owner_replays(self):
@@ -88,7 +88,6 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.platform.queue.active = 2
         self.assertEqual(await self.gate.readiness("one"), {**self.idle(), "active_agent_tasks": 2})
         self.platform.queue.active = 0
-        self.conn.execute("INSERT INTO durable_jobs VALUES ('agent_learning_review', 'queued')")
         self.gate.closing = True
         self.assertEqual(await self.gate.readiness("one"), {**self.idle(), "blocker_error": "service is shutting down"})
 

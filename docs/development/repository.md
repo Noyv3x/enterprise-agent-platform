@@ -5,7 +5,7 @@ Read [product boundaries](../design/product.md), [architecture](../design/system
 | Path | Owner/responsibility |
 | --- | --- |
 | `enterprise-agent-platform/enterprise_agent_platform/` | Python Platform: auth, SQLite, durable queue, chat, tools, OAuth and Manager integration. |
-| `enterprise-agent-platform/agent-runtime/` | TypeScript Pi AgentSession host, remote tools, sessions and migration. |
+| `enterprise-agent-platform/agent-runtime/` | TypeScript Pi AgentSession host, remote tools and sessions. |
 | `enterprise-agent-platform/frontend/` | React/Vite product views, API client, localization and preserved visual design. |
 | `enterprise-agent-platform/camofox-runtime/` | Browser service adapter. |
 | `manager/` | Go host Manager: ingress, lifecycle, executor, release and sandbox profiles. |

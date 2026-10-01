@@ -1,8 +1,5 @@
 import asyncio
 import json
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -792,69 +789,20 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         with self.p.db.connect() as conn:
             self.assertEqual(conn.execute("SELECT metadata_json FROM messages WHERE id=?", (mid,)).fetchone()[0], "{}")
 
-    async def test_new_scope_publishes_rollback_identity_separate_from_pi(self):
+    async def test_new_scope_records_live_sandbox_identity_once(self):
         with self.p.db.connect() as conn:
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
         for scope, expected in (("private", "user-1"), ("channel-1", "channels/channel-1")):
             info = self.q.scope(self.user, scope)
             with self.p.db.connect() as conn:
-                row = conn.execute("SELECT s.workspace_path,r.session_id,r.lifecycle_id FROM agent_scopes s JOIN agent_runtime_scopes r USING(scope_key) JOIN agent_runtime_scope_sessions a ON a.scope_key=r.scope_key AND a.lifecycle_id=r.lifecycle_id AND a.session_id=r.session_id WHERE s.scope_key=?", (info["scope_key"],)).fetchone()
-            self.assertEqual(row["workspace_path"], expected)
-            self.assertNotEqual(row["session_id"], info["sid"])
-            marker = json.loads((info["workspace"] / ".agent-platform-scope.json").read_text())
-            self.assertEqual(marker["lifecycle_id"], row["lifecycle_id"])
-            self.assertEqual(marker["workspace_relative_path"], "workspaces/" + expected)
+                row = conn.execute("SELECT * FROM agent_scopes WHERE scope_key=?", (info["scope_key"],)).fetchone()
+            self.assertEqual((row["workspace_path"], row["sandbox_id"], row["lifecycle_id"]),
+                             (expected, expected.replace("/", "-"), info["sandbox"]["lifecycle_id"]))
+            self.assertFalse((info["workspace"] / ".agent-platform-scope.json").exists())
             await self.q.reset(self.user, scope)
+            self.assertEqual(self.q.scope(self.user, scope)["sandbox"], info["sandbox"])
             with self.p.db.connect() as conn:
-                self.assertEqual(conn.execute("SELECT session_id FROM agent_runtime_scopes WHERE scope_key=?", (info["scope_key"],)).fetchone()[0], row["session_id"])
-
-    @unittest.skipUnless(os.environ.get("OLD_PLATFORM_ROOT"), "requires archived previous Platform")
-    def test_archived_platform_starts_after_new_personal_and_channel_scopes(self):
-        old_root = Path(os.environ["OLD_PLATFORM_ROOT"]).resolve()
-        root = self.p.settings.data_dir / "rollback-startup"
-        root.mkdir(mode=0o700)
-        (root / "workspaces").mkdir(mode=0o700)
-        script = """
-import sys
-from pathlib import Path
-from enterprise_agent_platform.config import PlatformConfig
-from enterprise_agent_platform.service import EnterpriseService
-config = PlatformConfig(
-    data_dir=Path(sys.argv[1]), host="127.0.0.1", port=8765,
-    public_base_url="http://localhost:8765", token_secret="rollback-test-secret",
-    token_ttl_seconds=3600, agent_tool_token="rollback-test-tool",
-    agent_runtime_url="http://127.0.0.1:1",
-)
-service = EnterpriseService(config)
-try:
-    assert service.agent_scopes._missing_current_runtime_aliases() == []
-    print("archived-startup-complete")
-finally:
-    service.close()
-"""
-        def start_archived():
-            result = subprocess.run(
-                [sys.executable, "-c", script, str(root)], cwd=old_root,
-                env={**os.environ, "PYTHONPATH": str(old_root)},
-                capture_output=True, text=True, timeout=40,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("archived-startup-complete", result.stdout)
-        start_archived()
-        db = Database(root / "platform.db")
-        db.migrate(root)
-        with db.connect() as conn:
-            uid = conn.execute(
-                "INSERT INTO users(username,display_name,password_hash,role,created_at) VALUES ('rollback-user','Rollback User','unused','admin',1)"
-            ).lastrowid
-            channel = conn.execute(
-                "INSERT INTO channels(name,created_at) VALUES ('Rollback Channel',1)"
-            ).lastrowid
-        queue = Queue(SimpleNamespace(db=db, settings=SimpleNamespace(data_dir=root)))
-        user = queue.user(uid)
-        queue.scope(user, "private")
-        queue.scope(user, f"channel-{channel}")
-        start_archived()
+                self.assertEqual(conn.execute("SELECT count(*) FROM agent_scopes WHERE scope_key=?", (info["scope_key"],)).fetchone()[0], 1)
 
     async def test_attachment_only_authorization_and_delivery(self):
         from enterprise_agent_platform.files import Files as WorkspaceFiles

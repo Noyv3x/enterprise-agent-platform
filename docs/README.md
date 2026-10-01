@@ -1,12 +1,12 @@
 # Documentation
 
-This tree describes Pi-native R2. Install Manager M1 first; retained legacy data and machine-contract fields do not restore removed product features.
+This tree describes Pi-native R2. Install Manager M1 first; retained machine-contract fields do not restore removed product features.
 
 ## Design
 
 - [Product boundaries](design/product.md): personal AI, channels, standard chat and removed features.
 - [System architecture](design/system-architecture.md): Platform, Pi Runtime, Manager and data flow.
-- [Agent Runtime](design/agent-runtime.md): sessions, remote tools, cache and migration.
+- [Agent Runtime](design/agent-runtime.md): sessions, remote tools and cache.
 - [Data, memory and sessions](design/data-memory-sessions.md): SQLite, AGENTS.md, SKILL.md and v3 journals.
 - [Security and trust](design/security-and-trust.md): sandbox boundaries, authentication, files and secrets.
 - [Integrations](design/integrations.md): web, browser/takeover, MCP, schedules and OAuth.

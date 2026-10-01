@@ -12,8 +12,8 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from .auth import current_user, permissions
-from .db import _atomic, _directory, now
-from .files import bounded_read, open_workspace
+from .db import now
+from .files import bounded_read, ensure_workspace, open_workspace
 
 
 BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"]
@@ -198,26 +198,10 @@ class Queue:
             sandbox_id = old["sandbox_id"] if old else workspace_id.replace("/", "-")
             lifecycle = old["lifecycle_id"] if old and old["lifecycle_id"] else sandbox_key
             if kind == "agent" and not old:
-                # Keep the rollback release's identity independent of Pi session state.
-                legacy_sid = f"agent-platform-{scope_type}-{scope_id}-{uuid.uuid4().hex}"
-                marker = {"schema_version": 1, "kind": "agent-workspace-scope",
-                          "technical_profile": "agent-platform-v1", "scope_key": key,
-                          "scope_type": scope_type, "scope_id": scope_id,
-                          "lifecycle_id": lifecycle, "sandbox_id": sandbox_id,
-                          "workspace_id": workspace_id,
-                          "workspace_relative_path": f"workspaces/{workspace_id}",
-                          "isolation": "container-workspace"}
-                with _directory(self.p.settings.data_dir, workspace, create=True) as directory:
-                    _atomic(directory, ".agent-platform-scope.json", json.dumps(marker))
                 created = int(time.time())
                 conn.execute("INSERT INTO agent_scopes(scope_key,scope_type,scope_id,session_id,lifecycle_id,workspace_path,sandbox_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                             (key, scope_type, scope_id, legacy_sid, lifecycle, workspace_id, sandbox_id, created, created))
-                conn.execute("INSERT INTO agent_runtime_scopes(scope_key,session_id,lifecycle_id,created_at,updated_at) VALUES (?,?,?,?,?)",
-                             (key, legacy_sid, lifecycle, created, created))
-                conn.execute("INSERT INTO agent_runtime_scope_sessions(scope_key,lifecycle_id,session_id,created_at) VALUES (?,?,?,?)",
-                             (key, lifecycle, legacy_sid, created))
-        with _directory(self.p.settings.data_dir, workspace, create=True):
-            pass
+                             (key, scope_type, scope_id, sid, lifecycle, workspace_id, sandbox_id, created, created))
+        ensure_workspace(self.p.settings.data_dir, workspace)
         return {"kind": kind, "scope": scope, "scope_type": scope_type, "scope_id": scope_id,
                 "scope_key": key, "sid": sid, "workspace": workspace, "model": model,
                 "scope_name": scope_name,

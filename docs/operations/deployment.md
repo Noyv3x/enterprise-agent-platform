@@ -6,7 +6,7 @@ Production uses a host Manager with managed Docker containers. See [automatic up
 
 Linux, Docker Engine, Compose v2, user-level systemd and a deployment user permitted to use Docker are required. The user's account home must exist, be owned by that user, not be a symlink and not be group/world writable. The production host needs no source checkout, Python virtualenv or Node installation.
 
-**Install R1 / Manager M1 before R2.** M1 introduced five-image catalog support through the normal launcher self-update; R2 must not be offered directly to an older Manager. Before installing the simplified Manager, confirm the current and retained rollback releases both use five-image catalogs and the preceding update is settled and healthy. The simplified Manager rejects ten-image catalogs; legacy data remains untouched.
+**Install R1 / Manager M1 before R2.** M1 introduced five-image catalog support through the normal launcher self-update; R2 must not be offered directly to an older Manager. Before installing the simplified Manager, confirm the current and retained rollback releases both use five-image catalogs and the preceding update is settled and healthy. The simplified Manager rejects ten-image catalogs.
 
 ## Topology
 
@@ -55,7 +55,7 @@ The image keeps its existing tini entrypoint and sudo capability: no additional 
 
 Before upgrading, stop the sole writer and take a verified full data backup outside the deployment root. Include consistent SQLite/WAL, workspaces, attachments, environments, Runtime sessions and Manager state/configuration/secrets. Automatic DB snapshots are not full backups.
 
-R2 writes new sessions only to `sessions-v3/`; `sessions/` and `sessions.pre-pi/` remain untouched. Database migration is additive. Old releases remain able to read old data but will not see new v3 turns. Preserve post-release writes before rollback; never replace live data blindly with the pre-upgrade snapshot. See [recovery](../reference/data-layout.md#备份与恢复).
+R2 writes sessions only to `sessions-v3/`; `sessions/` and `sessions.pre-pi/` are not read. Database migrations are ordered and forward-only. A release rollback restores the pre-update snapshot with the previous generation and will not see later writes or v3 turns. Preserve post-release writes before rollback; never replace live data blindly with the pre-upgrade snapshot. See [recovery](../reference/data-layout.md#备份与恢复).
 
 ## Acceptance before R2 release
 
