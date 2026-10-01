@@ -18,7 +18,7 @@ Messages sent during a run queue FIFO; they are not joined into the active input
 
 ## Kept features
 
-- Login, users, administrators and permission groups.
+- Login, users, administrators and permission groups; administrators can sign in as another active account (管理员代入) from the account editor.
 - Attachment upload/download, document previews, generated-file links and personal workspace files.
 - Model settings, Codex device OAuth, token usage and cache-hit reporting.
 - Branding, theme and three locales.

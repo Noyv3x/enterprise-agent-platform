@@ -97,6 +97,37 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(self.client.patch(user_path, json={'permission_group': []}).status_code, 400)
         self.assertEqual(self.client.patch(user_path, json={'thinking_depth': []}).status_code, 400)
 
+    def test_admin_impersonation_swaps_session_without_revoking_others(self):
+        member_cookie = self.login('member', 'old-password')
+        path = f"/api/admin/users/{self.user['id']}/impersonate"
+        self.assertEqual(self.client.post(path, json={}).status_code, 403)
+        other = admin.create_user(self.p.db, 'other', 'other-password')
+        self.assertEqual(self.client.post(f"/api/admin/users/{other['id']}/impersonate", json={}).status_code, 403)
+
+        self.login()
+        before = self.client.get('/api/me').json()['user']
+        self.assertEqual(self.client.post(path, json={}, headers={'Origin': 'https://attacker.example'}).status_code, 403)
+        self.assertEqual(self.client.get('/api/me').json()['user'], before)
+        response = self.client.post(path, json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user']['username'], 'member')
+        self.assertNotIn('password_hash', response.json()['user'])
+        cookie = response.headers['set-cookie']
+        self.assertIn('HttpOnly', cookie)
+        self.assertIn('SameSite=lax', cookie)
+        self.assertEqual(self.client.get('/api/me').json()['user']['username'], 'member')
+        self.assertEqual(self.client.get('/api/me', headers={'Cookie': 'agent_platform_session=' + member_cookie}).status_code, 200)
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT token_version FROM users WHERE id=?', (self.user['id'],)).fetchone()[0], 1)
+
+    def test_admin_impersonation_rejects_self_inactive_and_missing_targets(self):
+        self.login()
+        self.assertEqual(self.client.post(f"/api/admin/users/{self.admin['id']}/impersonate", json={}).status_code, 400)
+        self.assertEqual(self.client.post('/api/admin/users/9999/impersonate', json={}).status_code, 404)
+        self.assertEqual(self.client.patch(f"/api/admin/users/{self.user['id']}", json={'active': False}).status_code, 200)
+        self.assertEqual(self.client.post(f"/api/admin/users/{self.user['id']}/impersonate", json={}).status_code, 404)
+        self.assertEqual(self.client.get('/api/me').json()['user']['username'], 'admin')
+
     def test_login_throttles_before_hash_and_expires(self):
         with patch.object(auth.time, 'monotonic', return_value=1000), patch.object(auth, 'verify_password', wraps=auth.verify_password) as verify:
             for _ in range(8):

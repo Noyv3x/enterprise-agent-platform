@@ -54,6 +54,7 @@ describe('Admin', () => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en');
   });
   afterEach(() => {
+    vi.unstubAllGlobals();
     cleanup();
     window.localStorage.clear();
     window.location.hash = '';
@@ -133,6 +134,36 @@ describe('Admin', () => {
 
     await waitFor(() => expect(api.request).toHaveBeenCalledWith('/api/admin/users/7', { method: 'DELETE' }));
     expect(await within(sheet).findByRole('button', { name: 'Reactivate' })).toBeVisible();
+  });
+
+  it('impersonates only another active account, then reloads at the home route', async () => {
+    const actor = userEvent.setup();
+    const policy = () => ({ allowed_models: [], default_model_id: '' });
+    serve({
+      'GET /api/admin/users/1/chat-model-policy': policy,
+      'GET /api/admin/users/7/chat-model-policy': policy,
+      'GET /api/admin/users/8/chat-model-policy': policy,
+      'POST /api/admin/users/7/impersonate': () => ({ user: ana }),
+    });
+    renderAdmin();
+
+    for (const [row, title] of [['ADMIN', 'ADMIN'], ['BEN', 'BEN']]) {
+      await actor.click(await screen.findByRole('button', { name: `Open ${row}` }));
+      const sheet = await screen.findByRole('dialog', { name: title });
+      expect(await within(sheet).findByRole('button', { name: 'Impersonate' })).toBeDisabled();
+      await actor.click(within(sheet).getByRole('button', { name: 'Done' }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    }
+
+    const location = { assign: vi.fn(), reload: vi.fn(), hash: '#admin' };
+    vi.stubGlobal('location', location);
+    await actor.click(await screen.findByRole('button', { name: 'Open ANA' }));
+    const sheet = await screen.findByRole('dialog', { name: 'ANA' });
+    await actor.click(await within(sheet).findByRole('button', { name: 'Impersonate' }));
+
+    await waitFor(() => expect(location.reload).toHaveBeenCalledTimes(1));
+    expect(api.request).toHaveBeenCalledWith('/api/admin/users/7/impersonate', { method: 'POST', body: '{}' });
+    expect(location.assign).toHaveBeenCalledWith('#');
   });
 
   it('opens the tab named in the hash and refuses to delete a group that still has accounts', async () => {

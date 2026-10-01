@@ -42,6 +42,8 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
   const [confirming, setConfirming] = useState(false);
   const [statusBusy, setStatusBusy] = useState(false);
   const [statusError, setStatusError] = useState('');
+  const [impersonating, setImpersonating] = useState(false);
+  const [impersonateError, setImpersonateError] = useState('');
   const set = (patch: Partial<Draft>) => { setDraft((old) => ({ ...old, ...patch })); setSaved(false); };
   const changed = (Object.keys(draft) as (keyof Draft)[]).filter((key) => draft[key] !== initial[key]);
   const valid = draft.permission_group !== '' && (current !== null || (draft.username.trim() !== '' && draft.password !== ''));
@@ -91,6 +93,20 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
       setStatusError(errorText(cause));
     } finally {
       setStatusBusy(false);
+    }
+  }
+
+  /** The server swaps the session cookie; a full reload at the home route drops all admin-scoped client state. */
+  async function impersonate() {
+    if (!current) return;
+    setImpersonating(true); setImpersonateError('');
+    try {
+      await request(`/api/admin/users/${current.id}/impersonate`, { method: 'POST', body: '{}' });
+      location.assign('#');
+      location.reload();
+    } catch (cause) {
+      setImpersonateError(errorText(cause));
+      setImpersonating(false);
     }
   }
 
@@ -161,6 +177,16 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
 
     {current && <div className="mt-5 flex flex-col gap-5 border-t border-line pt-5">
       <ChatPolicySection user={current} models={models} />
+      <section aria-labelledby={`${formId}-impersonate`} className="flex flex-col gap-2 border-t border-line pt-5">
+        <h3 id={`${formId}-impersonate`} className={EDITOR_HEADING}>{w('Impersonation', '管理员代入', '管理員代入')}</h3>
+        {impersonateError && <Notice tone="danger" title={impersonateError} />}
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-[12px] leading-[1.45] text-ink-2">{w('Replace your session with a normal session for this account, as if they had just signed in. Sign in again to return to your own account.', '用该账户的正常会话替换你当前的会话，如同对方刚刚登录。如需回到自己的账户，请重新登录。', '用該帳戶的正常工作階段取代你目前的工作階段，如同對方剛剛登入。如需回到自己的帳戶，請重新登入。')}</p>
+          <Button size="sm" className="shrink-0" title={w('Sign in as this account', '以此账号登录', '以此帳號登入')} onClick={() => void impersonate()} disabled={self || !current.active || impersonating || saving}>
+            {impersonating ? w('Switching…', '正在代入…', '正在代入…') : w('Impersonate', '管理员代入', '管理員代入')}
+          </Button>
+        </div>
+      </section>
       {!self && <section aria-labelledby={`${formId}-status`} className="flex flex-col gap-2 border-t border-line pt-5">
         <h3 id={`${formId}-status`} className={EDITOR_HEADING}>{w('Sign-in access', '登录权限', '登入權限')}</h3>
         {statusError && <Notice tone="danger" title={statusError} />}

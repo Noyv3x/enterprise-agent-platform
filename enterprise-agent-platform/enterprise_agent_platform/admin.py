@@ -14,7 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .auth import PERMISSIONS, body_json, current_user, groups, hash_password, public_user
+from .auth import COOKIE_NAME, PERMISSIONS, TTL, body_json, current_user, groups, hash_password, issue_session, public_user
 from .db import now
 from .gates import manager_request
 
@@ -93,6 +93,20 @@ async def user_update(request):
             conn.execute(f'UPDATE users SET {assignments},token_version=token_version+1 WHERE id=?', (*fields.values(), row['id']))
         user = public_user(conn.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone())
     return JSONResponse({'ok': True} if request.method == 'DELETE' else {'user': user})
+
+
+async def impersonate(request):
+    admin = current_user(request, admin=True)
+    p = request.app.state.platform
+    with p.db.connect() as conn:
+        row = conn.execute('SELECT * FROM users WHERE id=?', (request.path_params['id'],)).fetchone()
+    if row is None or not row['active']:
+        raise HTTPException(404, 'User not found')
+    if row['id'] == admin['id']:
+        raise HTTPException(400, 'Cannot impersonate yourself')
+    response = JSONResponse({'user': public_user(row)})
+    response.set_cookie(COOKIE_NAME, issue_session(p.settings, row), max_age=TTL, httponly=True, secure=p.settings.public_base_url.startswith('https://'), samesite='lax')
+    return response
 
 
 async def policy(request):
@@ -231,4 +245,4 @@ async def system(request):
 
 
 def routes():
-    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/chat-model-policy', policy, methods=['GET', 'PUT']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]
+    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/impersonate', impersonate, methods=['POST']), Route('/api/admin/users/{id:int}/chat-model-policy', policy, methods=['GET', 'PUT']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]

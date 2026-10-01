@@ -11,6 +11,7 @@ Use Manager's `agent` and `chat` resource profiles; identities bind a sandbox to
 ## Authentication and authorization
 
 - Platform authenticates signed cookies and checks active users and `token_version` on requests. Password/revocation changes invalidate prior tokens.
+- Administrators can impersonate any other active account (管理员代入). This simply issues a normal session for the target and replaces the caller's cookie, as if the target had just signed in: no flag marks the session as impersonated, other sessions and `token_version` are unchanged, and returning to the admin requires signing in again.
 - Cookie-authenticated mutations and login must be same-origin: the `Origin` must equal the configured public base URL or the origin the browser actually used. With `AGENT_PLATFORM_TRUSTED_PROXY=1` (container deployments, where the Manager gateway discards client-supplied forwarding headers and rebuilds them from the accepted connection), that request origin comes from `X-Forwarded-Proto`/`X-Forwarded-Host` and login throttling keys on `X-Forwarded-For`; otherwise `Host`, the public scheme and the TCP peer are used.
 - Server-side ownership protects personal scopes, chat conversations, files, schedules and browser takeover. Channel read/manage permissions come from permission groups; there is no implicit membership policy.
 - Runtime bearer, internal tool bearer, Manager control and Manager executor credentials are separate capabilities. Public APIs do not accept caller-supplied trusted scope identities.

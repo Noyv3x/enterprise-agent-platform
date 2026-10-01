@@ -84,6 +84,7 @@ Open event streams recheck the signed session and current authorization before e
 
 ## Admin and model settings
 - GET `/api/admin/users` → `{users:[]}`; POST same `{username,password,display_name?,role?,permission_group?,model_name?,thinking_depth?}` → `{user}`; PATCH `/api/admin/users/{id}` same mutable user fields plus `{password?,active?}` → `{user}`; DELETE same → `{ok:true}` (deactivate/revoke).
+- POST `/api/admin/users/{id}/impersonate` with `{}` → `{user}` for the target, and sets a fresh normal session cookie for that account (same attributes as login), replacing the admin's cookie. Admin only and same-origin; 404 if the target is missing or deactivated, 400 if it is the caller. The target's `token_version` and other sessions are untouched.
 - GET/PUT `/api/admin/users/{id}/chat-model-policy` → `{allowed_models:[string],default_model_id:string}`. PUT takes that exact shape.
 - GET `/api/admin/permission-groups` → `{groups:[{name,permissions:[string]}]}`; PUT same `{groups:[...]}` → same.
 - GET/PATCH `/api/admin/branding` → `{branding}`; patch accepts branding fields.
