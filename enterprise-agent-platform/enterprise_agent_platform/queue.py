@@ -23,6 +23,102 @@ def timestamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if isinstance(value, (int, float)) else value
 
 
+class _WorkTrace:
+    """A bounded, per-run display record, never a Runtime transcript."""
+
+    def __init__(self):
+        started = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        self.data = {"v": 1, "started_at": started, "ended_at": started,
+                     "items": [], "truncated": False}
+        self.last_tool_position = 0
+        self.previous = None
+
+    def clipped(self, text, limit):
+        if len(text) > limit:
+            self.data["truncated"] = True
+        return text[:limit]
+
+    def preview(self, parts):
+        text = ""
+        for part in parts:
+            if part.get("type") == "text":
+                value = part.get("text", "")
+                if len(text) + len(value) > 2000:
+                    self.data["truncated"] = True
+                text += value[:max(0, 2000 - len(text))]
+        return text
+
+    def store(self, item, index=None):
+        items = self.data["items"]
+        if index is None and len(items) >= 200:
+            self.data["truncated"] = True
+            return False
+        old = items[index] if index is not None else None
+        if index is None:
+            items.append(item)
+        else:
+            items[index] = item
+        # Reserve timestamp space for unfinished tools before accepting growth.
+        reserve = sum(40 for entry in items if entry["type"] == "tool" and entry["ended_at"] is None)
+        if len(json.dumps(self.data).encode("utf-8")) + reserve > 96 * 1024:
+            if index is None:
+                items.pop()
+            else:
+                items[index] = old
+            self.data["truncated"] = True
+            return False
+        return True
+
+    def add(self, event):
+        kind = event["type"]
+        items = self.data["items"]
+        if kind in ("thinking_delta", "text_delta"):
+            text = event.get("delta", "")
+            if not text:
+                return
+            item_type = kind.removesuffix("_delta")
+            merge = self.previous == item_type and items and items[-1]["type"] == item_type
+            prior = items[-1]["text"] if merge else ""
+            text = prior + self.clipped(text, max(0, 4000 - len(prior)))
+            self.store({"type": item_type, "text": text}, len(items) - 1 if merge else None)
+            self.previous = item_type
+        elif kind == "tool_start":
+            self.previous = "tool"
+            self.last_tool_position = len(items)
+            args = event.get("args", {})
+            encoded = json.dumps(args)
+            if len(encoded) > 2000:
+                args = {"_preview": self.clipped(encoded, 2000)}
+            self.store({"type": "tool", "id": event["tool_call_id"], "name": event["name"],
+                        "args": args, "status": "cancelled", "output": "",
+                        "started_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                        "ended_at": None})
+        elif kind in ("tool_update", "tool_end"):
+            self.previous = "tool"
+            for index, entry in enumerate(items):
+                if entry["type"] != "tool" or entry["id"] != event["tool_call_id"]:
+                    continue
+                item = dict(entry)
+                if kind == "tool_update":
+                    item["output"] = self.preview(event.get("partial", {}).get("content", []))
+                else:
+                    item["output"] = self.preview(event.get("content_preview", []))
+                    item["status"] = "error" if event.get("is_error") else "done"
+                    item["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                if not self.store(item, index) and kind == "tool_end":
+                    # The reserved timestamp budget guarantees terminal status
+                    # survives even when the final output cannot fit.
+                    item["output"] = entry["output"]
+                    self.store(item, index)
+                break
+
+    def finish(self):
+        self.data["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        self.data["items"] = [item for index, item in enumerate(self.data["items"])
+                              if item["type"] != "text" or index < self.last_tool_position]
+        return self.data if self.data["items"] else None
+
+
 class Queue:
     def __init__(self, platform):
         self.p = platform
@@ -396,6 +492,7 @@ class Queue:
                         if payload.get("schedule_run_id"):
                             conn.execute("UPDATE agent_schedule_runs SET status='running',started_at=?,updated_at=? WHERE id=?",
                                          (int(time.time()), int(time.time()), payload["schedule_run_id"]))
+                work = _WorkTrace()
                 try:
                     user = self.user(payload["user_id"])
                     if not user["active"]:
@@ -438,20 +535,21 @@ class Queue:
                                 continue
                             event = json.loads(line[5:].strip())
                             event.pop("seq", None)
+                            work.add(event)
                             if event["type"] == "run_end":
                                 payload["runtime_unsettled"] = False
                                 self.unsettled.pop(key, None)
-                                await self.finish(job, payload, user, info, event)
+                                await self.finish(job, payload, user, info, event, work)
                                 ended = True
                                 break
                             self.emit(key, event)
                     if not ended:
                         raise RuntimeError("Runtime event stream ended without run_end")
                 except asyncio.CancelledError:
-                    await self.interrupt(job, payload, "Platform stopped; execution was not replayed")
+                    await self.interrupt(job, payload, "Platform stopped; execution was not replayed", work)
                     raise
                 except Exception as exc:
-                    await self.interrupt(job, payload, str(exc))
+                    await self.interrupt(job, payload, str(exc), work)
                 finally:
                     self.running.pop(key, None)
                     self.cancelling.discard(key)
@@ -460,7 +558,7 @@ class Queue:
             self.cancelling.discard(key)
             self.tasks.pop(key, None)
 
-    async def finish(self, job, payload, user, info, event):
+    async def finish(self, job, payload, user, info, event, work=None):
         if payload.get("operation") == "compact":
             self.finish_compact(job, payload, event["status"], error=event.get("error"))
             return
@@ -470,12 +568,15 @@ class Queue:
         metadata = {"status": status}
         if event.get("error"):
             metadata["error"] = event["error"]
+        assistant_metadata = dict(metadata)
+        if work is not None and (trace := work.finish()):
+            assistant_metadata["work"] = trace
         with self.p.db.connect() as conn:
             state = conn.execute("SELECT status FROM durable_jobs WHERE id=?", (job["id"],)).fetchone()[0]
             if state not in ("queued", "running"):
                 return
             conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
-            mid = self.insert_message(conn, info, user, "assistant", event.get("text", ""), metadata)
+            mid = self.insert_message(conn, info, user, "assistant", event.get("text", ""), assistant_metadata)
             table = "chat_messages" if info["kind"] == "chat" else "messages"
             old_metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (payload["message_id"],)).fetchone()[0])
             conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps({**old_metadata, **metadata}), payload["message_id"]))
@@ -492,15 +593,15 @@ class Queue:
         try:
             await self.p.files.deliver(user, info, mid, event.get("text", ""))
         except Exception as exc:
-            event["error"] = metadata["error"] = f"File delivery failed: {exc}"
-            event["status"] = metadata["status"] = "interrupted"
+            event["error"] = assistant_metadata["error"] = f"File delivery failed: {exc}"
+            event["status"] = assistant_metadata["status"] = "interrupted"
             with self.p.db.connect() as conn:
-                conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps(metadata), mid))
+                conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps(assistant_metadata), mid))
                 conn.execute("UPDATE durable_jobs SET status='failed',last_error=? WHERE id=?", (event["error"], job["id"]))
         event["message"] = self.message(info, mid)
         self.emit(info["scope_key"], event)
 
-    async def interrupt(self, job, payload, error):
+    async def interrupt(self, job, payload, error, work=None):
         if payload.get("operation") == "compact":
             status = "cancelled" if self.payload_key(payload) in self.cancelling else "interrupted"
             self.finish_compact(job, payload, status, error=error)
@@ -508,7 +609,7 @@ class Queue:
         if self.payload_key(payload):
             user = self.user(payload["user_id"])
             info = self.scope(user, payload["scope"], authorize=False)
-            await self.finish(job, payload, user, info, {"type": "run_end", "status": "interrupted", "text": "", "error": error, "usage": {}, "model": info["model"]["id"]})
+            await self.finish(job, payload, user, info, {"type": "run_end", "status": "interrupted", "text": "", "error": error, "usage": {}, "model": info["model"]["id"]}, work)
         else:
             with self.p.db.connect() as conn:
                 conn.execute("UPDATE durable_jobs SET status='failed',last_error=?,updated_at=? WHERE id=?", (error, int(time.time()), job["id"]))

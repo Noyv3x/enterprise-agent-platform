@@ -1,7 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { request } from "../../api";
-import { Button } from "../../components/ui/beautiful";
-import { ComposerFrame, Glyph, Spinner } from "../../components/ui/fieldwork";
+import PromptBar, { type PromptCommand, type PromptModel } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
 import { uploadPath } from "./routes";
@@ -15,41 +14,70 @@ interface Upload {
   error: string;
 }
 
-export interface ComposerProps {
-  scope: string;
-  busy: boolean;
-  onSend: (content: string, attachmentIds: number[]) => Promise<void>;
-  onCancel: () => Promise<unknown>;
+export interface ComposerCommand extends PromptCommand {
+  run: () => void;
 }
 
-export function Composer({ scope, busy, onSend, onCancel }: ComposerProps) {
+export interface ComposerProps {
+  /** resolves the conversation scope uploads go to (a new chat creates its conversation here) */
+  ensureScope: () => Promise<string>;
+  onSend: (content: string, attachmentIds: number[]) => Promise<void>;
+  /** the agent is working on this conversation */
+  working?: boolean;
+  onStop?: () => Promise<unknown>;
+  /** accepted messages still waiting their FIFO turn */
+  queued?: number;
+  commands?: ComposerCommand[];
+  models?: PromptModel[];
+  model?: string;
+  onModelChange?: (model: string) => Promise<unknown>;
+  modelDisabled?: boolean;
+  /** extra status (e.g. a disallowed model warning); blocks sending when `blocked` */
+  notice?: ReactNode;
+  blocked?: boolean;
+  placeholder: string;
+  /** replaces the draft whenever `seed.n` changes (resend with attachments) */
+  seed?: { text: string; n: number } | null;
+}
+
+export function Composer({
+  ensureScope, onSend, working = false, onStop, queued = 0, commands = [], models, model, onModelChange, modelDisabled,
+  notice, blocked = false, placeholder, seed,
+}: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState("");
-  const fileInput = useRef<HTMLInputElement>(null);
   const nextKey = useRef(0);
+  const input = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (!seed) return;
+    setText(seed.text);
+    input.current?.focus();
+  }, [seed]);
 
   const uploading = uploads.some((upload) => !upload.attachment && !upload.error);
   const ready = uploads.flatMap((upload) => (upload.attachment ? [upload.attachment.id] : []));
-  const canSend = !sending && !uploading && (text.trim() !== "" || ready.length > 0);
+  const canSend = !blocked && !sending && !uploading && (text.trim() !== "" || ready.length > 0);
 
-  const upload = (files: FileList) => {
-    for (const file of Array.from(files)) {
+  const upload = (files: File[]) => {
+    setError("");
+    for (const file of files) {
       const key = nextKey.current++;
       setUploads((current) => [...current, { key, name: file.name, attachment: null, error: "" }]);
       const body = new FormData();
       body.append("file", file);
-      request<{ attachment: Attachment }>(uploadPath(scope), { method: "POST", body })
+      ensureScope()
+        .then((scope) => request<{ attachment: Attachment }>(uploadPath(scope), { method: "POST", body }))
         .then(({ attachment }) => setUploads((current) => current.map((item) => (item.key === key ? { ...item, attachment } : item))))
         .catch((reason: unknown) => setUploads((current) => current.map((item) => (item.key === key ? { ...item, error: errorText(reason) } : item))));
     }
   };
 
-  const submit = async (event?: { preventDefault: () => void }) => {
-    event?.preventDefault();
+  const submit = async () => {
     if (!canSend) return;
     setSending(true);
     setError("");
@@ -65,9 +93,10 @@ export function Composer({ scope, busy, onSend, onCancel }: ComposerProps) {
   };
 
   const stop = async () => {
+    if (!onStop) return;
     setStopping(true);
     try {
-      await onCancel();
+      await onStop();
     } catch (reason) {
       setError(errorText(reason));
     } finally {
@@ -75,66 +104,55 @@ export function Composer({ scope, busy, onSend, onCancel }: ComposerProps) {
     }
   };
 
-  const label = w("Message", "消息", "訊息");
+  const status = error ? <span className="text-red" role="alert">{error}</span>
+    : notice ? notice
+      : queued > 0 ? w(
+        `${queued} queued — messages run in order after the current reply`,
+        `${queued} 条排队中，将在当前回复后依次处理`,
+        `${queued} 則排隊中，將在目前回覆後依序處理`,
+      ) : null;
+
   return (
-    <form onSubmit={submit}>
-      <ComposerFrame
-        label={w("Compose message", "撰写消息", "撰寫訊息")}
-        recovery={error ? <div className="cv-error-text" role="alert">{error}</div> : undefined}
-        attachments={uploads.length ? (
-          <ul className="cv-chips" aria-label={w("Attached files", "已附加文件", "已附加檔案")}>
-            {uploads.map((item) => (
-              <li key={item.key} className="cv-chip" data-error={item.error ? "" : undefined}>
-                {!item.attachment && !item.error ? <Spinner size={12} /> : <Glyph name={item.error ? "warning" : "file"} size={14} />}
-                <span className="cv-chip-name">{item.name}</span>
-                <span className="cv-chip-meta">{item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…"))}</span>
-                <button type="button" className="cv-chip-remove" aria-label={`${w("Remove", "移除", "移除")} ${item.name}`}
-                  onClick={() => setUploads((current) => current.filter((other) => other.key !== item.key))}>
-                  <Glyph name="close" size={12} />
-                </button>
-              </li>
-            ))}
-          </ul>
-        ) : undefined}
-        input={
-          <textarea
-            className="cv-input"
-            aria-label={label}
-            placeholder={w("Message the agent", "给智能体发消息", "傳訊息給智慧體")}
-            rows={1}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                event.preventDefault();
-                void submit();
-              }
-            }}
-          />
-        }
-        startActions={
-          <>
-            <input ref={fileInput} type="file" multiple hidden onChange={(event) => { if (event.target.files) upload(event.target.files); event.target.value = ""; }} data-testid="composer-file" />
-            <Button type="button" variant="quiet" size="sm" className="cv-icon-button" aria-label={w("Attach files", "添加附件", "新增附件")} onClick={() => fileInput.current?.click()}>
-              <Glyph name="attach" size={16} />
-            </Button>
-          </>
-        }
-        status={busy ? w("New messages run after the current reply", "新消息将在当前回复后处理", "新訊息將在目前回覆後處理") : undefined}
-        submitAction={
-          <>
-            {busy && (
-              <Button type="button" variant="secondary" size="sm" disabled={stopping} onClick={() => void stop()}>
-                {w("Stop", "停止", "停止")}
-              </Button>
-            )}
-            <Button type="submit" variant="primary" size="sm" className="cv-icon-button" aria-label={w("Send", "发送", "傳送")} disabled={!canSend}>
-              {sending ? <Spinner size={14} /> : <Glyph name="arrowUp" size={16} />}
-            </Button>
-          </>
-        }
-        hint={<span>{w("Enter to send · Shift+Enter for a new line", "Enter 发送 · Shift+Enter 换行", "Enter 傳送 · Shift+Enter 換行")}</span>}
-      />
-    </form>
+    <PromptBar
+      tall
+      placeholder={placeholder}
+      draft={text}
+      onDraftChange={setText}
+      inputRef={input}
+      attachments={uploads.map((item) => ({
+        key: item.key,
+        name: item.name,
+        state: item.error ? "error" : item.attachment ? "ready" : "uploading",
+        detail: item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…")),
+      }))}
+      onAttach={upload}
+      onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
+      commands={commands}
+      onCommand={(key) => commands.find((command) => command.key === key)?.run()}
+      models={models}
+      model={model}
+      onModelChange={onModelChange ? (next) => {
+        setError("");
+        onModelChange(next).catch((reason: unknown) => setError(errorText(reason)));
+      } : undefined}
+      modelDisabled={modelDisabled}
+      canSend={canSend}
+      onSend={() => void submit()}
+      working={working}
+      onStop={onStop ? () => void stop() : undefined}
+      stopping={stopping}
+      status={status}
+      labels={{
+        prompt: w("Message", "消息", "訊息"),
+        attach: w("Attach files", "添加附件", "新增附件"),
+        remove: (name) => `${w("Remove", "移除", "移除")} ${name}`,
+        chooseModel: w("Model", "模型", "模型"),
+        send: w("Send", "发送", "傳送"),
+        stop: w("Stop", "停止", "停止"),
+        commandsHint: w("Commands", "命令", "命令"),
+        noMatches: (query) => w(`No commands match “${query}”`, `没有匹配“${query}”的命令`, `沒有符合「${query}」的命令`),
+        dropFiles: w("Drop files to attach", "松开以添加附件", "放開以新增附件"),
+      }}
+    />
   );
 }

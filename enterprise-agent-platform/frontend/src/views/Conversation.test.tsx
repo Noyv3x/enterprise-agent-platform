@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 
 import '@testing-library/jest-dom/vitest';
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FieldworkProvider } from '../components/ui/fieldwork';
+import { ShellContext } from '../components/ui/beautiful/controls';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../i18n';
-import { Conversation } from './Conversation';
+import { Conversation, type ConversationProps } from './Conversation';
 import type { Message } from './conversation/types';
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
@@ -42,15 +42,39 @@ function serve(routes: Record<string, Route>) {
 function calls(method: string, path: string): unknown[] {
   return api.request.mock.calls
     .filter(([calledPath, options]) => calledPath === path && (options?.method ?? 'GET') === method)
-    .map(([, options]) => (options?.body ? JSON.parse(String(options.body)) : undefined));
+    .map(([, options]) => (typeof options?.body === 'string' ? JSON.parse(options.body) : options?.body));
 }
 
 function message(id: number, role: Message['role'], content: string, status: Message['metadata']['status'] = 'completed'): Message {
   return { id, role, content, metadata: { status }, created_at: '2026-09-30T09:00:00Z', attachments: [] };
 }
 
-function renderConversation(scope: string) {
-  return render(<I18nProvider><FieldworkProvider mode="light" motion={false}><Conversation scope={scope} /></FieldworkProvider></I18nProvider>);
+const page = (messages: Message[], extra: Record<string, unknown> = {}) => ({ messages, next_before_id: null, last_seq: 0, compaction: null, ...extra });
+
+function renderConversation(scope: string, props: Partial<ConversationProps> = {}) {
+  const aside = document.createElement('div');
+  document.body.append(aside);
+  return render(
+    <I18nProvider>
+      <ShellContext.Provider value={{ narrow: false, openNavigation: () => undefined, asideSlot: aside }}>
+        <Conversation scope={scope} {...props} />
+      </ShellContext.Provider>
+    </I18nProvider>,
+  );
+}
+
+async function chooseAction(user: UserEvent, name: string) {
+  await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+  await user.click(await screen.findByRole('menuitem', { name }));
+}
+
+async function actionDisabled(user: UserEvent, name: string): Promise<boolean> {
+  await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+  const item = await screen.findByRole('menuitem', { name });
+  const disabled = item.getAttribute('aria-disabled') === 'true';
+  await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+  await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument());
+  return disabled;
 }
 
 describe('Conversation', () => {
@@ -63,60 +87,122 @@ describe('Conversation', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    document.body.innerHTML = '';
   });
 
-  it('retains legacy tool results and commentary without restoring review controls', async () => {
+  it('retains the draft, attachment and composer focus when another member starts an empty channel', async () => {
+    const user = userEvent.setup();
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([]),
+      'POST /api/attachments?scope=channel-3': () => ({ attachment }),
+      'POST /api/conversations/channel-3/messages': (body) => ({ message: message(3, 'user', String(body.content), 'queued'), job_id: 9 }),
+    });
+    renderConversation('channel-3');
+    const input = await screen.findByLabelText('Message');
+    await user.upload(screen.getByTestId('composer-file'), new File(['notes'], 'notes.txt', { type: 'text/plain' }));
+    await screen.findByRole('button', { name: 'Remove notes.txt' });
+    await user.type(input, 'My unsent draft');
+    FakeEventSource.instances[0].emit(1, { type: 'message', message: message(1, 'user', 'Another member posted', 'queued') });
+    expect(screen.getByLabelText('Message')).toBe(input);
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue('My unsent draft');
+    expect(screen.getByRole('button', { name: 'Remove notes.txt' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'My unsent draft', attachment_ids: [17] }]);
+  });
+
+  it('resends the selected request when cancellation replies settle in reverse order', async () => {
+    const user = userEvent.setup();
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([
+        message(1, 'user', 'Request A', 'cancelled'),
+        message(2, 'user', 'Request B', 'cancelled'),
+        message(3, 'assistant', 'Cancelled B', 'cancelled'),
+        message(4, 'assistant', 'Partial A', 'cancelled'),
+      ]),
+      'POST /api/conversations/channel-3/messages': (body) => ({ message: message(5, 'user', String(body.content), 'queued'), job_id: 9 }),
+    });
+    renderConversation('channel-3');
+    await screen.findByText('Request A');
+    // The retry is attached to the request, never inferred from answer completion order.
+    const retry = screen.getAllByRole('button', { name: 'Send again' })[0];
+    expect(retry.parentElement?.parentElement).toHaveTextContent('Request A');
+    await user.click(retry);
+    expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'Request A', attachment_ids: [] }]);
+  });
+
+  it('shows a persisted work trace collapsed after the reply, expandable to thinking, interim text and tool details', async () => {
+    const user = userEvent.setup();
+    const reply = { ...message(2, 'assistant', 'Q3 revenue grew **20%**.'), metadata: { status: 'completed' as const, work: {
+      v: 1, started_at: '2026-10-01T05:22:00Z', ended_at: '2026-10-01T05:22:12Z', truncated: false,
+      items: [
+        { type: 'thinking', text: 'Check the report before summarizing.' },
+        { type: 'text', text: 'I will read the revenue report.' },
+        { type: 'tool', id: 'call_1', name: 'read', args: { path: '/workspace/revenue.txt' }, status: 'done', output: 'Q3 revenue: $1.2M', started_at: '2026-10-01T05:22:01Z', ended_at: '2026-10-01T05:22:02Z' },
+        { type: 'tool', id: 'call_2', name: 'bash', args: { command: 'cat missing.txt' }, status: 'error', output: 'No such file', started_at: '2026-10-01T05:22:03Z', ended_at: '2026-10-01T05:22:04Z' },
+      ],
+    } } };
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Summarize Q3'), reply]) });
+    renderConversation('private');
+
+    expect(await screen.findByText('20%', { selector: 'strong' })).toBeVisible();
+    const header = screen.getByRole('button', { name: 'Thought for 12s' });
+    expect(header).toHaveAttribute('aria-expanded', 'false');
+    await user.click(header);
+    expect(header).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Check the report before summarizing.')).toBeVisible();
+    expect(screen.getByText('I will read the revenue report.')).toBeVisible();
+    expect(screen.getByRole('button', { name: '2 tool calls' })).toBeVisible();
+    expect(screen.getByText('Failed')).toBeVisible();
+
+    const read = screen.getByRole('button', { name: /Read.*revenue\.txt/ });
+    expect(screen.getByText('Q3 revenue: $1.2M')).not.toBeVisible();
+    await user.click(read);
+    expect(read).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Q3 revenue: $1.2M')).toBeVisible();
+  });
+
+  it('renders old agent_work records read-only: tools, interim text, plain steps, omissions, never approval actions', async () => {
     const user = userEvent.setup();
     const oldReply = { ...message(1, 'assistant', 'Done'), metadata: { agent_work: {
       state: 'needs_review',
       activity: [
+        { stage: 'preparing', label: 'Preparing workspace', detail: 'sandbox ready', at: '1790000000' },
         { stage: 'assistant.message', source: 'agent', detail: 'Checking the **release**.' },
-        { stage: 'tool', source: 'agent', tool: 'terminal', tool_status: 'completed', detail: 'printf release', parameters: { command: 'printf release', cwd: '/workspace' }, result: 'release ready' },
-        { stage: 'tool', source: 'agent', tool: 'web', tool_status: 'failed', detail: 'Release notes', result: '<script>bad()</script>' },
-        { stage: 'approval', label: 'Approve deployment' },
+        { stage: 'tool', source: 'agent', tool: 'terminal', tool_status: 'completed', detail: 'printf release', parameters: { command: 'printf release', cwd: '/workspace' }, result: 'release ready', at: '1790000001', completed_at: '1790000009' },
+        { stage: 'tool', source: 'agent', label: 'web', tool_status: 'failed', detail: 'Release notes', result: '<script>bad()</script>' },
+        { stage: 'tool', source: 'agent', tool: 'deploy', tool_status: 'running', detail: 'rollout' },
+        { stage: 'approval', label: 'Approve deployment', detail: 'production' },
         { stage: 'work.truncated', omitted_events: 4 },
       ],
     } } };
-    serve({ 'GET /api/conversations/private/messages?limit=100': () => ({ messages: [oldReply], next_before_id: null, last_seq: 0 }) });
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([oldReply]) });
     renderConversation('private');
-    expect(await screen.findByText('Done')).toBeVisible();
+
+    await user.click(await screen.findByRole('button', { name: 'Worked for 9s' }));
     expect(screen.getByText('release', { selector: 'strong' })).toBeVisible();
-    expect(screen.getByText('Completed')).toBeVisible();
+    expect(screen.getByText('Preparing workspace')).toBeVisible();
+    expect(screen.getByText('3 tool calls')).toBeVisible();
     expect(screen.getByText('Failed')).toBeVisible();
-    await user.click(screen.getByText('terminal'));
-    expect(screen.getByText(/release ready/)).toBeVisible();
-    expect(screen.getByText(/release ready/)).toHaveTextContent('"cwd": "/workspace"');
-    await user.click(screen.getByText('web'));
+    expect(screen.getByText('Stopped')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /terminal/ }));
+    expect(screen.getByText(/"cwd": "\/workspace"/)).toBeVisible();
+    expect(screen.getByText('release ready')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /web/ }));
     expect(screen.getByText('<script>bad()</script>')).toBeVisible();
     expect(screen.getByText('Earlier activity was omitted (4)')).toBeVisible();
-    expect(screen.queryByText('Approve deployment')).not.toBeInTheDocument();
+    // Removed actions stay removed: the approval is a plain line, never a control.
+    expect(screen.getByText('Approve deployment')).toBeVisible();
+    expect(screen.queryByRole('button', { name: /approve|deny/i })).not.toBeInTheDocument();
     expect(screen.queryByText(/needs.review/i)).not.toBeInTheDocument();
   });
 
-  it('sends an uploaded attachment without requiring message text', async () => {
-    const user = userEvent.setup();
-    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: null };
-    serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: [], next_before_id: null, last_seq: 0 }),
-      'POST /api/attachments?scope=private': () => ({ attachment }),
-      'POST /api/conversations/private/messages': () => ({ message: { ...message(1, 'user', '', 'queued'), attachments: [attachment] }, job_id: 9 }),
-    });
-    renderConversation('private');
-    const send = await screen.findByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
-    await user.upload(screen.getByTestId('composer-file'), new File(['notes'], 'notes.txt', { type: 'text/plain' }));
-    await waitFor(() => expect(send).toBeEnabled());
-    await user.click(send);
-    expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: '', attachment_ids: [17] }]);
-    expect(await screen.findByRole('link', { name: /Download/ })).toHaveAttribute('href', '/api/attachments/17');
-    expect(screen.queryByRole('button', { name: 'Remove notes.txt' })).not.toBeInTheDocument();
-  });
-
-  it('sends a message, streams tool activity and text, then replaces the stream with the final reply', async () => {
+  it('streams thinking, a running tool and the answer, then replaces the live reply with the persisted message', async () => {
     const user = userEvent.setup();
     const history = [message(1, 'assistant', 'Earlier **answer**')];
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: history, next_before_id: null, last_seq: 41 }),
+      'GET /api/conversations/private/messages?limit=100': () => page(history, { last_seq: 41 }),
       'POST /api/conversations/private/messages': (body) => ({ message: message(2, 'user', String(body.content), 'queued'), job_id: 9 }),
     });
     renderConversation('private');
@@ -128,193 +214,232 @@ describe('Conversation', () => {
     await user.type(screen.getByLabelText('Message'), 'List the files{Enter}');
     expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: 'List the files', attachment_ids: [] }]);
     expect(await screen.findByText('List the files')).toBeVisible();
-    expect(screen.getByText('Queued')).toBeVisible();
+    expect(screen.getAllByText('Queued')[0]).toBeVisible();
     expect(screen.getByLabelText('Message')).toHaveValue('');
 
-    stream.emit(42, { type: 'tool_start', tool_call_id: 'call-1', name: 'bash', args: { command: 'ls -la' } });
+    stream.emit(42, { type: 'message', message: message(2, 'user', 'List the files', 'running') });
+    expect(screen.getByText('Starting')).toBeVisible();
+
+    stream.emit(43, { type: 'thinking_delta', delta: 'Look at the ' });
+    stream.emit(44, { type: 'thinking_delta', delta: 'workspace.' });
     const live = screen.getByRole('article', { name: 'Reply in progress' });
-    expect(within(live).getByText('Ran command')).toBeVisible();
+    expect(within(live).getByText('Look at the workspace.')).toBeVisible();
+    expect(within(live).getByText(/Thinking/)).toBeVisible();
+
+    stream.emit(45, { type: 'tool_start', tool_call_id: 'call-1', name: 'bash', args: { command: 'ls -la' } });
     expect(within(live).getByText('ls -la')).toBeVisible();
     expect(within(live).getByText('Running')).toBeVisible();
-
-    stream.emit(43, { type: 'tool_end', tool_call_id: 'call-1', name: 'bash', is_error: false, content_preview: 'notes.md\nreport.pdf', details: {} });
+    stream.emit(46, { type: 'tool_end', tool_call_id: 'call-1', name: 'bash', is_error: false, content_preview: { content: [{ type: 'text', text: 'notes.md\nreport.pdf' }] }, details: {} });
     expect(within(live).queryByText('Running')).not.toBeInTheDocument();
-    expect(within(live).getByText(/report\.pdf/)).toBeInTheDocument();
 
-    stream.emit(44, { type: 'text_delta', delta: 'Found two ' });
-    stream.emit(45, { type: 'text_delta', delta: 'files.' });
+    stream.emit(47, { type: 'text_delta', delta: 'Found two ' });
+    stream.emit(48, { type: 'text_delta', delta: 'files.' });
     expect(within(live).getByText('Found two files.')).toBeVisible();
+    // The work settles while the answer streams.
+    expect(within(live).getByRole('button', { name: /^Thought for/ })).toHaveAttribute('aria-expanded', 'false');
 
     history.splice(0, history.length, message(1, 'assistant', 'Earlier **answer**'), message(2, 'user', 'List the files'), message(3, 'assistant', 'Found two files: notes.md and report.pdf.'));
-    stream.emit(46, { type: 'run_end', status: 'completed', text: 'Found two files: notes.md and report.pdf.', usage: {}, model: 'gpt', message: history[2] });
+    stream.emit(49, { type: 'run_end', status: 'completed', text: 'Found two files: notes.md and report.pdf.', usage: {}, model: 'gpt', message: history[2] });
 
     expect(screen.queryByRole('article', { name: 'Reply in progress' })).not.toBeInTheDocument();
     expect(screen.getByText('Found two files: notes.md and report.pdf.')).toBeVisible();
-    // The refreshed page settles the queued input.
     await waitFor(() => expect(screen.queryByText('Queued')).not.toBeInTheDocument());
   });
 
-  it('shows interrupted replies as visible terminal state without resubmitting', async () => {
+  it('keeps Shift+Enter and IME composition from sending', async () => {
+    const user = userEvent.setup();
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'POST /api/conversations/private/messages': (body) => ({ message: message(2, 'user', String(body.content), 'queued'), job_id: 9 }),
+    });
+    renderConversation('private');
+    const input = await screen.findByLabelText('Message');
+    await user.type(input, 'line one{Shift>}{Enter}{/Shift}line two');
+    expect(input).toHaveValue('line one\nline two');
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    fireEvent.compositionEnd(input);
+    expect(calls('POST', '/api/conversations/private/messages')).toEqual([]);
+    await user.type(input, '{Enter}');
+    expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: 'line one\nline two', attachment_ids: [] }]);
+  });
+
+  it('sends an uploaded attachment without text and shows it as a downloadable file card', async () => {
+    const user = userEvent.setup();
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'POST /api/attachments?scope=private': () => ({ attachment }),
+      'POST /api/conversations/private/messages': () => ({ message: { ...message(1, 'user', '', 'queued'), attachments: [attachment] }, job_id: 9 }),
+    });
+    renderConversation('private');
+    const send = await screen.findByRole('button', { name: 'Send' });
+    expect(send).toBeDisabled();
+    await user.upload(screen.getByTestId('composer-file'), new File(['notes'], 'notes.txt', { type: 'text/plain' }));
+    await waitFor(() => expect(send).toBeEnabled());
+    await user.click(send);
+    expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: '', attachment_ids: [17] }]);
+    expect(await screen.findByRole('link', { name: 'Download notes.txt' })).toHaveAttribute('href', '/api/attachments/17');
+    expect(screen.queryByRole('button', { name: 'Remove notes.txt' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(document.querySelector('iframe')).toHaveAttribute('src', '/api/attachments/17/preview');
+  });
+
+  it('accepts pasted files as attachments', async () => {
+    const attachment = { id: 18, filename: 'shot.png', mime_type: 'image/png', size_bytes: 2048, url: '/api/attachments/18', preview_url: null };
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'POST /api/attachments?scope=private': () => ({ attachment }),
+    });
+    renderConversation('private');
+    const input = await screen.findByLabelText('Message');
+    fireEvent.paste(input, { clipboardData: { files: [new File(['png'], 'shot.png', { type: 'image/png' })] } });
+    expect(await screen.findByText('2.0 KB')).toBeVisible();
+    expect(calls('POST', '/api/attachments?scope=private')).toHaveLength(1);
+  });
+
+  it('shows interrupted replies honestly and resends the original request only on request', async () => {
+    const user = userEvent.setup();
     const failed: Message = { ...message(5, 'assistant', 'Partial', 'interrupted'), metadata: { status: 'interrupted', error: 'Runtime restarted' } };
-    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => ({ messages: [message(4, 'user', 'Hi'), failed], next_before_id: null, last_seq: 7 }) });
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([message(4, 'user', 'Hi there', 'interrupted'), failed], { last_seq: 7 }),
+      'POST /api/conversations/channel-3/messages': (body) => ({ message: message(6, 'user', String(body.content), 'queued'), job_id: 9 }),
+    });
     renderConversation('channel-3');
 
-    expect(await screen.findByText('Interrupted — send again to retry')).toBeVisible();
+    expect(await screen.findByText('Interrupted')).toBeVisible();
     expect(screen.getByText('Runtime restarted')).toBeVisible();
     expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([]);
     expect(screen.queryByRole('button', { name: 'Computer' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Send again' }));
+    expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'Hi there', attachment_ids: [] }]);
   });
 
-  it('queues compaction during an active run and keeps it busy across later message enqueues', async () => {
+  it('stops the current run through the cancel API', async () => {
     const user = userEvent.setup();
-    const history = [message(1, 'user', 'Earlier work', 'running')];
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: history, next_before_id: null, last_seq: 0, compaction: null }),
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Long job', 'running')]),
+      'POST /api/conversations/private/cancel': () => ({ ok: true }),
+    });
+    renderConversation('private');
+    await user.click(await screen.findByRole('button', { name: 'Stop' }));
+    expect(calls('POST', '/api/conversations/private/cancel')).toEqual([{}]);
+  });
+
+  it('keeps channels read-only without the chat permission and names each author', async () => {
+    const theirs = { ...message(1, 'user', 'Release is ready'), metadata: { status: 'completed' as const, author_user_id: 2, author_display_name: 'Alex' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([theirs]) });
+    renderConversation('channel-3', { canSend: false, userId: 1 });
+    expect(await screen.findByText('Alex')).toBeVisible();
+    expect(screen.getByText('You can read this conversation but not post in it.')).toBeVisible();
+    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Conversation actions' })).not.toBeInTheDocument();
+  });
+
+  it('runs /compact from the composer and keeps compaction busy across later enqueues', async () => {
+    const user = userEvent.setup();
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Earlier work', 'running')]),
       'POST /api/conversations/private/compact': () => ({ ok: true, job_id: 20, status: 'queued' }),
       'POST /api/conversations/private/messages': () => ({ message: message(3, 'user', 'Later work', 'queued'), job_id: 21 }),
     });
     renderConversation('private');
-    await screen.findByText('Earlier work');
-    const compact = screen.getByRole('button', { name: 'Compact context' });
-    expect(compact).toBeEnabled();
-    await user.click(compact);
+    const input = await screen.findByLabelText('Message');
+    await user.type(input, '/comp');
+    expect(screen.getByRole('option', { name: /\/compact/ })).toBeVisible();
+    await user.keyboard('{Enter}');
+    expect(input).toHaveValue('');
+    expect(calls('POST', '/api/conversations/private/compact')).toEqual([{}]);
     const status = screen.getByRole('status', { name: 'Context compaction' });
-    expect(within(status).getByText('Queued')).toBeVisible();
-    expect(compact).toBeDisabled();
-    await user.type(screen.getByLabelText('Message'), 'Later work{Enter}');
+    expect(within(status).getByText(/Compaction queued/)).toBeVisible();
+    expect(await actionDisabled(user, 'Compact context')).toBe(true);
+
+    await user.type(input, 'Later work{Enter}');
     expect(await screen.findByText('Later work')).toBeVisible();
     FakeEventSource.instances[0].emit(1, { type: 'message', message: message(3, 'user', 'Later work', 'queued') });
-    expect(within(status).getByText('Queued')).toBeVisible();
-    expect(compact).toBeDisabled();
-    expect(calls('POST', '/api/conversations/private/compact')).toEqual([{}]);
+    expect(within(status).getByText(/Compaction queued/)).toBeVisible();
     expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: 'Later work', attachment_ids: [] }]);
   });
 
-  it('keeps manual compaction state when an older run-end history refresh arrives', async () => {
-    const user = userEvent.setup();
-    let refresh!: (value: unknown) => void;
-    let reads = 0;
-    serve({
-      'GET /api/conversations/private/messages?limit=100': () => ++reads === 1
-        ? { messages: [], next_before_id: null, last_seq: 0, compaction: null }
-        : new Promise((resolve) => { refresh = resolve; }),
-      'POST /api/conversations/private/compact': () => ({ ok: true, job_id: 20, status: 'queued' }),
-      'POST /api/conversations/private/cancel': () => ({ ok: true }),
-    });
-    renderConversation('private');
-    await screen.findByRole('button', { name: 'Send' });
-    const stream = FakeEventSource.instances[0];
-    stream.emit(1, { type: 'run_end' });
-    await user.click(screen.getByRole('button', { name: 'Compact context' }));
-    stream.emit(2, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting' });
-    await act(async () => refresh({ messages: [], next_before_id: null, last_seq: 1, compaction: null }));
-    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText('Compacting')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Compact context' })).toBeDisabled();
-    await user.click(screen.getByRole('button', { name: 'Stop' }));
-    expect(calls('POST', '/api/conversations/private/cancel')).toEqual([{}]);
-    stream.emit(3, { type: 'compaction', phase: 'end', job_id: 20, status: 'cancelled' });
-    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText('Cancelled')).toBeVisible();
-    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
-  });
-
   it.each([
-    ['done', undefined, 'Done'],
-    ['nothing_to_compact', 'too_small', 'Nothing to compact'],
-    ['interrupted', undefined, 'Interrupted'],
-    ['cancelled', undefined, 'Cancelled'],
+    ['done', undefined, /Context compacted/],
+    ['nothing_to_compact', 'too_small', /Nothing to compact/],
+    ['interrupted', undefined, /Compaction interrupted/],
+    ['cancelled', undefined, /Compaction cancelled/],
   ] as const)('settles manual compaction as %s independently of automatic compaction', async (status, reason, label) => {
     const user = userEvent.setup();
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: [], next_before_id: null, last_seq: 0, compaction: null }),
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'assistant', 'Hello')]),
       'POST /api/conversations/private/compact': () => ({ ok: true, job_id: 20, status: 'queued' }),
     });
     renderConversation('private');
-    await screen.findByRole('button', { name: 'Send' });
-    const compact = screen.getByRole('button', { name: 'Compact context' });
-    await user.click(compact);
+    await screen.findByText('Hello');
+    await chooseAction(user, 'Compact context');
     const manual = screen.getByRole('status', { name: 'Context compaction' });
     const stream = FakeEventSource.instances[0];
     stream.emit(1, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting' });
-    expect(within(manual).getByText('Compacting')).toBeVisible();
+    expect(within(manual).getByText('Compacting context')).toBeVisible();
     stream.emit(2, { type: 'compaction', phase: 'end', reason: 'auto' });
-    expect(within(manual).getByText('Compacting')).toBeVisible();
-    expect(compact).toBeDisabled();
+    expect(within(manual).getByText('Compacting context')).toBeVisible();
+    expect(await actionDisabled(user, 'Compact context')).toBe(true);
     stream.emit(3, { type: 'compaction', phase: 'end', job_id: 20, status, reason });
-    expect(within(manual).getByText(label)).toBeVisible();
-    if (reason === 'too_small') expect(within(manual).getByText('The conversation is too short to compact.')).toBeVisible();
-    expect(compact).toBeEnabled();
+    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(label)).toBeVisible();
+    expect(await actionDisabled(user, 'Compact context')).toBe(false);
     stream.emit(4, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting' });
-    expect(within(manual).getByText(label)).toBeVisible();
+    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(label)).toBeVisible();
   });
 
-  it('does not regress a finished SSE operation when the enqueue acknowledgement arrives late', async () => {
+  it('does not regress a finished operation when the enqueue acknowledgement arrives late', async () => {
     const user = userEvent.setup();
     let acknowledge!: (value: unknown) => void;
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: [], next_before_id: null, last_seq: 0, compaction: null }),
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'assistant', 'Hello')]),
       'POST /api/conversations/private/compact': () => new Promise((resolve) => { acknowledge = resolve; }),
     });
     renderConversation('private');
-    await screen.findByRole('button', { name: 'Send' });
-    const compact = screen.getByRole('button', { name: 'Compact context' });
-    await user.click(compact);
-    expect(compact).toBeDisabled();
-    await user.click(compact);
-    expect(calls('POST', '/api/conversations/private/compact')).toEqual([{}]);
+    await screen.findByText('Hello');
+    await chooseAction(user, 'Compact context');
     FakeEventSource.instances[0].emit(1, { type: 'compaction', phase: 'end', job_id: 20, status: 'done' });
     await act(async () => acknowledge({ ok: true, job_id: 20, status: 'queued' }));
-    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText('Done')).toBeVisible();
-    expect(compact).toBeEnabled();
+    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(/Context compacted/)).toBeVisible();
+    expect(await actionDisabled(user, 'Compact context')).toBe(false);
   });
 
   it.each([
-    ['queued', 'Queued', true],
-    ['compacting', 'Compacting', true],
-    ['done', 'Done', false],
-    ['nothing_to_compact', 'Nothing to compact', false],
-    ['interrupted', 'Interrupted', false],
-    ['cancelled', 'Cancelled', false],
+    ['queued', /Compaction queued/, true],
+    ['compacting', /Compacting context/, true],
+    ['done', /Context compacted/, false],
+    ['interrupted', /Compaction interrupted/, false],
   ] as const)('hydrates %s compaction after reload without creating a live reply', async (status, label, busy) => {
-    serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({
-        messages: [], next_before_id: null, last_seq: 15, compaction: { job_id: 20, status },
-      }),
-    });
-    const mounted = renderConversation('private');
-    await screen.findByRole('status', { name: 'Context compaction' });
-    mounted.unmount();
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([], { last_seq: 15, compaction: { job_id: 20, status } }) });
     renderConversation('private');
     const manual = await screen.findByRole('status', { name: 'Context compaction' });
     expect(within(manual).getByText(label)).toBeVisible();
     expect(screen.queryByRole('article', { name: 'Reply in progress' })).not.toBeInTheDocument();
-    if (busy) {
-      expect(screen.getByRole('button', { name: 'Compact context' })).toBeDisabled();
-      expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
-    } else {
-      expect(screen.getByRole('button', { name: 'Compact context' })).toBeEnabled();
-      expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
-    }
+    if (busy) expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
+    else expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
   });
 
   it('resets a channel conversation only after confirmation and reloads its history', async () => {
     const user = userEvent.setup();
-    let page = { messages: [message(1, 'user', 'Old question'), message(2, 'assistant', 'Old answer')], next_before_id: null, last_seq: 9 };
+    let history = page([message(1, 'user', 'Old question'), message(2, 'assistant', 'Old answer')], { last_seq: 9 });
     serve({
-      'GET /api/conversations/channel-3/messages?limit=100': () => page,
+      'GET /api/conversations/channel-3/messages?limit=100': () => history,
       'POST /api/conversations/channel-3/reset': () => {
-        page = { messages: [], next_before_id: null, last_seq: 12 };
+        history = page([], { last_seq: 12 });
         return { ok: true };
       },
     });
     renderConversation('channel-3');
+    await screen.findByText('Old answer');
 
-    await user.click(await screen.findByRole('button', { name: 'Reset' }));
+    await chooseAction(user, 'Reset conversation…');
     expect(screen.getByText('Reset this conversation?')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(calls('POST', '/api/conversations/channel-3/reset')).toEqual([]);
     expect(screen.getByText('Old answer')).toBeVisible();
 
-    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await chooseAction(user, 'Reset conversation…');
     await user.click(screen.getByRole('button', { name: 'Reset conversation' }));
     expect(calls('POST', '/api/conversations/channel-3/reset')).toEqual([{}]);
     await waitFor(() => expect(screen.queryByText('Old answer')).not.toBeInTheDocument());
@@ -322,11 +447,12 @@ describe('Conversation', () => {
     expect(FakeEventSource.instances[0].closed).toBe(true);
   });
 
-  it('acquires and releases browser takeover with one holder id', async () => {
+  it('acquires and releases browser takeover with one holder id, forwarding typed text while holding', async () => {
     const user = userEvent.setup();
     let lease: { holder_user_id: number; expires_at: string } | null = null;
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: [], next_before_id: null, last_seq: 0 }),
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'GET /api/workspace/files?path=': () => ({ files: [{ name: 'report.pdf', path: 'report.pdf', is_dir: false, size_bytes: 2048 }] }),
       'GET /api/browser': () => ({ tabs: [{ tabId: 'tab-1', url: 'https://example.com/login', title: 'Example login' }], lease }),
       'POST /api/browser/lease': () => {
         lease = { holder_user_id: 1, expires_at: '2026-09-30T09:01:00Z' };
@@ -340,29 +466,31 @@ describe('Conversation', () => {
     });
     renderConversation('private');
 
-    await user.click(await screen.findByRole('button', { name: 'Computer' }));
-    expect(await screen.findByRole('img', { name: 'Example login' })).toHaveAttribute('src', expect.stringContaining('/api/browser/screenshot?tab_id=tab-1'));
-    expect(screen.getByText('The agent is using the browser')).toBeVisible();
+    const panel = await screen.findByRole('complementary', { name: 'Computer' });
+    expect(await within(panel).findByRole('img', { name: 'Browser screen: Example login' })).toHaveAttribute('src', expect.stringContaining('/api/browser/screenshot?tab_id=tab-1'));
+    expect(within(panel).getByText('Idle')).toBeVisible();
+    expect(await within(panel).findByRole('link', { name: 'Download report.pdf' })).toHaveAttribute('href', '/api/workspace/download?path=report.pdf');
 
-    await user.click(screen.getByRole('button', { name: 'Take control' }));
-    expect(await screen.findByText('You are controlling the browser')).toBeVisible();
+    await user.click(within(panel).getByRole('button', { name: 'Take control' }));
+    const viewer = await screen.findByRole('dialog', { name: 'Example login' });
     const [acquired] = calls('POST', '/api/browser/lease') as { holder_id: string }[];
     expect(acquired.holder_id).toEqual(expect.any(String));
 
-    await user.type(screen.getByLabelText('Text to type'), 'alice');
-    await user.click(screen.getByRole('button', { name: 'Type' }));
+    await user.type(within(viewer).getByLabelText('Text to type'), 'alice');
+    await user.click(within(viewer).getByRole('button', { name: 'Type' }));
     expect(calls('POST', '/api/browser/action')).toEqual([{ holder_id: acquired.holder_id, action: 'type', arguments: { tab_id: 'tab-1', text: 'alice', mode: 'keyboard' } }]);
 
-    await user.click(screen.getByRole('button', { name: 'Hand back to agent' }));
-    expect(await screen.findByText('The agent is using the browser')).toBeVisible();
-    expect(calls('DELETE', '/api/browser/lease')).toEqual([{ holder_id: acquired.holder_id }]);
-    expect(screen.getByRole('button', { name: 'Take control' })).toBeEnabled();
+    await user.click(within(viewer).getByRole('button', { name: 'Hand back to agent' }));
+    await waitFor(() => expect(calls('DELETE', '/api/browser/lease')).toEqual([{ holder_id: acquired.holder_id }]));
+    await user.keyboard('{Escape}');
+    expect(await within(panel).findByRole('button', { name: 'Take control' })).toBeEnabled();
   });
 
   it('reports a competing takeover instead of pretending to hold the browser', async () => {
     const user = userEvent.setup();
     serve({
-      'GET /api/conversations/private/messages?limit=100': () => ({ messages: [], next_before_id: null, last_seq: 0 }),
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'GET /api/workspace/files?path=': () => ({ files: [] }),
       'GET /api/browser': () => ({ tabs: [], lease: { holder_user_id: 2, expires_at: '2026-09-30T09:01:00Z' } }),
       'POST /api/browser/lease': () => {
         throw new Error('Browser is controlled by someone else');
@@ -370,10 +498,10 @@ describe('Conversation', () => {
     });
     renderConversation('private');
 
-    await user.click(await screen.findByRole('button', { name: 'Computer' }));
-    expect(await screen.findByText('A person is controlling the browser')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Take control' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Browser is controlled by someone else');
-    expect(screen.queryByText('You are controlling the browser')).not.toBeInTheDocument();
+    const panel = await screen.findByRole('complementary', { name: 'Computer' });
+    expect(await within(panel).findByText('Someone else is in control')).toBeVisible();
+    await user.click(within(panel).getByRole('button', { name: 'Take control' }));
+    expect(await within(panel).findByRole('alert')).toHaveTextContent('Browser is controlled by someone else');
+    expect(screen.queryByRole('button', { name: 'Hand back to agent' })).not.toBeInTheDocument();
   });
 });

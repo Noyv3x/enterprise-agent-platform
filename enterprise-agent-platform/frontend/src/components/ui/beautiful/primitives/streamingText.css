@@ -1,0 +1,172 @@
+/* StreamingText answer typography. Upstream renders plain paragraphs (13.5px / 1.65, --ink, harness StreamLine);
+ * agent answers are Markdown, so block elements follow the same scale: headings step up in weight not size,
+ * inline code is the Chip atom (inset, chip radius, mono 12px), tables are hairline grids like RecordsTable,
+ * and display math scrolls instead of overflowing the column. Only upstream tokens are used. */
+
+.bui-prose {
+  overflow-wrap: anywhere;
+}
+
+.bui-prose > * + * {
+  margin-top: 0.75em;
+}
+
+.bui-prose :where(h1, h2, h3, h4, h5, h6) {
+  margin-top: 1.25em;
+  color: var(--ink);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.bui-prose > :where(h1, h2, h3, h4, h5, h6):first-child {
+  margin-top: 0;
+}
+
+.bui-prose h1 {
+  font-size: 17px;
+}
+
+.bui-prose h2 {
+  font-size: 15.5px;
+}
+
+.bui-prose :where(h3, h4, h5, h6) {
+  font-size: 14px;
+}
+
+.bui-prose :where(strong, b) {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.bui-prose a {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--accent-ink) 35%, transparent);
+  text-underline-offset: 2px;
+  transition: text-decoration-color 150ms ease;
+}
+
+.bui-prose a:hover {
+  text-decoration-color: currentColor;
+}
+
+.bui-prose :where(ul, ol) {
+  padding-left: 1.35em;
+}
+
+.bui-prose ul {
+  list-style: disc;
+}
+
+.bui-prose ol {
+  list-style: decimal;
+}
+
+.bui-prose li + li,
+.bui-prose li > :where(ul, ol) {
+  margin-top: 0.3em;
+}
+
+.bui-prose .contains-task-list {
+  list-style: none;
+  padding-left: 0.25em;
+}
+
+.bui-prose .task-list-item input {
+  margin-right: 6px;
+  accent-color: var(--ink);
+  vertical-align: -1px;
+}
+
+.bui-prose li::marker {
+  color: var(--ink-3);
+}
+
+.bui-prose li > p + p {
+  margin-top: 0.5em;
+}
+
+.bui-prose blockquote {
+  border-left: 2px solid var(--line-strong);
+  padding-left: 12px;
+  color: var(--ink-2);
+}
+
+.bui-prose hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin-block: 1.25em;
+}
+
+/* inline code — the Chip atom */
+.bui-prose :where(p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, a, strong, em) > code {
+  border-radius: var(--radius-chip);
+  background: var(--inset);
+  box-shadow: var(--shadow-hairline);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 1px 5px;
+}
+
+/* tables — hairline grid on the card surface */
+.bui-prose .bui-table {
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+
+.bui-prose table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bui-prose th {
+  background: var(--inset);
+  color: var(--ink-2);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.bui-prose :where(th, td) {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 12px;
+  vertical-align: top;
+}
+
+.bui-prose tr:last-child td {
+  border-bottom: 0;
+}
+
+.bui-prose :where(th, td) + :where(th, td) {
+  border-left: 1px solid var(--line);
+}
+
+/* KaTeX — display math scrolls inside the column */
+.bui-prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-block: 4px;
+}
+
+.bui-prose .katex {
+  font-size: 1.05em;
+}
+
+/* the caret sits at the live edge of the last block */
+.bui-prose .stream-caret {
+  margin-left: 2px;
+}
+
+@media (forced-colors: active) {
+  .bui-prose .bui-table {
+    border: 1px solid CanvasText;
+  }
+}

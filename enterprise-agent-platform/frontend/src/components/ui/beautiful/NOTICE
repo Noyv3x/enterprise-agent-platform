@@ -1,34 +1,31 @@
-Beautiful UI source adaptation
-Upstream: https://www.beautifului.dev (shadcn registry https://www.beautifului.dev/r/registry.json,
-source https://github.com/slev12397/beautiful-ui). Copyright (c) 2026 Shane Levine, MIT license:
-LICENSE in this directory; distributed copy: public/licenses/beautiful-ui-MIT.txt.
+Beautiful UI source
+Upstream: https://www.beautifului.dev (component library for AI interfaces; shadcn registry
+https://www.beautifului.dev/r/registry.json), source https://github.com/slev12397/beautiful-ui at 44a274e.
+Copyright (c) 2026 Shane Levine, MIT license: LICENSE in this directory; distributed copy:
+public/licenses/beautiful-ui-MIT.txt.
 
-Vendored close to upstream:
-  Button.tsx      atoms/Button.tsx (accent variant uses the brand's contrast-checked foreground)
-  GlideMenu.tsx   primitives/GlideMenu.tsx
-  Loading.tsx     primitives/LoadingState.tsx grid + atoms/Shimmer.tsx (caller-supplied label/elapsed; no demo timer or video)
-  highlight.tsx   primitives/CodeBlock.tsx highlighter
-  Icon.tsx        the inline stroke icon and glyph paths used across the primitives
-  foundation.css  app/beautifui/foundation.css tokens, @theme mappings, keyframes, StreamText caret, status pills;
-                  semantic tokens read the Fieldwork palette; dark mode follows data-wf-theme; the smooth shadow
-                  stacks are shadow-plugin's (Florian Kiem, MIT)
+Layout
+  foundation.css  upstream app/globals.css "GENERIC FOUNDATION": tokens (:root, .dark), @theme, base rules,
+                  primitive-* spacing utilities and shared keyframes. Smooth shadow stacks come from
+                  shadow-plugin (Florian Kiem, MIT). Fonts are self-hosted latin subsets instead of next/font;
+                  the gallery's striped page, showcase gestures and docs-nav scroller are omitted; reduced-motion,
+                  forced-colors and CJK tracking floors are appended. Accessibility: ink-3 is lifted to the 3:1
+                  non-text floor on every ground (light 0.695→0.619, dark 0.541→0.582 OKLCH lightness), and small
+                  informational text uses ink-2 (≥ 4.5:1); `color-scheme` follows the `.dark` theme.
+  atoms/          upstream components/atoms, with the `cn` import path and "use client" adjusted.
+                  Switch and SegmentedControl use non-submit buttons so form settings change without submitting;
+                  further component-specific accessibility adaptations are documented inline.
+  primitives/     upstream components/primitives. Each primitive keeps upstream markup, class names, tokens,
+                  radii and motion. Allowed adaptations: demo data and scripted timers replaced by props and
+                  callbacks carrying real state; i18n strings and accessibility; commercial Central Icons replaced
+                  by open icons; remote images, sounds and marketing removed. A primitive's COMPONENT-SPECIFIC CSS
+                  block from upstream globals.css sits next to it. TaskRows scopes detail IDs to each instance
+                  so repeated task keys in separate lists retain correct accessibility associations.
+  controls/       platform controls upstream does not ship (inputs, select, dialog, sheet, notice, empty state),
+                  composed only from upstream tokens and primitives.
 
-Production adaptations of primitive markup (real state, i18n, accessibility; no gallery data, timers,
-scripted output, remote artwork or commercial icons):
-  ThinkingState + ToolChips  -> chat/AgentWorkCard.tsx (work trace, rows, evidence)
-  LoadingState               -> chat/AgentTyping.tsx, fieldwork LoadingState
-  PromptBar                  -> fieldwork ComposerFrame, chat Send/Attach buttons, @ and / menus, file chips, context meter
-  StreamingText / StreamText -> message action icons, streaming caret
-  CodeBlock                  -> chat/MarkdownContent.tsx fenced code
-  ApprovalCard               -> fieldwork ApprovalPanel
-  SidebarNav                 -> fieldwork WorkspaceNav (Central Icons replaced by platform glyphs)
-  ChatComposer header tabs   -> fieldwork SectionIndex
-  TaskRows "List"            -> resource lists and status pills (design-system.css)
-  SearchList empty state     -> fieldwork EmptyState
-  InsightCards               -> fieldwork FactGrid stat tiles
-  atoms Button/Switch/SegmentedControl/Chip -> Ant Design Button, Switch, Segmented and Tag theme values
-                                (ink primary and "on" state, soft danger fill, pill track, filled chip)
-  app layout                 -> floating work panel beside the sidebar (design-system.css .wf-frame/.wf-main)
+npm packages used by upstream primitives: liveline (InsightCards charts, MIT), glimm (PromptBar accent sweep,
+MIT), shadow-plugin (MIT).
 
 Fonts: Inter and JetBrains Mono latin subsets are self-hosted from @fontsource-variable packages
 (SIL Open Font License 1.1: public/licenses/inter-OFL.txt, public/licenses/jetbrains-mono-OFL.txt);

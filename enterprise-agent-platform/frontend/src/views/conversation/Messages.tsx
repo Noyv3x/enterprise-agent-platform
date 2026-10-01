@@ -1,13 +1,17 @@
-import { ComputerOutput, Glyph, MessageEntry, Spinner, StatusMark, type GlyphName } from "../../components/ui/fieldwork";
+import { EntityChip } from "../../components/ui/beautiful/atoms/EntityChip";
+import { StatusPill } from "../../components/ui/beautiful/atoms/StatusPill";
+import LoadingState from "../../components/ui/beautiful/primitives/LoadingState";
+import StreamingText, { type StreamingAction } from "../../components/ui/beautiful/primitives/StreamingText";
+import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
-import { AttachmentItem } from "./Attachments";
+import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
-import type { LiveRun, Message, ToolActivity } from "./types";
-
-type Words = (en: string, zhCN?: string, zhTW?: string) => string;
+import type { LiveRun, Message } from "./types";
+import { messageWork, splitLive } from "./work";
+import { WorkView } from "./WorkView";
 
 /** `MEDIA: /workspace/x` lines stay in stored text; the attachment card replaces the ones it delivered. */
-function visibleContent(message: Message): string {
+export function visibleContent(message: Message): string {
   if (!message.attachments.length) return message.content;
   const names = new Set(message.attachments.map((attachment) => attachment.filename));
   return message.content
@@ -20,143 +24,133 @@ function visibleContent(message: Message): string {
     .trim();
 }
 
-function author(message: Message): string | null {
+function authorName(message: Message): string | null {
   const name = message.metadata.author_display_name;
   return typeof name === "string" && name ? name : null;
 }
 
-function StoredActivity({ work }: { work: unknown }) {
-  const w = useWords();
-  if (!work || typeof work !== "object" || !("activity" in work) || !Array.isArray(work.activity)) return null;
-  return <div aria-label={w("Recorded activity", "已记录的活动", "已記錄的活動")}>
-    {work.activity.map((entry: unknown, index: number) => {
-      if (!entry || typeof entry !== "object" || !("stage" in entry)) return null;
-      const detail = "detail" in entry && typeof entry.detail === "string" ? entry.detail : "";
-      const line = "line" in entry && typeof entry.line === "string" ? entry.line : "";
-      if (entry.stage === "assistant.message") return <Markdown key={index} content={detail || line} />;
-      if (entry.stage === "work.truncated") return <p key={index} className="cv-footnote">
-        {w("Earlier activity was omitted", "部分早期活动已省略", "部分早期活動已省略")}
-        {"omitted_events" in entry && typeof entry.omitted_events === "number" ? ` (${entry.omitted_events})` : ""}
-      </p>;
-      if (entry.stage !== "tool" || !("tool" in entry) || typeof entry.tool !== "string") return null;
-      const status = "tool_status" in entry ? entry.tool_status : null;
-      const statusLabel = status === "completed" ? w("Completed", "已完成", "已完成")
-        : status === "failed" ? w("Failed", "失败", "失敗")
-          : status === "running" ? w("Recorded as running", "记录为运行中", "記錄為執行中") : "";
-      const parameters = "parameters" in entry && entry.parameters && typeof entry.parameters === "object"
-        ? JSON.stringify(entry.parameters, null, 2) : "";
-      const result = "result" in entry && typeof entry.result === "string" ? entry.result : "";
-      return <details className="cv-tool" key={index}>
-        <summary>
-          <Glyph name="terminal" size={16} />
-          <span className="cv-tool-label">{entry.tool}</span>
-          {(detail || line) && <span className="cv-tool-summary wf-mono">{detail || line}</span>}
-          {statusLabel && <StatusMark subtle tone={status === "failed" ? "danger" : "neutral"}>{statusLabel}</StatusMark>}
-        </summary>
-        {(parameters || result) && <ComputerOutput kind="terminal"><pre>{[parameters, result].filter(Boolean).join("\n\n")}</pre></ComputerOutput>}
-      </details>;
-    })}
-  </div>;
+const AUTHOR_COLORS = ["var(--accent)", "var(--orange)", "var(--green)", "var(--red)", "var(--ink-2)"];
+
+function authorColor(message: Message): string {
+  const id = typeof message.metadata.author_user_id === "number" ? message.metadata.author_user_id : 0;
+  return AUTHOR_COLORS[Math.abs(id) % AUTHOR_COLORS.length];
 }
 
-export function MessageView({ message, showAuthor }: { message: Message; showAuthor: boolean }) {
+function timeLabel(message: Message): string {
+  return new Date(message.created_at).toLocaleString(intlLocale(), { dateStyle: "medium", timeStyle: "short" });
+}
+
+/** Harness UserBubble; channel messages name their author, and other people's messages sit on the left. */
+export function UserBubble({ message, showAuthor, mine, queuePosition }: {
+  message: Message;
+  showAuthor: boolean;
+  mine: boolean;
+  /** 1-based FIFO position while queued */
+  queuePosition?: number;
+}) {
   const w = useWords();
-  const status = message.metadata.status;
   const content = visibleContent(message);
-  const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const name = showAuthor && message.role === "user" ? author(message) : null;
+  const name = showAuthor ? authorName(message) : null;
+  const status = message.metadata.status;
   return (
-    <MessageEntry
-      kind={message.role === "assistant" ? "agent" : message.role}
-      header={name ? <span className="wf-message-author">{name}</span> : undefined}
-      work={message.role === "assistant" && message.metadata.agent_work ? <StoredActivity work={message.metadata.agent_work} /> : undefined}
-      attachments={message.attachments.length ? message.attachments.map((attachment) => <AttachmentItem key={attachment.id} attachment={attachment} />) : undefined}
-      footnote={
-        <span className="cv-footnote">
-          <time className="wf-message-time" dateTime={message.created_at}>{time}</time>
-          {status === "queued" && <StatusMark subtle>{w("Queued", "排队中", "排隊中")}</StatusMark>}
-          {status === "running" && <StatusMark subtle busy>{w("In progress", "处理中", "處理中")}</StatusMark>}
-          {status === "cancelled" && <StatusMark subtle>{w("Stopped", "已停止", "已停止")}</StatusMark>}
-          {status === "interrupted" && <StatusMark tone="warning" subtle>{w("Interrupted — send again to retry", "已中断，可重新发送", "已中斷，可重新傳送")}</StatusMark>}
-          {typeof message.metadata.error === "string" && message.metadata.error && <span className="cv-error-text">{message.metadata.error}</span>}
-        </span>
-      }
+    <div
+      className={`flex flex-col gap-1.5 ${mine ? "items-end pl-10 sm:pl-24" : "items-start pr-10 sm:pr-24"}`}
+      style={{ animation: "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" }}
     >
-      {message.role === "assistant" ? <Markdown content={content} /> : <div className="cv-plain">{content}</div>}
-    </MessageEntry>
-  );
-}
-
-function argText(args: Record<string, unknown>, key: string): string {
-  const value = args[key];
-  return typeof value === "string" ? value : "";
-}
-
-function describeTool(tool: ToolActivity, w: Words): { glyph: GlyphName; kind: "file" | "terminal" | "search"; label: string; summary: string; input: string } {
-  const { args } = tool;
-  const path = argText(args, "path");
-  switch (tool.name) {
-    case "bash":
-      return { glyph: "terminal", kind: "terminal", label: w("Ran command", "运行命令", "執行命令"), summary: argText(args, "command"), input: `$ ${argText(args, "command")}` };
-    case "write":
-      return { glyph: "file", kind: "file", label: w("Wrote file", "写入文件", "寫入檔案"), summary: path, input: argText(args, "content") };
-    case "edit":
-      return { glyph: "file", kind: "file", label: w("Edited file", "编辑文件", "編輯檔案"), summary: path, input: JSON.stringify(args.edits ?? { oldText: args.oldText, newText: args.newText }, null, 2) };
-    case "read":
-      return { glyph: "file", kind: "file", label: w("Read file", "读取文件", "讀取檔案"), summary: path, input: "" };
-    case "ls":
-    case "find":
-    case "grep":
-      return { glyph: "search", kind: "file", label: w("Searched files", "查找文件", "尋找檔案"), summary: [argText(args, "pattern"), path].filter(Boolean).join("  "), input: "" };
-    case "web_search":
-      return { glyph: "search", kind: "search", label: w("Searched the web", "搜索网页", "搜尋網頁"), summary: argText(args, "query"), input: "" };
-    case "web_fetch":
-      return { glyph: "browser", kind: "search", label: w("Opened page", "打开网页", "開啟網頁"), summary: argText(args, "url"), input: "" };
-    case "browser":
-      return { glyph: "browser", kind: "search", label: w("Used browser", "使用浏览器", "使用瀏覽器"), summary: [argText(args, "action"), argText(args, "url")].filter(Boolean).join("  "), input: "" };
-    case "schedule":
-      return { glyph: "schedule", kind: "terminal", label: w("Schedules", "定时任务", "排程任務"), summary: argText(args, "action"), input: JSON.stringify(args, null, 2) };
-    default:
-      return { glyph: "sparkle", kind: "terminal", label: tool.name, summary: [argText(args, "server"), argText(args, "tool")].filter(Boolean).join(" · "), input: JSON.stringify(args, null, 2) };
-  }
-}
-
-function ToolRow({ tool }: { tool: ToolActivity }) {
-  const w = useWords();
-  const view = describeTool(tool, w);
-  const body = [view.input, tool.output].filter(Boolean).join("\n\n");
-  return (
-    <details className="cv-tool">
-      <summary>
-        <Glyph name={view.glyph} size={16} />
-        <span className="cv-tool-label">{view.label}</span>
-        {view.summary && <span className="cv-tool-summary wf-mono">{view.summary}</span>}
-        {tool.state === "running" && <StatusMark subtle busy>{w("Running", "进行中", "進行中")}</StatusMark>}
-        {tool.state === "error" && <StatusMark tone="danger" subtle>{w("Failed", "失败", "失敗")}</StatusMark>}
-      </summary>
-      {body ? <ComputerOutput kind={view.kind}><pre>{body}</pre></ComputerOutput> : null}
-    </details>
-  );
-}
-
-export function LiveRunView({ run }: { run: LiveRun }) {
-  const w = useWords();
-  const hasText = run.items.some((item) => item.kind === "text" && item.text);
-  const status = run.notice === "retry" ? w("Connection hiccup, retrying…", "连接波动，正在重试…", "連線不穩，正在重試…")
-    : run.notice === "compaction" ? w("Compacting context…", "正在压缩上下文…", "正在壓縮上下文…")
-      : hasText ? null : w("Working…", "处理中…", "處理中…");
-  return (
-    <MessageEntry kind="agent" streaming label={w("Reply in progress", "回复生成中", "回覆產生中")}>
-      {run.thinking && (
-        <details className="cv-thinking">
-          <summary>{w("Thinking", "思考过程", "思考過程")}</summary>
-          <div className="cv-plain">{run.thinking}</div>
-        </details>
+      {name && <EntityChip name={name} color={authorColor(message)} className="mx-0" />}
+      {message.attachments.length > 0 && <AttachmentCards attachments={message.attachments} />}
+      {content && (
+        <div title={timeLabel(message)} className="max-w-full rounded-xl bg-field px-3.5 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-ink shadow-hairline [overflow-wrap:anywhere]">
+          {content}
+        </div>
       )}
-      {run.items.map((item, index) => item.kind === "tool"
-        ? <ToolRow key={item.id} tool={item} />
-        : <Markdown key={`text-${index}`} content={item.text} />)}
-      {status && <div className="cv-working" role="status"><Spinner size={14} />{status}</div>}
-    </MessageEntry>
+      {status === "queued" && (
+        <span className="text-[12px] text-ink-2">
+          {queuePosition && queuePosition > 1
+            ? w(`Queued · ${queuePosition - 1} ahead`, `排队中 · 前面还有 ${queuePosition - 1} 条`, `排隊中 · 前面還有 ${queuePosition - 1} 則`)
+            : w("Queued", "排队中", "排隊中")}
+        </span>
+      )}
+    </div>
   );
+}
+
+/** A finished (or stopped) agent reply: its work trace, the answer, files, and the action row. */
+export function AssistantMessage({ message }: { message: Message }) {
+  const w = useWords();
+  const content = visibleContent(message);
+  const trace = messageWork(message);
+  const status = message.metadata.status;
+  const error = typeof message.metadata.error === "string" ? message.metadata.error : "";
+  const stopped = status === "interrupted" || status === "cancelled";
+  const actions: StreamingAction[] = [];
+  if (content) {
+    actions.push({
+      key: "copy", icon: "copy", label: w("Copy reply", "复制回复", "複製回覆"), doneLabel: w("Copied", "已复制", "已複製"),
+      onClick: () => navigator.clipboard.writeText(message.content),
+    });
+  }
+  return (
+    <article className="flex min-w-0 flex-col gap-2" aria-label={w("Agent reply", "智能体回复", "智慧體回覆")} style={{ animation: "fade-up 450ms cubic-bezier(0.23,1,0.32,1) both" }}>
+      {trace && <WorkView trace={trace} working={false} />}
+      <StreamingText
+        streaming={false}
+        actions={actions}
+        status={stopped ? (
+          <>
+            <StatusPill tone={status === "interrupted" ? "orange" : "neutral"} className="h-5.5 text-[12px]">
+              {status === "interrupted" ? w("Interrupted", "已中断", "已中斷") : w("Stopped", "已停止", "已停止")}
+            </StatusPill>
+            {error && <span className="text-[12px] text-ink-2 [overflow-wrap:anywhere]">{error}</span>}
+          </>
+        ) : undefined}
+      >
+        {content ? <Markdown content={content} /> : undefined}
+      </StreamingText>
+      {message.attachments.length > 0 && <AttachmentCards attachments={message.attachments} />}
+    </article>
+  );
+}
+
+/** The reply streaming right now: live work (open, shimmering) above the answer with its caret. */
+export function LiveReply({ run }: { run: LiveRun }) {
+  const w = useWords();
+  const { work, answer } = splitLive(run.items);
+  const notice = run.notice === "retry" ? w("Connection hiccup, retrying", "连接波动，正在重试", "連線不穩，正在重試")
+    : run.notice === "compaction" ? w("Compacting context", "正在压缩上下文", "正在壓縮上下文") : null;
+  return (
+    <article className="flex min-w-0 flex-col gap-2" aria-label={w("Reply in progress", "回复生成中", "回覆產生中")} aria-busy="true">
+      {work.length > 0 && (
+        <WorkView trace={{ items: work, startedAt: run.startedAt, endedAt: null, truncated: false, omitted: 0 }} working={!answer} />
+      )}
+      {answer && (
+        <StreamingText streaming>
+          <Markdown content={answer} streaming />
+        </StreamingText>
+      )}
+      {(notice || (!work.length && !answer)) && (
+        <div className="flex min-h-6 items-center">
+          <LoadingState variant="Dots" label={notice ?? w("Thinking", "思考中", "思考中")} since={run.startedAt} />
+        </div>
+      )}
+    </article>
+  );
+}
+
+/** Waiting for the first event of an accepted message: queued behind other work, or starting. */
+export function PendingReply({ since, queued }: { since: number; queued: boolean }) {
+  const w = useWords();
+  return (
+    <div className="flex min-h-6 items-center" style={{ animation: "fade-in 200ms ease-out both" }}>
+      <LoadingState
+        variant="Dots"
+        since={since}
+        label={queued ? w("Waiting in queue", "排队等待中", "排隊等待中") : w("Starting", "正在开始", "正在開始")}
+      />
+    </div>
+  );
+}
+
+export function SystemLine({ message }: { message: Message }) {
+  return <p className="text-center text-[12px] text-ink-2">{message.content}</p>;
 }

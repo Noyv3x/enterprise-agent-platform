@@ -17,7 +17,7 @@ from starlette.requests import Request
 
 from enterprise_agent_platform.db import Database, now
 from enterprise_agent_platform.auth import issue_session
-from enterprise_agent_platform.queue import Queue, authenticated_events, routes
+from enterprise_agent_platform.queue import Queue, _WorkTrace, authenticated_events, routes
 
 
 class Gate:
@@ -64,6 +64,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.hold = asyncio.Event()
         self.hold.set()
         self.loss = False
+        self.runtime_events = None
+        self.runtime_stream = None
 
         async def runtime(request):
             self.calls.append((request.method, request.url.path))
@@ -72,6 +74,12 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 await self.hold.wait()
                 return httpx.Response(202, json={"run_id": f"r{len(self.requests)}"})
             if request.url.path.endswith("/events"):
+                if self.runtime_stream is not None:
+                    return httpx.Response(200, stream=self.runtime_stream)
+                if self.runtime_events is not None:
+                    return httpx.Response(200, text="".join(
+                        "data: " + json.dumps({"seq": seq, **event}) + "\n\n"
+                        for seq, event in enumerate(self.runtime_events, 1)))
                 events = [{"seq": 1, "type": "text_delta", "delta": "answer"}]
                 if not self.loss:
                     events.append({"seq": 2, "type": "run_end", "status": "completed", "text": "answer", "model": "model-a",
@@ -131,6 +139,225 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("without run_end", message["metadata"]["error"])
         self.assertIn(("POST", "/v1/sessions/agent-private-1/cancel"), self.calls)
         self.assertEqual(self.q.active, 0)
+
+    def test_work_exact_field_bounds_do_not_truncate(self):
+        trace = _WorkTrace()
+        args = {"command": "x" * (2000 - len(json.dumps({"command": ""})))}
+        for event in [
+            {"type": "thinking_delta", "delta": "t" * 4000},
+            {"type": "text_delta", "delta": "p" * 4000},
+            {"type": "tool_start", "tool_call_id": "exact", "name": "bash", "args": args},
+            {"type": "tool_end", "tool_call_id": "exact", "is_error": False,
+             "content_preview": [{"type": "text", "text": "o" * 2000}]},
+        ]:
+            trace.add(event)
+        work = trace.finish()
+        self.assertFalse(work["truncated"])
+        self.assertEqual(work["items"][0]["text"], "t" * 4000)
+        self.assertEqual(work["items"][1]["text"], "p" * 4000)
+        self.assertEqual(work["items"][2]["args"], args)
+        self.assertEqual(work["items"][2]["output"], "o" * 2000)
+
+    async def run_work(self, events, status="completed"):
+        self.runtime_events = list(events)
+        if status is not None:
+            self.runtime_events.append({"type": "run_end", "status": status, "text": "Final answer"})
+        await self.q.enqueue(self.user, "private", "Inspect the report")
+        await self.drain()
+        return self.q.messages(self.user, "private")["messages"][-1]
+
+    async def test_work_preserves_arrival_order_and_excludes_final_answer(self):
+        message = await self.run_work([
+            {"type": "thinking_delta", "delta": "Read "},
+            {"type": "thinking_delta", "delta": "the report"},
+            {"type": "text_delta", "delta": "Checking "},
+            {"type": "text_delta", "delta": "the figures"},
+            {"type": "tool_start", "tool_call_id": "read", "name": "read", "args": {"path": "report.csv"}},
+            {"type": "thinking_delta", "delta": "Compare totals"},
+            {"type": "tool_start", "tool_call_id": "sum", "name": "bash", "args": {"command": "sum report.csv"}},
+            {"type": "tool_update", "tool_call_id": "read",
+             "partial": {"content": [{"type": "text", "text": "Reading…"}]}},
+            {"type": "tool_end", "tool_call_id": "sum", "is_error": False,
+             "content_preview": [{"type": "text", "text": "Total: "}, {"type": "text", "text": "42"}]},
+            {"type": "tool_end", "tool_call_id": "read", "is_error": False,
+             "content_preview": [{"type": "text", "text": "Rows: 3"}]},
+            {"type": "text_delta", "delta": "Final answer"},
+            {"type": "thinking_delta", "delta": "Ready to respond"},
+        ])
+        work = message["metadata"]["work"]
+        self.assertEqual(work["v"], 1)
+        self.assertFalse(work["truncated"])
+        self.assertLessEqual(work["started_at"], work["ended_at"])
+        items = work["items"]
+        self.assertEqual([(item["type"], item.get("text", item.get("id"))) for item in items], [
+            ("thinking", "Read the report"), ("text", "Checking the figures"), ("tool", "read"),
+            ("thinking", "Compare totals"), ("tool", "sum"), ("thinking", "Ready to respond")])
+        for item, name, args, output in [
+            (items[2], "read", {"path": "report.csv"}, "Rows: 3"),
+            (items[4], "bash", {"command": "sum report.csv"}, "Total: 42"),
+        ]:
+            self.assertEqual((item["name"], item["args"], item["status"], item["output"]),
+                             (name, args, "done", output))
+            self.assertLessEqual(item["started_at"], item["ended_at"])
+        self.assertEqual(message["content"], "Final answer")
+        stream = self.q.events(self.user, "private", 0)
+        try:
+            async with asyncio.timeout(2):
+                async for frame in stream:
+                    event = json.loads(frame.split(b"data: ", 1)[1])
+                    if event["type"] == "run_end":
+                        self.assertEqual(event["message"], message)
+                        break
+        finally:
+            await stream.aclose()
+        self.assertNotIn("work", self.q.messages(self.user, "private")["messages"][0]["metadata"])
+        with self.p.db.connect() as conn:
+            payload = json.loads(conn.execute("SELECT payload_json FROM durable_jobs").fetchone()[0])
+        self.assertNotIn('"work"', json.dumps(payload))
+
+    async def test_work_tool_errors_and_unfinished_tools_survive_run_outcomes(self):
+        for runtime_status, message_status in [
+            ("completed", "completed"), ("failed", "interrupted"), ("cancelled", "cancelled"),
+            (None, "interrupted"),
+        ]:
+            with self.subTest(status=runtime_status):
+                message = await self.run_work([
+                    {"type": "tool_start", "tool_call_id": "ok", "name": "read", "args": {}},
+                    {"type": "tool_end", "tool_call_id": "ok", "is_error": False,
+                     "content_preview": [{"type": "text", "text": "Read complete"}]},
+                    {"type": "tool_start", "tool_call_id": "bad", "name": "bash", "args": {}},
+                    {"type": "tool_end", "tool_call_id": "bad", "is_error": True,
+                     "content_preview": [{"type": "text", "text": "Permission denied"}]},
+                    {"type": "tool_start", "tool_call_id": "pending", "name": "bash", "args": {}},
+                    {"type": "tool_update", "tool_call_id": "pending",
+                     "partial": {"content": [{"type": "text", "text": "Partial result"}]}},
+                ], runtime_status)
+                self.assertEqual(message["metadata"]["status"], message_status)
+                items = message["metadata"]["work"]["items"]
+                self.assertEqual([(item["id"], item["status"], item["output"]) for item in items], [
+                    ("ok", "done", "Read complete"), ("bad", "error", "Permission denied"),
+                    ("pending", "cancelled", "Partial result")])
+                self.assertIsNone(items[2]["ended_at"])
+
+    async def test_work_is_absent_for_empty_and_text_only_runs(self):
+        for events in ([], [{"type": "text_delta", "delta": "Final answer"}]):
+            with self.subTest(events=events):
+                message = await self.run_work(events)
+                self.assertNotIn("work", message["metadata"])
+
+    async def test_worker_cancellation_keeps_work_already_received(self):
+        received = asyncio.Event()
+        never = asyncio.Event()
+
+        class PausedStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                events = [
+                    {"seq": 1, "type": "thinking_delta", "delta": "Inspecting"},
+                    {"seq": 2, "type": "tool_start", "tool_call_id": "pending", "name": "read", "args": {}},
+                    {"seq": 3, "type": "tool_update", "tool_call_id": "pending",
+                     "partial": {"content": [{"type": "text", "text": "First page"}]}},
+                ]
+                yield "".join("data: " + json.dumps(event) + "\n\n" for event in events).encode()
+                received.set()
+                await never.wait()
+
+        self.runtime_stream = PausedStream()
+        await self.q.enqueue(self.user, "private", "Read the report")
+        await asyncio.wait_for(received.wait(), 2)
+        for task in list(self.q.tasks.values()):
+            task.cancel()
+        await asyncio.gather(*list(self.q.tasks.values()), return_exceptions=True)
+        message = self.q.messages(self.user, "private")["messages"][-1]
+        self.assertEqual(message["metadata"]["status"], "interrupted")
+        items = message["metadata"]["work"]["items"]
+        self.assertEqual(items[0], {"type": "thinking", "text": "Inspecting"})
+        self.assertEqual((items[1]["id"], items[1]["status"], items[1]["output"]),
+                         ("pending", "cancelled", "First page"))
+        self.assertIsNone(items[1]["ended_at"])
+
+    async def test_work_individual_bounds_preserve_prefixes(self):
+        args = {"command": "x" * 2100}
+        original_add = _WorkTrace.add
+
+        def checked_add(trace, event):
+            original_add(trace, event)
+            if event["type"] == "tool_update":
+                self.assertEqual(trace.data["items"][2]["output"], "u" * 2000)
+
+        with patch.object(_WorkTrace, "add", checked_add):
+            message = await self.run_work([
+                {"type": "thinking_delta", "delta": "t" * 3999},
+                {"type": "thinking_delta", "delta": "ail"},
+                {"type": "text_delta", "delta": "p" * 3999},
+                {"type": "text_delta", "delta": "ost"},
+                {"type": "tool_start", "tool_call_id": "large", "name": "bash", "args": args},
+                {"type": "tool_update", "tool_call_id": "large",
+                 "partial": {"content": [{"type": "text", "text": "u" * 2100}]}},
+                {"type": "tool_end", "tool_call_id": "large", "is_error": False,
+                 "content_preview": [{"type": "text", "text": "f" * 2100}]},
+            ])
+        self.assertEqual(message["metadata"]["status"], "completed")
+        work = message["metadata"]["work"]
+        self.assertEqual(work["items"][0]["text"], "t" * 3999 + "a")
+        self.assertEqual(work["items"][1]["text"], "p" * 3999 + "o")
+        self.assertEqual(work["items"][2]["args"], {"_preview": json.dumps(args)[:2000]})
+        self.assertEqual(work["items"][2]["output"], "f" * 2000)
+        self.assertTrue(work["truncated"])
+
+    async def test_work_item_count_is_bounded_during_streaming_and_at_finish(self):
+        original_add = _WorkTrace.add
+
+        def checked_add(trace, event):
+            original_add(trace, event)
+            self.assertLessEqual(len(trace.data["items"]), 200)
+
+        with patch.object(_WorkTrace, "add", checked_add):
+            message = await self.run_work([
+                {"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}}
+                for index in range(205)
+            ])
+        self.assertEqual(message["metadata"]["status"], "completed")
+        work = message["metadata"]["work"]
+        self.assertEqual([item["id"] for item in work["items"]], [str(index) for index in range(200)])
+        self.assertTrue(work["truncated"])
+        self.assertTrue(all(item["status"] == "cancelled" for item in work["items"]))
+
+    async def test_work_global_json_byte_bound_applies_during_streaming_including_unicode(self):
+        original_add = _WorkTrace.add
+
+        def checked_add(trace, event):
+            original_add(trace, event)
+            self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), 96 * 1024)
+
+        for text in ("x" * 4000, "漢😀" * 2000):
+            with self.subTest(unicode=text.startswith("漢")):
+                events = [
+                    {"type": "tool_start", "tool_call_id": "retained", "name": "read", "args": {}},
+                    {"type": "tool_update", "tool_call_id": "retained",
+                     "partial": {"content": [{"type": "text", "text": "First page"}]}},
+                ]
+                for index in range(40):
+                    events.extend([
+                        {"type": "thinking_delta", "delta": text},
+                        {"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}},
+                        {"type": "tool_end", "tool_call_id": str(index), "is_error": False,
+                         "content_preview": [{"type": "text", "text": "done"}]},
+                    ])
+                is_error = text.startswith("漢")
+                events.append({"type": "tool_end", "tool_call_id": "retained", "is_error": is_error,
+                               "content_preview": [{"type": "text", "text": "😀" * 2000}]})
+                with patch.object(_WorkTrace, "add", checked_add):
+                    message = await self.run_work(events)
+                self.assertEqual(message["metadata"]["status"], "completed")
+                work = message["metadata"]["work"]
+                self.assertLessEqual(len(json.dumps(work).encode("utf-8")), 96 * 1024)
+                self.assertTrue(work["truncated"])
+                self.assertEqual(work["items"][1], {"type": "thinking", "text": text})
+                retained = work["items"][0]
+                self.assertEqual((retained["id"], retained["status"]),
+                                 ("retained", "error" if is_error else "done"))
+                self.assertIsNotNone(retained["ended_at"])
+                self.assertEqual(retained["output"], "First page")
 
     async def test_restart_resumes_queued_never_running(self):
         self.q.stopping = True

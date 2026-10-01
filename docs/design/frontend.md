@@ -1,13 +1,13 @@
 # Frontend
 
-React/TypeScript/Vite keeps the existing Fieldwork and Beautiful UI design system. The [Platform API](../reference/platform-api.md) is the sole frontend wire contract; the browser does not call Runtime or Manager directly.
+React/TypeScript/Vite builds every surface from [Beautiful UI](https://www.beautifului.dev/), an MIT component library for AI interfaces, used as source rather than imitated (see [组件与视觉系统](#组件与视觉系统)). The [Platform API](../reference/platform-api.md) is the sole frontend wire contract; the browser does not call Runtime or Manager directly.
 
 ## Views
 
-- Login and shell: Personal AI, Channels, Chat, Schedules, Admin and Settings. Keep neutral branding, theme and all three locales.
-- Conversations: durable history, streaming text/thinking and tool activity, uploads, document previews and downloadable generated `MEDIA:` files. Sending during a run queues FIFO; there is no input joining or live file draft.
+- Login and shell: Personal AI, Channels, Chat, Schedules, Admin and Settings in the sidebar. Keep neutral branding, theme and all three locales.
+- Conversations: durable history, streaming text/thinking and tool activity, uploads, document previews and downloadable generated `MEDIA:` files. Thinking and tool calls stay visible after the reply finishes and after reload, from the persisted work trace (and, read-only, from older `agent_work` records). Sending during a run queues FIFO; there is no input joining or live file draft.
 - Personal computer panel: browser screenshot preview, acquire/release human takeover and workspace file list/download. A held lease makes agent browser actions busy. Channels and chat have no browser panel.
-- Chat: conversation list, create/rename/delete and model picker restricted to the user's allowed models. Each chat has a working directory in the user's shared lightweight sandbox; bash can access that user's other chat files.
+- Chat: conversation list in the sidebar's chat section (search, create, rename, delete) and a model picker in the composer restricted to the user's allowed models. Each chat has a working directory in the user's shared lightweight sandbox; bash can access that user's other chat files.
 - Schedules: create/edit/pause/resume/delete/run-now and occurrence history for personal AI. No continue/complete decision UI.
 - Admin: users and permission groups, personal model/thinking settings, allowed/default chat model policy, branding, models/Codex OAuth, system/update controls and token usage including cache-hit ratio.
 - Settings: kept account/preferences behavior with shared branding/theme/localization.
@@ -19,6 +19,12 @@ Use Platform history and its stream contract, not Runtime transcript export, as 
 Remove memory/skills management panels, approvals, execution-review/needs-review controls, todo/delegation/background views, drafts, Telegram/mail and learning-review UI. AGENTS.md and SKILL.md are files managed with normal agent tools, not separate panels.
 
 Server authorization remains authoritative even when controls are hidden. Preserve user input and reading position during streaming, navigation and locale/theme changes. Static assets ship with Platform: index is no-cache, hashed assets immutable, with available gzip/Brotli variants.
+
+- Chat lists and model policy are scoped to the authenticated account. Logout/session expiry invalidates cached and in-flight results. Deleting a chat permanently deletes its working-directory files; confirmations state both consequences.
+- Keep composer text and uploads when the first activity changes an empty conversation into a thread. Resend belongs to the originating stopped user request, not assistant completion order.
+- Switches and timing segments change drafts only; saving requires the form's explicit submit action. Schedule actions serialize globally, and history refresh errors remain visible alongside cached runs.
+- Browser tabs can be inspected without takeover. Expanded computer viewers sit above their parent sheet but below their popovers; Escape closes only the innermost layer.
+- Malformed chat hashes follow the unavailable-route path. Disclosure IDs are unique per component instance, and every mobile sidebar selection dismisses navigation, including the current route.
 
 ## Branding
 
@@ -39,20 +45,34 @@ Use neutral defaults (`Agent Platform`, `Agent`), shared theme tokens and same-o
 
 ### Beautiful UI
 
-[Beautiful UI](https://www.beautifului.dev/)（MIT）是全站唯一的视觉语言。源码、改编说明和许可在 `frontend/src/components/ui/beautiful/`，许可文件随 `public/licenses/` 分发。
+[Beautiful UI](https://www.beautifului.dev/)（MIT，源码 <https://github.com/slev12397/beautiful-ui>）是一个面向 AI 界面的前端组件资源库，也是全站的设计规则。界面直接使用它的源码，不再自制近似版本或另起一套设计层。源码、改编说明和许可在 `frontend/src/components/ui/beautiful/`（`NOTICE`），许可文件随 `public/licenses/` 分发。
 
-- 以下界面采用其源码的生产化改编：工作过程、等待状态、输入框、代码块、侧栏、分区标签、资源列表与状态标签、消息操作按钮和流式光标。
-- 改编后的组件只接收真实状态、本地化文案和回调，不包含演示数据、定时脚本、远程图片或付费图标。
-- 应用布局：侧栏在页面底色上，工作区是一块浮起的圆角面板；窄屏时工作区铺满。
-- 管理页、设置和面板里的通用元素也使用 Beautiful UI 的样式：墨色主按钮、柔和底色的危险按钮、墨色开关、胶囊分段控件、安静的提示卡、居中的空状态、统计卡片。输入框和按钮分开放，不拼接在一起。
-- 面板（抽屉）内的页面标题由面板标题代替，不重复显示。
-- Beautiful UI 没有的交互控件（表单校验、选择器、弹窗、抽屉、表格、上传）继续用 Ant Design 提供行为，外观通过主题设计值对齐；不复制 Ant 内部结构，也不用高优先级样式硬覆盖。
+- 来源：`foundation.css` 是上游 `app/globals.css` 的通用基础（设计值、浅色/深色、基础规则、间距工具、动画关键帧）；`atoms/` 是上游原子组件；`primitives/` 是上游组件，各组件的专属样式跟组件放在一起。
+- 改编只允许：演示数据和定时脚本换成真实数据与回调；接入三种语言和无障碍；付费图标（Central Icons）换成开源图标；去掉远程图片、音效和营销内容。标记结构、类名、设计值、圆角（标签 6、控件 8、卡片 10、窗口 14）、细线边框、阴影和动效保持上游原样。
+- 应用布局采用上游的 harness：底色（canvas）上是可收起的侧栏（SidebarNav），工作区是一块浮起的窗口（page 底色、窗口圆角、细线边框）；窄屏时侧栏变为抽屉，窗口铺满。
+- 组件对应：
+
+  | 界面 | Beautiful UI 组件 |
+  | --- | --- |
+  | 侧栏、对话列表与搜索 | SidebarNav、SearchList、GlideMenu |
+  | 对话消息 | ThinkingState（思考与步骤）、ToolChips（工具调用）、StreamingText 与 StreamText（回答、流式光标、操作）、CodeBlock、LoadingState、ContextCards（附件） |
+  | 输入框 | PromptBar（附件、斜杠命令、模型选择、发送与停止） |
+  | 电脑面板 | AgentScreen |
+  | 计划任务 | TaskRows、FilterTable |
+  | 用户、权限组、频道 | RecordsTable、FilterTable |
+  | 用量 | InsightCards |
+  | 系统与更新 | TaskRows、StatusPill |
+  | 品牌设置 | FineTuneCard |
+  | 通用元素 | Button、Switch、SegmentedControl、Chip、EntityChip、ValuePill、StatusPill、ProgressRing、Shimmer |
+
+- 上游没有的通用控件（单行与多行输入、下拉选择、对话框、侧拉面板、提示条、空状态）放在 `beautiful/controls/`，只用上游设计值和现有组件组合（GlideMenu 下拉、FineTuneCard 的字段样式、Button、SearchList 的空状态），外观与上游一致。不使用 Ant Design。
+- 品牌色写入上游的 accent 设计值（链接、焦点、发送按钮和少量强调），文字对比度自动保证；主按钮和开关的开启态仍是墨色。
 - 共享组件不直接调用 API，也不自造数据。
 
 ### 排版、颜色与可访问性底线
 
 - 字体：随静态资源分发 Inter 和 JetBrains Mono 的拉丁字符部分，不请求第三方字体；中文、中文标点和其它字符使用系统字体。等宽字体只用于代码、命令、时间和标识。
-- 颜色：使用 Beautiful UI 的中性冷灰语义色，浅色、深色两套。主操作按钮和开关的开启态是墨色；品牌色用于发送按钮、链接、焦点和少量强调；导航选中态为中性灰。
+- 颜色：使用 Beautiful UI 的中性冷灰语义色，浅色、深色两套（`.dark`）。主操作按钮和开关的开启态是墨色；品牌色用于发送按钮、链接、焦点和少量强调；导航选中态为中性灰。
 - 对比度：所有文字在其所在底色上至少 4.5:1，包括品牌色文字和状态色。状态不能只靠颜色区分。
 - 触屏和窄屏上所有可点区域至少 44px。
 - 系统开启高对比度（强制颜色）模式时，依靠阴影区分的表面要补上实线边框。

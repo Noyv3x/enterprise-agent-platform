@@ -1,3 +1,5 @@
+import type { WorkItem } from "./work";
+
 export interface Attachment {
   id: number;
   filename: string;
@@ -33,24 +35,11 @@ export interface MessagePage {
   compaction: Compaction | null;
 }
 
-export interface ToolActivity {
-  kind: "tool";
-  id: string;
-  name: string;
-  args: Record<string, unknown>;
-  output: string;
-  state: "running" | "done" | "error";
-}
-
-export interface TextSegment {
-  kind: "text";
-  text: string;
-}
-
 /** The agent turn currently streaming over SSE, in arrival order; it becomes a persisted message at `run_end`. */
 export interface LiveRun {
-  items: (TextSegment | ToolActivity)[];
-  thinking: string;
+  items: WorkItem[];
+  /** epoch ms the first event of this run arrived */
+  startedAt: number;
   notice: "retry" | "compaction" | null;
 }
 

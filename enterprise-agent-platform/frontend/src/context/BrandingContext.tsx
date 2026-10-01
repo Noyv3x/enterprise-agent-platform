@@ -10,8 +10,11 @@ import {
 } from "react";
 import { useI18n } from "../i18n";
 import type { BrandingSnapshot } from "../types";
+import { brandAccentCss } from "./brandAccent";
 
 export const BRANDING_CACHE_KEY = "agent-platform.branding:v1";
+/** <style> element carrying the brand-derived accent tokens. */
+export const BRAND_ACCENT_STYLE_ID = "brand-accent";
 export const DEFAULT_BRANDING: BrandingSnapshot = Object.freeze({
   schema_version: 1,
   revision: 0,
@@ -241,11 +244,18 @@ export function BrandingProvider({ children }: { children: ReactNode }) {
       "content",
       t("app.description", { product: branding.product_name }),
     );
-    document.documentElement.style.setProperty("--deployment-brand", branding.primary_color);
-    return () => {
-      document.documentElement.style.removeProperty("--deployment-brand");
-    };
   }, [branding, locale, t]);
+
+  // The brand color drives Beautiful UI's accent tokens for both themes (contrast-clamped, see brandAccent.ts).
+  useEffect(() => {
+    let style = document.getElementById(BRAND_ACCENT_STYLE_ID);
+    if (!style) {
+      style = document.createElement("style");
+      style.id = BRAND_ACCENT_STYLE_ID;
+      document.head.append(style);
+    }
+    style.textContent = brandAccentCss(branding.primary_color);
+  }, [branding.primary_color]);
 
   const value = useMemo(() => ({ branding, applyBranding }), [applyBranding, branding]);
   return <BrandingContext.Provider value={value}>{children}</BrandingContext.Provider>;

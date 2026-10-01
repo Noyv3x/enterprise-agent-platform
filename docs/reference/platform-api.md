@@ -20,6 +20,30 @@ All paths are same-origin. JSON requests/responses; errors `{ "error": "message"
 - GET `/api/conversations/{scope}/events?after=<seq>` → SSE.
 - Message: `{id,role:"user"|"assistant"|"system",content,metadata,created_at,attachments:[]}`. Metadata includes `status:"queued"|"running"|"completed"|"interrupted"|"cancelled"`, optional error.
 
+### Assistant message work trace
+
+Assistant messages may include `metadata.work` v1. It is stored only in the assistant message metadata, not a separate work table; the terminal `run_end.message` and history pages expose the same object:
+
+```json
+{
+  "v": 1,
+  "started_at": "2026-10-01T09:00:00+00:00",
+  "ended_at": "2026-10-01T09:00:03+00:00",
+  "items": [
+    {"type": "thinking", "text": "Inspect the report first."},
+    {"type": "text", "text": "I will read the report."},
+    {"type": "tool", "id": "call_1", "name": "read", "args": {"path": "report.txt"}, "status": "done", "output": "Revenue increased.", "started_at": "2026-10-01T09:00:01+00:00", "ended_at": "2026-10-01T09:00:02+00:00"}
+  ],
+  "truncated": false
+}
+```
+
+- Times are ISO-8601 UTC. Items retain arrival order; consecutive thinking deltas merge, and consecutive text deltas merge. The final answer is `message.content`, never repeated in work: text items after the last tool item are dropped (including all text items if there is no tool).
+- Tool fields are `type:"tool"`, `id`, `name`, `args`, `status`, `output`, `started_at`, and `ended_at`. Status is `done`, `error`, or `cancelled`; unfinished tools become `cancelled` at termination, with `ended_at:null`. Output previews use text parts from Runtime tool results, including partial updates when interrupted.
+- Bounds apply during streaming: each thinking/text item is at most 4,000 characters; tool args JSON is at most 2,000 characters or is replaced with `{"_preview":"<first 2,000 chars of the JSON>"}`; tool output is at most 2,000 characters; at most 200 items and at most 96 KiB of UTF-8 JSON for the whole object. `truncated:true` means any bound applied.
+- Omit `work` if no items remain. Completed, failed (exposed as `interrupted`), cancelled and interrupted runs retain whatever work arrived, including a Platform interruption after partial streaming.
+- Older messages may carry `metadata.agent_work.activity` from the previous system. Render those records read-only, without restoring removed actions. Older releases ignore the unknown `work` metadata key; the Pi-native reader before `af47c14` decodes and returns the metadata object without a closed-key schema. No database schema migration is required.
+
 ## Standard chat
 - GET `/api/chat/models` → `{allowed_models:[string],default_model_id:string}`.
 - GET `/api/chat/conversations` → `{conversations:[Conversation]}`; POST same `{title?,model_id?}` → `{conversation}`.

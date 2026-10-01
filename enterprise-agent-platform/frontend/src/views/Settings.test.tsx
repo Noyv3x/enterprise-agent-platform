@@ -5,7 +5,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { User } from '../api';
-import { FieldworkProvider } from '../components/ui/fieldwork';
+import { ThemeProvider } from '../context/ThemeContext';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../i18n';
 import { Settings } from './Settings';
 
@@ -26,7 +26,7 @@ const alice: User = {
 };
 
 function renderSettings(onSaved = vi.fn()) {
-  render(<I18nProvider><FieldworkProvider mode="light" motion={false}><Settings user={alice} onSaved={onSaved} /></FieldworkProvider></I18nProvider>);
+  render(<I18nProvider><ThemeProvider><Settings user={alice} onSaved={onSaved} /></ThemeProvider></I18nProvider>);
   return onSaved;
 }
 

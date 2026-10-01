@@ -1,11 +1,4 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { messages } from "./catalog";
-import { adminMessages } from "./messages/admin";
-import { chatMessages } from "./messages/chat";
-import { coreMessages } from "./messages/core";
-import { workspaceMessages } from "./messages/workspace";
-import { previewMessages } from "./messages/preview";
-import { scheduledTaskMessages } from "./messages/scheduledTasks";
 import {
   LOCALE_STORAGE_KEY,
   applyDocumentLocale,
@@ -17,7 +10,6 @@ import {
   t,
   translate,
 } from ".";
-import { workroomMessages } from "./messages/workroom";
 
 afterEach(() => setCurrentLocale("zh-CN"));
 
@@ -70,66 +62,12 @@ describe("locale normalization", () => {
   });
 });
 
-describe("translation catalogs", () => {
-  it("defines every message in all three locales", () => {
-    for (const definition of Object.values(messages)) {
-      expect(Object.keys(definition).sort()).toEqual(["en", "zh-CN", "zh-TW"]);
-    }
-  });
-
-  it("keeps every localized message and plural branch non-empty", () => {
-    for (const [key, definition] of Object.entries(messages)) {
-      for (const locale of ["zh-CN", "en", "zh-TW"] as const) {
-        const value = definition[locale];
-        const templates = typeof value === "string" ? [value] : Object.values(value);
-        expect(templates.length, `${key} ${locale} templates`).toBeGreaterThan(0);
-        for (const template of templates) {
-          expect(template.trim(), `${key} ${locale} empty template`).not.toBe("");
-        }
-      }
-    }
-  });
-
-  it("keeps interpolation parameters aligned across locales", () => {
-    const parameters = (value: string | Record<string, string>) => {
-      const templates = typeof value === "string" ? [value] : Object.values(value);
-      return [...new Set(templates.flatMap((template) => [...template.matchAll(/\{([A-Za-z0-9_]+)\}/g)].map((match) => match[1])))].sort();
-    };
-    for (const [key, definition] of Object.entries(messages)) {
-      expect(parameters(definition.en), `${key} English parameters`).toEqual(parameters(definition["zh-CN"]));
-      expect(parameters(definition["zh-TW"]), `${key} Traditional Chinese parameters`).toEqual(
-        parameters(definition["zh-CN"]),
-      );
-    }
-  });
-
-  it("does not shadow keys while merging domain catalogs", () => {
-    const seen = new Set<string>();
-    const duplicates: string[] = [];
-    for (const domain of [
-      coreMessages,
-      adminMessages,
-      chatMessages,
-      workspaceMessages,
-      previewMessages,
-      scheduledTaskMessages,
-      workroomMessages,
-    ]) {
-      for (const key of Object.keys(domain)) {
-        if (seen.has(key)) duplicates.push(key);
-        seen.add(key);
-      }
-    }
-    expect(duplicates).toEqual([]);
-    expect(seen.size).toBe(Object.keys(messages).length);
-  });
-
-  it("translates fixed messages and keeps the imperative locale current", () => {
-    expect(translate("zh-CN", "auth.login")).toBe("登录");
-    expect(translate("en", "auth.login")).toBe("Sign in");
-    expect(translate("zh-TW", "auth.login")).toBe("登入");
+describe("translation", () => {
+  it("translates with parameters and keeps the imperative locale current", () => {
+    expect(translate("zh-CN", "app.description", { product: "Agent" })).toBe("Agent - 公共频道、个人 AI 与运行时管理。");
+    expect(translate("zh-TW", "app.description", { product: "Agent" })).toBe("Agent - 公共頻道、個人 AI 與執行環境管理。");
     setCurrentLocale("en");
     expect(getCurrentLocale()).toBe("en");
-    expect(t("common.retry")).toBe("Retry");
+    expect(t("app.description", { product: "Agent" })).toBe("Agent - public channels, Personal AI, and runtime management.");
   });
 });

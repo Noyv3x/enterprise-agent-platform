@@ -1,0 +1,57 @@
+/* COMPONENT-SPECIFIC — FilterTable, from Beautiful UI app/globals.css (MIT). Electric status-pill colors.
+ * Platform additions: a `failed` and a `neutral` pill on the same base-hue derivation, light-mode text mixed
+ * further toward ink so every hue clears 4.5:1 on its tint, and 44px chip targets on coarse pointers. */
+.filter-status-todo,
+.filter-status-progress,
+.filter-status-done,
+.filter-status-failed,
+.filter-status-neutral {
+  border: 1px solid transparent;
+}
+
+/* Status pills share the same base-hue → color-mix derivation as .records-tag,
+ * so both components stay consistent across light and dark. */
+.filter-status-todo {
+  --tag-base: oklch(0.757 0.153 66.401);
+}
+.filter-status-progress {
+  --tag-base: oklch(0.671 0.118 219.351);
+}
+.filter-status-done {
+  --tag-base: oklch(0.652 0.131 162.865);
+}
+.filter-status-failed {
+  --tag-base: oklch(0.64 0.19 27);
+}
+.filter-status-neutral {
+  --tag-base: oklch(0.6 0.01 264);
+}
+
+.filter-status-todo,
+.filter-status-progress,
+.filter-status-done,
+.filter-status-failed,
+.filter-status-neutral {
+  color: color-mix(in srgb, var(--tag-base) 45%, var(--ink));
+  background: color-mix(in srgb, var(--tag-base) 20%, var(--surface));
+  border-color: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+}
+
+/* Dark mode — a richer, saturated same-hue fill
+ * with bright same-hue text and no visible border (light mode keeps the soft
+ * tinted pastels above). Platform: text mixes 45% white (upstream 14%) so every hue clears 4.5:1 on its fill. */
+.dark .filter-status-todo,
+.dark .filter-status-progress,
+.dark .filter-status-done,
+.dark .filter-status-failed,
+.dark .filter-status-neutral {
+  color: color-mix(in srgb, var(--tag-base) 55%, white);
+  background: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+  border-color: color-mix(in srgb, var(--tag-base) 34%, var(--surface));
+}
+
+@media (pointer: coarse), (max-width: 640px) {
+  .filter-chip {
+    min-height: 44px;
+  }
+}

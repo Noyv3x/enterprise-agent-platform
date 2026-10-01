@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { request } from "../../api";
 import { conversationBase } from "./routes";
-import type { Compaction, LiveRun, Message, MessagePage, ToolActivity } from "./types";
+import type { Compaction, LiveRun, Message, MessagePage } from "./types";
 
 const PAGE = 100;
 const EVENT_TYPES = ["message", "text_delta", "thinking_delta", "tool_start", "tool_update", "tool_end", "retry", "compaction", "run_end"] as const;
@@ -36,7 +36,7 @@ type Action =
   | { type: "older"; page: MessagePage }
   | { type: "upsert"; messages: Message[] }
   | { type: "compactQueued"; compaction: Compaction }
-  | { type: "event"; event: StreamEvent };
+  | { type: "event"; event: StreamEvent; at: number };
 
 const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null };
 
@@ -71,7 +71,7 @@ function latestCompaction(current: Compaction | null, incoming: Compaction): Com
   return incoming;
 }
 
-function applyEvent(state: State, event: StreamEvent): State {
+function applyEvent(state: State, event: StreamEvent, at: number): State {
   if (event.type === "message") return { ...state, messages: upsert(state, [event.message]) };
   if (event.type === "run_end") return { ...state, live: null, messages: event.message ? upsert(state, [event.message]) : state.messages };
   if (event.type === "compaction" && event.job_id !== undefined && event.status !== undefined) {
@@ -80,26 +80,35 @@ function applyEvent(state: State, event: StreamEvent): State {
   }
   // Automatic Pi compaction is run activity, never the durable manual operation.
   if (event.type === "compaction" && event.phase === "end" && state.live === null) return state;
-  const live: LiveRun = state.live ?? { items: [], thinking: "", notice: null };
+  const live: LiveRun = state.live ?? { items: [], startedAt: at, notice: null };
   const items = [...live.items];
   const last = items[items.length - 1];
   switch (event.type) {
     case "text_delta":
-      if (last?.kind === "text") items[items.length - 1] = { kind: "text", text: last.text + event.delta };
-      else items.push({ kind: "text", text: event.delta });
+    case "thinking_delta": {
+      const type = event.type === "text_delta" ? "text" : "thinking";
+      // Consecutive deltas of one kind merge into one item, as in the persisted trace.
+      if (last?.type === type) items[items.length - 1] = { type, text: last.text + event.delta };
+      else items.push({ type, text: event.delta });
       return { ...state, live: { ...live, items, notice: null } };
-    case "thinking_delta":
-      return { ...state, live: { ...live, thinking: live.thinking + event.delta, notice: null } };
+    }
     case "tool_start":
-      items.push({ kind: "tool", id: event.tool_call_id, name: event.name, args: event.args ?? {}, output: "", state: "running" });
+      items.push({ type: "tool", id: event.tool_call_id, name: event.name, args: event.args ?? {}, output: "", status: "running", startedAt: at, endedAt: null });
       return { ...state, live: { ...live, items, notice: null } };
     case "tool_update":
-    case "tool_end": {
-      const change = (tool: ToolActivity): ToolActivity => event.type === "tool_update"
-        ? { ...tool, output: outputText(event.partial) }
-        : { ...tool, output: outputText(event.content_preview) || tool.output, state: event.is_error ? "error" : "done" };
-      return { ...state, live: { ...live, items: items.map((item) => (item.kind === "tool" && item.id === event.tool_call_id ? change(item) : item)) } };
-    }
+    case "tool_end":
+      return {
+        ...state,
+        live: {
+          ...live,
+          items: items.map((item) => {
+            if (item.type !== "tool" || item.id !== event.tool_call_id) return item;
+            return event.type === "tool_update"
+              ? { ...item, output: outputText(event.partial) }
+              : { ...item, output: outputText(event.content_preview) || item.output, status: event.is_error ? "error" : "done", endedAt: at };
+          }),
+        },
+      };
     case "retry":
       return { ...state, live: { ...live, notice: "retry" } };
     case "compaction":
@@ -125,7 +134,7 @@ function reducer(state: State, action: Action): State {
     case "compactQueued":
       return { ...state, compaction: latestCompaction(state.compaction, action.compaction) };
     case "event":
-      return applyEvent(state, action.event);
+      return applyEvent(state, action.event, action.at);
   }
 }
 
@@ -165,7 +174,7 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
       } catch {
         return;
       }
-      dispatch({ type: "event", event });
+      dispatch({ type: "event", event, at: Date.now() });
       if (event.type === "run_end") {
         // Queued inputs change status without their own events; refresh the latest page once per run.
         request<MessagePage>(`${base}/messages?limit=${PAGE}`)

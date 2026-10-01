@@ -4,9 +4,9 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { FieldworkProvider } from '../components/ui/fieldwork';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../i18n';
 import { Chat } from './Chat';
+import { resetChatStore } from './chat/chatStore';
 import type { ChatConversation } from './conversation/types';
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
@@ -26,96 +26,126 @@ type Route = (body: Record<string, unknown>) => unknown;
 function serve(routes: Record<string, Route>) {
   api.request.mockImplementation(async (path: string, options: RequestInit = {}) => {
     const method = options.method ?? 'GET';
-    if (method === 'GET' && /^\/api\/chat\/conversations\/[^/]+\/messages\?limit=100$/.test(path)) return { messages: [], next_before_id: null, last_seq: 0 };
+    if (method === 'GET' && /^\/api\/chat\/conversations\/[^/]+\/messages\?limit=100$/.test(path)) return { messages: [], next_before_id: null, last_seq: 0, compaction: null };
     const route = routes[`${method} ${path}`];
     if (!route) throw new Error(`unexpected ${method} ${path}`);
-    return route(options.body ? JSON.parse(String(options.body)) : {});
+    return route(typeof options.body === 'string' ? JSON.parse(options.body) : {});
   });
 }
 
 function calls(method: string, path: string): unknown[] {
   return api.request.mock.calls
     .filter(([calledPath, options]) => calledPath === path && (options?.method ?? 'GET') === method)
-    .map(([, options]) => (options?.body ? JSON.parse(String(options.body)) : undefined));
+    .map(([, options]) => (typeof options?.body === 'string' ? JSON.parse(options.body) : undefined));
 }
 
 function conversation(id: string, title: string, model_id: string): ChatConversation {
   return { id, user_id: 1, title, model_id, created_at: '2026-09-30T09:00:00Z', updated_at: '2026-09-30T09:00:00Z', deleted_at: null };
 }
 
-function renderChat() {
-  return render(<I18nProvider><FieldworkProvider mode="light" motion={false}><Chat /></FieldworkProvider></I18nProvider>);
+const policy = { allowed_models: ['gpt-small', 'gpt-large'], default_model_id: 'gpt-large' };
+
+function renderChat(id?: string) {
+  return render(<I18nProvider><Chat id={id} userName="Ada" /></I18nProvider>);
 }
 
 describe('Chat', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetChatStore();
     FakeEventSource.urls = [];
     vi.stubGlobal('EventSource', FakeEventSource);
     window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en');
+    window.location.hash = '';
   });
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
   });
 
-  it('creates a chat on the default model and opens its conversation', async () => {
+  it('creates the conversation on the first send with the picked model, posts the message, then opens it', async () => {
     const user = userEvent.setup();
     serve({
       'GET /api/chat/conversations': () => ({ conversations: [] }),
-      'GET /api/chat/models': () => ({ allowed_models: ['gpt-small', 'gpt-large'], default_model_id: 'gpt-large' }),
+      'GET /api/chat/models': () => policy,
       'POST /api/chat/conversations': (body) => ({ conversation: conversation('c-new', '', String(body.model_id)) }),
+      'POST /api/chat/conversations/c-new/messages': (body) => ({ message: { id: 1, role: 'user', content: body.content, metadata: { status: 'queued' }, created_at: '2026-09-30T09:00:00Z', attachments: [] }, job_id: 3 }),
     });
     renderChat();
 
-    expect(await screen.findByText('Start a chat')).toBeVisible();
-    await user.click(screen.getAllByRole('button', { name: 'New chat' })[0]);
+    expect(await screen.findByText('Hello Ada')).toBeVisible();
+    expect(calls('POST', '/api/chat/conversations')).toEqual([]);
+    await user.click(screen.getByRole('button', { name: 'Model: gpt-large' }));
+    await user.click(screen.getByRole('menuitemradio', { name: /gpt-small/ }));
+    await user.type(screen.getByLabelText('Message'), 'Plan a trip{Enter}');
 
-    expect(calls('POST', '/api/chat/conversations')).toEqual([{ model_id: 'gpt-large' }]);
-    expect(await screen.findByRole('heading', { name: 'New chat' })).toBeVisible();
-    await waitFor(() => expect(FakeEventSource.urls).toEqual(['/api/chat/conversations/c-new/events?after=0']));
-    expect(screen.getByRole('combobox')).toHaveValue('gpt-large');
-    expect(screen.queryByRole('button', { name: 'Computer' })).not.toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe('#chat-c-new'));
+    expect(calls('POST', '/api/chat/conversations')).toEqual([{ model_id: 'gpt-small', title: 'New chat' }]);
+    expect(calls('POST', '/api/chat/conversations/c-new/messages')).toEqual([{ content: 'Plan a trip', attachment_ids: [] }]);
   });
 
-  it('offers only allowed models and flags a model the policy no longer allows', async () => {
+  it('offers only allowed models and blocks sending on a model the policy no longer allows', async () => {
     const user = userEvent.setup();
     serve({
       'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-retired')] }),
-      'GET /api/chat/models': () => ({ allowed_models: ['gpt-small', 'gpt-large'], default_model_id: 'gpt-small' }),
+      'GET /api/chat/models': () => policy,
       'PATCH /api/chat/conversations/c-1': (body) => ({ conversation: conversation('c-1', 'Trip plan', String(body.model_id)) }),
     });
-    renderChat();
+    renderChat('c-1');
 
-    const picker = await screen.findByRole('combobox');
-    const options = Array.from(picker.querySelectorAll('option')).map((option) => [option.value, option.disabled]);
-    expect(options).toEqual([['gpt-retired', true], ['gpt-small', false], ['gpt-large', false]]);
-    expect(screen.getByText('Pick an allowed model to continue')).toBeVisible();
+    expect(await screen.findByRole('heading', { name: 'Trip plan' })).toBeVisible();
+    expect(await screen.findByText(/gpt-retired is no longer allowed/)).toBeVisible();
+    await user.type(screen.getByLabelText('Message'), 'Hello');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
 
-    await user.selectOptions(picker, 'gpt-small');
+    await user.click(screen.getByRole('button', { name: 'Model: gpt-retired' }));
+    const options = screen.getAllByRole('menuitemradio').map((option) => option.textContent);
+    expect(options).toEqual(['gpt-small', 'gpt-largeDefault']);
+    await user.click(screen.getByRole('menuitemradio', { name: /gpt-small/ }));
     expect(calls('PATCH', '/api/chat/conversations/c-1')).toEqual([{ model_id: 'gpt-small' }]);
-    await waitFor(() => expect(screen.queryByText('Pick an allowed model to continue')).not.toBeInTheDocument());
-    expect(picker).toHaveValue('gpt-small');
+    await waitFor(() => expect(screen.queryByText(/no longer allowed/)).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
   });
 
-  it('deletes a chat only after confirmation', async () => {
+  it('renames through the header menu', async () => {
     const user = userEvent.setup();
     serve({
-      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-small'), conversation('c-2', 'Budget', 'gpt-small')] }),
-      'GET /api/chat/models': () => ({ allowed_models: ['gpt-small'], default_model_id: 'gpt-small' }),
+      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-small')] }),
+      'GET /api/chat/models': () => policy,
+      'PATCH /api/chat/conversations/c-1': (body) => ({ conversation: conversation('c-1', String(body.title), 'gpt-small') }),
+    });
+    renderChat('c-1');
+
+    await screen.findByRole('heading', { name: 'Trip plan' });
+    await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Rename…' }));
+    const field = screen.getByLabelText('Chat name');
+    await user.clear(field);
+    await user.type(field, 'Kyoto trip{Enter}');
+    expect(calls('PATCH', '/api/chat/conversations/c-1')).toEqual([{ title: 'Kyoto trip' }]);
+    expect(await screen.findByRole('heading', { name: 'Kyoto trip' })).toBeVisible();
+  });
+
+  it('deletes only after confirmation, then returns to a new chat', async () => {
+    const user = userEvent.setup();
+    serve({
+      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-small')] }),
+      'GET /api/chat/models': () => policy,
       'DELETE /api/chat/conversations/c-1': () => ({ ok: true }),
     });
-    renderChat();
+    renderChat('c-1');
+    await screen.findByRole('heading', { name: 'Trip plan' });
 
-    await user.click(await screen.findByRole('button', { name: 'Delete Trip plan' }));
+    await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Delete chat…' }));
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(calls('DELETE', '/api/chat/conversations/c-1')).toEqual([]);
 
-    await user.click(screen.getByRole('button', { name: 'Delete Trip plan' }));
+    await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
+    await user.click(await screen.findByRole('menuitem', { name: 'Delete chat…' }));
     await user.click(screen.getByRole('button', { name: 'Delete' }));
     expect(calls('DELETE', '/api/chat/conversations/c-1')).toEqual([undefined]);
-    await waitFor(() => expect(screen.queryByRole('button', { name: /Trip plan/ })).not.toBeInTheDocument());
-    expect(await screen.findByRole('heading', { name: 'Budget' })).toBeVisible();
+    await waitFor(() => expect(window.location.hash).toBe('#chat'));
   });
 
   it('blocks new chats when the policy allows no model', async () => {
@@ -126,6 +156,6 @@ describe('Chat', () => {
     renderChat();
 
     expect(await screen.findByText('No chat models available')).toBeVisible();
-    for (const button of screen.getAllByRole('button', { name: 'New chat' })) expect(button).toBeDisabled();
+    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
   });
 });

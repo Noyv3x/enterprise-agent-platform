@@ -1,14 +1,6 @@
-import { afterAll, beforeEach, vi } from "vitest";
-
-/* Browser APIs used by Ant Design's responsive and overlay primitives. Keep
-   these deterministic so component tests exercise real providers in jsdom. */
+/* Browser APIs jsdom lacks but the app uses (theme and reduced-motion queries, resize-driven scroll pinning). */
 
 if (typeof window !== "undefined") {
-  // rc-component's test-mode IDs collide across native portal/focus stacks.
-  vi.stubEnv("NODE_ENV", "development");
-  beforeEach(() => vi.stubEnv("NODE_ENV", "development"));
-  afterAll(() => vi.unstubAllEnvs());
-
   if (!window.matchMedia) {
     Object.defineProperty(window, "matchMedia", {
       configurable: true,
@@ -34,12 +26,6 @@ if (typeof window !== "undefined") {
     Object.defineProperty(window, "ResizeObserver", { configurable: true, value: ResizeObserverStub });
     Object.defineProperty(globalThis, "ResizeObserver", { configurable: true, value: ResizeObserverStub });
   }
-
-  const browserGetComputedStyle = window.getComputedStyle.bind(window);
-  Object.defineProperty(window, "getComputedStyle", {
-    configurable: true,
-    value: (element: Element) => browserGetComputedStyle(element),
-  });
 
   if (!HTMLElement.prototype.scrollTo) {
     HTMLElement.prototype.scrollTo = () => {};

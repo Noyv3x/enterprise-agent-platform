@@ -1,5 +1,0 @@
-/* Domain styles sit in the `app` cascade layer (see src/app.css). */
-@layer app {
-.wf-schedule-prompt { margin: var(--wf-space-4) 0 0; white-space: pre-wrap; }
-.wf-root .wf-schedule-amount { inline-size: 100%; }
-}

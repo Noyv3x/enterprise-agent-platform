@@ -1,55 +1,64 @@
-/* ThemeContext keeps CSS attribute-driven: it writes <html data-theme>, persists
-   localStorage["eap-theme"], and resolve "light"/"dark". An UNSET attribute
-   means "follow OS" and observes prefers-color-scheme changes while no explicit
-   data-theme is pinned. Theme lives in its own context, so toggling never
-   re-renders the store-subscribed tree. */
+/* ThemeContext keeps CSS attribute-driven: a pinned preference writes <html data-theme> and persists
+   localStorage["eap-theme"]; "system" removes both and follows prefers-color-scheme live. Beautiful UI tokens
+   switch on the `.dark` class, kept equal to the resolved theme. Theme lives in its own context, so changing it
+   never re-renders the store-subscribed tree. */
 
 import { createContext, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 export type ResolvedTheme = "light" | "dark";
+export type ThemePreference = ResolvedTheme | "system";
+
+export const THEME_STORAGE_KEY = "eap-theme";
 
 export interface ThemeContextValue {
+  /** what is painted now */
   theme: ResolvedTheme;
-  toggleTheme: () => void;
+  /** what the user chose */
+  preference: ThemePreference;
+  setPreference: (preference: ThemePreference) => void;
 }
 
-/** Resolve the active theme: pinned data-theme attribute, else OS preference. */
-export function currentTheme(): ResolvedTheme {
-  const attr = document.documentElement.dataset.theme;
-  if (attr === "light" || attr === "dark") return attr;
+function systemTheme(): ResolvedTheme {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function pinnedTheme(): ResolvedTheme | null {
+  const attr = document.documentElement.dataset.theme;
+  return attr === "light" || attr === "dark" ? attr : null;
 }
 
 export const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [theme, setTheme] = useState<ResolvedTheme>(() => currentTheme());
+  const [preference, setPreferenceState] = useState<ThemePreference>(() => pinnedTheme() ?? "system");
+  const [system, setSystem] = useState<ResolvedTheme>(() => systemTheme());
+  const theme = preference === "system" ? system : preference;
 
-  const toggleTheme = useCallback(() => {
-    const next: ResolvedTheme = currentTheme() === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
+  const setPreference = useCallback((next: ThemePreference) => {
+    const root = document.documentElement;
     try {
-      localStorage.setItem("eap-theme", next);
+      if (next === "system") localStorage.removeItem(THEME_STORAGE_KEY);
+      else localStorage.setItem(THEME_STORAGE_KEY, next);
     } catch {
-      /* storage may be unavailable (private mode); ignore */
+      /* storage may be unavailable (private mode); the choice still applies to this page */
     }
-    setTheme(next);
+    if (next === "system") delete root.dataset.theme;
+    else root.dataset.theme = next;
+    setPreferenceState(next);
   }, []);
 
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => {
-      // Follow the OS only while the user has not pinned a theme via the toggle.
-      if (!document.documentElement.dataset.theme) {
-        setTheme(mq.matches ? "dark" : "light");
-      }
-    };
+    const onChange = () => setSystem(mq.matches ? "dark" : "light");
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, []);
-  // Theme changes are not animated: controls with color transitions would pass
-  // through mixed, disabled-looking colors. Pin transitions off for the frames
-  // in which the new tokens are applied.
+
+  useLayoutEffect(() => {
+    document.documentElement.classList.toggle("dark", theme === "dark");
+  }, [theme]);
+  // Theme changes are not animated: controls with color transitions would pass through mixed, disabled-looking
+  // colors. Pin transitions off for the frames in which the new tokens are applied.
   const initialTheme = useRef(theme);
   useLayoutEffect(() => {
     if (initialTheme.current === theme) return;
@@ -65,6 +74,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     };
   }, [theme]);
 
-  const value = useMemo<ThemeContextValue>(() => ({ theme, toggleTheme }), [theme, toggleTheme]);
+  const value = useMemo<ThemeContextValue>(() => ({ theme, preference, setPreference }), [theme, preference, setPreference]);
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

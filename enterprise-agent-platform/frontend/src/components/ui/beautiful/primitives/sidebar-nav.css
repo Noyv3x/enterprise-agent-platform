@@ -1,0 +1,76 @@
+/* Beautiful UI — app/globals.css "COMPONENT-SPECIFIC — SidebarNav" (MIT, see ../LICENSE and ../NOTICE).
+ * The sidebar is one persistent 224px tree clipped by a 52px shell. Every rail glyph remains centered at x=26 in
+ * both states. Platform additions at the end: the drawer variant fills its panel. */
+.sidebar-row {
+  width: 208px;
+  transition-duration: var(--sidebar-copy-duration);
+  transition-timing-function: var(--sidebar-easing);
+}
+
+.sidebar-copy {
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    opacity var(--sidebar-copy-duration) ease-out,
+    transform var(--sidebar-copy-duration) var(--sidebar-easing);
+}
+
+.sidebar-logo,
+.sidebar-collapse-control,
+.sidebar-expand-control {
+  transition-duration: var(--sidebar-copy-duration);
+  transition-timing-function: ease-out;
+}
+
+.sidebar-expand-control {
+  pointer-events: none;
+  opacity: 0;
+}
+
+.sidebar-glide-highlight {
+  right: 8px;
+  left: 8px;
+}
+
+[data-sidebar-collapsed="true"] .sidebar-row {
+  width: 36px;
+}
+
+[data-sidebar-collapsed="true"] .sidebar-copy {
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(calc(var(--sidebar-copy-offset) * -1));
+}
+
+[data-sidebar-collapsed="true"] .sidebar-workspace-control {
+  pointer-events: none;
+}
+
+[data-sidebar-collapsed="true"] .sidebar-logo,
+[data-sidebar-collapsed="true"] .sidebar-collapse-control {
+  pointer-events: none;
+  opacity: 0;
+}
+
+[data-sidebar-collapsed="true"] .sidebar-expand-control {
+  pointer-events: auto;
+  opacity: 1;
+}
+
+[data-sidebar-collapsed="true"] .sidebar-glide-highlight {
+  right: auto;
+  width: 36px;
+}
+
+/* ── platform: drawer variant (narrow screens) — rows span the drawer instead of the 208px rail ── */
+[data-sidebar-drawer="true"] .sidebar-row {
+  width: auto;
+}
+
+/* ── platform: forced colors drop fills, so the current row keeps a system-colored outline ── */
+@media (forced-colors: active) {
+  .sidebar-row[aria-current="page"],
+  .sidebar-row:has([aria-current="page"]) {
+    outline: 1px solid Highlight;
+  }
+}

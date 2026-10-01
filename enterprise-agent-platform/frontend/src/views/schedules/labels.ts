@@ -1,4 +1,4 @@
-import type { Tone } from '../../components/ui/fieldwork';
+import type { TaskPillTone, TaskStatus } from '../../components/ui/beautiful/primitives/TaskRows';
 import { formatDate, splitInterval } from './model';
 import type { ScheduleSpec } from './model';
 
@@ -18,23 +18,28 @@ export function ruleLabel(spec: ScheduleSpec, timezone: string, locale: string, 
   return w(`Every ${amount} ${english}`, `每 ${amount} ${zhCN}`, `每 ${amount} ${zhTW}`);
 }
 
-export function stateLabel(state: string, w: Words): { label: string; tone: Tone } {
-  if (state === 'active') return { label: w('Active', '已启用', '已啟用'), tone: 'success' };
-  if (state === 'paused') return { label: w('Paused', '已暂停', '已暫停'), tone: 'warning' };
+export function stateLabel(state: string, w: Words): { label: string; tone: TaskPillTone } {
+  if (state === 'active') return { label: w('Active', '已启用', '已啟用'), tone: 'green' };
+  if (state === 'paused') return { label: w('Paused', '已暂停', '已暫停'), tone: 'orange' };
   if (state === 'completed') return { label: w('Finished', '已结束', '已結束'), tone: 'neutral' };
   return { label: state, tone: 'neutral' };
 }
 
-export function runStatusLabel(status: string, w: Words): { label: string; tone: Tone } {
+/** Failed, interrupted and blocked runs did not do the work. */
+export function runFailed(status: string | undefined): boolean {
+  return status === 'failed' || status === 'interrupted' || status === 'blocked';
+}
+
+export function runStatusLabel(status: string, w: Words): { label: string; tone: TaskPillTone; badge: TaskStatus } {
   switch (status) {
-    case 'queued': return { label: w('Queued', '排队中', '排隊中'), tone: 'info' };
-    case 'running': return { label: w('Running', '运行中', '執行中'), tone: 'info' };
-    case 'succeeded': return { label: w('Succeeded', '已完成', '已完成'), tone: 'success' };
-    case 'failed': return { label: w('Failed', '失败', '失敗'), tone: 'danger' };
-    case 'interrupted': return { label: w('Interrupted', '已中断', '已中斷'), tone: 'danger' };
-    case 'blocked': return { label: w('Blocked', '已阻止', '已阻擋'), tone: 'danger' };
-    case 'cancelled': return { label: w('Cancelled', '已取消', '已取消'), tone: 'warning' };
-    case 'skipped': return { label: w('Skipped', '已跳过', '已略過'), tone: 'warning' };
-    default: return { label: status.replace(/_/g, ' '), tone: 'neutral' };
+    case 'queued': return { label: w('Queued', '排队中', '排隊中'), tone: 'accent', badge: 'pending' };
+    case 'running': return { label: w('Running', '运行中', '執行中'), tone: 'accent', badge: 'running' };
+    case 'succeeded': return { label: w('Succeeded', '已完成', '已完成'), tone: 'green', badge: 'done' };
+    case 'failed': return { label: w('Failed', '失败', '失敗'), tone: 'red', badge: 'failed' };
+    case 'interrupted': return { label: w('Interrupted', '已中断', '已中斷'), tone: 'red', badge: 'failed' };
+    case 'blocked': return { label: w('Blocked', '已阻止', '已阻擋'), tone: 'red', badge: 'failed' };
+    case 'cancelled': return { label: w('Cancelled', '已取消', '已取消'), tone: 'orange', badge: 'idle' };
+    case 'skipped': return { label: w('Skipped', '已跳过', '已略過'), tone: 'orange', badge: 'idle' };
+    default: return { label: status.replace(/_/g, ' '), tone: 'neutral', badge: 'idle' };
   }
 }

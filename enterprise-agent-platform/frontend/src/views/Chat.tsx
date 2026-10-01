@@ -1,57 +1,109 @@
-import { useCallback, useEffect, useState } from "react";
+import { useRef, useState } from "react";
 import { request } from "../api";
-import { Button } from "../components/ui/beautiful";
-import { EmptyState, Glyph, LoadingState, Notice, StatusMark } from "../components/ui/fieldwork";
+import { Button } from "../components/ui/beautiful/atoms/Button";
+import { ConfirmDialog, Dialog, EmptyState, Icon, NavigationButton, Notice, TextField } from "../components/ui/beautiful/controls";
+import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
+import type { PromptModel } from "../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../words";
 import { Conversation } from "./Conversation";
-import type { ChatConversation, ChatModels } from "./conversation/types";
+import { createChat, deleteChat, refreshChats, updateChat, useChats } from "./chat/chatStore";
+import { Composer } from "./conversation/Composer";
+import { conversationBase } from "./conversation/routes";
+import type { ChatConversation, ChatModels, Message } from "./conversation/types";
 import { errorText } from "./conversation/useConversation";
-import "./conversation/conversation.css";
 
-/** Standard chat: many conversations per user, each on a model the administrator allows. */
-export function Chat() {
+function modelOptions(models: ChatModels, defaultTag: string): PromptModel[] {
+  return models.allowed_models.map((key) => ({ key, name: key, tag: key === models.default_model_id ? defaultTag : undefined }));
+}
+
+function ChatHeader({ title }: { title: string }) {
+  return (
+    <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3 sm:pl-4 touch:h-14">
+      <NavigationButton />
+      <h1 className="min-w-0 truncate text-[13px] font-semibold text-ink">{title}</h1>
+    </div>
+  );
+}
+
+/** `#chat`: the empty state and composer; the first send creates the conversation, then opens `#chat-<id>`. */
+function NewChat({ models, userName }: { models: ChatModels; userName?: string }) {
   const w = useWords();
-  const [models, setModels] = useState<ChatModels | null>(null);
-  const [conversations, setConversations] = useState<ChatConversation[] | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [open, setOpen] = useState(false);
-  const [confirming, setConfirming] = useState<string | null>(null);
+  const [model, setModel] = useState(models.default_model_id || models.allowed_models[0] || "");
+  const created = useRef<Promise<ChatConversation> | null>(null);
+  const noModels = models.allowed_models.length === 0;
+
+  // Uploads and the first send share one new conversation; it is created on first need, with the picked model and
+  // a title in the interface language (the server's default title is English).
+  const ensure = () => {
+    created.current ??= createChat({ model_id: model, title: w("New chat", "新聊天", "新聊天") }).catch((reason: unknown) => {
+      created.current = null;
+      throw reason;
+    });
+    return created.current;
+  };
+
+  const send = async (content: string, attachmentIds: number[]) => {
+    const chat = await ensure();
+    if (chat.model_id !== model) await updateChat(chat.id, { model_id: model });
+    await request<{ message: Message; job_id: number }>(`${conversationBase(`chat-${chat.id}`)}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content, attachment_ids: attachmentIds }),
+    });
+    location.hash = `chat-${chat.id}`;
+  };
+
+  const untitled = w("New chat", "新聊天", "新聊天");
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <ChatHeader title={untitled} />
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex min-h-full w-full max-w-[720px] flex-col justify-center px-4 py-10 sm:px-8">
+          <h1 className="text-[26px] font-normal tracking-[-0.02em] text-ink" style={{ animation: "fade-up 450ms cubic-bezier(0.16,1,0.3,1) both" }}>
+            <span className="block text-ink-3">{userName ? w(`Hello ${userName}`, `你好，${userName}`, `你好，${userName}`) : untitled}</span>
+            <span className="block">{w("What would you like to ask?", "想问点什么？", "想問點什麼？")}</span>
+          </h1>
+          <p className="mt-2 text-[13px] text-ink-2" style={{ animation: "fade-up 450ms cubic-bezier(0.16,1,0.3,1) 60ms both" }}>
+            {w("Each chat keeps its own files and can search the web and run code.", "每个对话都有独立的文件，可以搜索网页和运行代码。", "每個對話都有獨立的檔案，可以搜尋網頁和執行程式。")}
+          </p>
+          <div className="relative mt-7" style={{ animation: "fade-up 450ms cubic-bezier(0.16,1,0.3,1) 120ms both" }}>
+            {noModels ? (
+              <Notice tone="warning" title={w("No chat models available", "没有可用的对话模型", "沒有可用的對話模型")}>
+                {w("Ask an administrator to allow a model for your account.", "请联系管理员为你的账号开放模型。", "請聯絡管理員為你的帳號開放模型。")}
+              </Notice>
+            ) : (
+              <Composer
+                ensureScope={async () => `chat-${(await ensure()).id}`}
+                onSend={send}
+                models={modelOptions(models, w("Default", "默认", "預設"))}
+                model={model}
+                onModelChange={async (next) => setModel(next)}
+                placeholder={w("Ask anything…", "问点什么…", "問點什麼…")}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** `#chat-<id>`: the conversation with its model picker, rename and delete. */
+function OpenChat({ chat, models, userName }: { chat: ChatConversation; models: ChatModels; userName?: string }) {
+  const w = useWords();
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState("");
+  const [deleting, setDeleting] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
+  const allowed = models.allowed_models.includes(chat.model_id);
+  const untitled = w("New chat", "新聊天", "新聊天");
 
-  const refreshList = useCallback(async () => {
-    const result = await request<{ conversations: ChatConversation[] }>("/api/chat/conversations");
-    setConversations(result.conversations);
-    return result.conversations;
-  }, []);
-
-  const load = useCallback(async () => {
-    setError("");
-    try {
-      const [policy, list] = await Promise.all([request<ChatModels>("/api/chat/models"), refreshList()]);
-      setModels(policy);
-      setSelected((current) => current ?? list[0]?.id ?? null);
-    } catch (reason) {
-      setError(errorText(reason));
-    }
-  }, [refreshList]);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const create = async () => {
-    if (!models) return;
+  const rename = async () => {
     setPending(true);
     setError("");
     try {
-      const { conversation } = await request<{ conversation: ChatConversation }>("/api/chat/conversations", {
-        method: "POST",
-        body: JSON.stringify({ model_id: models.default_model_id }),
-      });
-      setConversations((current) => [conversation, ...(current ?? [])]);
-      setSelected(conversation.id);
-      setOpen(true);
+      await updateChat(chat.id, { title: name.trim() });
+      setRenaming(false);
     } catch (reason) {
       setError(errorText(reason));
     } finally {
@@ -59,18 +111,13 @@ export function Chat() {
     }
   };
 
-  const remove = async (id: string) => {
+  const remove = async () => {
     setPending(true);
     setError("");
     try {
-      await request(`/api/chat/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
-      const rest = (conversations ?? []).filter((item) => item.id !== id);
-      setConversations(rest);
-      setConfirming(null);
-      if (selected === id) {
-        setSelected(rest[0]?.id ?? null);
-        setOpen(false);
-      }
+      await deleteChat(chat.id);
+      setDeleting(false);
+      location.hash = "chat";
     } catch (reason) {
       setError(errorText(reason));
     } finally {
@@ -78,102 +125,99 @@ export function Chat() {
     }
   };
 
-  const changeModel = async (id: string, modelId: string) => {
-    setError("");
-    try {
-      const { conversation } = await request<{ conversation: ChatConversation }>(`/api/chat/conversations/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ model_id: modelId }),
-      });
-      setConversations((current) => (current ?? []).map((item) => (item.id === id ? conversation : item)));
-    } catch (reason) {
-      setError(errorText(reason));
-    }
-  };
+  return (
+    <>
+      <Conversation
+        scope={`chat-${chat.id}`}
+        title={chat.title || untitled}
+        meta={chat.model_id}
+        userName={userName}
+        onRunEnd={() => void refreshChats()}
+        model={{
+          models: modelOptions(models, w("Default", "默认", "預設")),
+          value: chat.model_id,
+          onChange: (model) => updateChat(chat.id, { model_id: model }),
+          notice: allowed ? undefined : (
+            <span className="text-orange-ink">
+              {w(`${chat.model_id} is no longer allowed — pick another model to continue`, `${chat.model_id} 已不可用，请选择其他模型以继续`, `${chat.model_id} 已不可用，請選擇其他模型以繼續`)}
+            </span>
+          ),
+          blocked: !allowed,
+        }}
+        menuItems={[
+          { key: "rename", label: w("Rename…", "重命名…", "重新命名…"), icon: <Icon name="pencil" size={16} />, onSelect: () => { setName(chat.title); setError(""); setRenaming(true); } },
+          { key: "delete", label: w("Delete chat…", "删除对话…", "刪除對話…"), icon: <Icon name="trash" size={16} />, tone: "danger", onSelect: () => { setError(""); setDeleting(true); } },
+          { key: "separator", separator: true },
+        ]}
+      />
+      <Dialog
+        open={renaming}
+        onClose={() => setRenaming(false)}
+        title={w("Rename chat", "重命名对话", "重新命名對話")}
+        footer={
+          <>
+            <Button variant="quiet" size="sm" onClick={() => setRenaming(false)}>{w("Cancel", "取消", "取消")}</Button>
+            <Button variant="primary" size="sm" disabled={pending || !name.trim()} onClick={() => void rename()}>{w("Save", "保存", "儲存")}</Button>
+          </>
+        }
+      >
+        <form onSubmit={(event) => { event.preventDefault(); if (name.trim()) void rename(); }} className="flex flex-col gap-2">
+          <TextField autoFocus aria-label={w("Chat name", "对话名称", "對話名稱")} value={name} maxLength={200} onChange={(event) => setName(event.target.value)} />
+          {error && <p role="alert" className="text-[12.5px] text-red-ink">{error}</p>}
+        </form>
+      </Dialog>
+      <ConfirmDialog
+        open={deleting}
+        tone="danger"
+        title={w(`Delete “${chat.title || untitled}”?`, `删除“${chat.title || untitled}”？`, `刪除「${chat.title || untitled}」？`)}
+        description={w("The conversation and its files are removed. This cannot be undone.", "对话及其文件将被删除，此操作无法撤销。", "對話及其檔案將被刪除，此操作無法復原。")}
+        confirmLabel={w("Delete", "删除", "刪除")}
+        busy={pending}
+        error={error || undefined}
+        onConfirm={() => void remove()}
+        onCancel={() => setDeleting(false)}
+      />
+    </>
+  );
+}
+
+/** Standard chat: `#chat` starts a new conversation, `#chat-<id>` opens one from the shared chat list. */
+export function Chat({ id, userName }: { id?: string; userName?: string }) {
+  const w = useWords();
+  const { conversations, models, error } = useChats();
 
   if (!conversations || !models) {
     return (
-      <div className="wf-page">
-        {error
-          ? <Notice tone="danger" title={w("Chats could not be loaded", "无法加载对话", "無法載入對話")} action={<Button type="button" variant="secondary" size="sm" onClick={() => void load()}>{w("Retry", "重试", "重試")}</Button>}>{error}</Notice>
-          : <LoadingState label={w("Loading chats…", "正在加载对话…", "正在載入對話…")} />}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <ChatHeader title={w("Chat", "聊天", "聊天")} />
+        <div className="flex flex-1 items-center justify-center p-6">
+          {error ? (
+            <Notice tone="danger" title={w("Chats could not be loaded", "无法加载对话", "無法載入對話")}
+              action={<Button variant="secondary" size="sm" onClick={() => void refreshChats()}>{w("Retry", "重试", "重試")}</Button>}>
+              {error}
+            </Notice>
+          ) : <LoadingState variant="Dots" label={w("Loading chats", "正在加载对话", "正在載入對話")} />}
+        </div>
       </div>
     );
   }
 
-  const noModels = models.allowed_models.length === 0;
-  const current = conversations.find((item) => item.id === selected) ?? null;
-  const untitled = w("New chat", "新对话", "新對話");
-  const allowed = current ? models.allowed_models.includes(current.model_id) : true;
-
-  return (
-    <div className="cv-chat" data-open={open && current ? "" : undefined}>
-      <nav className="cv-chat-list" aria-label={w("Chats", "对话列表", "對話列表")}>
-        <Button type="button" variant="primary" size="sm" disabled={pending || noModels} onClick={() => void create()}>
-          <Glyph name="plus" size={14} />
-          {w("New chat", "新对话", "新對話")}
-        </Button>
-        {error && <div className="cv-error-text" role="alert">{error}</div>}
-        {noModels && (
-          <Notice tone="warning" title={w("No chat models available", "没有可用的对话模型", "沒有可用的對話模型")}>
-            {w("Ask an administrator to allow a model for your account.", "请联系管理员为你的账号开放模型。", "請聯絡管理員為你的帳號開放模型。")}
-          </Notice>
-        )}
-        <ul>
-          {conversations.map((item) => (
-            <li key={item.id} className="cv-chat-row" data-active={item.id === selected ? "" : undefined}>
-              {confirming === item.id ? (
-                <div className="cv-chat-confirm" role="group" aria-label={w("Confirm delete", "确认删除", "確認刪除")}>
-                  <span>{w("Delete this chat and its files?", "删除此对话及其文件？", "刪除此對話及其檔案？")}</span>
-                  <Button type="button" variant="primary" size="xs" disabled={pending} onClick={() => void remove(item.id)}>{w("Delete", "删除", "刪除")}</Button>
-                  <Button type="button" variant="quiet" size="xs" onClick={() => setConfirming(null)}>{w("Cancel", "取消", "取消")}</Button>
-                </div>
-              ) : (
-                <>
-                  <button type="button" className="cv-chat-open" aria-current={item.id === selected ? "page" : undefined} onClick={() => { setSelected(item.id); setOpen(true); }}>
-                    <span className="cv-chat-title">{item.title || untitled}</span>
-                    <span className="cv-chat-meta">{item.model_id}</span>
-                  </button>
-                  <Button type="button" variant="quiet" size="xs" className="cv-icon-button" aria-label={`${w("Delete", "删除", "刪除")} ${item.title || untitled}`} onClick={() => setConfirming(item.id)}>
-                    <Glyph name="trash" size={14} />
-                  </Button>
-                </>
-              )}
-            </li>
-          ))}
-        </ul>
-      </nav>
-      <div className="cv-chat-main">
-        {current ? (
-          <Conversation
-            scope={`chat-${current.id}`}
-            title={current.title || untitled}
-            onRunEnd={() => void refreshList().catch(() => undefined)}
-            actions={
-              <>
-                <Button type="button" variant="quiet" size="sm" className="cv-chat-back" onClick={() => setOpen(false)}>
-                  <Glyph name="back" size={14} />
-                  {w("Chats", "对话", "對話")}
-                </Button>
-                <label className="cv-footnote">
-                  <span className="wf-sr-only">{w("Model", "模型", "模型")}</span>
-                  <select className="cv-select" value={current.model_id} onChange={(event) => void changeModel(current.id, event.target.value)}>
-                    {!allowed && <option value={current.model_id} disabled>{`${current.model_id} (${w("no longer allowed", "已不可用", "已不可用")})`}</option>}
-                    {models.allowed_models.map((model) => <option key={model} value={model}>{model}</option>)}
-                  </select>
-                  {!allowed && <StatusMark tone="warning" subtle>{w("Pick an allowed model to continue", "请选择可用的模型以继续", "請選擇可用的模型以繼續")}</StatusMark>}
-                </label>
-              </>
-            }
-          />
-        ) : (
+  if (!id) return <NewChat key="new" models={models} userName={userName} />;
+  const chat = conversations.find((item) => item.id === id);
+  if (!chat) {
+    return (
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <ChatHeader title={w("Chat", "聊天", "聊天")} />
+        <div className="flex flex-1 items-center justify-center">
           <EmptyState
-            title={w("Start a chat", "开始对话", "開始對話")}
-            description={w("Each chat has its own files and can search the web and run code.", "每个对话都有独立的文件空间，可以搜索网页和运行代码。", "每個對話都有獨立的檔案空間，可以搜尋網頁和執行程式。")}
-            action={<Button type="button" variant="primary" size="sm" disabled={pending || noModels} onClick={() => void create()}>{w("New chat", "新对话", "新對話")}</Button>}
+            icon="chat"
+            title={w("This chat is not available", "此聊天不存在", "此聊天不存在")}
+            description={w("It may have been deleted. Start a new chat instead.", "它可能已被删除。可以开始一个新聊天。", "它可能已被刪除。可以開始一個新聊天。")}
+            action={<Button variant="primary" size="sm" onClick={() => { location.hash = "chat"; }}>{w("New chat", "新聊天", "新聊天")}</Button>}
           />
-        )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
+  return <OpenChat key={chat.id} chat={chat} models={models} userName={userName} />;
 }

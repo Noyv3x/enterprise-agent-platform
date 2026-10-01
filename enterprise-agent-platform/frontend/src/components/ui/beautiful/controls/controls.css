@@ -1,0 +1,53 @@
+/* Beautiful UI controls — platform additions composed from upstream tokens (see ./index.ts).
+ * Status "ink" tokens: upstream's --red/--green/--orange are mark colors (icons, dots, fills) and fall under 4.5:1
+ * as text on the light grounds; these darker (light) / lighter (dark) twins keep the hue for text and reach 4.5:1 on
+ * page, surface, field and the matching tint. --danger is the destructive button fill (white label ≥ 4.5:1). */
+:root {
+  --red-ink: oklch(0.54 0.192 23.042);
+  --green-ink: oklch(0.51 0.155 150.883);
+  --orange-ink: oklch(0.53 0.179 49.902);
+  --danger: oklch(0.55 0.2 24);
+  --scrim: oklch(0.2 0.01 264 / 0.3);
+}
+
+.dark {
+  --red-ink: oklch(0.74 0.15 21.433);
+  --green-ink: var(--green);
+  --orange-ink: var(--orange);
+  --danger: oklch(0.55 0.19 23);
+  --scrim: oklch(0.12 0.005 264 / 0.55);
+}
+
+/* Sheet: slides in from its edge with the strong ease, as upstream panes do. */
+@keyframes sheet-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes drawer-in {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+/* Forced colors: fields and popovers are separated only by fill and shadow. */
+@media (forced-colors: active) {
+  .bui-field,
+  .bui-popover,
+  .bui-window,
+  .bui-notice {
+    border: 1px solid CanvasText;
+  }
+  .bui-field:focus-within {
+    outline: 2px solid Highlight;
+  }
+}

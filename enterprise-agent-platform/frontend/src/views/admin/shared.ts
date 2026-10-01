@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { request } from '../../api';
+import { intlLocale } from '../../i18n';
 import { useWords } from '../../words';
 
 export interface ModelOption { id: string; name: string }
@@ -20,13 +21,15 @@ export function operationKey(): string {
 }
 
 export function formatNumber(value: number | undefined): string {
-  return typeof value === 'number' ? new Intl.NumberFormat().format(value) : '—';
+  return typeof value === 'number' ? new Intl.NumberFormat(intlLocale()).format(value) : '—';
 }
 
-export function formatTime(value: string | null | undefined): string {
-  if (!value) return '—';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+/** ISO strings and epoch seconds (OAuth `expires_at`) both render as local date-time in the interface language,
+ * in the same medium-date/short-time style as schedules. */
+export function formatTime(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '—';
+  const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat(intlLocale(), { dateStyle: 'medium', timeStyle: 'short' }).format(date);
 }
 
 /** One GET endpoint as local state. `reload(true)` refreshes without flagging the region as loading (background polling). */
@@ -78,5 +81,20 @@ export function useAdminLabels() {
     group: (name: string) => groups[name] ?? name,
     depth: (value: string) => depths[value === 'none' ? 'off' : value] ?? value,
     permission: (name: string) => permissions[name] ?? name,
+  };
+}
+
+/** Shared RecordsTable copy. */
+export function useRecordsLabels(table: string) {
+  const w = useWords();
+  return {
+    table,
+    count: w('total', '条', '筆'),
+    sortBy: (label: string) => w(`Sort by ${label}`, `按${label}排序`, `依${label}排序`),
+    resize: (label: string) => w(`Resize ${label} column`, `调整“${label}”列宽`, `調整「${label}」欄寬`),
+    open: (name: string) => w(`Open ${name}`, `打开 ${name}`, `開啟 ${name}`),
+    options: w('Table options', '表格选项', '表格選項'),
+    compact: w('Compact columns', '紧凑列宽', '緊湊欄寬'),
+    reset: w('Reset column widths', '重置列宽', '重設欄寬'),
   };
 }

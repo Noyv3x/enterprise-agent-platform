@@ -1,11 +1,13 @@
 import { useState } from 'react';
-import { Button, Popconfirm } from 'antd';
-import { request, type User } from '../../api';
+import type { User } from '../../api';
+import { Button } from '../../components/ui/beautiful/atoms/Button';
+import { ValuePill } from '../../components/ui/beautiful/atoms/ValuePill';
+import { EmptyState, Icon, Notice } from '../../components/ui/beautiful/controls';
+import LoadingState from '../../components/ui/beautiful/primitives/LoadingState';
+import RecordsTable, { RecordStatus, RecordTagList, RecordsFilterMenu, RecordsSearch, RecordsToolbar, type RecordColumn } from '../../components/ui/beautiful/primitives/RecordsTable';
 import { useWords } from '../../words';
-import { DataRegion, EmptyState, Notice, ResourceList, ResourceRow, Section, StatusMark } from '../../components/ui/fieldwork';
-import { ChatPolicyPanel } from './ChatPolicyPanel';
 import { UserEditor } from './UserEditor';
-import { errorText, useAdminLabels, useResource, type ModelCatalog, type PermissionGroup } from './shared';
+import { useAdminLabels, useRecordsLabels, useResource, type ModelCatalog, type PermissionGroup } from './shared';
 
 export function Users() {
   const w = useWords();
@@ -15,73 +17,104 @@ export function Users() {
   const catalog = useResource<ModelCatalog>('/api/admin/models');
   const me = useResource<{ user: User }>('/api/me');
   const selfId = me.data?.user.id;
-  const [editing, setEditing] = useState<User | 'new' | null>(null);
-  const [policyUser, setPolicyUser] = useState<User | null>(null);
-  const [busyId, setBusyId] = useState<number | null>(null);
-  const [error, setError] = useState('');
+  const [editing, setEditing] = useState<number | 'new' | null>(null);
+  const [query, setQuery] = useState('');
+  const [role, setRole] = useState<string | null>(null);
+  const [group, setGroup] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const models = catalog.data?.models ?? [];
   const list = users.data?.users ?? [];
+  const recordsLabels = useRecordsLabels(w('Accounts', '账户', '帳戶'));
+
+  const needle = query.trim().toLowerCase();
+  const rows = list.filter((user) =>
+    (!needle || [user.username, user.display_name, user.position].some((value) => value.toLowerCase().includes(needle)))
+    && (role === null || user.role === role)
+    && (group === null || user.permission_group === group)
+    && (status === null || String(user.active) === status));
+
+  const columns: RecordColumn<User>[] = [
+    { key: 'username', label: w('Username', '用户名', '使用者名稱'), glyph: 'user', width: 150,
+      sort: (a, b) => a.username.localeCompare(b.username), render: (user) => <span className="font-mono text-[12.5px] text-ink-2">@{user.username}</span> },
+    { key: 'access', label: w('Role & group', '角色与权限组', '角色與權限群組'), glyph: 'multi', width: 220,
+      sort: (a, b) => a.role.localeCompare(b.role) || a.permission_group.localeCompare(b.permission_group),
+      render: (user) => <RecordTagList label={w('Access', '访问权限', '存取權限')} tags={[
+        ...(user.role === 'admin' ? [{ key: 'role-admin', label: w('Admin role', '管理员角色', '管理員角色'), hue: 'purple' as const }] : []),
+        { key: `group-${user.permission_group}`, label: labels.group(user.permission_group), hue: 'neutral' as const },
+      ]} /> },
+    { key: 'model', label: w('Personal AI model', '个人 AI 模型', '個人 AI 模型'), glyph: 'model', width: 220,
+      sort: (a, b) => (a.model_name || '').localeCompare(b.model_name || ''),
+      render: (user) => <span className="flex min-w-0 items-center gap-1">
+        <span className={`truncate ${user.model_name ? '' : 'text-ink-2'}`}>{user.model_name ? models.find((model) => model.id === user.model_name)?.name || user.model_name : w('System default', '系统默认', '系統預設')}</span>
+        <ValuePill className="shrink-0" tone={user.thinking_depth === 'off' ? 'neutral' : 'accent'}>{labels.depth(user.thinking_depth)}</ValuePill>
+      </span> },
+    { key: 'position', label: w('Position', '职位', '職位'), glyph: 'text', width: 150,
+      sort: (a, b) => a.position.localeCompare(b.position), muted: (user) => !user.position, render: (user) => user.position || '—' },
+    { key: 'status', label: w('Status', '状态', '狀態'), glyph: 'single', width: 140,
+      sort: (a, b) => Number(b.active) - Number(a.active),
+      render: (user) => <RecordStatus color={user.active ? 'var(--green)' : 'var(--ink-3)'}>{user.active ? w('Active', '正常', '正常') : w('Deactivated', '已停用', '已停用')}</RecordStatus>,
+      footer: (rows) => w(`${rows.filter((user) => user.active).length} active`, `${rows.filter((user) => user.active).length} 个正常`, `${rows.filter((user) => user.active).length} 個正常`) },
+  ];
+
+  const groupNames = Array.from(new Set([...(groups.data?.groups.map((item) => item.name) ?? []), ...list.map((user) => user.permission_group)]));
+  const editingUser = typeof editing === 'number' ? list.find((user) => user.id === editing) ?? null : null;
 
   function saved(user: User) {
     users.setData({ users: list.some((item) => item.id === user.id) ? list.map((item) => item.id === user.id ? user : item) : [...list, user] });
-    setEditing(null);
-  }
-  async function setActive(user: User, active: boolean) {
-    setBusyId(user.id); setError('');
-    try {
-      if (active) {
-        saved((await request<{ user: User }>(`/api/admin/users/${user.id}`, { method: 'PATCH', body: JSON.stringify({ active: true }) })).user);
-      } else {
-        await request(`/api/admin/users/${user.id}`, { method: 'DELETE' });
-        await users.reload(true);
-      }
-    } catch (cause) {
-      setError(errorText(cause));
-    } finally {
-      setBusyId(null);
-    }
   }
 
-  return <Section
-    actions={<>
-      <Button onClick={() => { void users.reload(); void groups.reload(); void catalog.reload(); }} loading={users.refreshing}>{w('Refresh', '刷新', '重新整理')}</Button>
-      <Button type="primary" onClick={() => setEditing('new')} disabled={!groups.data}>{w('Create account', '创建账户', '建立帳戶')}</Button>
-    </>}>
-    {error && <Notice tone="danger" title={error} />}
-    {catalog.error && <Notice tone="warning" title={w('Model catalog unavailable', '模型目录不可用', '模型目錄無法使用')}>{catalog.error}</Notice>}
-    <DataRegion
-      state={users.state === 'ready' && !list.length ? 'empty' : users.state}
-      loadingLabel={w('Loading accounts…', '正在加载账户…', '正在載入帳戶…')}
-      error={users.error}
-      retry={<Button onClick={() => void users.reload()}>{w('Retry', '重试', '重試')}</Button>}
-      refreshing={users.refreshing}
-      empty={<EmptyState compact title={w('No accounts yet', '暂无账户', '尚無帳戶')} description={w('Create the first account to let a teammate sign in.', '创建第一个账户，让同事可以登录。', '建立第一個帳戶，讓同事可以登入。')} />}>
-      <ResourceList label={w('Accounts', '账户', '帳戶')}>
-        {list.map((user) => <ResourceRow
-          key={user.id}
-          title={user.display_name || user.username}
-          description={`@${user.username}${user.position ? ` · ${user.position}` : ''}`}
-          status={<>
-            <StatusMark tone={user.active ? 'success' : 'neutral'}>{user.active ? w('Active', '正常', '正常') : w('Disabled', '已停用', '已停用')}</StatusMark>
-            {user.role === 'admin' && <StatusMark tone="info" subtle>{w('Administrator', '管理员', '管理員')}</StatusMark>}
-          </>}
-          meta={`${labels.group(user.permission_group)} · ${user.model_name ? models.find((model) => model.id === user.model_name)?.name ?? user.model_name : w('System default model', '系统默认模型', '系統預設模型')} · ${labels.depth(user.thinking_depth)}`}
-          actions={<>
-            <Button onClick={() => setEditing(user)} disabled={busyId === user.id}>{w('Edit', '编辑', '編輯')}</Button>
-            <Button onClick={() => setPolicyUser(user)} disabled={busyId === user.id}>{w('Chat models', '聊天模型', '聊天模型')}</Button>
-            {user.id === selfId ? null : user.active
-              ? <Popconfirm
-                  title={w('Deactivate this account?', '停用此账户？', '停用此帳戶？')}
-                  description={w('The account is signed out everywhere and can no longer sign in.', '该账户将在所有设备上退出，并且无法再登录。', '該帳戶將在所有裝置上登出，並且無法再登入。')}
-                  okText={w('Deactivate', '停用', '停用')} cancelText={w('Cancel', '取消', '取消')} okButtonProps={{ danger: true }}
-                  onConfirm={() => setActive(user, false)}>
-                  <Button danger loading={busyId === user.id}>{w('Deactivate', '停用', '停用')}</Button>
-                </Popconfirm>
-              : <Button loading={busyId === user.id} onClick={() => void setActive(user, true)}>{w('Reactivate', '重新启用', '重新啟用')}</Button>}
-          </>} />)}
-      </ResourceList>
-    </DataRegion>
-    {editing && <UserEditor key={editing === 'new' ? 'new' : editing.id} user={editing === 'new' ? null : editing} self={editing !== 'new' && editing.id === selfId} groups={groups.data?.groups ?? []} models={models} onSaved={saved} onClose={() => setEditing(null)} />}
-    {policyUser && <ChatPolicyPanel key={policyUser.id} user={policyUser} models={models} onClose={() => setPolicyUser(null)} />}
-  </Section>;
+  if (users.state !== 'ready') {
+    return <div className="p-4 sm:p-6">
+      {users.state === 'loading'
+        ? <LoadingState label={w('Loading accounts…', '正在加载账户…', '正在載入帳戶…')} />
+        : <Notice tone="danger" title={w('Accounts could not be loaded', '无法加载账户', '無法載入帳戶')} action={<Button size="sm" onClick={() => void users.reload()}>{w('Retry', '重试', '重試')}</Button>}>{users.error}</Notice>}
+    </div>;
+  }
+
+  return <div className="flex min-h-0 flex-1 flex-col">
+    {catalog.error && <div className="px-4 pt-3 sm:px-6"><Notice tone="warning" title={w('Model catalog unavailable', '模型目录不可用', '模型目錄無法使用')}>{catalog.error}</Notice></div>}
+    <RecordsTable<User>
+      fill
+      rows={rows}
+      rowId={(user) => String(user.id)}
+      primary={{ label: w('Name', '名称', '名稱'), glyph: 'text', width: 230, name: (user) => user.display_name || user.username }}
+      columns={columns}
+      labels={recordsLabels}
+      selectedId={typeof editing === 'number' ? String(editing) : null}
+      onOpen={(user) => setEditing(user.id)}
+      empty={list.length
+        ? w('No accounts match the search or filters.', '没有符合搜索或筛选条件的账户。', '沒有符合搜尋或篩選條件的帳戶。')
+        : <EmptyState title={w('No accounts yet', '暂无账户', '尚無帳戶')} description={w('Create the first account to let a teammate sign in.', '创建第一个账户，让同事可以登录。', '建立第一個帳戶，讓同事可以登入。')} />}
+      toolbar={<RecordsToolbar
+        left={<>
+          <RecordsSearch value={query} onChange={setQuery} label={w('Search accounts', '搜索账户', '搜尋帳戶')} placeholder={w('Search name, username or position', '搜索名称、用户名或职位', '搜尋名稱、使用者名稱或職位')} />
+          <RecordsFilterMenu label={w('Filter', '筛选', '篩選')} groups={[
+            { key: 'role', label: w('Role', '角色', '角色'), anyLabel: w('Any role', '全部角色', '全部角色'), value: role, onChange: setRole,
+              options: [{ value: 'admin', label: w('Administrator', '管理员', '管理員') }, { value: 'user', label: w('Standard user', '普通用户', '一般使用者') }] },
+            { key: 'group', label: w('Permission group', '权限组', '權限群組'), anyLabel: w('Any group', '全部权限组', '全部權限群組'), value: group, onChange: setGroup,
+              options: groupNames.map((name) => ({ value: name, label: labels.group(name) })) },
+            { key: 'status', label: w('Status', '状态', '狀態'), anyLabel: w('Any status', '全部状态', '全部狀態'), value: status, onChange: setStatus,
+              options: [{ value: 'true', label: w('Active', '正常', '正常') }, { value: 'false', label: w('Deactivated', '已停用', '已停用') }] },
+          ]} />
+        </>}
+        right={<>
+          <button type="button" className="records-quiet-button" disabled={users.refreshing} onClick={() => { void users.reload(); void groups.reload(); void catalog.reload(); }}>
+            <Icon name="refresh" size={14} />{w('Refresh', '刷新', '重新整理')}
+          </button>
+          <Button size="sm" variant="primary" disabled={!groups.data} onClick={() => setEditing('new')}>
+            <Icon name="plus" size={14} />{w('New account', '新建账户', '新增帳戶')}
+          </Button>
+        </>} />}
+    />
+    {editing !== null && (editing === 'new' || editingUser) && <UserEditor
+      key={editing}
+      user={editingUser}
+      self={editingUser !== null && editingUser.id === selfId}
+      groups={groups.data?.groups ?? []}
+      models={models}
+      onSaved={saved}
+      onDeactivated={() => void users.reload(true)}
+      onClose={() => setEditing(null)}
+    />}
+  </div>;
 }
