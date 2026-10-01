@@ -462,3 +462,161 @@ func assertAutoUpdateAudit(t *testing.T, app *application, eventType, cause stri
 		}
 	}
 }
+
+type recordingUpdateEngine struct {
+	wiringEngine
+	mu    sync.Mutex
+	calls []string
+}
+
+func (e *recordingUpdateEngine) record(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.calls = append(e.calls, name)
+}
+func (e *recordingUpdateEngine) snapshot() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.calls...)
+}
+func (e *recordingUpdateEngine) Pull(context.Context, release.Manifest) error {
+	e.record("pull")
+	return nil
+}
+func (e *recordingUpdateEngine) StopFixed(context.Context) error {
+	e.record("stop")
+	return nil
+}
+func (e *recordingUpdateEngine) StartFixed(_ context.Context, manifest release.Manifest) error {
+	e.record("start:" + manifest.ID())
+	return nil
+}
+
+type reservationCountingGate struct {
+	autoUpdateGate
+	mu       sync.Mutex
+	reserves int
+}
+
+func (g *reservationCountingGate) Reserve(ctx context.Context, id string) (operation.Reservation, error) {
+	g.mu.Lock()
+	g.reserves++
+	g.mu.Unlock()
+	return g.autoUpdateGate.Reserve(ctx, id)
+}
+
+// A stale manifest response to the operation's own fetch (the check saw the
+// new release, the operation then saw the still-current one) must not restart
+// services onto Current; the next tick retries the accepted target.
+func TestAutoUpdateStaleOperationFetchFailsRetryableThenAppliesAcceptedTarget(t *testing.T) {
+	currentID := strings.Repeat("1", 40)
+	targetID := strings.Repeat("2", 40)
+	var targetFixture, currentFixture releasetest.Fixture
+	var targetData, currentData []byte
+	var requestMu sync.Mutex
+	manifestRequests := 0
+
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/manifest.json":
+			requestMu.Lock()
+			manifestRequests++
+			n := manifestRequests
+			requestMu.Unlock()
+			response.Header().Set("Content-Type", "application/json")
+			if n == 2 { // the first operation's fetch is stale
+				response.Header().Set("ETag", `"current"`)
+				_, _ = response.Write(currentData)
+				return
+			}
+			if request.Header.Get("If-None-Match") == `"target"` {
+				response.WriteHeader(http.StatusNotModified)
+				return
+			}
+			response.Header().Set("ETag", `"target"`)
+			_, _ = response.Write(targetData)
+		case "/agent-platform-compose.yaml":
+			_, _ = response.Write(targetFixture.Compose)
+		default:
+			http.NotFound(response, request)
+		}
+	}))
+	defer server.Close()
+	targetFixture = releasetest.NewTarget(targetID, releasetest.WithArtifactBaseURL(server.URL))
+	currentFixture = releasetest.NewTarget(currentID, releasetest.WithArtifactBaseURL(server.URL))
+	var err error
+	if targetData, err = json.Marshal(targetFixture.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	if currentData, err = json.Marshal(currentFixture.Manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	root := t.TempDir()
+	store, err := journal.Open(filepath.Join(root, "journal"), time.Unix(10, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MutateState(time.Unix(11, 0), func(state *model.ManagerState) error {
+		state.Current = &model.Generation{ID: currentID}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	engine := &recordingUpdateEngine{}
+	gate := &reservationCountingGate{}
+	orchestrator := &operation.Orchestrator{
+		Store: store, Engine: engine, Gate: gate, Snapshots: autoUpdateSnapshot{},
+		ReleasesDir: filepath.Join(root, "releases"), ManifestURL: server.URL + "/manifest.json",
+		Channel: targetFixture.Manifest.Channel, ReleaseClient: release.Client{HTTP: server.Client()},
+	}
+	cfg := config.Config{UpdateEnabled: true, ReleaseURL: server.URL + "/manifest.json"}
+	app := &application{configs: config.NewManager(cfg), state: store, operations: orchestrator}
+
+	app.autoUpdate(context.Background())
+	firstID := store.State().ActiveOperationID
+	if firstID == "" {
+		t.Fatal("accepted target did not start an update")
+	}
+	first, err := orchestrator.Await(context.Background(), firstID)
+	if err != nil || first.Status != model.OperationFailed || !first.Finalized || !first.Retryable {
+		t.Fatalf("stale fetch did not fail retryable: operation=%#v err=%v", first, err)
+	}
+	if !strings.Contains(first.Error, currentID) || !strings.Contains(first.Error, targetID) {
+		t.Fatalf("error does not name both IDs: %q", first.Error)
+	}
+	gate.mu.Lock()
+	reserves := gate.reserves
+	gate.mu.Unlock()
+	if calls := engine.snapshot(); len(calls) != 0 || reserves != 0 {
+		t.Fatalf("stale fetch caused maintenance: engine calls=%v reservations=%d", calls, reserves)
+	}
+	if current := store.State().Current; current == nil || current.ID != currentID {
+		t.Fatalf("stale fetch changed Current: %#v", current)
+	}
+
+	app.autoUpdate(context.Background())
+	secondID := store.State().ActiveOperationID
+	if secondID == "" || secondID == firstID {
+		t.Fatalf("next tick did not start a new attempt: first=%q second=%q", firstID, secondID)
+	}
+	second, err := orchestrator.Await(context.Background(), secondID)
+	if err != nil || second.Status != model.OperationSucceeded || second.Attempt != 2 {
+		t.Fatalf("retry did not commit: operation=%#v err=%v", second, err)
+	}
+	if current := store.State().Current; current == nil || current.ID != targetID {
+		t.Fatalf("retry committed current=%#v, want %s", current, targetID)
+	}
+	found := false
+	for _, call := range engine.snapshot() {
+		if call == "start:"+targetID {
+			found = true
+		}
+		if call == "start:"+currentID {
+			t.Fatalf("services were started on Current: %v", engine.snapshot())
+		}
+	}
+	if !found {
+		t.Fatalf("target was not deployed: %v", engine.snapshot())
+	}
+}

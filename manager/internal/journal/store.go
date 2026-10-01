@@ -234,7 +234,7 @@ func (s *Store) BeginWithAdmission(req model.OperationRequest, now time.Time, ad
 	op := model.Operation{
 		SchemaVersion: 1, ID: id, Kind: req.Kind, IdempotencyKey: req.IdempotencyKey,
 		Attempt:            attempt,
-		ExpectedGeneration: req.ExpectedGeneration, TargetManifestURL: req.ManifestURL,
+		ExpectedGeneration: req.ExpectedGeneration, TargetManifestURL: req.ManifestURL, ExpectedTargetID: req.ExpectedTargetID,
 		Status: model.OperationPending, Phase: model.PhaseValidating,
 		History: []model.PhaseEvent{{Phase: model.PhaseValidating, At: now.UTC()}}, CreatedAt: now.UTC(), UpdatedAt: now.UTC(),
 	}

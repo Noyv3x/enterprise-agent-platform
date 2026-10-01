@@ -111,6 +111,7 @@ type Operation struct {
 	Attempt                   int                  `json:"attempt"`
 	ExpectedGeneration        uint64               `json:"expected_generation"`
 	TargetManifestURL         string               `json:"target_manifest_url,omitempty"`
+	ExpectedTargetID          string               `json:"expected_target_id,omitempty"`
 	TargetGeneration          string               `json:"target_generation,omitempty"`
 	Status                    OperationStatus      `json:"status"`
 	Finalized                 bool                 `json:"finalized"`
@@ -136,4 +137,7 @@ type OperationRequest struct {
 	IdempotencyKey     string        `json:"idempotency_key"`
 	ExpectedGeneration uint64        `json:"expected_generation"`
 	ManifestURL        string        `json:"manifest_url,omitempty"`
+	// ExpectedTargetID, when set, pins an update to the release manifest ID
+	// that an automatic check accepted.
+	ExpectedTargetID string `json:"expected_target_id,omitempty"`
 }

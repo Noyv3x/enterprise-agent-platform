@@ -20,7 +20,7 @@ Manager accepts exactly `platform`, `agent-runtime`, `camofox`, `agent-sandbox` 
 
 ## Detection and pulls
 
-Manager polls the configured channel; `check` may persist a candidate but never creates an update operation. Candidate protocol, identities, digests and schema boundaries must validate before disruption. Network/space failures leave the current generation running.
+Manager polls the configured channel; `check` may persist a candidate but never creates an update operation. An automatic update applies only the release the check accepted; a stale or changed manifest response is retried without restarting services. Candidate protocol, identities, digests and schema boundaries must validate before disruption. Network/space failures leave the current generation running.
 
 Default manifest checks and artifact downloads use fresh HTTP connections, retaining the 30-second request timeout and environment-configured proxy support. Conditional checks still retain bounded cache validators; connection freshness does not bypass manifest validation or artifact checksum verification.
 

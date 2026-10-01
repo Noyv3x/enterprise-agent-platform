@@ -529,6 +529,10 @@ func (o *Orchestrator) runUpdate(ctx context.Context, op model.Operation) {
 			return
 		}
 	}
+	if op.ExpectedTargetID != "" && manifest.ID() != op.ExpectedTargetID {
+		o.failBeforeMaintenanceRetryable(op, fmt.Errorf("release manifest %s does not match accepted update target %s; retrying later", manifest.ID(), op.ExpectedTargetID))
+		return
+	}
 	if err := validateDatabaseVersion(o.Store.State().Current, manifest); err != nil {
 		o.failBeforeMaintenance(op, err)
 		return

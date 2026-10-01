@@ -2866,3 +2866,32 @@ func TestOperationalMutationsKeepMaintenanceUntilGateReleaseIsDurable(t *testing
 		})
 	}
 }
+
+func TestExpectedTargetMismatchFailsRetryableBeforeMaintenance(t *testing.T) {
+	server, url := testReleaseServer(t)
+	defer server.Close()
+	store, err := journal.Open(t.TempDir(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := &fakeEngine{}
+	orchestrator := &Orchestrator{Store: store, Engine: engine, Gate: fakeGate{}, Snapshots: fakeSnapshot{}, ReleasesDir: t.TempDir(), ManifestURL: url, Channel: "main", ReleaseClient: release.Client{HTTP: server.Client()}}
+	expected := strings.Repeat("c", 40)
+	generation := store.State().Generation
+	op, _, err := orchestrator.Start(model.OperationRequest{Kind: model.OperationUpdate, IdempotencyKey: "pinned", ExpectedGeneration: generation, ExpectedTargetID: expected})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := orchestrator.Await(context.Background(), op.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := strings.Repeat("b", 40)
+	if failed.Status != model.OperationFailed || !failed.Finalized || !failed.Retryable ||
+		!strings.Contains(failed.Error, actual) || !strings.Contains(failed.Error, expected) {
+		t.Fatalf("mismatched expected target did not fail retryable naming both IDs: %#v", failed)
+	}
+	if len(engine.calls) != 0 || store.State().Maintenance || store.State().Current != nil {
+		t.Fatalf("mismatch mutated state or engine: calls=%v state=%#v", engine.calls, store.State())
+	}
+}

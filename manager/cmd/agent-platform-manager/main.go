@@ -796,6 +796,7 @@ func (a *application) autoUpdate(ctx context.Context) {
 		IdempotencyKey:     autoUpdateIdempotencyKey(cfg.ReleaseURL, a.pendingAutoUpdate.targetID, time.Now()),
 		ExpectedGeneration: fresh.Generation,
 		ManifestURL:        cfg.ReleaseURL,
+		ExpectedTargetID:   a.pendingAutoUpdate.targetID,
 	})
 	if startErr != nil {
 		a.recordAutoUpdateFailure("auto_update.start_failed", cfg, startErr)
