@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
@@ -46,6 +46,19 @@ export interface ConversationProps {
   userName?: string;
 }
 
+
+/** Where the manual compaction sits in the loaded thread: after a message id, at the start (it preceded every
+ * message), at the end (queued, place not known yet), or nowhere (settled without a recorded place, placed in
+ * history not loaded yet, or its history was reset away). */
+function compactionPlacement(compaction: Compaction | null, messages: Message[], oldestLoaded: boolean): number | "start" | "end" | null {
+  if (!compaction) return null;
+  const anchor = compaction.after_message_id;
+  if (anchor === undefined) return compaction.status === "queued" || compaction.status === "compacting" ? "end" : null;
+  if (anchor === null) return oldestLoaded ? "start" : null;
+  let after: number | null = null;
+  for (const message of messages) if (message.id <= anchor) after = message.id;
+  return after;
+}
 
 function CompactionRow({ compaction }: { compaction: Compaction }) {
   const w = useWords();
@@ -152,7 +165,9 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
   const personal = scope === "private";
   const channel = scope.startsWith("channel-");
   const resettable = canSend && !scope.startsWith("chat-");
-  const empty = phase === "ready" && messages.length === 0 && !live && !conversation.compaction;
+  const compactionAt = compactionPlacement(conversation.compaction, messages, conversation.nextBefore === null);
+  const compactionRow = conversation.compaction && compactionAt !== null ? <CompactionRow compaction={conversation.compaction} /> : null;
+  const empty = phase === "ready" && messages.length === 0 && !live && !compactionRow;
 
   // Keep the reading position when older history is prepended.
   useLayoutEffect(() => {
@@ -414,12 +429,14 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
                 </Button>
               </div>
             )}
+            {compactionAt === "start" && compactionRow}
             {messages.map((message) => {
+              let entry: ReactNode;
               if (message.role === "user") {
                 const mine = !channel || userId === undefined || message.metadata.author_user_id === userId;
                 const retryable = message.metadata.status === "interrupted" || message.metadata.status === "cancelled";
-                return (
-                  <div key={message.id}>
+                entry = (
+                  <div>
                     <UserBubble message={message} showAuthor={channel} mine={mine} queuePosition={positions.get(message.id)} />
                     {canSend && retryable && (
                       <div className="mt-2 flex justify-end">
@@ -428,14 +445,19 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
                     )}
                   </div>
                 );
-              }
-              if (message.role === "system") return <SystemLine key={message.id} message={message} />;
-              return <AssistantMessage key={message.id} message={message} />;
+              } else if (message.role === "system") entry = <SystemLine message={message} />;
+              else entry = <AssistantMessage message={message} />;
+              return (
+                <Fragment key={message.id}>
+                  {entry}
+                  {compactionAt === message.id && compactionRow}
+                </Fragment>
+              );
             })}
             {live ? <LiveReply run={live} />
               : running ? <PendingReply since={lastRunning ?? Date.now()} queued={false} />
                 : firstQueued ? <PendingReply since={Date.parse(firstQueued.created_at) || Date.now()} queued /> : null}
-            {conversation.compaction && <CompactionRow compaction={conversation.compaction} />}
+            {compactionAt === "end" && compactionRow}
           </div>
         </div>
 

@@ -75,7 +75,7 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
   if (event.type === "message") return { ...state, messages: upsert(state, [event.message]) };
   if (event.type === "run_end") return { ...state, live: null, messages: event.message ? upsert(state, [event.message]) : state.messages };
   if (event.type === "compaction" && event.job_id !== undefined && event.status !== undefined) {
-    const compaction: Compaction = { job_id: event.job_id, status: event.status, reason: event.reason, error: event.error };
+    const compaction: Compaction = { job_id: event.job_id, status: event.status, reason: event.reason, error: event.error, after_message_id: event.after_message_id };
     return { ...state, compaction: latestCompaction(state.compaction, compaction), compactionSeq: Math.max(state.compactionSeq, event.seq) };
   }
   // Automatic Pi compaction is run activity, never the durable manual operation.

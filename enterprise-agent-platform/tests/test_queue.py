@@ -605,6 +605,17 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.compactions, [])
         self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "cancelled")
 
+    async def test_compact_cancelled_while_queued_is_placed_where_it_settled(self):
+        await self.q.enqueue(self.user, "private", "hello")
+        await self.drain()
+        newest = self.q.messages(self.user, "private")["messages"][-1]["id"]
+        self.q.stopping = True
+        await self.q.compact(self.user, "private")
+        self.assertNotIn("after_message_id", self.q.messages(self.user, "private")["compaction"])
+        await self.q.cancel(self.user, "private")
+        compaction = self.q.messages(self.user, "private")["compaction"]
+        self.assertEqual((compaction["status"], compaction["after_message_id"]), ("cancelled", newest))
+
     async def test_compact_permission_and_execution_policy_revocation(self):
         with self.p.db.connect() as conn:
             conn.execute("UPDATE users SET role='user',permission_group='no-access' WHERE id=2")
@@ -645,13 +656,16 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.compact_timeout, 900)
         self.assertEqual([r["prompt"]["text"] for r in self.requests], ["before", "after one", "after two"])
         page = self.q.messages(self.user, "private")
-        self.assertEqual(page["compaction"], {"job_id": accepted["job_id"], "status": "done"})
+        # Placed after the reply to "before": earlier work had finished when compaction started.
+        before_reply = [m for m in page["messages"] if m["role"] == "assistant"][0]["id"]
+        self.assertEqual(page["compaction"], {"job_id": accepted["job_id"], "status": "done", "after_message_id": before_reply})
         self.assertEqual([m["content"] for m in page["messages"] if m["role"] == "user"], ["before", "after one", "after two"])
         self.assertEqual([m["metadata"]["status"] for m in page["messages"] if m["role"] == "assistant"], ["completed"] * 3)
         with self.p.db.connect() as conn:
             events = [json.loads(row[0]) for row in conn.execute("SELECT event_json FROM queue_events")]
             usage = conn.execute("SELECT * FROM token_usage_events WHERE json_extract(raw_usage_json,'$.kind')='compaction'").fetchone()
         self.assertEqual([(e["phase"], e["status"]) for e in events if e["type"] == "compaction"], [("queued", "queued"), ("start", "compacting"), ("end", "done")])
+        self.assertEqual([e.get("after_message_id", "absent") for e in events if e["type"] == "compaction"], ["absent", before_reply, before_reply])
         self.assertIsNone(usage["request_message_id"])
         self.assertIsNone(usage["response_message_id"])
         self.assertEqual((usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]), (10, 2, 21))
@@ -664,6 +678,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         page = self.q.messages(self.user, "private")
         self.assertEqual(page["compaction"]["status"], "nothing_to_compact")
         self.assertEqual(page["compaction"]["reason"], "too_small")
+        self.assertIsNone(page["compaction"]["after_message_id"])
         self.q.stopping = True
         await self.q.compact(self.user, "private")
         await self.q.cancel(self.user, "private")
@@ -683,7 +698,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls[0], ("POST", "/v1/sessions/agent-private-1/cancel"))
         self.assertEqual(self.compactions, [])
         self.assertEqual([r["prompt"]["text"] for r in self.requests], ["after crash"])
-        self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "interrupted")
+        compaction = self.q.messages(self.user, "private")["compaction"]
+        # "after crash" is queued behind the compaction, so it is not where the compaction belongs.
+        self.assertEqual((compaction["status"], compaction["after_message_id"]), ("interrupted", None))
 
     async def test_compact_uncertain_blocks_until_sid_cancel_settles(self):
         entered, release = asyncio.Event(), asyncio.Event()

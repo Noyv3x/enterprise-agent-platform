@@ -649,18 +649,37 @@ class Queue:
             self.wake(info["scope_key"])
         return {"ok": True, "job_id": job_id, "status": "queued"}
 
+    def compaction_anchor(self, conn, job_id, scope):
+        """The message a manual compaction follows: the newest message except user messages queued behind it (FIFO)."""
+        scope_type, scope_id = conn.execute("SELECT scope_type,scope_id FROM durable_jobs WHERE id=?", (job_id,)).fetchone()
+        later = [row[0] for row in conn.execute(
+            "SELECT json_extract(payload_json,'$.message_id') FROM durable_jobs WHERE id>? AND scope_type=? AND scope_id=? "
+            "AND json_extract(payload_json,'$.scope')=? AND json_extract(payload_json,'$.message_id') IS NOT NULL",
+            (job_id, scope_type, scope_id, scope))]
+        exclude = f" AND id NOT IN ({','.join('?' * len(later))})" if later else ""
+        if scope.startswith("chat-"):
+            row = conn.execute(f"SELECT MAX(id) FROM chat_messages WHERE conversation_id=?{exclude}", (scope[5:], *later)).fetchone()
+        else:
+            row = conn.execute(f"SELECT MAX(id) FROM messages WHERE scope_type=? AND scope_id=? AND hidden_at IS NULL{exclude}",
+                               (scope_type, scope_id, *later)).fetchone()
+        return row[0]
+
     def finish_compact(self, job, payload, status, reason=None, error=None, accounting=None):
         """Commit the manual-operation outcome and its actual usage together."""
+        started = payload.get("compaction") or {}
         result = {"status": status}
         if reason:
             result["reason"] = reason
         if error:
             result["error"] = error
-        payload["compaction"] = result
         with self.p.db.connect() as conn:
             state = conn.execute("SELECT status FROM durable_jobs WHERE id=?", (job["id"],)).fetchone()[0]
             if state not in ("queued", "running"):
                 return
+            # Keep the place recorded at start; an operation settled without starting is placed where it settled.
+            result["after_message_id"] = (started["after_message_id"] if "after_message_id" in started
+                                          else self.compaction_anchor(conn, job["id"], payload["scope"]))
+            payload["compaction"] = result
             conn.execute("UPDATE durable_jobs SET status=?,payload_json=?,last_error=?,updated_at=? WHERE id=?",
                          ("succeeded" if status in ("done", "nothing_to_compact") else "failed",
                           json.dumps(payload), error or "", int(time.time()), job["id"]))
@@ -676,10 +695,11 @@ class Queue:
         if key in self.cancelling:
             self.finish_compact(job, payload, "cancelled")
             return
-        payload.update(runtime_sid=info["sid"], runtime_unsettled=True, compaction={"status": "compacting"})
         with self.p.db.connect() as conn:
+            anchor = self.compaction_anchor(conn, job["id"], payload["scope"])
+            payload.update(runtime_sid=info["sid"], runtime_unsettled=True, compaction={"status": "compacting", "after_message_id": anchor})
             conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
-            self.emit(key, {"type": "compaction", "phase": "start", "job_id": job["id"], "status": "compacting"}, conn)
+            self.emit(key, {"type": "compaction", "phase": "start", "job_id": job["id"], "status": "compacting", "after_message_id": anchor}, conn)
         self.unsettled[key] = (job["id"], payload)
         result = await self.runtime("POST", f"/v1/sessions/{info['sid']}/compact", json={"model": model}, timeout=900)
         if result.get("compacted") is True:

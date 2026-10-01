@@ -6,6 +6,7 @@ React/TypeScript/Vite builds every surface from [Beautiful UI](https://www.beaut
 
 - Login and shell: Personal AI, Channels, Chat, Schedules, Admin and Settings in the sidebar. Keep neutral branding, theme and all three locales.
 - Conversations: durable history, streaming text/thinking and tool activity, uploads, document previews and downloadable generated `MEDIA:` files. Thinking and tool calls stay visible after the reply finishes and after reload, from the persisted work trace (and, read-only, from older `agent_work` records). Sending during a run queues FIFO; there is no input joining or live file draft.
+- Manual context compaction shows as a status row at its place in the transcript (`after_message_id`), not pinned to the end; only an operation still queued, whose place is not known yet, follows the latest activity.
 - Personal computer panel: browser screenshot preview, acquire/release human takeover and workspace file list/download. A held lease makes agent browser actions busy. Channels and chat have no browser panel.
 - Chat: conversation list in the sidebar's chat section (search, create, rename, delete) and a model picker in the composer restricted to the user's allowed models. Each chat has a working directory in the user's shared lightweight sandbox; bash can access that user's other chat files.
 - Schedules: create/edit/pause/resume/delete/run-now and occurrence history for personal AI. No continue/complete decision UI.

@@ -25,6 +25,8 @@ export interface Compaction {
   status: "queued" | "compacting" | "done" | "nothing_to_compact" | "interrupted" | "cancelled";
   reason?: string;
   error?: string;
+  /** The message the operation follows in the transcript (null: before every message); absent while queued. */
+  after_message_id?: number | null;
 }
 
 export interface MessagePage {

@@ -375,18 +375,42 @@ describe('Conversation', () => {
     renderConversation('private');
     await screen.findByText('Hello');
     await chooseAction(user, 'Compact context');
-    const manual = screen.getByRole('status', { name: 'Context compaction' });
+    const manual = () => screen.getByRole('status', { name: 'Context compaction' });
     const stream = FakeEventSource.instances[0];
-    stream.emit(1, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting' });
-    expect(within(manual).getByText('Compacting context')).toBeVisible();
+    stream.emit(1, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting', after_message_id: 1 });
+    expect(within(manual()).getByText('Compacting context')).toBeVisible();
     stream.emit(2, { type: 'compaction', phase: 'end', reason: 'auto' });
-    expect(within(manual).getByText('Compacting context')).toBeVisible();
+    expect(within(manual()).getByText('Compacting context')).toBeVisible();
     expect(await actionDisabled(user, 'Compact context')).toBe(true);
-    stream.emit(3, { type: 'compaction', phase: 'end', job_id: 20, status, reason });
-    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(label)).toBeVisible();
+    stream.emit(3, { type: 'compaction', phase: 'end', job_id: 20, status, reason, after_message_id: 1 });
+    expect(within(manual()).getByText(label)).toBeVisible();
     expect(await actionDisabled(user, 'Compact context')).toBe(false);
-    stream.emit(4, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting' });
-    expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(label)).toBeVisible();
+    stream.emit(4, { type: 'compaction', phase: 'start', job_id: 20, status: 'compacting', after_message_id: 1 });
+    expect(within(manual()).getByText(label)).toBeVisible();
+  });
+
+  it('keeps a finished compaction where it happened instead of below later messages', async () => {
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page(
+        [message(1, 'user', 'First question'), message(2, 'assistant', 'First answer'), message(3, 'user', 'Second question'), message(4, 'assistant', 'Second answer')],
+        { compaction: { job_id: 20, status: 'done', after_message_id: 2 } },
+      ),
+    });
+    renderConversation('private');
+    const before = await screen.findByText('First answer');
+    const row = screen.getByRole('status', { name: 'Context compaction' });
+    expect(before.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(row.compareDocumentPosition(screen.getByText('Second question')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it.each([
+    ['has no recorded place', [message(1, 'user', 'Question'), message(2, 'assistant', 'Answer')], { job_id: 20, status: 'done' }],
+    ['followed history that was reset', [message(5, 'user', 'Question'), message(6, 'assistant', 'Answer')], { job_id: 20, status: 'done', after_message_id: 2 }],
+  ] as const)('does not pin a finished compaction that %s to the thread', async (_case, messages, compaction) => {
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([...messages], { compaction }) });
+    renderConversation('private');
+    await screen.findByText('Answer');
+    expect(screen.queryByRole('status', { name: 'Context compaction' })).not.toBeInTheDocument();
   });
 
   it('does not regress a finished operation when the enqueue acknowledgement arrives late', async () => {
@@ -399,7 +423,7 @@ describe('Conversation', () => {
     renderConversation('private');
     await screen.findByText('Hello');
     await chooseAction(user, 'Compact context');
-    FakeEventSource.instances[0].emit(1, { type: 'compaction', phase: 'end', job_id: 20, status: 'done' });
+    FakeEventSource.instances[0].emit(1, { type: 'compaction', phase: 'end', job_id: 20, status: 'done', after_message_id: 1 });
     await act(async () => acknowledge({ ok: true, job_id: 20, status: 'queued' }));
     expect(within(screen.getByRole('status', { name: 'Context compaction' })).getByText(/Context compacted/)).toBeVisible();
     expect(await actionDisabled(user, 'Compact context')).toBe(false);
@@ -411,7 +435,8 @@ describe('Conversation', () => {
     ['done', /Context compacted/, false],
     ['interrupted', /Compaction interrupted/, false],
   ] as const)('hydrates %s compaction after reload without creating a live reply', async (status, label, busy) => {
-    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([], { last_seq: 15, compaction: { job_id: 20, status } }) });
+    const compaction = status === 'queued' ? { job_id: 20, status } : { job_id: 20, status, after_message_id: null };
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([], { last_seq: 15, compaction }) });
     renderConversation('private');
     const manual = await screen.findByRole('status', { name: 'Context compaction' });
     expect(within(manual).getByText(label)).toBeVisible();
