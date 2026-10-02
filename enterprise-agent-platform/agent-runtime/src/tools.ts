@@ -4,7 +4,7 @@ import { posix as path } from "node:path";
 import { createReadTool, createEditTool, createWriteTool, createFindTool, createLsTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Parse } from "typebox/value";
-import type { ExecutorTransport, GatewayTransport, Sandbox, ToolContext } from "./transport.js";
+import type { ExecutorTransport, GatewayTransport, OutputListener, Sandbox, ToolContext } from "./transport.js";
 
 export interface ToolDependencies {
   sandbox: Sandbox;
@@ -13,6 +13,8 @@ export interface ToolDependencies {
   executor: ExecutorTransport;
   gateway: GatewayTransport;
   skillsDirectory?: string;
+  /** Live bash output (sanitized by Manager), in order; the tool result stays authoritative. */
+  output?: (toolCallId: string, text: string) => void;
 }
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 const text = (value: string, details: unknown = {}) => ({ content: [{ type: "text" as const, text: value }], details });
@@ -21,6 +23,12 @@ const grepSchema = Type.Object({ pattern: Type.String(), path: Type.Optional(Typ
 const bashSchema = Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default 600, maximum 3600)." })) });
 const mcpSchema = Type.Object({ action: Type.Union([Type.Literal("list"), Type.Literal("call")]), server: Type.Optional(Type.String()), tool: Type.Optional(Type.String()), arguments: Type.Optional(Type.Record(Type.String(), Type.Unknown())) });
 const gatewayArguments = Type.Record(Type.String(), Type.Unknown());
+const SCHEDULE_DESCRIPTION = [
+  "Manage your own scheduled tasks. Each time a schedule fires, its `prompt` is sent to you as a new message in this personal conversation, so write the prompt as an instruction to yourself that makes sense without the current chat.",
+  "Use it for reminders and for recurring or later work the user asks for; do not tell the user to manage schedules themselves.",
+  "Actions: list, get, create, update, pause, resume, delete, run_now and history (past runs); all but list and create need `schedule_id`.",
+  "Timing (`schedule`): {type:\"once\", at:<RFC3339 time with offset or Z>}, {type:\"interval\", every_seconds:<n>} or {type:\"cron\", expression:<cron>}. Cron fires in `timezone`, an IANA name that defaults to the user's timezone.",
+].join(" ");
 
 export function createTools(cwd: string, dependencies: ToolDependencies): ToolDefinition[] {
   const { sandbox, executor, gateway } = dependencies;
@@ -33,9 +41,9 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
     if (!inside(root, absolute)) throw new Error(`Path is outside ${root}: ${value}`);
     return absolute;
   }
-  async function terminal(command: string, timeoutMs = 60_000, auditDetails?: Record<string, unknown>) {
+  async function terminal(command: string, timeoutMs = 60_000, auditDetails?: Record<string, unknown>, onOutput?: OutputListener) {
     const call = current();
-    return executor.terminal(sandbox, call.context, command, cwd, timeoutMs, call.signal, auditDetails);
+    return executor.terminal(sandbox, call.context, command, cwd, timeoutMs, call.signal, auditDetails, onOutput);
   }
   async function checked(command: string): Promise<string> {
     const result = await terminal(command);
@@ -118,18 +126,30 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
     } } }),
     { name: "bash", label: "bash", description: "Execute bash in the sandbox. Output is limited to the last 2000 lines or 50 KiB; larger output is saved to a readable sandbox file.",
       parameters: bashSchema,
-      execute: async (_id, args) => {
+      execute: async (id, args) => {
         // Capture inside the sandbox, not Pi's Runtime-local OutputAccumulator.
         // No Runtime environment is forwarded to the shell.
+        // The command's combined output goes to the spill file; a tail follows
+        // that file and forwards the same bytes on stderr as live output. stdout
+        // carries only the summary protocol. Waiting on the shell (not a pipe)
+        // keeps its exit status and lets a lingering background process hold no
+        // descriptor the wrapper waits on; --pid ends the tail after a final drain.
         const command = `${guard(cwd)} && f=$(mktemp -- "$p/.pi-bash-XXXXXX.log") || exit 1
-bash -c ${quote(args.command)} >"$f" 2>&1
+bash -c ${quote(args.command)} >"$f" 2>&1 &
+b=$!
+tail -c +1 -s 0.05 -f --pid="$b" -- "$f" >&2 &
+t=$!
+wait "$b"
 s=$?
+wait "$t"
 bytes=$(wc -c <"$f"); lines=$(wc -l <"$f")
 printf '%s\\n%s\\n%s\\n' "$f" "$bytes" "$lines"
 tail -c 51200 -- "$f" | tail -n 2000
 if [ "$bytes" -le 51200 ] && [ "$lines" -lt 2000 ]; then rm -- "$f"; fi
 exit "$s"`;
-        const result = await terminal(command, args.timeout === undefined ? 600_000 : args.timeout * 1000);
+        const emit = dependencies.output;
+        const result = await terminal(command, args.timeout === undefined ? 600_000 : args.timeout * 1000, undefined,
+          emit && ((stream, data) => { if (stream === "stderr") emit(id, data); }));
         const match = /^([^\n]+)\n(\d+)\n(\d+)\n/.exec(result.stdout);
         if (!match) throw new Error(result.stderr || `Sandbox command failed (${result.status})`);
         const spilled = Number(match[2]) > 51200 || Number(match[3]) >= 2000;
@@ -161,8 +181,8 @@ exit "$s"`;
         return text(result.stdout.split("\n").slice(0, args.limit ?? 100).join("\n") || "No matches", { exit_code: result.exit_code });
       } } satisfies ToolDefinition<typeof grepSchema>,
   ];
-  function remote(name: string, tool: "web" | "browser" | "schedule", parameters: ToolDefinition["parameters"], action?: string): ToolDefinition {
-    return { name, label: name, description: `Use the platform ${name} service.`, parameters,
+  function remote(name: string, tool: "web" | "browser" | "schedule", parameters: ToolDefinition["parameters"], action?: string, description = `Use the platform ${name} service.`): ToolDefinition {
+    return { name, label: name, description, parameters,
       execute: async (_id, input) => {
         const params = Parse(gatewayArguments, input);
         const { action: requestedAction, ...rest } = params;
@@ -191,7 +211,7 @@ exit "$s"`;
       schema: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     }, { additionalProperties: true })));
     tools.push(remote("schedule", "schedule", Type.Object({
-      action: Type.Union(["list", "get", "create", "update", "pause", "resume", "delete", "run_now"].map(value => Type.Literal(value))),
+      action: Type.Union(["list", "get", "create", "update", "pause", "resume", "delete", "run_now", "history"].map(value => Type.Literal(value))),
       schedule_id: Type.Optional(Type.Integer()), name: Type.Optional(Type.String()), prompt: Type.Optional(Type.String()),
       timezone: Type.Optional(Type.String()),
       schedule: Type.Optional(Type.Union([
@@ -199,7 +219,7 @@ exit "$s"`;
         Type.Object({ type: Type.Literal("interval"), every_seconds: Type.Integer({ minimum: 1 }) }),
         Type.Object({ type: Type.Literal("cron"), expression: Type.String() }),
       ])),
-    })));
+    }), undefined, SCHEDULE_DESCRIPTION));
     tools.push({ name: "mcp", label: "mcp", description: "List configured MCP servers or call an MCP tool in the sandbox.",
       parameters: mcpSchema,
       execute: async (_id, params) => {

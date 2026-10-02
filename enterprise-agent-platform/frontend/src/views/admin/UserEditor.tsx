@@ -1,23 +1,23 @@
 import { useId, useState, type ReactNode } from 'react';
-import { request, type User } from '../../api';
+import { request, type AdminUser } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
 import { ConfirmDialog, Field, FormGrid, Notice, Select, Sheet, TextField } from '../../components/ui/beautiful/controls';
 import { useWords } from '../../words';
-import { ChatPolicySection } from './ChatPolicySection';
 import { THINKING_DEPTHS, errorText, useAdminLabels, type ModelOption, type PermissionGroup } from './shared';
 
-interface Draft { username: string; display_name: string; position: string; role: string; permission_group: string; model_name: string; thinking_depth: string; password: string }
+interface Draft { username: string; display_name: string; position: string; role: string; permission_group: string; model_name: string; chat_model_name: string; thinking_depth: string; password: string }
 
 const SYSTEM_DEFAULT = '__system_default__';
+const FOLLOW_PERSONAL = '__follow_personal__';
 
-/** Create or edit an account in a side sheet: identity, access, personal AI and password save together; the chat
- * model policy and deactivation are separate actions below, each with its own button. */
+/** Create or edit an account in a side sheet: identity, access, models and password save together;
+ * deactivation and impersonation are separate actions below, each with its own button. */
 export function UserEditor({ user, self, groups, models, onSaved, onDeactivated, onClose }: {
-  user: User | null;
+  user: AdminUser | null;
   self: boolean;
   groups: PermissionGroup[];
   models: ModelOption[];
-  onSaved: (user: User) => void;
+  onSaved: (user: AdminUser) => void;
   onDeactivated: () => void;
   onClose: () => void;
 }) {
@@ -31,10 +31,11 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     role: user?.role ?? 'user',
     permission_group: user?.permission_group ?? (groups.some((group) => group.name === 'member') ? 'member' : groups[0]?.name ?? ''),
     model_name: user?.model_name ?? '',
+    chat_model_name: user?.chat_model_name ?? '',
     thinking_depth: user?.thinking_depth === 'none' ? 'off' : user?.thinking_depth || 'medium',
     password: '',
   }));
-  const [current, setCurrent] = useState<User | null>(user);
+  const [current, setCurrent] = useState<AdminUser | null>(user);
   const [draft, setDraft] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -53,6 +54,11 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     ...models.map((model) => ({ value: model.id, label: model.name || model.id })),
   ];
   if (draft.model_name && !models.some((model) => model.id === draft.model_name)) modelOptions.push({ value: draft.model_name, label: `${draft.model_name} · ${w('unavailable', '不可用', '無法使用')}` });
+  const chatModelOptions = [
+    { value: FOLLOW_PERSONAL, label: w('Follow personal AI', '跟随个人 AI', '跟隨個人 AI') },
+    ...models.map((model) => ({ value: model.id, label: model.name || model.id })),
+  ];
+  if (draft.chat_model_name && !models.some((model) => model.id === draft.chat_model_name)) chatModelOptions.push({ value: draft.chat_model_name, label: `${draft.chat_model_name} · ${w('unavailable', '不可用', '無法使用')}` });
 
   async function submit() {
     if (!valid || saving || !changed.length) return;
@@ -60,8 +66,8 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     try {
       const body: Partial<Draft> = current ? Object.fromEntries(changed.map((key) => [key, draft[key]])) : { ...draft, username: draft.username.trim() };
       const response = current
-        ? await request<{ user: User }>(`/api/admin/users/${current.id}`, { method: 'PATCH', body: JSON.stringify(body) })
-        : await request<{ user: User }>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
+        ? await request<{ user: AdminUser }>(`/api/admin/users/${current.id}`, { method: 'PATCH', body: JSON.stringify(body) })
+        : await request<{ user: AdminUser }>('/api/admin/users', { method: 'POST', body: JSON.stringify(body) });
       onSaved(response.user);
       const next: Draft = { ...draft, password: '' };
       setCurrent(response.user);
@@ -80,7 +86,7 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     setStatusBusy(true); setStatusError('');
     try {
       if (active) {
-        const response = await request<{ user: User }>(`/api/admin/users/${current.id}`, { method: 'PATCH', body: JSON.stringify({ active: true }) });
+        const response = await request<{ user: AdminUser }>(`/api/admin/users/${current.id}`, { method: 'PATCH', body: JSON.stringify({ active: true }) });
         setCurrent(response.user);
         onSaved(response.user);
       } else {
@@ -155,10 +161,13 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
             </Field>
           </FormGrid>
         </EditorGroup>
-        <EditorGroup title={w('Personal AI', '个人 AI', '個人 AI')}>
+        <EditorGroup title={w('Models and thinking', '模型与思考', '模型與思考')}>
           <FormGrid>
-            <Field label={w('Model', '模型', '模型')}>
+            <Field label={w('Personal AI model', '个人 AI 模型', '個人 AI 模型')}>
               <Select value={draft.model_name || SYSTEM_DEFAULT} onChange={(value: string) => set({ model_name: value === SYSTEM_DEFAULT ? '' : value })} options={modelOptions} />
+            </Field>
+            <Field label={w('Chat model', '聊天模型', '聊天模型')} hint={w('Standard chat uses the personal AI model unless one is set here.', '标准聊天默认使用个人 AI 的模型，可在此单独指定。', '標準聊天預設使用個人 AI 的模型，可在此單獨指定。')}>
+              <Select value={draft.chat_model_name || FOLLOW_PERSONAL} onChange={(value: string) => set({ chat_model_name: value === FOLLOW_PERSONAL ? '' : value })} options={chatModelOptions} />
             </Field>
             <Field label={w('Thinking depth', '思考深度', '思考深度')}>
               <Select value={draft.thinking_depth} onChange={(thinking_depth: string) => set({ thinking_depth })}
@@ -176,8 +185,7 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     </form>
 
     {current && <div className="mt-5 flex flex-col gap-5 border-t border-line pt-5">
-      <ChatPolicySection user={current} models={models} />
-      <section aria-labelledby={`${formId}-impersonate`} className="flex flex-col gap-2 border-t border-line pt-5">
+      <section aria-labelledby={`${formId}-impersonate`} className="flex flex-col gap-2">
         <h3 id={`${formId}-impersonate`} className={EDITOR_HEADING}>{w('Impersonation', '管理员代入', '管理員代入')}</h3>
         {impersonateError && <Notice tone="danger" title={impersonateError} />}
         <div className="flex items-center justify-between gap-3">

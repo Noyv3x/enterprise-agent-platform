@@ -67,7 +67,6 @@ export function Sidebar({
   const nav: SidebarNavItem[] = [
     ...(access.private ? [{ key: "private", label: w("Personal AI", "个人 AI", "個人 AI"), icon: <Icon name="sparkle" /> }] : []),
     ...(access.chat ? [{ key: "chat", label: w("Chat", "聊天", "聊天"), icon: <Icon name="chat" /> }] : []),
-    ...(access.private ? [{ key: "schedules", label: w("Schedules", "定时任务", "排程任務"), icon: <Icon name="clock" /> }] : []),
     ...(access.channels ? [{ key: "channels", label: w("Channels", "频道", "頻道"), icon: <Icon name="hash" /> }] : []),
   ];
   const footerNav: SidebarNavItem[] = [

@@ -16,7 +16,7 @@ from starlette.routing import Route
 
 PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings']
 DEFAULT_GROUPS = {'admin': PERMISSIONS, 'manager': PERMISSIONS[:4], 'member': PERMISSIONS[:3], 'viewer': PERMISSIONS[:1]}
-USER_FIELDS = 'id username display_name role position permission_group model_name thinking_depth timezone active'.split()
+USER_FIELDS = 'id username display_name role position permission_group thinking_depth timezone active'.split()
 TTL = 7 * 86400
 COOKIE_NAME = 'agent_platform_session'
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
@@ -106,6 +106,11 @@ def public_user(row):
     if user['thinking_depth'] == 'none':
         user['thinking_depth'] = 'off'
     return user
+
+
+def admin_user(row):
+    """The administrator view of an account: the self-facing shape plus its models."""
+    return {**public_user(row), 'model_name': row['model_name'], 'chat_model_name': row['chat_model_name']}
 
 
 def groups(db):

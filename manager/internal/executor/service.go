@@ -32,6 +32,9 @@ func (s *Service) Audit(request AuditRequest) (AuditReceipt, error) {
 	return s.Audits.Record(request)
 }
 func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, error) {
+	return s.terminal(ctx, call, nil)
+}
+func (s *Service) terminal(ctx context.Context, call Call, live *liveOutput) (map[string]any, error) {
 	if call.Action != "run" {
 		return nil, errors.New("terminal action must be run")
 	}
@@ -66,6 +69,7 @@ func (s *Service) Terminal(ctx context.Context, call Call) (map[string]any, erro
 		}
 		args.DisplayCommand = redactRetainedText(command)
 	}
+	args.live = live
 	if err := s.Audits.Started(call, map[string]any{"operation": record.Operation, "arguments": record.Details}); err != nil {
 		return nil, err
 	}

@@ -84,11 +84,8 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(self.client.patch('/api/admin/users/' + str(self.user['id']), json={'active': False}).status_code, 200)
         self.assertEqual(self.client.get('/api/me', headers={'Cookie': 'agent_platform_session=' + member_cookie}).status_code, 401)
 
-    def test_policy_default_membership_and_cross_origin(self):
+    def test_cross_origin_and_admin_user_validation(self):
         self.login()
-        path = f"/api/admin/users/{self.user['id']}/chat-model-policy"
-        self.assertEqual(self.client.get(path).json(), {'allowed_models': [], 'default_model_id': ''})
-        self.assertEqual(self.client.put(path, json={'allowed_models': ['a'], 'default_model_id': 'b'}).status_code, 400)
         self.assertEqual(self.client.patch('/api/me', json={'display_name': 'stolen'}, headers={'Origin': 'https://attacker.example'}).status_code, 403)
         self.assertEqual(self.client.patch('/api/me', json={'role': 'admin'}).status_code, 400)
         self.assertEqual(self.client.get('/api/branding', headers={'Cookie': ''}).json()['branding']['product_name'], 'Agent Platform')
@@ -96,6 +93,27 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(self.client.patch(user_path, json={'username': 'admin'}).status_code, 409)
         self.assertEqual(self.client.patch(user_path, json={'permission_group': []}).status_code, 400)
         self.assertEqual(self.client.patch(user_path, json={'thinking_depth': []}).status_code, 400)
+
+    def test_only_administrators_see_and_set_models(self):
+        self.login()
+        user_path = f"/api/admin/users/{self.user['id']}"
+        self.assertEqual(self.admin['chat_model_name'], '')
+        for value in ('x' * 129, 5):
+            self.assertEqual(self.client.patch(user_path, json={'chat_model_name': value}).status_code, 400)
+        updated = self.client.patch(user_path, json={'model_name': 'personal', 'chat_model_name': 'chat'}).json()['user']
+        self.assertEqual((updated['model_name'], updated['chat_model_name']), ('personal', 'chat'))
+        listed = next(user for user in self.client.get('/api/admin/users').json()['users'] if user['id'] == self.user['id'])
+        self.assertEqual((listed['model_name'], listed['chat_model_name']), ('personal', 'chat'))
+        self.assertEqual(self.client.patch(user_path, json={'chat_model_name': ''}).json()['user']['chat_model_name'], '')
+        self.assertEqual(self.client.patch(user_path, json={'chat_model_name': 'chat'}).status_code, 200)
+        self.assertEqual(self.client.post(user_path + '/impersonate', json={}).json()['user']['chat_model_name'], 'chat')
+        login = self.client.post('/api/auth/login', json={'username': 'member', 'password': 'old-password'}).json()['user']
+        mine = self.client.get('/api/me').json()['user']
+        for user in (login, mine):
+            self.assertFalse({'model_name', 'chat_model_name'} & set(user))
+            self.assertIn('thinking_depth', user)
+        for field in ('model_name', 'chat_model_name'):
+            self.assertEqual(self.client.patch('/api/me', json={field: 'mine'}).status_code, 400)
 
     def test_admin_impersonation_swaps_session_without_revoking_others(self):
         member_cookie = self.login('member', 'old-password')
@@ -265,8 +283,6 @@ class IdentityTests(unittest.TestCase):
         self.assertLess(refreshed['expires_at'], time.time() + 3700)
         unknown = self.client.post(path, json={**body, 'model': 'unavailable'}, headers={'Authorization': 'Bearer tool-secret'})
         self.assertEqual(unknown.status_code, 409)
-        policy = {'allowed_models': ['gpt-5.5'], 'default_model_id': 'gpt-5.5'}
-        self.assertEqual(self.client.put(f"/api/admin/users/{self.user['id']}/chat-model-policy", json=policy).json(), policy)
         self.assertEqual(self.client.delete('/api/admin/oauth').status_code, 200)
         self.assertEqual(self.client.get('/api/admin/models').json(), {'models': [], 'connected': False})
 

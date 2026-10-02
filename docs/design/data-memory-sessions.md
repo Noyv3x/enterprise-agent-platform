@@ -6,16 +6,15 @@
 
 | Tables | Purpose |
 | --- | --- |
-| `users`, `settings` | Accounts, permission groups, personal model/thinking settings, branding and OAuth. Signed login cookies use `users.token_version` for revocation; there is no login-session table. |
+| `users`, `settings` | Accounts, permission groups, personal model/thinking settings, the administrator-set chat model (`users.chat_model_name`, `''` follows the personal AI model), branding and OAuth. Signed login cookies use `users.token_version` for revocation; there is no login-session table. |
 | `channels`, `messages`, `attachments` | Shared/private product history and attachment metadata; bytes remain on disk. Hiding messages resets the visible conversation. Channel authorization uses permission groups, not membership rows. |
 | `agent_scopes` | Stable workspace and sandbox/lifecycle identity per personal or channel scope; Manager reads the scope inventory. |
 | `durable_jobs` | One durable queue, using kind `agent`; message and job are inserted atomically. FIFO per session; no automatic replay after uncertain execution. |
 | `agent_schedules`, `agent_schedule_runs` | Schedule configuration, occurrences and execution history. Each occurrence enqueues an agent job in the owner's private scope. |
 | `token_usage_events` | Run usage; `raw_usage_json` retains input, output, cache-read and cache-write data for admin reporting. |
 | `schema_migrations` | Ordered, versioned forward migrations (each applied once) and the Manager release schema boundary. |
-| `chat_conversations` | `id, user_id, title, model_id, created_at, updated_at, deleted_at`. |
+| `chat_conversations` | `id, user_id, title, created_at, updated_at, deleted_at`. |
 | `chat_messages` | `id, conversation_id, role, content, metadata_json, created_at`. |
-| `chat_model_policies` | `user_id` primary key, `allowed_models_json, default_model_id, updated_at`. |
 
 Executor audit records belong to Manager, not a new SQL audit table. Tables of removed features (memory, Telegram, mail, identities, run inputs, revisions, full-text indexes) are dropped by migration `2026100101`; no pre-Pi data is retained.
 

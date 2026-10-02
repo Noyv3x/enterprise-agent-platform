@@ -98,6 +98,8 @@ type terminalArguments struct {
 	// record and never accepted from the executor protocol body.
 	DisplayCommand string `json:"-"`
 	PrivateOutput  bool   `json:"-"`
+	// live receives committed, redacted output for opt-in streaming responses.
+	live *liveOutput
 }
 type fileReadArguments struct {
 	Path   string `json:"path"`

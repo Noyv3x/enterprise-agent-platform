@@ -27,7 +27,7 @@ export function Admin() {
   }, []);
 
   const pages: Record<Tab, { label: string; description: string }> = {
-    users: { label: w('Accounts', '账户', '帳戶'), description: w('Who can sign in, their access, personal AI model and chat model policy.', '谁可以登录、访问权限、个人 AI 模型和聊天模型策略。', '誰可以登入、存取權限、個人 AI 模型和聊天模型策略。') },
+    users: { label: w('Accounts', '账户', '帳戶'), description: w('Who can sign in, their access, personal AI model and chat model.', '谁可以登录、访问权限、个人 AI 模型和聊天模型。', '誰可以登入、存取權限、個人 AI 模型和聊天模型。') },
     groups: { label: w('Permission groups', '权限组', '權限群組'), description: w('Each account belongs to one group; the group decides which workspace features it can use.', '每个账户属于一个权限组，权限组决定可使用的工作区功能。', '每個帳戶屬於一個權限群組，權限群組決定可使用的工作區功能。') },
     models: { label: w('Models', '模型', '模型'), description: w('Codex sign-in and the models it provides to every agent and chat.', 'Codex 登录及其为所有 Agent 和聊天提供的模型。', 'Codex 登入及其為所有 Agent 和聊天提供的模型。') },
     branding: { label: w('Branding', '品牌', '品牌'), description: w('Product name, agent name, accent color and logo shown to everyone.', '对所有人显示的产品名称、Agent 名称、强调色和 Logo。', '對所有人顯示的產品名稱、Agent 名稱、強調色和 Logo。') },

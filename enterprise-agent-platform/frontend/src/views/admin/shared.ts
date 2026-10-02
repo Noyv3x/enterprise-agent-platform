@@ -6,7 +6,6 @@ import { useWords } from '../../words';
 export interface ModelOption { id: string; name: string }
 export interface ModelCatalog { models: ModelOption[]; connected: boolean }
 export interface PermissionGroup { name: string; permissions: string[] }
-export interface ChatModelPolicy { allowed_models: string[]; default_model_id: string }
 
 export const THINKING_DEPTHS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export const PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings'] as const;
@@ -25,7 +24,7 @@ export function formatNumber(value: number | undefined): string {
 }
 
 /** ISO strings and epoch seconds (OAuth `expires_at`) both render as local date-time in the interface language,
- * in the same medium-date/short-time style as schedules. */
+ * in a medium-date/short-time style. */
 export function formatTime(value: string | number | null | undefined): string {
   if (value === null || value === undefined || value === '') return '—';
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);

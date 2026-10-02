@@ -54,9 +54,7 @@ async def bootstrap(request):
         branding = admin.branding(p.db)
         allowed = auth.permissions(p.db, user)
         channels = [dict(r) for r in conn.execute('SELECT id,name,description,archived FROM channels WHERE archived=0 ORDER BY id')] if 'read_workspace' in allowed or user['role'] == 'admin' else []
-        policy = conn.execute('SELECT allowed_models_json,default_model_id FROM chat_model_policies WHERE user_id=?', (user['id'],)).fetchone()
-        chat_models = {'allowed_models': json.loads(policy['allowed_models_json']), 'default_model_id': policy['default_model_id']} if policy else {'allowed_models': [], 'default_model_id': ''}
-    return JSONResponse({'user': user, 'branding': branding, 'permissions': allowed, 'channels': channels, 'chat_models': chat_models})
+    return JSONResponse({'user': user, 'branding': branding, 'permissions': allowed, 'channels': channels})
 
 
 async def channels(request):
@@ -194,7 +192,7 @@ def create_app(settings=None):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
 
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
-    for module in (auth, admin, oauth, queue, gates, tools, files, schedules):
+    for module in (auth, admin, oauth, queue, gates, tools, files):
         route_list.extend(module.routes())
     route_list.append(Route('/{path:path}', static))
     app = Starlette(routes=route_list, lifespan=lifespan, exception_handlers={HTTPException: error, json.JSONDecodeError: malformed})

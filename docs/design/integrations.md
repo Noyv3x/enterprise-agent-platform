@@ -28,13 +28,13 @@ Server packages and tenant-provided configuration remain in the workspace. The h
 
 ## Schedules
 
-Personal AI schedules support list/get/create/update/pause/resume/delete/run-now and execution history. Each occurrence inserts a normal durable agent job in the owner's private scope. Jobs share that conversation's FIFO ordering and produce ordinary messages and usage records.
+Schedules are managed only by the personal AI through its `schedule` tool (list/get/create/update/pause/resume/delete/run-now and `history` for past runs); users have no schedule UI or API. Each occurrence inserts a normal durable agent job in the owner's private scope, sending the schedule's `prompt` to the personal AI as a new message. Jobs share that conversation's FIFO ordering and produce ordinary messages and usage records.
 
-Once, interval and cron timing use the configured timezone. The existing schedule/run tables remain authoritative. No continue-current/complete-current tool, completion decision guard or Telegram delivery remains. Standard chat and channel agents do not manage schedules.
+Once, interval and cron timing use the configured timezone. The existing schedule/run tables remain authoritative. The tool is owner-scoped through the internal gateway. No continue-current/complete-current tool, completion decision guard or Telegram delivery remains. Standard chat and channel agents do not manage schedules.
 
 ## Models and OAuth
 
-Administrators manage models and the Codex device authorization flow. Platform persists OAuth credentials and refreshes them; Runtime resolves access tokens through Platform, including forced provider refresh. Personal model/thinking settings and each user's allowed/default chat model policy are separate.
+Administrators manage models and the Codex device authorization flow. Platform persists OAuth credentials and refreshes them; Runtime resolves access tokens through Platform, including forced provider refresh. Personal model/thinking settings and the optional per-account chat model are administrator-managed and not visible to users.
 
 ## Host Manager
 

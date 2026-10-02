@@ -7,10 +7,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 from starlette.exceptions import HTTPException
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
-from .auth import body_json, require_permission
 
 
 def now():
@@ -151,22 +147,3 @@ async def tick(platform):
         with platform.db.connect() as conn:
             user = dict(conn.execute('SELECT * FROM users WHERE id=?', (row['owner_user_id'],)).fetchone())
         await occurrence(platform, row, user, row['next_run_at'])
-
-
-async def endpoint(request):
-    p = request.app.state.platform
-    user = require_permission(request, 'private_agent')
-    args = await body_json(request) if request.method in {'POST', 'PATCH'} else {}
-    if 'id' in request.path_params:
-        args['schedule_id'] = request.path_params['id']
-        action = ('history' if request.url.path.endswith('/runs') else request.path_params.get('action')) or {'GET': 'get', 'PATCH': 'update', 'DELETE': 'delete'}[request.method]
-        action = {'run-now': 'run_now', 'runs': 'history'}.get(action, action)
-    else:
-        action = 'create' if request.method == 'POST' else 'list'
-    return JSONResponse(await dispatch(p, action, args, user))
-
-
-def routes():
-    return [Route('/api/schedules', endpoint, methods=['GET', 'POST']), Route('/api/schedules/{id:int}', endpoint, methods=['GET', 'PATCH', 'DELETE']),
-            Route('/api/schedules/{id:int}/runs', endpoint, methods=['GET'], name='schedule-runs'),
-            Route('/api/schedules/{id:int}/{action}', endpoint, methods=['POST'])]

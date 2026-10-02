@@ -63,6 +63,13 @@ function renderConversation(scope: string, props: Partial<ConversationProps> = {
   );
 }
 
+/** The computer panel also shows the latest step's output; these assertions are about the conversation's own work trace. */
+function inThread(text: string): HTMLElement {
+  const node = screen.getAllByText(text).find((candidate) => !candidate.closest('aside, [role="complementary"]'));
+  if (!node) throw new Error(`no thread text ${text}`);
+  return node;
+}
+
 async function chooseAction(user: UserEvent, name: string) {
   await user.click(screen.getByRole('button', { name: 'Conversation actions' }));
   await user.click(await screen.findByRole('menuitem', { name }));
@@ -154,13 +161,13 @@ describe('Conversation', () => {
     expect(screen.getByText('Check the report before summarizing.')).toBeVisible();
     expect(screen.getByText('I will read the revenue report.')).toBeVisible();
     expect(screen.getByRole('button', { name: '2 tool calls' })).toBeVisible();
-    expect(screen.getByText('Failed')).toBeVisible();
+    expect(inThread('Failed')).toBeVisible();
 
     const read = screen.getByRole('button', { name: /Read.*revenue\.txt/ });
-    expect(screen.getByText('Q3 revenue: $1.2M')).not.toBeVisible();
+    expect(inThread('Q3 revenue: $1.2M')).not.toBeVisible();
     await user.click(read);
     expect(read).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByText('Q3 revenue: $1.2M')).toBeVisible();
+    expect(inThread('Q3 revenue: $1.2M')).toBeVisible();
   });
 
   it('renders old agent_work records read-only: tools, interim text, plain steps, omissions, never approval actions', async () => {
@@ -184,13 +191,13 @@ describe('Conversation', () => {
     expect(screen.getByText('release', { selector: 'strong' })).toBeVisible();
     expect(screen.getByText('Preparing workspace')).toBeVisible();
     expect(screen.getByText('3 tool calls')).toBeVisible();
-    expect(screen.getByText('Failed')).toBeVisible();
+    expect(inThread('Failed')).toBeVisible();
     expect(screen.getByText('Stopped')).toBeVisible();
     await user.click(screen.getByRole('button', { name: /terminal/ }));
     expect(screen.getByText(/"cwd": "\/workspace"/)).toBeVisible();
-    expect(screen.getByText('release ready')).toBeVisible();
+    expect(inThread('release ready')).toBeVisible();
     await user.click(screen.getByRole('button', { name: /web/ }));
-    expect(screen.getByText('<script>bad()</script>')).toBeVisible();
+    expect(inThread('<script>bad()</script>')).toBeVisible();
     expect(screen.getByText('Earlier activity was omitted (4)')).toBeVisible();
     // Removed actions stay removed: the approval is a plain line, never a control.
     expect(screen.getByText('Approve deployment')).toBeVisible();
@@ -239,7 +246,7 @@ describe('Conversation', () => {
     expect(within(live).getByRole('button', { name: /^Thought for/ })).toHaveAttribute('aria-expanded', 'false');
 
     history.splice(0, history.length, message(1, 'assistant', 'Earlier **answer**'), message(2, 'user', 'List the files'), message(3, 'assistant', 'Found two files: notes.md and report.pdf.'));
-    stream.emit(49, { type: 'run_end', status: 'completed', text: 'Found two files: notes.md and report.pdf.', usage: {}, model: 'gpt', message: history[2] });
+    stream.emit(49, { type: 'run_end', status: 'completed', text: 'Found two files: notes.md and report.pdf.', usage: {}, message: history[2] });
 
     expect(screen.queryByRole('article', { name: 'Reply in progress' })).not.toBeInTheDocument();
     expect(screen.getByText('Found two files: notes.md and report.pdf.')).toBeVisible();

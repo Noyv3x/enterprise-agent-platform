@@ -1,15 +1,14 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { request } from "../../api";
-import type { ChatConversation, ChatModels } from "../conversation/types";
+import type { ChatConversation } from "../conversation/types";
 
 /** One shared list of standard-chat conversations: the sidebar's chat section and the chat view read the same state. */
 interface ChatState {
   conversations: ChatConversation[] | null;
-  models: ChatModels | null;
   error: string;
 }
 
-let state: ChatState = { conversations: null, models: null, error: "" };
+let state: ChatState = { conversations: null, error: "" };
 const listeners = new Set<() => void>();
 let loading: Promise<void> | null = null;
 let account: number | null = null;
@@ -40,12 +39,9 @@ function ordered(list: ChatConversation[]): ChatConversation[] {
 export function refreshChats(): Promise<void> {
   if (loading) return loading;
   const started = generation;
-  const pending = Promise.all([
-    request<{ conversations: ChatConversation[] }>("/api/chat/conversations"),
-    request<ChatModels>("/api/chat/models"),
-  ])
-    .then(([list, models]) => {
-      if (started === generation) set({ conversations: ordered(list.conversations), models, error: "" });
+  const pending = request<{ conversations: ChatConversation[] }>("/api/chat/conversations")
+    .then((list) => {
+      if (started === generation) set({ conversations: ordered(list.conversations), error: "" });
     })
     .catch((reason: unknown) => {
       if (started === generation) set({ error: reason instanceof Error ? reason.message : String(reason) });
@@ -57,7 +53,7 @@ export function refreshChats(): Promise<void> {
   return pending;
 }
 
-export async function createChat(input: { model_id?: string; title?: string } = {}): Promise<ChatConversation> {
+export async function createChat(input: { title?: string } = {}): Promise<ChatConversation> {
   const started = generation;
   const { conversation } = await request<{ conversation: ChatConversation }>("/api/chat/conversations", {
     method: "POST",
@@ -67,7 +63,7 @@ export async function createChat(input: { model_id?: string; title?: string } = 
   return conversation;
 }
 
-export async function updateChat(id: string, patch: { title?: string; model_id?: string }): Promise<ChatConversation> {
+export async function updateChat(id: string, patch: { title?: string }): Promise<ChatConversation> {
   const started = generation;
   const { conversation } = await request<{ conversation: ChatConversation }>(`/api/chat/conversations/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -103,5 +99,5 @@ export function useChats(enabled = true): ChatState {
 export function resetChatStore() {
   generation++;
   loading = null;
-  set({ conversations: null, models: null, error: "" });
+  set({ conversations: null, error: "" });
 }

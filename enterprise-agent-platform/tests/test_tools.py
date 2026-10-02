@@ -194,19 +194,66 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             row = conn.execute('SELECT next_run_at,created_at,updated_at FROM agent_schedules WHERE id=?', (ident,)).fetchone()
         self.assertTrue(all(isinstance(value, int) for value in row))
 
-    async def running_scope(self, name):
-        admitted = await self.queue.enqueue(self.user, name, 'Use a tool')
+    async def running_scope(self, name, user=None):
+        user = user or self.user
+        admitted = await self.queue.enqueue(user, name, 'Use a tool')
         with self.db.connect() as conn:
             conn.execute("UPDATE durable_jobs SET status='running' WHERE id=?", (admitted['job_id'],))
-        info = self.queue.scope(self.user, name)
+        info = self.queue.scope(user, name)
         self.queue.running[info['scope_key']] = 'runtime-run'
         return info, {'sid': info['sid'], 'scope_key': info['sandbox']['scope_key'], 'run_id': 'runtime-run'}
+
+    async def test_schedule_tool_manages_the_personal_ai_schedule_lifecycle(self):
+        _, context = await self.running_scope('private')
+        browser = Browser(self.p)
+        async def call(action, **args):
+            return (await browser.gateway('schedule', action, args, context))['data']
+        spec = {'type': 'interval', 'every_seconds': 3600}
+        created = (await call('create', name='Daily', prompt='Report', schedule=spec))['schedule']
+        ident = created['id']
+        self.assertEqual((created['state'], created['schedule']), ('active', spec))
+        self.assertEqual([item['id'] for item in (await call('list'))['schedules']], [ident])
+        self.assertEqual((await call('get', schedule_id=ident))['schedule']['name'], 'Daily')
+        updated = (await call('update', schedule_id=ident, name='Weekly', schedule={'type': 'interval', 'every_seconds': 604800}))['schedule']
+        self.assertEqual((updated['name'], updated['schedule']['every_seconds']), ('Weekly', 604800))
+        self.assertEqual((await call('pause', schedule_id=ident))['schedule']['state'], 'paused')
+        self.assertEqual((await call('resume', schedule_id=ident))['schedule']['state'], 'active')
+        self.assertEqual((await call('history', schedule_id=ident))['runs'], [])
+        ran = (await call('run_now', schedule_id=ident))['schedule']
+        self.assertEqual(ran['last_run']['trigger'], 'manual')
+        runs = (await call('history', schedule_id=ident))['runs']
+        self.assertEqual([run['trigger'] for run in runs], ['manual'])
+        with self.db.connect() as conn:
+            contents = [json.loads(row[0]).get('content') for row in conn.execute("SELECT payload_json FROM durable_jobs WHERE status='queued'")]
+        self.assertIn('Report', contents)
+        self.assertEqual(await call('delete', schedule_id=ident), {'ok': True})
+        self.assertEqual((await call('list'))['schedules'], [])
+
+    async def test_schedule_tool_only_reaches_the_owners_schedules(self):
+        _, owner_context = await self.running_scope('private')
+        browser = Browser(self.p)
+        created = (await browser.gateway('schedule', 'create', {'name': 'Mine', 'prompt': 'Report', 'schedule': {'type': 'interval', 'every_seconds': 60}}, owner_context))['data']['schedule']
+        with self.db.connect() as conn:
+            other = dict(conn.execute('SELECT * FROM users WHERE id=2').fetchone())
+        _, other_context = await self.running_scope('private', other)
+        self.assertEqual((await browser.gateway('schedule', 'list', {}, other_context))['data']['schedules'], [])
+        for action in ('get', 'pause', 'delete', 'run_now', 'history'):
+            with self.assertRaises(HTTPException) as raised:
+                await browser.gateway('schedule', action, {'schedule_id': created['id']}, other_context)
+            self.assertEqual(raised.exception.status_code, 404, action)
+
+    async def test_chat_cannot_use_the_schedule_tool(self):
+        with self.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('conversation',1,'Chat','2026-01-01','2026-01-01')")
+        _, context = await self.running_scope('chat-conversation')
+        with self.assertRaises(HTTPException) as raised:
+            await Browser(self.p).gateway('schedule', 'list', {}, context)
+        self.assertEqual(raised.exception.status_code, 403)
 
     async def test_chat_and_channel_web_use_active_job_without_owner_hint(self):
         with self.db.connect() as conn:
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',?)", (int(time.time()),))
-            conn.execute("INSERT INTO chat_conversations(id,user_id,title,model_id,created_at,updated_at) VALUES('conversation',1,'Chat','model','2026-01-01','2026-01-01')")
-            conn.execute("INSERT INTO chat_model_policies(user_id,allowed_models_json,default_model_id,updated_at) VALUES(1,'[\"model\"]','model','2026-01-01')")
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('conversation',1,'Chat','2026-01-01','2026-01-01')")
         browser = Browser(self.p)
         for name in ('channel-3', 'chat-conversation'):
             _, context = await self.running_scope(name)

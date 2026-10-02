@@ -53,7 +53,10 @@ complete browser image content.
 | --- | --- |
 | text_delta, thinking_delta | delta |
 | tool_start | tool_call_id, name, args |
+| tool_input_start | tool_call_id, name |
+| tool_input_delta | tool_call_id, delta |
 | tool_update | tool_call_id, partial |
+| tool_output | tool_call_id, delta?, truncated? |
 | tool_end | tool_call_id, name, is_error, content_preview, details |
 | retry | attempt, max, delay_ms, error |
 | compaction | phase (start/end), reason |
@@ -63,6 +66,17 @@ complete browser image content.
 `run_end` is always the last event. No draft events are emitted.
 `side_effects` becomes true when bash/write/edit, a mutating browser or
 schedule action, or any MCP operation starts.
+
+`tool_input_start` marks the model beginning to generate a tool call (Pi
+`message_update`/`toolcall_start`, resolved through `partial.content[contentIndex]`);
+`tool_input_delta` carries raw argument-JSON text fragments in order, coalesced
+to about 100 ms, for every tool. Concatenating all deltas for an id yields the
+argument JSON as generated; `tool_start` stays the authoritative full arguments.
+`tool_output` carries live bash output text, appended in order and coalesced to
+at most about 8 events per second per call. Live output is capped at 512 KiB per
+call, after which one `{tool_call_id,delta:"",truncated:true}` is emitted and
+no more follow. `tool_end` stays authoritative for the result. All three are
+informational: they never set `side_effects` and Platform ignores them in work traces.
 
 `POST /v1/runs/{run_id}/cancel` returns `{ok:true}` and cancels Pi and
 Manager execution. `POST /v1/sessions/{sid}/cancel` settles an active run
@@ -89,8 +103,7 @@ using the actual Pi compaction token usage. A session with insufficient
 history returns HTTP 200 `{compacted:false,reason:"too_small"}` without
 calling the summarization provider. This no-work result is not a failure.
 The requested model/thinking are used for summarization, including when
-restoring a persisted session after restart or eviction. Platform validates
-current model policy before requesting compaction.
+restoring a persisted session after restart or eviction.
 Concurrent session mutations return 409. `DELETE /v1/sessions/{sid}`
 disposes the object and deletes its v3 file. `GET
 /v1/sessions/{sid}/history?before=<entry_id>&limit=n` returns
@@ -124,6 +137,28 @@ only in memory, not persisted or recovered as background work. If the sandbox
 supervisor is lost or stopped and cleanup cannot be proved, cancellation retries
 remain `{confirmed:false}`; Manager restart's sandbox cleanup is the reset boundary.
 
+Terminal responses are JSON by default. A request with `Accept:
+application/x-ndjson` opts into streaming: `Content-Type:
+application/x-ndjson`, one JSON object per line, flushed per frame:
+`{"type":"output","stream":"stdout"|"stderr","data":"<text>"}` carries output
+after Manager redaction, in commit order (never an undecided suffix or a secret
+split across frames); the last line is `{"type":"result","result":{…}}` (the
+JSON-mode object plus `type`) or `{"type":"error","status":409,"error":"…"}`
+for a failure after streaming began. Failures before the first frame use the
+ordinary HTTP error response. Private (MCP) output is never streamed. At most
+1 MiB is streamed per call, pending frames are bounded (a reader too slow to
+drain them stops receiving output frames), and the result frame stays
+authoritative. Redaction withholds an undecided suffix of up to 512 bytes per
+stream, so the newest bytes appear in frames only as more output arrives or at
+exit. Disconnect, cancellation, audit, admission and timeouts are unchanged.
+
+Runtime opts in for bash only. The in-sandbox wrapper writes combined output to
+the spill file exactly as before and also tails it to stderr, which Runtime
+forwards as live `tool_output`; stdout keeps the summary protocol (path, bytes,
+lines, then the tail). Runtime ignores stdout frames for live output. If Manager
+answers with plain JSON (an older Manager during a rolling update) the result is
+used with no live output.
+
 Foreground admission is limited to 16 pending/running calls per scope family
 and 128 globally. Admission counts begin before sandbox creation or process
 startup, and slots are released when execution settles. Over-limit calls return
@@ -149,6 +184,7 @@ skills with the same name. Chat sessions never advertise either catalog.
 Web, browser and schedule tools call Platform
 `POST /internal/agent/tools/{web|browser|schedule}` using agent-tool-token
 and `{action,arguments,context:{sid,scope_key,run_id,owner_user_id?,channel_id?}}`.
+The `schedule` tool's actions are `list|get|create|update|pause|resume|delete|run_now|history`; it is owner-scoped, personal-AI only, and each occurrence sends the schedule's `prompt` to the personal AI as a new message.
 MCP invokes `/usr/local/bin/agent-platform-mcp <base64url-json>` through the
 sandbox executor with Manager's MCP audit projection/private-output handling;
 encoded call arguments are not presented as ordinary audited shell commands.

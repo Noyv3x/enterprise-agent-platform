@@ -3,7 +3,6 @@ import { Button } from "../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
-import type { PromptModel } from "../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../words";
 import { Composer, type ComposerCommand } from "./conversation/Composer";
 import { ComputerBody } from "./conversation/Computer";
@@ -14,28 +13,16 @@ import { errorText, useConversation } from "./conversation/useConversation";
 /** Reader within this distance of the bottom keeps following new output (harness value). */
 const STICK_PX = 120;
 
-export interface ConversationModel {
-  models: PromptModel[];
-  value: string;
-  onChange: (model: string) => Promise<unknown>;
-  /** e.g. the current model is no longer allowed */
-  notice?: ReactNode;
-  /** sending is blocked until the notice is resolved */
-  blocked?: boolean;
-}
-
 export interface ConversationProps {
   /** `private`, `channel-<id>` or `chat-<uuid>` (API route form). */
   scope: string;
   title?: ReactNode;
-  /** quiet text next to the title, e.g. the chat model */
+  /** quiet text next to the title */
   meta?: ReactNode;
   /** extra header controls */
   actions?: ReactNode;
   /** extra rows for the header menu (chat rename/delete) */
   menuItems?: MenuItem[];
-  /** chat model picker in the composer */
-  model?: ConversationModel;
   /** Called after each finished agent run (chat titles may change). */
   onRunEnd?: () => void;
   /** False for read-only viewers (e.g. channel readers without chat permission): no composer or conversation mutations. */
@@ -142,7 +129,7 @@ const starterIcon = (path: ReactNode) => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>{path}</svg>
 );
 
-function ConversationScope({ scope, title, meta, actions, menuItems = [], model, onRunEnd, canSend = true, userId, userName }: ConversationProps) {
+function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunEnd, canSend = true, userId, userName }: ConversationProps) {
   const w = useWords();
   const { narrow } = useShell();
   const conversation = useConversation(scope, onRunEnd);
@@ -349,12 +336,6 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
       onStop={conversation.cancel}
       queued={queuedMessages.length}
       commands={commands}
-      models={model?.models}
-      model={model?.value}
-      onModelChange={model?.onChange}
-      modelDisabled={conversation.busy}
-      notice={model?.notice}
-      blocked={model?.blocked}
       seed={seed}
       placeholder={empty && personal
         ? w("Ask your agent to research, write files or run code…", "让智能体查资料、写文件或运行代码…", "讓智慧體查資料、寫檔案或執行程式…")
@@ -491,7 +472,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
       {body}
       {personal && computerOpen && (narrow ? (
         <Sheet open onClose={() => setComputerOpen(false)} title={computerLabel} width={420}>
-          <ComputerBody working={conversation.busy} />
+          <ComputerBody working={conversation.busy} live={live} lastCalls={conversation.lastCalls} messages={messages} />
         </Sheet>
       ) : (
         <WindowAside label={computerLabel} className="w-[380px]">
@@ -503,7 +484,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], model,
             </button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            <ComputerBody working={conversation.busy} />
+            <ComputerBody working={conversation.busy} live={live} lastCalls={conversation.lastCalls} messages={messages} />
           </div>
         </WindowAside>
       ))}

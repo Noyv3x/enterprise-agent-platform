@@ -48,7 +48,6 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             for uid in (1, 2):
                 conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,model_name,created_at) VALUES (?,?,?,?,?,?,?)",
                              (uid, f"u{uid}", f"User {uid}", "unused", "admin", "model-a", 1))
-                conn.execute("INSERT INTO chat_model_policies VALUES (?,?,?,?)", (uid, '["model-a","model-b"]', "model-a", now()))
         self.calls = []
         self.requests = []
         self.compactions = []
@@ -391,15 +390,20 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.q.messages(self.user, "private")["messages"], [])
         self.assertNotEqual(self.q.scope(self.user, "private")["sid"], "agent-private-1")
 
-    async def test_chat_policy_ownership_create_delete_and_shared_sandbox(self):
+    async def test_chat_ownership_create_delete_and_shared_sandbox(self):
         app = Starlette(routes=routes())
         app.state.platform = self.p
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
             with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
-                forbidden = await client.post("/api/chat/conversations", json={"model_id": "forbidden"})
-                self.assertEqual(forbidden.status_code, 403)
                 first = (await client.post("/api/chat/conversations", json={})).json()["conversation"]
-                second = (await client.post("/api/chat/conversations", json={"model_id": "model-b"})).json()["conversation"]
+                second = (await client.post("/api/chat/conversations", json={"title": "Second"})).json()["conversation"]
+                self.assertEqual(set(first), {"id", "user_id", "title", "created_at", "updated_at", "deleted_at"})
+                self.assertEqual((await client.post("/api/chat/conversations", json={"model_id": "model-b"})).status_code, 400)
+                self.assertEqual((await client.patch("/api/chat/conversations/" + first["id"], json={"model_id": "model-b"})).status_code, 400)
+                self.assertEqual((await client.patch("/api/chat/conversations/" + first["id"], json={"title": "Renamed", "model_id": "model-b"})).status_code, 400)
+                self.assertEqual((await client.get("/api/chat/conversations/" + first["id"])).json()["conversation"]["title"], "New chat")
+                self.assertEqual((await client.patch("/api/chat/conversations/" + first["id"], json={"title": "Renamed"})).json()["conversation"]["title"], "Renamed")
+                self.assertEqual((await client.get("/api/chat/models")).status_code, 404)
                 info = self.q.scope(self.user, "chat-" + first["id"])
                 other = self.q.scope(self.user, "chat-" + second["id"])
                 self.assertEqual(info["sandbox"]["sandbox_id"], other["sandbox"]["sandbox_id"])
@@ -568,24 +572,47 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertEqual(self.requests[0]["model"], {"id": "catalog-default", "thinking": "off"})
 
-    async def test_compaction_uses_current_allowed_chat_model(self):
+    async def test_chat_follows_the_personal_model_until_an_administrator_sets_one(self):
         cid = "11111111-1111-1111-1111-111111111111"
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Switch models','model-a',?,?,NULL)", (cid, 1, now(), now()))
+            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Switch models',?,?,NULL)", (cid, 1, now(), now()))
         scope = "chat-" + cid
-        await self.q.enqueue(self.user, scope, "First turn on model A")
+        await self.q.enqueue(self.user, scope, "Follows personal")
         await self.drain()
+        self.assertEqual(self.requests[0]["model"], {"id": "model-a", "thinking": "off"})
         with self.p.db.connect() as conn:
-            conn.execute("UPDATE chat_conversations SET model_id='model-b' WHERE id=?", (cid,))
+            conn.execute("UPDATE users SET chat_model_name='model-b' WHERE id=1")
+        await self.q.enqueue(self.user, scope, "Admin model")
+        await self.drain()
+        self.assertEqual(self.requests[1]["model"], {"id": "model-b", "thinking": "off"})
         await self.q.compact(self.user, scope)
         await self.drain()
         self.assertEqual(self.compactions, [{"model": {"id": "model-b", "thinking": "off"}}])
+        await self.q.enqueue(self.user, "private", "Personal AI is unaffected")
+        await self.drain()
+        self.assertEqual(self.requests[2]["model"], {"id": "model-a", "thinking": "medium"})
         with self.p.db.connect() as conn:
-            conn.execute("UPDATE chat_model_policies SET allowed_models_json='[\"model-a\"]' WHERE user_id=1")
-        with self.assertRaises(HTTPException) as denied:
-            await self.q.compact(self.user, scope)
-        self.assertEqual(denied.exception.status_code, 403)
-        self.assertEqual(len(self.compactions), 1)
+            conn.execute("UPDATE users SET model_name='',chat_model_name='' WHERE id=1")
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}]}))
+        await self.q.enqueue(self.user, scope, "Catalog default")
+        await self.drain()
+        self.assertEqual(self.requests[3]["model"], {"id": "catalog-default", "thinking": "off"})
+
+    async def test_users_see_no_model_in_events_or_messages(self):
+        await self.q.enqueue(self.user, "private", "hello")
+        await self.drain()
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE messages SET metadata_json=json_set(metadata_json,'$.generation','{}','$.token_usage','{}') WHERE author_type='agent'")
+        for message in self.q.messages(self.user, "private")["messages"]:
+            self.assertFalse({"generation", "token_usage"} & set(message["metadata"]))
+        stream = self.q.events(self.user, "private", 0)
+        event = {}
+        while event.get("type") != "run_end":
+            event = json.loads((await anext(stream)).split(b"data: ")[1])
+        await stream.aclose()
+        self.assertNotIn("model", event)
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT model FROM token_usage_events").fetchone()[0], "model-a")
 
     async def test_compact_cancel_before_runtime_submission(self):
         entered, release = asyncio.Event(), asyncio.Event()
@@ -613,26 +640,16 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         compaction = self.q.messages(self.user, "private")["compaction"]
         self.assertEqual((compaction["status"], compaction["after_message_id"]), ("cancelled", newest))
 
-    async def test_compact_permission_and_execution_policy_revocation(self):
+    async def test_compact_permission_and_ownership(self):
         with self.p.db.connect() as conn:
             conn.execute("UPDATE users SET role='user',permission_group='no-access' WHERE id=2")
-            conn.execute("INSERT INTO chat_conversations VALUES ('policy',1,'Policy','model-a',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO chat_conversations VALUES ('policy',1,'Policy',?,?,NULL)", (now(), now()))
         with self.assertRaises(HTTPException) as denied:
             await self.q.compact(self.q.user(2), "private")
         self.assertEqual(denied.exception.status_code, 403)
         with self.assertRaises(HTTPException) as ownership:
             await self.q.compact(self.q.user(2), "chat-policy")
         self.assertIn(ownership.exception.status_code, (403, 404))
-        self.q.stopping = True
-        await self.q.compact(self.user, "chat-policy")
-        with self.p.db.connect() as conn:
-            conn.execute("UPDATE chat_model_policies SET allowed_models_json='[]' WHERE user_id=1")
-        await self.q.start()
-        await self.drain()
-        self.assertEqual(self.compactions, [])
-        self.assertEqual(self.q.messages(self.user, "chat-policy")["compaction"]["status"], "interrupted")
-        with self.p.db.connect() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM chat_messages").fetchone()[0], 0)
 
     async def test_compact_fifo_and_accounting_without_phantom_messages(self):
         self.hold.clear()

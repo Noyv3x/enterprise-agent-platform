@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { request } from "node:http";
 
 export interface Sandbox {
@@ -20,8 +21,13 @@ export interface ToolContext {
 export interface ProcessResult { stdout: string; stderr: string; exit_code?: number; status: string }
 export interface FileResult { content: string; details: { returned?: number; total?: number } }
 export interface GatewayResult { content: string; data: unknown; is_error: boolean }
+/** Live sanitized terminal output as Manager commits it; never authoritative (the result is). */
+export type OutputListener = (stream: "stdout" | "stderr", data: string) => void;
+// One NDJSON line carries at most the result frame (two bounded streams plus
+// JSON escaping), so a line beyond this is a protocol violation, not data.
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 export interface ExecutorTransport {
-  terminal(sandbox: Sandbox, context: ToolContext, command: string, cwd: string, timeoutMs: number, signal?: AbortSignal, auditDetails?: Record<string, unknown>): Promise<ProcessResult>;
+  terminal(sandbox: Sandbox, context: ToolContext, command: string, cwd: string, timeoutMs: number, signal?: AbortSignal, auditDetails?: Record<string, unknown>, onOutput?: OutputListener): Promise<ProcessResult>;
   file(sandbox: Sandbox, context: ToolContext, action: "read" | "write", args: Record<string, unknown>, signal?: AbortSignal): Promise<FileResult>;
   cancelRun(sandbox: Sandbox, runId: string): Promise<boolean>;
 }
@@ -30,17 +36,51 @@ export interface GatewayTransport {
 }
 
 export function createExecutorTransport(options: { socketPath: string; token: string; timeoutMs?: number }): ExecutorTransport {
-  function post<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  function post<T>(path: string, body: unknown, signal?: AbortSignal, onOutput?: OutputListener): Promise<T> {
     const { promise, resolve, reject } = Promise.withResolvers<T>();
       const req = request({ socketPath: options.socketPath, path: `/v1/executor/${path}`, method: "POST", signal,
-        headers: { authorization: `Bearer ${options.token}`, "content-type": "application/json" } }, res => {
+        headers: { authorization: `Bearer ${options.token}`, "content-type": "application/json", ...(onOutput ? { accept: "application/x-ndjson" } : {}) } }, res => {
+        const ok = !!res.statusCode && res.statusCode >= 200 && res.statusCode < 300;
+        if (onOutput && ok && String(res.headers["content-type"] ?? "").toLowerCase().startsWith("application/x-ndjson")) {
+          // Frames are processed as they arrive; only the partial last line is buffered.
+          const decoder = new StringDecoder("utf8");
+          let pending = "";
+          let final: { result: unknown } | undefined;
+          const frame = (line: string) => {
+            if (!line) return;
+            const value = JSON.parse(line) as { type?: string; stream?: string; data?: unknown; result?: unknown; error?: unknown; status?: unknown };
+            if (value.type === "output") {
+              if ((value.stream === "stdout" || value.stream === "stderr") && typeof value.data === "string") {
+                try { onOutput(value.stream, value.data); } catch { /* live display must not affect the execution */ }
+              }
+            } else if (value.type === "result") final = { result: value.result };
+            else if (value.type === "error") throw new Error(typeof value.error === "string" ? value.error : `Executor HTTP ${value.status ?? 500}`);
+          };
+          const feed = (text: string) => {
+            pending += text;
+            let newline: number;
+            while ((newline = pending.indexOf("\n")) >= 0) { const line = pending.slice(0, newline); pending = pending.slice(newline + 1); frame(line); }
+            if (pending.length > MAX_FRAME_BYTES) throw new Error("Executor stream frame too large");
+          };
+          res.on("data", (chunk: Buffer) => { try { feed(decoder.write(chunk)); } catch (error) { reject(error); req.destroy(); } });
+          res.on("error", reject);
+          res.on("end", () => {
+            try {
+              feed(decoder.end());
+              if (pending) { frame(pending); pending = ""; }
+              if (!final) throw new Error("Executor stream ended without a result");
+              resolve(final as T);
+            } catch (error) { reject(error); }
+          });
+          return;
+        }
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("error", reject);
         res.on("end", () => {
           try {
             const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-            if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) throw new Error(result.error ?? `Executor HTTP ${res.statusCode}`);
+            if (!ok) throw new Error(result.error ?? `Executor HTTP ${res.statusCode}`);
             resolve(result as T);
           } catch (error) { reject(error); }
         });
@@ -53,17 +93,17 @@ export function createExecutorTransport(options: { socketPath: string; token: st
   const identity = (sandbox: Sandbox, runId: string) => ({ run_id: runId, scope_id: sandbox.scope_key,
     lifecycle_id: sandbox.lifecycle_id, execution_context: { sandbox_id: sandbox.sandbox_id, workspace_id: sandbox.workspace_id, profile: sandbox.profile } });
   async function execute<T>(sandbox: Sandbox, context: ToolContext, endpoint: string, operation: string, action: string,
-    args: Record<string, unknown>, details: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    args: Record<string, unknown>, details: Record<string, unknown>, signal?: AbortSignal, onOutput?: OutputListener): Promise<T> {
     const call = { ...identity(sandbox, context.run_id), tool_call_id: context.tool_call_id ?? randomUUID(), target: "sandbox", action, arguments: args };
     const receipt = await post<{ audit_id: string; executor_id: string }>("audit", { ...call, audit_id: randomUUID(), operation, details }, signal);
-    return post<T>(endpoint, { ...call, audit_id: receipt.audit_id, executor_id: receipt.executor_id }, signal);
+    return post<T>(endpoint, { ...call, audit_id: receipt.audit_id, executor_id: receipt.executor_id }, signal, onOutput);
   }
   return {
-    async terminal(sandbox, context, command, cwd, timeoutMs, signal, auditDetails) {
+    async terminal(sandbox, context, command, cwd, timeoutMs, signal, auditDetails, onOutput) {
       // Every foreground command must terminate even if Runtime disappears.
       const deadline = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 3_600_000) : 600_000;
       const response = await execute<{ result: ProcessResult }>(sandbox, context, "terminal", "terminal", "run",
-        { command, cwd, timeout_ms: deadline, background: false }, auditDetails ?? { command }, signal);
+        { command, cwd, timeout_ms: deadline, background: false }, auditDetails ?? { command }, signal, onOutput);
       return response.result;
     },
     file: (sandbox, context, action, args, signal) => execute<FileResult>(sandbox, context, "file", action === "read" ? "read_file" : "write_file", action, args, {}, signal),

@@ -4,13 +4,12 @@ React/TypeScript/Vite builds every surface from [Beautiful UI](https://www.beaut
 
 ## Views
 
-- Login and shell: Personal AI, Channels, Chat, Schedules, Admin and Settings in the sidebar. Keep neutral branding, theme and all three locales.
+- Login and shell: Personal AI, Channels, Chat, Admin and Settings in the sidebar. Keep neutral branding, theme and all three locales.
 - Conversations: durable history, streaming text/thinking and tool activity, uploads, document previews and downloadable generated `MEDIA:` files. Thinking and tool calls stay visible after the reply finishes and after reload, from the persisted work trace (and, read-only, from older `agent_work` records). Sending during a run queues FIFO; there is no input joining or live file draft.
 - Manual context compaction shows as a status row at its place in the transcript (`after_message_id`), not pinned to the end; only an operation still queued, whose place is not known yet, follows the latest activity.
-- Personal computer panel: browser screenshot preview, acquire/release human takeover and workspace file list/download. A held lease makes agent browser actions busy. Channels and chat have no browser panel.
-- Chat: conversation list in the sidebar's chat section (search, create, rename, delete) and a model picker in the composer restricted to the user's allowed models. Each chat has a working directory in the user's shared lightweight sandbox; bash can access that user's other chat files.
-- Schedules: create/edit/pause/resume/delete/run-now and occurrence history for personal AI. No continue/complete decision UI.
-- Admin: users and permission groups, personal model/thinking settings, allowed/default chat model policy, branding, models/Codex OAuth, system/update controls and token usage including cache-hit ratio.
+- Personal computer panel: the AI's ongoing work in one AgentScreen frame with three views (browser / terminal / editor, a segmented switcher) above the workspace file list/download. Terminal: read-only transcript of bash, grep, find and ls (`$ command`, output scrolling live from `tool_output`, replaced by the final output at `tool_end`) and one line per web_search, web_fetch, mcp and schedule call. Editor: the file being written (content grows from `tool_input_delta`), edited (removed/added blocks, then the result diff) or read, with a path header. Browser: screenshot, tabs, human takeover (acquire/release; a held lease makes agent browser actions busy and pins the browser view). The panel follows the newest activity (file tools → editor, browser → browser, everything else → terminal) until the person picks a view; "Follow AI" or a new run resumes it. Without a run it shows the last step (the finished run, or the latest reply's persisted `metadata.work` after reload). Very long content shows its last lines with a note; the terminal is `role=log` and announces only state changes. The conversation's work trace is unchanged and does not show streaming input or output. Channels and chat have no computer panel.
+- Chat: conversation list in the sidebar's chat section (search, create, rename, delete). The composer and header show no model; chat uses the account's model set by administrators. Each chat has a working directory in the user's shared lightweight sandbox; bash can access that user's other chat files.
+- Admin: users and permission groups, personal model/thinking settings and an optional chat model per account (default: follow the personal AI), branding, models/Codex OAuth, system/update controls and token usage including cache-hit ratio.
 - Settings: kept account/preferences behavior with shared branding/theme/localization.
 
 ## State and behavior
@@ -21,9 +20,9 @@ Remove memory/skills management panels, approvals, execution-review/needs-review
 
 Server authorization remains authoritative even when controls are hidden. Preserve user input and reading position during streaming, navigation and locale/theme changes. Static assets ship with Platform: index is no-cache, hashed assets immutable, with available gzip/Brotli variants.
 
-- Chat lists and model policy are scoped to the authenticated account. Logout/session expiry invalidates cached and in-flight results. Deleting a chat permanently deletes its working-directory files; confirmations state both consequences.
+- Chat lists are scoped to the authenticated account. Logout/session expiry invalidates cached and in-flight results. Deleting a chat permanently deletes its working-directory files; confirmations state both consequences.
 - Keep composer text and uploads when the first activity changes an empty conversation into a thread. Resend belongs to the originating stopped user request, not assistant completion order.
-- Switches and timing segments change drafts only; saving requires the form's explicit submit action. Schedule actions serialize globally, and history refresh errors remain visible alongside cached runs.
+- Switches change drafts only; saving requires the form's explicit submit action.
 - Browser tabs can be inspected without takeover. Expanded computer viewers sit above their parent sheet but below their popovers; Escape closes only the innermost layer.
 - Malformed chat hashes follow the unavailable-route path. Disclosure IDs are unique per component instance, and every mobile sidebar selection dismisses navigation, including the current route.
 
@@ -57,9 +56,8 @@ Use neutral defaults (`Agent Platform`, `Agent`), shared theme tokens and same-o
   | --- | --- |
   | 侧栏、对话列表与搜索 | SidebarNav、SearchList、GlideMenu |
   | 对话消息 | ThinkingState（思考与步骤）、ToolChips（工具调用）、StreamingText 与 StreamText（回答、流式光标、操作）、CodeBlock、LoadingState、ContextCards（附件） |
-  | 输入框 | PromptBar（附件、斜杠命令、模型选择、发送与停止） |
-  | 电脑面板 | AgentScreen |
-  | 计划任务 | TaskRows、FilterTable |
+  | 输入框 | PromptBar（附件、斜杠命令、发送与停止） |
+  | 电脑面板（浏览器、终端、编辑器） | AgentScreen（取景框，终端与编辑器以内容节点替代截图）、SegmentedControl（视图切换）、CodeBlock 的等宽字体、分隔线与圆角 |
   | 用户、权限组、频道 | RecordsTable、FilterTable |
   | 用量 | InsightCards |
   | 系统与更新 | TaskRows、StatusPill |
@@ -89,4 +87,4 @@ Use neutral defaults (`Agent Platform`, `Agent`), shared theme tokens and same-o
 
 ## Verification
 
-Exercise the real browser surface for login, each conversation mode, attachments, model policy, browser takeover, schedules and administration. See [testing](../development/testing.md); mock screenshots or CSS assertions do not prove those behaviors.
+Exercise the real browser surface for login, each conversation mode, attachments, the administrator's chat model setting, browser takeover and administration. See [testing](../development/testing.md); mock screenshots or CSS assertions do not prove those behaviors.

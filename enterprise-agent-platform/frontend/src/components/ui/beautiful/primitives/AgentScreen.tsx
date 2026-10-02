@@ -7,6 +7,9 @@
  * - the viewer is controlled (`open`), forwards clicks on the screen while the person holds control, and
  *   renders the caller's input row below the screen; the custom cursor shows only while interactive;
  * - labels come from the caller (i18n); the dialog traps focus, restores it, and consumes Escape before a parent sheet;
+ * - the caller may give the screen as a node (`screen` for the card, `viewerScreen` for the expanded viewer, which
+ *   sizes it to the viewer's measure) instead of a screenshot: the computer panel's terminal and editor views reuse
+ *   this frame so every view shares its card, title bar, focus handling and Escape behavior;
  * - the expanded viewer sits above sheets (60) and below its portaled popovers (80).
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
@@ -107,6 +110,8 @@ export default function AgentScreen({
   agentName,
   status,
   streamSrc,
+  screen,
+  viewerScreen,
   loading = false,
   empty,
   open,
@@ -125,6 +130,10 @@ export default function AgentScreen({
   status?: ReactNode;
   /** current screenshot URL; absent → `empty` */
   streamSrc?: string | null;
+  /** a node shown on the card instead of the screenshot (it is not interactive; the card opens the viewer) */
+  screen?: ReactNode;
+  /** a node shown in the expanded viewer instead of the screenshot, in a fixed-size scroll frame */
+  viewerScreen?: ReactNode;
   loading?: boolean;
   /** shown on the card when there is no screen */
   empty?: ReactNode;
@@ -208,7 +217,7 @@ export default function AgentScreen({
         ) : (
           <>
             <div className="absolute inset-0 overflow-hidden bg-inset">
-              {streamSrc ? (
+              {screen ? screen : streamSrc ? (
                 <img
                   src={streamSrc}
                   alt={labels.screen}
@@ -302,7 +311,9 @@ export default function AgentScreen({
                 }}
                 onMouseLeave={() => setCursorPos(null)}
               >
-                {loading || !streamSrc ? (
+                {viewerScreen ? (
+                  <div className="relative overflow-hidden" style={{ width: "min(960px, 90vw)", height: inputs ? "min(560px, calc(100vh - 210px))" : "min(560px, calc(100vh - 150px))" }}>{viewerScreen}</div>
+                ) : loading || !streamSrc ? (
                   <div className={`relative ${SCREEN_ASPECT}`} style={{ width: "min(960px, 90vw)" }}>
                     {loading ? <LoadingScreen label={labels.connecting} /> : (
                       <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-[13px] text-ink-2">{empty}</div>

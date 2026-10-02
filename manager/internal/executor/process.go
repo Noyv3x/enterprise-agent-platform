@@ -43,6 +43,8 @@ type boundedBuffer struct {
 	truncated bool
 	private   bool
 	redactor  outputRedactor
+	stream    string
+	live      *liveOutput
 }
 
 func (b *boundedBuffer) Write(p []byte) (int, error) {
@@ -62,6 +64,9 @@ func (b *boundedBuffer) writeSanitizedLocked(p []byte) {
 		b.truncated = true
 	}
 	_, _ = b.value.Write(p)
+	if b.live != nil && !b.private {
+		b.live.append(b.stream, p)
+	}
 }
 func (b *boundedBuffer) String() string {
 	b.mu.Lock()
@@ -291,8 +296,11 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	defer stdin.Close()
 	reader, writer := io.Pipe()
 	command.Stdout = writer
-	stdout := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput}
-	stderr := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput}
+	stdout := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput, stream: "stdout"}
+	stderr := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput, stream: "stderr"}
+	if !args.PrivateOutput {
+		stdout.live, stderr.live = args.live, args.live
+	}
 	command.Stderr = stderr
 	if err := command.Start(); err != nil {
 		reader.Close()

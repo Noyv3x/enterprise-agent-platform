@@ -14,8 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .auth import COOKIE_NAME, PERMISSIONS, TTL, body_json, current_user, groups, hash_password, issue_session, public_user
-from .db import now
+from .auth import COOKIE_NAME, PERMISSIONS, TTL, admin_user, body_json, current_user, groups, hash_password, issue_session
 from .gates import manager_request
 
 THINKING = {'off', 'minimal', 'low', 'medium', 'high', 'xhigh'}
@@ -26,9 +25,9 @@ def setting(conn, key, value, secret=0):
 
 
 def validate_user(db, fields):
-    if set(fields) - {'username', 'display_name', 'role', 'position', 'permission_group', 'model_name', 'thinking_depth', 'timezone', 'active', 'password'}:
+    if set(fields) - {'username', 'display_name', 'role', 'position', 'permission_group', 'model_name', 'chat_model_name', 'thinking_depth', 'timezone', 'active', 'password'}:
         raise HTTPException(400, 'Unknown user field')
-    for name in ('username', 'display_name', 'position', 'model_name'):
+    for name in ('username', 'display_name', 'position', 'model_name', 'chat_model_name'):
         if name in fields and (not isinstance(fields[name], str) or len(fields[name]) > 128 or (name == 'username' and not fields[name].strip())):
             raise HTTPException(400, 'Invalid ' + name)
     if 'role' in fields and fields['role'] not in ('admin', 'user'):
@@ -55,7 +54,7 @@ def create_user(db, username, password, display_name='', role='user', **fields):
     try:
         with db.connect() as conn:
             cursor = conn.execute(f"INSERT INTO users({','.join(values)}) VALUES({','.join('?' for _ in values)})", tuple(values.values()))
-            return public_user(conn.execute('SELECT * FROM users WHERE id=?', (cursor.lastrowid,)).fetchone())
+            return admin_user(conn.execute('SELECT * FROM users WHERE id=?', (cursor.lastrowid,)).fetchone())
     except sqlite3.IntegrityError:
         raise HTTPException(409, 'Username already exists') from None
 
@@ -70,7 +69,7 @@ async def users(request):
         return JSONResponse({'user': create_user(db, **body)}, status_code=201)
     with db.connect() as conn:
         rows = conn.execute('SELECT * FROM users ORDER BY id').fetchall()
-    return JSONResponse({'users': [public_user(row) for row in rows]})
+    return JSONResponse({'users': [admin_user(row) for row in rows]})
 
 
 async def user_update(request):
@@ -91,7 +90,7 @@ async def user_update(request):
         if fields:
             assignments = ','.join(key + '=?' for key in fields)
             conn.execute(f'UPDATE users SET {assignments},token_version=token_version+1 WHERE id=?', (*fields.values(), row['id']))
-        user = public_user(conn.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone())
+        user = admin_user(conn.execute('SELECT * FROM users WHERE id=?', (row['id'],)).fetchone())
     return JSONResponse({'ok': True} if request.method == 'DELETE' else {'user': user})
 
 
@@ -104,32 +103,9 @@ async def impersonate(request):
         raise HTTPException(404, 'User not found')
     if row['id'] == admin['id']:
         raise HTTPException(400, 'Cannot impersonate yourself')
-    response = JSONResponse({'user': public_user(row)})
+    response = JSONResponse({'user': admin_user(row)})
     response.set_cookie(COOKIE_NAME, issue_session(p.settings, row), max_age=TTL, httponly=True, secure=p.settings.public_base_url.startswith('https://'), samesite='lax')
     return response
-
-
-async def policy(request):
-    current_user(request, admin=True)
-    db = request.app.state.platform.db
-    user_id = request.path_params['id']
-    body = await body_json(request) if request.method == 'PUT' else None
-    if body is not None:
-        allowed = body.get('allowed_models')
-        default = body.get('default_model_id')
-        if set(body) != {'allowed_models', 'default_model_id'} or not isinstance(allowed, list) or not all(isinstance(m, str) and 0 < len(m) <= 128 for m in allowed) or len(set(allowed)) != len(allowed) or not isinstance(default, str) or (allowed and default not in allowed) or (not allowed and default != ''):
-            raise HTTPException(400, 'Default model must belong to the allowed model list')
-        if allowed:
-            catalog = await request.app.state.platform.oauth.catalog()
-            if not set(allowed) <= {model['id'] for model in catalog['models']}:
-                raise HTTPException(400, 'Model is not available')
-    with db.connect() as conn:
-        if conn.execute('SELECT id FROM users WHERE id=?', (user_id,)).fetchone() is None:
-            raise HTTPException(404, 'User not found')
-        if body is not None:
-            conn.execute('INSERT INTO chat_model_policies(user_id,allowed_models_json,default_model_id,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET allowed_models_json=excluded.allowed_models_json,default_model_id=excluded.default_model_id,updated_at=excluded.updated_at', (user_id, json.dumps(allowed), default, now()))
-        row = conn.execute('SELECT * FROM chat_model_policies WHERE user_id=?', (user_id,)).fetchone()
-    return JSONResponse({'allowed_models': json.loads(row['allowed_models_json']) if row else [], 'default_model_id': row['default_model_id'] if row else ''})
 
 
 async def permission_groups(request):
@@ -245,4 +221,4 @@ async def system(request):
 
 
 def routes():
-    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/impersonate', impersonate, methods=['POST']), Route('/api/admin/users/{id:int}/chat-model-policy', policy, methods=['GET', 'PUT']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]
+    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/impersonate', impersonate, methods=['POST']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]

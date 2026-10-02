@@ -523,6 +523,10 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 		if !a.decodeExecutor(response, request, &body) {
 			return
 		}
+		if acceptsNDJSON(request) {
+			a.streamTerminal(response, request, body)
+			return
+		}
 		result, err := a.Executor.Terminal(request.Context(), body)
 		a.executorResult(response, result, err)
 	case "/v1/executor/file":
@@ -555,6 +559,55 @@ func (a *API) executorResult(response http.ResponseWriter, result any, err error
 		return
 	}
 	writeJSON(response, http.StatusOK, result)
+}
+
+func acceptsNDJSON(request *http.Request) bool {
+	for _, value := range request.Header.Values("Accept") {
+		for _, part := range strings.Split(value, ",") {
+			mediaType, _, _ := strings.Cut(part, ";")
+			if strings.EqualFold(strings.TrimSpace(mediaType), "application/x-ndjson") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// streamTerminal answers an opted-in terminal call as NDJSON. The response
+// starts at the first frame; a failure before that is the ordinary HTTP error.
+func (a *API) streamTerminal(response http.ResponseWriter, request *http.Request, body executor.Call) {
+	controller := http.NewResponseController(response)
+	started := false
+	emit := func(frame any) error {
+		data, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		if !started {
+			started = true
+			response.Header().Set("Content-Type", "application/x-ndjson")
+			response.WriteHeader(http.StatusOK)
+		}
+		if _, err := response.Write(append(data, '\n')); err != nil {
+			return err
+		}
+		return controller.Flush()
+	}
+	result, err := a.Executor.TerminalStream(request.Context(), body, emit)
+	if err != nil {
+		if !started {
+			writeError(response, http.StatusConflict, err.Error())
+			return
+		}
+		_ = emit(map[string]any{"type": "error", "status": http.StatusConflict, "error": journal.BoundDiagnostic(err.Error())})
+		return
+	}
+	frame := make(map[string]any, len(result)+1)
+	for key, value := range result {
+		frame[key] = value
+	}
+	frame["type"] = "result"
+	_ = emit(frame)
 }
 func authorized(request *http.Request, expected string) bool {
 	header := request.Header.Get("Authorization")

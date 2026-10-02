@@ -164,7 +164,7 @@ function BrandPreview({ product, agent, color, logo }: { product: string; agent:
           </span>
           <span className="truncate text-[13px] font-semibold text-ink">{product}</span>
         </div>
-        {[w('Personal AI', '个人 AI', '個人 AI'), w('Chat', '聊天', '聊天'), w('Schedules', '定时任务', '排程任務')].map((label, index) => (
+        {[w('Personal AI', '个人 AI', '個人 AI'), w('Chat', '聊天', '聊天'), w('Channels', '频道', '頻道')].map((label, index) => (
           <span key={label} className={`truncate rounded-[8px] px-2 py-1.5 text-[12.5px] ${index === 0 ? 'bg-hover-2 font-medium text-ink' : 'text-ink-2'}`}>{label}</span>
         ))}
       </div>

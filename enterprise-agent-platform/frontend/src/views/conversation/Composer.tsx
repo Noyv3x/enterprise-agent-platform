@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { request } from "../../api";
-import PromptBar, { type PromptCommand, type PromptModel } from "../../components/ui/beautiful/primitives/PromptBar";
+import PromptBar, { type PromptCommand } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
 import { uploadPath } from "./routes";
@@ -28,21 +28,13 @@ export interface ComposerProps {
   /** accepted messages still waiting their FIFO turn */
   queued?: number;
   commands?: ComposerCommand[];
-  models?: PromptModel[];
-  model?: string;
-  onModelChange?: (model: string) => Promise<unknown>;
-  modelDisabled?: boolean;
-  /** extra status (e.g. a disallowed model warning); blocks sending when `blocked` */
-  notice?: ReactNode;
-  blocked?: boolean;
   placeholder: string;
   /** replaces the draft whenever `seed.n` changes (resend with attachments) */
   seed?: { text: string; n: number } | null;
 }
 
 export function Composer({
-  ensureScope, onSend, working = false, onStop, queued = 0, commands = [], models, model, onModelChange, modelDisabled,
-  notice, blocked = false, placeholder, seed,
+  ensureScope, onSend, working = false, onStop, queued = 0, commands = [], placeholder, seed,
 }: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
@@ -61,7 +53,7 @@ export function Composer({
 
   const uploading = uploads.some((upload) => !upload.attachment && !upload.error);
   const ready = uploads.flatMap((upload) => (upload.attachment ? [upload.attachment.id] : []));
-  const canSend = !blocked && !sending && !uploading && (text.trim() !== "" || ready.length > 0);
+  const canSend = !sending && !uploading && (text.trim() !== "" || ready.length > 0);
 
   const upload = (files: File[]) => {
     setError("");
@@ -105,12 +97,11 @@ export function Composer({
   };
 
   const status = error ? <span className="text-red" role="alert">{error}</span>
-    : notice ? notice
-      : queued > 0 ? w(
-        `${queued} queued — messages run in order after the current reply`,
-        `${queued} 条排队中，将在当前回复后依次处理`,
-        `${queued} 則排隊中，將在目前回覆後依序處理`,
-      ) : null;
+    : queued > 0 ? w(
+      `${queued} queued — messages run in order after the current reply`,
+      `${queued} 条排队中，将在当前回复后依次处理`,
+      `${queued} 則排隊中，將在目前回覆後依序處理`,
+    ) : null;
 
   return (
     <PromptBar
@@ -129,13 +120,6 @@ export function Composer({
       onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
       commands={commands}
       onCommand={(key) => commands.find((command) => command.key === key)?.run()}
-      models={models}
-      model={model}
-      onModelChange={onModelChange ? (next) => {
-        setError("");
-        onModelChange(next).catch((reason: unknown) => setError(errorText(reason)));
-      } : undefined}
-      modelDisabled={modelDisabled}
       canSend={canSend}
       onSend={() => void submit()}
       working={working}

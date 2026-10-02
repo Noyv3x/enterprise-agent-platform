@@ -90,7 +90,7 @@ export function Models() {
       {catalog.state === 'loading' && <LoadingState label={w('Checking the connection…', '正在检查连接…', '正在檢查連線…')} />}
       {catalog.state === 'error' && <Notice tone="danger" title={w('Connection status unavailable', '无法获取连接状态', '無法取得連線狀態')} action={<Button size="sm" onClick={() => void catalog.reload()}>{w('Retry', '重试', '重試')}</Button>}>{catalog.error}</Notice>}
       {catalog.data && !flow && <p className="text-[13px] leading-[1.5] text-ink-2">{linked
-        ? w(`Signed in. ${models.length} models are available to personal AI and chat policies.`, `已登录。个人 AI 和聊天策略可使用 ${models.length} 个模型。`, `已登入。個人 AI 和聊天策略可使用 ${models.length} 個模型。`)
+        ? w(`Signed in. ${models.length} models are available to personal AI and chat.`, `已登录。个人 AI 和聊天可使用 ${models.length} 个模型。`, `已登入。個人 AI 和聊天可使用 ${models.length} 個模型。`)
         : w('No account is connected, so agents cannot answer. Connect an account with the device code sign-in.', '尚未连接账户，Agent 无法回复。请使用设备代码登录连接账户。', '尚未連線帳戶，Agent 無法回覆。請使用裝置代碼登入連線帳戶。')}</p>}
       {flow && <ol aria-label={w('Device sign-in', '设备登录', '裝置登入')} className="flex flex-col gap-3">
         <li className="flex items-start gap-2.5">
@@ -129,7 +129,7 @@ export function Models() {
 
     <FormSection
       title={w('Available models', '可用模型', '可用模型')}
-      description={w('Choices offered for personal AI models and standard chat policies.', '可用于个人 AI 模型和标准聊天策略的模型。', '可用於個人 AI 模型和標準聊天策略的模型。')}
+      description={w('Choices offered for personal AI and standard chat models.', '可用于个人 AI 和标准聊天的模型。', '可用於個人 AI 和標準聊天的模型。')}
       actions={<Button size="xs" variant="quiet" disabled={catalog.refreshing} onClick={() => void catalog.reload()}><Icon name="refresh" size={14} />{w('Refresh', '刷新', '重新整理')}</Button>}
     >
       {catalog.state === 'loading' && <LoadingState label={w('Loading models…', '正在加载模型…', '正在載入模型…')} />}

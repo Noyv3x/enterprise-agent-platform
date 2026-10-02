@@ -11,7 +11,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from .auth import current_user, permissions
+from .auth import body_json, current_user, permissions
 from .db import now
 from .files import bounded_read, ensure_workspace, open_workspace
 
@@ -21,6 +21,11 @@ BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search",
 
 def timestamp(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat() if isinstance(value, (int, float)) else value
+
+
+def visible_metadata(metadata):
+    """Message metadata as users see it: no legacy model-usage keys."""
+    return {key: value for key, value in metadata.items() if key not in ("generation", "token_usage")}
 
 
 class _WorkTrace:
@@ -137,12 +142,6 @@ class Queue:
     def lock(self, key):
         return self.locks.setdefault(key, asyncio.Lock())
 
-    def policy(self, user):
-        with self.p.db.connect() as conn:
-            row = conn.execute("SELECT * FROM chat_model_policies WHERE user_id=?", (user["id"],)).fetchone()
-        return {"allowed_models": json.loads(row["allowed_models_json"]) if row else [],
-                "default_model_id": row["default_model_id"] if row else ""}
-
     def conversation(self, user, conversation_id):
         with self.p.db.connect() as conn:
             row = conn.execute("SELECT * FROM chat_conversations WHERE id=? AND user_id=? AND deleted_at IS NULL",
@@ -153,7 +152,9 @@ class Queue:
 
     def scope(self, user, scope, authorize=True):
         root = self.p.settings.data_dir / "workspaces"
-        model = {"id": user["model_name"], "thinking": "off" if user["thinking_depth"] == "none" else user["thinking_depth"]}
+        with self.p.db.connect() as conn:
+            names = conn.execute("SELECT model_name,chat_model_name FROM users WHERE id=?", (user["id"],)).fetchone()
+        model = {"id": names["model_name"], "thinking": "off" if user["thinking_depth"] == "none" else user["thinking_depth"]}
         kind, channel = "agent", None
         scope_name = ""
         required = "chat" if scope.startswith("chat-") else "private_agent" if scope == "private" else "read_workspace"
@@ -167,7 +168,7 @@ class Queue:
             workspace_id = f"chat-user-{user['id']}"
             workspace = root / "chat" / f"user-{user['id']}" / conversation["id"]
             sid = scope
-            model = {"id": conversation["model_id"], "thinking": "off"}
+            model = {"id": names["chat_model_name"] or names["model_name"], "thinking": "off"}
             sandbox_key = f"chat:{user['id']}"
             cwd = f"/workspace/{conversation['id']}"
         elif scope == "private":
@@ -225,7 +226,7 @@ class Queue:
         with self.p.db.connect() as conn:
             row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (message_id,)).fetchone()
         role = row["role"] if info["kind"] == "chat" else {"agent": "assistant"}.get(row["author_type"], row["author_type"])
-        metadata = json.loads(row["metadata_json"])
+        metadata = visible_metadata(json.loads(row["metadata_json"]))
         if info["kind"] == "agent" and role == "user":
             metadata.setdefault("author_display_name", row["username"])
             metadata.setdefault("author_user_id", row["user_id"])
@@ -278,6 +279,9 @@ class Queue:
                 rows = conn.execute("SELECT id,event_json FROM queue_events WHERE scope_key=? AND id>? ORDER BY id LIMIT 100", (key, after)).fetchall()
             for row in rows:
                 event = json.loads(row["event_json"])
+                event.pop("model", None)
+                if isinstance(event.get("message"), dict):
+                    event["message"]["metadata"] = visible_metadata(event["message"].get("metadata", {}))
                 after = event["seq"] = row["id"]
                 yield f"id: {after}\nevent: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
             if not rows:
@@ -292,8 +296,6 @@ class Queue:
         info = self.scope(user, scope)
         if info["channel_id"] is not None and "chat" not in permissions(self.p.db, user):
             raise HTTPException(403, "Permission denied")
-        if info["kind"] == "chat" and info["model"]["id"] not in self.policy(user)["allowed_models"]:
-            raise HTTPException(403, "Chat model is not allowed")
         async with self.p.gate.admit(), self.lock(info["scope_key"]):
             with self.p.db.connect() as conn:
                 if schedule_run_id:
@@ -393,12 +395,9 @@ class Queue:
         response.raise_for_status()
         return response.json()
 
-    async def selected_model(self, user, info):
+    async def selected_model(self, info):
         catalog = await self.p.oauth.catalog()
-        if info["kind"] == "chat":
-            if info["model"]["id"] not in self.policy(user)["allowed_models"]:
-                raise HTTPException(403, "Chat model is no longer allowed")
-        elif not info["model"]["id"]:
+        if not info["model"]["id"]:
             if not catalog["models"]:
                 raise HTTPException(409, "No executable model is available")
             info["model"]["id"] = catalog["models"][0]["id"]
@@ -491,7 +490,7 @@ class Queue:
                         metadata["status"] = "running"
                         conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps(metadata), payload["message_id"]))
                     self.emit(key, {"type": "message", "message": self.message(info, payload["message_id"])})
-                    await self.selected_model(user, info)
+                    await self.selected_model(info)
                     prompt = self.p.files.prompt(user, info, payload["attachment_ids"])
                     prompt["text"] = payload["content"] + ("\n" + prompt["text"] if prompt["text"] else "")
                     tools = BUILTINS + (["browser", "schedule", "mcp"] if info["kind"] == "agent" and info["channel_id"] is None else [])
@@ -593,7 +592,7 @@ class Queue:
         if self.payload_key(payload):
             user = self.user(payload["user_id"])
             info = self.scope(user, payload["scope"], authorize=False)
-            await self.finish(job, payload, user, info, {"type": "run_end", "status": "interrupted", "text": "", "error": error, "usage": {}, "model": info["model"]["id"]}, work)
+            await self.finish(job, payload, user, info, {"type": "run_end", "status": "interrupted", "text": "", "error": error, "usage": {}}, work)
         else:
             with self.p.db.connect() as conn:
                 conn.execute("UPDATE durable_jobs SET status='failed',last_error=?,updated_at=? WHERE id=?", (error, int(time.time()), job["id"]))
@@ -608,7 +607,7 @@ class Queue:
             while pending := self.pending(info["scope_key"]):
                 job, payload = pending
                 await self.finish(job, payload, self.user(payload["user_id"]), info,
-                                  {"type": "run_end", "status": "cancelled", "text": "", "usage": {}, "model": info["model"]["id"]})
+                                  {"type": "run_end", "status": "cancelled", "text": "", "usage": {}})
             run_id = self.running.get(info["scope_key"])
             unsettled = self.unsettled.get(info["scope_key"])
             if unsettled and unsettled[1].get("operation") == "compact":
@@ -621,8 +620,6 @@ class Queue:
         info = self.scope(user, scope)
         if info["channel_id"] is not None and "chat" not in permissions(self.p.db, user):
             raise HTTPException(403, "Permission denied")
-        if info["kind"] == "chat" and info["model"]["id"] not in self.policy(user)["allowed_models"]:
-            raise HTTPException(403, "Chat model is not allowed")
         async with self.p.gate.admit(), self.lock(info["scope_key"]):
             payload = {"operation": "compact", "user_id": user["id"], "scope": scope,
                        "compaction": {"status": "queued"}}
@@ -674,7 +671,7 @@ class Queue:
     async def execute_compact(self, job, payload, user, info):
         if info["channel_id"] is not None and "chat" not in permissions(self.p.db, user):
             raise HTTPException(403, "Permission denied")
-        model = await self.selected_model(user, info)
+        model = await self.selected_model(info)
         key = info["scope_key"]
         if key in self.cancelling:
             self.finish_compact(job, payload, "cancelled")
@@ -717,10 +714,6 @@ class Queue:
         return {"ok": True}
 
 
-async def chat_models(request):
-    return JSONResponse(request.app.state.platform.queue.policy(current_user(request)))
-
-
 async def chats(request):
     user = current_user(request)
     p = request.app.state.platform
@@ -730,18 +723,16 @@ async def chats(request):
         with p.db.connect() as conn:
             rows = conn.execute("SELECT * FROM chat_conversations WHERE user_id=? AND deleted_at IS NULL ORDER BY updated_at DESC", (user["id"],)).fetchall()
         return JSONResponse({"conversations": [dict(row) for row in rows]})
-    body = await request.json()
-    policy = p.queue.policy(user)
-    model = body.get("model_id", policy["default_model_id"])
-    if model not in policy["allowed_models"]:
-        raise HTTPException(403, "Chat model is not allowed")
+    body = await body_json(request)
+    if set(body) - {"title"}:
+        raise HTTPException(400, "Unknown conversation field")
     title = body.get("title", "New chat")
     if not isinstance(title, str) or not title.strip():
         raise HTTPException(400, "Title is required")
     cid = str(uuid.uuid4())
     async with p.gate.admit():
         with p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations(id,user_id,title,model_id,created_at,updated_at) VALUES (?,?,?,?,?,?)", (cid, user["id"], title, model, now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)", (cid, user["id"], title, now(), now()))
         p.queue.scope(user, "chat-" + cid)
     return JSONResponse({"conversation": p.queue.conversation(user, cid)}, status_code=201)
 
@@ -765,14 +756,14 @@ async def chat(request):
                 conn.execute("UPDATE chat_conversations SET deleted_at=?,updated_at=? WHERE id=?", (now(), now(), cid))
             shutil.rmtree(info["workspace"])
             return JSONResponse({"ok": True})
-        body = await request.json()
-        model, title = body.get("model_id", conversation["model_id"]), body.get("title", conversation["title"])
-        if model not in p.queue.policy(user)["allowed_models"]:
-            raise HTTPException(403, "Chat model is not allowed")
+        body = await body_json(request)
+        if set(body) - {"title"}:
+            raise HTTPException(400, "Unknown conversation field")
+        title = body.get("title", conversation["title"])
         if not isinstance(title, str) or not title.strip():
             raise HTTPException(400, "Title is required")
         with p.db.connect() as conn:
-            conn.execute("UPDATE chat_conversations SET title=?,model_id=?,updated_at=? WHERE id=?", (title, model, now(), cid))
+            conn.execute("UPDATE chat_conversations SET title=?,updated_at=? WHERE id=?", (title, now(), cid))
     return JSONResponse({"conversation": p.queue.conversation(user, cid)})
 
 
@@ -812,7 +803,7 @@ async def conversation_route(request):
 
 
 def routes():
-    result = [Route("/api/chat/models", chat_models), Route("/api/chat/conversations", chats, methods=["GET", "POST"]),
+    result = [Route("/api/chat/conversations", chats, methods=["GET", "POST"]),
               Route("/api/chat/conversations/{id}", chat, methods=["GET", "PATCH", "DELETE"])]
     for prefix in ("/api/conversations/{scope}", "/api/chat/conversations/{id}"):
         for action in ("messages", "events", "cancel", "compact", "reset"):

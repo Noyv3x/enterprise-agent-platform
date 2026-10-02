@@ -16,7 +16,6 @@ import { Admin } from './views/Admin';
 import { Channels, type Channel } from './views/Channels';
 import { Chat } from './views/Chat';
 import { Conversation } from './views/Conversation';
-import { Schedules } from './views/Schedules';
 import { Settings } from './views/Settings';
 import { setChatAccount } from './views/chat/chatStore';
 
@@ -123,8 +122,6 @@ function Shell() {
     view = <Chat key={route.id ?? 'new'} id={route.id ?? undefined} userName={userName} />;
   } else if (route.view === 'channels') {
     view = <Channels channels={channels} onChange={next => setSession({ ...session, channels: next })} onOpen={navigate} permissions={permissions} admin={access.admin} />;
-  } else if (route.view === 'schedules') {
-    view = <Schedules />;
   } else if (route.view === 'admin') {
     view = <Admin />;
   } else {

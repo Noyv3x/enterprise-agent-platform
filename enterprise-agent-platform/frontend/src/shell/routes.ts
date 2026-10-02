@@ -6,7 +6,6 @@ export type Route =
   | { view: "channels" }
   | { view: "channel"; id: number }
   | { view: "chat"; id: string | null }
-  | { view: "schedules" }
   | { view: "admin" }
   | { view: "settings" }
   | { view: "unknown" };
@@ -42,7 +41,6 @@ export function parseRoute(hash: string): Route {
       return { view: "unknown" };
     }
   }
-  if (key === "schedules") return { view: "schedules" };
   if (key === "admin" || key.startsWith("admin/")) return { view: "admin" };
   if (key === "settings") return { view: "settings" };
   return { view: "unknown" };
@@ -51,7 +49,6 @@ export function parseRoute(hash: string): Route {
 export function allowed(route: Route, access: Access): boolean {
   switch (route.view) {
     case "private":
-    case "schedules":
       return access.private;
     case "channels":
     case "channel":

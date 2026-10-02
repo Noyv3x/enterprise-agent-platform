@@ -5,9 +5,9 @@ All paths are same-origin. JSON requests/responses; errors `{ "error": "message"
 ## Auth and bootstrap
 - POST `/api/auth/login` `{username,password}` → `{user}`; POST `/api/auth/logout` `{}` → `{ok:true}`.
 - Login failures use bounded 15-minute client/account counters; throttled requests return 429 before password hashing for exhausted client/pair budgets. Password changes require current-password proof (missing or wrong returns 400) and issue a fresh installed-session cookie.
-- GET `/api/bootstrap` → `{user,branding,permissions,channels,chat_models}`.
+- GET `/api/bootstrap` → `{user,branding,permissions,channels}`.
 - GET/PATCH `/api/me` (patch `{display_name?,timezone?,password?,current_password?}`) → `{user}`. Changing `password` requires valid `current_password`; success renews the caller's cookie while revoking older copies.
-- User: `{id,username,display_name,role,position,permission_group,model_name,thinking_depth,timezone,active}`. Passwords never returned.
+- User (self-facing: bootstrap, login, `/api/me`): `{id,username,display_name,role,position,permission_group,thinking_depth,timezone,active}`. Users never receive `model_name` or `chat_model_name`. Passwords never returned.
 - Branding: `{product_name,agent_name,primary_color,logo}`. Permissions: string array. Admin receives all permissions.
 - GET `/api/branding` is public and returns `{branding}` for the login page.
 
@@ -18,7 +18,7 @@ All paths are same-origin. JSON requests/responses; errors `{ "error": "message"
 - POST `/api/conversations/{scope}/cancel` → `{ok:true}`; POST `/api/conversations/{scope}/reset` → `{ok:true}`.
 - POST `/api/conversations/{scope}/compact` → HTTP 202 `{ok:true,job_id,status:"queued"}`. Manual compaction is a durable operation in the same per-session FIFO as messages; existing work finishes first and later messages wait behind it. The Runtime compaction request has a 15-minute timeout.
 - GET `/api/conversations/{scope}/events?after=<seq>` → SSE.
-- Message: `{id,role:"user"|"assistant"|"system",content,metadata,created_at,attachments:[]}`. Metadata includes `status:"queued"|"running"|"completed"|"interrupted"|"cancelled"`, optional error.
+- Message: `{id,role:"user"|"assistant"|"system",content,metadata,created_at,attachments:[]}`. Metadata includes `status:"queued"|"running"|"completed"|"interrupted"|"cancelled"`, optional error. Message payloads never carry the legacy metadata keys `generation` or `token_usage`; model usage is recorded only for administrators in token usage events.
 
 ### Assistant message work trace
 
@@ -45,15 +45,14 @@ Assistant messages may include `metadata.work` v1. It is stored only in the assi
 - Older messages may carry `metadata.agent_work.activity` from the previous system. Render those records read-only, without restoring removed actions. Older releases ignore the unknown `work` metadata key; the Pi-native reader before `af47c14` decodes and returns the metadata object without a closed-key schema. No database schema migration is required.
 
 ## Standard chat
-- GET `/api/chat/models` → `{allowed_models:[string],default_model_id:string}`.
-- GET `/api/chat/conversations` → `{conversations:[Conversation]}`; POST same `{title?,model_id?}` → `{conversation}`.
-- GET/PATCH `/api/chat/conversations/{id}` → `{conversation}` (patch `{title?,model_id?}`); DELETE same → `{ok:true}`.
-- Conversation: `{id,user_id,title,model_id,created_at,updated_at,deleted_at:null}`.
-- GET/POST `/api/chat/conversations/{id}/messages`, GET `.../events`, POST `.../cancel`, POST `.../compact`: same shapes as agent conversation routes. Chat tools are only Pi built-ins plus web search/fetch. Model must be allowed by admin policy.
+- GET `/api/chat/conversations` → `{conversations:[Conversation]}`; POST same `{title?}` → `{conversation}`.
+- GET/PATCH `/api/chat/conversations/{id}` → `{conversation}` (patch `{title?}`); DELETE same → `{ok:true}`.
+- Conversation: `{id,user_id,title,created_at,updated_at,deleted_at:null}`. Any other request field, including `model_id`, returns 400; there is no chat model endpoint and users cannot select a model.
+- GET/POST `/api/chat/conversations/{id}/messages`, GET `.../events`, POST `.../cancel`, POST `.../compact`: same shapes as agent conversation routes. Chat tools are only Pi built-ins plus web search/fetch. The chat model is the account's administrator-set `chat_model_name`, else its personal AI model, else the first catalog model.
 - One chat sandbox is shared by all conversations of one user (`chat-user-<id>`, profile `chat`). The security boundary is the user. File tools reject paths outside `/workspace/<conversation_id>`; bash starts there but may access that same user's other conversation files. Conversation deletion removes only its directory.
 
 ## SSE
-Each event uses `id: <seq>`, `event: <type>`, `data: <JSON>`. Event object includes `{seq,type,...}`. Types: `message {message}`, `text_delta {delta}`, `thinking_delta {delta}`, `tool_start {tool_call_id,name,args}`, `tool_update {tool_call_id,partial}`, `tool_end {tool_call_id,name,is_error,content_preview,details}`, `retry {attempt,max,delay_ms,error}`, `compaction {phase,reason}`, `run_end {status,text,usage,model,error?,message}`. Reconnect using `after` or Last-Event-ID. `interrupted` is a visible terminal state; no automatic resubmission.
+Each event uses `id: <seq>`, `event: <type>`, `data: <JSON>`. Event object includes `{seq,type,...}`. Types: `message {message}`, `text_delta {delta}`, `thinking_delta {delta}`, `tool_input_start {tool_call_id,name}` (the model began a tool call; precedes `tool_start`), `tool_input_delta {tool_call_id,delta}` (raw argument-JSON fragments in order; their concatenation is partial until `tool_start`), `tool_start {tool_call_id,name,args}` (authoritative arguments), `tool_update {tool_call_id,partial}`, `tool_output {tool_call_id,delta,truncated?}` (live bash output appended in order, at most 512 KiB per call, then one event with `truncated:true` and an empty delta; `tool_end` stays authoritative), `tool_end {tool_call_id,name,is_error,content_preview,details}`, `retry {attempt,max,delay_ms,error}`, `compaction {phase,reason}`, `run_end {status,text,usage,error?,message}` (no model identifier). Reconnect using `after` or Last-Event-ID. `interrupted` is a visible terminal state; no automatic resubmission.
 Message pages are ascending by id; `next_before_id` is null at the oldest page. SSE sequences are globally monotonic, durable, and filtered by authorized scope. Without `after`, events replay from the beginning; reconnect with the latest sequence. User messages broadcast when queued; assistant messages are inserted only at termination, including interruption.
 The page `last_seq` watermark is the active job's starting sequence, or the current scope maximum while idle; use it for the initial SSE `after` to recover partial output without replaying old runs. Last-Event-ID wins over the query parameter on reconnect. User message metadata includes `author_user_id` and `author_display_name`, and `message` also announces transition to running. Reset, chat deletion and chat updates return 409 while busy; cancel first. Manual compaction instead joins the FIFO.
 Manual compaction emits `compaction` events with `{phase:"queued"|"start"|"end",job_id,status,reason?,error?,after_message_id?}`. Status is `queued`, `compacting`, `done`, `nothing_to_compact`, `interrupted`, or `cancelled`; `nothing_to_compact` carries `reason:"too_small"` and is a successful no-op, not an error. `after_message_id` is the operation's place in the transcript: the newest message when it started (or settled without starting), excluding user messages still queued behind it; `null` for an empty conversation; absent while queued. The messages-page `compaction` object retains `{job_id,status,reason?,error?,after_message_id?}` for reloads. Manual compaction creates no artificial conversation messages. Automatic compaction during a model run retains its existing `compaction {phase:"start"|"end",reason}` events.
@@ -76,16 +75,11 @@ Open event streams recheck the signed session and current authorization before e
 - Navigation permits ordinary LAN targets but rejects dangerous address ranges, credential-bearing URLs and the Platform container's own interface subnets. This entry-point check does not intercept every in-page redirect/link; see the documented residual risk in [security and trust](../design/security-and-trust.md).
 
 ## Schedules
-- GET `/api/schedules` → `{schedules:[]}`; POST same `{name,prompt,schedule,timezone?}` → `{schedule}`.
-- GET/PATCH/DELETE `/api/schedules/{id}` → `{schedule}` / `{ok:true}`.
-- POST `/api/schedules/{id}/{pause|resume|run-now}` → `{schedule}`.
-- GET `/api/schedules/{id}/runs` → `{runs:[]}`.
-- Schedule: `{id,name,prompt,schedule,timezone,delivery:"chat",state,enabled,next_run_at,last_run,created_at,updated_at}`. Schedule specification: `{type:"once",at:ISO}` or `{type:"interval",every_seconds:n}` or `{type:"cron",expression:string}`. Each occurrence queues personal AI work.
+- Schedules have no user API. They are managed only by the personal AI's `schedule` tool through the internal gateway `POST /internal/agent/tools/schedule`.
 
 ## Admin and model settings
-- GET `/api/admin/users` → `{users:[]}`; POST same `{username,password,display_name?,role?,permission_group?,model_name?,thinking_depth?}` → `{user}`; PATCH `/api/admin/users/{id}` same mutable user fields plus `{password?,active?}` → `{user}`; DELETE same → `{ok:true}` (deactivate/revoke).
+- GET `/api/admin/users` → `{users:[]}`; POST same `{username,password,display_name?,role?,permission_group?,model_name?,chat_model_name?,thinking_depth?}` → `{user}`; PATCH `/api/admin/users/{id}` same mutable user fields plus `{password?,active?}` → `{user}`; DELETE same → `{ok:true}` (deactivate/revoke). Admin user objects (also the impersonation response) add `model_name` (personal AI) and `chat_model_name` (standard chat; `""` follows the personal AI model) to the self-facing user shape.
 - POST `/api/admin/users/{id}/impersonate` with `{}` → `{user}` for the target, and sets a fresh normal session cookie for that account (same attributes as login), replacing the admin's cookie. Admin only and same-origin; 404 if the target is missing or deactivated, 400 if it is the caller. The target's `token_version` and other sessions are untouched.
-- GET/PUT `/api/admin/users/{id}/chat-model-policy` → `{allowed_models:[string],default_model_id:string}`. PUT takes that exact shape.
 - GET `/api/admin/permission-groups` → `{groups:[{name,permissions:[string]}]}`; PUT same `{groups:[...]}` → same.
 - GET/PATCH `/api/admin/branding` → `{branding}`; patch accepts branding fields.
 - GET `/api/admin/models` → `{models:[{id,name,contextWindow?,maxTokens?}],connected:boolean}`. Positive token limits are included when advertised by the provider and forwarded to Runtime; visible authorized Codex model IDs are not limited to a bundled static list.
@@ -93,7 +87,7 @@ Open event streams recheck the signed session and current authorization before e
 - GET `/api/admin/usage` → `{input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_tokens,cache_hit_ratio,events:[]}` (ratio cache_read/(input+cache_read), zero when denominator zero).
 - GET `/api/admin/system` → Manager `/v1/status` JSON unchanged; GET/PATCH `/api/admin/system/config` → Manager config unchanged; POST `/api/admin/system/check` `{idempotency_key}` → Manager check unchanged; POST `/api/admin/system/operations` `{operation,idempotency_key,expected_generation?}` → Manager operation unchanged.
 - Roles and permission groups are independent. Editable permission catalog: `read_workspace`, `chat`, `private_agent`, `manage_channels`, `manage_users`, `system_settings`. Existing group names may be retained or new groups added; a referenced group cannot be removed.
-- `thinking_depth`: `off|minimal|low|medium|high|xhigh`. Model catalog choices apply to both personal and chat models; chat policy defaults must belong to its allowed list.
+- `thinking_depth`: `off|minimal|low|medium|high|xhigh`. `model_name` and `chat_model_name` are strings of at most 128 characters set only by administrators; `""` means the personal AI uses the first catalog model and chat follows the personal AI model.
 - Branding `logo` accepts a PNG/WebP data URL (maximum 256 KiB and 4096 pixels per dimension); null clears it.
 - OAuth `expires_at` is epoch seconds, not an ISO date. Expired device flows return HTTP 410.
 - Usage totals are all-time; `events` contains the newest 200 events without date filters. Events contain id/user_id/username/display_name/scope_type/scope_id/scope_name/request_message_id/response_message_id/provider/model/input_tokens/output_tokens/total_tokens/degraded/created_at and parsed `raw_usage` (including cache counters).
@@ -106,6 +100,6 @@ Installed container startup requires successful Manager reservation recovery bef
 Runtime bearer POST `/api/agent/tools/credentials/resolve` `{provider,model,scope_key?,force_refresh?}` → `{provider,access_token,token_type:"Bearer",expires_at,base_url,model}`. POST `/internal/agent/tools/{web|browser|schedule}` `{action,arguments,context:{sid,scope_key,run_id,owner_user_id?,channel_id?}}` → `{content,data,is_error}`.
 
 ## Migration
-`enterprise-agent-platform migrate` creates the live tables if missing and then applies an ordered list of forward migrations recorded in `schema_migrations`. Each version is applied once, in the same transaction and file lock as the schema statements; the highest recorded version is the `schema_version` that health and the release contract report. Migration `2026100101` (`drop-pre-pi-rollback-compat`) drops the tables, triggers and full-text indexes of removed features, deletes `durable_jobs` rows whose kind is not `agent`, and removes the obsolete `durable_agent_jobs_start_message_id` setting and the `pi_schema_migrations` ledger. No pre-Pi data is retained.
+`enterprise-agent-platform migrate` creates the live tables if missing and then applies an ordered list of forward migrations recorded in `schema_migrations`. A migration is a list of SQL statements or a Python callable that receives the open connection. Each version is applied once, in the same transaction and file lock as the schema statements; the highest recorded version is the `schema_version` that health and the release contract report. Migration `2026100101` (`drop-pre-pi-rollback-compat`) drops the tables, triggers and full-text indexes of removed features, deletes `durable_jobs` rows whose kind is not `agent`, and removes the obsolete `durable_agent_jobs_start_message_id` setting and the `pi_schema_migrations` ledger. No pre-Pi data is retained. Migration `2026100201` (`chat-model-follows-personal-ai`) adds `users.chat_model_name` (default `""`), copies each non-empty `chat_model_policies.default_model_id` into it, then drops `chat_model_policies` and `chat_conversations.model_id`; per-user allowed-model lists are discarded.
 
 New personal/channel scopes record their workspace, sandbox and lifecycle identity in `agent_scopes`. Workspace `AGENTS.md` and `.agent-platform/skills` are read as they are on disk.

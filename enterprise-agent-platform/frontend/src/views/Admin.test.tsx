@@ -14,7 +14,7 @@ vi.mock('liveline', () => ({ Liveline: () => null }));
 
 const user = (id: number, username: string, extra: Record<string, unknown> = {}) => ({
   id, username, display_name: username.toUpperCase(), role: 'user', position: '', permission_group: 'member',
-  model_name: '', thinking_depth: 'medium', timezone: 'UTC', active: true, ...extra,
+  model_name: '', chat_model_name: '', thinking_depth: 'medium', timezone: 'UTC', active: true, ...extra,
 });
 const me = user(1, 'admin', { role: 'admin', permission_group: 'admin' });
 const ana = user(7, 'ana');
@@ -80,7 +80,6 @@ describe('Admin', () => {
   it('saves only changed account fields from the editor sheet', async () => {
     const actor = userEvent.setup();
     serve({
-      'GET /api/admin/users/7/chat-model-policy': () => ({ allowed_models: ['gpt-a'], default_model_id: 'gpt-a' }),
       'PATCH /api/admin/users/7': (body) => ({ user: { ...ana, ...body } }),
     });
     renderAdmin();
@@ -95,32 +94,34 @@ describe('Admin', () => {
     expect(await within(sheet).findByText('Saved')).toBeVisible();
   });
 
-  it('keeps unavailable saved chat models and moves the default to an allowed model', async () => {
+  it('sets the chat model separately from the personal model, keeping an unavailable one visible', async () => {
     const actor = userEvent.setup();
-    const path = '/api/admin/users/7/chat-model-policy';
+    const retired = user(7, 'ana', { chat_model_name: 'retired' });
     serve({
-      // `retired` is no longer in the catalog but is still part of the saved policy.
-      [`GET ${path}`]: () => ({ allowed_models: ['gpt-a', 'retired'], default_model_id: 'gpt-a' }),
-      [`PUT ${path}`]: (body) => body,
+      'GET /api/admin/users': () => ({ users: [me, retired, ben] }),
+      'PATCH /api/admin/users/7': (body) => ({ user: { ...retired, ...body } }),
     });
     renderAdmin();
 
     await actor.click(await screen.findByRole('button', { name: 'Open ANA' }));
     const sheet = await screen.findByRole('dialog', { name: 'ANA' });
-    const allowed = await within(sheet).findByRole('combobox', { name: 'Allowed models' });
-    await actor.click(allowed);
+    const chatModel = within(sheet).getByRole('combobox', { name: 'Chat model' });
+    expect(chatModel).toHaveTextContent('retired · unavailable');
+    await actor.click(chatModel);
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Follow personal AI', 'GPT A', 'GPT B', 'retired · unavailable']);
     await actor.click(screen.getByRole('option', { name: 'GPT B' }));
-    await actor.click(screen.getByRole('option', { name: 'GPT A' }));
-    await actor.keyboard('{Escape}');
-    await actor.click(within(sheet).getByRole('button', { name: 'Save chat models' }));
+    await actor.click(within(sheet).getByRole('button', { name: 'Save account' }));
+    await waitFor(() => expect(sent('PATCH', '/api/admin/users/7')).toEqual({ chat_model_name: 'gpt-b' }));
 
-    await waitFor(() => expect(sent('PUT', path)).toEqual({ allowed_models: ['gpt-b', 'retired'], default_model_id: 'gpt-b' }));
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat model' }));
+    await actor.click(screen.getByRole('option', { name: 'Follow personal AI' }));
+    await actor.click(within(sheet).getByRole('button', { name: 'Save account' }));
+    await waitFor(() => expect(api.request).toHaveBeenLastCalledWith('/api/admin/users/7', expect.objectContaining({ body: JSON.stringify({ chat_model_name: '' }) })));
   });
 
   it('deactivates another account only after confirmation', async () => {
     const actor = userEvent.setup();
     serve({
-      'GET /api/admin/users/7/chat-model-policy': () => ({ allowed_models: [], default_model_id: '' }),
       'DELETE /api/admin/users/7': () => ({ ok: true }),
     });
     renderAdmin();
@@ -138,11 +139,7 @@ describe('Admin', () => {
 
   it('impersonates only another active account, then reloads at the home route', async () => {
     const actor = userEvent.setup();
-    const policy = () => ({ allowed_models: [], default_model_id: '' });
     serve({
-      'GET /api/admin/users/1/chat-model-policy': policy,
-      'GET /api/admin/users/7/chat-model-policy': policy,
-      'GET /api/admin/users/8/chat-model-policy': policy,
       'POST /api/admin/users/7/impersonate': () => ({ user: ana }),
     });
     renderAdmin();

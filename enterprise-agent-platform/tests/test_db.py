@@ -93,7 +93,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
         self.assertEqual(settings, {'keep'})
-        self.assertEqual(db.schema_version(), 2026100101)
+        self.assertEqual(db.schema_version(), 2026100201)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -106,16 +106,60 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026100101)
+        self.assertEqual(self.db.schema_version(), 2026100201)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101])
+                             [2026082901, 2026100101, 2026100201])
+
+    def before_chat_model_change(self):
+        """A database as 2026100101 left it: chat model policies and a model on every conversation."""
+        path = self.root / 'before' / 'platform.db'
+        path.parent.mkdir()
+        db = Database(path)
+        db.migrate(path.parent)
+        with db.connect() as conn:
+            conn.execute('ALTER TABLE users DROP COLUMN chat_model_name')
+            conn.execute("ALTER TABLE chat_conversations ADD COLUMN model_id TEXT NOT NULL DEFAULT ''")
+            conn.execute('CREATE TABLE chat_model_policies(user_id INTEGER PRIMARY KEY REFERENCES users(id), '
+                         'allowed_models_json TEXT NOT NULL, default_model_id TEXT NOT NULL, updated_at TEXT NOT NULL)')
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026100201')
+            for uid, name in ((1, 'alice'), (2, 'bob'), (3, 'carol')):
+                conn.execute("INSERT INTO users(id,username,display_name,password_hash,created_at) VALUES(?,?,?,?,1)", (uid, name, name, 'hash'))
+            conn.execute("INSERT INTO chat_model_policies VALUES(1,'[\"a\",\"b\"]','b','now')")
+            conn.execute("INSERT INTO chat_model_policies VALUES(2,'[]','','now')")
+            conn.execute("INSERT INTO chat_conversations VALUES('c',1,'title','now','now',NULL,'a')")
+            conn.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES('c','user','hi','now')")
+        return db
+
+    def test_chat_model_migration_keeps_admin_choice_and_drops_the_old_model_state(self):
+        db = self.before_chat_model_change()
+        db.migrate(db.path.parent)
+        with db.connect() as conn:
+            chosen = {row['username']: row['chat_model_name'] for row in conn.execute('SELECT username,chat_model_name FROM users')}
+            conversation = [row[1] for row in conn.execute('PRAGMA table_info(chat_conversations)')]
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            counts = [conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'chat_conversations', 'chat_messages')]
+            applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100201').fetchone()[0]
+        self.assertEqual(chosen, {'alice': 'b', 'bob': '', 'carol': ''})
+        self.assertNotIn('model_id', conversation)
+        self.assertNotIn('chat_model_policies', tables)
+        self.assertEqual(counts, [3, 1, 1])
+        before = self.shape(db)
+        db.migrate(db.path.parent)
+        self.assertEqual(self.shape(db), before)
+        with db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100201').fetchone()[0], applied)
+            self.assertEqual(conn.execute("SELECT chat_model_name FROM users WHERE id=1").fetchone()[0], 'b')
+        with self.db.connect() as fresh, db.connect() as migrated:
+            for table in ('users', 'chat_conversations'):
+                self.assertEqual([tuple(row)[1:] for row in fresh.execute(f'PRAGMA table_info({table})')],
+                                 [tuple(row)[1:] for row in migrated.execute(f'PRAGMA table_info({table})')])
 
     def test_foreign_keys_and_rollback(self):
         import sqlite3
         with self.assertRaises(sqlite3.IntegrityError):
             with self.db.connect() as conn:
-                conn.execute("INSERT INTO chat_conversations VALUES('c',999,'title','model','now','now',NULL)")
+                conn.execute("INSERT INTO chat_conversations VALUES('c',999,'title','now','now',NULL)")
         with self.assertRaises(RuntimeError):
             with self.db.connect() as conn:
                 conn.execute("INSERT INTO settings VALUES('not-committed','v',0,1)")

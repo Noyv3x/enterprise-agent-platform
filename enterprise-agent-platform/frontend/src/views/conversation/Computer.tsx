@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { request } from "../../api";
 import { Button } from "../../components/ui/beautiful/atoms/Button";
+import { SegmentedControl } from "../../components/ui/beautiful/atoms/SegmentedControl";
 import { StatusPill } from "../../components/ui/beautiful/atoms/StatusPill";
 import { EmptyState, Icon, Notice, Select, TextField } from "../../components/ui/beautiful/controls";
 import AgentScreen, { Ico, controlIcon } from "../../components/ui/beautiful/primitives/AgentScreen";
@@ -8,15 +9,17 @@ import GlideMenu from "../../components/ui/beautiful/primitives/GlideMenu";
 import LoadingState from "../../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
-import type { BrowserLease, BrowserTab, WorkspaceFile } from "./types";
+import type { BrowserLease, BrowserTab, LiveRun, Message, ToolCall, WorkspaceFile } from "./types";
 import { errorText } from "./useConversation";
+import { ActivityScreen } from "./ActivityScreen";
+import { FILE_TOOLS, followView, persistedCalls, viewOf, type PanelView } from "./computerView";
 
 const STATE_POLL_MS = 3000;
 const FRAME_DELAY_MS = 1200;
 const LEASE_RENEW_MS = 30_000;
 
 /** The agent browser as an AgentScreen: live screenshot, takeover lease, and controls while a person holds it. */
-function BrowserScreen({ working }: { working: boolean }) {
+function BrowserScreen({ working, onHoldingChange }: { working: boolean; onHoldingChange: (holding: boolean) => void }) {
   const w = useWords();
   // One takeover identity per mounted panel; the Platform lease is keyed by it.
   const holderId = useRef(crypto.randomUUID());
@@ -73,6 +76,12 @@ function BrowserScreen({ working }: { working: boolean }) {
     // Leaving the panel hands the browser back to the agent.
     if (holdingRef.current) void request("/api/browser/lease", { method: "DELETE", body: leaseBody }).catch(() => undefined);
   }, [leaseBody]);
+
+  // The panel keeps the browser view while a person holds it; an unmounted view is never held.
+  useEffect(() => {
+    onHoldingChange(holding);
+  }, [holding, onHoldingChange]);
+  useEffect(() => () => onHoldingChange(false), [onHoldingChange]);
 
   const acquire = async () => {
     setPending(true);
@@ -323,11 +332,84 @@ function WorkspaceFiles() {
   );
 }
 
-/** Personal AI computer panel body: the agent browser (AgentScreen) above the workspace files. */
-export function ComputerBody({ working }: { working: boolean }) {
+const VIEWS: readonly PanelView[] = ["browser", "terminal", "editor"];
+
+/** Personal AI computer panel body: the AI's newest work (browser, terminal or editor) above the workspace files. */
+export function ComputerBody({ working, live, lastCalls, messages }: {
+  working: boolean;
+  live: LiveRun | null;
+  /** the run that just ended, until the next run starts */
+  lastCalls: ToolCall[] | null;
+  messages: readonly Message[];
+}) {
+  const w = useWords();
+  const persisted = useMemo(() => persistedCalls(messages), [messages]);
+  // The running run, else the one that just ended, else the latest reply's persisted trace (after a reload).
+  const calls = live?.calls.length ? live.calls : lastCalls?.length ? lastCalls : persisted;
+  const auto = followView(calls);
+  const editorCall = useMemo(() => [...calls].reverse().find((call) => FILE_TOOLS.has(call.name)) ?? null, [calls]);
+
+  // A manual choice holds until "Follow AI" or the start of a new run.
+  const [pick, setPick] = useState<PanelView | null>(null);
+  const runKey = live?.startedAt ?? null;
+  const [seenRun, setSeenRun] = useState(runKey);
+  if (runKey !== null && runKey !== seenRun) {
+    setSeenRun(runKey);
+    setPick(null);
+  }
+  const [holding, setHolding] = useState(false);
+  const [open, setOpen] = useState(false);
+  // A person holding the browser stays there.
+  const view = holding ? "browser" : pick ?? auto;
+
+  const labels: Record<PanelView, string> = {
+    browser: w("Browser", "浏览器", "瀏覽器"),
+    terminal: w("Terminal", "终端", "終端"),
+    editor: w("Editor", "编辑器", "編輯器"),
+  };
+
+  // Only state changes are announced; streamed text never is.
+  const last = calls[calls.length - 1];
+  const previous = useRef<{ id: string; status: ToolCall["status"] } | null>(null);
+  const [announcement, setAnnouncement] = useState("");
+  useEffect(() => {
+    const before = previous.current;
+    if (last && before?.id === last.id && (before.status === "preparing" || before.status === "running") && (last.status === "done" || last.status === "error")) {
+      const shell = viewOf(last.name) === "terminal";
+      setAnnouncement(last.status === "error" ? (shell ? w("Command failed", "命令失败", "命令失敗") : w("Step failed", "步骤失败", "步驟失敗"))
+        : shell ? w("Command finished", "命令已完成", "命令已完成") : w("Step finished", "步骤已完成", "步驟已完成"));
+    }
+    previous.current = last ? { id: last.id, status: last.status } : null;
+  }, [last, w]);
+
+  const status = working ? <StatusPill tone="accent" className="h-5.5 text-[12px]">{w("Working", "工作中", "工作中")}</StatusPill>
+    : <StatusPill className="h-5.5 text-[12px]">{w("Idle", "空闲", "閒置")}</StatusPill>;
+
   return (
     <div className="flex flex-col gap-6">
-      <BrowserScreen working={working} />
+      <div className="flex flex-col gap-3">
+        {!holding && (
+          <div className="flex flex-wrap items-center gap-2">
+            <div role="group" aria-label={w("View", "视图", "檢視")} className="min-w-[200px] flex-1">
+              <SegmentedControl
+                options={VIEWS.map((item) => labels[item])}
+                value={labels[view]}
+                onChange={(label) => setPick(VIEWS.find((item) => labels[item] === label) ?? null)}
+                className="w-full touch:h-11"
+              />
+            </div>
+            {pick !== null ? (
+              <Button variant="quiet" size="sm" className="touch:h-11" onClick={() => setPick(null)}>{w("Follow AI", "跟随 AI", "跟隨 AI")}</Button>
+            ) : working ? (
+              <span className="text-[12px] text-ink-2">{w("Following the AI", "正在跟随 AI", "正在跟隨 AI")}</span>
+            ) : null}
+          </div>
+        )}
+        {view === "browser"
+          ? <BrowserScreen working={working} onHoldingChange={setHolding} />
+          : <ActivityScreen view={view} calls={calls} editorCall={editorCall} status={status} open={open} onOpenChange={setOpen} />}
+        <div role="status" className="sr-only">{announcement}</div>
+      </div>
       <WorkspaceFiles />
     </div>
   );

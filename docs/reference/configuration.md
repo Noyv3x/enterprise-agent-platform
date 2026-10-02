@@ -14,7 +14,7 @@ All historically accepted `manager.toml` keys still parse. `health_timeout_secon
 
 ## Models and account settings
 
-Personal AI uses `users.model_name` and `thinking_depth`. Standard chat uses each user's allowed model list/default and each conversation's selected model. Server-side policy restricts choices; a frontend model picker is not authorization.
+Personal AI uses `users.model_name` and `thinking_depth`; an empty `model_name` uses the first catalog model. Standard chat uses `users.chat_model_name` when an administrator set it, otherwise the personal AI model, and always runs with thinking off. Only administrators see or change these models; users see and change only their thinking depth.
 
 Codex device OAuth is deployment-wide Platform state. Platform owns durable credentials and refresh; Runtime resolves access through Platform. Protect the DB as credential-bearing data: `secret` flags do not encrypt stored values.
 

@@ -37,9 +37,31 @@ export interface MessagePage {
   compaction: Compaction | null;
 }
 
+/** One tool call as the computer panel sees it: streamed input and live output, beyond the work trace's final record. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** preparing: the model is still writing the call; running: executing; the rest are final */
+  status: "preparing" | "running" | "done" | "error" | "cancelled";
+  /** while preparing: parsed from `input` so far; from tool_start on: the authoritative arguments */
+  args: Record<string, unknown>;
+  /** raw argument JSON as generated (empty for calls restored from a persisted trace) */
+  input: string;
+  /** live output while running; the final output once done */
+  output: string;
+  /** the live output hit the cap or the Runtime's limit; the final output is authoritative */
+  truncated: boolean;
+  /** tool_output events arrived, so tool_update partials no longer replace the output */
+  streamed: boolean;
+  /** unified diff of an edit's result (tool_end details) */
+  diff: string;
+}
+
 /** The agent turn currently streaming over SSE, in arrival order; it becomes a persisted message at `run_end`. */
 export interface LiveRun {
   items: WorkItem[];
+  /** the run's tool calls with streaming input/output, for the computer panel only */
+  calls: ToolCall[];
   /** epoch ms the first event of this run arrived */
   startedAt: number;
   notice: "retry" | "compaction" | null;
@@ -49,15 +71,9 @@ export interface ChatConversation {
   id: string;
   user_id: number;
   title: string;
-  model_id: string;
   created_at: string;
   updated_at: string;
   deleted_at: null;
-}
-
-export interface ChatModels {
-  allowed_models: string[];
-  default_model_id: string;
 }
 
 export interface BrowserTab {

@@ -19,7 +19,6 @@ const alice: User = {
   role: 'user',
   position: 'Engineer',
   permission_group: 'member',
-  model_name: 'gpt-5',
   thinking_depth: 'medium',
   timezone: 'UTC',
   active: true,

@@ -33,6 +33,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
   const gatewayCalls: {path:string;body:any;authorization:string|undefined}[] = [];
   const cancelOutcomes: ({confirmed:boolean}|{error:string})[] = [];
   let onCancel: (()=>void) | undefined;
+  let terminalFrames: object[] | undefined;
   const executor = httpServer(async (req,res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -43,6 +44,9 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
       if('error' in outcome)res.statusCode=503;
       res.once('finish',()=>onCancel?.());
       res.end(JSON.stringify(outcome));
+    }else if(terminalFrames&&req.url?.endsWith('/terminal')&&req.headers.accept==='application/x-ndjson'){
+      res.setHeader('content-type','application/x-ndjson');
+      res.end(terminalFrames.map(frame=>JSON.stringify(frame)+'\n').join(''));
     }else res.end(JSON.stringify(req.url?.endsWith('/audit') ? {audit_id:body.audit_id,executor_id:'fake-executor'} : {result:{stdout:'/workspace/.pi-bash-test.log\n15\n1\nsandbox output\n',stderr:'',exit_code:0,status:'completed'}}));
   });
   const gateway = httpServer(async (req,res) => {
@@ -90,7 +94,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     server = createServer(runtime,'runtime-secret');
     url = await listen(server);
   }
-  return {faux,http,start,events,reopen,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;}};
+  return {faux,http,start,events,reopen,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;},streamTerminal(frames:object[]){terminalFrames=frames;}};
 }
 
 test('HTTP rejects invalid optional model limits before admitting a run or compaction', {timeout:20_000}, async t=>{
@@ -503,4 +507,67 @@ test('cancellation deadline preserves admission fence until pending construction
   await rejectedStart;
   assert.deepEqual(await runtime.cancelSession('agent-private-1'),{cancelled:false,run_id:null});
   t.mock.timers.reset();
+});
+
+test('tool_input events map ids and names across several tool calls in one message and concatenate to the generated arguments', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  const bashArgs = {command:'printf sandbox'};
+  const writeArgs = {path:'notes.md',content:'# Title\n'.repeat(40)};
+  f.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall('write',writeArgs,{id:'call-write'}),fauxToolCall('bash',bashArgs,{id:'call-bash'})],{stopReason:'toolUse'}),
+    fauxAssistantMessage('done'),
+  ]);
+  const id = await f.start('agent-private-inputs',request(f.faux.getModel().id));
+  const events = await f.events(id);
+  const starts = events.filter(e=>e.type==='tool_input_start');
+  assert.deepEqual(starts.map(e=>[e.tool_call_id,e.name]),[['call-write','write'],['call-bash','bash']]);
+  const text = (call:string) => events.filter(e=>e.type==='tool_input_delta'&&e.tool_call_id===call).map(e=>e.delta).join('');
+  assert.deepEqual(JSON.parse(text('call-write')),writeArgs);
+  assert.deepEqual(JSON.parse(text('call-bash')),bashArgs);
+  // Argument deltas of one call never precede its start and never follow its tool_start.
+  for(const call of ['call-write','call-bash']){
+    const first = events.findIndex(e=>e.type==='tool_input_start'&&e.tool_call_id===call);
+    const last = events.findLastIndex(e=>e.type==='tool_input_delta'&&e.tool_call_id===call);
+    const executed = events.findIndex(e=>e.type==='tool_start'&&e.tool_call_id===call);
+    assert(first>=0&&first<last&&last<executed,`${call}: ${first} ${last} ${executed}`);
+  }
+  assert.deepEqual(events.filter(e=>e.type==='tool_start').map(e=>e.args),[writeArgs,bashArgs]);
+});
+
+test('bash live output from Manager frames becomes ordered coalesced tool_output events before tool_end', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  const result = {stdout:'/workspace/.pi-bash-test.log\n15\n1\nlive one two\n',stderr:'live one two\n',exit_code:0,status:'completed'};
+  f.streamTerminal([
+    {type:'output',stream:'stdout',data:'/workspace/.pi-bash-test.log\n15\n1\nlive one two\n'},
+    {type:'output',stream:'stderr',data:'live '},{type:'output',stream:'stderr',data:'one '},{type:'output',stream:'stderr',data:'two\n'},
+    {type:'result',result},
+  ]);
+  f.faux.setResponses([fauxAssistantMessage([fauxToolCall('bash',{command:'echo live one two'},{id:'call-live'})],{stopReason:'toolUse'}),fauxAssistantMessage('done')]);
+  const id = await f.start('agent-private-output',request(f.faux.getModel().id));
+  const events = await f.events(id);
+  const output = events.filter(e=>e.type==='tool_output');
+  assert(output.length>=1&&output.length<3,'three writes within one interval are coalesced');
+  assert(output.every(e=>e.tool_call_id==='call-live'&&!('truncated' in e)));
+  assert.equal(output.map(e=>e.delta).join(''),'live one two\n');
+  const end = events.findIndex(e=>e.type==='tool_end');
+  assert(events.findLastIndex(e=>e.type==='tool_output')<end&&events.findIndex(e=>e.type==='tool_start')<events.findIndex(e=>e.type==='tool_output'));
+  assert.equal(events[end]!.is_error,false);
+  assert.deepEqual(events.filter(e=>e.type==='tool_end').map(e=>e.content_preview),[[{type:'text',text:'live one two\n'}]]);
+});
+
+test('live bash output stops at 512 KiB with a single truncated event while tool_end stays authoritative', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  const chunk = 'x'.repeat(64*1024);
+  f.streamTerminal([
+    ...Array.from({length:12},()=>({type:'output',stream:'stderr',data:chunk})),
+    {type:'result',result:{stdout:'/workspace/.pi-bash-test.log\n15\n1\nfinal\n',stderr:'',exit_code:0,status:'completed'}},
+  ]);
+  f.faux.setResponses([fauxAssistantMessage([fauxToolCall('bash',{command:'big'},{id:'call-big'})],{stopReason:'toolUse'}),fauxAssistantMessage('done')]);
+  const id = await f.start('agent-private-cap',request(f.faux.getModel().id));
+  const events = await f.events(id);
+  const output = events.filter(e=>e.type==='tool_output');
+  assert.equal(output.slice(0,-1).reduce((total,e)=>total+Buffer.byteLength(String(e.delta)),0)+Buffer.byteLength(String(output.at(-1)!.delta)),512*1024);
+  assert.deepEqual(output.at(-1),{...output.at(-1)!,delta:'',truncated:true});
+  assert.equal(output.filter(e=>e.truncated===true).length,1);
+  assert.deepEqual(events.find(e=>e.type==='tool_end')!.content_preview,[{type:'text',text:'final\n'}]);
 });

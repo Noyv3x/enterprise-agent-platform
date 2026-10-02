@@ -39,11 +39,9 @@ function calls(method: string, path: string): unknown[] {
     .map(([, options]) => (typeof options?.body === 'string' ? JSON.parse(options.body) : undefined));
 }
 
-function conversation(id: string, title: string, model_id: string): ChatConversation {
-  return { id, user_id: 1, title, model_id, created_at: '2026-09-30T09:00:00Z', updated_at: '2026-09-30T09:00:00Z', deleted_at: null };
+function conversation(id: string, title: string): ChatConversation {
+  return { id, user_id: 1, title, created_at: '2026-09-30T09:00:00Z', updated_at: '2026-09-30T09:00:00Z', deleted_at: null };
 }
-
-const policy = { allowed_models: ['gpt-small', 'gpt-large'], default_model_id: 'gpt-large' };
 
 function renderChat(id?: string) {
   return render(<I18nProvider><Chat id={id} userName="Ada" /></I18nProvider>);
@@ -63,56 +61,30 @@ describe('Chat', () => {
     vi.unstubAllGlobals();
   });
 
-  it('creates the conversation on the first send with the picked model, posts the message, then opens it', async () => {
+  it('creates the conversation on the first send, posts the message, then opens it, with no model to pick or show', async () => {
     const user = userEvent.setup();
     serve({
       'GET /api/chat/conversations': () => ({ conversations: [] }),
-      'GET /api/chat/models': () => policy,
-      'POST /api/chat/conversations': (body) => ({ conversation: conversation('c-new', '', String(body.model_id)) }),
+      'POST /api/chat/conversations': () => ({ conversation: conversation('c-new', '') }),
       'POST /api/chat/conversations/c-new/messages': (body) => ({ message: { id: 1, role: 'user', content: body.content, metadata: { status: 'queued' }, created_at: '2026-09-30T09:00:00Z', attachments: [] }, job_id: 3 }),
     });
     renderChat();
 
     expect(await screen.findByText('Hello Ada')).toBeVisible();
     expect(calls('POST', '/api/chat/conversations')).toEqual([]);
-    await user.click(screen.getByRole('button', { name: 'Model: gpt-large' }));
-    await user.click(screen.getByRole('menuitemradio', { name: /gpt-small/ }));
+    expect(screen.queryByRole('button', { name: /^Model/ })).not.toBeInTheDocument();
     await user.type(screen.getByLabelText('Message'), 'Plan a trip{Enter}');
 
     await waitFor(() => expect(window.location.hash).toBe('#chat-c-new'));
-    expect(calls('POST', '/api/chat/conversations')).toEqual([{ model_id: 'gpt-small', title: 'New chat' }]);
+    expect(calls('POST', '/api/chat/conversations')).toEqual([{ title: 'New chat' }]);
     expect(calls('POST', '/api/chat/conversations/c-new/messages')).toEqual([{ content: 'Plan a trip', attachment_ids: [] }]);
-  });
-
-  it('offers only allowed models and blocks sending on a model the policy no longer allows', async () => {
-    const user = userEvent.setup();
-    serve({
-      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-retired')] }),
-      'GET /api/chat/models': () => policy,
-      'PATCH /api/chat/conversations/c-1': (body) => ({ conversation: conversation('c-1', 'Trip plan', String(body.model_id)) }),
-    });
-    renderChat('c-1');
-
-    expect(await screen.findByRole('heading', { name: 'Trip plan' })).toBeVisible();
-    expect(await screen.findByText(/gpt-retired is no longer allowed/)).toBeVisible();
-    await user.type(screen.getByLabelText('Message'), 'Hello');
-    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
-
-    await user.click(screen.getByRole('button', { name: 'Model: gpt-retired' }));
-    const options = screen.getAllByRole('menuitemradio').map((option) => option.textContent);
-    expect(options).toEqual(['gpt-small', 'gpt-largeDefault']);
-    await user.click(screen.getByRole('menuitemradio', { name: /gpt-small/ }));
-    expect(calls('PATCH', '/api/chat/conversations/c-1')).toEqual([{ model_id: 'gpt-small' }]);
-    await waitFor(() => expect(screen.queryByText(/no longer allowed/)).not.toBeInTheDocument());
-    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
   });
 
   it('renames through the header menu', async () => {
     const user = userEvent.setup();
     serve({
-      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-small')] }),
-      'GET /api/chat/models': () => policy,
-      'PATCH /api/chat/conversations/c-1': (body) => ({ conversation: conversation('c-1', String(body.title), 'gpt-small') }),
+      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan')] }),
+      'PATCH /api/chat/conversations/c-1': (body) => ({ conversation: conversation('c-1', String(body.title)) }),
     });
     renderChat('c-1');
 
@@ -129,8 +101,7 @@ describe('Chat', () => {
   it('deletes only after confirmation, then returns to a new chat', async () => {
     const user = userEvent.setup();
     serve({
-      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan', 'gpt-small')] }),
-      'GET /api/chat/models': () => policy,
+      'GET /api/chat/conversations': () => ({ conversations: [conversation('c-1', 'Trip plan')] }),
       'DELETE /api/chat/conversations/c-1': () => ({ ok: true }),
     });
     renderChat('c-1');
@@ -146,16 +117,5 @@ describe('Chat', () => {
     await user.click(screen.getByRole('button', { name: 'Delete' }));
     expect(calls('DELETE', '/api/chat/conversations/c-1')).toEqual([undefined]);
     await waitFor(() => expect(window.location.hash).toBe('#chat'));
-  });
-
-  it('blocks new chats when the policy allows no model', async () => {
-    serve({
-      'GET /api/chat/conversations': () => ({ conversations: [] }),
-      'GET /api/chat/models': () => ({ allowed_models: [], default_model_id: '' }),
-    });
-    renderChat();
-
-    expect(await screen.findByText('No chat models available')).toBeVisible();
-    expect(screen.queryByLabelText('Message')).not.toBeInTheDocument();
   });
 });

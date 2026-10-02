@@ -12,6 +12,8 @@ import { createTools } from './tools.js';
 import { createExecutorTransport, createGatewayTransport } from './transport.js';
 import { bindModelSession, resolveModel } from './models.js';
 import { RunEvents } from './events.js';
+import type { AssistantMessageEvent } from '@earendil-works/pi-ai';
+import { LiveBuffer } from './live-events.js';
 
 export interface RunRequest {
   kind: 'agent' | 'chat';
@@ -32,6 +34,11 @@ type Run = {id:string; sid:string; events:RunEvents; done:boolean; cancelled:boo
 // `key` identifies the Platform-supplied inputs the Pi session object was built from.
 type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; key:string; runId:string; lastUsed:number};
 type Cancellation = {cancelled:boolean;run_id:string|null};
+interface RunStreams {inputs:Map<number,LiveBuffer>; outputs:Map<string,LiveBuffer>}
+const runStreams=new WeakMap<Run,RunStreams>();
+const INPUT_INTERVAL_MS=100;
+const OUTPUT_INTERVAL_MS=125;
+const OUTPUT_LIMIT_BYTES=512*1024;
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
 const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true};
 
@@ -95,7 +102,7 @@ export class Runtime {
     const live={} as Live;
     const guard=()=>{this.compactions.get(sid)?.controller.signal.throwIfAborted();const run=this.runs.get(live.runId);if(run?.cancelled&&!run.done)throw new DOMException('Run cancelled','AbortError');};
     bindModelSession(models,sid,guard);
-    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
+    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now()});
     this.sessions.set(sid,live);return live;
@@ -122,17 +129,68 @@ export class Runtime {
   private emit(run:Run,event:Event) {
     if(!run.done)run.events.emit(event);
   }
+  private streams(run:Run):RunStreams {
+    let streams=runStreams.get(run);
+    if(!streams){streams={inputs:new Map(),outputs:new Map()};runStreams.set(run,streams);}
+    return streams;
+  }
+  // Argument generation is forwarded verbatim; `tool_start` stays the authoritative full arguments.
+  private onToolInput(run:Run,delta:Extract<AssistantMessageEvent,{type:'toolcall_start'|'toolcall_delta'|'toolcall_end'}>) {
+    const {inputs}=this.streams(run);
+    let input=inputs.get(delta.contentIndex);
+    if(!input){
+      if(delta.type==='toolcall_end')return;
+      const block=delta.partial.content[delta.contentIndex];
+      if(block?.type!=='toolCall')return;
+      const id=block.id;
+      this.emit(run,{type:'tool_input_start',tool_call_id:id,name:block.name});
+      input=new LiveBuffer({intervalMs:INPUT_INTERVAL_MS,send:text=>this.emit(run,{type:'tool_input_delta',tool_call_id:id,delta:text})});
+      inputs.set(delta.contentIndex,input);
+    }
+    if(delta.type==='toolcall_delta')input.push(delta.delta);
+    else if(delta.type==='toolcall_end'){input.close();inputs.delete(delta.contentIndex);}
+  }
+  private closeInputs(run:Run) {
+    const {inputs}=this.streams(run);
+    for(const input of inputs.values())input.close();
+    inputs.clear();
+  }
+  private closeStreams(run:Run) {
+    this.closeInputs(run);
+    for(const output of this.streams(run).outputs.values())output.close();
+    this.streams(run).outputs.clear();
+  }
+  // Live bash output from the Manager executor; `tool_end` carries the authoritative result.
+  private liveOutput(runId:string,id:string,text:string) {
+    const run=this.runs.get(runId);
+    if(!run||run.done)return;
+    const {outputs}=this.streams(run);
+    let output=outputs.get(id);
+    if(!output){
+      output=new LiveBuffer({intervalMs:OUTPUT_INTERVAL_MS,limitBytes:OUTPUT_LIMIT_BYTES,
+        send:delta=>this.emit(run,{type:'tool_output',tool_call_id:id,delta}),
+        onLimit:()=>this.emit(run,{type:'tool_output',tool_call_id:id,delta:'',truncated:true})});
+      outputs.set(id,output);
+    }
+    output.push(text);
+  }
   private onEvent(run:Run,event:AgentSessionEvent) {
     if(event.type==='message_update'){
       const delta=event.assistantMessageEvent;
       if(delta.type==='text_delta'||delta.type==='thinking_delta')this.emit(run,{type:delta.type,delta:delta.delta});
+      else if(delta.type==='toolcall_start'||delta.type==='toolcall_delta'||delta.type==='toolcall_end')this.onToolInput(run,delta);
     }else if(event.type==='tool_execution_start'){
       const args:unknown=event.args;
       const action=args&&typeof args==='object'&&'action' in args&&typeof args.action==='string'?args.action:undefined;
       if(['bash','write','edit','mcp'].includes(event.toolName)||event.toolName==='browser'&&!['list','snapshot','screenshot','vision','links','images','downloads','stats','extract','console'].includes(action??'')||event.toolName==='schedule'&&!['list','get','history'].includes(action??''))run.sideEffects=true;
+      this.closeInputs(run);
       this.emit(run,{type:'tool_start',tool_call_id:event.toolCallId,name:event.toolName,args:event.args});
     }else if(event.type==='tool_execution_update')this.emit(run,{type:'tool_update',tool_call_id:event.toolCallId,partial:event.partialResult});
-    else if(event.type==='tool_execution_end')this.emit(run,{type:'tool_end',tool_call_id:event.toolCallId,name:event.toolName,is_error:event.isError,content_preview:event.result.content,details:event.result.details});
+    else if(event.type==='tool_execution_end'){
+      const output=this.streams(run).outputs.get(event.toolCallId);
+      if(output){output.close();this.streams(run).outputs.delete(event.toolCallId);}
+      this.emit(run,{type:'tool_end',tool_call_id:event.toolCallId,name:event.toolName,is_error:event.isError,content_preview:event.result.content,details:event.result.details});
+    }
     else if(event.type==='auto_retry_start'||event.type==='summarization_retry_scheduled')this.emit(run,{type:'retry',attempt:event.attempt,max:event.maxAttempts,delay_ms:event.delayMs,error:event.errorMessage});
     else if(event.type==='compaction_start'||event.type==='compaction_end'){
       this.emit(run,{type:'compaction',phase:event.type==='compaction_start'?'start':'end',reason:event.reason});
@@ -140,6 +198,7 @@ export class Runtime {
       if(usage){run.usage.input+=usage.input;run.usage.output+=usage.output;run.usage.cache_read+=usage.cacheRead;run.usage.cache_write+=usage.cacheWrite;run.usage.total+=usage.totalTokens;}
     }
     else if(event.type==='message_end'&&event.message.role==='assistant'){
+      this.closeInputs(run);
       const message=event.message;
       run.text=message.content.filter(c=>c.type==='text').map(c=>c.text).join('');
       run.usage.input+=message.usage.input;run.usage.output+=message.usage.output;
@@ -160,7 +219,7 @@ export class Runtime {
     }catch(error){run.error=error instanceof Error?error.message:String(error);}
     finally {
       if(run.cancelled)await run.stopConfirmed;
-      unsubscribe();live.lastUsed=Date.now();
+      unsubscribe();live.lastUsed=Date.now();this.closeStreams(run);
       this.emit(run,{type:'run_end',status:run.cancelled?'cancelled':run.error?'failed':'completed',text:run.text,usage:run.usage,model:request.model.id,...(run.error?{error:run.error}:{}),side_effects:run.sideEffects});
       run.done=true;run.endedAt=Date.now();this.busy.delete(run.sid);
       run.events.close();

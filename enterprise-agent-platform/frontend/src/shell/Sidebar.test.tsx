@@ -13,17 +13,16 @@ import { Sidebar } from "./Sidebar";
 const api = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("../api", () => api);
 
-const admin: User = { id: 1, username: "root", display_name: "Root", role: "admin", position: "", permission_group: "", model_name: "", thinking_depth: "", timezone: "UTC", active: true };
+const admin: User = { id: 1, username: "root", display_name: "Root", role: "admin", position: "", permission_group: "", thinking_depth: "", timezone: "UTC", active: true };
 const member: User = { ...admin, id: 2, username: "mia", display_name: "Mia", role: "user" };
 const chats = [
-  { id: "c1", user_id: 1, title: "Budget review", model_id: "m", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-03T00:00:00Z", deleted_at: null },
-  { id: "c2", user_id: 1, title: "Release notes", model_id: "m", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-02T00:00:00Z", deleted_at: null },
+  { id: "c1", user_id: 1, title: "Budget review", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-03T00:00:00Z", deleted_at: null },
+  { id: "c2", user_id: 1, title: "Release notes", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-02T00:00:00Z", deleted_at: null },
 ];
 
 function serve() {
   api.request.mockImplementation(async (path: string, init?: RequestInit) => {
     if (path === "/api/chat/conversations") return { conversations: chats };
-    if (path === "/api/chat/models") return { allowed_models: ["m"], default_model_id: "m" };
     if (init?.method === "PATCH") return { conversation: { ...chats[1], ...JSON.parse(String(init.body)), updated_at: "2026-09-04T00:00:00Z" } };
     if (init?.method === "DELETE") return {};
     throw new Error(`unexpected ${path}`);
@@ -73,7 +72,6 @@ describe("Sidebar", () => {
       ["New chat", "chat"],
       ["Product", "channel-4"],
       ["Personal AI", "private"],
-      ["Schedules", "schedules"],
       ["Channels", "channels"],
       ["Admin", "admin"],
       ["Settings", "settings"],
@@ -90,7 +88,6 @@ describe("Sidebar", () => {
     renderSidebar(member, ["private_agent"]);
     const nav = screen.getByRole("complementary", { name: "Workspace navigation" });
     expect(within(nav).getByRole("button", { name: "Personal AI" })).toBeVisible();
-    expect(within(nav).getByRole("button", { name: "Schedules" })).toBeVisible();
     for (const hidden of ["Chat", "Channels", "Admin", "New chat"]) expect(within(nav).queryByRole("button", { name: hidden })).not.toBeInTheDocument();
     expect(within(nav).getByRole("button", { name: "Settings" })).toBeVisible();
     expect(api.request).not.toHaveBeenCalled();
@@ -168,6 +165,7 @@ describe("routes", () => {
     expect(parseRoute("#channel-7")).toEqual({ view: "channel", id: 7 });
     expect(parseRoute("")).toEqual({ view: "private" });
     expect(parseRoute("#nowhere")).toEqual({ view: "unknown" });
+    expect(parseRoute("#schedules")).toEqual({ view: "unknown" });
     const reader = accessFor("user", ["read_workspace"]);
     expect(allowed({ view: "channel", id: 7 }, reader)).toBe(true);
     expect(allowed({ view: "chat", id: null }, reader)).toBe(false);

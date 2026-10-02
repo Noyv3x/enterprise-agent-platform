@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { User } from '../../api';
+import type { AdminUser, User } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
 import { ValuePill } from '../../components/ui/beautiful/atoms/ValuePill';
 import { EmptyState, Icon, Notice } from '../../components/ui/beautiful/controls';
@@ -12,7 +12,7 @@ import { useAdminLabels, useRecordsLabels, useResource, type ModelCatalog, type 
 export function Users() {
   const w = useWords();
   const labels = useAdminLabels();
-  const users = useResource<{ users: User[] }>('/api/admin/users');
+  const users = useResource<{ users: AdminUser[] }>('/api/admin/users');
   const groups = useResource<{ groups: PermissionGroup[] }>('/api/admin/permission-groups');
   const catalog = useResource<ModelCatalog>('/api/admin/models');
   const me = useResource<{ user: User }>('/api/me');
@@ -33,7 +33,7 @@ export function Users() {
     && (group === null || user.permission_group === group)
     && (status === null || String(user.active) === status));
 
-  const columns: RecordColumn<User>[] = [
+  const columns: RecordColumn<AdminUser>[] = [
     { key: 'username', label: w('Username', '用户名', '使用者名稱'), glyph: 'user', width: 150,
       sort: (a, b) => a.username.localeCompare(b.username), render: (user) => <span className="font-mono text-[12.5px] text-ink-2">@{user.username}</span> },
     { key: 'access', label: w('Role & group', '角色与权限组', '角色與權限群組'), glyph: 'multi', width: 220,
@@ -59,7 +59,7 @@ export function Users() {
   const groupNames = Array.from(new Set([...(groups.data?.groups.map((item) => item.name) ?? []), ...list.map((user) => user.permission_group)]));
   const editingUser = typeof editing === 'number' ? list.find((user) => user.id === editing) ?? null : null;
 
-  function saved(user: User) {
+  function saved(user: AdminUser) {
     users.setData({ users: list.some((item) => item.id === user.id) ? list.map((item) => item.id === user.id ? user : item) : [...list, user] });
   }
 
@@ -73,7 +73,7 @@ export function Users() {
 
   return <div className="flex min-h-0 flex-1 flex-col">
     {catalog.error && <div className="px-4 pt-3 sm:px-6"><Notice tone="warning" title={w('Model catalog unavailable', '模型目录不可用', '模型目錄無法使用')}>{catalog.error}</Notice></div>}
-    <RecordsTable<User>
+    <RecordsTable<AdminUser>
       fill
       rows={rows}
       rowId={(user) => String(user.id)}

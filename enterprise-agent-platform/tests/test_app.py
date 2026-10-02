@@ -44,6 +44,16 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/channels/{channel['id']}").status_code, 200)
         self.assertEqual(self.client.get('/api/channels').json()['channels'], [])
 
+    def test_bootstrap_carries_no_model(self):
+        body = self.client.get('/api/bootstrap').json()
+        self.assertEqual(set(body), {'user', 'branding', 'permissions', 'channels'})
+        self.assertFalse({'model_name', 'chat_model_name'} & set(body['user']))
+
+    def test_schedules_have_no_user_api(self):
+        self.assertEqual(self.client.get('/api/schedules').status_code, 404)
+        self.assertIn(self.client.post('/api/schedules', json={'name': 'x', 'prompt': 'x', 'schedule': {'type': 'interval', 'every_seconds': 60}}).status_code, {404, 405})
+        self.assertEqual(self.client.get('/api/schedules/1/runs').status_code, 404)
+
     def test_cross_origin_cookie_mutations_rejected(self):
         response = self.client.post('/api/channels', json={'name': 'Injected'}, headers={'Origin': 'https://attacker.example'})
         self.assertEqual(response.status_code, 403)

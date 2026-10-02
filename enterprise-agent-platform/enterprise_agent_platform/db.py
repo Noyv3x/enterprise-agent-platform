@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     active INTEGER NOT NULL DEFAULT 1,
     token_version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    last_login_at INTEGER
+    last_login_at INTEGER,
+    chat_model_name TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -215,7 +216,7 @@ INSERT OR IGNORE INTO schema_migrations(version, name, applied_at)
 
 CREATE TABLE IF NOT EXISTS chat_conversations(
     id TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-    title TEXT NOT NULL, model_id TEXT NOT NULL, created_at TEXT NOT NULL,
+    title TEXT NOT NULL, created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL, deleted_at TEXT);
 CREATE INDEX IF NOT EXISTS idx_chat_conversations_user ON chat_conversations(user_id, updated_at);
 CREATE TABLE IF NOT EXISTS chat_messages(
@@ -224,9 +225,6 @@ CREATE TABLE IF NOT EXISTS chat_messages(
     role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
     content TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages(conversation_id, id);
-CREATE TABLE IF NOT EXISTS chat_model_policies(
-    user_id INTEGER PRIMARY KEY REFERENCES users(id), allowed_models_json TEXT NOT NULL,
-    default_model_id TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS chat_attachments(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT NOT NULL REFERENCES chat_conversations(id),
@@ -260,7 +258,22 @@ _DEAD_TABLES = ('message_fts_trigram', 'message_fts', 'agent_memory_fts',
                 'telegram_link_challenges', 'telegram_updates',
                 'mail_account_credentials', 'mail_accounts')
 
-# (version, name, statements). Append only; versions must increase.
+
+def _chat_model_follows_personal_ai(conn: sqlite3.Connection) -> None:
+    """Keep each administrator's explicit chat default; drop the per-conversation model and allowed-list policy."""
+    def columns(table):
+        return {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+    if 'chat_model_name' not in columns('users'):
+        conn.execute("ALTER TABLE users ADD COLUMN chat_model_name TEXT NOT NULL DEFAULT ''")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='chat_model_policies'").fetchone():
+        conn.execute("UPDATE users SET chat_model_name=(SELECT default_model_id FROM chat_model_policies WHERE user_id=users.id) "
+                     "WHERE id IN (SELECT user_id FROM chat_model_policies WHERE default_model_id!='')")
+        conn.execute('DROP TABLE chat_model_policies')
+    if 'model_id' in columns('chat_conversations'):
+        conn.execute('ALTER TABLE chat_conversations DROP COLUMN model_id')
+
+
+# (version, name, SQL statements or a callable taking the open connection). Append only; versions must increase.
 _MIGRATIONS = (
     (2026100101, 'drop-pre-pi-rollback-compat', (
         *(f'DROP TRIGGER IF EXISTS {name}' for name in _FTS_TRIGGERS),
@@ -269,6 +282,7 @@ _MIGRATIONS = (
         "DELETE FROM settings WHERE key='durable_agent_jobs_start_message_id'",
         'DROP TABLE IF EXISTS pi_schema_migrations',
     )),
+    (2026100201, 'chat-model-follows-personal-ai', _chat_model_follows_personal_ai),
 )
 
 
@@ -308,8 +322,11 @@ class Database:
                 for version, name, statements in _MIGRATIONS:
                     if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?", (version,)).fetchone():
                         continue
-                    for statement in statements:
-                        conn.execute(statement)
+                    if callable(statements):
+                        statements(conn)
+                    else:
+                        for statement in statements:
+                            conn.execute(statement)
                     conn.execute("INSERT INTO schema_migrations(version,name,applied_at) "
                                  "VALUES (?,?,CAST(strftime('%s','now') AS INTEGER))", (version, name))
                 conn.commit()
