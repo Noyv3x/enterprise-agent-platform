@@ -19,12 +19,13 @@ function NestedViewer() {
       <Sheet open={sheetOpen} onClose={() => setSheetOpen(false)} title="Computer">
         <AgentScreen
           agentName="Browser"
+          tabs={[{ id: "one", label: "First page" }]}
           open={viewerOpen}
           onOpenChange={setViewerOpen}
           controlling
           controls={<button type="button">Hand back</button>}
           inputs={<Select aria-label="Tab" value={tab} onChange={setTab} options={[{ value: "one", label: "First page" }, { value: "two", label: "Second page" }]} />}
-          labels={{ open: "Expand browser", collapse: "Collapse", connecting: "Connecting", screen: "Browser screen" }}
+          labels={{ open: "Expand browser", collapse: "Collapse", connecting: "Connecting", screen: "Browser screen", window: "Agent screen" }}
         />
       </Sheet>
     </I18nProvider>

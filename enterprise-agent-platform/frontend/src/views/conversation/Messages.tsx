@@ -92,7 +92,7 @@ export function AssistantMessage({ message }: { message: Message }) {
   }
   return (
     <article className="flex min-w-0 flex-col gap-2" aria-label={w("Agent reply", "智能体回复", "智慧體回覆")} style={{ animation: "fade-up 450ms cubic-bezier(0.23,1,0.32,1) both" }}>
-      {trace && <WorkView trace={trace} working={false} />}
+      {trace && <WorkView trace={trace} working={false} run={message.id} />}
       <StreamingText
         streaming={false}
         actions={actions}
@@ -121,7 +121,7 @@ export function LiveReply({ run }: { run: LiveRun }) {
   return (
     <article className="flex min-w-0 flex-col gap-2" aria-label={w("Reply in progress", "回复生成中", "回覆產生中")} aria-busy="true">
       {work.length > 0 && (
-        <WorkView trace={{ items: work, startedAt: run.startedAt, endedAt: null, truncated: false, omitted: 0 }} working={!answer} />
+        <WorkView trace={{ items: work, startedAt: run.startedAt, endedAt: null, truncated: false, omitted: 0 }} working={!answer} run="live" />
       )}
       {answer && (
         <StreamingText streaming>

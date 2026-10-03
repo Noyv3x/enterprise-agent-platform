@@ -1,13 +1,14 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../words";
 import { Composer, type ComposerCommand } from "./conversation/Composer";
-import { ComputerBody } from "./conversation/Computer";
+import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
+import { ComputerContext } from "./conversation/computerView";
 import { AssistantMessage, LiveReply, PendingReply, SystemLine, UserBubble } from "./conversation/Messages";
-import type { Compaction, Message } from "./conversation/types";
+import type { Compaction, Message, RunRef } from "./conversation/types";
 import { errorText, useConversation } from "./conversation/useConversation";
 
 /** Reader within this distance of the bottom keeps following new output (harness value). */
@@ -134,6 +135,8 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const { narrow } = useShell();
   const conversation = useConversation(scope, onRunEnd);
   const [computerOpen, setComputerOpen] = useState(scope === "private" && !narrow);
+  // A step chosen with "View in computer"; cleared on close so reopening the panel follows the AI.
+  const [computerFocus, setComputerFocus] = useState<ComputerFocus | null>(null);
   const [notice, setNotice] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
   const [confirmingReset, setConfirmingReset] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -150,6 +153,16 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
 
   const { messages, live, phase } = conversation;
   const personal = scope === "private";
+  const computer = useMemo(() => (personal ? {
+    show: (run: RunRef, callId: string) => {
+      setComputerOpen(true);
+      setComputerFocus((current) => ({ step: { run, callId }, n: (current?.n ?? 0) + 1 }));
+    },
+  } : null), [personal]);
+  const closeComputer = () => {
+    setComputerOpen(false);
+    setComputerFocus(null);
+  };
   const channel = scope.startsWith("channel-");
   const resettable = canSend && !scope.startsWith("chat-");
   const compactionAt = compactionPlacement(conversation.compaction, messages, conversation.nextBefore === null);
@@ -301,7 +314,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
           <button
             type="button"
             aria-pressed={computerOpen}
-            onClick={() => setComputerOpen(!computerOpen)}
+            onClick={() => (computerOpen ? closeComputer() : setComputerOpen(true))}
             className={`flex h-7 items-center gap-1.5 rounded-[7px] px-2 text-[12.5px] font-medium transition-colors duration-100 touch:h-11 ${
               computerOpen ? "bg-hover-2 text-ink" : "text-ink-2 hover:bg-hover hover:text-ink"
             }`}
@@ -463,7 +476,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         )}
       </>
     );
-    body = <Welcome {...welcomeProps} empty={empty} thread={thread} composerRef={composerBox} composer={composer} />;
+    body = <ComputerContext.Provider value={computer}><Welcome {...welcomeProps} empty={empty} thread={thread} composerRef={composerBox} composer={composer} /></ComputerContext.Provider>;
   }
 
   return (
@@ -471,20 +484,20 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       {header}
       {body}
       {personal && computerOpen && (narrow ? (
-        <Sheet open onClose={() => setComputerOpen(false)} title={computerLabel} width={420}>
-          <ComputerBody working={conversation.busy} live={live} lastCalls={conversation.lastCalls} messages={messages} />
+        <Sheet open onClose={closeComputer} title={computerLabel} width={420}>
+          <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
         </Sheet>
       ) : (
         <WindowAside label={computerLabel} className="w-[380px]">
           <div className="flex h-11 shrink-0 items-center justify-between border-b border-line px-3 sm:pl-4">
             <span className="text-[13px] font-semibold text-ink">{computerLabel}</span>
-            <button type="button" aria-label={w("Close computer", "关闭电脑面板", "關閉電腦面板")} onClick={() => setComputerOpen(false)}
+            <button type="button" aria-label={w("Close computer", "关闭电脑面板", "關閉電腦面板")} onClick={closeComputer}
               className="flex size-6 items-center justify-center rounded-[6px] text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink touch:size-11">
               <Icon name="close" size={13} strokeWidth={2.2} />
             </button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            <ComputerBody working={conversation.busy} live={live} lastCalls={conversation.lastCalls} messages={messages} />
+            <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
           </div>
         </WindowAside>
       ))}

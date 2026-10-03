@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import ThinkingState, { TraceProse, TraceStep } from "../../components/ui/beautiful/primitives/ThinkingState";
 import ToolChips, { type ToolDetailLine, type ToolDiff, type ToolDiffLine, type ToolStep } from "../../components/ui/beautiful/primitives/ToolChips";
 import { useWords } from "../../words";
+import { ComputerContext, fileName } from "./computerView";
 import { Markdown } from "./Markdown";
-import type { WorkItem, WorkTrace } from "./work";
+import type { RunRef } from "./types";
+import { toolVerb, type WorkItem, type WorkTrace, type Words } from "./work";
 
-type Words = (en: string, zhCN?: string, zhTW?: string) => string;
 type ToolItem = Extract<WorkItem, { type: "tool" }>;
 
 const DETAIL_LIMIT = 4000;
@@ -36,16 +37,12 @@ function editPairs(args: Record<string, unknown>): { oldText: string; newText: s
   });
 }
 
-function fileName(path: string): string {
-  return path.split("/").filter(Boolean).pop() ?? path;
-}
-
 /** How one tool call reads as a ToolChips row (and, for file writes, a diff chip). */
 function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; diffLines?: ToolDiffLine[] } {
   const { args } = tool;
   const path = arg(args, "path");
   let icon = "tool";
-  let label = tool.name;
+  let label = toolVerb(tool.name, w);
   let chip = "";
   let mono = true;
   let input: ToolDetailLine[] = [];
@@ -54,13 +51,11 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
   switch (tool.name) {
     case "bash":
       icon = "run";
-      label = w("Run", "运行", "執行");
       chip = arg(args, "command");
       input = lines(`$ ${chip}`, "muted");
       break;
     case "read":
       icon = "read";
-      label = w("Read", "读取", "讀取");
       chip = path;
       break;
     case "write": {
@@ -80,7 +75,6 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
       const add = pairs.reduce((sum, pair) => sum + lineCount(pair.newText), 0);
       const del = pairs.reduce((sum, pair) => sum + lineCount(pair.oldText), 0);
       icon = "write";
-      label = w("Edit", "编辑", "編輯");
       chip = path;
       input = pairs.flatMap((pair) => [...lines(pair.oldText, "del"), ...lines(pair.newText, "add")]);
       if (path && pairs.length) {
@@ -96,27 +90,22 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
     case "find":
     case "grep":
       icon = "search";
-      label = tool.name === "ls" ? w("List", "列出", "列出") : w("Search files", "查找文件", "尋找檔案");
       chip = [arg(args, "pattern"), path].filter(Boolean).join("  ") || ".";
       break;
     case "web_search":
       icon = "web";
-      label = w("Search the web", "搜索网页", "搜尋網頁");
       chip = arg(args, "query");
       mono = false;
       break;
     case "web_fetch":
       icon = "web";
-      label = w("Open page", "打开网页", "開啟網頁");
       chip = arg(args, "url");
       break;
     case "browser":
       icon = "web";
-      label = w("Browser", "浏览器", "瀏覽器");
       chip = [arg(args, "action"), arg(args, "url") || arg(args, "text") || arg(args, "key")].filter(Boolean).join("  ");
       break;
     case "schedule":
-      label = w("Schedule", "定时任务", "排程任務");
       chip = arg(args, "action") || arg(args, "name");
       input = lines(JSON.stringify(args, null, 2), "muted");
       break;
@@ -142,8 +131,9 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
   };
 }
 
-function ToolGroup({ tools }: { tools: ToolItem[] }) {
+function ToolGroup({ tools, run }: { tools: ToolItem[]; run: RunRef }) {
   const w = useWords();
+  const computer = useContext(ComputerContext);
   const described = tools.map((tool) => describe(tool, w));
   const diffs = new Map<string, ToolDiff>();
   const diffLines: Record<string, ToolDiffLine[]> = {};
@@ -159,6 +149,7 @@ function ToolGroup({ tools }: { tools: ToolItem[] }) {
       steps={described.map(({ step }) => step)}
       diffs={[...diffs.values()]}
       diffLines={diffLines}
+      rowAction={computer ? { label: w("View in computer", "在电脑中查看", "在電腦中檢視"), onSelect: (id) => computer.show(run, id) } : undefined}
       labels={{
         header: w(`${count} tool ${count === 1 ? "call" : "calls"}`, `${count} 次工具调用`, `${count} 次工具呼叫`),
         showDiff: (file) => w(`Show changes to ${file}`, `查看 ${file} 的改动`, `查看 ${file} 的變更`),
@@ -193,8 +184,9 @@ function activeLabel(items: WorkItem[], w: Words): string {
   return w("Thinking", "思考中", "思考中");
 }
 
-/** An assistant turn's work: ThinkingState around reasoning, interim text, old status steps and ToolChips groups. */
-export function WorkView({ trace, working }: { trace: WorkTrace; working: boolean }) {
+/** An assistant turn's work: ThinkingState around reasoning, interim text, old status steps and ToolChips groups.
+ * `run` identifies the turn for the personal AI computer panel ("View in computer"). */
+export function WorkView({ trace, working, run }: { trace: WorkTrace; working: boolean; run: RunRef }) {
   const w = useWords();
   const now = useNow(working);
   // A live trace settles when its answer starts; freeze the clock at that moment.
@@ -211,7 +203,7 @@ export function WorkView({ trace, working }: { trace: WorkTrace; working: boolea
   const blocks: ReactNode[] = [];
   let group: ToolItem[] = [];
   const flush = () => {
-    if (group.length) blocks.push(<ToolGroup key={`tools-${group[0].id}-${blocks.length}`} tools={group} />);
+    if (group.length) blocks.push(<ToolGroup key={`tools-${group[0].id}-${blocks.length}`} tools={group} run={run} />);
     group = [];
   };
   trace.items.forEach((item, index) => {

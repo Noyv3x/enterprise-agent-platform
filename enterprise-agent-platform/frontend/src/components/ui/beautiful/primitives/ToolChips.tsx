@@ -1,9 +1,11 @@
 /* Adapted from Beautiful UI components/primitives/ToolChips.tsx (MIT, see ../NOTICE).
  * Adaptations: rows and file-diff chips carry the caller's real tool calls instead of the demo script and step
  * timer; a row shows a progress ring while its tool runs and a warning mark plus label when it failed or stopped;
- * expanded rows show the tool's real arguments and output; labels come from the caller (i18n). Markup, classes
- * and motion are upstream's. */
-import { useState, type ReactNode, type SyntheticEvent } from "react";
+ * expanded rows show the tool's real arguments and output; labels come from the caller (i18n). The caller may give
+ * one per-row action (`rowAction`, the personal AI's "View in computer"): a small trailing monitor-icon button,
+ * a sibling of the row button so it never toggles the row, revealed on row hover or focus like the chevron and
+ * always visible on coarse pointers and narrow screens (44px there). Markup, classes and motion are upstream's. */
+import { useId, useState, type ReactNode, type SyntheticEvent } from "react";
 import { createPortal } from "react-dom";
 
 /* ─────────────────────────────────────────────────────────
@@ -22,6 +24,8 @@ const Icons: Record<string, ReactNode> = {
   search: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4.3-4.3" /></g>,
   web: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" /></g>,
   tool: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z" /></g>,
+  /* the row action's "View in computer" glyph */
+  monitor: <><rect x="3.5" y="4.5" width="17" height="11.5" rx="2.5" /><path d="M8.5 19.5h7M12 16v3.5" /></>,
 };
 
 export type ToolDetailLine = { text: string; tone?: "add" | "del" | "error" | "muted" };
@@ -48,6 +52,9 @@ export type ToolChipsLabels = {
   showDiff: (file: string) => string;
 };
 
+/** A trailing action on every row, e.g. showing the step elsewhere; it receives the row's step id. */
+export type ToolChipsRowAction = { label: string; onSelect: (id: string) => void };
+
 const DETAIL_TONE = { add: "text-green", del: "text-red", error: "text-red", muted: "text-ink-2" } as const;
 
 function RunningRing() {
@@ -65,6 +72,7 @@ export default function ToolChips({
   diffs = [],
   diffLines = {},
   labels,
+  rowAction,
   className,
   onOpenChange,
   onToggleRow,
@@ -73,10 +81,12 @@ export default function ToolChips({
   diffs?: ToolDiff[];
   diffLines?: Record<string, ToolDiffLine[]>;
   labels: ToolChipsLabels;
+  rowAction?: ToolChipsRowAction;
   className?: string;
   onOpenChange?: (open: boolean) => void;
   onToggleRow?: (id: string, open: boolean) => void;
 }) {
+  const uid = useId();
   const [open, setOpen] = useState(true);
   const [openRows, setOpenRows] = useState<Set<string>>(new Set());
   /* Rendered in a body portal so animated/translated reply wrappers cannot
@@ -139,17 +149,19 @@ export default function ToolChips({
             row hover pills room inside this overflow-hidden clip box */}
         <div className="-mx-1 min-h-0 overflow-hidden px-1.5 pb-1">
         <div className="mt-1.5 flex flex-col gap-1">
-          {steps.map((row) => {
+          {steps.map((row, index) => {
             const rowOpen = openRows.has(row.id);
             const hasDetail = row.detail.length > 0;
             return (
             <div key={row.id} style={{ animation: "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" }}>
+              <div className="group/line relative">
               <button
                 type="button"
+                id={`${uid}-row-${index}`}
                 aria-expanded={hasDetail ? rowOpen : undefined}
                 disabled={!hasDetail}
                 onClick={() => toggleRow(row.id)}
-                className="group/row -mx-[3px] flex h-7 w-[calc(100%+6px)] min-w-0 items-center gap-2 rounded-control px-[3px] text-left transition-colors duration-100 enabled:hover:bg-hover-2 pointer-coarse:h-11 max-sm:h-11"
+                className={`group/row -mx-[3px] flex h-7 w-[calc(100%+6px)] min-w-0 items-center gap-2 rounded-control px-[3px] text-left transition-colors duration-100 enabled:hover:bg-hover-2 pointer-coarse:h-11 max-sm:h-11${rowAction ? " pr-8 pointer-coarse:pr-12 max-sm:pr-12" : ""}`}
               >
                 <span className="relative flex size-4 shrink-0 items-center justify-center text-ink-3">
                   {row.state === "running" ? (
@@ -192,6 +204,24 @@ export default function ToolChips({
                   <span className={`shrink-0 text-[11.5px] font-medium ${row.state === "error" ? "text-red" : "text-ink-2"}`}>{row.stateLabel}</span>
                 )}
               </button>
+              {rowAction && (
+                <button
+                  type="button"
+                  aria-label={rowAction.label}
+                  aria-describedby={`${uid}-row-${index}`}
+                  title={rowAction.label}
+                  onClick={() => rowAction.onSelect(row.id)}
+                  className="absolute top-1/2 -right-[3px] flex size-6 -translate-y-1/2 items-center justify-center rounded-chip text-ink-3 opacity-0
+                    transition-[opacity,color,background-color] duration-100 hover:bg-hover hover:text-ink focus-visible:opacity-100
+                    group-hover/line:opacity-100 group-focus-within/line:opacity-100
+                    pointer-coarse:size-11 pointer-coarse:opacity-100 max-sm:size-11 max-sm:opacity-100"
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                    {Icons.monitor}
+                  </svg>
+                </button>
+              )}
+              </div>
 
               {/* expanded detail */}
               {hasDetail && (

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ShellContext } from "../../components/ui/beautiful/controls";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { Conversation } from "../Conversation";
-import type { Message } from "./types";
+import type { BrowserTab, Message } from "./types";
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("../../api", () => api);
@@ -30,17 +30,37 @@ function emit(event: Record<string, unknown> & { type: string }) {
 
 const input = (id: string, delta: string) => emit({ type: "tool_input_delta", tool_call_id: id, delta });
 const text = (value: string) => [{ type: "text", text: value }];
-
-function reply(id: number, work?: Record<string, unknown>): Message {
-  return { id, role: "assistant", content: "Done.", metadata: { status: "completed", ...(work ? { work } : {}) }, created_at: "2026-10-01T05:22:12Z", attachments: [] };
+/** One finished tool step: input start, authoritative arguments, end. */
+function step(id: string, name: string, args: Record<string, unknown>, output = "ok", isError = false) {
+  emit({ type: "tool_input_start", tool_call_id: id, name });
+  emit({ type: "tool_start", tool_call_id: id, name, args });
+  emit({ type: "tool_end", tool_call_id: id, is_error: isError, content_preview: text(output), details: null });
 }
 
+function tool(id: string, name: string, args: Record<string, unknown>, output = "ok") {
+  return { type: "tool", id, name, args, status: "done", output, started_at: "2026-10-01T05:22:01Z", ended_at: "2026-10-01T05:22:02Z" };
+}
+
+function reply(id: number, tools: Record<string, unknown>[] = []): Message {
+  const work = tools.length ? { v: 1, started_at: "2026-10-01T05:22:00Z", ended_at: "2026-10-01T05:22:12Z", truncated: false, items: tools } : undefined;
+  return { id, role: "assistant", content: `Reply ${id}.`, metadata: { status: "completed", ...(work ? { work } : {}) }, created_at: "2026-10-01T05:22:12Z", attachments: [] };
+}
+
+let tabs: BrowserTab[] = [];
+let lease: { holder_user_id: number; expires_at: string } | null = null;
+
 async function mount(messages: Message[] = []) {
-  api.request.mockImplementation(async (path: string) => {
+  api.request.mockImplementation(async (path: string, options: RequestInit = {}) => {
+    const method = options.method ?? "GET";
     if (path.startsWith("/api/conversations/private/messages")) return { messages, next_before_id: null, last_seq: 0, compaction: null };
-    if (path === "/api/browser") return { tabs: [], lease: null };
+    if (path === "/api/browser") return { tabs, lease };
+    if (path === "/api/browser/lease" && method === "POST") return { lease: (lease = { holder_user_id: 1, expires_at: "2026-10-01T06:00:00Z" }) };
+    if (path === "/api/browser/lease" && method === "DELETE") {
+      lease = null;
+      return { ok: true };
+    }
     if (path.startsWith("/api/workspace/files")) return { files: [] };
-    throw new Error(`unexpected ${path}`);
+    throw new Error(`unexpected ${method} ${path}`);
   });
   const aside = document.createElement("div");
   document.body.append(aside);
@@ -56,9 +76,13 @@ async function mount(messages: Message[] = []) {
   return panel;
 }
 
+const windowOf = (panel: HTMLElement) => within(panel).getByRole("region", { name: "Computer screen" });
+
 describe("Computer panel", () => {
   beforeEach(() => {
     seq = 0;
+    tabs = [];
+    lease = null;
     FakeEventSource.instances = [];
     vi.stubGlobal("EventSource", FakeEventSource);
     window.localStorage.setItem(LOCALE_STORAGE_KEY, "en");
@@ -69,124 +93,185 @@ describe("Computer panel", () => {
     document.body.innerHTML = "";
   });
 
-  it("grows a streaming write in the editor and switches the panel to it", async () => {
+  it("is one window with no view switcher, the live browser when there is no step", async () => {
+    tabs = [{ tabId: "t1", url: "https://example.com/", title: "Example" }];
     const panel = await mount();
-    expect(within(panel).getByRole("region", { name: "Browser" })).toBeVisible();
+    expect(within(panel).getAllByRole("region", { name: "Computer screen" })).toHaveLength(1);
+    expect(within(panel).queryByRole("tablist")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("tab")).not.toBeInTheDocument();
+    expect(within(panel).queryByRole("button", { name: /follow/i })).not.toBeInTheDocument();
+    expect(await within(windowOf(panel)).findByRole("img", { name: "Browser screen: Example" })).toBeVisible();
+    expect(within(windowOf(panel)).getByText("https://example.com/")).toBeVisible();
+    expect(within(panel).getByText("Idle")).toBeVisible();
+    // Fewer than two steps: nothing to play back.
+    expect(within(panel).getByRole("slider", { name: "Step" })).toHaveAttribute("aria-disabled", "true");
+    expect(within(panel).getByRole("button", { name: "Previous step" })).toBeDisabled();
+  });
+
+  it("follows the AI across kinds: a streaming write, live bash output replaced at tool_end, then the live browser", async () => {
+    tabs = [{ tabId: "t1", url: "https://example.com/", title: "Example" }];
+    const panel = await mount();
+    await within(windowOf(panel)).findByRole("img", { name: "Browser screen: Example" });
 
     emit({ type: "tool_input_start", tool_call_id: "w1", name: "write" });
     input("w1", '{"path":"src/app.ts","content":"const a = 1;\\nconst b');
-    const editor = await within(panel).findByRole("region", { name: "Editor" });
-    expect(within(panel).queryByRole("region", { name: "Browser" })).not.toBeInTheDocument();
-    expect(within(editor).getByText("src/app.ts")).toBeVisible();
-    expect(within(editor).getByText("const a = 1;")).toBeVisible();
-    expect(within(editor).getByText("const b")).toBeVisible();
-    expect(within(editor).getByText("Writing")).toBeVisible();
+    let win = windowOf(panel);
+    expect(within(win).queryByRole("img", { name: /Browser screen/ })).not.toBeInTheDocument();
+    expect(within(win).getByText("app.ts")).toBeVisible();
+    expect(within(win).getByText("src/app.ts")).toBeVisible();
+    expect(within(win).getByText("const a = 1;")).toBeVisible();
+    expect(within(win).getByText("const b")).toBeVisible();
+    expect(within(panel).getByText("Write app.ts")).toBeVisible();
+    expect(within(panel).getByText("Working")).toBeVisible();
+    expect(within(panel).getByText("Live")).toBeVisible();
 
     input("w1", ' = 2;\\nconst c = 3;"}');
-    expect(within(editor).getByText("const b = 2;")).toBeVisible();
-    expect(within(editor).getByText("const c = 3;")).toBeVisible();
-
-    // The authoritative arguments replace the parsed stream; the call finishes.
+    expect(within(win).getByText("const b = 2;")).toBeVisible();
     emit({ type: "tool_start", tool_call_id: "w1", name: "write", args: { path: "src/app.ts", content: "final 1\nfinal 2" } });
-    expect(within(editor).getByText("final 2")).toBeVisible();
-    emit({ type: "tool_end", tool_call_id: "w1", name: "write", is_error: false, content_preview: text("ok"), details: null });
-    expect(within(editor).getByText("Done")).toBeVisible();
-  });
+    expect(within(win).getByText("final 2")).toBeVisible();
+    emit({ type: "tool_end", tool_call_id: "w1", is_error: false, content_preview: text("ok"), details: null });
+    // Between steps the live run is thinking.
+    expect(within(panel).getByText("Thinking")).toBeVisible();
 
-  it("appends live bash output in the terminal and replaces it with the final output at tool_end", async () => {
-    const panel = await mount();
+    // A new step takes the window as soon as it begins.
     emit({ type: "tool_input_start", tool_call_id: "b1", name: "bash" });
+    const log = within(windowOf(panel)).getByRole("log", { name: "Terminal output" });
+    expect(within(windowOf(panel)).getByText("Terminal")).toBeVisible();
     emit({ type: "tool_start", tool_call_id: "b1", name: "bash", args: { command: "npm test" } });
-    const terminal = await within(panel).findByRole("region", { name: "Terminal" });
-    const log = within(terminal).getByRole("log", { name: "Terminal output" });
     expect(log).toHaveTextContent("$ npm test");
-    expect(within(log).getByRole("img", { name: "Running" })).toBeInTheDocument();
-
+    expect(within(panel).getByText("Run npm test")).toBeVisible();
     emit({ type: "tool_output", tool_call_id: "b1", delta: "compiling\n" });
     emit({ type: "tool_output", tool_call_id: "b1", delta: "3 passed\n" });
     expect(log).toHaveTextContent(/compiling\s*3 passed/);
-    // Appended text is never announced.
     expect(log).toHaveAttribute("aria-live", "off");
-
-    emit({ type: "tool_end", tool_call_id: "b1", name: "bash", is_error: true, content_preview: text("FINAL: 1 failed"), details: null });
+    emit({ type: "tool_end", tool_call_id: "b1", is_error: true, content_preview: text("FINAL: 1 failed"), details: null });
     expect(log).toHaveTextContent("FINAL: 1 failed");
     expect(log).not.toHaveTextContent("compiling");
     expect(within(log).getByRole("img", { name: "Failed" })).toBeInTheDocument();
     expect(within(panel).getByRole("status")).toHaveTextContent("Command failed");
+
+    step("br1", "browser", { action: "navigate", url: "https://example.com/" });
+    win = windowOf(panel);
+    expect(within(win).getByRole("img", { name: "Browser screen: Example" })).toBeVisible();
+    expect(within(panel).getByText("Browse example.com")).toBeVisible();
+    expect(within(panel).getByText("3 / 3")).toBeVisible();
   });
 
-  it("shows other tools as one line each", async () => {
-    const panel = await mount();
-    emit({ type: "tool_start", tool_call_id: "s1", name: "web_search", args: { query: "pi agent" } });
-    emit({ type: "tool_end", tool_call_id: "s1", name: "web_search", is_error: false, content_preview: text("3 results"), details: null });
-    emit({ type: "tool_start", tool_call_id: "g1", name: "grep", args: { pattern: "TODO", path: "src" } });
-    const log = await within(panel).findByRole("log", { name: "Terminal output" });
-    expect(log).toHaveTextContent('› web_search "pi agent"');
-    expect(log).toHaveTextContent("3 results");
-    expect(log).toHaveTextContent("$ grep -rn TODO src");
-  });
-
-  it("stops following after a manual view choice until Follow AI is pressed", async () => {
+  it("reviews an earlier step that new steps and a new run never move, then returns to live", async () => {
     const user = userEvent.setup();
     const panel = await mount();
-    emit({ type: "tool_start", tool_call_id: "b1", name: "bash", args: { command: "ls" } });
-    await within(panel).findByRole("region", { name: "Terminal" });
+    step("b1", "bash", { command: "ls" }, "a.md");
+    step("w1", "write", { path: "notes.md", content: "hello notes" });
+    emit({ type: "tool_start", tool_call_id: "b2", name: "bash", args: { command: "sleep 9" } });
 
-    await user.click(within(panel).getByRole("tab", { name: "Editor" }));
-    expect(within(panel).getByRole("region", { name: "Editor" })).toBeVisible();
-    emit({ type: "tool_start", tool_call_id: "b2", name: "bash", args: { command: "pwd" } });
-    emit({ type: "tool_start", tool_call_id: "r1", name: "read", args: { path: "a.md" } });
-    expect(within(panel).getByRole("region", { name: "Editor" })).toBeVisible();
+    await user.click(within(panel).getByRole("button", { name: "Previous step" }));
+    const slider = within(panel).getByRole("slider", { name: "Step" });
+    expect(slider).toHaveAttribute("aria-valuetext", "Step 2 of 3: Write notes.md");
+    expect(within(windowOf(panel)).getByText("hello notes")).toBeVisible();
+    expect(within(panel).getByText("2 / 3")).toBeVisible();
+    expect(within(panel).queryByText("Live")).not.toBeInTheDocument();
 
-    await user.click(within(panel).getByRole("button", { name: "Follow AI" }));
-    expect(within(panel).getByRole("region", { name: "Editor" })).toBeVisible();
-    emit({ type: "tool_start", tool_call_id: "b3", name: "bash", args: { command: "date" } });
-    expect(await within(panel).findByRole("region", { name: "Terminal" })).toBeVisible();
-    expect(within(panel).queryByRole("button", { name: "Follow AI" })).not.toBeInTheDocument();
+    // New steps only update the count.
+    step("b3", "bash", { command: "date" });
+    expect(within(windowOf(panel)).getByText("hello notes")).toBeVisible();
+    expect(within(panel).getByText("2 / 4")).toBeVisible();
 
-    // A new run also resumes following.
-    await user.click(within(panel).getByRole("tab", { name: "Browser" }));
-    emit({ type: "run_end", message: reply(2) });
-    emit({ type: "tool_start", tool_call_id: "e1", name: "edit", args: { path: "a.md", edits: [{ oldText: "x", newText: "y" }] } });
-    expect(await within(panel).findByRole("region", { name: "Editor" })).toBeVisible();
+    // The run ends and the next one starts: the reviewed step stays, resolved by the reply it became.
+    emit({ type: "run_end", message: reply(5, [tool("b1", "bash", { command: "ls" }), tool("w1", "write", { path: "notes.md", content: "hello notes" })]) });
+    emit({ type: "tool_start", tool_call_id: "x1", name: "bash", args: { command: "uptime" } });
+    expect(within(windowOf(panel)).getByText("hello notes")).toBeVisible();
+
+    // Keyboard review within the reviewed run.
+    slider.focus();
+    await user.keyboard("{Home}");
+    expect(within(windowOf(panel)).getByRole("log", { name: "Terminal output" })).toHaveTextContent("$ ls");
+    await user.keyboard("{End}");
+    expect(within(panel).getByRole("slider", { name: "Step" })).toHaveAttribute("aria-valuetext", "Step 4 of 4: Run date");
+
+    await user.click(within(panel).getByRole("button", { name: "Back to live" }));
+    expect(within(windowOf(panel)).getByRole("log", { name: "Terminal output" })).toHaveTextContent("$ uptime");
+    expect(within(panel).getByText("Live")).toBeVisible();
+    expect(within(panel).getByText("1 / 1")).toBeVisible();
   });
 
-  it("keeps the last step after the run ends", async () => {
+  it("opens an older reply's step from the conversation with View in computer", async () => {
+    const user = userEvent.setup();
+    const older = reply(2, [tool("t1", "bash", { command: "make" }, "built")]);
+    const latest = reply(4, [tool("s1", "web_search", { query: "pi agent" }, "Pi agent docs https://pi.dev/docs.\nMore")]);
+    const panel = await mount([older, latest]);
+    expect(within(windowOf(panel)).getByText("pi agent")).toBeVisible();
+    const link = within(windowOf(panel)).getByRole("link", { name: "https://pi.dev/docs" });
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
+
+    const [olderReply] = screen.getAllByRole("article", { name: "Agent reply" });
+    await user.click(within(olderReply).getByRole("button", { name: "View in computer" }));
+    expect(within(windowOf(panel)).getByRole("log", { name: "Terminal output" })).toHaveTextContent(/\$ make\s*built/);
+    expect(within(panel).getByText("Run make")).toBeVisible();
+    expect(within(panel).getByText("1 / 1")).toBeVisible();
+
+    await user.click(within(panel).getByRole("button", { name: "Back to latest step" }));
+    expect(within(windowOf(panel)).getByRole("link", { name: "https://pi.dev/docs" })).toBeVisible();
+  });
+
+  it("opens the closed panel on the chosen step", async () => {
+    const user = userEvent.setup();
+    const panel = await mount([reply(2, [tool("t1", "bash", { command: "make" }, "built")]), reply(4, [tool("s1", "web_search", { query: "pi" })])]);
+    await user.click(within(panel).getByRole("button", { name: "Close computer" }));
+    expect(screen.queryByRole("complementary", { name: "Computer" })).not.toBeInTheDocument();
+    await user.click(screen.getAllByRole("button", { name: "View in computer" })[0]);
+    const reopened = await screen.findByRole("complementary", { name: "Computer" });
+    expect(within(windowOf(reopened)).getByRole("log", { name: "Terminal output" })).toHaveTextContent("$ make");
+  });
+
+  it("shows the latest reply's last step after a reload, noting clipped arguments", async () => {
+    const clipped = tool("w9", "write", { _preview: '{"path":"notes/big.md","content":"line one\\nline tw' });
+    const panel = await mount([reply(2, [tool("t1", "bash", { command: "make" })]), reply(3), reply(4, [tool("t2", "bash", { command: "ls" }), clipped])]);
+    const win = windowOf(panel);
+    expect(within(win).getByText("big.md")).toBeVisible();
+    expect(within(win).getByText("line one")).toBeVisible();
+    expect(within(win).getByText("Only part of this step was kept")).toBeVisible();
+    expect(within(panel).getByText("Write big.md")).toBeVisible();
+    expect(within(panel).getByText("2 / 2")).toBeVisible();
+    // The status under the window (the file header inside it repeats the step state).
+    expect(within(panel).getAllByText("Done").filter((node) => !win.contains(node))).toHaveLength(1);
+    expect(within(panel).queryByRole("button", { name: /back to/i })).not.toBeInTheDocument();
+  });
+
+  it("pins the live browser while a person holds it and resumes following after handing back", async () => {
+    const user = userEvent.setup();
+    tabs = [{ tabId: "t1", url: "https://example.com/login", title: "Login" }];
     const panel = await mount();
-    emit({ type: "tool_input_start", tool_call_id: "e1", name: "edit" });
-    input("e1", '{"path":"a.md","edits":[{"oldText":"old line","newText":"new li');
-    const editor = await within(panel).findByRole("region", { name: "Editor" });
-    expect(within(editor).getByText("old line")).toBeVisible();
-    expect(within(editor).getByText("new li")).toBeVisible();
-    emit({ type: "tool_start", tool_call_id: "e1", name: "edit", args: { path: "a.md", edits: [{ oldText: "old line", newText: "new line" }] } });
-    emit({ type: "tool_end", tool_call_id: "e1", name: "edit", is_error: false, content_preview: text("ok"), details: { diff: "--- a.md\n+++ a.md\n@@ -1 +1 @@\n-old line\n+new line" } });
-    emit({ type: "run_end", message: reply(2) });
-    await waitFor(() => expect(within(panel).getByText("Idle")).toBeVisible());
-    const kept = within(panel).getByRole("region", { name: "Editor" });
-    expect(within(kept).getByText("new line")).toBeVisible();
-    expect(within(kept).getByText("a.md", { selector: "span.font-mono" })).toBeVisible();
+    step("b1", "bash", { command: "echo one" });
+    step("b2", "bash", { command: "echo two" });
+    expect(within(windowOf(panel)).getByRole("log", { name: "Terminal output" })).toBeVisible();
+
+    await user.click(within(panel).getByRole("button", { name: "Take control" }));
+    const viewer = await screen.findByRole("dialog", { name: "Login" });
+    expect(within(viewer).getByRole("img", { name: "Browser screen: Login" })).toBeVisible();
+    expect(within(windowOf(panel)).getByRole("img", { name: "Browser screen: Login" })).toBeInTheDocument();
+    expect(within(panel).getByRole("button", { name: "Previous step" })).toBeDisabled();
+    expect(within(panel).getByRole("slider", { name: "Step" })).toHaveAttribute("aria-disabled", "true");
+
+    step("b3", "bash", { command: "echo three" });
+    expect(within(windowOf(panel)).queryByRole("log")).not.toBeInTheDocument();
+
+    await user.click(within(viewer).getByRole("button", { name: "Hand back to agent" }));
+    await user.keyboard("{Escape}");
+    expect(await within(windowOf(panel)).findByRole("log", { name: "Terminal output" })).toHaveTextContent("$ echo three");
+    expect(within(panel).getByRole("button", { name: "Previous step" })).toBeEnabled();
   });
 
-  it("uses the latest reply's persisted work trace after a reload", async () => {
-    const work = {
-      v: 1, started_at: "2026-10-01T05:22:00Z", ended_at: "2026-10-01T05:22:12Z", truncated: false,
-      items: [
-        { type: "tool", id: "t1", name: "bash", args: { command: "make" }, status: "done", output: "built", started_at: "2026-10-01T05:22:01Z", ended_at: "2026-10-01T05:22:02Z" },
-        { type: "tool", id: "t2", name: "write", args: { path: "notes/todo.md", content: "- one\n- two" }, status: "done", output: "", started_at: "2026-10-01T05:22:03Z", ended_at: "2026-10-01T05:22:04Z" },
-      ],
-    };
-    const panel = await mount([reply(2, work)]);
-    const editor = await within(panel).findByRole("region", { name: "Editor" });
-    expect(within(editor).getByText("notes/todo.md")).toBeVisible();
-    expect(within(editor).getByText("- two")).toBeVisible();
-    await userEvent.setup().click(within(panel).getByRole("tab", { name: "Terminal" }));
-    expect(within(panel).getByRole("log", { name: "Terminal output" })).toHaveTextContent(/\$ make\s*built/);
-  });
-
-  it("shows the browser when there is no activity at all", async () => {
+  it("opens the expanded viewer with the same step and the playback bar", async () => {
+    const user = userEvent.setup();
     const panel = await mount();
-    expect(within(panel).getByRole("region", { name: "Browser" })).toBeVisible();
-    expect(within(panel).queryByRole("button", { name: "Follow AI" })).not.toBeInTheDocument();
+    step("b1", "bash", { command: "pwd" }, "/workspace");
+    step("w1", "write", { path: "a.txt", content: "alpha" });
+    await user.click(within(windowOf(panel)).getByRole("button", { name: "Expand" }));
+    const viewer = await screen.findByRole("dialog", { name: "Write a.txt" });
+    expect(within(viewer).getByText("alpha")).toBeVisible();
+    await user.click(within(viewer).getByRole("button", { name: "Previous step" }));
+    expect(within(viewer).getByRole("log", { name: "Terminal output" })).toHaveTextContent(/\$ pwd\s*\/workspace/);
   });
 
   it("decodes escaped quotes, newlines and unicode split across deltas", async () => {
@@ -195,10 +280,10 @@ describe("Computer panel", () => {
     input("w1", '{"path":"q.txt","content":"say \\');
     input("w1", '"hi\\');
     input("w1", '"\\nnext \\u00');
-    const editor = await within(panel).findByRole("region", { name: "Editor" });
-    expect(within(editor).getByText('say "hi"')).toBeVisible();
-    expect(within(editor).getByText("next")).toBeVisible();
+    const win = windowOf(panel);
+    expect(within(win).getByText('say "hi"')).toBeVisible();
+    expect(within(win).getByText("next")).toBeVisible();
     input("w1", 'e9\\\\n"}');
-    expect(within(editor).getByText("next é\\n")).toBeVisible();
+    expect(within(win).getByText("next é\\n")).toBeVisible();
   });
 });

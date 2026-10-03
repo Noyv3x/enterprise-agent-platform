@@ -27,6 +27,37 @@ export interface WorkTrace {
   omitted: number;
 }
 
+export type Words = (en: string, zhCN?: string, zhTW?: string) => string;
+
+/** The verb a tool call reads as; the conversation's work trace and the computer panel share it. */
+export function toolVerb(name: string, w: Words): string {
+  switch (name) {
+    case "bash":
+      return w("Run", "运行", "執行");
+    case "read":
+      return w("Read", "读取", "讀取");
+    case "write":
+      return w("Write", "写入", "寫入");
+    case "edit":
+      return w("Edit", "编辑", "編輯");
+    case "ls":
+      return w("List", "列出", "列出");
+    case "find":
+    case "grep":
+      return w("Search files", "查找文件", "尋找檔案");
+    case "web_search":
+      return w("Search the web", "搜索网页", "搜尋網頁");
+    case "web_fetch":
+      return w("Open page", "打开网页", "開啟網頁");
+    case "browser":
+      return w("Browse", "浏览", "瀏覽");
+    case "schedule":
+      return w("Schedule", "定时任务", "排程任務");
+    default:
+      return name;
+  }
+}
+
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }

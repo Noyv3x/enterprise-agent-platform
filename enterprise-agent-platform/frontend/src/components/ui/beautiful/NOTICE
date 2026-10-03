@@ -21,8 +21,8 @@ Layout
                   by open icons; remote images, sounds and marketing removed. A primitive's COMPONENT-SPECIFIC CSS
                   block from upstream globals.css sits next to it. TaskRows scopes detail IDs to each instance
                   so repeated task keys in separate lists retain correct accessibility associations.
-  controls/       platform controls upstream does not ship (inputs, select, dialog, sheet, notice, empty state),
-                  composed only from upstream tokens and primitives.
+  controls/       platform controls upstream does not ship (inputs, select, dialog, sheet, notice, empty state,
+                  step scrubber), composed only from upstream tokens and primitives.
 
 npm packages used by upstream primitives: liveline (InsightCards charts, MIT), glimm (PromptBar accent sweep,
 MIT), shadow-plugin (MIT).

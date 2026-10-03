@@ -5,7 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../../../i18n";
-import { ConfirmDialog, Field, Menu, MultiSelect, Select, TextField } from ".";
+import { ConfirmDialog, Field, Menu, MultiSelect, Select, StepScrubber, TextField } from ".";
 
 const FRUIT = [
   { value: "apple", label: "Apple" },
@@ -186,5 +186,47 @@ describe("Field", () => {
     const input = screen.getByLabelText("Name");
     expect(input).toHaveAttribute("aria-invalid", "true");
     expect(input).toHaveAccessibleDescription("Enter a name");
+  });
+});
+
+describe("StepScrubber", () => {
+  function ScrubberHarness() {
+    const [value, setValue] = useState(1);
+    return <StepScrubber count={5} value={value} onChange={setValue} label="Step" valueText={(at) => `Step ${at + 1} of 5`} />;
+  }
+
+  it("steps with arrows, jumps with Home and End, and seeks where the pointer presses and drags", async () => {
+    const user = userEvent.setup();
+    render(<ScrubberHarness />);
+    const slider = screen.getByRole("slider", { name: "Step" });
+    expect(slider).toHaveAttribute("aria-valuenow", "2");
+    expect(slider).toHaveAttribute("aria-valuetext", "Step 2 of 5");
+
+    slider.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(slider).toHaveAttribute("aria-valuenow", "3");
+    await user.keyboard("{End}");
+    expect(slider).toHaveAttribute("aria-valuetext", "Step 5 of 5");
+    await user.keyboard("{ArrowRight}{Home}{ArrowLeft}");
+    expect(slider).toHaveAttribute("aria-valuenow", "1");
+
+    // The track spans x 0–400: 300 is step 4, dragging to 100 lands on step 2.
+    const track = slider.firstElementChild as HTMLElement;
+    vi.spyOn(track, "getBoundingClientRect").mockReturnValue({ left: 0, width: 400, top: 0, height: 4, right: 400, bottom: 4, x: 0, y: 0, toJSON: () => ({}) });
+    await user.pointer([{ keys: "[MouseLeft>]", target: slider, coords: { clientX: 300 } }]);
+    expect(slider).toHaveAttribute("aria-valuenow", "4");
+    await user.pointer([{ target: slider, coords: { clientX: 100 } }, { keys: "[/MouseLeft]", target: slider }]);
+    expect(slider).toHaveAttribute("aria-valuenow", "2");
+  });
+
+  it("is inert with fewer than two steps", async () => {
+    const onChange = vi.fn();
+    render(<StepScrubber count={1} value={0} onChange={onChange} label="Step" valueText={() => "Step 1 of 1"} />);
+    const slider = screen.getByRole("slider", { name: "Step" });
+    expect(slider).toHaveAttribute("aria-disabled", "true");
+    expect(slider).not.toHaveAttribute("tabindex", "0");
+    slider.focus();
+    await userEvent.setup().keyboard("{End}");
+    expect(onChange).not.toHaveBeenCalled();
   });
 });

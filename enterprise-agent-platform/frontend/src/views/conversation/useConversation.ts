@@ -2,7 +2,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import { request } from "../../api";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
-import type { Compaction, LiveRun, Message, MessagePage, ToolCall } from "./types";
+import type { Compaction, LastRun, LiveRun, Message, MessagePage, ToolCall } from "./types";
 
 const PAGE = 100;
 /** The panel keeps at most this much live output per call; the Runtime already limits it to 512 KiB. */
@@ -37,8 +37,8 @@ interface State {
   compactionSeq: number;
   /** Watermark from the first page; the stream starts there. */
   after: number | null;
-  /** Tool calls of the run that just ended, for the computer panel until the next run starts. */
-  lastCalls: ToolCall[] | null;
+  /** The run that just ended with its streamed calls, for the computer panel until the next run ends or a reload. */
+  lastRun: LastRun | null;
 }
 
 type Action =
@@ -49,7 +49,7 @@ type Action =
   | { type: "compactQueued"; compaction: Compaction }
   | { type: "event"; event: StreamEvent; at: number };
 
-const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastCalls: null };
+const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null };
 
 function upsert(state: State, incoming: Message[]): Message[] {
   const oldest = state.messages[0]?.id;
@@ -140,7 +140,9 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
   if (event.type === "run_end") {
     // Calls cut short by a stop or failure are not running any more.
     const calls = state.live?.calls.map((call) => (call.status === "preparing" || call.status === "running" ? { ...call, status: "cancelled" as const } : call));
-    return { ...state, live: null, lastCalls: calls?.length ? calls : state.lastCalls, messages: event.message ? upsert(state, [event.message]) : state.messages };
+    // The run becomes its reply message; the panel keeps resolving it by that id with the full streams.
+    const lastRun = event.message && calls?.length ? { messageId: event.message.id, calls } : state.lastRun;
+    return { ...state, live: null, lastRun, messages: event.message ? upsert(state, [event.message]) : state.messages };
   }
   if (event.type === "compaction" && event.job_id !== undefined && event.status !== undefined) {
     const compaction: Compaction = { job_id: event.job_id, status: event.status, reason: event.reason, error: event.error, after_message_id: event.after_message_id };
@@ -193,7 +195,7 @@ function reducer(state: State, action: Action): State {
     case "loaded":
       return {
         ...state, phase: "ready", error: "", messages: action.page.messages,
-        nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastCalls: null,
+        nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastRun: null,
         compaction: action.page.last_seq < state.compactionSeq ? state.compaction
           : action.page.compaction ? latestCompaction(state.compaction, action.page.compaction) : null,
       };

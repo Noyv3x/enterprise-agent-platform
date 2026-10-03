@@ -1,29 +1,32 @@
 /* Adapted from Beautiful UI components/primitives/AgentScreen.tsx (MIT, see ../NOTICE).
  * Adaptations:
- * - the screen is the agent browser's live screenshot from the caller (`streamSrc`), not the placeholder capture;
- *   without one the card shows the caller's empty message; the faux window is removed;
+ * - window mode: the resting card is upstream's FauxWindow (exported below) carrying real data instead of the
+ *   placeholder capture: traffic lights, the caller's title tab(s), an address row only when the caller gives one,
+ *   and the caller's content. It fills the height its parent gives it (the caller fixes that height so the window
+ *   never jumps), is a real window rather than a clickable card (its content scrolls; there is no hover overlay),
+ *   and upstream's open icon sits at the right of the title row to open the expanded viewer;
+ * - the content is the agent browser's live screenshot (`streamSrc`, fitted to the window's width and top-aligned,
+ *   since the window is taller than a page) or a caller node (`screen`); the expanded viewer shows the screenshot as
+ *   upstream does, or the caller's larger node (`viewerScreen`) inside the same window chrome; without either the
+ *   window shows the caller's empty message;
  * - "Teach a task" / recording becomes human takeover: the caller's controls acquire and release the browser
- *   lease, and the REC badge becomes the control badge with the time held;
+ *   lease, and the REC badge becomes the control badge with the time held (in the title row and the viewer);
  * - the viewer is controlled (`open`), forwards clicks on the screen while the person holds control, and
  *   renders the caller's input row below the screen; the custom cursor shows only while interactive;
  * - labels come from the caller (i18n); the dialog traps focus, restores it, and consumes Escape before a parent sheet;
- * - the caller may give the screen as a node (`screen` for the card, `viewerScreen` for the expanded viewer, which
- *   sizes it to the viewer's measure) instead of a screenshot: the computer panel's terminal and editor views reuse
- *   this frame so every view shares its card, title bar, focus handling and Escape behavior;
  * - the expanded viewer sits above sheets (60) and below its portaled popovers (80).
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Button } from "../atoms/Button";
+import { cn } from "../cn";
 import "./agentScreen.css";
 
 /* ─────────────────────────────────────────────────────────
  * AGENT SCREEN (live viewer)
- * Watch an agent work. The resting card is a framed capture of
- * the agent's screen; hover reveals an "Open" pill (the blue
- * accent Button). Open expands to a full-width viewer where you
- * can take control, collapse (control keeps running, the card
- * shows a red badge), and hand back.
+ * Watch an agent work. The window shows what the agent is doing;
+ * its open control expands a full-width viewer where you can take
+ * control, collapse (control keeps running, the window shows a red
+ * badge), and hand back.
  * ───────────────────────────────────────────────────────── */
 
 const SCREEN_ASPECT = "aspect-[16/10]";
@@ -98,17 +101,97 @@ function LoadingScreen({ label }: { label: string }) {
   );
 }
 
+export type WindowTab = { id: string; label: string };
+
+const TAB = "flex min-w-0 items-center gap-1.5 rounded-t-[6px] px-2 py-1 text-[11.5px] font-medium leading-none";
+const ACTIVE_TAB = "bg-surface text-ink shadow-[0_-1px_0_var(--line)] forced-colors:border forced-colors:border-b-0";
+
+/** Upstream's FauxWindow with real data: traffic lights and title tab(s) on an inset bar, an optional address row
+ * (decorative back/forward and a URL pill), then the content. Accessibility adaptations: the tab and URL text are
+ * real labels in ink / ink-2 at 11.5px (upstream draws placeholder bars and 9px ink-3); several tabs become
+ * buttons choosing the shown one when the caller handles `onTabChange`; the tab and pill get a border under forced
+ * colors. */
+export function FauxWindow({ tabs, activeTab, onTabChange, tabsLabel, address, actions, children }: {
+  tabs: WindowTab[];
+  activeTab?: string;
+  onTabChange?: (id: string) => void;
+  /** accessible name of the tab group when tabs are choosable */
+  tabsLabel?: string;
+  /** shown in the address row; the row is omitted without one */
+  address?: string | null;
+  /** controls at the right of the title row */
+  actions?: ReactNode;
+  children: ReactNode;
+}) {
+  const active = activeTab ?? tabs[0]?.id;
+  const choosable = Boolean(onTabChange) && tabs.length > 1;
+  return (
+    <div className="flex h-full w-full flex-col bg-surface">
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-line bg-inset px-2.5 py-1.5">
+        <span aria-hidden className="flex shrink-0 items-center gap-1">
+          <span className="size-2 rounded-full bg-red" />
+          <span className="size-2 rounded-full bg-orange" />
+          <span className="size-2 rounded-full bg-green" />
+        </span>
+        <div role={choosable ? "group" : undefined} aria-label={choosable ? tabsLabel : undefined} className="ml-1 flex min-w-0 flex-1 items-center gap-0.5">
+          {tabs.map((tab) => {
+            const selected = tab.id === active;
+            const marker = <span aria-hidden className="size-2 shrink-0 rounded-[3px] bg-accent-tint" />;
+            return choosable ? (
+              <button
+                key={tab.id}
+                type="button"
+                aria-pressed={selected}
+                title={tab.label}
+                onClick={() => onTabChange?.(tab.id)}
+                className={cn(TAB, "max-w-[12rem] transition-colors duration-100 touch:min-h-11", selected ? ACTIVE_TAB : "text-ink-2 hover:bg-hover hover:text-ink")}
+              >
+                {marker}
+                <span className="truncate">{tab.label}</span>
+              </button>
+            ) : (
+              <span key={tab.id} title={tab.label} className={cn(TAB, selected ? ACTIVE_TAB : "text-ink-2")}>
+                {marker}
+                <span className="truncate">{tab.label}</span>
+              </span>
+            );
+          })}
+        </div>
+        {actions && <div className="ml-auto flex shrink-0 items-center gap-1">{actions}</div>}
+      </div>
+      {address && (
+        <div className="flex shrink-0 items-center gap-2 border-b border-line px-2.5 py-1.5 text-ink-3">
+          <Ico size={12} path={<path d="M15 18l-6-6 6-6" />} />
+          <Ico size={12} path={<path d="M9 6l6 6-6 6" />} />
+          <span className="min-w-0 flex-1 truncate rounded-full bg-field px-2.5 py-[3px] font-mono text-[11.5px] text-ink-2 forced-colors:border" title={address}>
+            {address}
+          </span>
+        </div>
+      )}
+      <div className="relative min-h-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
 export type AgentScreenLabels = {
   open: string;
   collapse: string;
   connecting: string;
   /** accessible name of the screen image */
   screen: string;
+  /** accessible name of the window's tabs when they are choosable */
+  tabs?: string;
+  /** accessible name of the window (a region) */
+  window: string;
 };
 
 export default function AgentScreen({
   agentName,
   status,
+  tabs,
+  activeTab,
+  onTabChange,
+  address,
   streamSrc,
   screen,
   viewerScreen,
@@ -124,33 +207,43 @@ export default function AgentScreen({
   onFrameLoad,
   onFrameError,
   labels,
+  className,
 }: {
   agentName: string;
   /** status shown next to the name (e.g. a Working pill) */
   status?: ReactNode;
+  /** the window's title tab(s) */
+  tabs: WindowTab[];
+  activeTab?: string;
+  /** makes several tabs choosable */
+  onTabChange?: (id: string) => void;
+  /** the window's address row (a URL or query); omitted when absent */
+  address?: string | null;
   /** current screenshot URL; absent → `empty` */
   streamSrc?: string | null;
-  /** a node shown on the card instead of the screenshot (it is not interactive; the card opens the viewer) */
+  /** a node shown in the window instead of the screenshot */
   screen?: ReactNode;
-  /** a node shown in the expanded viewer instead of the screenshot, in a fixed-size scroll frame */
+  /** a node shown in the expanded viewer instead of the screenshot, in a fixed-size frame */
   viewerScreen?: ReactNode;
   loading?: boolean;
-  /** shown on the card when there is no screen */
+  /** shown in the window when there is no screen */
   empty?: ReactNode;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** the person holds control: badge on the card and in the viewer, screen clicks forward */
+  /** the person holds control: badge in the window and in the viewer, screen clicks forward */
   controlling?: boolean;
   /** epoch ms control was taken, for the badge timer */
   controlSince?: number | null;
   /** viewer title-bar controls (take control / hand back) */
   controls?: ReactNode;
-  /** viewer row below the screen (address, typing) */
+  /** viewer row below the screen (playback, address, typing) */
   inputs?: ReactNode;
   onScreenClick?: (event: MouseEvent<HTMLImageElement>) => void;
   onFrameLoad?: () => void;
   onFrameError?: () => void;
   labels: AgentScreenLabels;
+  /** the root's layout (its height bounds the window) */
+  className?: string;
 }) {
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -203,57 +296,55 @@ export default function AgentScreen({
   );
 
   return (
-    <div className="w-full">
-      {/* ── resting card ── */}
-      <div
-        className={`group/screen relative ${SCREEN_ASPECT} overflow-hidden rounded-window bg-inset shadow-card transition-shadow duration-150 ${
-          loading ? "" : "cursor-pointer hover:shadow-raised"
-        }`}
-        onClick={loading ? undefined : () => onOpenChange(true)}
+    <div className={cn("flex w-full min-w-0 flex-col", className)}>
+      {/* ── the window ── */}
+      <section
+        aria-label={labels.window}
+        className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-window bg-surface shadow-card"
         style={{ animation: "fade-up 380ms cubic-bezier(0.23,1,0.32,1) both" }}
       >
-        {loading ? (
-          <LoadingScreen label={labels.connecting} />
-        ) : (
-          <>
-            <div className="absolute inset-0 overflow-hidden bg-inset">
-              {screen ? screen : streamSrc ? (
-                <img
-                  src={streamSrc}
-                  alt={labels.screen}
-                  className="absolute inset-0 h-full w-full object-cover object-top"
-                  onLoad={open ? undefined : onFrameLoad}
-                  onError={open ? undefined : onFrameError}
-                />
-              ) : (
-                <div className="absolute inset-0 flex items-center justify-center p-4 text-center text-[12.5px] text-ink-2">{empty}</div>
-              )}
-            </div>
-            {controlling && <span className="absolute top-2 left-2">{badge}</span>}
-
-            {/* hover reveal — scoped to this frame's named group */}
-            <div className="absolute inset-0 flex items-center justify-center bg-[rgba(17,19,24,0)] transition-colors duration-150 group-hover/screen:bg-[rgba(17,19,24,0.18)] group-focus-within/screen:bg-[rgba(17,19,24,0.18)]">
-              <span className="translate-y-1 opacity-0 transition duration-150 group-hover/screen:translate-y-0 group-hover/screen:opacity-100 group-focus-within/screen:translate-y-0 group-focus-within/screen:opacity-100 pointer-coarse:translate-y-0 pointer-coarse:opacity-100">
-                <Button
-                  variant="accent"
-                  size="sm"
-                  className="pointer-coarse:h-11"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onOpenChange(true);
-                  }}
-                >
-                  <Ico size={14} path={openIcon} />
-                  {labels.open}
-                </Button>
-              </span>
-            </div>
-          </>
-        )}
-      </div>
+        <FauxWindow
+          tabs={tabs}
+          activeTab={activeTab}
+          onTabChange={onTabChange}
+          tabsLabel={labels.tabs}
+          address={address}
+          actions={
+            <>
+              {badge}
+              <button
+                type="button"
+                aria-label={labels.open}
+                title={labels.open}
+                disabled={loading}
+                onClick={() => onOpenChange(true)}
+                className="primitive-icon-button size-6 text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink disabled:opacity-50 touch:size-11"
+              >
+                <Ico size={13} path={openIcon} />
+              </button>
+            </>
+          }
+        >
+          {loading ? (
+            <LoadingScreen label={labels.connecting} />
+          ) : screen ? (
+            screen
+          ) : streamSrc ? (
+            <img
+              src={streamSrc}
+              alt={labels.screen}
+              className="absolute inset-0 h-full w-full bg-inset object-contain object-top"
+              onLoad={open ? undefined : onFrameLoad}
+              onError={open ? undefined : onFrameError}
+            />
+          ) : (
+            <div className="absolute inset-0 flex items-center justify-center bg-inset p-4 text-center text-[12.5px] text-ink-2">{empty}</div>
+          )}
+        </FauxWindow>
+      </section>
 
       <div className="mt-2.5 flex min-w-0 items-center gap-2 px-0.5">
-        <span className="truncate text-[13px] font-medium text-ink">{agentName}</span>
+        <span className="truncate text-[13px] font-medium text-ink" title={agentName}>{agentName}</span>
         {status}
       </div>
 
@@ -312,7 +403,9 @@ export default function AgentScreen({
                 onMouseLeave={() => setCursorPos(null)}
               >
                 {viewerScreen ? (
-                  <div className="relative overflow-hidden" style={{ width: "min(960px, 90vw)", height: inputs ? "min(560px, calc(100vh - 210px))" : "min(560px, calc(100vh - 150px))" }}>{viewerScreen}</div>
+                  <div className="relative overflow-hidden" style={{ width: "min(960px, 90vw)", height: inputs ? "min(560px, calc(100vh - 230px))" : "min(560px, calc(100vh - 150px))" }}>
+                    <FauxWindow tabs={tabs} activeTab={activeTab} address={address}>{viewerScreen}</FauxWindow>
+                  </div>
                 ) : loading || !streamSrc ? (
                   <div className={`relative ${SCREEN_ASPECT}`} style={{ width: "min(960px, 90vw)" }}>
                     {loading ? <LoadingScreen label={labels.connecting} /> : (
@@ -324,7 +417,7 @@ export default function AgentScreen({
                     src={streamSrc}
                     alt={labels.screen}
                     className="block h-auto w-auto object-contain"
-                    style={{ maxHeight: inputs ? "calc(100vh - 210px)" : "calc(100vh - 150px)", maxWidth: "min(960px, 90vw)" }}
+                    style={{ maxHeight: inputs ? "calc(100vh - 230px)" : "calc(100vh - 150px)", maxWidth: "min(960px, 90vw)" }}
                     onClick={controlling ? onScreenClick : undefined}
                     onLoad={onFrameLoad}
                     onError={onFrameError}

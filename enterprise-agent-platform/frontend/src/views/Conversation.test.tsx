@@ -192,7 +192,7 @@ describe('Conversation', () => {
     expect(screen.getByText('Preparing workspace')).toBeVisible();
     expect(screen.getByText('3 tool calls')).toBeVisible();
     expect(inThread('Failed')).toBeVisible();
-    expect(screen.getByText('Stopped')).toBeVisible();
+    expect(inThread('Stopped')).toBeVisible();
     await user.click(screen.getByRole('button', { name: /terminal/ }));
     expect(screen.getByText(/"cwd": "\/workspace"/)).toBeVisible();
     expect(inThread('release ready')).toBeVisible();
@@ -320,6 +320,19 @@ describe('Conversation', () => {
     expect(screen.queryByRole('button', { name: 'Computer' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Send again' }));
     expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'Hi there', attachment_ids: [] }]);
+  });
+
+  it('offers View in computer on tool rows only where the computer exists', async () => {
+    const user = userEvent.setup();
+    const work = { v: 1, started_at: '2026-09-30T09:00:00Z', ended_at: '2026-09-30T09:00:05Z', truncated: false, items: [
+      { type: 'tool', id: 't1', name: 'bash', args: { command: 'make' }, status: 'done', output: 'built', started_at: null, ended_at: null },
+    ] };
+    const reply = { ...message(2, 'assistant', 'Built.'), metadata: { status: 'completed' as const, work } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([reply]) });
+    renderConversation('channel-3');
+    await user.click(await screen.findByRole('button', { name: 'Worked for 5s' }));
+    expect(screen.getByText('make')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'View in computer' })).not.toBeInTheDocument();
   });
 
   it('stops the current run through the cancel API', async () => {
@@ -501,6 +514,9 @@ describe('Conversation', () => {
     const panel = await screen.findByRole('complementary', { name: 'Computer' });
     expect(await within(panel).findByRole('img', { name: 'Browser screen: Example login' })).toHaveAttribute('src', expect.stringContaining('/api/browser/screenshot?tab_id=tab-1'));
     expect(within(panel).getByText('Idle')).toBeVisible();
+    // The workspace files sit behind a collapsed disclosure and are listed once it opens.
+    expect(calls('GET', '/api/workspace/files?path=')).toEqual([]);
+    await user.click(within(panel).getByRole('button', { name: 'Workspace files' }));
     expect(await within(panel).findByRole('link', { name: 'Download report.pdf' })).toHaveAttribute('href', '/api/workspace/download?path=report.pdf');
 
     await user.click(within(panel).getByRole('button', { name: 'Take control' }));

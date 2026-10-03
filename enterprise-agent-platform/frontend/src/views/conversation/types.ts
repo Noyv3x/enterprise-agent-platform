@@ -67,6 +67,21 @@ export interface LiveRun {
   notice: "retry" | "compaction" | null;
 }
 
+/** A finished run's streamed calls, keyed by the assistant message the run became (run_end's message). */
+export interface LastRun {
+  messageId: number;
+  calls: ToolCall[];
+}
+
+/** A run the computer panel can show: the live run, or a finished one by its assistant message id. */
+export type RunRef = "live" | number;
+
+/** One step of a run, as selected in the computer panel or from the conversation. */
+export interface StepRef {
+  run: RunRef;
+  callId: string;
+}
+
 export interface ChatConversation {
   id: string;
   user_id: number;

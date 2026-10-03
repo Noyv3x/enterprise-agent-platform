@@ -1,6 +1,7 @@
 /* Beautiful UI controls — common controls upstream does not ship (inputs, selects, dialogs, side sheets, notices,
- * empty states, window headers), composed only from upstream tokens, atoms and primitives (GlideMenu, FineTuneCard
- * field look, SearchList empty state, UseThisHarness modal, harness window header). No Ant Design. */
+ * empty states, window headers, a step scrubber), composed only from upstream tokens, atoms and primitives
+ * (GlideMenu, FineTuneCard field look and scrub, Switch track, SearchList empty state, UseThisHarness modal, harness
+ * window header). No Ant Design. */
 import "./controls.css";
 
 export { DescriptionList, Field, FormActions, FormGrid, FormSection, useFieldControl } from "./Field";
@@ -14,3 +15,4 @@ export { EmptyState } from "./EmptyState";
 export { PageHeader, type PageTab } from "./PageHeader";
 export { NavigationButton, ShellContext, WindowAside, useShell, type ShellContextValue } from "./shell";
 export { Icon, type IconName } from "./Icon";
+export { StepScrubber } from "./StepScrubber";
