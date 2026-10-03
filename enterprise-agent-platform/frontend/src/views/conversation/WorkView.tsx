@@ -216,7 +216,7 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
     else if (item.type === "text") blocks.push(
       <div key={index} className="bui-prose px-1.5 py-0.5 text-[12.5px] leading-relaxed text-ink"><Markdown content={item.text} /></div>,
     );
-    else blocks.push(<TraceStep key={index} primary={item.label || item.detail} secondary={item.label ? item.detail : undefined} />);
+    else if (item.type === "step") blocks.push(<TraceStep key={index} primary={item.label || item.detail} secondary={item.label ? item.detail : undefined} />);
   });
   flush();
   if (trace.truncated) {

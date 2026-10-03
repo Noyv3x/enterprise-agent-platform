@@ -12,7 +12,7 @@ import { createTools } from './tools.js';
 import { createExecutorTransport, createGatewayTransport } from './transport.js';
 import { bindModelSession, resolveModel } from './models.js';
 import { RunEvents } from './events.js';
-import type { AssistantMessageEvent } from '@earendil-works/pi-ai';
+import type { AssistantMessageEvent, UserMessage } from '@earendil-works/pi-ai';
 import { LiveBuffer } from './live-events.js';
 
 export interface RunRequest {
@@ -24,13 +24,19 @@ export interface RunRequest {
   resources: {system_prompt:string; agents_md?:{path:string;content:string}|null; skills:{name:string;description:string;path:string}[]};
   tools:string[];
 }
+export interface SteerRequest {
+  input_id:string;
+  prompt:Required<RunRequest['prompt']>;
+  context_prefix:string;
+}
 export interface RuntimeConfig {
   home:string; platformUrl:string; platformToken:string; executorSocket:string; executorToken:string; skillsDirectory:string;
   // Injecting a model runtime permits exercising the real Pi session with a faux provider.
   modelRuntimeFactory?: (modelId:string) => Promise<ModelRuntime>;
 }
 type Event = {type:string;[key:string]:unknown};
-type Run = {id:string; sid:string; events:RunEvents; done:boolean; cancelled:boolean; sideEffects:boolean; controller:AbortController; stopping?:Promise<void>; stopConfirmed:Promise<void>; confirmStop:()=>void; finished:Promise<void>; finish:()=>void; endedAt:number; usage:{input:number;output:number;cache_read:number;cache_write:number;total:number}; text:string; error?:string};
+type PendingInput = {message:UserMessage;text:string};
+type Run = {id:string; sid:string; events:RunEvents; done:boolean; cancelled:boolean; acceptingInput:boolean; initialInputPending:boolean; acceptedInputs:Set<string>; pendingInputs:Map<string,PendingInput>; sideEffects:boolean; controller:AbortController; stopping?:Promise<void>; stopConfirmed:Promise<void>; confirmStop:()=>void; finished:Promise<void>; finish:()=>void; endedAt:number; usage:{input:number;output:number;cache_read:number;cache_write:number;total:number}; text:string; error?:string};
 // `key` identifies the Platform-supplied inputs the Pi session object was built from.
 type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; key:string; runId:string; lastUsed:number};
 type Cancellation = {cancelled:boolean;run_id:string|null};
@@ -39,6 +45,7 @@ const runStreams=new WeakMap<Run,RunStreams>();
 const INPUT_INTERVAL_MS=100;
 const OUTPUT_INTERVAL_MS=125;
 const OUTPUT_LIMIT_BYTES=512*1024;
+const MAX_PENDING_INPUTS=32;
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
 const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true};
 
@@ -104,6 +111,7 @@ export class Runtime {
     bindModelSession(models,sid,guard);
     const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
+    session.agent.steeringMode='all';
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now()});
     this.sessions.set(sid,live);return live;
   }
@@ -121,10 +129,21 @@ export class Runtime {
     live.request.model=structuredClone(request.model);
     const finished=Promise.withResolvers<void>();
     const stopped=Promise.withResolvers<void>();
-    const run:Run={id:randomUUID(),sid,events:new RunEvents(),done:false,cancelled:false,controller,stopConfirmed:stopped.promise,confirmStop:stopped.resolve,sideEffects:false,finished:finished.promise,finish:finished.resolve,endedAt:0,usage:{input:0,output:0,cache_read:0,cache_write:0,total:0},text:''};
+    const run:Run={id:randomUUID(),sid,events:new RunEvents(),done:false,cancelled:false,acceptingInput:true,initialInputPending:true,acceptedInputs:new Set(),pendingInputs:new Map(),controller,stopConfirmed:stopped.promise,confirmStop:stopped.resolve,sideEffects:false,finished:finished.promise,finish:finished.resolve,endedAt:0,usage:{input:0,output:0,cache_read:0,cache_write:0,total:0},text:''};
     live.runId=run.id;this.runs.set(run.id,run);
     void this.execute(live,run,request);
     return {run_id:run.id};
+  }
+  steer(id:string,input:SteerRequest):void {
+    const run=this.runs.get(id);if(!run)throw failure(404,'Run not found');
+    if(run.acceptedInputs.has(input.input_id))return;
+    if(run.done||run.cancelled||!run.acceptingInput)throw failure(409,'Run is not accepting input');
+    if(run.pendingInputs.size>=MAX_PENDING_INPUTS)throw failure(409,'Run has too many pending inputs');
+    const text=[input.context_prefix,input.prompt.text].filter(Boolean).join('\n');
+    const message:UserMessage={role:'user',content:[{type:'text',text},...input.prompt.images.map(image=>({type:'image' as const,mimeType:image.mime,data:image.data}))],timestamp:Date.now()};
+    run.acceptedInputs.add(input.input_id);
+    run.pendingInputs.set(input.input_id,{message,text});
+    this.sessions.get(run.sid)!.session.agent.steer(message);
   }
   private emit(run:Run,event:Event) {
     if(!run.done)run.events.emit(event);
@@ -174,8 +193,23 @@ export class Runtime {
     }
     output.push(text);
   }
+  private onInput(run:Run,message:UserMessage) {
+    let inputId:string|undefined;
+    for(const [id,input] of run.pendingInputs)if(input.message===message){inputId=id;break;}
+    // The run's own prompt can have the same text as a queued input.
+    if(inputId===undefined&&run.initialInputPending){run.initialInputPending=false;return;}
+    if(inputId===undefined){
+      const text=typeof message.content==='string'?message.content:message.content.filter(c=>c.type==='text').map(c=>c.text).join('');
+      for(const [id,input] of run.pendingInputs)if(input.text===text){inputId=id;break;}
+    }
+    if(inputId!==undefined){
+      run.pendingInputs.delete(inputId);
+      this.emit(run,{type:'input_delivered',input_id:inputId});
+    }
+  }
   private onEvent(run:Run,event:AgentSessionEvent) {
-    if(event.type==='message_update'){
+    if(event.type==='message_start'&&event.message.role==='user')this.onInput(run,event.message);
+    else if(event.type==='message_update'){
       const delta=event.assistantMessageEvent;
       if(delta.type==='text_delta'||delta.type==='thinking_delta')this.emit(run,{type:delta.type,delta:delta.delta});
       else if(delta.type==='toolcall_start'||delta.type==='toolcall_delta'||delta.type==='toolcall_end')this.onToolInput(run,delta);
@@ -215,12 +249,16 @@ export class Runtime {
       live.session.setThinkingLevel(request.model.thinking);
       if(run.cancelled)return;
       await live.session.prompt([request.context_prefix,request.prompt.text].filter(Boolean).join('\n'),{expandPromptTemplates:false,images:request.prompt.images?.map(i=>({type:'image' as const,mimeType:i.mime,data:i.data}))??[]});
+      run.acceptingInput=false;
+      live.session.clearQueue();
       await live.session.waitForIdle();
     }catch(error){run.error=error instanceof Error?error.message:String(error);}
     finally {
+      if(run.acceptingInput){run.acceptingInput=false;live.session.clearQueue();}
       if(run.cancelled)await run.stopConfirmed;
       unsubscribe();live.lastUsed=Date.now();this.closeStreams(run);
-      this.emit(run,{type:'run_end',status:run.cancelled?'cancelled':run.error?'failed':'completed',text:run.text,usage:run.usage,model:request.model.id,...(run.error?{error:run.error}:{}),side_effects:run.sideEffects});
+      this.emit(run,{type:'run_end',status:run.cancelled?'cancelled':run.error?'failed':'completed',text:run.text,usage:run.usage,model:request.model.id,...(run.error?{error:run.error}:{}),side_effects:run.sideEffects,undelivered_inputs:[...run.pendingInputs.keys()]});
+      run.pendingInputs.clear();
       run.done=true;run.endedAt=Date.now();this.busy.delete(run.sid);
       run.events.close();
       run.finish();

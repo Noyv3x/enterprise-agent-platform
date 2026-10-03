@@ -15,7 +15,14 @@ export interface Message {
   id: number;
   role: "user" | "assistant" | "system";
   content: string;
-  metadata: { status?: MessageStatus; error?: string; [key: string]: unknown };
+  metadata: {
+    status?: MessageStatus;
+    error?: string;
+    inserted_into?: number;
+    delivery?: "pending" | "delivered";
+    reply_to?: { message_id: number };
+    [key: string]: unknown;
+  };
   created_at: string;
   attachments: Attachment[];
 }

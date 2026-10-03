@@ -9,6 +9,7 @@ import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
 import { ComputerContext } from "./conversation/computerView";
 import { AssistantMessage, LiveReply, PendingReply, SystemLine, UserBubble } from "./conversation/Messages";
 import type { Compaction, Message, RunRef } from "./conversation/types";
+import { conversationTurns } from "./conversation/turns";
 import { errorText, useConversation } from "./conversation/useConversation";
 
 /** Reader within this distance of the bottom keeps following new output (harness value). */
@@ -152,6 +153,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const runningSeen = useRef(new Map<number, number>());
 
   const { messages, live, phase } = conversation;
+  const turns = useMemo(() => conversationTurns(messages, live), [messages, live]);
   const personal = scope === "private";
   const computer = useMemo(() => (personal ? {
     show: (run: RunRef, callId: string) => {
@@ -266,11 +268,40 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     return send(request.content, []).catch((reason: unknown) => setNotice({ tone: "danger", text: errorText(reason) }));
   };
 
-  // FIFO positions: the running request first, then queued ones in order.
-  const queuedMessages = messages.filter((message) => message.role === "user" && message.metadata.status === "queued");
-  const running = messages.find((message) => message.role === "user" && message.metadata.status === "running");
+  const { running, inserted, queued: queuedMessages } = turns;
   if (running && !runningSeen.current.has(running.id)) runningSeen.current.set(running.id, Date.now());
   const positions = new Map(queuedMessages.map((message, index) => [message.id, index + 1 + (running ? 1 : 0)]));
+  const renderUser = (message: Message, pending = false) => {
+    const mine = !channel || userId === undefined || message.metadata.author_user_id === userId;
+    const retryable = message.metadata.status === "interrupted" || message.metadata.status === "cancelled";
+    return (
+      <div>
+        <UserBubble message={message} showAuthor={channel} mine={mine} queuePosition={positions.get(message.id)} pending={pending} />
+        {canSend && retryable && (
+          <div className="mt-2 flex justify-end">
+            <Button variant="quiet" size="xs" onClick={() => void resend(message)}>{w("Send again", "重新发送", "重新傳送")}</Button>
+          </div>
+        )}
+      </div>
+    );
+  };
+  const renderInput = (id: number, pending = false) => {
+    const message = turns.byId.get(id);
+    return message?.role === "user" ? (
+      <>
+        {renderUser(message, pending)}
+        {compactionAt === id && compactionRow}
+      </>
+    ) : null;
+  };
+  const renderMessage = (message: Message) => (
+    <Fragment key={message.id}>
+      {message.role === "user" ? renderUser(message)
+        : message.role === "system" ? <SystemLine message={message} />
+          : <AssistantMessage message={message} renderInput={renderInput} />}
+      {compactionAt === message.id && compactionRow}
+    </Fragment>
+  );
 
   const commands: ComposerCommand[] = canSend ? [
     {
@@ -348,6 +379,8 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       working={conversation.busy}
       onStop={conversation.cancel}
       queued={queuedMessages.length}
+      inserting={Boolean(running || live) && !queuedMessages.length && !conversation.compactBusy}
+      pendingInputs={inserted.filter((message) => message.metadata.delivery === "pending").length}
       commands={commands}
       seed={seed}
       placeholder={empty && personal
@@ -424,33 +457,18 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
               </div>
             )}
             {compactionAt === "start" && compactionRow}
-            {messages.map((message) => {
-              let entry: ReactNode;
-              if (message.role === "user") {
-                const mine = !channel || userId === undefined || message.metadata.author_user_id === userId;
-                const retryable = message.metadata.status === "interrupted" || message.metadata.status === "cancelled";
-                entry = (
-                  <div>
-                    <UserBubble message={message} showAuthor={channel} mine={mine} queuePosition={positions.get(message.id)} />
-                    {canSend && retryable && (
-                      <div className="mt-2 flex justify-end">
-                        <Button variant="quiet" size="xs" onClick={() => void resend(message)}>{w("Send again", "重新发送", "重新傳送")}</Button>
-                      </div>
-                    )}
-                  </div>
-                );
-              } else if (message.role === "system") entry = <SystemLine message={message} />;
-              else entry = <AssistantMessage message={message} />;
-              return (
-                <Fragment key={message.id}>
-                  {entry}
-                  {compactionAt === message.id && compactionRow}
-                </Fragment>
-              );
-            })}
-            {live ? <LiveReply run={live} />
-              : running ? <PendingReply since={lastRunning ?? Date.now()} queued={false} />
-                : firstQueued ? <PendingReply since={Date.parse(firstQueued.created_at) || Date.now()} queued /> : null}
+            {turns.history.map(renderMessage)}
+            {running && renderMessage(running)}
+            {(live || running) ? (
+              <LiveReply
+                run={live ?? { items: [], calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
+                starting={!live}
+                inserted={inserted}
+                renderInput={renderInput}
+              />
+            ) : null}
+            {queuedMessages.map(renderMessage)}
+            {!live && !running && firstQueued && <PendingReply since={Date.parse(firstQueued.created_at) || Date.now()} queued />}
             {compactionAt === "end" && compactionRow}
           </div>
         </div>
@@ -482,6 +500,9 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {header}
+      <div role="status" aria-label={w("Message delivery", "消息送达", "訊息送達")} aria-live="polite" aria-atomic="true" className="sr-only">
+        {conversation.deliveredInput && <span key={conversation.deliveredInput.seq}>{w("Message delivered — the agent can now use it", "消息已送达，智能体已收到补充内容", "訊息已送達，智慧體已收到補充內容")}</span>}
+      </div>
       {body}
       {personal && computerOpen && (narrow ? (
         <Sheet open onClose={closeComputer} title={computerLabel} width={420}>

@@ -105,6 +105,30 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 await browser.gateway(tool, 'list', {}, context)
             self.assertEqual(raised.exception.status_code, 403)
 
+    async def test_absorbed_channel_author_never_becomes_tool_principal(self):
+        with self.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',?)", (int(time.time()),))
+        _, context = await self.running_scope('channel-3')
+        author = self.queue.user(2)
+        child = await self.queue.enqueue(author, 'channel-3', 'A different author inserts input')
+        with self.db.connect() as conn:
+            job = conn.execute('SELECT status,payload_json FROM durable_jobs WHERE id=?', (child['job_id'],)).fetchone()
+        self.assertEqual(job['status'], 'running')
+        parent_id = json.loads(job['payload_json'])['parent_job_id']
+        browser = Browser(self.p)
+        with patch('enterprise_agent_platform.tools.fetch', new_callable=AsyncMock, return_value={'text': 'page'}) as fetch_page:
+            result = await browser.gateway('web', 'fetch', {'url': 'https://public.example/'},
+                                           {**context, 'owner_user_id': self.user['id']})
+            self.assertEqual(result['data'], {'text': 'page'})
+            with self.db.connect() as conn:
+                conn.execute("UPDATE durable_jobs SET status='failed' WHERE id=?", (parent_id,))
+            with self.assertRaises(HTTPException) as rejected:
+                await browser.gateway('web', 'fetch', {'url': 'https://public.example/'},
+                                      {**context, 'owner_user_id': author['id']})
+            self.assertEqual(rejected.exception.status_code, 403)
+            self.assertEqual(rejected.exception.detail, 'Tool session has no active owning job')
+            fetch_page.assert_awaited_once()
+
     async def test_schedule_tick_enqueues_once_and_preserves_epoch_schema(self):
         created = await dispatch(self.p, 'create', {'name': 'Reminder', 'prompt': 'Say hello', 'schedule': {'type': 'once', 'at': '2020-01-01T00:00:00Z'}}, self.user)
         await tick(self.p)

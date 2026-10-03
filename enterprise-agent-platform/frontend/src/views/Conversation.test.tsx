@@ -119,6 +119,217 @@ describe('Conversation', () => {
     expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'My unsent draft', attachment_ids: [17] }]);
   });
 
+  it('keeps a pending insert at the live reply end, delivers it between work segments, and persists the same layout', async () => {
+    const user = userEvent.setup();
+    const request = message(1, 'user', 'Review the report', 'running');
+    const inserted: Message = { ...message(2, 'user', 'Focus on revenue', 'running'), metadata: {
+      status: 'running', inserted_into: 1, delivery: 'pending', author_user_id: 2, author_display_name: 'Alex',
+    } };
+    let history = [request];
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page(history),
+      'POST /api/conversations/channel-3/messages': () => ({ message: inserted, job_id: 12 }),
+    });
+    renderConversation('channel-3', { userId: 1 });
+    const input = await screen.findByLabelText('Message');
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'text_delta', delta: 'I will check the report.' });
+    stream.emit(2, { type: 'tool_start', tool_call_id: 'read-report', name: 'read', args: { path: '/workspace/report.txt' } });
+    await user.type(input, 'Focus on revenue{Enter}');
+    let reply = screen.getByRole('article', { name: 'Reply in progress' });
+    expect(within(reply).getByText('Focus on revenue')).toBeVisible();
+    expect(within(reply).getByText('Alex')).toBeVisible();
+    expect(within(reply).getByText('The agent will see this after its current step')).toBeVisible();
+    expect(within(reply).getByText('/workspace/report.txt').compareDocumentPosition(within(reply).getByText('Focus on revenue')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('1 message waiting for the current step to finish')).toBeVisible();
+    expect(screen.queryByText(/queued —/)).not.toBeInTheDocument();
+
+    stream.emit(3, { type: 'tool_end', tool_call_id: 'read-report', is_error: false, content_preview: 'Q3 revenue' });
+    stream.emit(4, { type: 'input_delivered', message_id: 2 });
+    stream.emit(5, { type: 'thinking_delta', delta: 'Compare the revenue figures.' });
+    stream.emit(6, { type: 'tool_start', tool_call_id: 'read-revenue', name: 'read', args: { path: '/workspace/revenue.txt' } });
+    reply = screen.getByRole('article', { name: 'Reply in progress' });
+    expect(screen.queryByText('The agent will see this after its current step')).not.toBeInTheDocument();
+    expect(screen.getByRole('status', { name: 'Message delivery' })).toHaveTextContent('Message delivered — the agent can now use it');
+    expect(screen.getByRole('status', { name: 'Message delivery' })).toHaveAttribute('aria-live', 'polite');
+    expect(within(reply).getByText('Focus on revenue').compareDocumentPosition(within(reply).getByText('/workspace/revenue.txt')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(reply).getByText('/workspace/revenue.txt')).toBeVisible();
+    expect(screen.getAllByText('Focus on revenue')).toHaveLength(1);
+    // Replaying delivery cannot insert another bubble or another segment.
+    stream.emit(4, { type: 'input_delivered', message_id: 2 });
+    stream.emit(7, { type: 'tool_end', tool_call_id: 'read-revenue', is_error: false, content_preview: 'Revenue rose 20%' });
+    stream.emit(8, { type: 'text_delta', delta: 'Revenue rose 20%.' });
+    const segmentHeaders = within(reply).getAllByRole('button', { name: /^(Worked|Thought) for/ });
+    expect(segmentHeaders).toHaveLength(2);
+    for (const header of segmentHeaders) expect(header).toHaveAttribute('aria-expanded', 'false');
+
+    const finished: Message = { ...message(3, 'assistant', 'Revenue rose 20%.'), metadata: {
+      status: 'completed', reply_to: { message_id: 1 }, work: {
+        v: 1, started_at: '2026-10-03T09:00:00Z', ended_at: '2026-10-03T09:00:10Z', truncated: false, items: [
+          { type: 'text', text: 'I will check the report.' },
+          { type: 'tool', id: 'read-report', name: 'read', args: { path: '/workspace/report.txt' }, status: 'done', output: 'Q3 revenue' },
+          { type: 'input', message_id: 2, at: '2026-10-03T09:00:05Z' },
+          { type: 'thinking', text: 'Compare the revenue figures.' },
+          { type: 'tool', id: 'read-revenue', name: 'read', args: { path: '/workspace/revenue.txt' }, status: 'done', output: 'Revenue rose 20%' },
+        ],
+      },
+    } };
+    history = [{ ...request, metadata: { status: 'completed' } }, { ...inserted, metadata: { ...inserted.metadata, status: 'completed', delivery: 'delivered' } }, finished];
+    stream.emit(9, { type: 'run_end', message: finished });
+    reply = screen.getByRole('article', { name: 'Agent reply' });
+    expect(within(reply).getByText('Focus on revenue')).toBeVisible();
+    expect(screen.getAllByText('Focus on revenue')).toHaveLength(1);
+    expect(within(reply).getAllByRole('button', { name: /^(Worked|Thought) for/ })).toHaveLength(2);
+    for (const header of within(reply).getAllByRole('button', { name: /^(Worked|Thought) for/ })) await user.click(header);
+    const ordered = ['I will check the report.', '/workspace/report.txt', 'Focus on revenue', 'Compare the revenue figures.', '/workspace/revenue.txt', 'Revenue rose 20%.'];
+    for (let index = 1; index < ordered.length; index++) {
+      expect(within(reply).getByText(ordered[index - 1]).compareDocumentPosition(within(reply).getByText(ordered[index])) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument());
+  });
+
+  it('orders historical interleaved requests by their linked reply while preserving unpaired id positions', async () => {
+    const a1 = { ...message(5, 'assistant', 'A1'), metadata: { reply_to: { message_id: 1 } } };
+    const a2 = { ...message(7, 'assistant', 'A2'), metadata: { reply_to: { message_id: 2 } } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([
+      message(1, 'user', 'Q1'), message(2, 'user', 'Q2'), message(3, 'system', 'Context note'),
+      message(4, 'user', 'Unpaired request'), a1, message(6, 'system', 'Later note'), a2,
+    ]) });
+    renderConversation('channel-3');
+    await screen.findByText('A2');
+    const ordered = ['Context note', 'Unpaired request', 'Q1', 'A1', 'Later note', 'Q2', 'A2'];
+    for (let index = 1; index < ordered.length; index++) {
+      expect(screen.getByText(ordered[index - 1]).compareDocumentPosition(screen.getByText(ordered[index])) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it('renders truly queued messages after the live reply and counts only that queue', async () => {
+    const inserted: Message = { ...message(2, 'user', 'Inline addition', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([
+      message(1, 'user', 'Active request', 'running'), inserted, message(3, 'user', 'Next turn', 'queued'),
+    ]) });
+    renderConversation('channel-3');
+    await screen.findByText('Next turn');
+    FakeEventSource.instances[0].emit(1, { type: 'thinking_delta', delta: 'Working on the active request' });
+    const live = screen.getByRole('article', { name: 'Reply in progress' });
+    expect(within(live).getByText('Inline addition')).toBeVisible();
+    expect(live.compareDocumentPosition(screen.getByText('Next turn')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('Queued · 1 ahead')).toBeVisible();
+    expect(screen.getByText('1 queued — messages run in order after the current reply')).toBeVisible();
+  });
+
+  it.each([
+    ['en', 'Message', 'Add a message to this run…', 'Send to guide the agent after its current step'],
+    ['zh-CN', '消息', '补充消息，加入当前任务…', '发送补充消息，智能体会在当前步骤后接收'],
+    ['zh-TW', '訊息', '補充訊息，加入目前任務…', '傳送補充訊息，智慧體會在目前步驟後接收'],
+  ])('explains insertion in the working composer in %s', async (locale, label, placeholder, hint) => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Working', 'running')]) });
+    renderConversation('channel-3');
+    expect(await screen.findByLabelText(label)).toHaveAttribute('placeholder', placeholder);
+    expect(screen.getByText(hint)).toBeVisible();
+  });
+
+  it('keeps resend on a cancelled inserted message inside its persisted reply', async () => {
+    const user = userEvent.setup();
+    const inserted: Message = { ...message(2, 'user', 'Use the revised figures', 'cancelled'), metadata: { status: 'cancelled', inserted_into: 1, delivery: 'delivered' } };
+    const answer: Message = { ...message(3, 'assistant', 'Partial result', 'cancelled'), metadata: {
+      status: 'cancelled', reply_to: { message_id: 1 },
+      work: { v: 1, items: [{ type: 'input', message_id: 2, at: '2026-10-03T09:00:05Z' }] },
+    } };
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Review', 'cancelled'), inserted, answer]),
+      'POST /api/conversations/channel-3/messages': (body) => ({ message: message(4, 'user', String(body.content), 'queued'), job_id: 14 }),
+    });
+    renderConversation('channel-3');
+    const reply = await screen.findByRole('article', { name: 'Agent reply' });
+    expect(within(reply).getByText('Use the revised figures')).toBeVisible();
+    await user.click(within(reply).getByRole('button', { name: 'Send again' }));
+    expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([{ content: 'Use the revised figures', attachment_ids: [] }]);
+  });
+
+  it('keeps a segment break when its inserted message is not loaded', async () => {
+    const user = userEvent.setup();
+    const reply: Message = { ...message(5, 'assistant', 'Finished'), metadata: {
+      reply_to: { message_id: 1 }, work: { v: 1, started_at: '2026-10-03T09:00:00Z', ended_at: '2026-10-03T09:00:10Z', items: [
+        { type: 'text', text: 'Before input' }, { type: 'input', message_id: 2, at: '2026-10-03T09:00:05Z' }, { type: 'thinking', text: 'After input' },
+      ] },
+    } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([reply], { next_before_id: 5 }) });
+    renderConversation('channel-3');
+    const article = await screen.findByRole('article', { name: 'Agent reply' });
+    const segments = within(article).getAllByRole('button', { name: /^(Worked|Thought) for/ });
+    expect(segments).toHaveLength(2);
+    for (const segment of segments) await user.click(segment);
+    expect(within(article).getByText('Before input')).toBeVisible();
+    expect(within(article).getByText('After input')).toBeVisible();
+    expect(within(article).queryByText(/will see this|waiting for/)).not.toBeInTheDocument();
+  });
+
+  it('renders an absorbed input inside the starting reply before Runtime emits its first event', async () => {
+    const inserted: Message = { ...message(2, 'user', 'One more detail', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Start here', 'running'), inserted]) });
+    renderConversation('channel-3');
+    const live = await screen.findByRole('article', { name: 'Reply in progress' });
+    expect(within(live).getByText('Starting')).toBeVisible();
+    expect(within(live).getByText('One more detail')).toBeVisible();
+    expect(screen.getByText('Start here').compareDocumentPosition(live) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByText('One more detail')).toHaveLength(1);
+  });
+
+  it('does not regress delivered input when its POST acknowledgement arrives after SSE', async () => {
+    const user = userEvent.setup();
+    let acknowledge!: (value: unknown) => void;
+    const inserted: Message = { ...message(2, 'user', 'Keep it brief', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Explain', 'running')]),
+      'POST /api/conversations/channel-3/messages': () => new Promise((resolve) => { acknowledge = resolve; }),
+    });
+    renderConversation('channel-3');
+    await user.type(await screen.findByLabelText('Message'), 'Keep it brief{Enter}');
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'message', message: inserted });
+    stream.emit(2, { type: 'input_delivered', message_id: 2 });
+    stream.emit(3, { type: 'thinking_delta', delta: 'Summarize only the key point.' });
+    await act(async () => acknowledge({ message: inserted, job_id: 12 }));
+    expect(screen.queryByText('The agent will see this after its current step')).not.toBeInTheDocument();
+    expect(screen.queryByText('1 message waiting for the current step to finish')).not.toBeInTheDocument();
+    expect(screen.getAllByText('Keep it brief')).toHaveLength(1);
+  });
+
+  it('keeps earlier assistant text before consecutive delivered inputs instead of merging it into the final answer', async () => {
+    const first: Message = { ...message(2, 'user', 'First addition', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    const second: Message = { ...message(3, 'user', 'Second addition', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Question', 'running'), first, second]) });
+    renderConversation('channel-3');
+    await screen.findByText('Question');
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'text_delta', delta: 'Initial answer.' });
+    stream.emit(2, { type: 'input_delivered', message_id: 2 });
+    stream.emit(3, { type: 'input_delivered', message_id: 3 });
+    stream.emit(4, { type: 'text_delta', delta: 'Revised answer.' });
+    const live = screen.getByRole('article', { name: 'Reply in progress' });
+    expect(within(live).getByText('Initial answer.')).not.toBeVisible();
+    expect(within(live).getByText('Revised answer.')).toBeVisible();
+    const ordered = ['Initial answer.', 'First addition', 'Second addition', 'Revised answer.'];
+    for (let index = 1; index < ordered.length; index++) {
+      expect(within(live).getByText(ordered[index - 1]).compareDocumentPosition(within(live).getByText(ordered[index])) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it('returns an undelivered insert to the standalone queue without duplicating it', async () => {
+    const inserted: Message = { ...message(2, 'user', 'Use this later', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Running', 'running'), inserted]) });
+    renderConversation('channel-3');
+    await screen.findByText('Use this later');
+    FakeEventSource.instances[0].emit(1, { type: 'message', message: message(2, 'user', 'Use this later', 'queued') });
+    const live = screen.getByRole('article', { name: 'Reply in progress' });
+    expect(within(live).queryByText('Use this later')).not.toBeInTheDocument();
+    expect(live.compareDocumentPosition(screen.getByText('Use this later')) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByText('Use this later')).toHaveLength(1);
+    expect(screen.getByText('Queued · 1 ahead')).toBeVisible();
+  });
+
   it('resends the selected request when cancellation replies settle in reverse order', async () => {
     const user = userEvent.setup();
     serve({
@@ -245,7 +456,9 @@ describe('Conversation', () => {
     // The work settles while the answer streams.
     expect(within(live).getByRole('button', { name: /^Thought for/ })).toHaveAttribute('aria-expanded', 'false');
 
-    history.splice(0, history.length, message(1, 'assistant', 'Earlier **answer**'), message(2, 'user', 'List the files'), message(3, 'assistant', 'Found two files: notes.md and report.pdf.'));
+    history.splice(0, history.length, message(1, 'assistant', 'Earlier **answer**'), message(2, 'user', 'List the files'), {
+      ...message(3, 'assistant', 'Found two files: notes.md and report.pdf.'), metadata: { status: 'completed', reply_to: { message_id: 2 } },
+    });
     stream.emit(49, { type: 'run_end', status: 'completed', text: 'Found two files: notes.md and report.pdf.', usage: {}, message: history[2] });
 
     expect(screen.queryByRole('article', { name: 'Reply in progress' })).not.toBeInTheDocument();

@@ -7,7 +7,7 @@ The plain Pi runtime listens on port 8766. `GET /health` returns
 ## Runs
 
 `POST /v1/sessions/{sid}/runs` returns `202 {"run_id":"..."}` or 409 when
-that session is busy. Platform owns FIFO admission and stable session IDs:
+that session is busy. Platform owns admission and stable session IDs:
 `agent-private-<uid>`, `agent-channel-<cid>`, and `chat-<conversation-id>`.
 
 ```json
@@ -36,6 +36,39 @@ enabled prompt caching. Credentials come from Platform's
 Credential and tool-gateway requests have finite deadlines combined with
 SDK cancellation.
 
+`POST /v1/runs/{run_id}/steer` inserts input into the active run:
+
+```json
+{"input_id":"42","prompt":{"text":"Use the other file instead","images":[]},"context_prefix":"<context time=... user=... tz=...>"}
+```
+
+All fields shown are required. `input_id` is a string of 1–64 characters.
+`prompt.text` and `context_prefix` are strings; `prompt.images` is an array
+of the same `{mime,data}` entries as a run prompt (empty when there are no
+images). Success returns HTTP 200 `{"ok":true}`. Repeating an accepted
+`input_id` for that run returns success without queuing it twice.
+Invalid bodies return 400, unknown runs 404, and new inputs return 409 with
+`{"error":"..."}` if the run is done, cancelled, no longer accepting input,
+or already has 32 pending inputs.
+
+A run accepts input from creation until its Pi session prompt returns. All
+pending inputs are delivered together at the next Pi turn boundary, in
+acceptance order; inputs queued before the agent loop starts are included
+in its first model request. An input arriving during a final answer can
+continue the same run with another model response. The model text is exactly
+`[context_prefix, prompt.text].filter(Boolean).join('\n')`; images are mapped
+as in run prompts. Steering is literal user input: `/skill:` commands and
+prompt templates are not expanded.
+
+`input_delivered` is emitted when Pi adds the corresponding user message to
+the model context. Delivered inputs persist as ordinary user messages in the
+Pi transcript. Once the session prompt returns, Runtime closes admission
+and clears Pi's input queues. Every terminal `run_end`, including cancellation
+and failure, reports accepted but undelivered IDs in `undelivered_inputs`,
+in acceptance order (an empty array when all were delivered). These cleared
+inputs never enter a later run. An uncertain delivery must not be blindly
+replayed.
+
 `GET /v1/runs/{run_id}/events?after=<seq>` streams SSE JSON objects with
 monotonic `seq` and `type`. Omit `after` to replay from the beginning.
 Completed buffers remain available for ten minutes, with a 4 MiB per-run
@@ -60,7 +93,8 @@ complete browser image content.
 | tool_end | tool_call_id, name, is_error, content_preview, details |
 | retry | attempt, max, delay_ms, error |
 | compaction | phase (start/end), reason |
-| run_end | status (completed/failed/cancelled), text, usage, model, error?, side_effects |
+| input_delivered | input_id |
+| run_end | status (completed/failed/cancelled), text, usage, model, error?, side_effects, undelivered_inputs |
 
 `usage` contains `input`, `output`, `cache_read`, `cache_write`, `total`.
 `run_end` is always the last event. No draft events are emitted.

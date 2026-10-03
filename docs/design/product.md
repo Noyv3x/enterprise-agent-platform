@@ -14,7 +14,7 @@ Standard chat supports create, rename and delete. Automatic titles are optional.
 
 Chat conversations share one network-disabled sandbox per user. File tools restrict the active conversation directory; bash starts there but may access that user's other chat files. The security boundary is per user, not per conversation.
 
-Messages sent during a run queue FIFO; they are not joined into the active input. Failed or lost runs are visibly interrupted, not automatically resubmitted. Users can resend deliberately.
+Messages sent during an interactive run are inserted into that run at the AI's next step boundary, unless earlier queued work or cancellation requires a separate turn. Schedule occurrences and compaction remain FIFO. Failed or lost runs are visibly interrupted, not automatically resubmitted; users can resend deliberately. See the [insertion and settlement rules](../reference/platform-api.md#mid-run-insertion).
 
 ## Kept features
 
@@ -31,7 +31,7 @@ Long-term memory is workspace `AGENTS.md`, editable by the agent using ordinary 
 
 ## Removed features
 
-No Telegram, mail, approvals, host execution, todo system, delegation/subagents, background processes, live file drafts, input joining, learning reviews, dedicated memory/skill management, execution-review or `needs_review` machinery. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
+No Telegram, mail, approvals, host execution, todo system, delegation/subagents, background processes, live file drafts, learning reviews, dedicated memory/skill management, execution-review or `needs_review` machinery. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
 
 Tables of removed features are dropped by migration. Historical messages remain readable, including old `agent_work` activity rendered read-only; this does not imply continued support for their old actions.
 

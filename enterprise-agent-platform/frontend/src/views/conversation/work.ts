@@ -4,6 +4,7 @@ import type { Message } from "./types";
 export type WorkItem =
   | { type: "thinking"; text: string }
   | { type: "text"; text: string }
+  | { type: "input"; messageId: number; at: number | null }
   /** a plain status line from old `agent_work` records */
   | { type: "step"; label: string; detail: string }
   | {
@@ -85,6 +86,9 @@ function fromWork(work: Record<string, unknown>): WorkTrace | null {
     const item = record(raw);
     if (!item) continue;
     if (item.type === "thinking" || item.type === "text") items.push({ type: item.type, text: text(item.text) });
+    else if (item.type === "input" && typeof item.message_id === "number") {
+      items.push({ type: "input", messageId: item.message_id, at: isoTime(item.at) });
+    }
     else if (item.type === "tool") {
       const status = item.status === "done" || item.status === "error" ? item.status : "cancelled";
       items.push({
@@ -152,17 +156,37 @@ export function messageWork(message: Message): WorkTrace | null {
   return null;
 }
 
-/** Splits a live run: text after the last tool is the streaming answer; everything before is work. */
+/** Text after the last tool or delivered input is the answer; earlier text remains in its work segment. */
 export function splitLive(items: WorkItem[]): { work: WorkItem[]; answer: string } {
-  let lastTool = -1;
+  let lastBoundary = -1;
   items.forEach((item, index) => {
-    if (item.type === "tool") lastTool = index;
+    if (item.type === "tool" || item.type === "input") lastBoundary = index;
   });
   const work: WorkItem[] = [];
   let answer = "";
   items.forEach((item, index) => {
-    if (item.type === "text" && index > lastTool) answer += item.text;
+    if (item.type === "text" && index > lastBoundary) answer += item.text;
     else work.push(item);
   });
   return { work, answer };
+}
+
+/** Live and persisted traces use identical segment boundaries and keep the enclosing run's identity. */
+export function workSegments(trace: WorkTrace): { key: string; trace: WorkTrace; input: number | null }[] {
+  const segments: { key: string; trace: WorkTrace; input: number | null }[] = [];
+  let key = "start";
+  let startedAt = trace.startedAt;
+  let items: WorkItem[] = [];
+  for (const item of trace.items) {
+    if (item.type !== "input") {
+      items.push(item);
+      continue;
+    }
+    segments.push({ key, trace: { items, startedAt, endedAt: item.at, truncated: false, omitted: 0 }, input: item.messageId });
+    key = `after-${item.messageId}`;
+    startedAt = item.at;
+    items = [];
+  }
+  segments.push({ key, trace: { ...trace, items, startedAt }, input: null });
+  return segments;
 }

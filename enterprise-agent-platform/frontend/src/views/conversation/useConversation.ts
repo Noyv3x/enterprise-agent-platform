@@ -9,7 +9,7 @@ const PAGE = 100;
 const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_delta", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
-  "retry", "compaction", "run_end",
+  "input_delivered", "retry", "compaction", "run_end",
 ] as const;
 
 /** Platform SSE payloads (platform-api.md § SSE). */
@@ -22,6 +22,7 @@ type StreamEvent = { seq: number } & (
   | { type: "tool_update"; tool_call_id: string; partial: unknown }
   | { type: "tool_output"; tool_call_id: string; delta: string; truncated?: boolean }
   | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { diff?: unknown } | null }
+  | { type: "input_delivered"; message_id: number }
   | { type: "retry" }
   | ({ type: "compaction"; phase: "queued" | "start" | "end" } & Partial<Compaction>)
   | { type: "run_end"; message?: Message | null }
@@ -39,6 +40,8 @@ interface State {
   after: number | null;
   /** The run that just ended with its streamed calls, for the computer panel until the next run ends or a reload. */
   lastRun: LastRun | null;
+  /** Kept outside the busy live reply so assistive technology announces delivery immediately. */
+  deliveredInput: { messageId: number; seq: number } | null;
 }
 
 type Action =
@@ -46,10 +49,11 @@ type Action =
   | { type: "failed"; error: string }
   | { type: "older"; page: MessagePage }
   | { type: "upsert"; messages: Message[] }
+  | { type: "accepted"; message: Message }
   | { type: "compactQueued"; compaction: Compaction }
   | { type: "event"; event: StreamEvent; at: number };
 
-const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null };
+const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null };
 
 function upsert(state: State, incoming: Message[]): Message[] {
   const oldest = state.messages[0]?.id;
@@ -157,6 +161,16 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
   const items = [...live.items];
   const last = items[items.length - 1];
   switch (event.type) {
+    case "input_delivered":
+      if (items.some((item) => item.type === "input" && item.messageId === event.message_id)) return state;
+      items.push({ type: "input", messageId: event.message_id, at });
+      return {
+        ...state,
+        live: { ...live, items, notice: null },
+        messages: state.messages.map((message) => message.id === event.message_id
+          ? { ...message, metadata: { ...message.metadata, delivery: "delivered" } } : message),
+        deliveredInput: { messageId: event.message_id, seq: event.seq },
+      };
     case "text_delta":
     case "thinking_delta": {
       const type = event.type === "text_delta" ? "text" : "thinking";
@@ -195,7 +209,7 @@ function reducer(state: State, action: Action): State {
     case "loaded":
       return {
         ...state, phase: "ready", error: "", messages: action.page.messages,
-        nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastRun: null,
+        nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastRun: null, deliveredInput: null,
         compaction: action.page.last_seq < state.compactionSeq ? state.compaction
           : action.page.compaction ? latestCompaction(state.compaction, action.page.compaction) : null,
       };
@@ -205,6 +219,13 @@ function reducer(state: State, action: Action): State {
       return { ...state, messages: [...action.page.messages, ...state.messages], nextBefore: action.page.next_before_id };
     case "upsert":
       return { ...state, messages: upsert(state, action.messages) };
+    case "accepted": {
+      // SSE can deliver or even settle this input before its POST acknowledgement arrives.
+      if (state.messages.some((message) => message.id === action.message.id)) return state;
+      const delivered = state.live?.items.some((item) => item.type === "input" && item.messageId === action.message.id);
+      const message = delivered ? { ...action.message, metadata: { ...action.message.metadata, delivery: "delivered" as const } } : action.message;
+      return { ...state, messages: upsert(state, [message]) };
+    }
     case "compactQueued":
       return { ...state, compaction: latestCompaction(state.compaction, action.compaction) };
     case "event":
@@ -271,7 +292,7 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
       method: "POST",
       body: JSON.stringify({ content, attachment_ids: attachmentIds }),
     });
-    dispatch({ type: "upsert", messages: [result.message] });
+    dispatch({ type: "accepted", message: result.message });
   }, [base]);
 
   const cancel = useCallback(() => request<{ ok: true }>(`${base}/cancel`, { method: "POST", body: "{}" }), [base]);

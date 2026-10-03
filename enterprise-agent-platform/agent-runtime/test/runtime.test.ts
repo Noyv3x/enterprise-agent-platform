@@ -24,6 +24,12 @@ async function close(server: Server) {
 function request(model: string, kind: 'agent' | 'chat' = 'agent'): RunRequest {
   return {kind, sandbox:{scope_key:kind === 'chat' ? 'chat:1' : 'private:1',workspace_id:kind === 'chat' ? 'chat-user-1' : 'user-1',sandbox_id:'sandbox',lifecycle_id:'lifecycle',profile:'agent',cwd:kind === 'chat' ? '/workspace/conversation' : '/workspace'},model:{id:model,thinking:'off'},prompt:{text:'First question'},context_prefix:'<context time="first"/>',resources:{system_prompt:'Stable assistant instructions.',agents_md:{path:'/workspace/AGENTS.md',content:'PRIVATE_CONTEXT_MARKER'},skills:[{name:'example',description:'Example skill',path:'/workspace/skills/example/SKILL.md'}]},tools:['bash','web_search']};
 }
+function steering(input_id:string,text:string,context_prefix=''): Parameters<Runtime['steer']>[1] {
+  return {input_id,prompt:{text,images:[]},context_prefix};
+}
+function userTexts(messages:TranscriptContext['messages']):string[] {
+  return messages.filter(message=>message.role==='user').map(message=>typeof message.content==='string'?message.content:message.content.filter(part=>part.type==='text').map(part=>part.text).join(''));
+}
 type WireEvent = {seq:number;type:string;[key:string]:unknown};
 async function fixture(t: TestContext, constructionGate?: {entered:()=>void;ready:Promise<void>}) {
   const home = await mkdtemp(join(tmpdir(),'pi-runtime-proof-'));
@@ -33,11 +39,13 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
   const gatewayCalls: {path:string;body:any;authorization:string|undefined}[] = [];
   const cancelOutcomes: ({confirmed:boolean}|{error:string})[] = [];
   let onCancel: (()=>void) | undefined;
+  let onTerminal: (()=>Promise<void>) | undefined;
   let terminalFrames: object[] | undefined;
   const executor = httpServer(async (req,res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     executorCalls.push({path:req.url!,body,authorization:req.headers.authorization});
+    if(req.url?.endsWith('/terminal'))await onTerminal?.();
     res.setHeader('content-type','application/json');
     if(req.url?.endsWith('/runs/cancel')){
       const outcome=cancelOutcomes.shift()??{confirmed:true};
@@ -58,7 +66,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
   const socket = join(home,'executor.sock');
   await listen(executor,socket);
   const platformUrl = await listen(gateway);
-  const faux = fauxProvider({tokensPerSecond:1_000_000,models:[{id:'runtime-proof',reasoning:true},{id:'summary-proof',reasoning:true}]});
+  const faux = fauxProvider({tokensPerSecond:1_000_000,models:[{id:'runtime-proof',reasoning:true,input:['text','image']},{id:'summary-proof',reasoning:true}]});
   const models = await ModelRuntime.create({credentials:new InMemoryCredentialStore(),modelsPath:null,refreshOnCreate:false});
   const usage: Usage[] = [];
   models.registerNativeProvider({...faux.provider,streamSimple(model,context,options){
@@ -94,8 +102,456 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     server = createServer(runtime,'runtime-secret');
     url = await listen(server);
   }
-  return {faux,http,start,events,reopen,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;},streamTerminal(frames:object[]){terminalFrames=frames;}};
+  return {faux,http,start,events,reopen,home,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get url(){return url;},get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;},onTerminal(callback:()=>Promise<void>){onTerminal=callback;},streamTerminal(frames:object[]){terminalFrames=frames;}};
 }
+
+test('steering HTTP requires authentication and validates every field before looking up a run', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const path='/v1/runs/unknown-run/steer';
+  const valid=steering('input-1','Literal input');
+  for(const authorization of [undefined,'Bearer wrong-secret']){
+    const response=await fetch(f.url+path,{method:'POST',headers:{'content-type':'application/json',...(authorization?{authorization}:{})},body:JSON.stringify(valid),signal:AbortSignal.timeout(10_000)});
+    assert.equal(response.status,401);
+    assert.equal(response.headers.get('www-authenticate'),'Bearer');
+  }
+  const malformed:unknown[]=[
+    null,[],{}, {...valid,input_id:undefined}, {...valid,input_id:''}, {...valid,input_id:1}, {...valid,input_id:'x'.repeat(65)},
+    {...valid,prompt:undefined}, {...valid,prompt:null}, {...valid,prompt:[]},
+    {...valid,prompt:{images:[]}}, {...valid,prompt:{text:1,images:[]}},
+    {...valid,prompt:{text:'Missing images'}}, {...valid,prompt:{text:'Bad images',images:null}}, {...valid,prompt:{text:'Bad images',images:{}}},
+    {...valid,context_prefix:undefined}, {...valid,context_prefix:null}, {...valid,context_prefix:1},
+  ];
+  for(const image of [null,[],{},'image',{mime:'image/png'},{data:'YQ=='},{mime:'',data:'YQ=='},{mime:1,data:'YQ=='},{mime:'image/png',data:''},{mime:'image/png',data:1}]){
+    malformed.push({...valid,prompt:{text:'Bad image',images:[image]}});
+  }
+  for(const body of malformed)assert.equal((await f.http(path,body)).status,400,JSON.stringify(body));
+  const invalidJSON=await fetch(f.url+path,{method:'POST',headers:{authorization:'Bearer runtime-secret','content-type':'application/json'},body:'{',signal:AbortSignal.timeout(10_000)});
+  assert.equal(invalidJSON.status,400);
+  assert.equal((await f.http(path,valid)).status,404);
+  assert.equal((await f.http(path,steering('x'.repeat(64),''))).status,404,'empty text and context are valid, and 64-character IDs are accepted');
+  const wrongMethod=await f.http(path);
+  assert.equal(wrongMethod.status,405);
+  assert.equal(wrongMethod.headers.get('allow'),'POST');
+  assert.equal(f.faux.state.callCount,0);
+});
+
+test('steering during a tool is delivered after tool_end in the next request and persists across reopen', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  f.onTerminal(async()=>{entered.resolve();await ready.promise;});
+  const captured:TranscriptContext[]=[];
+  f.faux.setResponses([
+    context=>{captured.push(structuredClone(context));return fauxAssistantMessage(fauxToolCall('bash',{command:'printf steering'},{id:'steered-tool'}),{stopReason:'toolUse'});},
+    context=>{captured.push(structuredClone(context));return fauxAssistantMessage('Used the inserted instruction');},
+    context=>{captured.push(structuredClone(context));return fauxAssistantMessage('Remembered after reopen');},
+  ]);
+  const body=request('runtime-proof');
+  const input=steering('tool-input','Inspect the sandbox result','<context time="inserted"/>');
+  const literal=input.context_prefix+'\n'+input.prompt.text;
+  const id=await f.start('agent-private-steered-tool',body);
+  await entered.promise;
+  const response=await f.http(`/v1/runs/${id}/steer`,input);
+  assert.equal(response.status,200,await response.clone().text());
+  assert.deepEqual(await response.json(),{ok:true});
+  assert.equal(f.faux.state.callCount,1,'steering must not start a request while the tool is still running');
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,2);
+  assert.deepEqual(userTexts(captured[0]!.messages),[body.context_prefix+'\n'+body.prompt.text]);
+  assert.deepEqual(userTexts(captured[1]!.messages),[body.context_prefix+'\n'+body.prompt.text,literal]);
+  assert.equal(captured[1]!.messages.at(-1)!.role,'user');
+  assert(captured[1]!.messages.findIndex(message=>message.role==='toolResult')<captured[1]!.messages.length-1);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(({seq,...event})=>event),[{type:'input_delivered',input_id:input.input_id}]);
+  assert(events.findIndex(event=>event.type==='tool_end')<events.findIndex(event=>event.type==='input_delivered'));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.equal(events.at(-1)!.text,'Used the inserted instruction');
+  assert.equal(events.at(-1)!.side_effects,true);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+  const history=await (await f.http('/v1/sessions/agent-private-steered-tool/history')).json() as {messages:{message:TranscriptContext['messages'][number]}[]};
+  assert.deepEqual(userTexts(history.messages.map(entry=>entry.message)),[body.context_prefix+'\n'+body.prompt.text,literal]);
+  await f.reopen();
+  assert.deepEqual(await (await f.http('/v1/sessions/agent-private-steered-tool/history')).json(),history);
+  body.prompt.text='What did I insert?';
+  const next=await f.events(await f.start('agent-private-steered-tool',body));
+  assert.deepEqual(userTexts(captured[2]!.messages),[body.context_prefix+'\nFirst question',literal,body.context_prefix+'\n'+body.prompt.text]);
+  assert.equal(next.at(-1)!.text,'Remembered after reopen');
+  assert.deepEqual(next.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(next.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering after a provisional final answer continues the same run and batches inputs in acceptance order', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    const unsubscribe=this.agent.subscribe(async event=>{
+      if(event.type==='message_end'&&event.message.role==='assistant'&&event.message.content.some(part=>part.type==='text'&&part.text==='Provisional final answer')){
+        entered.resolve();
+        await ready.promise;
+      }
+    });
+    try{return await prompt.apply(this,args);}finally{unsubscribe();}
+  });
+  let continuation:TranscriptContext|undefined;
+  f.faux.setResponses([fauxAssistantMessage('Provisional final answer'),context=>{continuation=structuredClone(context);return fauxAssistantMessage('Revised final answer');}]);
+  const body=request('runtime-proof');
+  const id=await f.start('agent-private-steered-final',body);
+  await entered.promise;
+  const inputs=[steering('first-input','First correction'),steering('second-input','Second correction')];
+  for(const input of inputs){
+    const response=await f.http(`/v1/runs/${id}/steer`,input);
+    assert.equal(response.status,200,await response.clone().text());
+    assert.deepEqual(await response.json(),{ok:true});
+  }
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,2,'both inputs must be in one next request, not one continuation each');
+  assert.deepEqual(userTexts(continuation!.messages),[body.context_prefix+'\n'+body.prompt.text,...inputs.map(input=>input.prompt.text)]);
+  assert.deepEqual(continuation!.messages.slice(-2).map(message=>message.role),['user','user']);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),inputs.map(input=>input.input_id));
+  assert.equal(events.filter(event=>event.type==='text_delta').map(event=>event.delta).join(''),'Provisional final answerRevised final answer');
+  assert(events.findIndex(event=>event.type==='input_delivered')>events.findIndex(event=>event.type==='text_delta'));
+  assert.equal(events.filter(event=>event.type==='run_end').length,1);
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.equal(events.at(-1)!.text,'Revised final answer');
+  assert.equal(events.at(-1)!.side_effects,false);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering pending limit rejects the thirty-third input but accepts duplicates at capacity and after closure', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  let continuation:TranscriptContext|undefined;
+  f.faux.setResponses([
+    async()=>{entered.resolve();await ready.promise;return fauxAssistantMessage('Before all pending inputs');},
+    context=>{continuation=structuredClone(context);return fauxAssistantMessage('All pending inputs received');},
+  ]);
+  const id=await f.start('agent-private-steered-cap',request('runtime-proof'));
+  await entered.promise;
+  const inputs=Array.from({length:32},(_,index)=>steering(`input-${index}`,`Instruction ${index}`));
+  for(const input of inputs){
+    const response=await f.http(`/v1/runs/${id}/steer`,input);
+    assert.equal(response.status,200,await response.clone().text());
+    assert.deepEqual(await response.json(),{ok:true});
+  }
+  const duplicate={...inputs[0]!,prompt:{text:'A duplicate must not replace the accepted message',images:[]}};
+  const repeated=await f.http(`/v1/runs/${id}/steer`,duplicate);
+  assert.equal(repeated.status,200);
+  assert.deepEqual(await repeated.json(),{ok:true});
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('overflow','Must not be accepted'))).status,409);
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,2);
+  assert.deepEqual(userTexts(continuation!.messages).slice(1),inputs.map(input=>input.prompt.text));
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),inputs.map(input=>input.input_id));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+  const closedDuplicate=await f.http(`/v1/runs/${id}/steer`,duplicate);
+  assert.equal(closedDuplicate.status,200);
+  assert.deepEqual(await closedDuplicate.json(),{ok:true});
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('after-done','Too late'))).status,409);
+  assert.deepEqual(await f.events(id),events,'duplicate acceptance after closure must not append any events');
+});
+
+test('steering closes admission and clears undelivered inputs when prompt returns before waitForIdle settles', {timeout:20_000}, async t=>{
+  const settled=Promise.withResolvers<AgentSession>();
+  const returnPrompt=Promise.withResolvers<void>();
+  const idleEntered=Promise.withResolvers<AgentSession>();
+  const returnIdle=Promise.withResolvers<void>();
+  t.after(()=>{returnPrompt.resolve();returnIdle.resolve();});
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  const waitForIdle=AgentSession.prototype.waitForIdle;
+  let firstPrompt=true;
+  let firstIdle=true;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    const pause=firstPrompt;firstPrompt=false;
+    await prompt.apply(this,args);
+    if(pause){settled.resolve(this);await returnPrompt.promise;}
+  });
+  t.mock.method(AgentSession.prototype,'waitForIdle',async function(this:AgentSession){
+    if(firstIdle){firstIdle=false;idleEntered.resolve(this);await returnIdle.promise;}
+    return waitForIdle.call(this);
+  });
+  let nextContext:TranscriptContext|undefined;
+  f.faux.setResponses([fauxAssistantMessage('Normal answer before prompt settlement'),context=>{nextContext=structuredClone(context);return fauxAssistantMessage('Clean next run');}]);
+  const body=request('runtime-proof');
+  const id=await f.start('agent-private-steered-settlement',body);
+  await settled.promise;
+  const inputs=[steering('late-first','Undelivered normal input one'),steering('late-second','Undelivered normal input two')];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  returnPrompt.resolve();
+  const session=await idleEntered.promise;
+  assert.equal(session.agent.hasQueuedMessages(),false,'Pi queues must be cleared as soon as prompt returns, not after waitForIdle');
+  assert.equal(session.pendingMessageCount,0);
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('after-prompt','Must be rejected before run_end'))).status,409);
+  const duplicate=await f.http(`/v1/runs/${id}/steer`,inputs[0]);
+  assert.equal(duplicate.status,200);
+  assert.deepEqual(await duplicate.json(),{ok:true});
+  assert.equal((await f.http('/v1/sessions/agent-private-steered-settlement/runs',body)).status,409,'the run is still active while waitForIdle is pending');
+  returnIdle.resolve();
+  const events=await f.events(id);
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.equal(events.at(-1)!.text,'Normal answer before prompt settlement');
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,inputs.map(input=>input.input_id));
+  body.prompt.text='Fresh after normal settlement';
+  const next=await f.events(await f.start('agent-private-steered-settlement',body));
+  assert.deepEqual(userTexts(nextContext!.messages),[body.context_prefix+'\nFirst question',body.context_prefix+'\n'+body.prompt.text]);
+  assert.equal(next.at(-1)!.text,'Clean next run');
+  assert.deepEqual(next.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(next.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering cancellation rejects new inputs and reports pending IDs without leaking into the next run', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const aborted=Promise.withResolvers<void>();
+  const terminal=Promise.withResolvers<void>();
+  t.after(()=>terminal.resolve());
+  const f=await fixture(t);
+  let nextContext:TranscriptContext|undefined;
+  f.faux.setResponses([
+    async(_context,options)=>{
+      assert(options?.signal);
+      entered.resolve();
+      await new Promise<void>(resolve=>{if(options.signal!.aborted)resolve();else options.signal!.addEventListener('abort',()=>resolve(),{once:true});});
+      aborted.resolve();
+      await terminal.promise;
+      return fauxAssistantMessage('',{stopReason:'aborted'});
+    },
+    context=>{nextContext=structuredClone(context);return fauxAssistantMessage('Clean after cancellation');},
+  ]);
+  const body=request('runtime-proof');
+  const id=await f.start('agent-private-steered-cancel',body);
+  await entered.promise;
+  const inputs=[steering('cancel-first','Never deliver cancelled input one'),steering('cancel-second','Never deliver cancelled input two')];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  const cancelling=f.http(`/v1/runs/${id}/cancel`,{});
+  await aborted.promise;
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('while-cancelled','Must not be admitted'))).status,409);
+  const duplicate=await f.http(`/v1/runs/${id}/steer`,inputs[0]);
+  assert.equal(duplicate.status,200);
+  assert.deepEqual(await duplicate.json(),{ok:true});
+  terminal.resolve();
+  assert.equal((await cancelling).status,200);
+  const events=await f.events(id);
+  assert.equal(events.at(-1)!.status,'cancelled');
+  assert.equal(events.filter(event=>event.type==='run_end').length,1);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,inputs.map(input=>input.input_id));
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,inputs[1])).status,200);
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('after-cancelled','Still closed'))).status,409);
+  body.prompt.text='Fresh after cancellation';
+  const next=await f.events(await f.start('agent-private-steered-cancel',body));
+  assert.deepEqual(userTexts(nextContext!.messages),[body.context_prefix+'\nFirst question',body.context_prefix+'\n'+body.prompt.text]);
+  assert.equal(next.at(-1)!.text,'Clean after cancellation');
+  assert.deepEqual(next.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(next.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering failure reports and clears accepted undelivered inputs before the next run', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<AgentSession>();
+  const fail=Promise.withResolvers<void>();
+  t.after(()=>fail.resolve());
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  let failFirst=true;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    if(failFirst){
+      failFirst=false;
+      entered.resolve(this);
+      await fail.promise;
+      throw new Error('Pi prompt failed before delivery');
+    }
+    return prompt.apply(this,args);
+  });
+  let nextContext:TranscriptContext|undefined;
+  f.faux.setResponses([context=>{nextContext=structuredClone(context);return fauxAssistantMessage('Clean after failure');}]);
+  const body=request('runtime-proof');
+  const id=await f.start('agent-private-steered-failure',body);
+  const session=await entered.promise;
+  const inputs=[steering('failed-first','Undelivered failed input one'),steering('failed-second','Undelivered failed input two')];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  fail.resolve();
+  const events=await f.events(id);
+  assert.equal(events.at(-1)!.status,'failed');
+  assert.equal(events.at(-1)!.error,'Pi prompt failed before delivery');
+  assert.equal(events.at(-1)!.side_effects,false);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,inputs.map(input=>input.input_id));
+  assert.equal(session.agent.hasQueuedMessages(),false);
+  assert.equal(session.pendingMessageCount,0);
+  assert.equal(f.faux.state.callCount,0);
+  body.prompt.text='Fresh after failure';
+  const next=await f.events(await f.start('agent-private-steered-failure',body));
+  assert.deepEqual(userTexts(nextContext!.messages),[body.context_prefix+'\n'+body.prompt.text]);
+  assert.equal(next.at(-1)!.text,'Clean after failure');
+  assert.deepEqual(next.filter(event=>event.type==='input_delivered'),[]);
+  assert.deepEqual(next.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering preserves registered skill commands literally and passes images and context prefixes unchanged', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  const skillPath=join(f.home,'literal-skill.md');
+  await writeFile(skillPath,'---\nname: x\ndescription: Literal steering test skill\n---\nSKILL_EXPANSION_MUST_NOT_APPEAR\n');
+  const body=request('runtime-proof');
+  body.resources.skills=[{name:'x',description:'Literal steering test skill',path:skillPath}];
+  let continuation:TranscriptContext|undefined;
+  f.faux.setResponses([
+    async()=>{entered.resolve();await ready.promise;return fauxAssistantMessage('Before literal inputs');},
+    context=>{continuation=structuredClone(context);return fauxAssistantMessage('Literal inputs received');},
+  ]);
+  const id=await f.start('agent-private-steered-literal',body);
+  await entered.promise;
+  const imageInput=steering('image-input','  Describe this image.\n','<context time="image"/>\n');
+  imageInput.prompt.images=[{mime:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='}];
+  const inputs=[steering('skill-input','/skill:x literal arguments'),imageInput,steering('prefix-only','','Only the prefix'),steering('empty-input','')];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,2);
+  const literalTexts=['/skill:x literal arguments','<context time="image"/>\n\n  Describe this image.\n','Only the prefix',''];
+  assert.deepEqual(userTexts(continuation!.messages).slice(1),literalTexts);
+  assert(JSON.stringify(continuation!.messages.filter(message=>message.role==='system')).includes(skillPath),'the literal command must name a registered skill');
+  assert.doesNotMatch(JSON.stringify(continuation!.messages),/SKILL_EXPANSION_MUST_NOT_APPEAR/);
+  const imageMessage=continuation!.messages.filter(message=>message.role==='user')[2]!;
+  assert.deepEqual(imageMessage.content,[{type:'text',text:literalTexts[1]},{type:'image',mimeType:'image/png',data:imageInput.prompt.images[0]!.data}]);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),inputs.map(input=>input.input_id));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.equal(events.at(-1)!.side_effects,false);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering accepted before Pi starts is included in the first model request', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    entered.resolve();
+    await ready.promise;
+    return prompt.apply(this,args);
+  });
+  let firstContext:TranscriptContext|undefined;
+  f.faux.setResponses([context=>{firstContext=structuredClone(context);return fauxAssistantMessage('First request included steering');}]);
+  const body=request('runtime-proof');
+  const id=await f.start('agent-private-steered-preflight',body);
+  await entered.promise;
+  const inputs=[steering('preflight-first','Before the agent loop'),steering('preflight-second','Also before the agent loop','<context time="early"/>')];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  assert.equal(f.faux.state.callCount,0);
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,1,'preflight inputs must not wait until a second model request');
+  assert.deepEqual(userTexts(firstContext!.messages),[body.context_prefix+'\n'+body.prompt.text,'Before the agent loop','<context time="early"/>\nAlso before the agent loop']);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),inputs.map(input=>input.input_id));
+  assert(events.findLastIndex(event=>event.type==='input_delivered')<events.findIndex(event=>event.type==='text_delta'));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+});
+
+test('steering matching the original prompt is not falsely delivered before the steering boundary', {timeout:20_000}, async t=>{
+  const preflight=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  const originalStarted=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  let userStarts=0;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    const unsubscribe=this.agent.subscribe(async(event,signal)=>{
+      if(event.type==='message_start'&&event.message.role==='user'&&++userStarts===1){
+        originalStarted.resolve();
+        await new Promise<void>(resolve=>{if(signal.aborted)resolve();else signal.addEventListener('abort',()=>resolve(),{once:true});});
+        // Stop before the initial steering poll, which otherwise emits queued users even after abort.
+        throw new Error('Cancelled at the original prompt boundary');
+      }
+    });
+    preflight.resolve();
+    await ready.promise;
+    try{return await prompt.apply(this,args);}finally{unsubscribe();}
+  });
+  const body=request('runtime-proof');
+  body.context_prefix='';
+  body.prompt.text='The original and inserted messages are identical';
+  f.faux.setResponses([fauxAssistantMessage('Must not reach the provider')]);
+  const id=await f.start('agent-private-steered-identical-root',body);
+  await preflight.promise;
+  const input=steering('identical-input',body.prompt.text);
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  ready.resolve();
+  await originalStarted.promise;
+  assert.equal((await f.http(`/v1/runs/${id}/cancel`,{})).status,200);
+  const events=await f.events(id);
+  assert.equal(userStarts,1);
+  assert.equal(f.faux.state.callCount,0);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered'),[],'the original message_start must not acknowledge same-text pending steering');
+  assert.equal(events.at(-1)!.status,'cancelled');
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[input.input_id]);
+});
+
+test('steering delivery matches Pi message identity before exact-text fallback for cloned events', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  const subscribe=AgentSession.prototype.subscribe;
+  let session:AgentSession|undefined;
+  let queued:AgentSession['messages']=[];
+  let identityStarts=0;
+  let clonedStarts=0;
+  t.mock.method(AgentSession.prototype,'subscribe',function(this:AgentSession,listener:Parameters<AgentSession['subscribe']>[0]){
+    session=this;
+    return subscribe.call(this,event=>{
+      if(event.type==='message_start'&&event.message.role==='user'){
+        if(event.message===queued[0]){
+          identityStarts++;
+          const content=event.message.content;
+          event.message.content=[{type:'text',text:'Different text only during the identity observation'}];
+          try{listener(event);}finally{event.message.content=content;}
+          return;
+        }
+        if(event.message===queued[1]){
+          clonedStarts++;
+          listener({...event,message:structuredClone(event.message)});
+          return;
+        }
+      }
+      listener(event);
+    });
+  });
+  let continuation:TranscriptContext|undefined;
+  f.faux.setResponses([
+    async()=>{entered.resolve();await ready.promise;return fauxAssistantMessage('Before identical steering inputs');},
+    context=>{continuation=structuredClone(context);return fauxAssistantMessage('Both identical inputs received');},
+  ]);
+  const id=await f.start('agent-private-steered-message-matching',request('runtime-proof'));
+  await entered.promise;
+  const literal='  Identical steering text with exact whitespace.\n';
+  const inputs=[steering('identity-input',literal),steering('cloned-input',literal)];
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  queued=session!.agent.peekQueuedMessages();
+  assert.equal(queued.length,2);
+  ready.resolve();
+  const events=await f.events(id);
+  assert.equal(identityStarts,1);
+  assert.equal(clonedStarts,1);
+  assert.equal(f.faux.state.callCount,2);
+  assert.deepEqual(userTexts(continuation!.messages).slice(1),[literal,literal],'observation hooks must not change model-visible input');
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),inputs.map(input=>input.input_id));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+});
 
 test('HTTP rejects invalid optional model limits before admitting a run or compaction', {timeout:20_000}, async t=>{
   const f=await fixture(t);
@@ -134,7 +590,7 @@ test('HTTP runs stream real Pi text, thinking, sandbox and gateway tools, aggreg
   assert.equal(f.usage.length,2);
   const sum = (key:keyof Pick<Usage,'input'|'output'|'cacheRead'|'cacheWrite'|'totalTokens'>) => f.usage.reduce((total,usage)=>total+usage[key],0);
   assert(sum('cacheRead')>0 && sum('cacheWrite')>0);
-  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Finished from sandbox and web',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:f.faux.getModel().id,side_effects:true});
+  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Finished from sandbox and web',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:f.faux.getModel().id,side_effects:true,undelivered_inputs:[]});
   assert.deepEqual(await f.events(id,events.length-1),[events.at(-1)]);
   assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/terminal']);
   assert(f.executorCalls[0] && f.executorCalls[1] && f.gatewayCalls[0]);
@@ -371,7 +827,7 @@ test('automatic threshold compaction streams its lifecycle, accounts for summary
   const currentUsage=f.usage.slice(1);
   const sum=(key:keyof Pick<Usage,'input'|'output'|'cacheRead'|'cacheWrite'|'totalTokens'>)=>currentUsage.reduce((total,usage)=>total+usage[key],0);
   assert(f.usage[2]!.input>0 && f.usage[2]!.output>0,'summary usage must contribute to the run total');
-  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Answer before automatic compaction.',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:'runtime-proof',side_effects:false});
+  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Answer before automatic compaction.',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:'runtime-proof',side_effects:false,undelivered_inputs:[]});
   assert.equal(events.filter(event=>event.type==='text_delta').map(event=>event.delta).join(''),'Answer before automatic compaction.','summary text must not leak into assistant output');
   assert.deepEqual(await f.events(id),events,'SSE replay must preserve the compaction lifecycle and final usage');
   const history=await f.http('/v1/sessions/agent-private-1/history');

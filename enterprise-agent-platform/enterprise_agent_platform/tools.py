@@ -228,7 +228,7 @@ class Browser:
         key = context.get('scope_key', '')
         with self.p.db.connect() as conn:
             session = conn.execute('SELECT scope_key FROM queue_sessions WHERE sid=?', (context.get('sid'),)).fetchone()
-            jobs = conn.execute("SELECT payload_json FROM durable_jobs WHERE kind='agent' AND status='running'").fetchall()
+            jobs = conn.execute("SELECT payload_json FROM durable_jobs WHERE kind='agent' AND status='running' AND json_extract(payload_json,'$.parent_job_id') IS NULL").fetchall()
             payload = None
             for job in jobs:
                 candidate = json.loads(job['payload_json'])

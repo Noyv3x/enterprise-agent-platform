@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -38,6 +39,41 @@ class Files:
         return []
 
 
+
+class ControlledStream(httpx.AsyncByteStream):
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.frames = asyncio.Queue()
+        self.seq = 0
+
+    async def __aiter__(self):
+        self.started.set()
+        while True:
+            frame = await self.frames.get()
+            if frame is None:
+                return
+            events, received = frame
+            data = []
+            for event in events:
+                self.seq += 1
+                data.append("data: " + json.dumps({"seq": self.seq, **event}) + "\n\n")
+            yield "".join(data).encode()
+            if received is not None:
+                received.set()
+
+    async def send(self, *events):
+        received = asyncio.Event()
+        self.frames.put_nowait((events, received))
+        await asyncio.wait_for(received.wait(), 2)
+
+    def finish(self, status="completed", text="answer", undelivered_inputs=()):
+        self.frames.put_nowait(([{"type": "run_end", "status": status, "text": text,
+                                 "model": "model-a", "usage": {},
+                                 "undelivered_inputs": list(undelivered_inputs)}], None))
+
+    def disconnect(self):
+        self.frames.put_nowait(None)
+
 class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -62,14 +98,41 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.loss = False
         self.runtime_events = None
         self.runtime_stream = None
+        self.streams = {}
+        self.run_started = asyncio.Event()
+        self.cancelled_runs = set()
+        self.steers = []
+        self.steer_jobs = []
+        self.steer_started = asyncio.Event()
+        self.steer_hold = asyncio.Event()
+        self.steer_hold.set()
+        self.steer_status = 200
+        self.steer_error = None
 
         async def runtime(request):
             self.calls.append((request.method, request.url.path))
             if request.url.path.endswith("/runs"):
                 self.requests.append(json.loads(request.content))
+                run_id = f"r{len(self.requests)}"
+                self.run_started.set()
                 await self.hold.wait()
-                return httpx.Response(202, json={"run_id": f"r{len(self.requests)}"})
+                return httpx.Response(202, json={"run_id": run_id})
+            if request.url.path.endswith("/steer"):
+                body = json.loads(request.content)
+                self.steers.append((request.url.path, body))
+                self.steer_jobs.append(self.job(int(body["input_id"])))
+                self.steer_started.set()
+                await self.steer_hold.wait()
+                if self.steer_error is not None:
+                    raise self.steer_error
+                return httpx.Response(self.steer_status, json={"ok": self.steer_status == 200})
+            if request.url.path.startswith("/v1/runs/") and request.url.path.endswith("/cancel"):
+                self.cancelled_runs.add(request.url.path.split("/")[-2])
+                return httpx.Response(200, json={"cancelled": True})
             if request.url.path.endswith("/events"):
+                run_id = request.url.path.split("/")[-2]
+                if run_id in self.streams:
+                    return httpx.Response(200, stream=self.streams[run_id])
                 if self.runtime_stream is not None:
                     return httpx.Response(200, stream=self.runtime_stream)
                 if self.runtime_events is not None:
@@ -78,8 +141,11 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                         for seq, event in enumerate(self.runtime_events, 1)))
                 events = [{"seq": 1, "type": "text_delta", "delta": "answer"}]
                 if not self.loss:
-                    events.append({"seq": 2, "type": "run_end", "status": "completed", "text": "answer", "model": "model-a",
-                                   "usage": {"input": 10, "output": 2, "cache_read": 8, "cache_write": 1, "total": 21}})
+                    events.append({"seq": 2, "type": "run_end",
+                                   "status": "cancelled" if run_id in self.cancelled_runs else "completed",
+                                   "text": "answer", "model": "model-a",
+                                   "usage": {"input": 10, "output": 2, "cache_read": 8, "cache_write": 1, "total": 21},
+                                   "undelivered_inputs": []})
                 return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
             if request.url.path.endswith("/compact"):
                 self.compactions.append(json.loads(request.content))
@@ -104,24 +170,583 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         while self.q.tasks:
             await asyncio.gather(*list(self.q.tasks.values()))
 
-    async def test_fifo_single_submit_and_stable_session(self):
-        self.hold.clear()
-        await self.q.enqueue(self.user, "private", "first")
-        await asyncio.sleep(0)
-        await self.q.enqueue(self.user, "private", "second")
-        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["first"])
-        self.hold.set()
+    def job(self, result):
+        ident = result["job_id"] if isinstance(result, dict) else result
+        with self.p.db.connect() as conn:
+            row = dict(conn.execute("SELECT * FROM durable_jobs WHERE id=?", (ident,)).fetchone())
+        row["payload"] = json.loads(row["payload_json"])
+        return row
+
+    def recorded_events(self, scope="private", user=None):
+        key = self.q.payload_key({"scope": scope, "user_id": (user or self.user)["id"]})
+        with self.p.db.connect() as conn:
+            return [json.loads(row[0]) for row in conn.execute(
+                "SELECT event_json FROM queue_events WHERE scope_key=? ORDER BY id", (key,))]
+
+    async def begin_run(self, scope="private", user=None, content="first", schedule_run_id=None):
+        stream = ControlledStream()
+        self.streams[f"r{len(self.requests) + 1}"] = stream
+        result = await self.q.enqueue(user or self.user, scope, content, schedule_run_id=schedule_run_id)
+        await asyncio.wait_for(stream.started.wait(), 2)
+        return result, stream
+
+    def schedule_occurrence(self):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO agent_schedules(id,owner_user_id,name,prompt,schedule_json,created_at,updated_at) VALUES (1,1,'Once','scheduled','{}',1,1)")
+            conn.execute("INSERT INTO agent_schedule_runs(id,schedule_id,scheduled_for,created_at,updated_at) VALUES (1,1,1,1,1)")
+        return 1
+
+    def assert_reply_to(self, message, request):
+        self.assertEqual(message["metadata"]["reply_to"]["message_id"], request["message"]["id"])
+
+    async def test_idle_messages_start_separate_runs_with_stable_session(self):
+        first = await self.q.enqueue(self.user, "private", "first")
+        await self.drain()
+        second = await self.q.enqueue(self.user, "private", "second")
         await self.drain()
         self.assertEqual([r["prompt"]["text"] for r in self.requests], ["first", "second"])
         self.assertEqual([path for method, path in self.calls if path.endswith("/runs")], ["/v1/sessions/agent-private-1/runs"] * 2)
+        self.assertEqual(self.steers, [])
         page = self.q.messages(self.user, "private")
-        self.assertEqual([m["content"] for m in page["messages"]], ["first", "second", "answer", "answer"])
+        self.assertEqual([m["content"] for m in page["messages"]], ["first", "answer", "second", "answer"])
         self.assertIsNone(page["next_before_id"])
         self.assertEqual(page["messages"][0]["metadata"]["author_display_name"], "User 1")
+        self.assert_reply_to(page["messages"][1], first)
+        self.assert_reply_to(page["messages"][3], second)
+        for request in (first, second):
+            self.assertNotIn("parent_job_id", self.job(request)["payload"])
+            self.assertNotIn("inserted_into", request["message"]["metadata"])
         with self.p.db.connect() as conn:
             self.assertEqual([r[0] for r in conn.execute("SELECT status FROM durable_jobs ORDER BY id")], ["succeeded", "succeeded"])
             usage = json.loads(conn.execute("SELECT raw_usage_json FROM token_usage_events LIMIT 1").fetchone()[0])
             self.assertEqual(usage["cacheRead"], 8)
+
+    async def test_active_run_absorbs_before_run_id_and_delivers_in_acceptance_order(self):
+        stream = self.streams["r1"] = ControlledStream()
+        self.hold.clear()
+        parent = await self.q.enqueue(self.user, "private", "first")
+        await asyncio.wait_for(self.run_started.wait(), 2)
+        children = [await self.q.enqueue(self.user, "private", text) for text in ("second", "third")]
+        self.assertEqual(self.steers, [])
+        self.assertNotIn("private:1", self.q.running)
+        for child in children:
+            stored = self.job(child)
+            self.assertEqual(stored["status"], "running")
+            self.assertEqual(stored["payload"]["parent_job_id"], parent["job_id"])
+            self.assertFalse(stored["payload"].get("steer_sent", False))
+            self.assertEqual(child["message"]["metadata"]["status"], "running")
+            self.assertEqual(child["message"]["metadata"]["inserted_into"], parent["message"]["id"])
+            self.assertEqual(child["message"]["metadata"]["delivery"], "pending")
+        self.hold.set()
+        await asyncio.wait_for(stream.started.wait(), 2)
+        self.assertEqual([path for path, body in self.steers], ["/v1/runs/r1/steer"] * 2)
+        self.assertEqual([body["input_id"] for path, body in self.steers],
+                         [str(child["job_id"]) for child in children])
+        self.assertEqual([body["prompt"] for path, body in self.steers],
+                         [{"text": text, "images": []} for text in ("second", "third")])
+        for stored in self.steer_jobs:
+            self.assertEqual(stored["status"], "running")
+            self.assertEqual(stored["payload"]["parent_job_id"], parent["job_id"])
+            self.assertIs(stored["payload"]["steer_sent"], True)
+        await stream.send({"type": "text_delta", "delta": "Original answer before insertion"},
+                          *[{"type": "input_delivered", "input_id": str(child["job_id"])} for child in children],
+                          {"type": "text_delta", "delta": "Updated answer"})
+        stream.finish(text="Updated answer")
+        await self.drain()
+        page = self.q.messages(self.user, "private")
+        self.assertEqual([message["content"] for message in page["messages"]],
+                         ["first", "second", "third", "Updated answer"])
+        self.assert_reply_to(page["messages"][-1], parent)
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue(all(self.job(request)["status"] == "succeeded" for request in (parent, *children)))
+        for message in page["messages"][1:3]:
+            self.assertEqual((message["metadata"]["status"], message["metadata"]["delivery"]),
+                             ("completed", "delivered"))
+        work = page["messages"][-1]["metadata"]["work"]
+        self.assertFalse(work["truncated"])
+        self.assertEqual(work["items"][0], {"type": "text", "text": "Original answer before insertion"})
+        self.assertEqual([item["message_id"] for item in work["items"][1:]],
+                         [child["message"]["id"] for child in children])
+        for item in work["items"][1:]:
+            self.assertEqual(set(item), {"type", "message_id", "at"})
+            self.assertEqual(item["type"], "input")
+            self.assertLessEqual(work["started_at"], item["at"])
+            self.assertLessEqual(item["at"], work["ended_at"])
+        events = self.recorded_events()
+        delivered = [event for event in events if event["type"] == "input_delivered"]
+        self.assertEqual(delivered, [{"type": "input_delivered", "message_id": child["message"]["id"]}
+                                     for child in children])
+        for event in delivered:
+            prior = events[events.index(event) - 1]
+            self.assertEqual(prior["type"], "message")
+            self.assertEqual(prior["message"]["id"], event["message_id"])
+            self.assertEqual(prior["message"]["metadata"]["delivery"], "delivered")
+        public = self.q.events(self.user, "private", 0)
+        try:
+            async with asyncio.timeout(2):
+                for expected in events:
+                    event = json.loads((await anext(public)).split(b"data: ", 1)[1])
+                    self.assertEqual(event["type"], expected["type"])
+                    self.assertNotIn("input_id", json.dumps(event))
+                    self.assertNotIn("undelivered_inputs", json.dumps(event))
+        finally:
+            await public.aclose()
+        with self.p.db.connect() as conn:
+            usage = conn.execute("SELECT request_message_id,response_message_id FROM token_usage_events").fetchall()
+        self.assertEqual([tuple(row) for row in usage], [(parent["message"]["id"], page["messages"][-1]["id"])])
+
+    async def test_chat_and_channel_insertions_use_author_context_and_attachment_prompt(self):
+        from enterprise_agent_platform.files import Files as WorkspaceFiles
+        self.p.files = WorkspaceFiles(self.p)
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations VALUES ('steering',1,'Steering',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+            conn.execute("UPDATE users SET display_name='Channel Author',timezone='Asia/Tokyo' WHERE id=2")
+        for scope, uid, name, timezone in [
+            ("chat-steering", 1, "Updated Chat Author", "Pacific/Auckland"),
+            ("channel-1", 2, "Channel Author", "Asia/Tokyo"),
+        ]:
+            with self.subTest(scope=scope):
+                with self.p.db.connect() as conn:
+                    conn.execute("UPDATE users SET display_name='User 1',timezone='UTC' WHERE id=1")
+                parent, stream = await self.begin_run(scope, self.q.user(1))
+                with self.p.db.connect() as conn:
+                    conn.execute("UPDATE users SET display_name=?,timezone=? WHERE id=?", (name, timezone, uid))
+                author = self.q.user(uid)
+                info = self.q.scope(author, scope)
+                image = base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a4hcAAAAASUVORK5CYII=")
+                attachments = [
+                    self.p.files.store(author, info, "report.txt", b"quarterly report"),
+                    self.p.files.store(author, info, "chart.png", image),
+                ]
+                ids = [attachment["id"] for attachment in attachments]
+                expected_prompt = self.p.files.prompt(author, info, ids)
+                with patch.object(self.p.files, "prompt", wraps=self.p.files.prompt) as prompt:
+                    child = await self.q.enqueue(author, scope, "Use these instead", ids)
+                prompt.assert_called_once()
+                self.assertEqual(prompt.call_args.args[0]["id"], uid)
+                self.assertEqual(prompt.call_args.args[1]["scope_key"], info["scope_key"])
+                self.assertEqual(prompt.call_args.args[2], ids)
+                body = self.steers[-1][1]
+                self.assertEqual(body["prompt"], {"text": "Use these instead\n" + expected_prompt["text"],
+                                                  "images": expected_prompt["images"]})
+                self.assertEqual(body["prompt"]["images"], [{"mime": "image/png", "data": base64.b64encode(image).decode()}])
+                prefix = json.loads(body["context_prefix"])
+                self.assertEqual((prefix["user"], prefix["tz"]), (name, timezone))
+                self.assertIsInstance(prefix["time"], str)
+                original_prefix = json.loads(self.requests[-1]["context_prefix"])
+                self.assertEqual((original_prefix["user"], original_prefix["tz"]), ("User 1", "UTC"))
+                self.assertEqual(child["message"]["metadata"]["author_display_name"], name)
+                self.assertEqual(child["message"]["metadata"]["author_user_id"], uid)
+                self.assertEqual(child["message"]["metadata"]["inserted_into"], parent["message"]["id"])
+                self.assertEqual([attachment["id"] for attachment in child["message"]["attachments"]], ids)
+                self.assertEqual(self.job(child)["payload"]["parent_job_id"], parent["job_id"])
+                await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+                stream.finish()
+                await self.drain()
+                replies = [message for message in self.q.messages(author, scope)["messages"] if message["role"] == "assistant"]
+                self.assertEqual(len(replies), 1)
+                self.assert_reply_to(replies[0], parent)
+                self.assertEqual(replies[0]["metadata"]["work"]["items"][0]["message_id"], child["message"]["id"])
+                self.assertEqual(self.job(child)["status"], "succeeded")
+        self.assertEqual(len(self.requests), 2)
+
+    async def test_active_insertion_preserves_content_and_attachment_validation(self):
+        parent, stream = await self.begin_run()
+        for content, attachments, status in [
+            ("", [], 400), ("x" * (1024 * 1024 + 1), [], 413),
+            ("too many attachments", list(range(33)), 413), ("unknown attachment", [999], 404),
+        ]:
+            with self.subTest(status=status, attachments=len(attachments)):
+                with self.assertRaises(HTTPException) as rejected:
+                    await self.q.enqueue(self.user, "private", content, attachments)
+                self.assertEqual(rejected.exception.status_code, status)
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM durable_jobs").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 1)
+        self.assertEqual(self.steers, [])
+        stream.finish()
+        await self.drain()
+        self.assert_reply_to(self.q.messages(self.user, "private")["messages"][-1], parent)
+
+    async def test_scheduled_parent_does_not_absorb_interactive_message(self):
+        parent, stream = await self.begin_run(content="scheduled", schedule_run_id=self.schedule_occurrence())
+        child = await self.q.enqueue(self.user, "private", "interactive")
+        self.assertEqual(self.job(child)["status"], "queued")
+        self.assertNotIn("parent_job_id", self.job(child)["payload"])
+        self.assertNotIn("inserted_into", child["message"]["metadata"])
+        self.assertEqual(self.steers, [])
+        stream.finish()
+        await self.drain()
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["scheduled", "interactive"])
+        replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+        for reply, request in zip(replies, (parent, child), strict=True):
+            self.assert_reply_to(reply, request)
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT status FROM agent_schedule_runs").fetchone()[0], "succeeded")
+
+    async def test_schedule_occurrence_during_interactive_run_stays_fifo(self):
+        parent, stream = await self.begin_run()
+        scheduled = await self.q.enqueue(self.user, "private", "scheduled", schedule_run_id=self.schedule_occurrence())
+        self.assertEqual(self.job(scheduled)["status"], "queued")
+        self.assertNotIn("parent_job_id", self.job(scheduled)["payload"])
+        self.assertNotIn("inserted_into", scheduled["message"]["metadata"])
+        self.assertEqual(self.steers, [])
+        stream.finish()
+        await self.drain()
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["first", "scheduled"])
+        replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+        for reply, request in zip(replies, (parent, scheduled), strict=True):
+            self.assert_reply_to(reply, request)
+
+    async def test_queued_work_prevents_later_interactive_absorption(self):
+        parent, stream = await self.begin_run()
+        compact = await self.q.compact(self.user, "private")
+        child = await self.q.enqueue(self.user, "private", "after queued compaction")
+        self.assertEqual(self.job(compact)["status"], "queued")
+        self.assertEqual(self.job(child)["status"], "queued")
+        self.assertNotIn("parent_job_id", self.job(child)["payload"])
+        self.assertEqual(child["message"]["metadata"]["status"], "queued")
+        self.assertEqual(self.steers, [])
+        stream.finish()
+        await self.drain()
+        operations = [path.rsplit("/", 1)[-1] for method, path in self.calls if method == "POST"]
+        self.assertEqual(operations, ["runs", "compact", "runs"])
+        replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+        for reply, request in zip(replies, (parent, child), strict=True):
+            self.assert_reply_to(reply, request)
+
+    async def test_cancelling_scope_keeps_new_messages_out_of_active_run(self):
+        parent, stream = await self.begin_run()
+        inserted = await self.q.enqueue(self.user, "private", "cancel with parent")
+        await self.q.cancel(self.user, "private")
+        self.assertIn("private:1", self.q.cancelling)
+        later = await self.q.enqueue(self.user, "private", "after cancellation")
+        self.assertEqual(self.job(later)["status"], "queued")
+        self.assertNotIn("parent_job_id", self.job(later)["payload"])
+        self.assertEqual(len(self.steers), 1)
+        stream.finish(status="cancelled", undelivered_inputs=[str(inserted["job_id"])])
+        await self.drain()
+        messages = self.q.messages(self.user, "private")["messages"]
+        child = next(message for message in messages if message["id"] == inserted["message"]["id"])
+        self.assertEqual(child["metadata"]["status"], "cancelled")
+        self.assertEqual(self.job(inserted)["status"], "failed")
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["first", "after cancellation"])
+        replies = [message for message in messages if message["role"] == "assistant"]
+        for reply, request in zip(replies, (parent, later), strict=True):
+            self.assert_reply_to(reply, request)
+
+    async def test_other_scope_backlog_does_not_prevent_insertion(self):
+        parent, stream = await self.begin_run()
+        with patch.object(self.q, "wake"):
+            other = await self.q.enqueue(self.q.user(2), "private", "other user's queue")
+        child = await self.q.enqueue(self.user, "private", "same scope")
+        self.assertEqual(self.job(other)["status"], "queued")
+        self.assertEqual(self.job(child)["payload"]["parent_job_id"], parent["job_id"])
+        await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+        stream.finish()
+        await self.drain()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.job(other)["status"], "queued")
+
+    async def test_normal_completion_requeues_only_undelivered_inputs_in_order(self):
+        parent, stream = await self.begin_run()
+        delivered = await self.q.enqueue(self.user, "private", "used in parent")
+        pending = [await self.q.enqueue(self.user, "private", text) for text in ("queued one", "queued two")]
+        await stream.send({"type": "input_delivered", "input_id": str(delivered["job_id"])})
+        original_settle = self.q.settle_inputs
+        settled = []
+
+        def settle(conn, parent_job_id, info, status, error=None):
+            if parent_job_id == parent["job_id"]:
+                self.assertTrue(conn.in_transaction)
+                self.assertEqual(conn.execute("SELECT status FROM durable_jobs WHERE id=?", (parent_job_id,)).fetchone()[0],
+                                 "succeeded")
+                with self.p.db.connect() as observer:
+                    self.assertEqual([row[0] for row in observer.execute("SELECT status FROM durable_jobs ORDER BY id")],
+                                     ["running"] * 4)
+            mids = original_settle(conn, parent_job_id, info, status, error)
+            if parent_job_id == parent["job_id"]:
+                settled.extend(mids)
+                self.assertEqual([row[0] for row in conn.execute("SELECT status FROM durable_jobs ORDER BY id")],
+                                 ["succeeded", "succeeded", "queued", "queued"])
+            return mids
+
+        with patch.object(self.q, "settle_inputs", side_effect=settle):
+            stream.finish(undelivered_inputs=[str(child["job_id"]) for child in pending])
+            await self.drain()
+        self.assertEqual(settled, [child["message"]["id"] for child in (delivered, *pending)])
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["first", "queued one", "queued two"])
+        messages = self.q.messages(self.user, "private")["messages"]
+        replies = [message for message in messages if message["role"] == "assistant"]
+        for reply, request in zip(replies, (parent, *pending), strict=True):
+            self.assert_reply_to(reply, request)
+        for child in pending:
+            job = self.job(child)
+            self.assertEqual(job["status"], "succeeded")
+            self.assertNotIn("parent_job_id", job["payload"])
+            self.assertNotIn("steer_sent", job["payload"])
+            message = next(message for message in messages if message["id"] == child["message"]["id"])
+            self.assertNotIn("inserted_into", message["metadata"])
+            self.assertNotIn("delivery", message["metadata"])
+            updates = [event["message"] for event in self.recorded_events() if event["type"] == "message"
+                       and event["message"]["id"] == child["message"]["id"]]
+            queued = next(message for message in updates if message["metadata"]["status"] == "queued")
+            self.assertNotIn("inserted_into", queued["metadata"])
+            self.assertNotIn("delivery", queued["metadata"])
+        delivered_message = next(message for message in messages if message["id"] == delivered["message"]["id"])
+        self.assertEqual(delivered_message["metadata"]["status"], "completed")
+        self.assertEqual(delivered_message["metadata"]["delivery"], "delivered")
+        self.assertNotIn("undelivered_inputs", json.dumps(self.recorded_events()))
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM token_usage_events").fetchone()[0], 3)
+
+    async def test_failed_cancelled_and_lost_parents_settle_children_without_replies(self):
+        for runtime_status, status in [("failed", "interrupted"), ("cancelled", "cancelled"), (None, "interrupted")]:
+            with self.subTest(status=runtime_status):
+                first_request = len(self.requests)
+                parent, stream = await self.begin_run(content=f"parent {runtime_status}")
+                children = [await self.q.enqueue(self.user, "private", text) for text in ("delivered", "pending")]
+                await stream.send({"type": "input_delivered", "input_id": str(children[0]["job_id"])})
+                if runtime_status is None:
+                    stream.disconnect()
+                else:
+                    stream.finish(status=runtime_status, undelivered_inputs=[str(children[1]["job_id"])])
+                await self.drain()
+                self.assertEqual(len(self.requests), first_request + 1)
+                messages = self.q.messages(self.user, "private")["messages"]
+                replies = [message for message in messages if message["role"] == "assistant"
+                           and message["metadata"]["reply_to"]["message_id"] == parent["message"]["id"]]
+                self.assertEqual(len(replies), 1)
+                self.assertEqual(replies[0]["metadata"]["status"], status)
+                for child, delivery in zip(children, ("delivered", "pending"), strict=True):
+                    self.assertEqual(self.job(child)["status"], "failed")
+                    message = next(message for message in messages if message["id"] == child["message"]["id"])
+                    self.assertEqual(message["metadata"]["status"], status)
+                    self.assertEqual(message["metadata"]["delivery"], delivery)
+                    self.assertEqual(message["metadata"]["inserted_into"], parent["message"]["id"])
+                    self.assertFalse(any(message["role"] == "assistant"
+                                         and message["metadata"]["reply_to"]["message_id"] == child["message"]["id"]
+                                         for message in messages))
+                    updates = [event["message"] for event in self.recorded_events() if event["type"] == "message"
+                               and event["message"]["id"] == child["message"]["id"]]
+                    self.assertEqual(updates[-1]["metadata"]["status"], status)
+                self.assertNotIn("undelivered_inputs", json.dumps(self.recorded_events()))
+                self.assertEqual(self.q.active, 0)
+
+    async def test_file_delivery_failure_interrupts_delivered_and_pending_children(self):
+        for runtime_status in ("completed", "cancelled", "failed"):
+            with self.subTest(status=runtime_status):
+                before = len(self.requests)
+                parent, stream = await self.begin_run()
+                children = [await self.q.enqueue(self.user, "private", text) for text in ("delivered", "pending")]
+                await stream.send({"type": "input_delivered", "input_id": str(children[0]["job_id"])})
+                with patch.object(self.p.files, "deliver", side_effect=OSError("attachment storage unavailable")):
+                    stream.finish(status=runtime_status, undelivered_inputs=[str(children[1]["job_id"])])
+                    await self.drain()
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertTrue(all(self.job(request)["status"] == "failed" for request in (parent, *children)))
+                messages = [message for message in self.q.messages(self.user, "private")["messages"]
+                            if message["id"] >= parent["message"]["id"]]
+                replies = [message for message in messages if message["role"] == "assistant"]
+                self.assertEqual(len(replies), 1)
+                self.assert_reply_to(replies[0], parent)
+                for message in messages:
+                    self.assertEqual(message["metadata"]["status"], "interrupted")
+                    self.assertIn("attachment storage unavailable", message["metadata"]["error"])
+                for child in children:
+                    updates = [event["message"] for event in self.recorded_events() if event["type"] == "message"
+                               and event["message"]["id"] == child["message"]["id"]]
+                    self.assertEqual(updates[-1]["metadata"]["status"], "interrupted")
+
+    async def test_definite_steer_rejections_requeue_with_independent_replies(self):
+        for status in (404, 409):
+            with self.subTest(status=status):
+                parent, stream = await self.begin_run(content=f"parent {status}")
+                self.steer_status = status
+                child = await self.q.enqueue(self.user, "private", f"rejected {status}")
+                stored = self.job(child)
+                self.assertEqual(stored["status"], "queued")
+                self.assertNotIn("parent_job_id", stored["payload"])
+                self.assertNotIn("steer_sent", stored["payload"])
+                self.assertEqual(child["message"]["metadata"]["status"], "queued")
+                self.assertNotIn("inserted_into", child["message"]["metadata"])
+                self.assertNotIn("delivery", child["message"]["metadata"])
+                stream.finish()
+                await self.drain()
+                self.assertEqual([request["prompt"]["text"] for request in self.requests[-2:]],
+                                 [f"parent {status}", f"rejected {status}"])
+                replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+                self.assert_reply_to(replies[-2], parent)
+                self.assert_reply_to(replies[-1], child)
+                self.assertEqual(self.job(child)["status"], "succeeded")
+        self.assertEqual(len(self.steers), 2)
+
+    async def test_uncertain_steer_is_never_resent_by_repeat_drain_or_recovery(self):
+        for error, delivered in [(httpx.ReadTimeout("lost steer response"), True),
+                                 (httpx.ConnectError("steer connection lost"), False)]:
+            with self.subTest(error=type(error).__name__):
+                before = len(self.steers)
+                parent, stream = await self.begin_run()
+                self.steer_error = error
+                child = await self.q.enqueue(self.user, "private", "uncertain input")
+                self.assertEqual(self.job(child)["status"], "running")
+                self.assertIs(self.job(child)["payload"]["steer_sent"], True)
+                self.assertIs(self.steer_jobs[-1]["payload"]["steer_sent"], True)
+                info = self.q.scope(self.user, "private")
+                async with self.q.lock(info["scope_key"]):
+                    await self.q.send_inputs(parent["job_id"], info)
+                    await self.q.send_inputs(parent["job_id"], info)
+                self.q.resume()
+                self.assertEqual(len(self.steers), before + 1)
+                if delivered:
+                    await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+                    stream.finish()
+                else:
+                    stream.disconnect()
+                await self.drain()
+                self.q = self.p.queue = Queue(self.p)
+                await self.q.start()
+                await self.drain()
+                async with self.q.lock(info["scope_key"]):
+                    await self.q.send_inputs(parent["job_id"], info)
+                self.assertEqual(len(self.steers), before + 1)
+                self.assertEqual(self.job(child)["status"], "succeeded" if delivered else "failed")
+                replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+                self.assert_reply_to(replies[-1], parent)
+                self.assertFalse(any(message["metadata"]["reply_to"]["message_id"] == child["message"]["id"]
+                                     for message in replies))
+
+    async def test_startup_recovery_settles_absorbed_inputs_without_replay(self):
+        self.q.stopping = True
+        parent = await self.q.enqueue(self.user, "private", "lost parent")
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE durable_jobs SET status='running' WHERE id=?", (parent["job_id"],))
+            conn.execute("UPDATE messages SET metadata_json=json_set(metadata_json,'$.status','running') WHERE id=?",
+                         (parent["message"]["id"],))
+        children = [await self.q.enqueue(self.user, "private", text)
+                    for text in ("not submitted", "uncertain submission", "already delivered")]
+        with self.p.db.connect() as conn:
+            for child, sent in zip(children, (False, True, True), strict=True):
+                conn.execute("UPDATE durable_jobs SET payload_json=json_set(payload_json,'$.steer_sent',json(?)) WHERE id=?",
+                             (json.dumps(sent), child["job_id"]))
+            conn.execute("UPDATE messages SET metadata_json=json_set(metadata_json,'$.delivery','delivered') WHERE id=?",
+                         (children[-1]["message"]["id"],))
+        self.q = self.p.queue = Queue(self.p)
+        await self.q.start()
+        await self.drain()
+        await self.q.start()
+        await self.drain()
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.steers, [])
+        self.assertEqual(self.calls, [("POST", "/v1/sessions/agent-private-1/cancel")])
+        self.assertTrue(all(self.job(request)["status"] == "failed" for request in (parent, *children)))
+        messages = self.q.messages(self.user, "private")["messages"]
+        replies = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(replies), 1)
+        self.assert_reply_to(replies[0], parent)
+        for message in messages:
+            self.assertEqual(message["metadata"]["status"], "interrupted")
+            self.assertIn("Platform restarted", message["metadata"]["error"])
+        self.assertEqual(self.q.active, 0)
+
+    async def test_input_delivery_ignores_unknown_foreign_and_duplicate_ids(self):
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "deliver once")
+        other_parent, other_stream = await self.begin_run(user=self.q.user(2))
+        other_child = await self.q.enqueue(self.q.user(2), "private", "belongs to another run")
+        await stream.send(
+            {"type": "input_delivered", "input_id": "unknown-runtime-input"},
+            {"type": "input_delivered", "input_id": str(parent["job_id"])},
+            {"type": "input_delivered", "input_id": str(other_child["job_id"])},
+            {"type": "input_delivered", "input_id": str(child["job_id"])},
+            {"type": "input_delivered", "input_id": str(child["job_id"])})
+        other_message = self.q.message(self.q.scope(self.q.user(2), "private"), other_child["message"]["id"])
+        self.assertEqual(other_message["metadata"]["delivery"], "pending")
+        await other_stream.send({"type": "input_delivered", "input_id": str(other_child["job_id"])})
+        stream.finish()
+        other_stream.finish()
+        await self.drain()
+        events = self.recorded_events()
+        self.assertEqual([event for event in events if event["type"] == "input_delivered"],
+                         [{"type": "input_delivered", "message_id": child["message"]["id"]}])
+        self.assertNotIn("unknown-runtime-input", json.dumps(events))
+        reply = self.q.messages(self.user, "private")["messages"][-1]
+        self.assertEqual(len(reply["metadata"]["work"]["items"]), 1)
+        self.assert_reply_to(reply, parent)
+        self.assert_reply_to(self.q.messages(self.q.user(2), "private")["messages"][-1], other_parent)
+
+    async def test_parent_finish_while_steer_is_in_flight_cannot_strand_or_revive_child(self):
+        for response_status, run_status in [(200, "completed"), (404, "failed"), (409, "cancelled")]:
+            with self.subTest(response_status=response_status, run_status=run_status):
+                parent, stream = await self.begin_run()
+                parent_finished = asyncio.Event()
+                original_finish = self.q.finish
+
+                async def finish(job, *args, **kwargs):
+                    await original_finish(job, *args, **kwargs)
+                    if job["id"] == parent["job_id"]:
+                        parent_finished.set()
+
+                self.steer_status = response_status
+                self.steer_started.clear()
+                self.steer_hold.clear()
+                with patch.object(self.q, "finish", side_effect=finish):
+                    accepted = asyncio.create_task(self.q.enqueue(self.user, "private", "racing input"))
+                    try:
+                        await asyncio.wait_for(self.steer_started.wait(), 2)
+                        child_id = int(self.steers[-1][1]["input_id"])
+                        stream.finish(status=run_status, undelivered_inputs=[str(child_id)])
+                        await asyncio.wait_for(parent_finished.wait(), 2)
+                        self.assertEqual(self.job(child_id)["status"], "queued" if run_status == "completed" else "failed")
+                        self.steer_hold.set()
+                        child = await asyncio.wait_for(accepted, 2)
+                        await self.drain()
+                    finally:
+                        self.steer_hold.set()
+                        if not accepted.done():
+                            accepted.cancel()
+                        await asyncio.gather(accepted, return_exceptions=True)
+                self.assertEqual(self.job(child)["status"], "succeeded" if run_status == "completed" else "failed")
+                replies = [message for message in self.q.messages(self.user, "private")["messages"] if message["role"] == "assistant"]
+                child_replies = [message for message in replies
+                                 if message["metadata"]["reply_to"]["message_id"] == child["message"]["id"]]
+                self.assertEqual(len(child_replies), 1 if run_status == "completed" else 0)
+                self.assertEqual(self.q.active, 0)
+
+    async def test_absorb_rechecks_parent_after_stale_running_selection(self):
+        self.q.stopping = True
+        parent = await self.q.enqueue(self.user, "private", "parent")
+        child = await self.q.enqueue(self.user, "private", "arrives while parent finishes")
+        with self.p.db.connect() as conn:
+            conn.execute("UPDATE durable_jobs SET status='running' WHERE id=?", (parent["job_id"],))
+            stale = conn.execute("SELECT id,payload_json FROM durable_jobs WHERE id=?", (parent["job_id"],)).fetchone()
+        info = self.q.scope(self.user, "private")
+        job = self.job(parent)
+        await self.q.finish(job, job["payload"], self.user, info,
+                            {"type": "run_end", "status": "completed", "text": "settled", "usage": {}})
+
+        class StaleSelection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, parameters=()):
+                if sql.startswith("SELECT id,payload_json") and "status='running'" in sql:
+                    return SimpleNamespace(fetchone=lambda: stale)
+                return self.connection.execute(sql, parameters)
+
+        payload = self.job(child)["payload"]
+        with self.p.db.connect() as conn:
+            self.assertFalse(self.q.absorb(StaleSelection(conn), child["job_id"], payload, info))
+        self.assertNotIn("parent_job_id", payload)
+        self.assertEqual(self.job(child)["status"], "queued")
+        self.assertNotIn("inserted_into", self.q.message(info, child["message"]["id"])["metadata"])
+        self.q.stopping = False
+        self.q.resume()
+        await self.drain()
+        self.assertEqual([request["prompt"]["text"] for request in self.requests], ["arrives while parent finishes"])
+        self.assert_reply_to(self.q.messages(self.user, "private")["messages"][-1], child)
 
     async def test_loss_interrupted_without_resubmission(self):
         self.loss = True
@@ -135,6 +760,112 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("without run_end", message["metadata"]["error"])
         self.assertIn(("POST", "/v1/sessions/agent-private-1/cancel"), self.calls)
         self.assertEqual(self.q.active, 0)
+
+    async def test_worker_stop_interrupts_inserted_inputs_without_replay_on_restart(self):
+        parent, stream = await self.begin_run()
+        children = [await self.q.enqueue(self.user, "private", text) for text in ("delivered", "pending")]
+        await stream.send({"type": "input_delivered", "input_id": str(children[0]["job_id"])})
+        await self.q.stop()
+        self.q = self.p.queue = Queue(self.p)
+        await self.q.start()
+        await self.drain()
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.steers), 2)
+        self.assertTrue(all(self.job(request)["status"] == "failed" for request in (parent, *children)))
+        messages = self.q.messages(self.user, "private")["messages"]
+        replies = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(replies), 1)
+        self.assert_reply_to(replies[0], parent)
+        self.assertTrue(all(message["metadata"]["status"] == "interrupted" for message in messages))
+        self.assertEqual(self.q.active, 0)
+
+    async def test_chat_interruption_and_queued_cancellation_keep_reply_to(self):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations VALUES ('interrupted',1,'Interrupted',?,?,NULL)", (now(), now()))
+        self.loss = True
+        interrupted = await self.q.enqueue(self.user, "chat-interrupted", "uncertain chat")
+        await self.drain()
+        self.q.stopping = True
+        cancelled = await self.q.enqueue(self.user, "chat-interrupted", "cancel queued chat")
+        await self.q.cancel(self.user, "chat-interrupted")
+        replies = [message for message in self.q.messages(self.user, "chat-interrupted")["messages"]
+                   if message["role"] == "assistant"]
+        self.assertEqual([message["metadata"]["status"] for message in replies], ["interrupted", "cancelled"])
+        for reply, request in zip(replies, (interrupted, cancelled), strict=True):
+            self.assert_reply_to(reply, request)
+
+    def test_work_input_boundary_preserves_prior_text_and_removes_final_answer(self):
+        trace = _WorkTrace()
+        trace.add({"type": "text_delta", "delta": "Earlier answer"})
+        trace.add({"type": "input_delivered", "message_id": 42})
+        trace.add({"type": "text_delta", "delta": "Final answer"})
+        work = trace.finish()
+        self.assertFalse(work["truncated"])
+        self.assertEqual(work["items"][0], {"type": "text", "text": "Earlier answer"})
+        self.assertEqual(len(work["items"]), 2)
+        marker = work["items"][1]
+        self.assertEqual(set(marker), {"type", "message_id", "at"})
+        self.assertEqual((marker["type"], marker["message_id"]), ("input", 42))
+        self.assertLessEqual(work["started_at"], marker["at"])
+        self.assertLessEqual(marker["at"], work["ended_at"])
+
+    def test_work_input_markers_survive_item_limit_and_later_tool_updates(self):
+        trace = _WorkTrace()
+        trace.add({"type": "input_delivered", "message_id": 11})
+        for index in range(200):
+            trace.add({"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}})
+        self.assertEqual(len(trace.data["items"]), 200)
+        trace.add({"type": "input_delivered", "message_id": 12})
+        self.assertEqual(len(trace.data["items"]), 200)
+        for ident in ("0", "198"):
+            trace.add({"type": "tool_end", "tool_call_id": ident, "is_error": False,
+                       "content_preview": [{"type": "text", "text": "finished"}]})
+        work = trace.finish()
+        self.assertTrue(work["truncated"])
+        self.assertEqual([item["message_id"] for item in work["items"] if item["type"] == "input"], [11, 12])
+        tools = [item for item in work["items"] if item["type"] == "tool"]
+        self.assertEqual([item["id"] for item in tools], [str(index) for index in range(1, 199)])
+        self.assertEqual((tools[-1]["status"], tools[-1]["output"]), ("done", "finished"))
+        self.assertLessEqual(len(json.dumps(work).encode("utf-8")), 96 * 1024)
+
+    def test_work_input_markers_evict_non_input_items_at_json_byte_limit(self):
+        limit = 96 * 1024
+        for character in ("x", "漢", "😀"):
+            with self.subTest(character=character):
+                trace = _WorkTrace()
+                trace.add({"type": "input_delivered", "message_id": 11})
+                width = len(json.dumps(character).encode("utf-8")) - 2
+                index = 0
+                while True:
+                    item_type = "thinking" if index % 2 == 0 else "text"
+                    overhead = len(json.dumps({"type": item_type, "text": ""}).encode("utf-8")) + 2
+                    room = limit - len(json.dumps(trace.data).encode("utf-8")) - overhead - 8
+                    count = min(4000, room // width)
+                    if count <= 0:
+                        break
+                    trace.add({"type": item_type + "_delta", "delta": character * count})
+                    index += 1
+                self.assertGreater(len(json.dumps(trace.data).encode("utf-8")), limit - 128)
+                before = len(trace.data["items"])
+                trace.add({"type": "input_delivered", "message_id": 12})
+                self.assertLessEqual(len(trace.data["items"]), before)
+                self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), limit)
+                work = trace.finish()
+                self.assertTrue(work["truncated"])
+                self.assertEqual([item["message_id"] for item in work["items"] if item["type"] == "input"], [11, 12])
+                self.assertLessEqual(len(work["items"]), 200)
+                self.assertLessEqual(len(json.dumps(work).encode("utf-8")), limit)
+
+    def test_work_retains_all_input_markers_when_markers_alone_exceed_item_limit(self):
+        trace = _WorkTrace()
+        for message_id in range(205):
+            trace.add({"type": "input_delivered", "message_id": message_id})
+        trace.add({"type": "thinking_delta", "delta": "No room for more work"})
+        work = trace.finish()
+        self.assertTrue(work["truncated"])
+        self.assertEqual(len(work["items"]), 205)
+        self.assertEqual([item["message_id"] for item in work["items"]], list(range(205)))
+        self.assertTrue(all(item["type"] == "input" for item in work["items"]))
 
     def test_work_exact_field_bounds_do_not_truncate(self):
         trace = _WorkTrace()
@@ -375,15 +1106,22 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_during_submit_and_reset(self):
         self.hold.clear()
-        await self.q.enqueue(self.user, "private", "active")
-        await asyncio.sleep(0)
-        await self.q.enqueue(self.user, "private", "queued")
+        parent = await self.q.enqueue(self.user, "private", "active")
+        await asyncio.wait_for(self.run_started.wait(), 2)
+        child = await self.q.enqueue(self.user, "private", "inserted before run creation")
+        self.assertEqual(self.job(child)["payload"]["parent_job_id"], parent["job_id"])
         await self.q.cancel(self.user, "private")
         self.hold.set()
         await self.drain()
         self.assertEqual(len(self.requests), 1)
         self.assertIn(("POST", "/v1/runs/r1/cancel"), self.calls)
-        self.assertIn("cancelled", [m["metadata"]["status"] for m in self.q.messages(self.user, "private")["messages"]])
+        messages = self.q.messages(self.user, "private")["messages"]
+        self.assertTrue(all(message["metadata"]["status"] == "cancelled" for message in messages))
+        self.assertEqual(self.steers, [])
+        replies = [message for message in messages if message["role"] == "assistant"]
+        self.assertEqual(len(replies), 1)
+        self.assert_reply_to(replies[0], parent)
+        self.assertEqual(self.job(child)["status"], "failed")
         await self.q.compact(self.user, "private")
         await self.drain()
         await self.q.reset(self.user, "private")
@@ -653,16 +1391,20 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_fifo_and_accounting_without_phantom_messages(self):
         self.hold.clear()
-        await self.q.enqueue(self.user, "private", "before")
-        await asyncio.sleep(0)
+        before = await self.q.enqueue(self.user, "private", "before")
+        await asyncio.wait_for(self.run_started.wait(), 2)
         self.compact_hold.clear()
         accepted = await self.q.compact(self.user, "private")
         self.assertEqual(accepted["status"], "queued")
         self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "queued")
         self.hold.set()
         await asyncio.wait_for(self.compact_started.wait(), 2)
-        await self.q.enqueue(self.user, "private", "after one")
-        await self.q.enqueue(self.user, "private", "after two")
+        after = [await self.q.enqueue(self.user, "private", text) for text in ("after one", "after two")]
+        for child in after:
+            self.assertEqual(self.job(child)["status"], "queued")
+            self.assertNotIn("parent_job_id", self.job(child)["payload"])
+            self.assertNotIn("inserted_into", child["message"]["metadata"])
+        self.assertEqual(self.steers, [])
         self.assertEqual([r["prompt"]["text"] for r in self.requests], ["before"])
         self.assertEqual(self.q.messages(self.user, "private")["compaction"]["status"], "compacting")
         self.compact_hold.set()
@@ -675,6 +1417,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page["compaction"], {"job_id": accepted["job_id"], "status": "done", "after_message_id": before_reply})
         self.assertEqual([m["content"] for m in page["messages"] if m["role"] == "user"], ["before", "after one", "after two"])
         self.assertEqual([m["metadata"]["status"] for m in page["messages"] if m["role"] == "assistant"], ["completed"] * 3)
+        replies = [message for message in page["messages"] if message["role"] == "assistant"]
+        for reply, request in zip(replies, (before, *after), strict=True):
+            self.assert_reply_to(reply, request)
         with self.p.db.connect() as conn:
             events = [json.loads(row[0]) for row in conn.execute("SELECT event_json FROM queue_events")]
             usage = conn.execute("SELECT * FROM token_usage_events WHERE json_extract(raw_usage_json,'$.kind')='compaction'").fetchone()

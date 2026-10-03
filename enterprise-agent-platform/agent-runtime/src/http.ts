@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer as nodeCreateServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Runtime } from './runtime.js';
 
-type Service = Pick<Runtime, 'start' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
+type Service = Pick<Runtime, 'start' | 'steer' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
 const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
@@ -19,12 +19,21 @@ function validateModel(model: unknown): asserts model is Parameters<Runtime['sta
     if(value!==undefined&&(typeof value!=='number'||!Number.isSafeInteger(value)||value<1))throw failure(400,`Invalid model ${key}`);
   }
 }
+function validatePrompt(prompt: unknown): asserts prompt is Parameters<Runtime['start']>[1]['prompt'] {
+  if (!object(prompt) || typeof prompt.text !== 'string' || (prompt.images !== undefined && (!Array.isArray(prompt.images) || !prompt.images.every(image => object(image) && text(image.mime) && text(image.data))))) throw failure(400, 'Invalid prompt');
+}
+function validateSteer(value: unknown): asserts value is Parameters<Runtime['steer']>[1] {
+  if (!object(value) || !text(value.input_id) || value.input_id.length > 64) throw failure(400, 'Invalid input_id');
+  validatePrompt(value.prompt);
+  if (!Array.isArray(value.prompt.images)) throw failure(400, 'Invalid prompt images');
+  if (typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
+}
 function validateRun(value: unknown): asserts value is Parameters<Runtime['start']>[1] {
   if (!object(value) || !['agent', 'chat'].includes(String(value.kind))) throw failure(400, 'Invalid run kind');
   const { sandbox, model, prompt, resources } = value;
   if (!object(sandbox) || !['scope_key', 'workspace_id', 'sandbox_id', 'lifecycle_id', 'cwd'].every(key => text(sandbox[key])) || !['agent', 'chat'].includes(String(sandbox.profile))) throw failure(400, 'Invalid sandbox');
   validateModel(model);
-  if (!object(prompt) || typeof prompt.text !== 'string' || (prompt.images !== undefined && (!Array.isArray(prompt.images) || !prompt.images.every(image => object(image) && text(image.mime) && text(image.data))))) throw failure(400, 'Invalid prompt');
+  validatePrompt(prompt);
   if (value.context_prefix !== undefined && typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
   if (!object(resources) || typeof resources.system_prompt !== 'string' || !Array.isArray(resources.skills) || !resources.skills.every(skill => object(skill) && text(skill.name) && typeof skill.description === 'string' && text(skill.path)) || (resources.agents_md !== null && resources.agents_md !== undefined && (!object(resources.agents_md) || !text(resources.agents_md.path) || typeof resources.agents_md.content !== 'string'))) throw failure(400, 'Invalid resources');
   if (!Array.isArray(value.tools) || !value.tools.every(tool => typeof tool === 'string' && tools.includes(tool))) throw failure(400, 'Invalid tools');
@@ -84,13 +93,13 @@ export function createServer(runtime: Service, token: string, maxBodyBytes = 33_
         json(response, 200, { status: 'ok', service: 'agent-platform-runtime' });
         return;
       }
-      const route = /^\/v1\/(sessions|runs)\/([^/]+)(?:\/(runs|events|cancel|compact|history))?$/.exec(url.pathname);
+      const route = /^\/v1\/(sessions|runs)\/([^/]+)(?:\/(runs|events|steer|cancel|compact|history))?$/.exec(url.pathname);
       if (!route) throw failure(404, 'Not found');
       let id: string;
       try { id = decodeURIComponent(route[2]!); } catch { throw failure(400, 'Invalid identifier'); }
       if (!id || /[\x00-\x1f\x7f]/.test(id)) throw failure(400, 'Invalid identifier');
       const operation = `${route[1]}/${route[3] ?? ''}`;
-      const allowed: Record<string, string> = { 'sessions/runs': 'POST', 'sessions/cancel': 'POST', 'sessions/compact': 'POST', 'sessions/': 'DELETE', 'sessions/history': 'GET', 'runs/events': 'GET', 'runs/cancel': 'POST' };
+      const allowed: Record<string, string> = { 'sessions/runs': 'POST', 'sessions/cancel': 'POST', 'sessions/compact': 'POST', 'sessions/': 'DELETE', 'sessions/history': 'GET', 'runs/events': 'GET', 'runs/steer': 'POST', 'runs/cancel': 'POST' };
       if (!allowed[operation]) throw failure(404, 'Not found');
       if (method !== allowed[operation]) { response.setHeader('allow', allowed[operation]); throw failure(405, 'Method not allowed'); }
       switch (operation) {
@@ -99,6 +108,12 @@ export function createServer(runtime: Service, token: string, maxBodyBytes = 33_
           validateRun(input);
           json(response, 202, await runtime.start(id, input));
           return;
+        }
+        case 'runs/steer': {
+          const input = await body(request, maxBodyBytes);
+          validateSteer(input);
+          runtime.steer(id, input);
+          break;
         }
         case 'runs/events': runtime.events(id, integer(url.searchParams.get('after'), 0, 0), response); return;
         case 'runs/cancel': await runtime.cancel(id); break;

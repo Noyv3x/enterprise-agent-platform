@@ -9,7 +9,7 @@
 | `users`, `settings` | Accounts, permission groups, personal model/thinking settings, the administrator-set chat model (`users.chat_model_name`, `''` follows the personal AI model), branding and OAuth. Signed login cookies use `users.token_version` for revocation; there is no login-session table. |
 | `channels`, `messages`, `attachments` | Shared/private product history and attachment metadata; bytes remain on disk. Hiding messages resets the visible conversation. Channel authorization uses permission groups, not membership rows. |
 | `agent_scopes` | Stable workspace and sandbox/lifecycle identity per personal or channel scope; Manager reads the scope inventory. |
-| `durable_jobs` | One durable queue, using kind `agent`; message and job are inserted atomically. FIFO per session; no automatic replay after uncertain execution. |
+| `durable_jobs` | One durable queue, using kind `agent`; message and job are inserted atomically. Eligible interactive messages join the running parent as linked running jobs, never independent worker claims; parent-first settlement updates all children in the same transaction. Other work remains FIFO per session. Uncertain inputs are never automatically replayed. |
 | `agent_schedules`, `agent_schedule_runs` | Schedule configuration, occurrences and execution history. Each occurrence enqueues an agent job in the owner's private scope. |
 | `token_usage_events` | Run usage; `raw_usage_json` retains input, output, cache-read and cache-write data for admin reporting. |
 | `schema_migrations` | Ordered, versioned forward migrations (each applied once) and the Manager release schema boundary. |

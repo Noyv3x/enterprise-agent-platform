@@ -1,3 +1,4 @@
+import { Fragment, type ReactNode } from "react";
 import { EntityChip } from "../../components/ui/beautiful/atoms/EntityChip";
 import { StatusPill } from "../../components/ui/beautiful/atoms/StatusPill";
 import LoadingState from "../../components/ui/beautiful/primitives/LoadingState";
@@ -6,8 +7,8 @@ import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
-import type { LiveRun, Message } from "./types";
-import { messageWork, splitLive } from "./work";
+import type { LiveRun, Message, RunRef } from "./types";
+import { messageWork, splitLive, workSegments, type WorkTrace } from "./work";
 import { WorkView } from "./WorkView";
 
 /** `MEDIA: /workspace/x` lines stay in stored text; the attachment card replaces the ones it delivered. */
@@ -41,12 +42,13 @@ function timeLabel(message: Message): string {
 }
 
 /** Harness UserBubble; channel messages name their author, and other people's messages sit on the left. */
-export function UserBubble({ message, showAuthor, mine, queuePosition }: {
+export function UserBubble({ message, showAuthor, mine, queuePosition, pending = false }: {
   message: Message;
   showAuthor: boolean;
   mine: boolean;
   /** 1-based FIFO position while queued */
   queuePosition?: number;
+  pending?: boolean;
 }) {
   const w = useWords();
   const content = visibleContent(message);
@@ -71,12 +73,33 @@ export function UserBubble({ message, showAuthor, mine, queuePosition }: {
             : w("Queued", "排队中", "排隊中")}
         </span>
       )}
+      {pending && <span className="text-[12px] text-ink-2">{w("The agent will see this after its current step", "智能体会在当前步骤结束后看到这条消息", "智慧體會在目前步驟結束後看到這則訊息")}</span>}
     </div>
   );
 }
 
+type RenderInput = (messageId: number, pending?: boolean) => ReactNode;
+
+/** Inputs sit outside the collapsible work, exactly where the agent received them. */
+function ReplyWork({ trace, working, run, renderInput }: {
+  trace: WorkTrace;
+  working: boolean;
+  run: RunRef;
+  renderInput: RenderInput;
+}) {
+  const segments = workSegments(trace);
+  return segments.map((segment, index) => (
+    <Fragment key={segment.key}>
+      {(segment.trace.items.length > 0 || segment.trace.truncated) && (
+        <WorkView trace={segment.trace} working={working && index === segments.length - 1} run={run} />
+      )}
+      {segment.input !== null && <div className="py-4">{renderInput(segment.input)}</div>}
+    </Fragment>
+  ));
+}
+
 /** A finished (or stopped) agent reply: its work trace, the answer, files, and the action row. */
-export function AssistantMessage({ message }: { message: Message }) {
+export function AssistantMessage({ message, renderInput }: { message: Message; renderInput: RenderInput }) {
   const w = useWords();
   const content = visibleContent(message);
   const trace = messageWork(message);
@@ -92,7 +115,7 @@ export function AssistantMessage({ message }: { message: Message }) {
   }
   return (
     <article className="flex min-w-0 flex-col gap-2" aria-label={w("Agent reply", "智能体回复", "智慧體回覆")} style={{ animation: "fade-up 450ms cubic-bezier(0.23,1,0.32,1) both" }}>
-      {trace && <WorkView trace={trace} working={false} run={message.id} />}
+      {trace && <ReplyWork trace={trace} working={false} run={message.id} renderInput={renderInput} />}
       <StreamingText
         streaming={false}
         actions={actions}
@@ -113,15 +136,21 @@ export function AssistantMessage({ message }: { message: Message }) {
 }
 
 /** The reply streaming right now: live work (open, shimmering) above the answer with its caret. */
-export function LiveReply({ run }: { run: LiveRun }) {
+export function LiveReply({ run, inserted, renderInput, starting = false }: {
+  run: LiveRun;
+  inserted: Message[];
+  renderInput: RenderInput;
+  starting?: boolean;
+}) {
   const w = useWords();
   const { work, answer } = splitLive(run.items);
   const notice = run.notice === "retry" ? w("Connection hiccup, retrying", "连接波动，正在重试", "連線不穩，正在重試")
     : run.notice === "compaction" ? w("Compacting context", "正在压缩上下文", "正在壓縮上下文") : null;
+  const delivered = new Set(work.flatMap((item) => item.type === "input" ? [item.messageId] : []));
   return (
     <article className="flex min-w-0 flex-col gap-2" aria-label={w("Reply in progress", "回复生成中", "回覆產生中")} aria-busy="true">
       {work.length > 0 && (
-        <WorkView trace={{ items: work, startedAt: run.startedAt, endedAt: null, truncated: false, omitted: 0 }} working={!answer} run="live" />
+        <ReplyWork trace={{ items: work, startedAt: run.startedAt, endedAt: null, truncated: false, omitted: 0 }} working={!answer} run="live" renderInput={renderInput} />
       )}
       {answer && (
         <StreamingText streaming>
@@ -130,9 +159,12 @@ export function LiveReply({ run }: { run: LiveRun }) {
       )}
       {(notice || (!work.length && !answer)) && (
         <div className="flex min-h-6 items-center">
-          <LoadingState variant="Dots" label={notice ?? w("Thinking", "思考中", "思考中")} since={run.startedAt} />
+          <LoadingState variant="Dots" label={notice ?? (starting ? w("Starting", "正在开始", "正在開始") : w("Thinking", "思考中", "思考中"))} since={run.startedAt} />
         </div>
       )}
+      {inserted.filter((message) => !delivered.has(message.id)).map((message) => (
+        <div key={message.id} className="py-4">{renderInput(message.id, message.metadata.delivery !== "delivered")}</div>
+      ))}
     </article>
   );
 }

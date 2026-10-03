@@ -3,11 +3,14 @@
  * - the self-running demo, demo @ sources, demo files and dictation are removed; every control is real:
  *   attach (+, paste, drag and drop) reports files to the caller, which owns uploads and chip state;
  *   `/` commands, the model list and send/stop come from props;
- * - a stop control takes the dictation slot while the agent is working (send still queues FIFO);
+ * - a stop control takes the dictation slot while the agent is working (send remains available for steering);
  * - the textarea is controlled by the caller so drafts survive re-renders and can be pre-filled;
  * - IME composition never sends; menus get listbox/menu roles; the glimm sweep marks a model change and is
  *   skipped under reduced motion or without WebGL; labels come from the caller (i18n);
- * - the send button uses the accent token (brand colour) per docs/design/frontend.md.
+ * - the send button uses the accent token (brand colour) per docs/design/frontend.md;
+ * - accessibility: controls grow to 44px through the app's `touch:` variant (coarse pointers and narrow screens)
+ *   rather than `pointer-coarse:` alone, the grid columns size to those targets, and the placeholder uses ink-2 for
+ *   4.5:1 contrast.
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createShader, playSweep, accentChain, ACCENTS, type ShaderController } from "glimm";
@@ -500,7 +503,7 @@ export default function PromptBar({
                   type="button"
                   aria-label={labels.remove(file.name)}
                   onClick={() => onRemoveAttachment?.(file.key)}
-                  className={`-my-1 flex size-6 shrink-0 items-center justify-center text-ink-3 transition-colors duration-100 hover:bg-line/70 hover:text-ink pointer-coarse:size-11 ${
+                  className={`-my-1 flex size-6 shrink-0 items-center justify-center text-ink-3 transition-colors duration-100 hover:bg-line/70 hover:text-ink touch:size-11 ${
                     pill ? "rounded-full" : "rounded-[5px]"
                   }`}
                 >
@@ -517,8 +520,8 @@ export default function PromptBar({
           ref={controlsRef}
           className={`grid items-end gap-x-1 gap-y-1.5 ${
             wide
-              ? "grid-cols-[28px_auto_minmax(0,1fr)_auto_28px]"
-              : "grid-cols-[28px_minmax(0,1fr)_auto_auto_28px]"
+              ? "grid-cols-[auto_auto_minmax(0,1fr)_auto_auto]"
+              : "grid-cols-[auto_minmax(0,1fr)_auto_auto_auto]"
           }`}
         >
           {onAttach && (
@@ -542,7 +545,7 @@ export default function PromptBar({
                   setModelOpen(false);
                   fileRef.current?.click();
                 }}
-                className={`flex size-7 shrink-0 items-center justify-center justify-self-start text-ink-3 transition-[background-color,color,transform] duration-150 hover:bg-hover hover:text-ink active:scale-[0.94] pointer-coarse:size-11 ${round} ${wide ? "col-start-1 row-start-2" : "col-start-1 row-start-1"}`}
+                className={`flex size-7 shrink-0 items-center justify-center justify-self-start text-ink-3 transition-[background-color,color,transform] duration-150 hover:bg-hover hover:text-ink active:scale-[0.94] touch:size-11 ${round} ${wide ? "col-start-1 row-start-2" : "col-start-1 row-start-1"}`}
               >
                 <Icon size={16} strokeWidth={2}><path d="M12 5v14M5 12h14" /></Icon>
               </button>
@@ -603,7 +606,7 @@ export default function PromptBar({
             }}
             placeholder={placeholder}
             aria-label={labels.prompt}
-            className={`${tall ? "min-h-[68px] px-2 py-2 text-[14px] leading-5" : "min-h-7 px-1 py-[5px] text-[13px] leading-[18px]"} min-w-0 w-full resize-none bg-transparent text-ink outline-none [overflow-wrap:anywhere] placeholder:text-ink-3 ${
+            className={`${tall ? "min-h-[68px] px-2 py-2 text-[14px] leading-5" : "min-h-7 px-1 py-[5px] text-[13px] leading-[18px]"} min-w-0 w-full resize-none bg-transparent text-ink outline-none [overflow-wrap:anywhere] placeholder:text-ink-2 ${
               wide ? "col-span-full col-start-1 row-start-1" : "col-start-2 row-start-1"
             }`}
           />
@@ -625,7 +628,7 @@ export default function PromptBar({
                   requestAnimationFrame(() => modelRowRefs.current[Math.max(0, modelIndex)]?.focus());
                 }
               }}
-              className={`flex h-7 min-w-0 shrink items-center gap-1 px-1.5 text-[12px] font-medium transition-colors duration-150 enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-50 pointer-coarse:h-11 ${
+              className={`flex h-7 min-w-0 shrink items-center gap-1 px-1.5 text-[12px] font-medium transition-colors duration-150 enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-50 touch:h-11 ${
                 selectedModel ? "text-ink-2" : "text-orange"
               } ${round} ${wide ? "col-start-2 row-start-2 justify-self-start" : "col-start-3 row-start-1"}`}
             >
@@ -644,7 +647,7 @@ export default function PromptBar({
               title={labels.stop}
               disabled={stopping}
               onClick={onStop}
-              className={`flex size-7 shrink-0 items-center justify-center text-ink-2 shadow-btn transition-[background-color,color,transform] duration-150 enabled:hover:bg-hover enabled:hover:text-ink enabled:active:scale-[0.94] disabled:opacity-50 pointer-coarse:size-11 ${round} ${wide ? "col-start-4 row-start-2" : "col-start-4 row-start-1"}`}
+              className={`flex size-7 shrink-0 items-center justify-center text-ink-2 shadow-btn transition-[background-color,color,transform] duration-150 enabled:hover:bg-hover enabled:hover:text-ink enabled:active:scale-[0.94] disabled:opacity-50 touch:size-11 ${round} ${wide ? "col-start-4 row-start-2" : "col-start-4 row-start-1"}`}
             >
               <span className="size-2.5 rounded-[2px] bg-current" />
             </button>
@@ -656,7 +659,7 @@ export default function PromptBar({
             aria-label={labels.send}
             disabled={!canSend}
             onClick={send}
-            className={`flex size-7 shrink-0 items-center justify-center transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] pointer-coarse:size-11 ${round} ${wide ? "col-start-5 row-start-2" : "col-start-5 row-start-1"}`}
+            className={`flex size-7 shrink-0 items-center justify-center transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] touch:size-11 ${round} ${wide ? "col-start-5 row-start-2" : "col-start-5 row-start-1"}`}
             style={{
               background: canSend ? "var(--accent)" : "var(--line-strong)",
               color: canSend ? "white" : "var(--ink-2)",

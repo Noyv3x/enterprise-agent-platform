@@ -108,6 +108,41 @@ describe("Computer panel", () => {
     expect(within(panel).getByRole("button", { name: "Previous step" })).toBeDisabled();
   });
 
+  it("opens each segment's tool in the same live run and persisted reply", async () => {
+    const user = userEvent.setup();
+    const panel = await mount();
+    step("before-input", "read", { path: "/workspace/before.txt" }, "Before the insertion");
+    emit({ type: "input_delivered", message_id: 7 });
+    step("after-input", "read", { path: "/workspace/after.txt" }, "After the insertion");
+    const live = screen.getByRole("article", { name: "Reply in progress" });
+    await user.click(within(live).getByRole("button", { name: /^Worked for/ }));
+    const liveActions = within(live).getAllByRole("button", { name: "View in computer" });
+    expect(liveActions).toHaveLength(2);
+    await user.click(liveActions[0]);
+    expect(within(windowOf(panel)).getByText("Before the insertion")).toBeVisible();
+    expect(within(panel).getByText("1 / 2")).toBeVisible();
+    await user.click(liveActions[1]);
+    expect(within(windowOf(panel)).getByText("After the insertion")).toBeVisible();
+    expect(within(panel).getByText("2 / 2")).toBeVisible();
+
+    const finished = reply(40, [
+      tool("before-input", "read", { path: "/workspace/before.txt" }, "Before the insertion"),
+      { type: "input", message_id: 7, at: "2026-10-01T05:22:06Z" },
+      tool("after-input", "read", { path: "/workspace/after.txt" }, "After the insertion"),
+    ]);
+    emit({ type: "run_end", message: finished });
+    const settled = screen.getByRole("article", { name: "Agent reply" });
+    for (const header of within(settled).getAllByRole("button", { name: /^Worked for/ })) await user.click(header);
+    const persistedActions = within(settled).getAllByRole("button", { name: "View in computer" });
+    expect(persistedActions).toHaveLength(2);
+    await user.click(persistedActions[0]);
+    expect(within(windowOf(panel)).getByText("Before the insertion")).toBeVisible();
+    expect(within(panel).getByText("1 / 2")).toBeVisible();
+    await user.click(persistedActions[1]);
+    expect(within(windowOf(panel)).getByText("After the insertion")).toBeVisible();
+    expect(within(panel).getByText("2 / 2")).toBeVisible();
+  });
+
   it("follows the AI across kinds: a streaming write, live bash output replaced at tool_end, then the live browser", async () => {
     tabs = [{ tabId: "t1", url: "https://example.com/", title: "Example" }];
     const panel = await mount();

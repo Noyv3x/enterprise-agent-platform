@@ -27,6 +27,9 @@ export interface ComposerProps {
   onStop?: () => Promise<unknown>;
   /** accepted messages still waiting their FIFO turn */
   queued?: number;
+  /** this interactive turn can receive a message after its current step */
+  inserting?: boolean;
+  pendingInputs?: number;
   commands?: ComposerCommand[];
   placeholder: string;
   /** replaces the draft whenever `seed.n` changes (resend with attachments) */
@@ -34,7 +37,7 @@ export interface ComposerProps {
 }
 
 export function Composer({
-  ensureScope, onSend, working = false, onStop, queued = 0, commands = [], placeholder, seed,
+  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], placeholder, seed,
 }: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
@@ -101,12 +104,16 @@ export function Composer({
       `${queued} queued — messages run in order after the current reply`,
       `${queued} 条排队中，将在当前回复后依次处理`,
       `${queued} 則排隊中，將在目前回覆後依序處理`,
-    ) : null;
+    ) : pendingInputs > 0 ? w(
+      `${pendingInputs} ${pendingInputs === 1 ? "message" : "messages"} waiting for the current step to finish`,
+      `${pendingInputs} 条补充消息等待当前步骤结束`,
+      `${pendingInputs} 則補充訊息等待目前步驟結束`,
+    ) : inserting ? w("Send to guide the agent after its current step", "发送补充消息，智能体会在当前步骤后接收", "傳送補充訊息，智慧體會在目前步驟後接收") : null;
 
   return (
     <PromptBar
       tall
-      placeholder={placeholder}
+      placeholder={inserting ? w("Add a message to this run…", "补充消息，加入当前任务…", "補充訊息，加入目前任務…") : placeholder}
       draft={text}
       onDraftChange={setText}
       inputRef={input}

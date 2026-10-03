@@ -1,4 +1,4 @@
-"""Durable FIFO conversations; an uncertain Runtime submission is never replayed."""
+"""Durable conversations with mid-run inputs; uncertain execution is never replayed."""
 import asyncio
 import json
 import os
@@ -6,6 +6,8 @@ import shutil
 import time
 import uuid
 from datetime import datetime, timezone
+
+import httpx
 
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse, StreamingResponse
@@ -35,7 +37,7 @@ class _WorkTrace:
         started = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         self.data = {"v": 1, "started_at": started, "ended_at": started,
                      "items": [], "truncated": False}
-        self.last_tool_position = 0
+        self.last_boundary_position = 0
         self.previous = None
 
     def clipped(self, text, limit):
@@ -55,6 +57,20 @@ class _WorkTrace:
 
     def store(self, item, index=None):
         items = self.data["items"]
+        if index is None and item["type"] == "input":
+            # Delivery boundaries must survive a full trace. Make space by
+            # evicting other work, never an already delivered user input.
+            items.append(item)
+            while (len(items) > 200 or len(json.dumps(self.data).encode("utf-8")) +
+                   sum(40 for entry in items if entry["type"] == "tool" and entry["ended_at"] is None) > 96 * 1024):
+                self.data["truncated"] = True
+                victim = next((i for i, entry in enumerate(items) if entry["type"] != "input"), None)
+                if victim is None:
+                    break
+                items.pop(victim)
+                if victim < self.last_boundary_position:
+                    self.last_boundary_position -= 1
+            return True
         if index is None and len(items) >= 200:
             self.data["truncated"] = True
             return False
@@ -89,7 +105,7 @@ class _WorkTrace:
             self.previous = item_type
         elif kind == "tool_start":
             self.previous = "tool"
-            self.last_tool_position = len(items)
+            self.last_boundary_position = len(items)
             args = event.get("args", {})
             encoded = json.dumps(args)
             if len(encoded) > 2000:
@@ -116,11 +132,16 @@ class _WorkTrace:
                     item["output"] = entry["output"]
                     self.store(item, index)
                 break
+        elif kind == "input_delivered":
+            self.store({"type": "input", "message_id": event["message_id"],
+                        "at": datetime.now(timezone.utc).isoformat(timespec="microseconds")})
+            self.last_boundary_position = len(items) - 1
+            self.previous = "input"
 
     def finish(self):
         self.data["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         self.data["items"] = [item for index, item in enumerate(self.data["items"])
-                              if item["type"] != "text" or index < self.last_tool_position]
+                              if item["type"] != "text" or index < self.last_boundary_position]
         return self.data if self.data["items"] else None
 
 
@@ -311,10 +332,141 @@ class Queue:
                                    (info["scope_type"], info["scope_id"], str(uuid.uuid4()), json.dumps(payload), int(time.time()), int(time.time()))).lastrowid
                 if schedule_run_id:
                     conn.execute("UPDATE agent_schedule_runs SET durable_job_id=?,source_message_id=?,updated_at=? WHERE id=?", (job, mid, int(time.time()), schedule_run_id))
+                self.absorb(conn, job, payload, info)
             message = self.message(info, mid)
             self.emit(info["scope_key"], {"type": "message", "message": message})
-            self.wake(info["scope_key"])
-        return {"message": message, "job_id": job}
+            if payload.get("parent_job_id"):
+                await self.send_inputs(payload["parent_job_id"], info)
+            else:
+                self.wake(info["scope_key"])
+        return {"message": self.message(info, mid), "job_id": job}
+
+    def absorb(self, conn, job_id, payload, info):
+        """Attach only while the interactive parent and queue admission remain valid."""
+        if payload.get("schedule_run_id") is not None or info["scope_key"] in self.cancelling:
+            return False
+        parent = conn.execute(
+            "SELECT id,payload_json FROM durable_jobs WHERE kind='agent' AND status='running' "
+            "AND scope_type=? AND scope_id=? AND json_extract(payload_json,'$.scope')=? "
+            "AND json_extract(payload_json,'$.parent_job_id') IS NULL "
+            "AND json_extract(payload_json,'$.operation') IS NULL "
+            "AND json_extract(payload_json,'$.schedule_run_id') IS NULL ORDER BY id LIMIT 1",
+            (info["scope_type"], info["scope_id"], payload["scope"])).fetchone()
+        if parent is None:
+            return False
+        attached = conn.execute(
+            "UPDATE durable_jobs SET status='running',payload_json=json_set(payload_json,'$.parent_job_id',?),updated_at=? "
+            "WHERE id=? AND status='queued' "
+            "AND EXISTS (SELECT 1 FROM durable_jobs WHERE id=? AND status='running') "
+            "AND NOT EXISTS (SELECT 1 FROM durable_jobs WHERE kind='agent' AND status='queued' AND id!=? "
+            "AND scope_type=? AND scope_id=? AND json_extract(payload_json,'$.scope')=?)",
+            (parent["id"], int(time.time()), job_id, parent["id"], job_id,
+             info["scope_type"], info["scope_id"], payload["scope"])).rowcount
+        if not attached:
+            return False
+        payload["parent_job_id"] = parent["id"]
+        table = "chat_messages" if info["kind"] == "chat" else "messages"
+        conn.execute(
+            f"UPDATE {table} SET metadata_json=json_set(metadata_json,'$.status','running','$.inserted_into',?,'$.delivery','pending') WHERE id=?",
+            (json.loads(parent["payload_json"])["message_id"], payload["message_id"]))
+        return True
+
+    def requeue_input(self, conn, job_id, parent_job_id, info):
+        """Detach only a still-absorbed input; late HTTP responses cannot revive it."""
+        row = conn.execute(
+            "UPDATE durable_jobs SET status='queued',payload_json=json_remove(payload_json,'$.parent_job_id','$.steer_sent'),updated_at=? "
+            "WHERE id=? AND status='running' AND json_extract(payload_json,'$.parent_job_id')=? RETURNING payload_json",
+            (int(time.time()), job_id, parent_job_id)).fetchone()
+        if row is None:
+            return None
+        mid = json.loads(row["payload_json"])["message_id"]
+        table = "chat_messages" if info["kind"] == "chat" else "messages"
+        conn.execute(
+            f"UPDATE {table} SET metadata_json=json_set(json_remove(metadata_json,'$.inserted_into','$.delivery'),'$.status','queued') WHERE id=?",
+            (mid,))
+        return mid
+
+    async def send_inputs(self, parent_job_id, info):
+        """Caller holds the scope lock, preserving acceptance order across senders."""
+        with self.p.db.connect() as conn:
+            parent = conn.execute("SELECT payload_json FROM durable_jobs WHERE id=? AND status='running'", (parent_job_id,)).fetchone()
+            if parent is None:
+                return
+            run_id = json.loads(parent["payload_json"]).get("runtime_run_id")
+            if not run_id or info["scope_key"] in self.cancelling:
+                return
+            rows = conn.execute(
+                "SELECT id,payload_json FROM durable_jobs WHERE status='running' "
+                "AND json_extract(payload_json,'$.parent_job_id')=? "
+                "AND COALESCE(json_extract(payload_json,'$.steer_sent'),0)=0 ORDER BY id",
+                (parent_job_id,)).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            author = self.user(payload["user_id"])
+            prompt = self.p.files.prompt(author, info, payload["attachment_ids"])
+            prompt["text"] = payload["content"] + ("\n" + prompt["text"] if prompt["text"] else "")
+            with self.p.db.connect() as conn:
+                sent = conn.execute(
+                    "UPDATE durable_jobs SET payload_json=json_set(payload_json,'$.steer_sent',json('true')),updated_at=? "
+                    "WHERE id=? AND status='running' AND json_extract(payload_json,'$.parent_job_id')=? "
+                    "AND COALESCE(json_extract(payload_json,'$.steer_sent'),0)=0 "
+                    "AND EXISTS (SELECT 1 FROM durable_jobs WHERE id=? AND status='running')",
+                    (int(time.time()), row["id"], parent_job_id, parent_job_id)).rowcount
+            if not sent:
+                continue
+            try:
+                await self.runtime("POST", f"/v1/runs/{run_id}/steer", json={
+                    "input_id": str(row["id"]), "prompt": prompt,
+                    "context_prefix": json.dumps({"time": now(), "user": author["display_name"], "tz": author["timezone"]})})
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in (404, 409):
+                    continue
+                with self.p.db.connect() as conn:
+                    mid = self.requeue_input(conn, row["id"], parent_job_id, info)
+                if mid is not None:
+                    self.emit(info["scope_key"], {"type": "message", "message": self.message(info, mid)})
+                    self.wake(info["scope_key"])
+            except httpx.RequestError:
+                # Persisted before submission: an uncertain side effect is never retried.
+                continue
+
+    def input_delivered(self, parent_job_id, info, input_id):
+        with self.p.db.connect() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM durable_jobs WHERE CAST(id AS TEXT)=? AND status='running' "
+                "AND json_extract(payload_json,'$.parent_job_id')=?", (input_id, parent_job_id)).fetchone()
+            if row is None:
+                return None
+            mid = json.loads(row["payload_json"])["message_id"]
+            table = "chat_messages" if info["kind"] == "chat" else "messages"
+            changed = conn.execute(
+                f"UPDATE {table} SET metadata_json=json_set(metadata_json,'$.delivery','delivered') "
+                "WHERE id=? AND json_extract(metadata_json,'$.delivery')='pending'", (mid,)).rowcount
+        if not changed:
+            return None
+        self.emit(info["scope_key"], {"type": "message", "message": self.message(info, mid)})
+        return {"type": "input_delivered", "message_id": mid}
+
+    def settle_inputs(self, conn, parent_job_id, info, status, error=None):
+        rows = conn.execute(
+            "SELECT id,payload_json FROM durable_jobs WHERE status='running' "
+            "AND json_extract(payload_json,'$.parent_job_id')=? ORDER BY id", (parent_job_id,)).fetchall()
+        table = "chat_messages" if info["kind"] == "chat" else "messages"
+        mids = []
+        for row in rows:
+            mid = json.loads(row["payload_json"])["message_id"]
+            metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (mid,)).fetchone()[0])
+            if status == "completed" and metadata["delivery"] != "delivered":
+                self.requeue_input(conn, row["id"], parent_job_id, info)
+            else:
+                metadata["status"] = status
+                if error:
+                    metadata["error"] = error
+                conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps(metadata), mid))
+                conn.execute("UPDATE durable_jobs SET status=?,last_error=?,updated_at=? WHERE id=?",
+                             ("succeeded" if status == "completed" else "failed", error or "", int(time.time()), row["id"]))
+            mids.append(mid)
+        return mids
 
     def wake(self, key):
         if not self.stopping and not getattr(self.p.gate, "reserved", None) and key not in self.tasks:
@@ -359,6 +511,9 @@ class Queue:
             rows = conn.execute("SELECT * FROM durable_jobs WHERE kind='agent' AND (status IN ('running','queued') OR json_extract(payload_json,'$.runtime_unsettled')=1) ORDER BY id").fetchall()
         for row in rows:
             payload = json.loads(row["payload_json"])
+            if payload.get("parent_job_id"):
+                # Recovery settles linked inputs with their parent, never as turns.
+                continue
             if not payload.get("scope") and payload.get("user_message"):
                 with self.p.db.connect() as conn:
                     message = conn.execute("SELECT * FROM messages WHERE id=?", (payload["user_message"]["id"],)).fetchone()
@@ -509,6 +664,9 @@ class Queue:
                     self.running[key] = run_id
                     if key in self.cancelling:
                         await self.runtime("POST", f"/v1/runs/{run_id}/cancel")
+                    else:
+                        async with self.lock(key):
+                            await self.send_inputs(job["id"], info)
                     ended = False
                     async with self.p.http.stream("GET", self.p.settings.runtime_url.rstrip("/") + f"/v1/runs/{run_id}/events?after=0",
                                                   headers={"Authorization": f"Bearer {self.p.settings.runtime_token}"}, timeout=None) as response:
@@ -518,6 +676,10 @@ class Queue:
                                 continue
                             event = json.loads(line[5:].strip())
                             event.pop("seq", None)
+                            if event["type"] == "input_delivered":
+                                event = self.input_delivered(job["id"], info, event.get("input_id"))
+                                if event is None:
+                                    continue
                             work.add(event)
                             if event["type"] == "run_end":
                                 payload["runtime_unsettled"] = False
@@ -542,6 +704,9 @@ class Queue:
             self.tasks.pop(key, None)
 
     async def finish(self, job, payload, user, info, event, work=None):
+        if payload.get("parent_job_id"):
+            return
+        event.pop("undelivered_inputs", None)
         if payload.get("operation") == "compact":
             self.finish_compact(job, payload, event["status"], error=event.get("error"))
             return
@@ -551,20 +716,24 @@ class Queue:
         metadata = {"status": status}
         if event.get("error"):
             metadata["error"] = event["error"]
-        assistant_metadata = dict(metadata)
+        assistant_metadata = {**metadata, "reply_to": {"message_id": payload["message_id"]}}
         if work is not None and (trace := work.finish()):
             assistant_metadata["work"] = trace
         with self.p.db.connect() as conn:
-            state = conn.execute("SELECT status FROM durable_jobs WHERE id=?", (job["id"],)).fetchone()[0]
-            if state not in ("queued", "running"):
+            # Acquire the write lock by settling the parent FIRST. Absorption's
+            # conditional update can therefore never attach to a finished job.
+            changed = conn.execute(
+                "UPDATE durable_jobs SET status=?,payload_json=?,last_error=?,updated_at=? "
+                "WHERE id=? AND status IN ('queued','running')",
+                ("succeeded" if status == "completed" else "failed", json.dumps(payload),
+                 event.get("error", ""), int(time.time()), job["id"])).rowcount
+            if not changed:
                 return
-            conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
+            child_mids = self.settle_inputs(conn, job["id"], info, status, event.get("error"))
             mid = self.insert_message(conn, info, user, "assistant", event.get("text", ""), assistant_metadata)
             table = "chat_messages" if info["kind"] == "chat" else "messages"
             old_metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (payload["message_id"],)).fetchone()[0])
             conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps({**old_metadata, **metadata}), payload["message_id"]))
-            conn.execute("UPDATE durable_jobs SET status=?,last_error=?,updated_at=? WHERE id=?",
-                         ("succeeded" if status == "completed" else "failed", event.get("error", ""), int(time.time()), job["id"]))
             usage = event.get("usage", {})
             conn.execute("INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,raw_usage_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                          (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], info["scope_name"],
@@ -573,14 +742,41 @@ class Queue:
             if payload.get("schedule_run_id"):
                 conn.execute("UPDATE agent_schedule_runs SET status=?,response_message_id=?,finished_at=?,error=?,updated_at=? WHERE id=?",
                              ("succeeded" if status == "completed" else "failed", mid, int(time.time()), event.get("error", ""), int(time.time()), payload["schedule_run_id"]))
+        self.emit(info["scope_key"], {"type": "message", "message": self.message(info, payload["message_id"])})
+        for child_mid in child_mids:
+            self.emit(info["scope_key"], {"type": "message", "message": self.message(info, child_mid)})
         try:
             await self.p.files.deliver(user, info, mid, event.get("text", ""))
         except Exception as exc:
             event["error"] = assistant_metadata["error"] = f"File delivery failed: {exc}"
             event["status"] = assistant_metadata["status"] = "interrupted"
+            failed_mids = []
             with self.p.db.connect() as conn:
+                conn.execute("UPDATE durable_jobs SET status='failed',last_error=?,updated_at=? WHERE id=?",
+                             (event["error"], int(time.time()), job["id"]))
                 conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps(assistant_metadata), mid))
-                conn.execute("UPDATE durable_jobs SET status='failed',last_error=? WHERE id=?", (event["error"], job["id"]))
+                conn.execute(f"UPDATE {table} SET metadata_json=json_set(metadata_json,'$.status','interrupted','$.error',?) WHERE id=?",
+                             (event["error"], payload["message_id"]))
+                # File delivery can fail after the run's terminal settlement. Children
+                # cannot execute while this worker is finishing their parent.
+                for child_mid in child_mids:
+                    changed = conn.execute(
+                        "UPDATE durable_jobs SET status='failed',last_error=?,updated_at=?,"
+                        "payload_json=json_set(payload_json,'$.parent_job_id',?) "
+                        "WHERE kind='agent' AND (status IN ('queued','succeeded') OR "
+                        "(status='failed' AND json_extract(payload_json,'$.parent_job_id')=?)) "
+                        "AND scope_type=? AND scope_id=? "
+                        "AND json_extract(payload_json,'$.scope')=? AND json_extract(payload_json,'$.message_id')=?",
+                        (event["error"], int(time.time()), job["id"], job["id"], info["scope_type"], info["scope_id"],
+                         payload["scope"], child_mid)).rowcount
+                    if changed:
+                        conn.execute(
+                            f"UPDATE {table} SET metadata_json=json_set(metadata_json,'$.status','interrupted','$.error',?,"
+                            "'$.inserted_into',?,'$.delivery',COALESCE(json_extract(metadata_json,'$.delivery'),'pending')) WHERE id=?",
+                            (event["error"], payload["message_id"], child_mid))
+                        failed_mids.append(child_mid)
+            for changed_mid in [payload["message_id"], *failed_mids]:
+                self.emit(info["scope_key"], {"type": "message", "message": self.message(info, changed_mid)})
         event["message"] = self.message(info, mid)
         self.emit(info["scope_key"], event)
 

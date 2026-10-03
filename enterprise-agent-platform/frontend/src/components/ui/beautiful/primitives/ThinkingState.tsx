@@ -1,9 +1,10 @@
 /* Adapted from Beautiful UI components/primitives/ThinkingState.tsx (MIT, see ../NOTICE).
  * Adaptations: the scripted stage timer is replaced by the caller's real `working` state; the trace body is the
  * caller's ordered work (reasoning prose, step rows, tool chips) instead of demo rows; the gallery's reserved
- * min-height is dropped; the trace line follows content growth while streaming. Markup, classes and motion are
- * upstream's. */
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+ * min-height is dropped; the trace line follows content growth while streaming. Accessibility: the header button is
+ * named by its status text, and the working shimmer sweeps between ink-2 and ink so the label keeps 4.5:1 contrast.
+ * Markup, classes and motion are upstream's. */
+import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 
 /* ─────────────────────────────────────────────────────────
  * THINKING — expandable agent trace
@@ -79,6 +80,7 @@ export default function ThinkingState({
   children: ReactNode;
   onToggle?: (expanded: boolean) => void;
 }) {
+  const labelId = useId();
   const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
   /* open while the agent works, settle closed; a reader's choice wins */
   const expanded = manualExpanded ?? working;
@@ -100,6 +102,7 @@ export default function ThinkingState({
       <button
         type="button"
         aria-expanded={expanded}
+        aria-labelledby={labelId}
         onClick={() => {
           const next = !expanded;
           setManualExpanded(next);
@@ -117,13 +120,13 @@ export default function ThinkingState({
             <path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" />
           </svg>
         )}
-        <span role="status" className="contents">
+        <span id={labelId} role="status" className="contents">
           {working ? (
             <span
               className="bg-clip-text text-[13px] font-medium whitespace-nowrap text-transparent"
               style={{
                 backgroundImage:
-                  "linear-gradient(90deg, var(--ink-3) 35%, var(--ink) 50%, var(--ink-3) 65%)",
+                  "linear-gradient(90deg, var(--ink-2) 35%, var(--ink) 50%, var(--ink-2) 65%)",
                 backgroundSize: "200% 100%",
                 animation: "shimmer-text 1.4s linear infinite",
               }}
