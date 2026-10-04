@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { request } from "../../api";
-import PromptBar, { type PromptCommand } from "../../components/ui/beautiful/primitives/PromptBar";
+import PromptBar, { clipboardFiles, type PromptCommand } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
 import { uploadPath } from "./routes";
@@ -71,6 +71,24 @@ export function Composer({
         .catch((reason: unknown) => setUploads((current) => current.map((item) => (item.key === key ? { ...item, error: errorText(reason) } : item))));
     }
   };
+
+  // Files pasted while focus is elsewhere in the conversation (not another text field or a dialog) attach here.
+  const uploadRef = useRef(upload);
+  uploadRef.current = upload;
+  useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
+      if (event.defaultPrevented) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest("input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='dialog']")) return;
+      const files = clipboardFiles(event.clipboardData);
+      if (!files.length) return;
+      event.preventDefault();
+      uploadRef.current(files);
+      input.current?.focus();
+    };
+    document.addEventListener("paste", onPaste);
+    return () => document.removeEventListener("paste", onPaste);
+  }, []);
 
   const submit = async () => {
     if (!canSend) return;

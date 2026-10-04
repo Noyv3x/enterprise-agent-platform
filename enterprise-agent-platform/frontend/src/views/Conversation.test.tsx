@@ -575,6 +575,40 @@ describe('Conversation', () => {
     expect(calls('POST', '/api/attachments?scope=private')).toHaveLength(1);
   });
 
+  it('attaches an unnamed clipboard image that only appears in the clipboard items', async () => {
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([]),
+      'POST /api/attachments?scope=private': () => ({ attachment: { id: 19, filename: 'pasted-image-1.png', mime_type: 'image/png', size_bytes: 3, url: '/api/attachments/19', preview_url: null } }),
+    });
+    renderConversation('private');
+    const input = await screen.findByLabelText('Message');
+    const image = new File(['png'], '', { type: 'image/png' });
+    fireEvent.paste(input, { clipboardData: { files: [], items: [{ kind: 'string', type: 'text/html', getAsFile: () => null }, { kind: 'file', type: 'image/png', getAsFile: () => image }] } });
+    expect(await screen.findByText('pasted-image-1.png')).toBeVisible();
+    expect(calls('POST', '/api/attachments?scope=private')).toHaveLength(1);
+  });
+
+  it('attaches files pasted while focus is outside the composer, but not pastes into another text field', async () => {
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'assistant', 'Hello')]),
+      'POST /api/attachments?scope=private': () => ({ attachment: { id: 20, filename: 'shot.png', mime_type: 'image/png', size_bytes: 2048, url: '/api/attachments/20', preview_url: null } }),
+    });
+    renderConversation('private');
+    const input = await screen.findByLabelText('Message');
+    const clipboardData = () => ({ files: [new File(['png'], 'shot.png', { type: 'image/png' })], items: [] });
+
+    const other = document.createElement('input');
+    document.body.append(other);
+    fireEvent.paste(other, { clipboardData: clipboardData() });
+    expect(calls('POST', '/api/attachments?scope=private')).toHaveLength(0);
+    other.remove();
+
+    fireEvent.paste(screen.getByText('Hello'), { clipboardData: clipboardData() });
+    expect(await screen.findByText('2.0 KB')).toBeVisible();
+    expect(calls('POST', '/api/attachments?scope=private')).toHaveLength(1);
+    expect(input).toHaveFocus();
+  });
+
   it('shows interrupted replies honestly and resends the original request only on request', async () => {
     const user = userEvent.setup();
     const failed: Message = { ...message(5, 'assistant', 'Partial', 'interrupted'), metadata: { status: 'interrupted', error: 'Runtime restarted' } };

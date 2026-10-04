@@ -1,7 +1,9 @@
 /* Adapted from Beautiful UI components/primitives/PromptBar.tsx (MIT, see ../NOTICE).
  * Adaptations:
  * - the self-running demo, demo @ sources, demo files and dictation are removed; every control is real:
- *   attach (+, paste, drag and drop) reports files to the caller, which owns uploads and chip state;
+ *   attach (+, paste, drag and drop) reports files to the caller, which owns uploads and chip state; paste reads
+ *   the clipboard's file items (some browsers and apps leave `files` empty) and names unnamed images
+ *   (`clipboardFiles`, also used by callers that accept pastes outside the textarea);
  *   `/` commands, the model list and send/stop come from props;
  * - a stop control takes the dictation slot while the agent is working (send remains available for steering);
  * - the textarea is controlled by the caller so drafts survive re-renders and can be pre-filled;
@@ -14,6 +16,25 @@
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createShader, playSweep, accentChain, ACCENTS, type ShaderController } from "glimm";
+
+const PASTE_EXTENSIONS: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp" };
+
+/** Files on a paste's clipboard: file items first (some browsers and apps leave `files` empty), else `files`.
+ * Clipboard images often have no name; they get `pasted-image-N.<ext>`. */
+export function clipboardFiles(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  let files = Array.from(data.items ?? []).flatMap((item) => {
+    const file = item.kind === "file" ? item.getAsFile() : null;
+    return file ? [file] : [];
+  });
+  if (!files.length) files = Array.from(data.files ?? []);
+  let unnamed = 0;
+  return files.map((file) => {
+    if (file.name) return file;
+    const type = file.type || "image/png";
+    return new File([file], `pasted-image-${++unnamed}.${PASTE_EXTENSIONS[type] ?? "png"}`, { type, lastModified: file.lastModified || Date.now() });
+  });
+}
 
 /* The built-in "prism" palette is only cyan→indigo→magenta, so a sweep
  * reads as blue/purple. Build a true full-spectrum rainbow instead. */
@@ -572,7 +593,7 @@ export default function PromptBar({
               composingRef.current = false;
             }}
             onPaste={(event) => {
-              const files = Array.from(event.clipboardData.files);
+              const files = clipboardFiles(event.clipboardData);
               if (files.length && onAttach) {
                 event.preventDefault();
                 attachFiles(files);

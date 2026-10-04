@@ -22,6 +22,7 @@ Server authorization remains authoritative even when controls are hidden. Preser
 
 - Chat lists are scoped to the authenticated account. Logout/session expiry invalidates cached and in-flight results. Deleting a chat permanently deletes its working-directory files; confirmations state both consequences.
 - Keep composer text and uploads when the first activity changes an empty conversation into a thread. Resend belongs to the originating stopped user request, not assistant completion order.
+- Pasting (Ctrl/⌘+V) attaches the clipboard's files and images, read from its items with the file list as fallback; an unnamed clipboard image is uploaded as `pasted-image-N.<ext>`. In a conversation with a composer this works wherever focus is, except inside another text field or a dialog, and returns focus to the composer.
 - Switches change drafts only; saving requires the form's explicit submit action.
 - Browser tabs can be inspected without takeover. Expanded computer viewers sit above their parent sheet but below their popovers; Escape closes only the innermost layer.
 - Malformed chat hashes follow the unavailable-route path. Disclosure IDs are unique per component instance, and every mobile sidebar selection dismisses navigation, including the current route.
