@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -794,6 +795,165 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         for reply, request in zip(replies, (interrupted, cancelled), strict=True):
             self.assert_reply_to(reply, request)
 
+    def test_work_thinking_blocks_keep_separate_start_and_end_times(self):
+        instant = datetime(2026, 10, 4, tzinfo=timezone.utc)
+        moments = [instant + timedelta(seconds=second) for second in (0, 1, 9, 10, 13, 14)]
+        with patch("enterprise_agent_platform.queue.datetime") as clock:
+            clock.now.side_effect = moments
+            trace = _WorkTrace()
+            trace.add({"type": "thinking_start"})
+            self.assertEqual(trace.data["items"], [{
+                "type": "thinking", "text": "", "started_at": moments[1].isoformat(timespec="microseconds"),
+                "ended_at": None,
+            }])
+            trace.add({"type": "thinking_delta", "delta": "**Inspecting**\n\n"})
+            trace.add({"type": "thinking_delta", "delta": "First summary."})
+            trace.add({"type": "thinking_end"})
+            trace.add({"type": "thinking_start"})
+            trace.add({"type": "thinking_delta", "delta": "Second summary."})
+            trace.add({"type": "thinking_end"})
+            work = trace.finish()
+        self.assertEqual(work["items"], [
+            {"type": "thinking", "text": "**Inspecting**\n\nFirst summary.",
+             "started_at": moments[1].isoformat(timespec="microseconds"),
+             "ended_at": moments[2].isoformat(timespec="microseconds")},
+            {"type": "thinking", "text": "Second summary.",
+             "started_at": moments[3].isoformat(timespec="microseconds"),
+             "ended_at": moments[4].isoformat(timespec="microseconds")},
+        ])
+        self.assertFalse(work["truncated"])
+
+    def test_work_empty_thinking_block_retains_start_and_end_times(self):
+        instant = datetime(2026, 10, 4, tzinfo=timezone.utc)
+        moments = [instant + timedelta(seconds=second) for second in (0, 2, 5, 6)]
+        with patch("enterprise_agent_platform.queue.datetime") as clock:
+            clock.now.side_effect = moments
+            trace = _WorkTrace()
+            trace.add({"type": "thinking_start"})
+            trace.add({"type": "thinking_end"})
+            work = trace.finish()
+        self.assertEqual(work["items"], [{
+            "type": "thinking", "text": "", "started_at": moments[1].isoformat(timespec="microseconds"),
+            "ended_at": moments[2].isoformat(timespec="microseconds"),
+        }])
+        self.assertFalse(work["truncated"])
+
+    def test_work_thinking_delta_fallback_merges_without_open_blocks(self):
+        trace = _WorkTrace()
+        for event in [
+            {"type": "thinking_delta", "delta": "Legacy "},
+            {"type": "thinking_delta", "delta": ""},
+            {"type": "thinking_delta", "delta": "summary."},
+            {"type": "tool_start", "tool_call_id": "read", "name": "read", "args": {}},
+            {"type": "tool_end", "tool_call_id": "read", "is_error": False, "content_preview": []},
+            {"type": "thinking_delta", "delta": "Another "},
+            {"type": "thinking_delta", "delta": "summary."},
+            {"type": "thinking_start"},
+            {"type": "thinking_delta", "delta": "Explicit block."},
+            {"type": "thinking_end"},
+            {"type": "thinking_delta", "delta": "Later "},
+            {"type": "thinking_delta", "delta": "summary."},
+        ]:
+            trace.add(event)
+        items = trace.finish()["items"]
+        self.assertEqual([item["type"] for item in items], ["thinking", "tool", "thinking", "thinking", "thinking"])
+        for index, text in ((0, "Legacy summary."), (2, "Another summary."), (4, "Later summary.")):
+            self.assertEqual(items[index], {"type": "thinking", "text": text})
+        self.assertEqual(items[3]["text"], "Explicit block.")
+        self.assertIsNotNone(items[3]["ended_at"])
+
+    def test_work_thinking_blocks_clip_at_16000_characters(self):
+        for character in ("x", "漢", "😀"):
+            with self.subTest(character=character):
+                trace = _WorkTrace()
+                trace.add({"type": "thinking_start"})
+                trace.add({"type": "thinking_delta", "delta": "x" * 15998 + character})
+                trace.add({"type": "thinking_delta", "delta": character})
+                self.assertFalse(trace.data["truncated"])
+                trace.add({"type": "thinking_delta", "delta": "discarded suffix"})
+                trace.add({"type": "thinking_end"})
+                work = trace.finish()
+                self.assertEqual(work["items"][0]["text"], "x" * 15998 + character * 2)
+                self.assertIsNotNone(work["items"][0]["ended_at"])
+                self.assertTrue(work["truncated"])
+
+    def test_work_trace_bound_reserves_thinking_end_times_with_input_eviction(self):
+        limit = 96 * 1024
+        instant = datetime(2026, 10, 4, tzinfo=timezone.utc)
+        marker = {"type": "input", "message_id": 42, "at": instant.isoformat(timespec="microseconds")}
+        victim_length = len(json.dumps(marker)) - len(json.dumps({"type": "thinking", "text": ""})) - 25
+        for insert_input in (False, True):
+            for character in ("x", "漢", "😀"):
+                with self.subTest(insert_input=insert_input, character=character):
+                    with patch("enterprise_agent_platform.queue.datetime") as clock:
+                        clock.now.return_value = instant
+                        trace = _WorkTrace()
+                        trace.add({"type": "thinking_delta", "delta": "v" * victim_length})
+                        for index in range(22):
+                            trace.add({"type": "text_delta", "delta": "p" * 4000})
+                            trace.add({"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}})
+                            trace.add({"type": "tool_end", "tool_call_id": str(index),
+                                       "is_error": False, "content_preview": []})
+                        trace.add({"type": "thinking_start"})
+                        room = limit - len(json.dumps(trace.data).encode("utf-8")) - 40
+                        width = len(json.dumps(character).encode("utf-8")) - 2
+                        summary = character * (room // width) + "x" * (room % width)
+                        self.assertGreater(len(summary), 0)
+                        self.assertLess(len(summary), 16000)
+                        trace.add({"type": "thinking_delta", "delta": summary})
+                        self.assertEqual(len(json.dumps(trace.data).encode("utf-8")), limit - 40)
+                        trace.add({"type": "thinking_delta", "delta": "x" * 40})
+                        self.assertEqual(trace.data["items"][-1]["text"], summary)
+                        self.assertTrue(trace.data["truncated"])
+                        # Setting truncated changes false to true, freeing one byte.
+                        trace.add({"type": "thinking_delta", "delta": "x"})
+                        self.assertEqual(len(json.dumps(trace.data).encode("utf-8")), limit - 40)
+                        if insert_input:
+                            trace.add({"type": "input_delivered", "message_id": 42})
+                            self.assertEqual(trace.data["items"][-1], marker)
+                            self.assertEqual(trace.data["items"][0]["type"], "tool")
+                        trace.add({"type": "thinking_end"})
+                        work = trace.finish()
+                    block = next(item for item in work["items"]
+                                 if item["type"] == "thinking" and "started_at" in item)
+                    self.assertEqual(block["text"], summary + "x")
+                    self.assertEqual(block["started_at"], marker["at"])
+                    self.assertEqual(block["ended_at"], marker["at"])
+                    self.assertLessEqual(len(json.dumps(work).encode("utf-8")), limit)
+
+    def test_work_rejected_thinking_start_cannot_merge_into_prior_block(self):
+        trace = _WorkTrace()
+        for index in range(199):
+            trace.add({"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}})
+        trace.add({"type": "thinking_delta", "delta": "Retained legacy summary."})
+        trace.add({"type": "thinking_start"})
+        trace.add({"type": "thinking_delta", "delta": "Discarded new block."})
+        trace.add({"type": "thinking_end"})
+        work = trace.finish()
+        self.assertEqual(len(work["items"]), 200)
+        self.assertEqual(work["items"][-1], {"type": "thinking", "text": "Retained legacy summary."})
+        self.assertTrue(work["truncated"])
+
+    def test_work_evicted_thinking_block_cannot_overwrite_later_items(self):
+        trace = _WorkTrace()
+        trace.add({"type": "thinking_start"})
+        trace.add({"type": "thinking_delta", "delta": "Evicted summary."})
+        for index in range(199):
+            trace.add({"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}})
+        trace.add({"type": "input_delivered", "message_id": 42})
+        trace.add({"type": "thinking_delta", "delta": "Discarded continuation."})
+        trace.add({"type": "thinking_end"})
+        trace.add({"type": "tool_end", "tool_call_id": "198", "is_error": False,
+                   "content_preview": [{"type": "text", "text": "Finished"}]})
+        work = trace.finish()
+        self.assertEqual(len(work["items"]), 200)
+        self.assertEqual([item["type"] for item in work["items"]], ["tool"] * 199 + ["input"])
+        self.assertEqual(work["items"][-1]["message_id"], 42)
+        self.assertEqual(work["items"][-2]["status"], "done")
+        self.assertEqual(work["items"][-2]["output"], "Finished")
+        self.assertIsNotNone(work["items"][-2]["ended_at"])
+        self.assertTrue(work["truncated"])
+
     def test_work_input_boundary_preserves_prior_text_and_removes_final_answer(self):
         trace = _WorkTrace()
         trace.add({"type": "text_delta", "delta": "Earlier answer"})
@@ -871,7 +1031,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         trace = _WorkTrace()
         args = {"command": "x" * (2000 - len(json.dumps({"command": ""})))}
         for event in [
-            {"type": "thinking_delta", "delta": "t" * 4000},
+            {"type": "thinking_delta", "delta": "t" * 16000},
             {"type": "text_delta", "delta": "p" * 4000},
             {"type": "tool_start", "tool_call_id": "exact", "name": "bash", "args": args},
             {"type": "tool_end", "tool_call_id": "exact", "is_error": False,
@@ -880,7 +1040,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             trace.add(event)
         work = trace.finish()
         self.assertFalse(work["truncated"])
-        self.assertEqual(work["items"][0]["text"], "t" * 4000)
+        self.assertEqual(work["items"][0]["text"], "t" * 16000)
         self.assertEqual(work["items"][1]["text"], "p" * 4000)
         self.assertEqual(work["items"][2]["args"], args)
         self.assertEqual(work["items"][2]["output"], "o" * 2000)
@@ -892,6 +1052,83 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.q.enqueue(self.user, "private", "Inspect the report")
         await self.drain()
         return self.q.messages(self.user, "private")["messages"][-1]
+
+    async def test_work_thinking_blocks_interleave_with_tools_and_inputs_and_relay_over_sse(self):
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "Check the totals too")
+        events = [
+            {"type": "thinking_start"},
+            {"type": "thinking_delta", "delta": "Before tool. "},
+            {"type": "tool_start", "tool_call_id": "read", "name": "read", "args": {}},
+            {"type": "thinking_delta", "delta": "After tool start. "},
+            {"type": "input_delivered", "input_id": str(child["job_id"])},
+            {"type": "thinking_delta", "delta": "After input."},
+            {"type": "tool_end", "tool_call_id": "read", "is_error": False,
+             "content_preview": [{"type": "text", "text": "Read complete."}]},
+            {"type": "thinking_end"},
+            {"type": "thinking_start"},
+            {"type": "thinking_end"},
+            {"type": "thinking_start"},
+            {"type": "thinking_delta", "delta": "Final summary."},
+            {"type": "thinking_end"},
+            {"type": "text_delta", "delta": "Final answer"},
+        ]
+        await stream.send(*events)
+        stream.finish(text="Final answer")
+        await self.drain()
+        message = self.q.messages(self.user, "private")["messages"][-1]
+        self.assert_reply_to(message, parent)
+        self.assertEqual(message["content"], "Final answer")
+        work = message["metadata"]["work"]
+        items = work["items"]
+        self.assertEqual([item["type"] for item in items], ["thinking", "tool", "input", "thinking", "thinking"])
+        self.assertEqual([item["text"] for item in items if item["type"] == "thinking"],
+                         ["Before tool. After tool start. After input.", "", "Final summary."])
+        self.assertEqual((items[1]["status"], items[1]["output"]), ("done", "Read complete."))
+        self.assertEqual(items[2]["message_id"], child["message"]["id"])
+        for item in items:
+            if item["type"] in ("thinking", "tool"):
+                self.assertLessEqual(work["started_at"], item["started_at"])
+                self.assertLessEqual(item["started_at"], item["ended_at"])
+                self.assertLessEqual(item["ended_at"], work["ended_at"])
+        self.assertFalse(work["truncated"])
+        public = self.q.events(self.user, "private", 0)
+        relayed = []
+        try:
+            async with asyncio.timeout(2):
+                async for frame in public:
+                    event = json.loads(frame.split(b"data: ", 1)[1])
+                    event.pop("seq")
+                    if event["type"] == "run_end":
+                        self.assertEqual(event["message"], message)
+                        break
+                    if event["type"] != "message":
+                        relayed.append(event)
+        finally:
+            await public.aclose()
+        self.assertEqual(relayed, [
+            {"type": "input_delivered", "message_id": child["message"]["id"]}
+            if event["type"] == "input_delivered" else event for event in events
+        ])
+
+    async def test_work_unfinished_thinking_blocks_survive_run_outcomes(self):
+        for runtime_status, message_status in [
+            ("completed", "completed"), ("failed", "interrupted"), ("cancelled", "cancelled"),
+            (None, "interrupted"),
+        ]:
+            with self.subTest(status=runtime_status):
+                message = await self.run_work([
+                    {"type": "thinking_start"},
+                    {"type": "thinking_delta", "delta": "Partial summary."},
+                ], runtime_status)
+                self.assertEqual(message["metadata"]["status"], message_status)
+                work = message["metadata"]["work"]
+                self.assertEqual(len(work["items"]), 1)
+                block = work["items"][0]
+                self.assertEqual((block["type"], block["text"]), ("thinking", "Partial summary."))
+                self.assertLessEqual(work["started_at"], block["started_at"])
+                self.assertLessEqual(block["started_at"], work["ended_at"])
+                self.assertIsNone(block["ended_at"])
 
     async def test_work_preserves_arrival_order_and_excludes_final_answer(self):
         message = await self.run_work([
@@ -1013,7 +1250,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(_WorkTrace, "add", checked_add):
             message = await self.run_work([
-                {"type": "thinking_delta", "delta": "t" * 3999},
+                {"type": "thinking_delta", "delta": "t" * 15999},
                 {"type": "thinking_delta", "delta": "ail"},
                 {"type": "text_delta", "delta": "p" * 3999},
                 {"type": "text_delta", "delta": "ost"},
@@ -1025,7 +1262,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             ])
         self.assertEqual(message["metadata"]["status"], "completed")
         work = message["metadata"]["work"]
-        self.assertEqual(work["items"][0]["text"], "t" * 3999 + "a")
+        self.assertEqual(work["items"][0]["text"], "t" * 15999 + "a")
         self.assertEqual(work["items"][1]["text"], "p" * 3999 + "o")
         self.assertEqual(work["items"][2]["args"], {"_preview": json.dumps(args)[:2000]})
         self.assertEqual(work["items"][2]["output"], "f" * 2000)
@@ -1310,29 +1547,29 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertEqual(self.requests[0]["model"], {"id": "catalog-default", "thinking": "off"})
 
-    async def test_chat_follows_the_personal_model_until_an_administrator_sets_one(self):
+    async def test_chat_follows_the_personal_model_and_thinking_until_an_administrator_sets_a_model(self):
         cid = "11111111-1111-1111-1111-111111111111"
         with self.p.db.connect() as conn:
             conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Switch models',?,?,NULL)", (cid, 1, now(), now()))
         scope = "chat-" + cid
         await self.q.enqueue(self.user, scope, "Follows personal")
         await self.drain()
-        self.assertEqual(self.requests[0]["model"], {"id": "model-a", "thinking": "off"})
+        self.assertEqual(self.requests[0]["model"], {"id": "model-a", "thinking": "medium"})
         with self.p.db.connect() as conn:
             conn.execute("UPDATE users SET chat_model_name='model-b' WHERE id=1")
         await self.q.enqueue(self.user, scope, "Admin model")
         await self.drain()
-        self.assertEqual(self.requests[1]["model"], {"id": "model-b", "thinking": "off"})
+        self.assertEqual(self.requests[1]["model"], {"id": "model-b", "thinking": "medium"})
         await self.q.compact(self.user, scope)
         await self.drain()
-        self.assertEqual(self.compactions, [{"model": {"id": "model-b", "thinking": "off"}}])
+        self.assertEqual(self.compactions, [{"model": {"id": "model-b", "thinking": "medium"}}])
         await self.q.enqueue(self.user, "private", "Personal AI is unaffected")
         await self.drain()
         self.assertEqual(self.requests[2]["model"], {"id": "model-a", "thinking": "medium"})
         with self.p.db.connect() as conn:
-            conn.execute("UPDATE users SET model_name='',chat_model_name='' WHERE id=1")
+            conn.execute("UPDATE users SET model_name='',chat_model_name='',thinking_depth='none' WHERE id=1")
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}]}))
-        await self.q.enqueue(self.user, scope, "Catalog default")
+        await self.q.enqueue(self.q.user(1), scope, "Catalog default with thinking off")
         await self.drain()
         self.assertEqual(self.requests[3]["model"], {"id": "catalog-default", "thinking": "off"})
 

@@ -602,6 +602,79 @@ test('HTTP runs stream real Pi text, thinking, sandbox and gateway tools, aggreg
   assert.equal(f.gatewayCalls[0].body.context.owner_user_id,1);
 });
 
+test('thinking summary deltas stream between start and end in order', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  const summary = '**Inspecting packages**\n\nChecking the runtime and its scripted-model fixtures.';
+  f.faux.setResponses([fauxAssistantMessage([fauxThinking(summary),{type:'text',text:'Done'}])]);
+  const body = request(f.faux.getModel().id);
+  body.model.thinking = 'medium';
+  const events = await f.events(await f.start('agent-private-thinking',body));
+  const thinking = events.filter(event=>event.type.startsWith('thinking_'));
+  const deltas = thinking.slice(1,-1);
+  assert(deltas.length>1);
+  assert(deltas.every(event=>event.type==='thinking_delta'));
+  assert.equal(deltas.map(event=>event.delta).join(''),summary);
+  assert.deepEqual(thinking[0],{seq:1,type:'thinking_start'});
+  assert.deepEqual(thinking.at(-1),{seq:thinking.length,type:'thinking_end'});
+  assert.deepEqual(events.slice(0,thinking.length),thinking);
+  assert.equal(events[thinking.length]?.type,'text_delta');
+  assert.equal(events.at(-1)?.status,'completed');
+  assert.equal(events.at(-1)?.text,'Done');
+});
+
+test('a reasoning block without a summary emits start and end without deltas', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  // Faux synthesizes an empty delta; script Codex's no-summary stream without it.
+  const streamSimple = f.faux.provider.streamSimple;
+  t.mock.method(f.faux.provider,'streamSimple',(...args:Parameters<typeof streamSimple>)=>{
+    const stream = streamSimple(...args);
+    const push = stream.push.bind(stream);
+    t.mock.method(stream,'push',(event:Parameters<typeof push>[0])=>{
+      if(event.type!=='thinking_delta'||event.delta!=='')push(event);
+    });
+    return stream;
+  });
+  f.faux.setResponses([fauxAssistantMessage([fauxThinking(''),{type:'text',text:'Done'}])]);
+  const body = request(f.faux.getModel().id);
+  body.model.thinking = 'medium';
+  const events = await f.events(await f.start('agent-private-empty-thinking',body));
+  const thinking = events.filter(event=>event.type.startsWith('thinking_'));
+  assert.deepEqual(thinking,[{seq:1,type:'thinking_start'},{seq:2,type:'thinking_end'}]);
+  assert.deepEqual(events.slice(0,2),thinking);
+  assert.equal(events[2]?.type,'text_delta');
+  assert.equal(events.at(-1)?.status,'completed');
+  assert.equal(events.at(-1)?.text,'Done');
+});
+
+test('two reasoning blocks in one response keep separate start and end boundaries', {timeout:20_000}, async t=>{
+  const f = await fixture(t);
+  const summaries = ['**Inspecting packages**\n\nReading the runtime.','**Choosing the change**\n\nForwarding each boundary.'];
+  f.faux.setResponses([fauxAssistantMessage([...summaries.map(fauxThinking),{type:'text',text:'Done'}])]);
+  const body = request(f.faux.getModel().id);
+  body.model.thinking = 'medium';
+  const events = await f.events(await f.start('agent-private-thinking-blocks',body));
+  const blocks:string[] = [];
+  let open:string|undefined;
+  for(const event of events){
+    if(event.type==='thinking_start'){
+      assert.equal(open,undefined,'the previous block must end before another starts');
+      open = '';
+    }else if(event.type==='thinking_delta'){
+      assert(open!==undefined,'a summary delta must belong to an open block');
+      assert(typeof event.delta==='string');
+      open += event.delta;
+    }else if(event.type==='thinking_end'){
+      assert(open!==undefined,'each end must have its own start');
+      blocks.push(open);
+      open = undefined;
+    }else assert.equal(open,undefined,'thinking must end before text or run completion');
+  }
+  assert.equal(open,undefined);
+  assert.deepEqual(blocks,summaries);
+  assert.equal(events.at(-1)?.status,'completed');
+  assert.equal(events.at(-1)?.text,'Done');
+});
+
 test('unchanged resources add no prompt update; an edited AGENTS.md is appended by Pi without rewriting the prefix', {timeout:20_000}, async t=>{
   const f = await fixture(t);
   const captured: TranscriptContext[] = [];

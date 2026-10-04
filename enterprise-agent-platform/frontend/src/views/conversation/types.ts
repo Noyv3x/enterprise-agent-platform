@@ -67,6 +67,8 @@ export interface ToolCall {
 /** The agent turn currently streaming over SSE, in arrival order; it becomes a persisted message at `run_end`. */
 export interface LiveRun {
   items: WorkItem[];
+  /** index of the explicitly open reasoning block; null for older delta-only streams */
+  thinkingIndex: number | null;
   /** the run's tool calls with streaming input/output, for the computer panel only */
   calls: ToolCall[];
   /** epoch ms the first event of this run arrived */

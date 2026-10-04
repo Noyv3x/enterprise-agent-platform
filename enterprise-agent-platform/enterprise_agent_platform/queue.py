@@ -39,6 +39,7 @@ class _WorkTrace:
                      "items": [], "truncated": False}
         self.last_boundary_position = 0
         self.previous = None
+        self.thinking = None
 
     def clipped(self, text, limit):
         if len(text) > limit:
@@ -62,7 +63,8 @@ class _WorkTrace:
             # evicting other work, never an already delivered user input.
             items.append(item)
             while (len(items) > 200 or len(json.dumps(self.data).encode("utf-8")) +
-                   sum(40 for entry in items if entry["type"] == "tool" and entry["ended_at"] is None) > 96 * 1024):
+                   sum(40 for entry in items if entry["type"] in ("tool", "thinking") and
+                       entry.get("ended_at", "") is None) > 96 * 1024):
                 self.data["truncated"] = True
                 victim = next((i for i, entry in enumerate(items) if entry["type"] != "input"), None)
                 if victim is None:
@@ -79,8 +81,9 @@ class _WorkTrace:
             items.append(item)
         else:
             items[index] = item
-        # Reserve timestamp space for unfinished tools before accepting growth.
-        reserve = sum(40 for entry in items if entry["type"] == "tool" and entry["ended_at"] is None)
+        # Reserve timestamp space for unfinished tools and thinking blocks.
+        reserve = sum(40 for entry in items if entry["type"] in ("tool", "thinking") and
+                      entry.get("ended_at", "") is None)
         if len(json.dumps(self.data).encode("utf-8")) + reserve > 96 * 1024:
             if index is None:
                 items.pop()
@@ -93,15 +96,38 @@ class _WorkTrace:
     def add(self, event):
         kind = event["type"]
         items = self.data["items"]
-        if kind in ("thinking_delta", "text_delta"):
+        if kind == "thinking_start":
+            self.thinking = {"type": "thinking", "text": "",
+                             "started_at": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+                             "ended_at": None}
+            self.store(self.thinking)
+            self.previous = "thinking"
+        elif kind == "thinking_end":
+            for index, entry in enumerate(items):
+                if entry is self.thinking:
+                    self.store({**entry, "ended_at": datetime.now(timezone.utc).isoformat(timespec="microseconds")},
+                               index)
+                    break
+            self.thinking = None
+            self.previous = None
+        elif kind in ("thinking_delta", "text_delta"):
             text = event.get("delta", "")
             if not text:
                 return
             item_type = kind.removesuffix("_delta")
-            merge = self.previous == item_type and items and items[-1]["type"] == item_type
-            prior = items[-1]["text"] if merge else ""
-            text = prior + self.clipped(text, max(0, 4000 - len(prior)))
-            self.store({"type": item_type, "text": text}, len(items) - 1 if merge else None)
+            if item_type == "thinking" and self.thinking is not None:
+                index = next((i for i, entry in enumerate(items) if entry is self.thinking), None)
+                if index is None:
+                    # A bounded-out block must not merge into unrelated work.
+                    return
+            else:
+                merge = self.previous == item_type and items and items[-1]["type"] == item_type
+                index = len(items) - 1 if merge else None
+            item = dict(items[index]) if index is not None else {"type": item_type, "text": ""}
+            limit = 16000 if item_type == "thinking" else 4000
+            item["text"] += self.clipped(text, max(0, limit - len(item["text"])))
+            if self.store(item, index) and item_type == "thinking" and self.thinking is not None:
+                self.thinking = item
             self.previous = item_type
         elif kind == "tool_start":
             self.previous = "tool"
@@ -189,7 +215,7 @@ class Queue:
             workspace_id = f"chat-user-{user['id']}"
             workspace = root / "chat" / f"user-{user['id']}" / conversation["id"]
             sid = scope
-            model = {"id": names["chat_model_name"] or names["model_name"], "thinking": "off"}
+            model = {**model, "id": names["chat_model_name"] or names["model_name"]}
             sandbox_key = f"chat:{user['id']}"
             cwd = f"/workspace/{conversation['id']}"
         elif scope == "private":

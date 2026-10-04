@@ -461,7 +461,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
             {running && renderMessage(running)}
             {(live || running) ? (
               <LiveReply
-                run={live ?? { items: [], calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
+                run={live ?? { items: [], thinkingIndex: null, calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
                 starting={!live}
                 inserted={inserted}
                 renderInput={renderInput}

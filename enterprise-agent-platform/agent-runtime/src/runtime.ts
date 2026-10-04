@@ -212,6 +212,7 @@ export class Runtime {
     else if(event.type==='message_update'){
       const delta=event.assistantMessageEvent;
       if(delta.type==='text_delta'||delta.type==='thinking_delta')this.emit(run,{type:delta.type,delta:delta.delta});
+      else if(delta.type==='thinking_start'||delta.type==='thinking_end')this.emit(run,{type:delta.type});
       else if(delta.type==='toolcall_start'||delta.type==='toolcall_delta'||delta.type==='toolcall_end')this.onToolInput(run,delta);
     }else if(event.type==='tool_execution_start'){
       const args:unknown=event.args;

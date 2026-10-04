@@ -3,8 +3,11 @@
  * caller's ordered work (reasoning prose, step rows, tool chips) instead of demo rows; the gallery's reserved
  * min-height is dropped; the trace line follows content growth while streaming. Accessibility: the header button is
  * named by its status text, and the working shimmer sweeps between ink-2 and ink so the label keeps 4.5:1 contrast.
- * Markup, classes and motion are upstream's. */
+ * TraceProse accepts Markdown with a per-block heading in secondary ink (no live announcements); TraceThinking
+ * reuses the header sparkle as a quiet pulse for an empty live block, with a stable polite label and no motion
+ * under reduced motion. The remaining markup, classes and motion are upstream's. */
 import { useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import "./streamingText.css";
 
 /* ─────────────────────────────────────────────────────────
  * THINKING — expandable agent trace
@@ -51,11 +54,26 @@ export function TraceStep({
   );
 }
 
-/** A Reasoning-variant row: prose that wraps, in the secondary ink. */
-export function TraceProse({ children }: { children: ReactNode }) {
+/** A Reasoning-variant row: Markdown that wraps, with its optional head in the secondary ink. */
+export function TraceProse({ children, heading }: { children: ReactNode; heading?: ReactNode }) {
   return (
-    <div className={`${ROW} items-start`} style={{ animation: "fade-up 320ms cubic-bezier(0.23,1,0.32,1) both" }}>
-      <div className="min-w-0 text-[12.5px] leading-relaxed whitespace-pre-wrap text-ink-2 [overflow-wrap:anywhere]">{children}</div>
+    <div className={`${ROW} items-start`} aria-live="off" style={{ animation: "fade-up 320ms cubic-bezier(0.23,1,0.32,1) both" }}>
+      <div className="min-w-0 w-full text-[12.5px] leading-relaxed text-ink-2 [overflow-wrap:anywhere]">
+        {heading && <p className="mb-1 font-medium">{heading}</p>}
+        <div className="bui-prose">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/** An empty live reasoning block, kept in place until text arrives or the block ends. */
+export function TraceThinking({ label }: { label: string }) {
+  return (
+    <div className={`${ROW} text-[12.5px] text-ink-2`} role="status" aria-live="polite" aria-atomic="true">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden className="size-3 shrink-0 animate-pulse motion-reduce:animate-none">
+        <path d="M12 2l2.4 7.2L22 12l-7.6 2.8L12 22l-2.4-7.2L2 12l7.6-2.8z" />
+      </svg>
+      <span>{label}</span>
     </div>
   );
 }

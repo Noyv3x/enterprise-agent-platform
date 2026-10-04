@@ -1,13 +1,15 @@
-import { useContext, useEffect, useRef, useState, type ReactNode } from "react";
-import ThinkingState, { TraceProse, TraceStep } from "../../components/ui/beautiful/primitives/ThinkingState";
+import { memo, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import ThinkingState, { TraceProse, TraceStep, TraceThinking } from "../../components/ui/beautiful/primitives/ThinkingState";
 import ToolChips, { type ToolDetailLine, type ToolDiff, type ToolDiffLine, type ToolStep } from "../../components/ui/beautiful/primitives/ToolChips";
 import { useWords } from "../../words";
 import { ComputerContext, fileName } from "./computerView";
 import { Markdown } from "./Markdown";
+import { formatThinking } from "./thinking";
 import type { RunRef } from "./types";
 import { toolVerb, type WorkItem, type WorkTrace, type Words } from "./work";
 
 type ToolItem = Extract<WorkItem, { type: "tool" }>;
+type ThinkingItem = Extract<WorkItem, { type: "thinking" }>;
 
 const DETAIL_LIMIT = 4000;
 
@@ -175,6 +177,24 @@ function useNow(active: boolean): number {
   return now;
 }
 
+/** Each mounted block keeps its own formatting memo; settled Markdown never reparses on clock ticks. */
+const ThinkingBlock = memo(function ThinkingBlock({ item, streaming, end }: {
+  item: ThinkingItem;
+  streaming: boolean;
+  end: number | null;
+}) {
+  const w = useWords();
+  const content = useMemo(() => formatThinking(item.text), [item.text]);
+  if (!content) return streaming ? <TraceThinking label={w("Thinking", "思考中", "思考中")} /> : null;
+  const elapsed = item.startedAt !== null && end !== null ? Math.max(0, Math.round((end - item.startedAt) / 1000)) : null;
+  const duration = elapsed === null ? null : seconds(elapsed * 1000);
+  const heading = streaming
+    ? w(`Thinking · ${duration}`, `思考中 · ${duration}`, `思考中 · ${duration}`)
+    : duration === null ? w("Thought", "思考", "思考")
+      : w(`Thought for ${duration}`, `思考了 ${duration}`, `思考了 ${duration}`);
+  return <TraceProse heading={heading}><Markdown content={content} /></TraceProse>;
+});
+
 function activeLabel(items: WorkItem[], w: Words): string {
   const last = items[items.length - 1];
   if (last?.type === "tool" && last.status === "running") {
@@ -193,7 +213,7 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
   const settledAt = useRef<number | null>(null);
   if (working) settledAt.current = null;
   else settledAt.current ??= trace.endedAt ?? now;
-  const end = working ? now : settledAt.current;
+  const end = working ? now : trace.endedAt ?? settledAt.current;
   const duration = trace.startedAt !== null && end !== null ? seconds(end - trace.startedAt) : null;
   const thought = trace.items.some((item) => item.type === "thinking");
   const done = duration === null ? w("Recorded work", "工作记录", "工作紀錄")
@@ -212,7 +232,10 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
       return;
     }
     flush();
-    if (item.type === "thinking") blocks.push(<TraceProse key={index}>{item.text.trim()}</TraceProse>);
+    if (item.type === "thinking") {
+      const streaming = working && item.startedAt !== null && item.endedAt === null;
+      blocks.push(<ThinkingBlock key={index} item={item} streaming={streaming} end={item.endedAt ?? (streaming ? now : null)} />);
+    }
     else if (item.type === "text") blocks.push(
       <div key={index} className="bui-prose px-1.5 py-0.5 text-[12.5px] leading-relaxed text-ink"><Markdown content={item.text} /></div>,
     );

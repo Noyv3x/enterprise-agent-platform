@@ -85,6 +85,7 @@ complete browser image content.
 | Type | Fields |
 | --- | --- |
 | text_delta, thinking_delta | delta |
+| thinking_start, thinking_end | none |
 | tool_start | tool_call_id, name, args |
 | tool_input_start | tool_call_id, name |
 | tool_input_delta | tool_call_id, delta |
@@ -100,6 +101,10 @@ complete browser image content.
 `run_end` is always the last event. No draft events are emitted.
 `side_effects` becomes true when bash/write/edit, a mutating browser or
 schedule action, or any MCP operation starts.
+
+`thinking_start` and `thinking_end` surround each reasoning block's
+`thinking_delta` events, in order. A block may have no summary text, in which
+case its start and end are still emitted with no deltas between them.
 
 `tool_input_start` marks the model beginning to generate a tool call (Pi
 `message_update`/`toolcall_start`, resolved through `partial.content[contentIndex]`);

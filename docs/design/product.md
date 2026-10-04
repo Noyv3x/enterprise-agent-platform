@@ -10,7 +10,7 @@ The platform is a shared, browser-based product built around plain Pi. Platform 
 | Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch. Visibility and management use existing permission groups, not a new membership table. |
 | Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP, skills or AGENTS.md context. |
 
-Standard chat supports create, rename and delete. Automatic titles are optional. Users neither see nor change any model, in the personal AI or in chat. Chat uses the personal AI's model by default; an administrator may set a different chat model per account. Users keep their own thinking depth.
+Standard chat supports create, rename and delete. Automatic titles are optional. Users neither see nor change any model, in the personal AI or in chat. Chat uses the personal AI's model by default; an administrator may set a different chat model per account. Chat thinks with the same thinking depth as the user's personal AI, so its reasoning summaries are shown too. Users keep their own thinking depth.
 
 Chat conversations share one network-disabled sandbox per user. File tools restrict the active conversation directory; bash starts there but may access that user's other chat files. The security boundary is per user, not per conversation.
 

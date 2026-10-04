@@ -8,7 +8,7 @@ const PAGE = 100;
 /** The panel keeps at most this much live output per call; the Runtime already limits it to 512 KiB. */
 const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
-  "message", "text_delta", "thinking_delta", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
+  "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
   "input_delivered", "retry", "compaction", "run_end",
 ] as const;
 
@@ -16,6 +16,7 @@ const EVENT_TYPES = [
 type StreamEvent = { seq: number } & (
   | { type: "message"; message: Message }
   | { type: "text_delta" | "thinking_delta"; delta: string }
+  | { type: "thinking_start" | "thinking_end" }
   | { type: "tool_input_start"; tool_call_id: string; name: string }
   | { type: "tool_input_delta"; tool_call_id: string; delta: string }
   | { type: "tool_start"; tool_call_id: string; name: string; args: Record<string, unknown> | null }
@@ -154,7 +155,7 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
   }
   // Automatic Pi compaction is run activity, never the durable manual operation.
   if (event.type === "compaction" && event.phase === "end" && state.live === null) return state;
-  const live: LiveRun = state.live ?? { items: [], calls: [], startedAt: at, notice: null };
+  const live: LiveRun = state.live ?? { items: [], thinkingIndex: null, calls: [], startedAt: at, notice: null };
   if (event.type === "tool_input_start" || event.type === "tool_input_delta" || event.type === "tool_output") {
     return { ...state, live: { ...live, calls: patchCall(live.calls, event.tool_call_id, (call) => applyCallEvent(call, event)) } };
   }
@@ -171,14 +172,31 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
           ? { ...message, metadata: { ...message.metadata, delivery: "delivered" } } : message),
         deliveredInput: { messageId: event.message_id, seq: event.seq },
       };
-    case "text_delta":
+    case "thinking_start":
+      items.push({ type: "thinking", text: "", startedAt: at, endedAt: null });
+      return { ...state, live: { ...live, items, thinkingIndex: items.length - 1, notice: null } };
+    case "thinking_end": {
+      if (live.thinkingIndex === null) return state;
+      const thinking = items[live.thinkingIndex];
+      if (thinking.type === "thinking") items[live.thinkingIndex] = { ...thinking, endedAt: at };
+      return { ...state, live: { ...live, items, thinkingIndex: null } };
+    }
     case "thinking_delta": {
-      const type = event.type === "text_delta" ? "text" : "thinking";
-      // Consecutive deltas of one kind merge into one item, as in the persisted trace.
-      if (last?.type === type) items[items.length - 1] = { type, text: last.text + event.delta };
-      else items.push({ type, text: event.delta });
+      const thinking = live.thinkingIndex === null ? null : items[live.thinkingIndex];
+      if (thinking?.type === "thinking" && live.thinkingIndex !== null) {
+        items[live.thinkingIndex] = { ...thinking, text: thinking.text + event.delta };
+      } else if (last?.type === "thinking" && last.startedAt === null && last.endedAt === null) {
+        // Older runtimes/providers send deltas only; never merge into a finished explicit block.
+        items[items.length - 1] = { ...last, text: last.text + event.delta };
+      } else {
+        items.push({ type: "thinking", text: event.delta, startedAt: null, endedAt: null });
+      }
       return { ...state, live: { ...live, items, notice: null } };
     }
+    case "text_delta":
+      if (last?.type === "text") items[items.length - 1] = { ...last, text: last.text + event.delta };
+      else items.push({ type: "text", text: event.delta });
+      return { ...state, live: { ...live, items, notice: null } };
     case "tool_start":
       items.push({ type: "tool", id: event.tool_call_id, name: event.name, args: event.args ?? {}, output: "", status: "running", startedAt: at, endedAt: null });
       return { ...state, live: { ...live, items, calls: patchCall(live.calls, event.tool_call_id, (call) => applyCallEvent(call, event)), notice: null } };

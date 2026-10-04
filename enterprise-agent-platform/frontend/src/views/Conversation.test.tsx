@@ -93,6 +93,7 @@ describe('Conversation', () => {
   });
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     document.body.innerHTML = '';
   });
@@ -464,6 +465,62 @@ describe('Conversation', () => {
     expect(screen.queryByRole('article', { name: 'Reply in progress' })).not.toBeInTheDocument();
     expect(screen.getByText('Found two files: notes.md and report.pdf.')).toBeVisible();
     await waitFor(() => expect(screen.queryByText('Queued')).not.toBeInTheDocument());
+  });
+
+  it('streams empty and separate timed reasoning blocks, preserves Markdown parts, and restores the same persisted summaries', async () => {
+    const start = Date.parse('2026-10-04T09:00:00Z');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    let history = [message(1, 'user', 'Review the report', 'running')];
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page(history) });
+    renderConversation('channel-3');
+    await screen.findByLabelText('Message');
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'thinking_start' });
+    const live = screen.getByRole('article', { name: 'Reply in progress' });
+    const pulse = within(live).getAllByRole('status').find((node) => node.textContent === 'Thinking');
+    expect(pulse).toBeVisible();
+    clock.mockReturnValue(start + 2_000);
+    stream.emit(2, { type: 'thinking_end' });
+    expect(pulse).not.toBeInTheDocument();
+    clock.mockReturnValue(start + 3_000);
+    stream.emit(3, { type: 'thinking_start' });
+    stream.emit(4, { type: 'thinking_delta', delta: '**Inspecting the report**\n\n<!--' });
+    expect(within(live).getByText('Inspecting the report', { selector: 'strong' })).toBeVisible();
+    expect(live).not.toHaveTextContent('<!--');
+    stream.emit(5, { type: 'thinking_delta', delta: ' -->\n\nReading the figures.\n\n**Comparing totals**\n\n<!-- -->\n\nChecking the arithmetic.' });
+    clock.mockReturnValue(start + 11_000);
+    stream.emit(6, { type: 'thinking_end' });
+    expect(within(live).getByText('Thought for 8s')).toBeVisible();
+    expect(within(live).getByText('Comparing totals', { selector: 'strong' })).toBeVisible();
+    expect(live).not.toHaveTextContent('**');
+    // A provider's unmatched deltas still merge, but never into the explicit finished block.
+    stream.emit(7, { type: 'thinking_delta', delta: 'Untimed ' });
+    stream.emit(8, { type: 'thinking_delta', delta: 'summary.' });
+    expect(within(live).getByText('Untimed summary.')).toBeVisible();
+    expect(within(live).getByText('Checking the arithmetic.')).toBeVisible();
+    stream.emit(9, { type: 'tool_start', tool_call_id: 'report', name: 'read', args: { path: '/workspace/report.txt' } });
+    stream.emit(10, { type: 'tool_end', tool_call_id: 'report', is_error: false, content_preview: 'Totals match.' });
+    stream.emit(11, { type: 'text_delta', delta: 'The totals match.' });
+    expect(within(live).getByRole('button', { name: /^Thought for/ })).toHaveAttribute('aria-expanded', 'false');
+    const reply: Message = { ...message(2, 'assistant', 'The totals match.'), metadata: { status: 'completed', reply_to: { message_id: 1 }, work: {
+      v: 1, started_at: '2026-10-04T09:00:00Z', ended_at: '2026-10-04T09:00:12Z', items: [
+        { type: 'thinking', text: '', started_at: '2026-10-04T09:00:00Z', ended_at: '2026-10-04T09:00:02Z' },
+        { type: 'thinking', text: '**Inspecting the report**\n\n<!-- -->\n\nReading the figures.\n\n**Comparing totals**\n\n<!-- -->\n\nChecking the arithmetic.', started_at: '2026-10-04T09:00:03Z', ended_at: '2026-10-04T09:00:11Z' },
+        { type: 'thinking', text: 'Untimed summary.' },
+        { type: 'tool', id: 'report', name: 'read', args: { path: '/workspace/report.txt' }, status: 'done', output: 'Totals match.' },
+      ],
+    } } };
+    history = [message(1, 'user', 'Review the report'), reply];
+    stream.emit(12, { type: 'run_end', message: reply });
+    const finished = screen.getByRole('article', { name: 'Agent reply' });
+    fireEvent.click(within(finished).getByRole('button', { name: 'Thought for 12s' }));
+    expect(within(finished).getByText('Thought for 8s')).toBeVisible();
+    expect(within(finished).getByText('Inspecting the report', { selector: 'strong' })).toBeVisible();
+    expect(within(finished).getByText('Comparing totals', { selector: 'strong' })).toBeVisible();
+    expect(within(finished).getByText('Untimed summary.')).toBeVisible();
+    expect(within(finished).getByText('The totals match.')).toBeVisible();
+    expect(within(finished).queryByText('Thought for 2s')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument());
   });
 
   it('keeps Shift+Enter and IME composition from sending', async () => {

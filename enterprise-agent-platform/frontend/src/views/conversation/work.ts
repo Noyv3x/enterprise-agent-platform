@@ -2,7 +2,7 @@ import type { Message } from "./types";
 
 /** One entry of an assistant turn's work, in arrival order (platform-api.md § Assistant message work trace). */
 export type WorkItem =
-  | { type: "thinking"; text: string }
+  | { type: "thinking"; text: string; startedAt: number | null; endedAt: number | null }
   | { type: "text"; text: string }
   | { type: "input"; messageId: number; at: number | null }
   /** a plain status line from old `agent_work` records */
@@ -85,7 +85,10 @@ function fromWork(work: Record<string, unknown>): WorkTrace | null {
   for (const raw of work.items) {
     const item = record(raw);
     if (!item) continue;
-    if (item.type === "thinking" || item.type === "text") items.push({ type: item.type, text: text(item.text) });
+    if (item.type === "thinking") {
+      items.push({ type: "thinking", text: text(item.text), startedAt: isoTime(item.started_at), endedAt: isoTime(item.ended_at) });
+    }
+    else if (item.type === "text") items.push({ type: "text", text: text(item.text) });
     else if (item.type === "input" && typeof item.message_id === "number") {
       items.push({ type: "input", messageId: item.message_id, at: isoTime(item.at) });
     }
