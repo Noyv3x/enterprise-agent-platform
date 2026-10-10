@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, request, type User } from './api';
 import { Button } from './components/ui/beautiful/atoms/Button';
 import { Notice, PageHeader } from './components/ui/beautiful/controls';
@@ -9,7 +9,7 @@ import { I18nProvider } from './i18n';
 import { AppFrame } from './shell/AppFrame';
 import { Login } from './shell/Login';
 import { PreferenceCorner } from './shell/preferences';
-import { accessFor, allowed, homeRoute, parseRoute } from './shell/routes';
+import { accessFor, allowed, landingRoute, parseRoute } from './shell/routes';
 import { Sidebar } from './shell/Sidebar';
 import { useWords } from './words';
 import { Admin } from './views/Admin';
@@ -33,12 +33,25 @@ function currentHash(): string {
   return location.hash.slice(1);
 }
 
+/** True unless this document was reloaded or restored by back/forward, which keep the page they show. */
+function enteredApp(): boolean {
+  try {
+    const [entry] = performance.getEntriesByType('navigation');
+    const type = entry && 'type' in entry ? entry.type : 'navigate';
+    return type !== 'reload' && type !== 'back_forward';
+  } catch {
+    return true;
+  }
+}
+
 function Shell() {
   const w = useWords();
   const [session, setSession] = useState<Bootstrap | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [hash, setHash] = useState(currentHash);
+  // The next known session lands on Personal AI: once per entered page, and after every sign-in.
+  const entering = useRef(enteredApp());
   const [collapsed, setCollapsed] = useState(readCollapsed);
 
   const bootstrap = useCallback(async () => {
@@ -49,7 +62,7 @@ function Shell() {
       setError('');
     }
     catch (cause) {
-      if (cause instanceof ApiError && cause.status === 401) { setChatAccount(null); setSession(null); }
+      if (cause instanceof ApiError && cause.status === 401) { entering.current = true; setChatAccount(null); setSession(null); }
       else throw cause;
     }
   }, []);
@@ -60,7 +73,7 @@ function Shell() {
     return () => window.removeEventListener('hashchange', changed);
   }, []);
   useEffect(() => {
-    const expired = () => { setChatAccount(null); setSession(null); };
+    const expired = () => { entering.current = true; setChatAccount(null); setSession(null); };
     window.addEventListener('session-expired', expired);
     return () => window.removeEventListener('session-expired', expired);
   }, []);
@@ -71,17 +84,18 @@ function Shell() {
     try { localStorage.setItem(COLLAPSED_KEY, next ? '1' : '0'); } catch { /* the choice still holds for this page */ }
   };
   async function logout() {
-    try { await request('/api/auth/logout', { method: 'POST', body: '{}' }); setChatAccount(null); setSession(null); navigate(''); }
+    try { await request('/api/auth/logout', { method: 'POST', body: '{}' }); entering.current = true; setChatAccount(null); setSession(null); navigate(''); }
     catch (cause) { setError((cause as Error).message); }
   }
 
   const access = session ? accessFor(session.user.role, session.permissions) : null;
-  // A bare or unknown address opens the first area this session may use.
   useEffect(() => {
-    if (access && (hash === '' || parseRoute(hash).view === 'unknown')) {
-      const home = homeRoute(access);
-      history.replaceState(null, '', `#${home}`);
-      setHash(home);
+    if (!access) return;
+    const target = landingRoute(hash, access, entering.current);
+    entering.current = false;
+    if (target !== null) {
+      history.replaceState(null, '', `#${target}`);
+      setHash(target);
     }
   }, [access, hash]);
 

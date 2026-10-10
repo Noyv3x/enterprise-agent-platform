@@ -74,10 +74,19 @@ export function navKey(route: Route): string {
   }
 }
 
-/** First area the session may open, for the bare `#` and after sign-in. */
+/** First area the session may open, for a bare or unknown address. */
 export function homeRoute(access: Access): string {
   if (access.private) return "private";
   if (access.chat) return "chat";
   if (access.channels) return "channels";
   return "settings";
+}
+
+/** The page to replace the address with once the session is known, or null to stay. `entering` is the first
+ * resolution after entering the app or signing in (not a reload or back/forward): it opens Personal AI whenever the
+ * session may use it, whatever the address names. */
+export function landingRoute(hash: string, access: Access, entering: boolean): string | null {
+  if (entering && access.private) return hash === "private" ? null : "private";
+  if (hash === "" || parseRoute(hash).view === "unknown") return homeRoute(access);
+  return null;
 }

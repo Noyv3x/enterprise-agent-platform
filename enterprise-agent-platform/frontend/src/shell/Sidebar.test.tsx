@@ -7,7 +7,7 @@ import type { User } from "../api";
 import { ThemeProvider } from "../context/ThemeContext";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../i18n";
 import { resetChatStore } from "../views/chat/chatStore";
-import { accessFor, allowed, parseRoute, type Route } from "./routes";
+import { accessFor, allowed, landingRoute, parseRoute, type Route } from "./routes";
 import { Sidebar } from "./Sidebar";
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
@@ -171,5 +171,22 @@ describe("routes", () => {
     expect(allowed({ view: "chat", id: null }, reader)).toBe(false);
     expect(allowed({ view: "admin" }, reader)).toBe(false);
     expect(allowed({ view: "settings" }, reader)).toBe(true);
+  });
+
+  it("lands on Personal AI when entering, and keeps the page on reload or without access", () => {
+    const personal = accessFor("user", ["private_agent", "chat", "read_workspace"]);
+    for (const hash of ["", "chat-abc", "channel-7", "admin", "nowhere"]) expect(landingRoute(hash, personal, true)).toBe("private");
+    expect(landingRoute("private", personal, true)).toBeNull();
+    // A reload, back/forward or in-app navigation keeps a real page; only bare or unknown addresses move.
+    expect(landingRoute("chat-abc", personal, false)).toBeNull();
+    expect(landingRoute("channel-7", personal, false)).toBeNull();
+    expect(landingRoute("", personal, false)).toBe("private");
+    expect(landingRoute("nowhere", personal, false)).toBe("private");
+    // Without Personal AI the addressed page stays, and bare or unknown addresses open the first permitted area.
+    const chatter = accessFor("user", ["chat", "read_workspace"]);
+    expect(landingRoute("channel-7", chatter, true)).toBeNull();
+    expect(landingRoute("", chatter, true)).toBe("chat");
+    expect(landingRoute("nowhere", accessFor("user", ["read_workspace"]), true)).toBe("channels");
+    expect(landingRoute("", accessFor("user", []), true)).toBe("settings");
   });
 });
