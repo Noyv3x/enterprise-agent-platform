@@ -84,9 +84,11 @@ export function homeRoute(access: Access): string {
 
 /** The page to replace the address with once the session is known, or null to stay. `entering` is the first
  * resolution after entering the app or signing in (not a reload or back/forward): it opens Personal AI whenever the
- * session may use it, whatever the address names. */
+ * session may use it, unless the address names a specific chat or channel. */
 export function landingRoute(hash: string, access: Access, entering: boolean): string | null {
-  if (entering && access.private) return hash === "private" ? null : "private";
-  if (hash === "" || parseRoute(hash).view === "unknown") return homeRoute(access);
+  const route = parseRoute(hash);
+  const specific = route.view === "channel" || (route.view === "chat" && route.id !== null);
+  if (entering && access.private && !specific) return hash === "private" ? null : "private";
+  if (hash === "" || route.view === "unknown") return homeRoute(access);
   return null;
 }

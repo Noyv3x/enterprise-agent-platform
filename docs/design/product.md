@@ -10,7 +10,7 @@ The platform is a shared, browser-based product built around plain Pi. Platform 
 | Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch. Visibility and management use existing permission groups, not a new membership table. |
 | Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP, skills or AGENTS.md context. |
 
-Standard chat supports create, rename and delete. Automatic titles are optional. Users neither see nor change any model, in the personal AI or in chat. Chat uses the personal AI's model by default; an administrator may set a different chat model per account. Chat thinks with the same thinking depth as the user's personal AI, so its reasoning summaries are shown too. Users keep their own thinking depth.
+Standard chat supports create, rename and delete. Titles are never generated automatically: a new chat starts as `New chat` and changes only when the user renames it. Users neither see nor change any model or thinking depth, in the personal AI or in chat. Each account belongs to one administrator-managed model policy group (策略组) that sets a model and thinking depth per usage slot: personal AI (also schedules and background-task notices), channel main agent, chat (whose reasoning summaries are shown too), `scout` subagents and `task` subagents. A lower-spec group can serve accounts that do only simple work.
 
 Chat conversations share one network-disabled sandbox per user. File tools restrict the active conversation directory; bash starts there but may access that user's other chat files. The security boundary is per user, not per conversation.
 
@@ -20,7 +20,7 @@ Messages sent during an interactive run are inserted into that run at the AI's n
 
 - Login, users, administrators and permission groups; administrators can sign in as another active account (管理员代入) from the account editor.
 - Attachment upload/download, document previews, generated-file links and personal workspace files.
-- Model settings, Codex device OAuth, token usage and cache-hit reporting.
+- Model policy groups, Codex device OAuth, token usage and cache-hit reporting.
 - Branding, theme and three locales.
 - Scheduled tasks are not a user feature and have no user page; the personal AI creates, changes and reviews them through its own `schedule` tool, and each occurrence runs in the owner's personal AI.
 - Host Manager update status and controls.

@@ -1,21 +1,25 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ApiError } from "../api";
 import { Button } from "../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../words";
-import { Composer, type ComposerCommand } from "./conversation/Composer";
+import { Composer, type ComposerCommand, type ComposerSeed } from "./conversation/Composer";
 import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
 import { ComputerContext } from "./conversation/computerView";
-import { AssistantMessage, LiveReply, PendingReply, SystemLine, UserBubble } from "./conversation/Messages";
+import { PendingReply, Reply, SystemLine, UserBubble, type RenderInput } from "./conversation/Messages";
+import { LEAVE_MS, reducedMotion } from "./conversation/motion";
+import { Movable } from "./conversation/Movable";
 import { TaskOverlay } from "./conversation/Tasks";
 import { TasksContext, isRunning, stateAnnouncement, tasksValue, type TaskMap } from "./conversation/taskState";
-import type { Compaction, Message, RunRef } from "./conversation/types";
+import type { Compaction, LiveRun, Message, RunRef, SendMode } from "./conversation/types";
 import { conversationTurns } from "./conversation/turns";
 import { errorText, useConversation } from "./conversation/useConversation";
 
 /** Reader within this distance of the bottom keeps following new output (harness value). */
 const STICK_PX = 120;
+const NO_ITEMS: LiveRun["items"] = [];
 
 export interface ConversationProps {
   /** `private`, `channel-<id>` or `chat-<uuid>` (API route form). */
@@ -161,12 +165,16 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const [computerOpen, setComputerOpen] = useState(scope === "private" && !narrow);
   // A step chosen with "View in computer"; cleared on close so reopening the panel follows the AI.
   const [computerFocus, setComputerFocus] = useState<ComputerFocus | null>(null);
-  const [notice, setNotice] = useState<{ tone: "success" | "danger"; text: string } | null>(null);
+  const [notice, setNotice] = useState<{ tone: "info" | "success" | "danger"; text: string } | null>(null);
   const [confirmingReset, setConfirmingReset] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
-  const [seed, setSeed] = useState<{ text: string; n: number } | null>(null);
+  const [seed, setSeed] = useState<ComposerSeed | null>(null);
+  const [withdrawing, setWithdrawing] = useState<ReadonlySet<number>>(() => new Set());
+  const [confirmingStop, setConfirmingStop] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState("");
   const [composerHeight, setComposerHeight] = useState(150);
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -294,9 +302,9 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     }
   };
 
-  const send = async (text: string, attachmentIds: number[]) => {
+  const send = async (text: string, attachmentIds: number[], mode?: SendMode) => {
     stick.current = true;
-    await conversation.send(text, attachmentIds);
+    await conversation.send(text, attachmentIds, mode);
   };
 
   const resend = (request: Message) => {
@@ -308,40 +316,101 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     return send(request.content, []).catch((reason: unknown) => setNotice({ tone: "danger", text: errorText(reason) }));
   };
 
+  // Messages whose withdrawal lost to delivery: a short inline note under the bubble says the agent read them.
+  const [seen, setSeen] = useState<ReadonlySet<number>>(() => new Set());
+  const withdraw = async (message: Message) => {
+    setWithdrawing((current) => new Set(current).add(message.id));
+    try {
+      const restored = await conversation.withdraw(message.id);
+      // The bubble collapses first; then its text and files return to the composer, above any draft.
+      window.setTimeout(() => setSeed((current) => ({ text: restored.content, attachments: restored.attachments, prepend: true, n: (current?.n ?? 0) + 1 })),
+        reducedMotion() ? 0 : LEAVE_MS);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) {
+        setSeen((current) => new Set(current).add(message.id));
+        window.setTimeout(() => setSeen((current) => {
+          const next = new Set(current);
+          next.delete(message.id);
+          return next;
+        }), 5000);
+      } else {
+        setNotice({ tone: "danger", text: errorText(reason) });
+      }
+    } finally {
+      setWithdrawing((current) => {
+        const next = new Set(current);
+        next.delete(message.id);
+        return next;
+      });
+    }
+  };
+
   const { running, inserted, queued: queuedMessages } = turns;
+  const { removed, seenUpTo } = conversation;
   if (running && !runningSeen.current.has(running.id)) runningSeen.current.set(running.id, Date.now());
   const positions = new Map(queuedMessages.map((message, index) => [message.id, index + 1 + (running ? 1 : 0)]));
-  const renderUser = (message: Message, pending = false) => {
+  /** `slot` names where the bubble stands (history, pending, delivered, queued, running); a change glides it. */
+  const renderUser = (message: Message, slot: string, pending = false, className?: string) => {
     const mine = !channel || userId === undefined || message.metadata.author_user_id === userId;
-    const retryable = message.metadata.status === "interrupted" || message.metadata.status === "cancelled";
+    const { status } = message.metadata;
+    const retryable = status === "interrupted" || status === "cancelled";
+    const leaving = removed[message.id] === "leaving";
+    // Only its author may withdraw a message, and only before the agent saw it: queued, or absorbed but undelivered.
+    const withdrawable = canSend && mine && !leaving
+      && (status === "queued" || (status === "running" && message.metadata.inserted_into !== undefined && message.metadata.delivery === "pending"));
+    const action = seen.has(message.id) ? (
+      <span role="status" className="text-[12px] text-ink-2" style={{ animation: "fade-in 200ms ease-out both" }}>
+        {w("The agent is already taking this message in", "智能体已在接收这条消息，无法撤回", "智慧體已在接收這則訊息，無法收回")}
+      </span>
+    ) : withdrawable ? (
+      <Button variant="quiet" size="xs" disabled={withdrawing.has(message.id)} onClick={() => void withdraw(message)} className="text-ink-2 hover:text-ink">
+        {w("Withdraw", "撤回", "收回")}
+      </Button>
+    ) : undefined;
     return (
-      <div>
-        <UserBubble message={message} showAuthor={channel} mine={mine} queuePosition={positions.get(message.id)} pending={pending} />
+      <Movable messageId={message.id} slot={slot} enter={message.id > seenUpTo} leaving={leaving} className={className}>
+        <UserBubble message={message} showAuthor={channel} mine={mine} queuePosition={slot === "queued" ? positions.get(message.id) : undefined} pending={pending} action={action} />
         {canSend && retryable && (
           <div className="mt-2 flex justify-end">
             <Button variant="quiet" size="xs" onClick={() => void resend(message)}>{w("Send again", "重新发送", "重新傳送")}</Button>
           </div>
         )}
-      </div>
+      </Movable>
     );
   };
-  const renderInput = (id: number, pending = false) => {
-    const message = turns.byId.get(id);
+  // Stable while only the live reply streams, so settled replies (memoized) skip those renders.
+  const byId = useMemo(() => new Map(messages.map((message) => [message.id, message])), [messages]);
+  const renderUserRef = useRef(renderUser);
+  renderUserRef.current = renderUser;
+  const renderInput = useCallback<RenderInput>((id, pending) => {
+    const message = byId.get(id);
     return message?.role === "user" ? (
       <>
-        {renderUser(message, pending)}
+        {renderUserRef.current(message, pending ? "pending" : "delivered", pending, "py-4")}
         {compactionAt === id && compactionRow}
       </>
     ) : null;
+    // Deps: everything an input's bubble shows (message, withdrawal and removal state, compaction row, permissions, locale).
+  }, [byId, removed, withdrawing, seen, conversation.compaction, compactionAt, canSend, channel, userId, seenUpTo, w]);
+
+  // Stop cancels the whole backlog: with messages still waiting, say so first.
+  const backlog = queuedMessages.length + inserted.filter((message) => message.metadata.delivery === "pending").length;
+  const requestStop = async () => {
+    if (backlog === 0) return conversation.cancel();
+    setStopError("");
+    setConfirmingStop(true);
   };
-  const renderMessage = (message: Message) => (
-    <Fragment key={message.id}>
-      {message.role === "user" ? renderUser(message)
-        : message.role === "system" ? <SystemLine message={message} />
-          : <AssistantMessage message={message} renderInput={renderInput} />}
-      {compactionAt === message.id && compactionRow}
-    </Fragment>
-  );
+  const confirmStop = async () => {
+    setStopping(true);
+    try {
+      await conversation.cancel();
+      setConfirmingStop(false);
+    } catch (reason) {
+      setStopError(errorText(reason));
+    } finally {
+      setStopping(false);
+    }
+  };
 
   const commands: ComposerCommand[] = canSend ? [
     {
@@ -417,7 +486,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       ensureScope={async () => scope}
       onSend={send}
       working={conversation.busy}
-      onStop={conversation.cancel}
+      onStop={requestStop}
       queued={queuedMessages.length}
       inserting={Boolean(running || live) && !queuedMessages.length && !conversation.compactBusy}
       pendingInputs={inserted.filter((message) => message.metadata.delivery === "pending").length}
@@ -473,6 +542,33 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     };
     const lastRunning = running ? runningSeen.current.get(running.id) ?? Date.now() : null;
     const firstQueued = queuedMessages[0];
+    /* One keyed list: a message keeps its row (and DOM) as it moves from queued to running to history, and the live
+     * reply shares its key with the persisted reply it settles into. */
+    const rows: ReactNode[] = [];
+    const compactionKeyed = <Fragment key="compaction">{compactionRow}</Fragment>;
+    const pushMessage = (message: Message, slot: string) => {
+      if (message.role === "user") rows.push(<Fragment key={`user-${message.id}`}>{renderUser(message, slot)}</Fragment>);
+      else if (message.role === "system") rows.push(<SystemLine key={`system-${message.id}`} message={message} />);
+      else rows.push(<Reply key={conversation.replyKeys[message.id] ?? `reply-${message.id}`} message={message} renderInput={renderInput} enter={message.id > seenUpTo} />);
+      if (compactionAt === message.id) rows.push(compactionKeyed);
+    };
+    if (compactionAt === "start") rows.push(compactionKeyed);
+    for (const message of turns.history) pushMessage(message, "history");
+    if (running) pushMessage(running, "running");
+    if (live || running) {
+      rows.push(
+        <Reply
+          key={`run-${conversation.runKey}`}
+          run={live ?? { items: NO_ITEMS, thinkingIndex: null, calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
+          starting={!live}
+          inserted={inserted}
+          renderInput={renderInput}
+        />,
+      );
+    }
+    for (const message of queuedMessages) pushMessage(message, "queued");
+    if (!live && !running && firstQueued) rows.push(<PendingReply key="pending" since={Date.parse(firstQueued.created_at) || Date.now()} queued />);
+    if (compactionAt === "end") rows.push(compactionKeyed);
     const thread = empty ? noticeBar : (
       <>
         <div
@@ -496,20 +592,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
                 </Button>
               </div>
             )}
-            {compactionAt === "start" && compactionRow}
-            {turns.history.map(renderMessage)}
-            {running && renderMessage(running)}
-            {(live || running) ? (
-              <LiveReply
-                run={live ?? { items: [], thinkingIndex: null, calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
-                starting={!live}
-                inserted={inserted}
-                renderInput={renderInput}
-              />
-            ) : null}
-            {queuedMessages.map(renderMessage)}
-            {!live && !running && firstQueued && <PendingReply since={Date.parse(firstQueued.created_at) || Date.now()} queued />}
-            {compactionAt === "end" && compactionRow}
+            {rows}
           </div>
         </div>
 
@@ -574,6 +657,22 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         busy={resetting}
         onConfirm={() => void reset()}
         onCancel={() => setConfirmingReset(false)}
+      />
+      <ConfirmDialog
+        open={confirmingStop}
+        tone="danger"
+        title={w("Stop the agent?", "停止智能体？", "停止智慧體？")}
+        description={backlog > 0 ? w(
+          `${backlog} queued ${backlog === 1 ? "message" : "messages"} will also be cancelled. You can send ${backlog === 1 ? "it" : "them"} again afterwards.`,
+          `另有 ${backlog} 条排队中的消息也会被取消，之后可以重新发送。`,
+          `另有 ${backlog} 則排隊中的訊息也會被取消，之後可以重新傳送。`,
+        ) : w("The agent stops its current work.", "智能体将停止当前工作。", "智慧體將停止目前工作。")}
+        confirmLabel={w("Stop", "停止", "停止")}
+        cancelLabel={w("Keep working", "继续运行", "繼續執行")}
+        busy={stopping}
+        error={stopError || undefined}
+        onConfirm={() => void confirmStop()}
+        onCancel={() => setConfirmingStop(false)}
       />
     </div>
     </TasksContext.Provider>

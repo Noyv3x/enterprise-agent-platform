@@ -13,7 +13,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
-from .auth import body_json, current_user, permissions
+from .auth import body_json, current_user, model_slot, permissions
 from .db import now
 from .files import bounded_read, ensure_workspace, open_workspace
 
@@ -201,11 +201,9 @@ class Queue:
             raise HTTPException(404, "Conversation not found")
         return dict(row)
 
-    def scope(self, user, scope, authorize=True):
+    def scope(self, user, scope, authorize=True, slot=None):
+        """Resolve a scope; `slot` overrides the model slot the scope's own usage would select (subagents)."""
         root = self.p.settings.data_dir / "workspaces"
-        with self.p.db.connect() as conn:
-            names = conn.execute("SELECT model_name,chat_model_name FROM users WHERE id=?", (user["id"],)).fetchone()
-        model = {"id": names["model_name"], "thinking": "off" if user["thinking_depth"] == "none" else user["thinking_depth"]}
         kind, channel = "agent", None
         scope_name = ""
         required = "chat" if scope.startswith("chat-") else "private_agent" if scope == "private" else "read_workspace"
@@ -215,15 +213,14 @@ class Queue:
             conversation = self.conversation(user, scope[5:])
             kind = "chat"
             scope_name = conversation["title"]
-            scope_type, scope_id, key = "private", conversation["id"], scope
+            scope_type, scope_id, key, usage = "private", conversation["id"], scope, "chat"
             workspace_id = f"chat-user-{user['id']}"
             workspace = root / "chat" / f"user-{user['id']}" / conversation["id"]
             sid = scope
-            model = {**model, "id": names["chat_model_name"] or names["model_name"]}
             sandbox_key = f"chat:{user['id']}"
             cwd = f"/workspace/{conversation['id']}"
         elif scope == "private":
-            scope_type, scope_id = "private", str(user["id"])
+            scope_type, scope_id, usage = "private", str(user["id"]), "personal"
             key, sid = f"private:{scope_id}", f"agent-private-{scope_id}"
             workspace_id, workspace = f"user-{scope_id}", root / f"user-{scope_id}"
             sandbox_key, cwd = key, "/workspace"
@@ -234,7 +231,7 @@ class Queue:
             if not row:
                 raise HTTPException(404, "Channel not found")
             scope_name = row["name"]
-            scope_type, scope_id = "channel", str(channel)
+            scope_type, scope_id, usage = "channel", str(channel), "channel"
             key, sid = f"channel:{channel}:main-agent", f"agent-channel-{channel}"
             workspace_id = f"channels/channel-{channel}"
             workspace, sandbox_key, cwd = root / workspace_id, key, "/workspace"
@@ -255,7 +252,7 @@ class Queue:
                              (key, scope_type, scope_id, sid, lifecycle, workspace_id, sandbox_id, created, created))
         ensure_workspace(self.p.settings.data_dir, workspace)
         return {"kind": kind, "scope": scope, "scope_type": scope_type, "scope_id": scope_id,
-                "scope_key": key, "sid": sid, "workspace": workspace, "model": model,
+                "scope_key": key, "sid": sid, "workspace": workspace, "model": model_slot(self.p.db, user, slot or usage),
                 "scope_name": scope_name,
                 "owner_user_id": user["id"] if channel is None else None, "channel_id": channel,
                 "sandbox": {"scope_key": sandbox_key, "workspace_id": workspace_id, "sandbox_id": sandbox_id,
@@ -339,7 +336,9 @@ class Queue:
                 yield b": keepalive\n\n"
                 await asyncio.sleep(1)
 
-    async def enqueue(self, user, scope, content, attachment_ids=None, schedule_run_id=None):
+    async def enqueue(self, user, scope, content, attachment_ids=None, schedule_run_id=None, mode="insert"):
+        if mode not in ("insert", "after_turn"):
+            raise HTTPException(400, "Unknown send mode")
         if not isinstance(content, str) or (not content.strip() and not attachment_ids):
             raise HTTPException(400, "Message content is required")
         if len(content.encode()) > 1024 * 1024 or len(attachment_ids or []) > 32:
@@ -354,7 +353,8 @@ class Queue:
                     if existing and existing["durable_job_id"] is not None:
                         return {"message": self.message(info, existing["source_message_id"]), "job_id": existing["durable_job_id"]}
                 mid = self.insert_message(conn, info, user, "user", content,
-                                          {"status": "queued", "author_user_id": user["id"], "author_display_name": user["display_name"]})
+                                          {"status": "queued", "author_user_id": user["id"], "author_display_name": user["display_name"],
+                                           **({"send_mode": "after_turn"} if mode == "after_turn" else {})})
                 self.p.files.bind(user, info, mid, attachment_ids or [], conn=conn)
                 payload = {"user_id": user["id"], "scope": scope, "message_id": mid, "content": content,
                            "attachment_ids": attachment_ids or [], "schedule_run_id": schedule_run_id}
@@ -362,7 +362,8 @@ class Queue:
                                    (info["scope_type"], info["scope_id"], str(uuid.uuid4()), json.dumps(payload), int(time.time()), int(time.time()))).lastrowid
                 if schedule_run_id:
                     conn.execute("UPDATE agent_schedule_runs SET durable_job_id=?,source_message_id=?,updated_at=? WHERE id=?", (job, mid, int(time.time()), schedule_run_id))
-                self.absorb(conn, job, payload, info)
+                if mode == "insert":
+                    self.absorb(conn, job, payload, info)
             message = self.message(info, mid)
             self.emit(info["scope_key"], {"type": "message", "message": message})
             if payload.get("parent_job_id"):
@@ -460,6 +461,73 @@ class Queue:
             except httpx.RequestError:
                 # Persisted before submission: an uncertain side effect is never retried.
                 continue
+
+    def withdrawable(self, conn, user, info, message_id):
+        """The author's own pending user request and its job, or a typed refusal."""
+        if info["kind"] == "chat":
+            row = conn.execute("SELECT id,role,content FROM chat_messages WHERE id=? AND conversation_id=?", (message_id, info["scope"][5:])).fetchone()
+            role, author = row and row["role"], user["id"]
+        else:
+            row = conn.execute("SELECT id,author_type,user_id,content FROM messages WHERE id=? AND scope_type=? AND scope_id=? AND hidden_at IS NULL",
+                               (message_id, info["scope_type"], info["scope_id"])).fetchone()
+            role, author = row and row["author_type"], row and row["user_id"]
+        if row is None:
+            raise HTTPException(404, "Message not found")
+        if author != user["id"]:
+            raise HTTPException(403, "Only the author can withdraw this message")
+        job = conn.execute(
+            "SELECT id,status,payload_json FROM durable_jobs WHERE kind='agent' AND scope_type=? AND scope_id=? "
+            "AND json_extract(payload_json,'$.scope')=? AND json_extract(payload_json,'$.message_id')=? ORDER BY id DESC LIMIT 1",
+            (info["scope_type"], info["scope_id"], info["scope"], message_id)).fetchone()
+        payload = json.loads(job["payload_json"]) if job else {}
+        if role != "user" or payload.get("schedule_run_id") is not None or payload.get("notice") or payload.get("operation"):
+            raise HTTPException(400, "Message cannot be withdrawn")
+        if job is None:
+            raise HTTPException(409, "already_seen")
+        return row, job, payload
+
+    async def withdraw(self, user, scope, message_id):
+        """Remove a request the AI has not seen. Exactly one of withdrawn or delivered/started wins, decided under the scope lock
+        (worker start and submission hold it) and, for a submitted input, by Runtime's own answer."""
+        info = self.scope(user, scope)
+        if info["channel_id"] is not None and "chat" not in permissions(self.p.db, user):
+            raise HTTPException(403, "Permission denied")
+        table = "chat_messages" if info["kind"] == "chat" else "messages"
+        async with self.p.gate.admit(), self.lock(info["scope_key"]):
+            with self.p.db.connect() as conn:
+                row, job, payload = self.withdrawable(conn, user, info, message_id)
+                metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (message_id,)).fetchone()[0])
+                parent = conn.execute("SELECT payload_json FROM durable_jobs WHERE id=? AND status='running'", (payload.get("parent_job_id"),)).fetchone() if payload.get("parent_job_id") else None
+            sent = bool(payload.get("steer_sent"))
+            attached = job["status"] == "running" and parent is not None and metadata.get("delivery") == "pending"
+            if job["status"] != "queued" and not attached:
+                raise HTTPException(409, "already_seen")
+            if attached and sent:
+                run_id = json.loads(parent["payload_json"]).get("runtime_run_id")
+                try:
+                    result = await self.runtime("DELETE", f"/v1/runs/{run_id}/inputs/{job['id']}")
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (404, 409):
+                        raise HTTPException(409, "already_seen") from exc
+                    raise HTTPException(502, "Runtime could not withdraw the message") from exc
+                except httpx.RequestError as exc:
+                    raise HTTPException(502, "Runtime could not withdraw the message") from exc
+                if result.get("removed") is not True:
+                    raise HTTPException(502, "Runtime could not withdraw the message")
+            with self.p.db.connect() as conn:
+                # The parent may have settled while Runtime answered: a requeued input is withdrawn as a queued job, a settled one is final.
+                changed = conn.execute(
+                    "UPDATE durable_jobs SET status='failed',last_error='withdrawn',updated_at=? WHERE id=? "
+                    "AND (status='queued' OR (status='running' AND json_extract(payload_json,'$.parent_job_id') IS NOT NULL "
+                    "AND COALESCE(json_extract(payload_json,'$.steer_sent'),0)=?))",
+                    (int(time.time()), job["id"], int(sent))).rowcount
+                if not changed:
+                    raise HTTPException(409, "already_seen")
+                attachments = self.p.files.for_message(info, message_id)
+                self.p.files.release(info, message_id, conn)
+                conn.execute(f"DELETE FROM {table} WHERE id=?", (message_id,))
+                self.emit(info["scope_key"], {"type": "message_removed", "message_id": message_id}, conn)
+        return {"content": row["content"], "attachments": attachments}
 
     def input_delivered(self, parent_job_id, info, input_id):
         with self.p.db.connect() as conn:
@@ -1028,13 +1096,20 @@ async def conversation_route(request):
     if action == "messages":
         if request.method == "POST":
             body = await request.json()
-            return JSONResponse(await queue.enqueue(user, scope, body.get("content"), body.get("attachment_ids")), status_code=202)
+            mode = body.get("mode", "insert")
+            return JSONResponse(await queue.enqueue(user, scope, body.get("content"), body.get("attachment_ids"), mode=mode), status_code=202)
         return JSONResponse(queue.messages(user, scope, request.query_params.get("before"), request.query_params.get("limit", 100)))
     if action == "events":
         queue.scope(user, scope)
         after = int(request.headers.get("last-event-id", request.query_params.get("after", "0")))
         return StreamingResponse(authenticated_events(request, scope, after), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     return JSONResponse(await getattr(queue, action)(user, scope), status_code=202 if action == "compact" else 200)
+
+
+async def withdraw_route(request):
+    user = current_user(request)
+    scope = "chat-" + request.path_params["id"] if "id" in request.path_params else request.path_params["scope"]
+    return JSONResponse(await request.app.state.platform.queue.withdraw(user, scope, request.path_params["message_id"]))
 
 
 def routes():
@@ -1046,4 +1121,6 @@ def routes():
                 continue
             methods = ["GET", "POST"] if action == "messages" else ["GET"] if action == "events" else ["POST"]
             result.append(Route(prefix + "/" + action, conversation_route, methods=methods))
+            if action == "messages":
+                result.append(Route(prefix + "/messages/{message_id:int}", withdraw_route, methods=["DELETE"]))
     return result

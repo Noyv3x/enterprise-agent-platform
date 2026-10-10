@@ -35,6 +35,8 @@ SUBAGENT_TOOLS = {
     "scout": ["read", "grep", "find", "ls", "web_search", "web_fetch"],
     "task": ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"],
 }
+# The model policy slot each subagent type runs under.
+SUBAGENT_SLOT = {"scout": "scout", "task": "worker"}
 SUBAGENT_PROMPT = (
     "You are a subagent working for the user's personal AI, identified as {id}. Complete only the assigned task, "
     "using your tools. {capability} Your final answer is delivered to the personal AI as your report: state what you "
@@ -315,7 +317,7 @@ class Tasks:
         started = False
         try:
             user = self.p.queue.user(uid)
-            info = self.p.queue.scope(user, "private", authorize=False)
+            info = self.p.queue.scope(user, "private", authorize=False, slot=SUBAGENT_SLOT[row["agent_type"]])
             model = await self.p.queue.selected_model(info)
             sid = f"agent-private-{uid}-bg-{tid}"
             sandbox = {**info["sandbox"], "scope_key": f"private:{uid}/delegate/bg-{tid}"}

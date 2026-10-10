@@ -5,12 +5,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent, { type UserEvent } from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShellContext } from '../components/ui/beautiful/controls';
+import { ApiError } from '../api';
+import type * as ApiModule from '../api';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../i18n';
 import { Conversation, type ConversationProps } from './Conversation';
 import type { Message } from './conversation/types';
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
-vi.mock('../api', () => api);
+vi.mock('../api', async (importOriginal) => ({ ...(await importOriginal<typeof ApiModule>()), request: api.request }));
 
 class FakeEventSource extends EventTarget {
   static instances: FakeEventSource[] = [];
@@ -22,9 +24,14 @@ class FakeEventSource extends EventTarget {
   close() {
     this.closed = true;
   }
+  /** Delivers one event; a stream delta waits for its animation frame, which follows at once here. */
   emit(seq: number, event: Record<string, unknown> & { type: string }) {
     act(() => {
+      const frames: FrameRequestCallback[] = [];
+      const frame = vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => -frames.push(callback));
       this.dispatchEvent(new MessageEvent(event.type, { data: JSON.stringify({ seq, ...event }), lastEventId: String(seq) }));
+      frame.mockRestore();
+      for (const callback of frames) callback(performance.now());
     });
   }
 }
@@ -224,15 +231,198 @@ describe('Conversation', () => {
   });
 
   it.each([
-    ['en', 'Message', 'Add a message to this run…', 'Send to guide the agent after its current step'],
-    ['zh-CN', '消息', '补充消息，加入当前任务…', '发送补充消息，智能体会在当前步骤后接收'],
-    ['zh-TW', '訊息', '補充訊息，加入目前任務…', '傳送補充訊息，智慧體會在目前步驟後接收'],
-  ])('explains insertion in the working composer in %s', async (locale, label, placeholder, hint) => {
+    ['en', 'Message', 'Add a message to this run…', 'Enter adds to this turn · Alt+Enter sends after it', 'Send options'],
+    ['zh-CN', '消息', '补充消息，加入当前任务…', 'Enter 插入当前任务 · Alt+Enter 本轮结束后发送', '发送方式'],
+    ['zh-TW', '訊息', '補充訊息，加入目前任務…', 'Enter 插入目前任務 · Alt+Enter 本輪結束後傳送', '傳送方式'],
+  ])('explains both send modes in the working composer in %s', async (locale, label, placeholder, hint, options) => {
     window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
     serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Working', 'running')]) });
     renderConversation('channel-3');
     expect(await screen.findByLabelText(label)).toHaveAttribute('placeholder', placeholder);
     expect(screen.getByText(hint)).toBeVisible();
+    expect(screen.getByRole('button', { name: options })).toHaveAttribute('aria-haspopup', 'menu');
+  });
+
+  it('sends Enter into the running turn and Alt+Enter or the menu choice after it', async () => {
+    const user = userEvent.setup();
+    let next = 10;
+    serve({
+      'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Working', 'running')]),
+      // Every accepted message is absorbed, so the turn stays insertable for the next send.
+      'POST /api/conversations/channel-3/messages': (body) => ({
+        message: { ...message(next++, 'user', String(body.content), 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } }, job_id: next,
+      }),
+    });
+    renderConversation('channel-3');
+    const input = await screen.findByLabelText('Message');
+    await user.type(input, 'Insert this{Enter}');
+    await waitFor(() => expect(input).toHaveValue(''));
+    await user.type(input, 'After this turn');
+    await user.keyboard('{Alt>}{Enter}{/Alt}');
+    await waitFor(() => expect(input).toHaveValue(''));
+    await user.type(input, 'Chosen from the menu');
+    await user.click(screen.getByRole('button', { name: 'Send options' }));
+    const menu = await screen.findByRole('menu', { name: 'Send options' });
+    expect(within(menu).getByRole('menuitem', { name: /Add to this turn/ })).toHaveTextContent('Enter');
+    await user.click(within(menu).getByRole('menuitem', { name: /Send after this turn/ }));
+    await waitFor(() => expect(input).toHaveValue(''));
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(calls('POST', '/api/conversations/channel-3/messages')).toEqual([
+      { content: 'Insert this', attachment_ids: [], mode: 'insert' },
+      { content: 'After this turn', attachment_ids: [], mode: 'after_turn' },
+      { content: 'Chosen from the menu', attachment_ids: [], mode: 'after_turn' },
+    ]);
+  });
+
+  it('offers withdraw only to the author before delivery and labels after-turn messages', async () => {
+    const pending: Message = { ...message(2, 'user', 'Mine, pending'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending', author_user_id: 1 } };
+    const theirs: Message = { ...message(3, 'user', 'Theirs, queued'), metadata: { status: 'queued', author_user_id: 2, author_display_name: 'Alex' } };
+    const later: Message = { ...message(4, 'user', 'Mine, after the turn'), metadata: { status: 'queued', send_mode: 'after_turn', author_user_id: 1 } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([{ ...message(1, 'user', 'Start', 'running'), metadata: { status: 'running', author_user_id: 1 } }, pending, theirs, later]) });
+    renderConversation('channel-3', { userId: 1 });
+    const bubble = (text: string) => screen.getByText(text).closest('div.flex-col') as HTMLElement;
+    await screen.findByText('Mine, after the turn');
+    expect(within(bubble('Mine, pending')).getByRole('button', { name: 'Withdraw' })).toBeVisible();
+    expect(within(bubble('Mine, after the turn')).getByRole('button', { name: 'Withdraw' })).toBeVisible();
+    expect(within(bubble('Mine, after the turn')).getByText('Sends after this turn · 2 ahead')).toBeVisible();
+    expect(within(bubble('Theirs, queued')).queryByRole('button', { name: 'Withdraw' })).not.toBeInTheDocument();
+    expect(within(bubble('Start')).queryByRole('button', { name: 'Withdraw' })).not.toBeInTheDocument();
+
+    FakeEventSource.instances[0].emit(1, { type: 'input_delivered', message_id: 2 });
+    expect(within(bubble('Mine, pending')).queryByRole('button', { name: 'Withdraw' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Withdraw' })).toHaveLength(1);
+  });
+
+  it('withdraws into the composer: the text goes above the draft and the files return as chips', async () => {
+    const user = userEvent.setup();
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    const later: Message = { ...message(2, 'user', 'Check the totals'), metadata: { status: 'queued', send_mode: 'after_turn' }, attachments: [attachment] };
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Working', 'running'), later]),
+      'DELETE /api/conversations/private/messages/2': () => ({ content: 'Check the totals', attachments: [attachment] }),
+      'POST /api/conversations/private/messages': (body) => ({ message: message(3, 'user', String(body.content), 'queued'), job_id: 9 }),
+    });
+    renderConversation('private');
+    const input = await screen.findByLabelText('Message');
+    await user.type(input, 'My draft');
+    await user.click(screen.getByRole('button', { name: 'Withdraw' }));
+    expect(calls('DELETE', '/api/conversations/private/messages/2')).toHaveLength(1);
+    await waitFor(() => expect(input).toHaveValue('Check the totals\n\nMy draft'));
+    expect(screen.queryByText('Check the totals', { selector: '[role="log"] *' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove notes.txt' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: 'Check the totals\n\nMy draft', attachment_ids: [17], mode: 'insert' }]);
+  });
+
+  it('keeps a chat message the agent already read and says so gently', async () => {
+    const user = userEvent.setup();
+    const pending: Message = { ...message(2, 'user', 'Too late'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({
+      'GET /api/chat/conversations/abc/messages?limit=100': () => page([message(1, 'user', 'Working', 'running'), pending]),
+      'DELETE /api/chat/conversations/abc/messages/2': () => { throw new ApiError('already_seen', 409); },
+    });
+    renderConversation('chat-abc');
+    await user.click(await screen.findByRole('button', { name: 'Withdraw' }));
+    expect(await screen.findByText('The agent is already taking this message in')).toHaveAttribute('role', 'status');
+    expect(screen.getByText('Too late')).toBeVisible();
+    expect(screen.getByLabelText('Message')).toHaveValue('');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('removes a message withdrawn elsewhere when message_removed arrives, and ignores later events for it', async () => {
+    const theirs: Message = { ...message(2, 'user', 'Withdrawn by Alex'), metadata: { status: 'queued', author_user_id: 2, author_display_name: 'Alex' } };
+    serve({ 'GET /api/conversations/channel-3/messages?limit=100': () => page([message(1, 'user', 'Working', 'running'), theirs]) });
+    renderConversation('channel-3', { userId: 1 });
+    await screen.findByText('Withdrawn by Alex');
+    expect(screen.getByText('1 queued — messages run in order after the current reply')).toBeVisible();
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'message_removed', message_id: 2 });
+    await waitFor(() => expect(screen.queryByText('Withdrawn by Alex')).not.toBeInTheDocument());
+    stream.emit(2, { type: 'message', message: theirs });
+    expect(screen.queryByText('Withdrawn by Alex')).not.toBeInTheDocument();
+    expect(screen.queryByText(/queued —/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Message')).toHaveValue('');
+  });
+
+  it('keeps a message withdrawn while an earlier page was loading out of that page', async () => {
+    const user = userEvent.setup();
+    // The app's TypeScript lib predates Promise.withResolvers.
+    let release: (value: unknown) => void = () => {};
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([message(5, 'user', 'Recent')], { next_before_id: 5 }),
+      'GET /api/conversations/private/messages?before=5&limit=100': () => new Promise((resolve) => { release = resolve; }),
+    });
+    renderConversation('private');
+    await user.click(await screen.findByRole('button', { name: 'Load earlier messages' }));
+    FakeEventSource.instances[0].emit(1, { type: 'message_removed', message_id: 3 });
+    release(page([message(2, 'user', 'Kept earlier'), message(3, 'user', 'Withdrawn meanwhile')]));
+    expect(await screen.findByText('Kept earlier')).toBeVisible();
+    expect(screen.queryByText('Withdrawn meanwhile')).not.toBeInTheDocument();
+  });
+
+  it('confirms Stop when queued and pending messages would be cancelled with the run', async () => {
+    const user = userEvent.setup();
+    const pending: Message = { ...message(2, 'user', 'Pending insert'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({
+      'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Working', 'running'), pending, message(3, 'user', 'Queued next', 'queued')]),
+      'POST /api/conversations/private/cancel': () => ({ ok: true }),
+    });
+    renderConversation('private');
+    await user.click(await screen.findByRole('button', { name: 'Stop' }));
+    const dialog = await screen.findByRole('alertdialog', { name: 'Stop the agent?' });
+    expect(dialog).toHaveTextContent('2 queued messages will also be cancelled. You can send them again afterwards.');
+    expect(calls('POST', '/api/conversations/private/cancel')).toEqual([]);
+    await user.click(within(dialog).getByRole('button', { name: 'Keep working' }));
+    expect(calls('POST', '/api/conversations/private/cancel')).toEqual([]);
+    await user.click(screen.getByRole('button', { name: 'Stop' }));
+    await user.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Stop' }));
+    expect(calls('POST', '/api/conversations/private/cancel')).toEqual([{}]);
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
+  });
+
+  it('keeps the same bubble node from pending to delivered and the same reply node from live to persisted', async () => {
+    const user = userEvent.setup();
+    const request = message(1, 'user', 'Review the report', 'running');
+    const inserted: Message = { ...message(2, 'user', 'Focus on revenue', 'running'), metadata: { status: 'running', inserted_into: 1, delivery: 'pending' } };
+    serve({ 'GET /api/conversations/private/messages?limit=100': () => page([request, inserted]) });
+    renderConversation('private');
+    await screen.findByText('Focus on revenue');
+    const stream = FakeEventSource.instances[0];
+    stream.emit(1, { type: 'tool_start', tool_call_id: 'read-report', name: 'read', args: { path: '/workspace/report.txt' } });
+    const live = screen.getByRole('article', { name: 'Reply in progress' });
+    const bubble = within(live).getByText('Focus on revenue');
+    const requestBubble = screen.getByText('Review the report');
+    stream.emit(2, { type: 'tool_end', tool_call_id: 'read-report', is_error: false, content_preview: 'Q3' });
+    stream.emit(3, { type: 'input_delivered', message_id: 2 });
+    stream.emit(4, { type: 'tool_start', tool_call_id: 'read-revenue', name: 'read', args: { path: '/workspace/revenue.txt' } });
+    expect(within(live).getByText('Focus on revenue')).toBe(bubble);
+    expect(within(live).queryByText('The agent will see this after its current step')).not.toBeInTheDocument();
+    // A reader opens the first segment; settling must not close it.
+    const first = within(live).getAllByRole('button', { name: /^Worked for/ })[0];
+    await user.click(first);
+    expect(first).toHaveAttribute('aria-expanded', 'true');
+    stream.emit(5, { type: 'tool_end', tool_call_id: 'read-revenue', is_error: false, content_preview: 'Up 20%' });
+    stream.emit(6, { type: 'text_delta', delta: 'Revenue rose 20%.' });
+
+    const finished: Message = { ...message(3, 'assistant', 'Revenue rose 20%.'), metadata: {
+      status: 'completed', reply_to: { message_id: 1 }, work: {
+        v: 1, started_at: '2026-10-03T09:00:00Z', ended_at: '2026-10-03T09:00:10Z', truncated: false, items: [
+          { type: 'tool', id: 'read-report', name: 'read', args: { path: '/workspace/report.txt' }, status: 'done', output: 'Q3' },
+          { type: 'input', message_id: 2, at: '2026-10-03T09:00:05Z' },
+          { type: 'tool', id: 'read-revenue', name: 'read', args: { path: '/workspace/revenue.txt' }, status: 'done', output: 'Up 20%' },
+        ],
+      },
+    } };
+    stream.emit(7, { type: 'message', message: { ...request, metadata: { status: 'completed' } } });
+    stream.emit(8, { type: 'message', message: { ...inserted, metadata: { ...inserted.metadata, status: 'completed', delivery: 'delivered' } } });
+    stream.emit(9, { type: 'run_end', message: finished });
+    const settled = screen.getByRole('article', { name: 'Agent reply' });
+    expect(settled).toBe(live);
+    expect(settled).not.toHaveAttribute('aria-busy');
+    expect(within(settled).getByText('Focus on revenue')).toBe(bubble);
+    expect(within(settled).getAllByRole('button', { name: /^Worked for/ })[0]).toBe(first);
+    expect(first).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Review the report')).toBe(requestBubble);
   });
 
   it('keeps resend on a cancelled inserted message inside its persisted reply', async () => {
@@ -652,6 +842,7 @@ describe('Conversation', () => {
     renderConversation('private');
     await user.click(await screen.findByRole('button', { name: 'Stop' }));
     expect(calls('POST', '/api/conversations/private/cancel')).toEqual([{}]);
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
   });
 
   it('keeps channels read-only without the chat permission and names each author', async () => {

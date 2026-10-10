@@ -6,7 +6,7 @@
 
 | Tables | Purpose |
 | --- | --- |
-| `users`, `settings` | Accounts, permission groups, personal model/thinking settings, the administrator-set chat model (`users.chat_model_name`, `''` follows the personal AI model), branding and OAuth. Signed login cookies use `users.token_version` for revocation; there is no login-session table. |
+| `users`, `settings` | Accounts, permission groups, model policy groups (settings key `model_policies_v1`; each account names one in `users.model_policy`, default `default`), branding and OAuth. There are no per-account model or thinking columns. Signed login cookies use `users.token_version` for revocation; there is no login-session table. |
 | `channels`, `messages`, `attachments` | Shared/private product history and attachment metadata; bytes remain on disk. Hiding messages resets the visible conversation. Channel authorization uses permission groups, not membership rows. |
 | `agent_scopes` | Stable workspace and sandbox/lifecycle identity per personal or channel scope; Manager reads the scope inventory. |
 | `durable_jobs` | One durable queue, using kind `agent`; message and job are inserted atomically. Eligible interactive messages join the running parent as linked running jobs, never independent worker claims; parent-first settlement updates all children in the same transaction. Other work remains FIFO per session. Uncertain inputs are never automatically replayed. Task notice jobs (`payload.notice`, `task_ids`) queue like schedule occurrences: user messages never join them. |

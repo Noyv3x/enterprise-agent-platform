@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer as nodeCreateServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Runtime } from './runtime.js';
 
-type Service = Pick<Runtime, 'start' | 'steer' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
+type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
 const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
@@ -93,13 +93,13 @@ export function createServer(runtime: Service, token: string, maxBodyBytes = 33_
         json(response, 200, { status: 'ok', service: 'agent-platform-runtime' });
         return;
       }
-      const route = /^\/v1\/(sessions|runs)\/([^/]+)(?:\/(runs|events|steer|cancel|compact|history))?$/.exec(url.pathname);
+      const route = /^\/v1\/(sessions|runs)\/([^/]+)(?:\/(runs|events|steer|cancel|compact|history)|\/(inputs)\/([^/]+))?$/.exec(url.pathname);
       if (!route) throw failure(404, 'Not found');
       let id: string;
       try { id = decodeURIComponent(route[2]!); } catch { throw failure(400, 'Invalid identifier'); }
       if (!id || /[\x00-\x1f\x7f]/.test(id)) throw failure(400, 'Invalid identifier');
-      const operation = `${route[1]}/${route[3] ?? ''}`;
-      const allowed: Record<string, string> = { 'sessions/runs': 'POST', 'sessions/cancel': 'POST', 'sessions/compact': 'POST', 'sessions/': 'DELETE', 'sessions/history': 'GET', 'runs/events': 'GET', 'runs/steer': 'POST', 'runs/cancel': 'POST' };
+      const operation = `${route[1]}/${route[3] ?? route[4] ?? ''}`;
+      const allowed: Record<string, string> = { 'sessions/runs': 'POST', 'sessions/cancel': 'POST', 'sessions/compact': 'POST', 'sessions/': 'DELETE', 'sessions/history': 'GET', 'runs/events': 'GET', 'runs/steer': 'POST', 'runs/cancel': 'POST', 'runs/inputs': 'DELETE' };
       if (!allowed[operation]) throw failure(404, 'Not found');
       if (method !== allowed[operation]) { response.setHeader('allow', allowed[operation]); throw failure(405, 'Method not allowed'); }
       switch (operation) {
@@ -114,6 +114,14 @@ export function createServer(runtime: Service, token: string, maxBodyBytes = 33_
           validateSteer(input);
           runtime.steer(id, input);
           break;
+        }
+        case 'runs/inputs': {
+          let inputId: string;
+          try { inputId = decodeURIComponent(route[5]!); } catch { throw failure(400, 'Invalid identifier'); }
+          if (!inputId || inputId.length > 64 || /[\x00-\x1f\x7f]/.test(inputId)) throw failure(400, 'Invalid identifier');
+          runtime.removeInput(id, inputId);
+          json(response, 200, { removed: true });
+          return;
         }
         case 'runs/events': runtime.events(id, integer(url.searchParams.get('after'), 0, 0), response); return;
         case 'runs/cancel': await runtime.cancel(id); break;

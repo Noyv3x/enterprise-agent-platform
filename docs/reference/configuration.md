@@ -14,7 +14,7 @@ All historically accepted `manager.toml` keys still parse. `health_timeout_secon
 
 ## Models and account settings
 
-Personal AI uses `users.model_name` and `thinking_depth`; an empty `model_name` uses the first catalog model. Standard chat uses `users.chat_model_name` when an administrator set it, otherwise the personal AI model, with the same `thinking_depth` as the personal AI. Only administrators see or change these models; users see and change only their thinking depth.
+Each account belongs to exactly one model policy group (`users.model_policy`; settings key `model_policies_v1`; migration and fresh install create `default`). A group sets `{model,thinking}` for five slots: `personal` (personal AI, schedules, background-task notices), `channel` (the channel main agent, using the triggering user's group), `chat`, `scout` and `worker` (`task` subagents). Manual compaction uses the slot of the scope being compacted. An empty model uses the first catalog model. Only administrators see or change groups and assignments; users see and change neither models nor thinking depth.
 
 Codex device OAuth is deployment-wide Platform state. Platform owns durable credentials and refresh; Runtime resolves access through Platform. Protect the DB as credential-bearing data: `secret` flags do not encrypt stored values.
 

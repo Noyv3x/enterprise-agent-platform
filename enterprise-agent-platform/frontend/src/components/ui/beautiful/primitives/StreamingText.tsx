@@ -2,7 +2,8 @@
  * Adaptations: the answer is the caller's real (Markdown) content as it streams instead of a timed token script,
  * with StreamText's caret (`stream-caret`) at the live edge; the action row carries real actions (copy, resend)
  * and a status slot; demo sources and follow-up prompts are removed because replies carry none. The action row
- * keeps upstream's icon buttons and fade-in once the stream settles. */
+ * keeps upstream's icon buttons and its fade-in when the stream settles; a reply that was already settled when it
+ * mounted (restored history) shows the row in place, without replaying that entrance. */
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import "../atoms/stream-text.css";
 import "./streamingText.css";
@@ -76,6 +77,8 @@ export default function StreamingText({
   fill?: boolean;
 }) {
   const showRow = !streaming && (actions.length > 0 || status);
+  const [streamed, setStreamed] = useState(streaming);
+  if (streaming && !streamed) setStreamed(true);
   return (
     <div className={fill ? "w-full" : "w-full max-w-95"}>
       {children && <div className="bui-prose text-[13.5px] leading-[1.65] text-ink">{children}</div>}
@@ -84,7 +87,7 @@ export default function StreamingText({
       {showRow && (
         <div
           className={`${children ? "mt-2" : ""} flex flex-wrap items-center gap-0.5`}
-          style={{ animation: "fade-in 400ms ease-out both" }}
+          style={{ animation: streamed ? "fade-in 400ms ease-out both" : undefined }}
         >
           {status && <span className="mr-1.5 flex items-center gap-1.5">{status}</span>}
           {actions.map((action) => <ActionButton key={action.key} action={action} />)}

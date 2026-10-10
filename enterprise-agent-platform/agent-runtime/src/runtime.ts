@@ -163,6 +163,24 @@ export class Runtime {
     // A running personal bash call promotes its command to the background to hand control back.
     for(const watcher of [...live.watchers])watcher();
   }
+  /**
+   * Withdraw one accepted input Pi has not started. Pi's agent has no single-item removal, so the steering queue is cleared
+   * and the others are re-steered in their original order; no await sits between, so no step boundary can drain in between.
+   * An input missing from Pi's queue was already taken for delivery and cannot be withdrawn.
+   */
+  removeInput(id:string,inputId:string):void {
+    const run=this.runs.get(id);if(!run)throw failure(404,'Run not found');
+    const pending=run.pendingInputs.get(inputId);
+    if(run.done||!pending)throw failure(409,'Input is already delivered or the run is closed');
+    if(run.acceptingInput){
+      const live=this.sessions.get(run.sid);
+      const queued=live?.session.agent.peekQueuedMessages()??[];
+      if(!live||!queued.includes(pending.message))throw failure(409,'Input is already delivered or the run is closed');
+      live.session.agent.clearSteeringQueue();
+      for(const message of queued)if(message!==pending.message)live.session.agent.steer(message);
+    }
+    run.pendingInputs.delete(inputId);
+  }
   private emit(run:Run,event:Event) {
     if(!run.done)run.events.emit(event);
   }

@@ -8,7 +8,8 @@ Layout
   foundation.css  upstream app/globals.css "GENERIC FOUNDATION": tokens (:root, .dark), @theme, base rules,
                   primitive-* spacing utilities and shared keyframes. Smooth shadow stacks come from
                   shadow-plugin (Florian Kiem, MIT). Fonts are self-hosted latin subsets instead of next/font;
-                  the gallery's striped page, showcase gestures and docs-nav scroller are omitted; reduced-motion,
+                  the gallery's striped page, showcase gestures and docs-nav scroller are omitted; reduced-motion
+                  (which also zeroes animation and transition delays),
                   forced-colors and CJK tracking floors are appended. Accessibility: ink-3 is lifted to the 3:1
                   non-text floor on every ground (light 0.695→0.619, dark 0.541→0.582 OKLCH lightness), and small
                   informational text uses ink-2 (≥ 4.5:1); `color-scheme` follows the `.dark` theme.
@@ -20,7 +21,10 @@ Layout
                   callbacks carrying real state; i18n strings and accessibility; commercial Central Icons replaced
                   by open icons; remote images, sounds and marketing removed. A primitive's COMPONENT-SPECIFIC CSS
                   block from upstream globals.css sits next to it. TaskRows scopes detail IDs to each instance
-                  so repeated task keys in separate lists retain correct accessibility associations.
+                  so repeated task keys in separate lists retain correct accessibility associations. The work-trace
+                  primitives (ThinkingState, ToolChips, StreamingText) tune motion for live data: one disclosure
+                  timing, no measured trace line, and entrances only for genuinely new rows (entrance.ts, platform
+                  code); each file's header lists its changes.
   controls/       platform controls upstream does not ship (inputs, select, dialog, sheet, notice, empty state,
                   step scrubber), composed only from upstream tokens and primitives.
 

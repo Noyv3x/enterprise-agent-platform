@@ -19,7 +19,6 @@ const alice: User = {
   role: 'user',
   position: 'Engineer',
   permission_group: 'member',
-  thinking_depth: 'medium',
   timezone: 'UTC',
   active: true,
 };
@@ -91,5 +90,16 @@ describe('Settings', () => {
 
     expect(await screen.findByText('password must contain at least 8 characters')).toBeVisible();
     expect(screen.getByLabelText('New password')).toHaveValue('short');
+  });
+
+  it('shows no model, policy group or thinking depth, even if a stray field arrives', async () => {
+    const stray: User = { ...alice, thinking_depth: 'xhigh', model_policy: 'frugal', model_name: 'gpt-secret' };
+    for (const [locale, pattern] of [['en', /thinking|model|polic|gpt-secret|xhigh|frugal/i], ['zh-CN', /思考|模型|策略|gpt-secret|xhigh|frugal/]] as const) {
+      window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+      const { unmount } = render(<I18nProvider><ThemeProvider><Settings user={stray} onSaved={vi.fn()} /></ThemeProvider></I18nProvider>);
+      expect(screen.getByText(locale === 'en' ? 'Account' : '账户')).toBeVisible();
+      expect(document.body.textContent).not.toMatch(pattern);
+      unmount();
+    }
   });
 });

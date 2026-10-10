@@ -14,11 +14,20 @@ vi.mock('liveline', () => ({ Liveline: () => null }));
 
 const user = (id: number, username: string, extra: Record<string, unknown> = {}) => ({
   id, username, display_name: username.toUpperCase(), role: 'user', position: '', permission_group: 'member',
-  model_name: '', chat_model_name: '', thinking_depth: 'medium', timezone: 'UTC', active: true, ...extra,
+  model_policy: 'default', timezone: 'UTC', active: true, ...extra,
 });
 const me = user(1, 'admin', { role: 'admin', permission_group: 'admin' });
 const ana = user(7, 'ana');
-const ben = user(8, 'ben', { permission_group: 'viewer', active: false });
+const ben = user(8, 'ben', { permission_group: 'viewer', model_policy: 'light', active: false });
+
+const slots = (model: string, thinking: string) => ({
+  personal: { model, thinking }, channel: { model, thinking }, chat: { model, thinking }, scout: { model, thinking }, worker: { model, thinking },
+});
+const policies = [
+  { name: 'default', label: 'Default', slots: { ...slots('gpt-a', 'medium'), scout: { model: 'retired', thinking: 'low' } } },
+  { name: 'light', label: 'Light', slots: slots('', 'off') },
+  { name: 'spare', label: 'Spare', slots: slots('', 'medium') },
+];
 
 type Route = (body: Record<string, unknown>) => unknown;
 let routes: Record<string, Route> = {};
@@ -29,6 +38,7 @@ function serve(extra: Record<string, Route> = {}) {
     'GET /api/admin/users': () => ({ users: [me, ana, ben] }),
     'GET /api/admin/permission-groups': () => ({ groups: [{ name: 'admin', permissions: ['chat', 'manage_users'] }, { name: 'member', permissions: ['chat'] }, { name: 'viewer', permissions: [] }, { name: 'unused', permissions: ['chat'] }] }),
     'GET /api/admin/models': () => ({ models: [{ id: 'gpt-a', name: 'GPT A' }, { id: 'gpt-b', name: 'GPT B' }], connected: true }),
+    'GET /api/admin/model-policies': () => ({ policies, members: { default: 2, light: 1 } }),
     ...extra,
   };
   api.request.mockImplementation(async (path: string, options: RequestInit = {}) => {
@@ -94,29 +104,26 @@ describe('Admin', () => {
     expect(await within(sheet).findByText('Saved')).toBeVisible();
   });
 
-  it('sets the chat model separately from the personal model, keeping an unavailable one visible', async () => {
+  it('assigns the model policy group instead of models or thinking depth', async () => {
     const actor = userEvent.setup();
-    const retired = user(7, 'ana', { chat_model_name: 'retired' });
     serve({
-      'GET /api/admin/users': () => ({ users: [me, retired, ben] }),
-      'PATCH /api/admin/users/7': (body) => ({ user: { ...retired, ...body } }),
+      'PATCH /api/admin/users/7': (body) => ({ user: { ...ana, ...body } }),
     });
     renderAdmin();
 
-    await actor.click(await screen.findByRole('button', { name: 'Open ANA' }));
+    expect(within(await screen.findByRole('row', { name: /ANA/ })).getByText('Default')).toBeVisible();
+    await actor.click(screen.getByRole('button', { name: 'Open ANA' }));
     const sheet = await screen.findByRole('dialog', { name: 'ANA' });
-    const chatModel = within(sheet).getByRole('combobox', { name: 'Chat model' });
-    expect(chatModel).toHaveTextContent('retired · unavailable');
-    await actor.click(chatModel);
-    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Follow personal AI', 'GPT A', 'GPT B', 'retired · unavailable']);
-    await actor.click(screen.getByRole('option', { name: 'GPT B' }));
+    expect(within(sheet).queryByRole('combobox', { name: /model$|Thinking depth/ })).not.toBeInTheDocument();
+    const select = within(sheet).getByRole('combobox', { name: 'Model policy group' });
+    expect(select).toHaveTextContent('Default');
+    await actor.click(select);
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Default', 'Light', 'Spare']);
+    await actor.click(screen.getByRole('option', { name: 'Light' }));
     await actor.click(within(sheet).getByRole('button', { name: 'Save account' }));
-    await waitFor(() => expect(sent('PATCH', '/api/admin/users/7')).toEqual({ chat_model_name: 'gpt-b' }));
 
-    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat model' }));
-    await actor.click(screen.getByRole('option', { name: 'Follow personal AI' }));
-    await actor.click(within(sheet).getByRole('button', { name: 'Save account' }));
-    await waitFor(() => expect(api.request).toHaveBeenLastCalledWith('/api/admin/users/7', expect.objectContaining({ body: JSON.stringify({ chat_model_name: '' }) })));
+    await waitFor(() => expect(sent('PATCH', '/api/admin/users/7')).toEqual({ model_policy: 'light' }));
+    expect(await within(screen.getByRole('row', { name: /ANA/ })).findByText('Light')).toBeVisible();
   });
 
   it('deactivates another account only after confirmation', async () => {
@@ -182,6 +189,82 @@ describe('Admin', () => {
     await waitFor(() => expect(sent('PUT', '/api/admin/permission-groups')).toEqual({ groups: [
       { name: 'admin', permissions: ['chat', 'manage_users'] }, { name: 'member', permissions: ['chat'] }, { name: 'viewer', permissions: [] },
     ] }));
+  });
+
+  it('edits one slot of a model policy group and saves the whole list', async () => {
+    const actor = userEvent.setup();
+    serve({ 'PUT /api/admin/model-policies': (body) => ({ ...body, members: { default: 2, light: 1 } }) });
+    renderAdmin('#admin/policies');
+
+    expect(screen.getByRole('tab', { name: 'Model policy groups' })).toHaveAttribute('aria-selected', 'true');
+    await actor.click(await screen.findByRole('button', { name: 'Open Default' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Default' });
+    expect(within(sheet).getByRole('textbox', { name: 'Identifier' })).toHaveAttribute('readonly');
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat model' }));
+    await actor.click(screen.getByRole('option', { name: 'GPT B' }));
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat thinking depth' }));
+    await actor.click(screen.getByRole('option', { name: 'High' }));
+    await actor.click(within(sheet).getByRole('button', { name: 'Save group' }));
+
+    await waitFor(() => expect(sent('PUT', '/api/admin/model-policies')).toEqual({ policies: [
+      { ...policies[0], slots: { ...policies[0].slots, chat: { model: 'gpt-b', thinking: 'high' } } }, policies[1], policies[2],
+    ] }));
+    expect(await within(sheet).findByText('Saved')).toBeVisible();
+  });
+
+  it('creates a model policy group on the system default after validating its identifier', async () => {
+    const actor = userEvent.setup();
+    serve({ 'PUT /api/admin/model-policies': (body) => ({ ...body, members: { default: 2, light: 1 } }) });
+    renderAdmin('#admin/policies');
+
+    await actor.click(await screen.findByRole('button', { name: 'New group' }));
+    const sheet = await screen.findByRole('dialog', { name: 'New model policy group' });
+    await actor.type(within(sheet).getByRole('textbox', { name: 'Name' }), 'Frugal');
+    await actor.type(within(sheet).getByRole('textbox', { name: 'Identifier' }), 'Frugal');
+    expect(within(sheet).getByText(/Start with a lowercase letter/)).toBeVisible();
+    expect(within(sheet).getByRole('button', { name: 'Create group' })).toBeDisabled();
+    await actor.clear(within(sheet).getByRole('textbox', { name: 'Identifier' }));
+    await actor.type(within(sheet).getByRole('textbox', { name: 'Identifier' }), 'frugal');
+    await actor.click(within(sheet).getByRole('button', { name: 'Create group' }));
+
+    await waitFor(() => expect(sent('PUT', '/api/admin/model-policies')).toEqual({ policies: [
+      ...policies, { name: 'frugal', label: 'Frugal', slots: slots('', 'medium') },
+    ] }));
+  });
+
+  it('shows a configured model the catalog no longer offers as unavailable', async () => {
+    const actor = userEvent.setup();
+    serve();
+    renderAdmin('#admin/policies');
+
+    expect(await within(await screen.findByRole('row', { name: /Default/ })).findByText('retired · unavailable')).toBeVisible();
+    await actor.click(screen.getByRole('button', { name: 'Open Default' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Default' });
+    const scout = within(sheet).getByRole('combobox', { name: 'Research subagent model' });
+    expect(scout).toHaveTextContent('retired · unavailable');
+    await actor.click(scout);
+    // The system default names the catalog model it currently resolves to on its second line.
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['System defaultCurrently GPT A', 'GPT A', 'GPT B', 'retired · unavailable']);
+  });
+
+  it('refuses to delete a model policy group that still has accounts', async () => {
+    const actor = userEvent.setup();
+    serve({ 'PUT /api/admin/model-policies': (body) => ({ ...body, members: { default: 2, light: 1 } }) });
+    renderAdmin('#admin/policies');
+
+    await actor.click(await screen.findByRole('button', { name: 'Open Light' }));
+    let sheet = await screen.findByRole('dialog', { name: 'Light' });
+    expect(within(sheet).getByRole('button', { name: 'Delete group' })).toBeDisabled();
+    expect(within(sheet).getByText('Move its 1 accounts to another group before deleting it.')).toBeVisible();
+    await actor.click(within(sheet).getByRole('button', { name: 'Done' }));
+
+    await actor.click(screen.getByRole('button', { name: 'Open Spare' }));
+    sheet = await screen.findByRole('dialog', { name: 'Spare' });
+    await actor.click(within(sheet).getByRole('button', { name: 'Delete group' }));
+    await actor.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Delete group' }));
+
+    await waitFor(() => expect(sent('PUT', '/api/admin/model-policies')).toEqual({ policies: [policies[0], policies[1]] }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Spare' })).not.toBeInTheDocument());
   });
 
   it('shows the device code while waiting and reloads models once authorized', async () => {

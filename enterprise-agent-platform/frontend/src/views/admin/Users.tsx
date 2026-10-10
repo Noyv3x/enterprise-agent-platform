@@ -1,28 +1,30 @@
 import { useState } from 'react';
 import type { AdminUser, User } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
-import { ValuePill } from '../../components/ui/beautiful/atoms/ValuePill';
 import { EmptyState, Icon, Notice } from '../../components/ui/beautiful/controls';
 import LoadingState from '../../components/ui/beautiful/primitives/LoadingState';
 import RecordsTable, { RecordStatus, RecordTagList, RecordsFilterMenu, RecordsSearch, RecordsToolbar, type RecordColumn } from '../../components/ui/beautiful/primitives/RecordsTable';
 import { useWords } from '../../words';
 import { UserEditor } from './UserEditor';
-import { useAdminLabels, useRecordsLabels, useResource, type ModelCatalog, type PermissionGroup } from './shared';
+import { useAdminLabels, useRecordsLabels, useResource, type ModelPolicies, type PermissionGroup } from './shared';
 
 export function Users() {
   const w = useWords();
   const labels = useAdminLabels();
   const users = useResource<{ users: AdminUser[] }>('/api/admin/users');
   const groups = useResource<{ groups: PermissionGroup[] }>('/api/admin/permission-groups');
-  const catalog = useResource<ModelCatalog>('/api/admin/models');
+  const policies = useResource<ModelPolicies>('/api/admin/model-policies');
   const me = useResource<{ user: User }>('/api/me');
   const selfId = me.data?.user.id;
   const [editing, setEditing] = useState<number | 'new' | null>(null);
   const [query, setQuery] = useState('');
   const [role, setRole] = useState<string | null>(null);
   const [group, setGroup] = useState<string | null>(null);
+  const [policy, setPolicy] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
-  const models = catalog.data?.models ?? [];
+  const policyList = policies.data?.policies ?? [];
+  // A name the list does not hold (still loading, or failed) shows verbatim.
+  const policyLabel = (name: string) => policyList.find((item) => item.name === name)?.label ?? name;
   const list = users.data?.users ?? [];
   const recordsLabels = useRecordsLabels(w('Accounts', '账户', '帳戶'));
 
@@ -31,6 +33,7 @@ export function Users() {
     (!needle || [user.username, user.display_name, user.position].some((value) => value.toLowerCase().includes(needle)))
     && (role === null || user.role === role)
     && (group === null || user.permission_group === group)
+    && (policy === null || user.model_policy === policy)
     && (status === null || String(user.active) === status));
 
   const columns: RecordColumn<AdminUser>[] = [
@@ -42,12 +45,9 @@ export function Users() {
         ...(user.role === 'admin' ? [{ key: 'role-admin', label: w('Admin role', '管理员角色', '管理員角色'), hue: 'purple' as const }] : []),
         { key: `group-${user.permission_group}`, label: labels.group(user.permission_group), hue: 'neutral' as const },
       ]} /> },
-    { key: 'model', label: w('Personal AI model', '个人 AI 模型', '個人 AI 模型'), glyph: 'model', width: 220,
-      sort: (a, b) => (a.model_name || '').localeCompare(b.model_name || ''),
-      render: (user) => <span className="flex min-w-0 items-center gap-1">
-        <span className={`truncate ${user.model_name ? '' : 'text-ink-2'}`}>{user.model_name ? models.find((model) => model.id === user.model_name)?.name || user.model_name : w('System default', '系统默认', '系統預設')}</span>
-        <ValuePill className="shrink-0" tone={user.thinking_depth === 'off' ? 'neutral' : 'accent'}>{labels.depth(user.thinking_depth)}</ValuePill>
-      </span> },
+    { key: 'policy', label: w('Model policy group', '策略组', '策略群組'), glyph: 'model', width: 180,
+      sort: (a, b) => policyLabel(a.model_policy).localeCompare(policyLabel(b.model_policy)),
+      render: (user) => policyLabel(user.model_policy) },
     { key: 'position', label: w('Position', '职位', '職位'), glyph: 'text', width: 150,
       sort: (a, b) => a.position.localeCompare(b.position), muted: (user) => !user.position, render: (user) => user.position || '—' },
     { key: 'status', label: w('Status', '状态', '狀態'), glyph: 'single', width: 140,
@@ -57,6 +57,7 @@ export function Users() {
   ];
 
   const groupNames = Array.from(new Set([...(groups.data?.groups.map((item) => item.name) ?? []), ...list.map((user) => user.permission_group)]));
+  const policyNames = Array.from(new Set([...policyList.map((item) => item.name), ...list.map((user) => user.model_policy)]));
   const editingUser = typeof editing === 'number' ? list.find((user) => user.id === editing) ?? null : null;
 
   function saved(user: AdminUser) {
@@ -72,7 +73,7 @@ export function Users() {
   }
 
   return <div className="flex min-h-0 flex-1 flex-col">
-    {catalog.error && <div className="px-4 pt-3 sm:px-6"><Notice tone="warning" title={w('Model catalog unavailable', '模型目录不可用', '模型目錄無法使用')}>{catalog.error}</Notice></div>}
+    {policies.error && <div className="px-4 pt-3 sm:px-6"><Notice tone="warning" title={w('Model policy groups unavailable', '无法加载策略组', '無法載入策略群組')}>{policies.error}</Notice></div>}
     <RecordsTable<AdminUser>
       fill
       rows={rows}
@@ -93,15 +94,17 @@ export function Users() {
               options: [{ value: 'admin', label: w('Administrator', '管理员', '管理員') }, { value: 'user', label: w('Standard user', '普通用户', '一般使用者') }] },
             { key: 'group', label: w('Permission group', '权限组', '權限群組'), anyLabel: w('Any group', '全部权限组', '全部權限群組'), value: group, onChange: setGroup,
               options: groupNames.map((name) => ({ value: name, label: labels.group(name) })) },
+            { key: 'policy', label: w('Model policy group', '策略组', '策略群組'), anyLabel: w('Any policy group', '全部策略组', '全部策略群組'), value: policy, onChange: setPolicy,
+              options: policyNames.map((name) => ({ value: name, label: policyLabel(name) })) },
             { key: 'status', label: w('Status', '状态', '狀態'), anyLabel: w('Any status', '全部状态', '全部狀態'), value: status, onChange: setStatus,
               options: [{ value: 'true', label: w('Active', '正常', '正常') }, { value: 'false', label: w('Deactivated', '已停用', '已停用') }] },
           ]} />
         </>}
         right={<>
-          <button type="button" className="records-quiet-button" disabled={users.refreshing} onClick={() => { void users.reload(); void groups.reload(); void catalog.reload(); }}>
+          <button type="button" className="records-quiet-button" disabled={users.refreshing} onClick={() => { void users.reload(); void groups.reload(); void policies.reload(); }}>
             <Icon name="refresh" size={14} />{w('Refresh', '刷新', '重新整理')}
           </button>
-          <Button size="sm" variant="primary" disabled={!groups.data} onClick={() => setEditing('new')}>
+          <Button size="sm" variant="primary" disabled={!groups.data || !policies.data} onClick={() => setEditing('new')}>
             <Icon name="plus" size={14} />{w('New account', '新建账户', '新增帳戶')}
           </Button>
         </>} />}
@@ -111,7 +114,7 @@ export function Users() {
       user={editingUser}
       self={editingUser !== null && editingUser.id === selfId}
       groups={groups.data?.groups ?? []}
-      models={models}
+      policies={policyList}
       onSaved={saved}
       onDeactivated={() => void users.reload(true)}
       onClose={() => setEditing(null)}

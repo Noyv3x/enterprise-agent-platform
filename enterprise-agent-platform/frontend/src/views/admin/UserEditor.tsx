@@ -3,20 +3,17 @@ import { request, type AdminUser } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
 import { ConfirmDialog, Field, FormGrid, Notice, Select, Sheet, TextField } from '../../components/ui/beautiful/controls';
 import { useWords } from '../../words';
-import { THINKING_DEPTHS, errorText, useAdminLabels, type ModelOption, type PermissionGroup } from './shared';
+import { errorText, useAdminLabels, type ModelPolicy, type PermissionGroup } from './shared';
 
-interface Draft { username: string; display_name: string; position: string; role: string; permission_group: string; model_name: string; chat_model_name: string; thinking_depth: string; password: string }
+interface Draft { username: string; display_name: string; position: string; role: string; permission_group: string; model_policy: string; password: string }
 
-const SYSTEM_DEFAULT = '__system_default__';
-const FOLLOW_PERSONAL = '__follow_personal__';
-
-/** Create or edit an account in a side sheet: identity, access, models and password save together;
+/** Create or edit an account in a side sheet: identity, access, model policy group and password save together;
  * deactivation and impersonation are separate actions below, each with its own button. */
-export function UserEditor({ user, self, groups, models, onSaved, onDeactivated, onClose }: {
+export function UserEditor({ user, self, groups, policies, onSaved, onDeactivated, onClose }: {
   user: AdminUser | null;
   self: boolean;
   groups: PermissionGroup[];
-  models: ModelOption[];
+  policies: ModelPolicy[];
   onSaved: (user: AdminUser) => void;
   onDeactivated: () => void;
   onClose: () => void;
@@ -30,9 +27,7 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
     position: user?.position ?? '',
     role: user?.role ?? 'user',
     permission_group: user?.permission_group ?? (groups.some((group) => group.name === 'member') ? 'member' : groups[0]?.name ?? ''),
-    model_name: user?.model_name ?? '',
-    chat_model_name: user?.chat_model_name ?? '',
-    thinking_depth: user?.thinking_depth === 'none' ? 'off' : user?.thinking_depth || 'medium',
+    model_policy: user?.model_policy ?? (policies.some((policy) => policy.name === 'default') ? 'default' : policies[0]?.name ?? ''),
     password: '',
   }));
   const [current, setCurrent] = useState<AdminUser | null>(user);
@@ -47,18 +42,11 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
   const [impersonateError, setImpersonateError] = useState('');
   const set = (patch: Partial<Draft>) => { setDraft((old) => ({ ...old, ...patch })); setSaved(false); };
   const changed = (Object.keys(draft) as (keyof Draft)[]).filter((key) => draft[key] !== initial[key]);
-  const valid = draft.permission_group !== '' && (current !== null || (draft.username.trim() !== '' && draft.password !== ''));
+  const valid = draft.permission_group !== '' && draft.model_policy !== '' && (current !== null || (draft.username.trim() !== '' && draft.password !== ''));
 
-  const modelOptions = [
-    { value: SYSTEM_DEFAULT, label: w('System default', '系统默认', '系統預設') },
-    ...models.map((model) => ({ value: model.id, label: model.name || model.id })),
-  ];
-  if (draft.model_name && !models.some((model) => model.id === draft.model_name)) modelOptions.push({ value: draft.model_name, label: `${draft.model_name} · ${w('unavailable', '不可用', '無法使用')}` });
-  const chatModelOptions = [
-    { value: FOLLOW_PERSONAL, label: w('Follow personal AI', '跟随个人 AI', '跟隨個人 AI') },
-    ...models.map((model) => ({ value: model.id, label: model.name || model.id })),
-  ];
-  if (draft.chat_model_name && !models.some((model) => model.id === draft.chat_model_name)) chatModelOptions.push({ value: draft.chat_model_name, label: `${draft.chat_model_name} · ${w('unavailable', '不可用', '無法使用')}` });
+  const policyOptions = policies.map((policy) => ({ value: policy.name, label: policy.label }));
+  // An account can only point at an existing group; a name the list lacks means the list failed to load.
+  if (draft.model_policy && !policies.some((policy) => policy.name === draft.model_policy)) policyOptions.push({ value: draft.model_policy, label: draft.model_policy });
 
   async function submit() {
     if (!valid || saving || !changed.length) return;
@@ -161,19 +149,11 @@ export function UserEditor({ user, self, groups, models, onSaved, onDeactivated,
             </Field>
           </FormGrid>
         </EditorGroup>
-        <EditorGroup title={w('Models and thinking', '模型与思考', '模型與思考')}>
-          <FormGrid>
-            <Field label={w('Personal AI model', '个人 AI 模型', '個人 AI 模型')}>
-              <Select value={draft.model_name || SYSTEM_DEFAULT} onChange={(value: string) => set({ model_name: value === SYSTEM_DEFAULT ? '' : value })} options={modelOptions} />
-            </Field>
-            <Field label={w('Chat model', '聊天模型', '聊天模型')} hint={w('Standard chat uses the personal AI model unless one is set here.', '标准聊天默认使用个人 AI 的模型，可在此单独指定。', '標準聊天預設使用個人 AI 的模型，可在此單獨指定。')}>
-              <Select value={draft.chat_model_name || FOLLOW_PERSONAL} onChange={(value: string) => set({ chat_model_name: value === FOLLOW_PERSONAL ? '' : value })} options={chatModelOptions} />
-            </Field>
-            <Field label={w('Thinking depth', '思考深度', '思考深度')}>
-              <Select value={draft.thinking_depth} onChange={(thinking_depth: string) => set({ thinking_depth })}
-                options={THINKING_DEPTHS.map((depth) => ({ value: depth, label: labels.depth(depth) }))} />
-            </Field>
-          </FormGrid>
+        <EditorGroup title={w('Models', '模型', '模型')} description={w('The model policy group decides the model and thinking depth for each use. The account does not see it.', '策略组决定每种用途的模型和思考深度。账户本人看不到。', '策略群組決定每種用途的模型和思考深度。帳戶本人看不到。')}>
+          <Field label={w('Model policy group', '策略组', '策略群組')} required>
+            <Select value={draft.model_policy} onChange={(model_policy: string) => set({ model_policy })}
+              placeholder={w('Choose a group', '选择策略组', '選擇策略群組')} options={policyOptions} />
+          </Field>
         </EditorGroup>
         <EditorGroup title={w('Password', '密码', '密碼')}>
           <Field label={current ? w('New password', '新密码', '新密碼') : w('Initial password', '初始密码', '初始密碼')} required={!current}

@@ -7,6 +7,7 @@ inside the same transaction and lock as the schema block, on every ``migrate``.
 from __future__ import annotations
 
 import fcntl
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,14 +32,12 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT NOT NULL DEFAULT 'member',
     position TEXT NOT NULL DEFAULT '',
     permission_group TEXT NOT NULL DEFAULT 'member',
-    model_name TEXT NOT NULL DEFAULT '',
-    thinking_depth TEXT NOT NULL DEFAULT 'medium',
+    model_policy TEXT NOT NULL DEFAULT 'default',
     timezone TEXT NOT NULL DEFAULT '',
     active INTEGER NOT NULL DEFAULT 1,
     token_version INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL,
-    last_login_at INTEGER,
-    chat_model_name TEXT NOT NULL DEFAULT ''
+    last_login_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS channels (
@@ -273,6 +272,36 @@ def _chat_model_follows_personal_ai(conn: sqlite3.Connection) -> None:
         conn.execute('ALTER TABLE chat_conversations DROP COLUMN model_id')
 
 
+MODEL_SLOTS = ('personal', 'channel', 'chat', 'scout', 'worker')
+THINKING_DEPTHS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh')
+
+
+def _model_policy_groups(conn: sqlite3.Connection) -> None:
+    """Replace per-account model/thinking columns with the `default` model policy group every account joins.
+
+    The group is seeded from the lowest-id active administrator (else the lowest-id account);
+    with no accounts, every model is the system default and every depth `medium`.
+    """
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(users)')}
+    if 'model_policy' not in columns:
+        conn.execute("ALTER TABLE users ADD COLUMN model_policy TEXT NOT NULL DEFAULT 'default'")
+    source = None
+    if {'model_name', 'chat_model_name', 'thinking_depth'} <= columns:
+        source = (conn.execute("SELECT model_name,chat_model_name,thinking_depth FROM users WHERE role='admin' AND active=1 ORDER BY id LIMIT 1").fetchone()
+                  or conn.execute('SELECT model_name,chat_model_name,thinking_depth FROM users ORDER BY id LIMIT 1').fetchone())
+    model, chat_model, thinking = (source['model_name'], source['chat_model_name'], source['thinking_depth']) if source else ('', '', 'medium')
+    thinking = 'off' if thinking == 'none' else thinking if thinking in THINKING_DEPTHS else 'medium'
+    chat_model = chat_model or model
+    slots = {'personal': model, 'channel': model, 'chat': chat_model, 'scout': chat_model, 'worker': model}
+    policies = [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': slots[slot], 'thinking': thinking} for slot in MODEL_SLOTS}}]
+    conn.execute("INSERT OR IGNORE INTO settings(key,value,secret,updated_at) VALUES('model_policies_v1',?,0,CAST(strftime('%s','now') AS INTEGER))",
+                 (json.dumps(policies, ensure_ascii=False),))
+    conn.execute("UPDATE users SET model_policy='default'")
+    for column in ('model_name', 'chat_model_name', 'thinking_depth'):
+        if column in columns:
+            conn.execute(f'ALTER TABLE users DROP COLUMN {column}')
+
+
 # (version, name, SQL statements or a callable taking the open connection). Append only; versions must increase.
 _MIGRATIONS = (
     (2026100101, 'drop-pre-pi-rollback-compat', (
@@ -312,6 +341,7 @@ _MIGRATIONS = (
         'CREATE INDEX IF NOT EXISTS idx_background_tasks_user ON background_tasks(user_id, status, id)',
         'CREATE INDEX IF NOT EXISTS idx_background_tasks_undelivered ON background_tasks(status, delivered_at, notice_job_id)',
     )),
+    (2026101201, 'model-policy-groups', _model_policy_groups),
 )
 
 

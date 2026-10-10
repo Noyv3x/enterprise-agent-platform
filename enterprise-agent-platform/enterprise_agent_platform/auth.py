@@ -13,10 +13,12 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .db import MODEL_SLOTS
+
 
 PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings']
 DEFAULT_GROUPS = {'admin': PERMISSIONS, 'manager': PERMISSIONS[:4], 'member': PERMISSIONS[:3], 'viewer': PERMISSIONS[:1]}
-USER_FIELDS = 'id username display_name role position permission_group thinking_depth timezone active'.split()
+USER_FIELDS = 'id username display_name role position permission_group timezone active'.split()
 TTL = 7 * 86400
 COOKIE_NAME = 'agent_platform_session'
 LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
@@ -103,20 +105,37 @@ def verify_password(password, encoded):
 def public_user(row):
     user = {key: row[key] for key in USER_FIELDS}
     user['active'] = bool(user['active'])
-    if user['thinking_depth'] == 'none':
-        user['thinking_depth'] = 'off'
     return user
 
 
 def admin_user(row):
-    """The administrator view of an account: the self-facing shape plus its models."""
-    return {**public_user(row), 'model_name': row['model_name'], 'chat_model_name': row['chat_model_name']}
+    """The administrator view of an account: the self-facing shape plus its model policy group."""
+    return {**public_user(row), 'model_policy': row['model_policy']}
 
 
 def groups(db):
     with db.connect() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key='permission_groups_v1'").fetchone()
     return json.loads(row['value']) if row else [{'name': name, 'permissions': list(perms)} for name, perms in DEFAULT_GROUPS.items()]
+
+
+def model_policies(db):
+    with db.connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key='model_policies_v1'").fetchone()
+    if row:
+        return json.loads(row['value'])
+    return [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': '', 'thinking': 'medium'} for slot in MODEL_SLOTS}}]
+
+
+def model_slot(db, user, slot):
+    """The `{id, thinking}` the user's model policy group sets for a usage slot; an empty id is the system default.
+    Membership is read by account id: request users are public projections without `model_policy`."""
+    with db.connect() as conn:
+        row = conn.execute('SELECT model_policy FROM users WHERE id=?', (user['id'],)).fetchone()
+    policy = next((policy for policy in model_policies(db) if row and policy['name'] == row['model_policy']), None)
+    if policy is None:
+        raise HTTPException(409, 'Model policy group is missing')
+    return {'id': policy['slots'][slot]['model'], 'thinking': policy['slots'][slot]['thinking']}
 
 
 def permissions(db, user):

@@ -6,6 +6,10 @@
  *   (`clipboardFiles`, also used by callers that accept pastes outside the textarea);
  *   `/` commands, the model list and send/stop come from props;
  * - a stop control takes the dictation slot while the agent is working (send remains available for steering);
+ * - send options (platform addition for steering): when the caller passes `sendOptions`, a chevron before send and
+ *   a long press on send open a send-mode menu built like the model menu (pop-in above the composer, GlideMenu
+ *   highlight, menu semantics with arrow keys and Escape back to the trigger); Enter and Alt+Enter pick the option
+ *   bound to that shortcut (shown in the menu except on touch screens), and `onSend` receives the chosen option key;
  * - the textarea is controlled by the caller so drafts survive re-renders and can be pre-filled;
  * - IME composition never sends; menus get listbox/menu roles; the glimm sweep marks a model change and is
  *   skipped under reduced motion or without WebGL; labels come from the caller (i18n);
@@ -16,6 +20,7 @@
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createShader, playSweep, accentChain, ACCENTS, type ShaderController } from "glimm";
+import GlideMenu from "./GlideMenu";
 
 const PASTE_EXTENSIONS: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp" };
 
@@ -66,6 +71,12 @@ function Icon({ children, size = 15, strokeWidth = 1.8 }: { children: ReactNode;
 
 export type PromptCommand = { key: string; name: string; desc: string };
 export type PromptModel = { key: string; name: string; tag?: string };
+/** A way to send while the agent works; Enter and Alt+Enter each pick the option bound to them. */
+export type PromptSendOption = { key: string; label: string; shortcut: "enter" | "alt-enter" };
+
+const SHORTCUTS: Record<PromptSendOption["shortcut"], string> = { enter: "Enter", "alt-enter": "Alt+Enter" };
+/** Holding send this long opens the send options (touch devices have no Alt+Enter). */
+const LONG_PRESS_MS = 450;
 export type PromptAttachment = {
   key: string | number;
   name: string;
@@ -84,6 +95,8 @@ export type PromptBarLabels = {
   commandsHint: string;
   noMatches: (query: string) => string;
   dropFiles: string;
+  /** name of the send options menu and its chevron */
+  sendOptions?: string;
 };
 
 /* the last /word being typed at the start of the draft or after whitespace */
@@ -110,6 +123,7 @@ export default function PromptBar({
   modelDisabled = false,
   canSend,
   onSend,
+  sendOptions = [],
   working = false,
   onStop,
   stopping = false,
@@ -135,7 +149,10 @@ export default function PromptBar({
   onModelChange?: (key: string) => void;
   modelDisabled?: boolean;
   canSend: boolean;
-  onSend: () => void;
+  /** `option` is the chosen send option's key (none without `sendOptions`) */
+  onSend: (option?: string) => void;
+  /** two or more ways to send (e.g. into the running turn or after it); offered through Enter/Alt+Enter and a menu */
+  sendOptions?: PromptSendOption[];
   /** the agent is working: show stop next to send */
   working?: boolean;
   onStop?: () => void;
@@ -159,6 +176,8 @@ export default function PromptBar({
   const [modelHovered, setModelHovered] = useState<number | null>(null);
   const [modelMenuLeft, setModelMenuLeft] = useState(0);
   const [modelMenuBottom, setModelMenuBottom] = useState(0);
+  const [sendMenuOpen, setSendMenuOpen] = useState(false);
+  const [sendMenuBox, setSendMenuBox] = useState({ right: 0, bottom: 0 });
   const composerAnchorRef = useRef<HTMLDivElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
   const ownInputRef = useRef<HTMLTextAreaElement>(null);
@@ -172,6 +191,13 @@ export default function PromptBar({
   const shaderRef = useRef<ShaderController | null>(null);
   const sweepingRef = useRef(false);
   const composingRef = useRef(false);
+  const sendRef = useRef<HTMLButtonElement>(null);
+  const sendChevronRef = useRef<HTMLButtonElement>(null);
+  const sendRowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const pressTimer = useRef<number | undefined>(undefined);
+  const longPressed = useRef(false);
+  const hasSendOptions = sendOptions.length > 1;
+  const sendMenuId = `${ids}-send`;
 
   const token = dismissed || commands.length === 0 ? null : parseSlash(draft);
   const query = token?.query ?? "";
@@ -214,6 +240,28 @@ export default function PromptBar({
   useEffect(() => {
     if (!modelOpen) setModelHovered(null);
   }, [modelOpen]);
+
+  /* the send menu grows up from the send button, right edges aligned */
+  const sendMenuShown = sendMenuOpen && hasSendOptions;
+  useLayoutEffect(() => {
+    if (!sendMenuShown || !composerAnchorRef.current || !sendRef.current) return;
+    const anchorRect = composerAnchorRef.current.getBoundingClientRect();
+    const triggerRect = sendRef.current.getBoundingClientRect();
+    setSendMenuBox({ right: Math.max(0, anchorRect.right - triggerRect.right), bottom: anchorRect.bottom - triggerRect.top + 8 });
+  }, [sendMenuShown, wide]);
+
+  /* pressing anywhere outside the menu and its triggers closes it */
+  useEffect(() => {
+    if (!sendMenuShown) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target as Node;
+      if (![document.getElementById(sendMenuId), sendRef.current, sendChevronRef.current].some((node) => node?.contains(target))) setSendMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [sendMenuShown, sendMenuId]);
+
+  useEffect(() => () => window.clearTimeout(pressTimer.current), []);
 
   /* Build the shader with a pinned hue phase. createShader seeds its
    * internal hueShift from Math.random(), which made the sweep a different
@@ -285,7 +333,7 @@ export default function PromptBar({
     const measure = measureRef.current;
     if (!input || !controls || !measure) return;
 
-    const fixedControlsWidth = 28 * (working ? 3 : 2) + (modelRef.current?.offsetWidth ?? 0);
+    const fixedControlsWidth = 28 * (working ? 3 : 2) + (hasSendOptions ? 22 : 0) + (modelRef.current?.offsetWidth ?? 0);
     const inlineGaps = 4 * 4;
     const inlineInputWidth = controls.clientWidth - fixedControlsWidth - inlineGaps;
     const needsFullWidth = draft.includes("\n") || measure.offsetWidth + 8 > inlineInputWidth;
@@ -299,7 +347,7 @@ export default function PromptBar({
     const contentHeight = input.scrollHeight;
     input.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
     input.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
-  }, [draft, expanded, tall, working, inputRef]);
+  }, [draft, expanded, tall, working, hasSendOptions, inputRef]);
 
   /* clicking anywhere outside the composer closes the open menus */
   useEffect(() => {
@@ -318,10 +366,22 @@ export default function PromptBar({
     inputRef.current?.focus();
   };
 
-  const send = () => {
+  const send = (option?: string) => {
     if (!canSend) return;
-    onSend();
+    onSend(option);
     setModelOpen(false);
+    setSendMenuOpen(false);
+  };
+
+  const openSendMenu = () => {
+    setModelOpen(false);
+    setSendMenuOpen(true);
+    requestAnimationFrame(() => sendRowRefs.current[0]?.focus());
+  };
+
+  const closeSendMenu = () => {
+    setSendMenuOpen(false);
+    (sendChevronRef.current ?? inputRef.current)?.focus();
   };
 
   const attachFiles = (files: File[]) => {
@@ -450,6 +510,50 @@ export default function PromptBar({
               </span>
             </button>
           ))}
+        </div>
+      )}
+
+      {/* ── send menu ──────────────────────────────────── */}
+      {sendMenuShown && (
+        <div
+          id={sendMenuId}
+          role="menu"
+          aria-label={labels.sendOptions}
+          className="absolute z-10 w-60 rounded-[10px] bg-surface p-1 shadow-raised"
+          style={{ right: sendMenuBox.right, bottom: sendMenuBox.bottom, animation: "pop-in 180ms cubic-bezier(0.23,1,0.32,1) both", transformOrigin: "bottom right" }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" || event.key === "Tab") {
+              event.preventDefault();
+              closeSendMenu();
+            } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              const current = sendRowRefs.current.findIndex((row) => row === document.activeElement);
+              const next = (current + (event.key === "ArrowDown" ? 1 : sendOptions.length - 1)) % sendOptions.length;
+              sendRowRefs.current[next]?.focus();
+            }
+          }}
+        >
+          <GlideMenu highlightClassName="inset-x-0 rounded-[6px] bg-hover" rowSelector="[role=menuitem]">
+            {sendOptions.map((option, i) => (
+              <button
+                key={option.key}
+                type="button"
+                role="menuitem"
+                tabIndex={-1}
+                ref={(el) => {
+                  sendRowRefs.current[i] = el;
+                }}
+                onClick={() => {
+                  send(option.key);
+                  inputRef.current?.focus();
+                }}
+                className="relative z-10 flex h-8 w-full items-center gap-2 rounded-[6px] px-2 text-left outline-offset-[-2px] touch:h-11"
+              >
+                <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink">{option.label}</span>
+                <kbd className="shrink-0 font-sans text-[11px] text-ink-2 touch:hidden">{SHORTCUTS[option.shortcut]}</kbd>
+              </button>
+            ))}
+          </GlideMenu>
         </div>
       )}
 
@@ -618,11 +722,13 @@ export default function PromptBar({
               if (event.key === "Escape") {
                 setDismissed(true);
                 setModelOpen(false);
+                setSendMenuOpen(false);
                 return;
               }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                send();
+                const shortcut = event.altKey ? "alt-enter" : "enter";
+                send(sendOptions.find((option) => option.shortcut === shortcut)?.key);
               }
             }}
             placeholder={placeholder}
@@ -674,20 +780,63 @@ export default function PromptBar({
             </button>
           )}
 
-          {/* send — tactile square (round in the pill variant) */}
-          <button
-            type="button"
-            aria-label={labels.send}
-            disabled={!canSend}
-            onClick={send}
-            className={`flex size-7 shrink-0 items-center justify-center transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] touch:size-11 ${round} ${wide ? "col-start-5 row-start-2" : "col-start-5 row-start-1"}`}
-            style={{
-              background: canSend ? "var(--accent)" : "var(--line-strong)",
-              color: canSend ? "white" : "var(--ink-2)",
-            }}
-          >
-            <Icon size={16} strokeWidth={2.4}><path d="M12 19V5M5 12l7-7 7 7" /></Icon>
-          </button>
+          {/* send — tactile square (round in the pill variant); with send options a chevron opens them, as does a long press */}
+          <div className={`flex items-center gap-0.5 ${wide ? "col-start-5 row-start-2" : "col-start-5 row-start-1"}`}>
+            {hasSendOptions && (
+              <button
+                ref={sendChevronRef}
+                type="button"
+                aria-label={labels.sendOptions}
+                title={labels.sendOptions}
+                aria-haspopup="menu"
+                aria-expanded={sendMenuShown}
+                aria-controls={sendMenuShown ? sendMenuId : undefined}
+                disabled={!canSend}
+                onClick={() => (sendMenuShown ? setSendMenuOpen(false) : openSendMenu())}
+                onKeyDown={(event) => {
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    event.preventDefault();
+                    openSendMenu();
+                  }
+                }}
+                className={`flex h-7 w-5 shrink-0 items-center justify-center text-ink-3 transition-colors duration-150 enabled:hover:bg-hover enabled:hover:text-ink aria-expanded:bg-hover aria-expanded:text-ink disabled:opacity-50 touch:size-11 ${round}`}
+              >
+                <Icon size={11} strokeWidth={2.4}><path d="M6 9l6 6 6-6" /></Icon>
+              </button>
+            )}
+            <button
+              ref={sendRef}
+              type="button"
+              aria-label={labels.send}
+              disabled={!canSend}
+              onClick={() => {
+                if (longPressed.current) longPressed.current = false;
+                else send(sendOptions.find((option) => option.shortcut === "enter")?.key);
+              }}
+              onPointerDown={(event) => {
+                if (!hasSendOptions || event.button !== 0) return;
+                longPressed.current = false;
+                window.clearTimeout(pressTimer.current);
+                pressTimer.current = window.setTimeout(() => {
+                  longPressed.current = true;
+                  openSendMenu();
+                }, LONG_PRESS_MS);
+              }}
+              onPointerUp={() => window.clearTimeout(pressTimer.current)}
+              onPointerLeave={() => window.clearTimeout(pressTimer.current)}
+              onPointerCancel={() => window.clearTimeout(pressTimer.current)}
+              onContextMenu={(event) => {
+                if (hasSendOptions) event.preventDefault();
+              }}
+              className={`flex size-7 shrink-0 items-center justify-center transition-[background-color,color,transform] duration-200 enabled:active:scale-[0.94] touch:size-11 ${round}`}
+              style={{
+                background: canSend ? "var(--accent)" : "var(--line-strong)",
+                color: canSend ? "white" : "var(--ink-2)",
+              }}
+            >
+              <Icon size={16} strokeWidth={2.4}><path d="M12 19V5M5 12l7-7 7 7" /></Icon>
+            </button>
+          </div>
         </div>
       </div>
       </div>

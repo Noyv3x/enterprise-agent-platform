@@ -90,7 +90,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
   let server = createServer(runtime,'runtime-secret');
   let url = await listen(server);
   t.after(async()=>{await runtime.close();await close(server);await close(executor);await close(gateway);await rm(home,{recursive:true,force:true});});
-  const http = (path:string,body?:unknown) => fetch(url+path,{method:body === undefined ? 'GET' : 'POST',headers:{authorization:'Bearer runtime-secret','content-type':'application/json'},...(body === undefined ? {} : {body:JSON.stringify(body)}),signal:AbortSignal.timeout(10_000)});
+  const http = (path:string,body?:unknown,method?:string) => fetch(url+path,{method:method ?? (body === undefined ? 'GET' : 'POST'),headers:{authorization:'Bearer runtime-secret','content-type':'application/json'},...(body === undefined ? {} : {body:JSON.stringify(body)}),signal:AbortSignal.timeout(10_000)});
   async function start(sid:string,body:RunRequest) {
     const response = await http(`/v1/sessions/${sid}/runs`,body);
     assert.equal(response.status,202,await response.clone().text());
@@ -264,6 +264,104 @@ test('steering pending limit rejects the thirty-third input but accepts duplicat
   assert.deepEqual(await closedDuplicate.json(),{ok:true});
   assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('after-done','Too late'))).status,409);
   assert.deepEqual(await f.events(id),events,'duplicate acceptance after closure must not append any events');
+});
+
+test('removing a pending input keeps the order of the remaining inputs and is never delivered', {timeout:20_000}, async t=>{
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  const f=await fixture(t);
+  let continuation:TranscriptContext|undefined;
+  f.faux.setResponses([
+    async()=>{entered.resolve();await ready.promise;return fauxAssistantMessage('Before inputs');},
+    context=>{continuation=structuredClone(context);return fauxAssistantMessage('Inputs received');},
+  ]);
+  const id=await f.start('agent-private-remove-order',request('runtime-proof'));
+  await entered.promise;
+  const inputs=['a','b','c','d'].map(name=>steering(`input-${name}`,`Instruction ${name}`));
+  for(const input of inputs)assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  for(const name of ['b','c']){
+    const removed=await f.http(`/v1/runs/${id}/inputs/input-${name}`,undefined,'DELETE');
+    assert.equal(removed.status,200,await removed.clone().text());
+    assert.deepEqual(await removed.json(),{removed:true});
+  }
+  const again=await f.http(`/v1/runs/${id}/inputs/input-b`,undefined,'DELETE');
+  assert.equal(again.status,409,'a removed input is no longer pending');
+  const resteer=await f.http(`/v1/runs/${id}/steer`,inputs[1]!);
+  assert.equal(resteer.status,200,'the removed ID stays accepted, so a repeated steer is a no-op');
+  assert.deepEqual(await resteer.json(),{ok:true});
+  ready.resolve();
+  const events=await f.events(id);
+  assert.deepEqual(userTexts(continuation!.messages).slice(1),['Instruction a','Instruction d']);
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),['input-a','input-d']);
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+});
+
+test('removing an input conflicts once it was delivered or the run is closed, and only pending inputs are removable', {timeout:20_000}, async t=>{
+  const first=Promise.withResolvers<void>();
+  const firstReady=Promise.withResolvers<void>();
+  const second=Promise.withResolvers<void>();
+  const secondReady=Promise.withResolvers<void>();
+  t.after(()=>{firstReady.resolve();secondReady.resolve();});
+  const f=await fixture(t);
+  f.faux.setResponses([
+    async()=>{first.resolve();await firstReady.promise;return fauxAssistantMessage('Provisional');},
+    async()=>{second.resolve();await secondReady.promise;return fauxAssistantMessage('Revised');},
+    ()=>fauxAssistantMessage('Answer to the late input'),
+  ]);
+  const id=await f.start('agent-private-remove-race',request('runtime-proof'));
+  await first.promise;
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('seen','Delivered at the boundary'))).status,200);
+  firstReady.resolve();
+  await second.promise;
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,steering('late','Arrives while the second response streams'))).status,200);
+  const delivered=await f.http(`/v1/runs/${id}/inputs/seen`,undefined,'DELETE');
+  assert.equal(delivered.status,409,'Pi already took it from the queue');
+  assert.match(await delivered.text(),/already delivered/);
+  assert.equal((await f.http(`/v1/runs/${id}/inputs/never-accepted`,undefined,'DELETE')).status,409);
+  assert.equal((await f.http(`/v1/runs/unknown-run/inputs/seen`,undefined,'DELETE')).status,404);
+  assert.equal((await f.http(`/v1/runs/${id}/inputs/seen`)).status,405);
+  assert.equal((await f.http(`/v1/sessions/${id}/inputs/seen`,undefined,'DELETE')).status,404);
+  assert.equal((await f.http(`/v1/runs/${id}/inputs/late`,undefined,'DELETE')).status,200);
+  secondReady.resolve();
+  const events=await f.events(id);
+  assert.equal(f.faux.state.callCount,2,'the removed input must not trigger another model request');
+  assert.deepEqual(events.filter(event=>event.type==='input_delivered').map(event=>event.input_id),['seen']);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,[]);
+  assert.equal((await f.http(`/v1/runs/${id}/inputs/late`,undefined,'DELETE')).status,409,'a finished run cannot remove inputs');
+});
+
+test('an undelivered input is still removable after the prompt returned, until the run ends', {timeout:20_000}, async t=>{
+  const settled=Promise.withResolvers<AgentSession>();
+  const returnPrompt=Promise.withResolvers<void>();
+  const idleEntered=Promise.withResolvers<AgentSession>();
+  const returnIdle=Promise.withResolvers<void>();
+  t.after(()=>{returnPrompt.resolve();returnIdle.resolve();});
+  const f=await fixture(t);
+  const prompt=AgentSession.prototype.prompt;
+  const waitForIdle=AgentSession.prototype.waitForIdle;
+  let firstPrompt=true;
+  let firstIdle=true;
+  t.mock.method(AgentSession.prototype,'prompt',async function(this:AgentSession,...args:Parameters<AgentSession['prompt']>){
+    const pause=firstPrompt;firstPrompt=false;
+    await prompt.apply(this,args);
+    if(pause){settled.resolve(this);await returnPrompt.promise;}
+  });
+  t.mock.method(AgentSession.prototype,'waitForIdle',async function(this:AgentSession){
+    if(firstIdle){firstIdle=false;idleEntered.resolve(this);await returnIdle.promise;}
+    return waitForIdle.call(this);
+  });
+  f.faux.setResponses([fauxAssistantMessage('Normal answer')]);
+  const id=await f.start('agent-private-remove-closed',request('runtime-proof'));
+  await settled.promise;
+  for(const name of ['one','two'])assert.equal((await f.http(`/v1/runs/${id}/steer`,steering(name,`Late ${name}`))).status,200);
+  returnPrompt.resolve();
+  await idleEntered.promise;
+  assert.equal((await f.http(`/v1/runs/${id}/inputs/one`,undefined,'DELETE')).status,200);
+  returnIdle.resolve();
+  const events=await f.events(id);
+  assert.deepEqual(events.at(-1)!.undelivered_inputs,['two']);
 });
 
 test('steering closes admission and clears undelivered inputs when prompt returns before waitForIdle settles', {timeout:20_000}, async t=>{

@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException
 from enterprise_agent_platform import tasks as tasks_module
 from enterprise_agent_platform.auth import issue_session
 from enterprise_agent_platform.db import Database
+from policy_support import set_default_policy
 from enterprise_agent_platform.gates import Gate, ManagerClientError
 from enterprise_agent_platform.queue import Queue, _WorkTrace
 from enterprise_agent_platform.tasks import (
@@ -178,8 +179,9 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         db.migrate(root)
         with db.connect() as conn:
             for uid in (1, 2):
-                conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,model_name,created_at) VALUES (?,?,?,?,?,?,?)",
-                             (uid, f"u{uid}", f"User {uid}", "unused", "admin", "model-a", 1))
+                conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,created_at) VALUES (?,?,?,?,?,?)",
+                             (uid, f"u{uid}", f"User {uid}", "unused", "admin", 1))
+            set_default_policy(conn)
         self.manager = FakeManager()
         self.runs = []
         self.streams = {}
@@ -394,6 +396,30 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         over = await self.call("spawn", {"tasks": [{"task": "a"}, {"task": "b"}]})
         self.assertEqual(over["data"]["error"], "too_many_subagents")
         self.assertEqual(len(self.rows("user_id=1")), 9)
+
+    async def test_subagents_and_notice_turns_use_their_policy_slots(self):
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, personal={"model": "m-personal", "thinking": "low"}, channel={"model": "m-channel", "thinking": "low"},
+                               chat={"model": "m-chat", "thinking": "low"}, scout={"model": "m-scout", "thinking": "off"},
+                               worker={"model": "m-worker", "thinking": "xhigh"})
+        stream = await self.parent("first")
+        (scout,) = await self.spawn(1, "scout")
+        (worker,) = await self.spawn(1, "task")
+        await self.started(scout)
+        await self.started(worker)
+        models = {sid: body["model"] for sid, _, body in self.runs}
+        self.assertEqual(models["agent-private-1"], {"id": "m-personal", "thinking": "low"})
+        self.assertEqual(models[f"agent-private-1-bg-{scout}"], {"id": "m-scout", "thinking": "off"})
+        self.assertEqual(models[f"agent-private-1-bg-{worker}"], {"id": "m-worker", "thinking": "xhigh"})
+        for tid in (scout, worker):
+            self.child_stream(tid).finish(text="done", usage={"input": 1, "output": 1, "total": 2})
+        await self.until(lambda: self.row(scout)["status"] == "completed" and self.row(worker)["status"] == "completed")
+        await self.flushed()
+        stream.finish(text="working on it")
+        await self.quiet()
+        self.assertEqual(self.parent_runs, 2)
+        self.assertEqual(self.runs[-1][2]["model"], {"id": "m-personal", "thinking": "low"})
+        self.assertIn("<background-task-results>", self.runs[-1][2]["prompt"]["text"])
 
     async def test_children_run_beside_the_conversation_fifo_and_a_notice_continues_the_turn(self):
         stream = await self.parent("first")

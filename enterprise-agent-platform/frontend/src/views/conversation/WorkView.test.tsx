@@ -4,7 +4,7 @@ import '@testing-library/jest-dom/vitest';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../../i18n';
-import { AssistantMessage, LiveReply } from './Messages';
+import { Reply } from './Messages';
 import type { LiveRun, Message } from './types';
 import type { WorkItem } from './work';
 import { WorkView } from './WorkView';
@@ -93,7 +93,7 @@ describe('thinking blocks', () => {
       { type: 'thinking', text: 'Interrupted summary', started_at: '2026-10-04T09:00:12Z', ended_at: null },
       { type: 'thinking', text: '', started_at: '2026-10-04T09:00:13Z', ended_at: null },
     ]);
-    render(<I18nProvider><AssistantMessage message={message} renderInput={() => null} /></I18nProvider>);
+    render(<I18nProvider><Reply message={message} renderInput={() => null} /></I18nProvider>);
     const header = screen.getByRole('button', { name: 'Thought for 20s' });
     expect(header).toHaveAttribute('aria-expanded', 'false');
     fireEvent.click(header);
@@ -123,7 +123,7 @@ describe('thinking blocks', () => {
   it('keeps overall work headings accurate when a settled answer gains an inserted-message segment', () => {
     const first = thinking('Before the insertion', NOW - 10_000, NOW - 5_000);
     const run: LiveRun = { items: [first, { type: 'text', text: 'Initial answer' }], thinkingIndex: null, calls: [], startedAt: NOW - 10_000, notice: null };
-    const renderRun = (current: LiveRun) => <I18nProvider><LiveReply run={current} inserted={[]} renderInput={() => <p>Inserted request</p>} /></I18nProvider>;
+    const renderRun = (current: LiveRun) => <I18nProvider><Reply run={current} renderInput={() => <p>Inserted request</p>} /></I18nProvider>;
     const { rerender } = render(renderRun(run));
     expect(screen.getByRole('button', { name: 'Thought for 10s' })).toBeVisible();
     act(() => vi.advanceTimersByTime(5_000));

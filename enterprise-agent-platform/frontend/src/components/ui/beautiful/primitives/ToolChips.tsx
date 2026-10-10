@@ -11,9 +11,14 @@
  * delegation started) under the row on the expanded detail's hairline rail, each a row-height button with the
  * state glyph, a name, a type chip, a truncating activity line and mono meta (elapsed, tokens); on narrow screens
  * activity and meta move to a second line. The `agents` and `clock` row glyphs (delegate, wait) are open icons.
- * Markup, classes and motion are upstream's. */
-import { useId, useState, type ReactNode, type SyntheticEvent } from "react";
+ * A nested row's `meta` is a node, so a caller can tick an elapsed time in a small leaf without re-rendering the rows.
+ * Motion: group and detail disclosures share 300ms ease-out-strong (the group used the default easing upstream) and
+ * the group chevron turns on that timing (200ms upstream). Rows and diff chips play their entrance only when new
+ * (see ./entrance): those present when a settled trace first renders appear in place.
+ * Markup, classes and motion are otherwise upstream's. */
+import { useContext, useId, useState, type ReactNode, type SyntheticEvent } from "react";
 import { createPortal } from "react-dom";
+import { EntranceContext } from "./entrance";
 
 /* ─────────────────────────────────────────────────────────
  * TOOL CHIPS
@@ -69,7 +74,7 @@ export type ToolChildRow = {
   /** what the row is doing now, or its outcome */
   activity: string;
   /** mono trailing text (elapsed, tokens) */
-  meta?: string;
+  meta?: ReactNode;
   onSelect?: () => void;
 };
 
@@ -158,6 +163,9 @@ export default function ToolChips({
   const uid = useId();
   const [open, setOpen] = useState(true);
   const [openRows, setOpenRows] = useState<Set<string>>(new Set());
+  /* What this group showed at its first render, and whether that was new content (rows that come later always are). */
+  const entrance = useContext(EntranceContext);
+  const [first] = useState(() => ({ entering: entrance.current, rows: new Set(steps.map((row) => row.id)), files: new Set(diffs.map((diff) => diff.file)) }));
   /* Rendered in a body portal so animated/translated reply wrappers cannot
    * redefine the fixed-position coordinate system. */
   const [preview, setPreview] = useState<{
@@ -206,14 +214,14 @@ export default function ToolChips({
         }
         className="-mx-1.5 flex w-fit items-center gap-1.5 rounded-control px-1.5 py-1 text-[12.5px] text-ink-2 transition-colors duration-100 hover:bg-hover-2 pointer-coarse:min-h-11 max-sm:min-h-11"
       >
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="transition-transform duration-200" style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)" }} aria-hidden>
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="transition-transform duration-300 ease-out-strong" style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)" }} aria-hidden>
           <path d="M6 9l6 6 6-6" />
         </svg>
         <span className="tabular-nums">{labels.header}</span>
       </button>
 
       {/* tool call rows */}
-      <div className="grid transition-[grid-template-rows,opacity] duration-300" style={{ gridTemplateRows: open ? "1fr" : "0fr", opacity: open ? 1 : 0 }} inert={!open}>
+      <div className="grid transition-[grid-template-rows,opacity] duration-300 ease-out-strong" style={{ gridTemplateRows: open ? "1fr" : "0fr", opacity: open ? 1 : 0 }} inert={!open}>
         {/* -mx-1 + px-1.5 keeps content at the same x while giving the
             row hover pills room inside this overflow-hidden clip box */}
         <div className="-mx-1 min-h-0 overflow-hidden px-1.5 pb-1">
@@ -222,7 +230,7 @@ export default function ToolChips({
             const rowOpen = openRows.has(row.id);
             const hasDetail = row.detail.length > 0;
             return (
-            <div key={row.id} style={{ animation: "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" }}>
+            <div key={row.id} style={{ animation: first.entering || !first.rows.has(row.id) ? "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" : undefined }}>
               <div className={`group/line relative${row.badge ? ` flex items-center gap-1.5${rowAction ? " pr-7 pointer-coarse:pr-11 max-sm:pr-11" : ""}` : ""}`}>
               <button
                 type="button"
@@ -296,8 +304,8 @@ export default function ToolChips({
               {/* expanded detail */}
               {hasDetail && (
               <div
-                className="grid transition-[grid-template-rows,opacity] duration-300"
-                style={{ gridTemplateRows: rowOpen ? "1fr" : "0fr", opacity: rowOpen ? 1 : 0, transitionTimingFunction: "cubic-bezier(0.23, 1, 0.32, 1)" }}
+                className="grid transition-[grid-template-rows,opacity] duration-300 ease-out-strong"
+                style={{ gridTemplateRows: rowOpen ? "1fr" : "0fr", opacity: rowOpen ? 1 : 0 }}
                 inert={!rowOpen}
               >
                 <div className="min-h-0 overflow-hidden">
@@ -373,7 +381,11 @@ export default function ToolChips({
                 className="inline-flex h-7 max-w-full items-center gap-2 rounded-chip
                   bg-surface px-2 font-mono text-[11.5px] text-ink shadow-btn
                   transition-colors duration-100 hover:bg-hover pointer-coarse:h-11 max-sm:h-11"
-                style={{ animation: `pop-in 250ms cubic-bezier(0.23,1,0.32,1) ${i * 80}ms both` }}
+                style={{
+                  /* chips shown together stagger in; a later chip enters alone */
+                  animation: !first.files.has(d.file) ? "pop-in 250ms cubic-bezier(0.23,1,0.32,1) both"
+                    : first.entering ? `pop-in 250ms cubic-bezier(0.23,1,0.32,1) ${i * 80}ms both` : undefined,
+                }}
               >
                 <span className="min-w-0 truncate">{d.file}</span>
                 <span className="shrink-0 text-green tabular-nums">+{d.add}</span>

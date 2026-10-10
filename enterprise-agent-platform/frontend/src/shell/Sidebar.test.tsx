@@ -173,10 +173,10 @@ describe("routes", () => {
     expect(allowed({ view: "settings" }, reader)).toBe(true);
   });
 
-  it("lands on Personal AI when entering, and keeps the page on reload or without access", () => {
+  it("lands on Personal AI when entering, except at a specific chat or channel, and keeps the page on reload", () => {
     const personal = accessFor("user", ["private_agent", "chat", "read_workspace"]);
-    for (const hash of ["", "chat-abc", "channel-7", "admin", "nowhere"]) expect(landingRoute(hash, personal, true)).toBe("private");
-    expect(landingRoute("private", personal, true)).toBeNull();
+    for (const hash of ["", "chat", "channels", "admin", "settings", "nowhere"]) expect(landingRoute(hash, personal, true)).toBe("private");
+    for (const hash of ["private", "chat-abc", "channel-7"]) expect(landingRoute(hash, personal, true)).toBeNull();
     // A reload, back/forward or in-app navigation keeps a real page; only bare or unknown addresses move.
     expect(landingRoute("chat-abc", personal, false)).toBeNull();
     expect(landingRoute("channel-7", personal, false)).toBeNull();

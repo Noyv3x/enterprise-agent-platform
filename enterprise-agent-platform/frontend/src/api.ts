@@ -5,17 +5,15 @@ export interface User {
   role: string;
   position: string;
   permission_group: string;
-  thinking_depth: string;
   timezone: string;
   active: boolean;
   language?: string;
   [key: string]: unknown;
 }
 
-/** The administrator view of an account; users never receive the model fields. */
+/** The administrator view of an account; users never receive their model policy group. */
 export interface AdminUser extends User {
-  model_name: string;
-  chat_model_name: string;
+  model_policy: string;
 }
 
 export class ApiError extends Error {

@@ -200,6 +200,17 @@ class Files:
             rows = conn.execute(f'SELECT * FROM {self.table(info)} WHERE message_id=? ORDER BY id', (message_id,)).fetchall()
         return [attachment(row, info['kind'] == 'chat') for row in rows]
 
+    def release(self, info, message_id, conn):
+        """Undo `bind` for a withdrawn message: the uploads stay owned by their uploader and can be attached again by id."""
+        if info['kind'] == 'chat':
+            conn.execute('UPDATE chat_attachments SET message_id=NULL WHERE message_id=?', (message_id,))
+            return
+        for row in conn.execute('SELECT * FROM attachments WHERE message_id=? ORDER BY id', (message_id,)).fetchall():
+            values = dict(row)
+            values['message_id'] = None
+            conn.execute(f"INSERT INTO pending_attachments({','.join(values)}) VALUES({','.join('?' for _ in values)})", tuple(values.values()))
+        conn.execute('DELETE FROM attachments WHERE message_id=?', (message_id,))
+
     def prompt(self, user, info, attachment_ids):
         lines, images = [], []
         with self.p.db.connect() as conn:

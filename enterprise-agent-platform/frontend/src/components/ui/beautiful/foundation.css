@@ -5,7 +5,8 @@
  *   CJK punctuation fall through to system faces;
  * - the gallery-only page stripes, showcase gestures and docs-nav scroller are omitted: the app's page ground is
  *   --canvas, as in the upstream harness;
- * - accessibility floors (reduced motion, forced colors, CJK tracking, coarse-pointer targets) are appended.
+ * - accessibility floors (reduced motion, forced colors, CJK tracking, coarse-pointer targets) are appended; reduced
+ *   motion also zeroes animation and transition delays, so staggered entrances never wait.
  * COMPONENT-SPECIFIC blocks live next to their primitive under ./primitives/. */
 @import "shadow-plugin/unprefixed";
 
@@ -419,14 +420,17 @@ body:lang(zh),
   letter-spacing: normal;
 }
 
-/* Reduced motion: state changes still happen, only the movement goes. */
+/* Reduced motion: state changes still happen, only the movement goes — staggers and delays included, so nothing
+ * waits before it appears. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
+    animation-delay: 0s !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
+    transition-delay: 0s !important;
     transition-duration: 0.01ms !important;
   }
 }

@@ -40,8 +40,11 @@ function editPairs(args: Record<string, unknown>): { oldText: string; newText: s
   });
 }
 
+/** A tool call as one ToolChips row, plus the diff chip a file write contributes. */
+type Described = { step: ToolStep; diff?: ToolDiff; diffLines?: ToolDiffLine[] };
+
 /** How one tool call reads as a ToolChips row (and, for file writes, a diff chip). */
-function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; diffLines?: ToolDiffLine[] } {
+function describe(tool: ToolItem, w: Words): Described {
   const { args } = tool;
   const path = arg(args, "path");
   let icon = "tool";
@@ -154,61 +157,72 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
   };
 }
 
+/** A subagent's id, elapsed time and tokens; it ticks on its own while the subagent runs, even after the turn ended. */
+function SubagentMeta({ task }: { task: TaskView }) {
+  const w = useWords();
+  const now = useNow(isRunning(task));
+  return [task.id, taskElapsed(task, now), task.usage ? tokenCount(task.usage.total_tokens, w) : null].filter(Boolean).join(" · ");
+}
+
 /** A subagent under the `task` row that started it: name, type chip, activity, then id, elapsed time and tokens. */
-function subagentRow(task: TaskView, tasks: TasksValue, now: number, w: Words): ToolChildRow {
+function subagentRow(task: TaskView, tasks: TasksValue, w: Words): ToolChildRow {
   const activity = isRunning(task)
     ? task.current ? `${toolVerb(task.current.tool, w)} ${task.current.summary}`.trim() : w("Thinking", "思考中", "思考中")
     : task.status === "completed" && task.result_preview ? task.result_preview.split("\n").find((line) => line.trim()) ?? taskStatusLabel(task, w)
       : taskStatusLabel(task, w);
-  const meta = [task.id, taskElapsed(task, now), task.usage ? tokenCount(task.usage.total_tokens, w) : null].filter(Boolean).join(" · ");
   return {
     id: task.id, label: task.name || task.id, tag: agentTypeLabel(task.agent_type, w), state: TASK_TOOL_STATE[task.status],
-    stateLabel: taskStatusLabel(task, w), activity, meta, onSelect: () => tasks.open(task.id),
+    stateLabel: taskStatusLabel(task, w), activity, meta: <SubagentMeta task={task} />, onSelect: () => tasks.open(task.id),
   };
 }
 
-function ToolGroup({ tools, run }: { tools: ToolItem[]; run: RunRef }) {
+/** One run of consecutive tool calls. It re-renders only when one of its calls changed (the live reducer keeps
+ * unchanged items by identity), and describes each call once per item. */
+const ToolGroup = memo(function ToolGroup({ tools, run }: { tools: ToolItem[]; run: RunRef }) {
   const w = useWords();
   const computer = useContext(ComputerContext);
   const tasks = useContext(TasksContext);
+  const cache = useMemo(() => new WeakMap<ToolItem, Described>(), [w]);
+  const described = useMemo(() => tools.map((tool) => {
+    let entry = cache.get(tool);
+    if (!entry) cache.set(tool, entry = describe(tool, w));
+    return entry;
+  }), [cache, tools, w]);
+  const { diffs, diffLines } = useMemo(() => {
+    const files = new Map<string, ToolDiff>();
+    const lines: Record<string, ToolDiffLine[]> = {};
+    for (const { diff, diffLines: rows } of described) {
+      if (!diff) continue;
+      const previous = files.get(diff.file);
+      files.set(diff.file, previous ? { ...diff, add: previous.add + diff.add, del: previous.del + diff.del } : diff);
+      lines[diff.file] = [...(lines[diff.file] ?? []), ...(rows ?? [])].slice(0, 12);
+    }
+    return { diffs: [...files.values()], diffLines: lines };
+  }, [described]);
   const agents = tasks ? tools.flatMap((tool) => tool.name === "task" ? (tasks.byToolCall.get(tool.id) ?? []).filter((task) => task.kind === "agent") : []) : [];
-  // Elapsed times of running subagents tick even after the turn ended.
-  const now = useNow(agents.some(isRunning));
-  const described = tools.map((tool) => {
-    const { step, ...rest } = describe(tool, w);
+  const steps = described.map(({ step }, index) => {
+    const tool = tools[index];
     if (tool.name === "task" && tasks) {
-      const children = agents.filter((task) => task.created_by_tool_call_id === tool.id).map((task) => subagentRow(task, tasks, now, w));
-      return { ...rest, step: { ...step, children } };
+      return { ...step, children: agents.filter((task) => task.created_by_tool_call_id === tool.id).map((task) => subagentRow(task, tasks, w)) };
     }
     const background = tool.name === "bash" ? tool.background ?? promotedTaskId(tool.output) : null;
-    if (!background) return { ...rest, step };
+    if (!background) return step;
     const task = tasks?.byId.get(background);
     return {
-      ...rest,
-      step: {
-        ...step,
-        badge: {
-          label: w(`Background · ${background}`, `后台 · ${background}`, `背景 · ${background}`),
-          state: task ? TASK_TOOL_STATE[task.status] : "running",
-          stateLabel: task ? taskStatusLabel(task, w) : w("Running", "运行中", "執行中"),
-          onSelect: tasks ? () => tasks.open(background) : undefined,
-        },
+      ...step,
+      badge: {
+        label: w(`Background · ${background}`, `后台 · ${background}`, `背景 · ${background}`),
+        state: task ? TASK_TOOL_STATE[task.status] : "running",
+        stateLabel: task ? taskStatusLabel(task, w) : w("Running", "运行中", "執行中"),
+        onSelect: tasks ? () => tasks.open(background) : undefined,
       },
     };
   });
-  const diffs = new Map<string, ToolDiff>();
-  const diffLines: Record<string, ToolDiffLine[]> = {};
-  for (const { diff, diffLines: rows } of described) {
-    if (!diff) continue;
-    const previous = diffs.get(diff.file);
-    diffs.set(diff.file, previous ? { ...diff, add: previous.add + diff.add, del: previous.del + diff.del } : diff);
-    diffLines[diff.file] = [...(diffLines[diff.file] ?? []), ...(rows ?? [])].slice(0, 12);
-  }
   const count = tools.length;
   return (
     <ToolChips
-      steps={described.map(({ step }) => step)}
-      diffs={[...diffs.values()]}
+      steps={steps}
+      diffs={diffs}
       diffLines={diffLines}
       rowAction={computer ? { label: w("View in computer", "在电脑中查看", "在電腦中檢視"), onSelect: (id) => computer.show(run, id) } : undefined}
       labels={{
@@ -217,7 +231,8 @@ function ToolGroup({ tools, run }: { tools: ToolItem[]; run: RunRef }) {
       }}
     />
   );
-}
+}, (previous, next) => previous.run === next.run && previous.tools.length === next.tools.length
+  && previous.tools.every((tool, index) => tool === next.tools[index]));
 
 function seconds(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));
@@ -236,21 +251,22 @@ export function useNow(active: boolean): number {
   return now;
 }
 
-/** Each mounted block keeps its own formatting memo; settled Markdown never reparses on clock ticks. */
-const ThinkingBlock = memo(function ThinkingBlock({ item, streaming, end }: {
-  item: ThinkingItem;
-  streaming: boolean;
-  end: number | null;
-}) {
+/** A running duration as text. The clock lives in this leaf, so its tick re-renders only the text, never the trace. */
+function Elapsed({ since, format }: { since: number; format?: (duration: string) => string }) {
+  const duration = seconds(useNow(true) - since);
+  return format ? format(duration) : duration;
+}
+
+/** Each mounted block keeps its own formatting memo; settled Markdown never reparses on stream or clock ticks. */
+const ThinkingBlock = memo(function ThinkingBlock({ item, streaming }: { item: ThinkingItem; streaming: boolean }) {
   const w = useWords();
   const content = useMemo(() => formatThinking(item.text), [item.text]);
   if (!content) return streaming ? <TraceThinking label={w("Thinking", "思考中", "思考中")} /> : null;
-  const elapsed = item.startedAt !== null && end !== null ? Math.max(0, Math.round((end - item.startedAt) / 1000)) : null;
-  const duration = elapsed === null ? null : seconds(elapsed * 1000);
-  const heading = streaming
-    ? w(`Thinking · ${duration}`, `思考中 · ${duration}`, `思考中 · ${duration}`)
-    : duration === null ? w("Thought", "思考", "思考")
-      : w(`Thought for ${duration}`, `思考了 ${duration}`, `思考了 ${duration}`);
+  const { startedAt, endedAt } = item;
+  const heading = streaming && startedAt !== null
+    ? <Elapsed since={startedAt} format={(duration) => w(`Thinking · ${duration}`, `思考中 · ${duration}`, `思考中 · ${duration}`)} />
+    : startedAt === null || endedAt === null ? w("Thought", "思考", "思考")
+      : w(`Thought for ${seconds(endedAt - startedAt)}`, `思考了 ${seconds(endedAt - startedAt)}`, `思考了 ${seconds(endedAt - startedAt)}`);
   return <TraceProse heading={heading}><Markdown content={content} /></TraceProse>;
 });
 
@@ -265,15 +281,15 @@ function activeLabel(items: WorkItem[], w: Words): string {
 }
 
 /** An assistant turn's work: ThinkingState around reasoning, interim text, old status steps and ToolChips groups.
- * `run` identifies the turn for the personal AI computer panel ("View in computer"). */
+ * `run` identifies the turn for the personal AI computer panel ("View in computer"). Clocks tick in leaf components;
+ * blocks are keyed by their first item, which the append-only trace keeps in place. */
 export function WorkView({ trace, working, run }: { trace: WorkTrace; working: boolean; run: RunRef }) {
   const w = useWords();
-  const now = useNow(working);
   // A live trace settles when its answer starts; freeze the clock at that moment.
   const settledAt = useRef<number | null>(null);
   if (working) settledAt.current = null;
-  else settledAt.current ??= trace.endedAt ?? now;
-  const end = working ? now : trace.endedAt ?? settledAt.current;
+  else settledAt.current ??= trace.endedAt ?? Date.now();
+  const end = trace.endedAt ?? settledAt.current;
   const duration = trace.startedAt !== null && end !== null ? seconds(end - trace.startedAt) : null;
   const thought = trace.items.some((item) => item.type === "thinking");
   const done = duration === null ? w("Recorded work", "工作记录", "工作紀錄")
@@ -283,7 +299,7 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
   const blocks: ReactNode[] = [];
   let group: ToolItem[] = [];
   const flush = () => {
-    if (group.length) blocks.push(<ToolGroup key={`tools-${group[0].id}-${blocks.length}`} tools={group} run={run} />);
+    if (group.length) blocks.push(<ToolGroup key={`tools-${group[0].id}`} tools={group} run={run} />);
     group = [];
   };
   trace.items.forEach((item, index) => {
@@ -293,13 +309,12 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
     }
     flush();
     if (item.type === "thinking") {
-      const streaming = working && item.startedAt !== null && item.endedAt === null;
-      blocks.push(<ThinkingBlock key={index} item={item} streaming={streaming} end={item.endedAt ?? (streaming ? now : null)} />);
+      blocks.push(<ThinkingBlock key={`thinking-${index}`} item={item} streaming={working && item.startedAt !== null && item.endedAt === null} />);
     }
     else if (item.type === "text") blocks.push(
-      <div key={index} className="bui-prose px-1.5 py-0.5 text-[12.5px] leading-relaxed text-ink"><Markdown content={item.text} /></div>,
+      <div key={`text-${index}`} className="bui-prose px-1.5 py-0.5 text-[12.5px] leading-relaxed text-ink"><Markdown content={item.text} /></div>,
     );
-    else if (item.type === "step") blocks.push(<TraceStep key={index} primary={item.label || item.detail} secondary={item.label ? item.detail : undefined} />);
+    else if (item.type === "step") blocks.push(<TraceStep key={`step-${index}`} primary={item.label || item.detail} secondary={item.label ? item.detail : undefined} />);
   });
   flush();
   if (trace.truncated) {
@@ -315,7 +330,7 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
   return (
     <ThinkingState
       working={working}
-      active={<>{activeLabel(trace.items, w)} <span aria-hidden className="tabular-nums">{duration}</span></>}
+      active={<>{activeLabel(trace.items, w)} <span aria-hidden className="tabular-nums">{trace.startedAt !== null && <Elapsed since={trace.startedAt} />}</span></>}
       done={done}
     >
       {blocks}

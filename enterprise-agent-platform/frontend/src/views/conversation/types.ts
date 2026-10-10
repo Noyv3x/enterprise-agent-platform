@@ -11,6 +11,9 @@ export interface Attachment {
 
 export type MessageStatus = "queued" | "running" | "completed" | "interrupted" | "cancelled";
 
+/** How a message sent while the agent works joins it: into the running turn when eligible, or as the next turn. */
+export type SendMode = "insert" | "after_turn";
+
 export interface Message {
   id: number;
   role: "user" | "assistant" | "system";
@@ -21,6 +24,8 @@ export interface Message {
     inserted_into?: number;
     delivery?: "pending" | "delivered";
     reply_to?: { message_id: number };
+    /** recorded only for after-turn messages */
+    send_mode?: "after_turn";
     [key: string]: unknown;
   };
   created_at: string;

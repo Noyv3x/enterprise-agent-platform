@@ -92,28 +92,88 @@ class IdentityTests(unittest.TestCase):
         user_path = f"/api/admin/users/{self.user['id']}"
         self.assertEqual(self.client.patch(user_path, json={'username': 'admin'}).status_code, 409)
         self.assertEqual(self.client.patch(user_path, json={'permission_group': []}).status_code, 400)
-        self.assertEqual(self.client.patch(user_path, json={'thinking_depth': []}).status_code, 400)
+        for body in ({'model_policy': []}, {'model_policy': 'missing'}, {'model_name': 'x'}, {'chat_model_name': 'x'}, {'thinking_depth': 'low'}):
+            self.assertEqual(self.client.patch(user_path, json=body).status_code, 400, body)
 
-    def test_only_administrators_see_and_set_models(self):
+    def policy(self, name='light', **overrides):
+        slots = {slot: {'model': 'm-' + name, 'thinking': 'low'} for slot in ('personal', 'channel', 'chat', 'scout', 'worker')}
+        return {'name': name, 'label': name.title(), 'slots': {**slots, **overrides}}
+
+    def test_model_policy_list_validation_and_referenced_group_removal(self):
+        self.login()
+        listing = self.client.get('/api/admin/model-policies').json()
+        self.assertEqual([p['name'] for p in listing['policies']], ['default'])
+        self.assertEqual(listing['members'], {'default': 2})
+        self.assertEqual(listing['policies'][0]['slots']['chat'], {'model': '', 'thinking': 'medium'})
+        default = listing['policies'][0]
+        light = self.policy()
+        broken_slot = self.policy(chat={'model': 'x', 'thinking': 'none'})
+        invalid = [
+            {}, {'policies': []}, {'policies': 'x'}, {'policies': [default], 'extra': 1}, {'policies': [5]},
+            {'policies': [{**default, 'name': 'Bad Name'}]}, {'policies': [{**default, 'name': '1abc'}]},
+            {'policies': [{**default, 'name': 'a' * 65}]}, {'policies': [default, default]},
+            {'policies': [{**default, 'label': ''}]}, {'policies': [{**default, 'label': 'x' * 65}]}, {'policies': [{**default, 'label': 3}]},
+            {'policies': [{k: v for k, v in default.items() if k != 'label'}]}, {'policies': [{**default, 'extra': 1}]},
+            {'policies': [{**default, 'slots': {k: v for k, v in default['slots'].items() if k != 'scout'}}]},
+            {'policies': [{**default, 'slots': {**default['slots'], 'extra': default['slots']['chat']}}]},
+            {'policies': [broken_slot, default]}, {'policies': [self.policy(chat={'model': 'x' * 129, 'thinking': 'low'}), default]},
+            {'policies': [self.policy(chat={'model': 5, 'thinking': 'low'}), default]},
+            {'policies': [self.policy(chat={'model': 'x'}), default]}, {'policies': [self.policy(chat={'model': 'x', 'thinking': 'low', 'e': 1}), default]},
+            {'policies': [self.policy(chat='x'), default]},
+        ]
+        for body in invalid:
+            self.assertEqual(self.client.put('/api/admin/model-policies', json=body).status_code, 400, body)
+        self.assertEqual(self.client.get('/api/admin/model-policies').json(), listing)
+        saved = self.client.put('/api/admin/model-policies', json={'policies': [default, light, self.policy('spare')]})
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()['members'], {'default': 2, 'light': 0, 'spare': 0})
+        user_path = f"/api/admin/users/{self.user['id']}"
+        self.assertEqual(self.client.patch(user_path, json={'model_policy': 'light'}).json()['user']['model_policy'], 'light')
+        self.assertEqual(self.client.get('/api/admin/model-policies').json()['members'], {'default': 1, 'light': 1, 'spare': 0})
+        self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [default]}).status_code, 409)
+        # An inactive account still references its group.
+        self.assertEqual(self.client.patch(user_path, json={'active': False}).status_code, 200)
+        self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [default, self.policy('spare')]}).status_code, 409)
+        self.assertEqual(self.client.get('/api/admin/model-policies').json()['members']['light'], 1)
+        self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [default, light]}).status_code, 200)
+        self.assertEqual(self.client.get('/api/admin/model-policies', headers={'Cookie': ''}).status_code, 401)
+        self.assertEqual(self.client.patch(f"/api/admin/users/{self.user['id']}", json={'active': True}).status_code, 200)
+        self.login('member', 'old-password')
+        self.assertEqual(self.client.get('/api/admin/model-policies').status_code, 403)
+        self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [default]}).status_code, 403)
+
+    def test_user_create_and_update_carry_the_model_policy(self):
+        self.login()
+        self.assertEqual(self.admin['model_policy'], 'default')
+        policies = self.client.get('/api/admin/model-policies').json()['policies']
+        self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [*policies, self.policy()]}).status_code, 200)
+        created = self.client.post('/api/admin/users', json={'username': 'light-user', 'password': 'a-password', 'model_policy': 'light'})
+        self.assertEqual((created.status_code, created.json()['user']['model_policy']), (201, 'light'))
+        plain = self.client.post('/api/admin/users', json={'username': 'plain', 'password': 'a-password'}).json()['user']
+        self.assertEqual(plain['model_policy'], 'default')
+        for body in ({'model_policy': 'missing'}, {'model_policy': 5}, {'model_name': 'x'}, {'chat_model_name': ''}, {'thinking_depth': 'low'}):
+            self.assertEqual(self.client.post('/api/admin/users', json={'username': 'bad', 'password': 'a-password', **body}).status_code, 400, body)
+        listed = {user['username']: user['model_policy'] for user in self.client.get('/api/admin/users').json()['users']}
+        self.assertEqual(listed, {'admin': 'default', 'member': 'default', 'light-user': 'light', 'plain': 'default'})
+        user_path = f"/api/admin/users/{self.user['id']}"
+        updated = self.client.patch(user_path, json={'model_policy': 'light'}).json()['user']
+        self.assertEqual(updated['model_policy'], 'light')
+        self.assertEqual(self.client.post(user_path + '/impersonate', json={}).json()['user']['model_policy'], 'light')
+
+    def test_users_never_receive_models_policy_groups_or_thinking_depth(self):
         self.login()
         user_path = f"/api/admin/users/{self.user['id']}"
-        self.assertEqual(self.admin['chat_model_name'], '')
-        for value in ('x' * 129, 5):
-            self.assertEqual(self.client.patch(user_path, json={'chat_model_name': value}).status_code, 400)
-        updated = self.client.patch(user_path, json={'model_name': 'personal', 'chat_model_name': 'chat'}).json()['user']
-        self.assertEqual((updated['model_name'], updated['chat_model_name']), ('personal', 'chat'))
-        listed = next(user for user in self.client.get('/api/admin/users').json()['users'] if user['id'] == self.user['id'])
-        self.assertEqual((listed['model_name'], listed['chat_model_name']), ('personal', 'chat'))
-        self.assertEqual(self.client.patch(user_path, json={'chat_model_name': ''}).json()['user']['chat_model_name'], '')
-        self.assertEqual(self.client.patch(user_path, json={'chat_model_name': 'chat'}).status_code, 200)
-        self.assertEqual(self.client.post(user_path + '/impersonate', json={}).json()['user']['chat_model_name'], 'chat')
-        login = self.client.post('/api/auth/login', json={'username': 'member', 'password': 'old-password'}).json()['user']
+        policies = self.client.get('/api/admin/model-policies').json()['policies']
+        self.client.put('/api/admin/model-policies', json={'policies': [*policies, self.policy()]})
+        self.client.patch(user_path, json={'model_policy': 'light'})
+        hidden = {'model_name', 'chat_model_name', 'thinking_depth', 'model_policy', 'model', 'thinking'}
+        login = self.client.post('/api/auth/login', json={'username': 'member', 'password': 'old-password'})
         mine = self.client.get('/api/me').json()['user']
-        for user in (login, mine):
-            self.assertFalse({'model_name', 'chat_model_name'} & set(user))
-            self.assertIn('thinking_depth', user)
-        for field in ('model_name', 'chat_model_name'):
-            self.assertEqual(self.client.patch('/api/me', json={field: 'mine'}).status_code, 400)
+        for user in (login.json()['user'], mine):
+            self.assertFalse(hidden & set(user), user)
+            self.assertEqual(set(user), {'id', 'username', 'display_name', 'role', 'position', 'permission_group', 'timezone', 'active'})
+        for field in ('model_name', 'chat_model_name', 'thinking_depth', 'model_policy'):
+            self.assertEqual(self.client.patch('/api/me', json={field: 'default' if field == 'model_policy' else 'low'}).status_code, 400, field)
 
     def test_admin_impersonation_swaps_session_without_revoking_others(self):
         member_cookie = self.login('member', 'old-password')

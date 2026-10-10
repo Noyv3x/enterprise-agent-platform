@@ -4,11 +4,12 @@ import { useWords } from '../words';
 import { BrandingSettings } from './admin/Branding';
 import { Groups } from './admin/Groups';
 import { Models } from './admin/Models';
+import { Policies } from './admin/Policies';
 import { System } from './admin/System';
 import { Usage } from './admin/Usage';
 import { Users } from './admin/Users';
 
-const TABS = ['users', 'groups', 'models', 'branding', 'system', 'usage'] as const;
+const TABS = ['users', 'groups', 'policies', 'models', 'branding', 'system', 'usage'] as const;
 type Tab = (typeof TABS)[number];
 
 /** `#admin` opens Users; `#admin/<tab>` opens that tab. Unknown tabs fall back to Users. */
@@ -27,8 +28,9 @@ export function Admin() {
   }, []);
 
   const pages: Record<Tab, { label: string; description: string }> = {
-    users: { label: w('Accounts', '账户', '帳戶'), description: w('Who can sign in, their access, personal AI model and chat model.', '谁可以登录、访问权限、个人 AI 模型和聊天模型。', '誰可以登入、存取權限、個人 AI 模型和聊天模型。') },
+    users: { label: w('Accounts', '账户', '帳戶'), description: w('Who can sign in, their access and their model policy group.', '谁可以登录、访问权限和所属策略组。', '誰可以登入、存取權限和所屬策略群組。') },
     groups: { label: w('Permission groups', '权限组', '權限群組'), description: w('Each account belongs to one group; the group decides which workspace features it can use.', '每个账户属于一个权限组，权限组决定可使用的工作区功能。', '每個帳戶屬於一個權限群組，權限群組決定可使用的工作區功能。') },
+    policies: { label: w('Model policy groups', '策略组', '策略群組'), description: w('Each account belongs to one group; the group decides the model and thinking depth for each use. Accounts never see it.', '每个账户属于一个策略组，策略组决定每种用途的模型和思考深度。账户本人看不到。', '每個帳戶屬於一個策略群組，策略群組決定每種用途的模型和思考深度。帳戶本人看不到。') },
     models: { label: w('Models', '模型', '模型'), description: w('Codex sign-in and the models it provides to every agent and chat.', 'Codex 登录及其为所有 Agent 和聊天提供的模型。', 'Codex 登入及其為所有 Agent 和聊天提供的模型。') },
     branding: { label: w('Branding', '品牌', '品牌'), description: w('Product name, agent name, accent color and logo shown to everyone.', '对所有人显示的产品名称、Agent 名称、强调色和 Logo。', '對所有人顯示的產品名稱、Agent 名稱、強調色和 Logo。') },
     system: { label: w('System', '系统', '系統'), description: w('Release, service health and updates installed by the host Manager.', '由宿主机管理器安装的版本、服务健康状态和更新。', '由主機管理器安裝的版本、服務健康狀態和更新。') },
@@ -44,9 +46,10 @@ export function Admin() {
       onTabChange={(key: string) => { setTab(key as Tab); window.location.hash = key === 'users' ? 'admin' : `admin/${key}`; }}
     />
     {/* the record tables fill the window; the other tabs scroll */}
-    <div className={tab === 'users' || tab === 'groups' ? 'flex min-h-0 flex-1 flex-col' : 'min-h-0 flex-1 overflow-y-auto'}>
+    <div className={tab === 'users' || tab === 'groups' || tab === 'policies' ? 'flex min-h-0 flex-1 flex-col' : 'min-h-0 flex-1 overflow-y-auto'}>
       {tab === 'users' && <Users />}
       {tab === 'groups' && <Groups />}
+      {tab === 'policies' && <Policies />}
       {tab === 'models' && <Models />}
       {tab === 'branding' && <BrandingSettings />}
       {tab === 'system' && <System />}

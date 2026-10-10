@@ -42,7 +42,7 @@ Personal AI only. Runtime's `task`, `job` and `wait` tools are thin calls to the
 
 ## Models and OAuth
 
-Administrators manage models and the Codex device authorization flow. Platform persists OAuth credentials and refreshes them; Runtime resolves access tokens through Platform, including forced provider refresh. Personal model/thinking settings and the optional per-account chat model are administrator-managed and not visible to users.
+Administrators manage models and the Codex device authorization flow. Platform persists OAuth credentials and refreshes them; Runtime resolves access tokens through Platform, including forced provider refresh. Which model and thinking depth each usage gets is set by administrator-managed model policy groups and is not visible to users.
 
 ## Host Manager
 

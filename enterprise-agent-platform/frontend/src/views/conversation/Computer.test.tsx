@@ -22,9 +22,14 @@ class FakeEventSource extends EventTarget {
 }
 
 let seq = 0;
+/** Delivers one event; a stream delta waits for its animation frame, which follows at once here. */
 function emit(event: Record<string, unknown> & { type: string }) {
   act(() => {
+    const frames: FrameRequestCallback[] = [];
+    const frame = vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => -frames.push(callback));
     FakeEventSource.instances[0].dispatchEvent(new MessageEvent(event.type, { data: JSON.stringify({ seq: ++seq, ...event }), lastEventId: String(seq) }));
+    frame.mockRestore();
+    for (const callback of frames) callback(performance.now());
   });
 }
 

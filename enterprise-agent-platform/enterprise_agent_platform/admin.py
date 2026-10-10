@@ -14,10 +14,9 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .auth import COOKIE_NAME, PERMISSIONS, TTL, admin_user, body_json, current_user, groups, hash_password, issue_session
+from .auth import COOKIE_NAME, PERMISSIONS, TTL, admin_user, body_json, current_user, groups, hash_password, issue_session, model_policies
+from .db import MODEL_SLOTS, THINKING_DEPTHS
 from .gates import manager_request
-
-THINKING = {'off', 'minimal', 'low', 'medium', 'high', 'xhigh'}
 
 
 def setting(conn, key, value, secret=0):
@@ -25,17 +24,17 @@ def setting(conn, key, value, secret=0):
 
 
 def validate_user(db, fields):
-    if set(fields) - {'username', 'display_name', 'role', 'position', 'permission_group', 'model_name', 'chat_model_name', 'thinking_depth', 'timezone', 'active', 'password'}:
+    if set(fields) - {'username', 'display_name', 'role', 'position', 'permission_group', 'model_policy', 'timezone', 'active', 'password'}:
         raise HTTPException(400, 'Unknown user field')
-    for name in ('username', 'display_name', 'position', 'model_name', 'chat_model_name'):
+    for name in ('username', 'display_name', 'position'):
         if name in fields and (not isinstance(fields[name], str) or len(fields[name]) > 128 or (name == 'username' and not fields[name].strip())):
             raise HTTPException(400, 'Invalid ' + name)
     if 'role' in fields and fields['role'] not in ('admin', 'user'):
         raise HTTPException(400, 'Invalid role')
     if 'permission_group' in fields and (not isinstance(fields['permission_group'], str) or fields['permission_group'] not in {g['name'] for g in groups(db)}):
         raise HTTPException(400, 'Unknown permission group')
-    if 'thinking_depth' in fields and (not isinstance(fields['thinking_depth'], str) or fields['thinking_depth'] not in THINKING):
-        raise HTTPException(400, 'Invalid thinking depth')
+    if 'model_policy' in fields and (not isinstance(fields['model_policy'], str) or fields['model_policy'] not in {p['name'] for p in model_policies(db)}):
+        raise HTTPException(400, 'Unknown model policy group')
     if 'active' in fields and type(fields['active']) is not bool:
         raise HTTPException(400, 'Invalid active flag')
     if 'timezone' in fields:
@@ -48,7 +47,8 @@ def validate_user(db, fields):
 
 
 def create_user(db, username, password, display_name='', role='user', **fields):
-    values = {'username': username, 'password': password, 'display_name': display_name or username, 'role': role, 'position': '', 'permission_group': 'admin' if role == 'admin' else 'member', 'model_name': '', 'thinking_depth': 'off', 'timezone': 'UTC', 'active': True, **fields}
+    policy_names = [policy['name'] for policy in model_policies(db)]
+    values = {'username': username, 'password': password, 'display_name': display_name or username, 'role': role, 'position': '', 'permission_group': 'admin' if role == 'admin' else 'member', 'model_policy': 'default' if 'default' in policy_names else policy_names[0], 'timezone': 'UTC', 'active': True, **fields}
     validate_user(db, values)
     values.update(token_version=1, created_at=int(time.time()))
     try:
@@ -128,6 +128,46 @@ async def permission_groups(request):
                 raise HTTPException(409, 'Cannot remove a group assigned to users')
             setting(conn, 'permission_groups_v1', json.dumps(items))
     return JSONResponse({'groups': groups(db)})
+
+
+def valid_model_policy(policy):
+    if not isinstance(policy, dict) or set(policy) != {'name', 'label', 'slots'}:
+        return False
+    if not isinstance(policy['name'], str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', policy['name']):
+        return False
+    if not isinstance(policy['label'], str) or not 1 <= len(policy['label']) <= 64:
+        return False
+    slots = policy['slots']
+    if not isinstance(slots, dict) or set(slots) != set(MODEL_SLOTS):
+        return False
+    return all(isinstance(slot, dict) and set(slot) == {'model', 'thinking'} and isinstance(slot['model'], str) and len(slot['model']) <= 128
+               and isinstance(slot['thinking'], str) and slot['thinking'] in THINKING_DEPTHS for slot in slots.values())
+
+
+def policy_listing(db):
+    policies = model_policies(db)
+    with db.connect() as conn:
+        counts = {row[0]: row[1] for row in conn.execute('SELECT model_policy, count(*) FROM users GROUP BY model_policy')}
+    return {'policies': policies, 'members': {policy['name']: counts.get(policy['name'], 0) for policy in policies}}
+
+
+async def model_policy_groups(request):
+    current_user(request, admin=True)
+    db = request.app.state.platform.db
+    if request.method == 'PUT':
+        body = await body_json(request)
+        items = body.get('policies')
+        if set(body) != {'policies'} or not isinstance(items, list) or not items:
+            raise HTTPException(400, 'Policies must be a nonempty list')
+        if any(not valid_model_policy(policy) for policy in items) or len({policy['name'] for policy in items}) != len(items):
+            raise HTTPException(400, 'Invalid model policy group')
+        with db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            used = {row[0] for row in conn.execute('SELECT DISTINCT model_policy FROM users')}
+            if used - {policy['name'] for policy in items}:
+                raise HTTPException(409, 'Cannot remove a group assigned to users')
+            setting(conn, 'model_policies_v1', json.dumps(items, ensure_ascii=False))
+    return JSONResponse(policy_listing(db))
 
 
 def branding(db):
@@ -221,4 +261,4 @@ async def system(request):
 
 
 def routes():
-    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/impersonate', impersonate, methods=['POST']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]
+    return [Route('/api/admin/users', users, methods=['GET', 'POST']), Route('/api/admin/users/{id:int}', user_update, methods=['PATCH', 'DELETE']), Route('/api/admin/users/{id:int}/impersonate', impersonate, methods=['POST']), Route('/api/admin/permission-groups', permission_groups, methods=['GET', 'PUT']), Route('/api/admin/model-policies', model_policy_groups, methods=['GET', 'PUT']), Route('/api/branding', brand), Route('/api/admin/branding', brand, methods=['GET', 'PATCH']), Route('/api/admin/usage', usage), Route('/api/admin/system', system), Route('/api/admin/system/config', system, methods=['GET', 'PATCH']), Route('/api/admin/system/check', system, methods=['POST']), Route('/api/admin/system/operations', system, methods=['POST'])]

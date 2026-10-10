@@ -131,7 +131,6 @@ export function Settings({ user, onSaved }: { user: User; onSaved: (u: User) => 
             { key: 'role', label: w('Role', '角色', '角色'), value: user.role === 'admin' ? w('Administrator', '管理员', '管理員') : w('Standard user', '普通用户', '一般使用者') },
             { key: 'position', label: w('Position', '职位', '職位'), value: user.position || none },
             { key: 'group', label: w('Permission group', '权限组', '權限群組'), value: user.permission_group || none },
-            { key: 'thinking', label: w('Thinking depth', '思考深度', '思考深度'), value: user.thinking_depth || none },
           ]} />
         </FormSection>
       </div>

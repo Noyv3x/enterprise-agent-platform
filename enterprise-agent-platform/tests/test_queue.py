@@ -15,7 +15,8 @@ from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
 from enterprise_agent_platform.db import Database, now
-from enterprise_agent_platform.auth import issue_session
+from policy_support import set_default_policy
+from enterprise_agent_platform.auth import issue_session, public_user
 from enterprise_agent_platform.queue import Queue, _WorkTrace, authenticated_events, routes
 
 
@@ -35,6 +36,9 @@ class Files:
 
     def for_message(self, info, mid):
         return []
+
+    def release(self, info, mid, conn):
+        pass
 
     async def deliver(self, user, info, mid, text):
         return []
@@ -83,8 +87,9 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         db.migrate(root)
         with db.connect() as conn:
             for uid in (1, 2):
-                conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,model_name,created_at) VALUES (?,?,?,?,?,?,?)",
-                             (uid, f"u{uid}", f"User {uid}", "unused", "admin", "model-a", 1))
+                conn.execute("INSERT INTO users(id,username,display_name,password_hash,role,created_at) VALUES (?,?,?,?,?,?)",
+                             (uid, f"u{uid}", f"User {uid}", "unused", "admin", 1))
+            set_default_policy(conn)
         self.calls = []
         self.requests = []
         self.compactions = []
@@ -109,6 +114,12 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.steer_hold.set()
         self.steer_status = 200
         self.steer_error = None
+        self.removals = []
+        self.remove_started = asyncio.Event()
+        self.remove_hold = asyncio.Event()
+        self.remove_hold.set()
+        self.remove_status = 200
+        self.remove_error = None
 
         async def runtime(request):
             self.calls.append((request.method, request.url.path))
@@ -127,6 +138,13 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 if self.steer_error is not None:
                     raise self.steer_error
                 return httpx.Response(self.steer_status, json={"ok": self.steer_status == 200})
+            if request.method == "DELETE" and "/inputs/" in request.url.path:
+                self.removals.append(request.url.path)
+                self.remove_started.set()
+                await self.remove_hold.wait()
+                if self.remove_error is not None:
+                    raise self.remove_error
+                return httpx.Response(self.remove_status, json={"removed": True} if self.remove_status == 200 else {"error": "Input is already delivered"})
             if request.url.path.startswith("/v1/runs/") and request.url.path.endswith("/cancel"):
                 self.cancelled_runs.add(request.url.path.split("/")[-2])
                 return httpx.Response(200, json={"cancelled": True})
@@ -618,6 +636,327 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 self.assert_reply_to(replies[-1], parent)
                 self.assertFalse(any(message["metadata"]["reply_to"]["message_id"] == child["message"]["id"]
                                      for message in replies))
+
+    def stored(self, scope, mid):
+        table = "chat_messages" if scope.startswith("chat-") else "messages"
+        with self.p.db.connect() as conn:
+            return conn.execute(f"SELECT 1 FROM {table} WHERE id=?", (mid,)).fetchone() is not None
+
+    async def assert_refused(self, status, detail, user, scope, mid):
+        with self.assertRaises(HTTPException) as caught:
+            await self.q.withdraw(user, scope, mid)
+        self.assertEqual((caught.exception.status_code, caught.exception.detail), (status, detail))
+
+    def real_files(self):
+        from enterprise_agent_platform.files import Files as WorkspaceFiles
+        self.p.files = WorkspaceFiles(self.p)
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations VALUES ('c1',1,'Chat',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+
+    async def test_after_turn_is_never_absorbed_and_runs_as_its_own_turn_after_the_current_one(self):
+        self.real_files()
+        for scope in ("private", "chat-c1", "channel-1"):
+            with self.subTest(scope=scope):
+                before = len(self.requests)
+                parent, stream = await self.begin_run(scope)
+                later = await self.q.enqueue(self.user, scope, "after this turn", mode="after_turn")
+                stored = self.job(later)
+                self.assertEqual(stored["status"], "queued")
+                self.assertNotIn("parent_job_id", stored["payload"])
+                self.assertEqual(later["message"]["metadata"]["send_mode"], "after_turn")
+                self.assertEqual(later["message"]["metadata"]["status"], "queued")
+                self.assertNotIn("inserted_into", later["message"]["metadata"])
+                behind = await self.q.enqueue(self.user, scope, "behind it")
+                self.assertEqual(self.job(behind)["status"], "queued", "queued work stops later inserts from overtaking it")
+                self.assertNotIn("send_mode", behind["message"]["metadata"])
+                self.assertEqual(self.steers, [])
+                stream.finish()
+                await self.drain()
+                self.assertEqual([r["prompt"]["text"] for r in self.requests[before:]], ["first", "after this turn", "behind it"])
+                replies = [m for m in self.q.messages(self.user, scope)["messages"] if m["role"] == "assistant"]
+                for reply, request in zip(replies, (parent, later, behind), strict=True):
+                    self.assert_reply_to(reply, request)
+        self.assertEqual(self.steers, [])
+
+    async def test_send_mode_is_validated_and_after_turn_on_an_idle_scope_runs_normally(self):
+        with self.assertRaises(HTTPException) as caught:
+            await self.q.enqueue(self.user, "private", "x", mode="sideways")
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(self.q.messages(self.user, "private")["messages"], [])
+        sent = await self.q.enqueue(self.user, "private", "idle", mode="after_turn")
+        await self.drain()
+        self.assertEqual([r["prompt"]["text"] for r in self.requests], ["idle"])
+        self.assertEqual(self.job(sent)["status"], "succeeded")
+
+    async def test_withdrawing_a_queued_message_returns_content_and_attachments_that_stay_owned(self):
+        self.real_files()
+        for scope in ("private", "chat-c1", "channel-1"):
+            for mode in ("insert", "after_turn"):
+                with self.subTest(scope=scope, mode=mode):
+                    before = len(self.requests)
+                    parent, stream = await self.begin_run(scope)
+                    # A queued schedule-free predecessor keeps the insert-mode message FIFO; after_turn is queued by itself.
+                    blocker = await self.q.enqueue(self.user, scope, "blocker", mode="after_turn")
+                    info = self.q.scope(self.user, scope)
+                    attachment = self.p.files.store(self.user, info, "report.txt", b"data")
+                    queued = await self.q.enqueue(self.user, scope, "my text", [attachment["id"]], mode=mode)
+                    self.assertEqual(self.job(queued)["status"], "queued")
+                    mid = queued["message"]["id"]
+                    result = await self.q.withdraw(self.user, scope, mid)
+                    self.assertEqual(result, {"content": "my text", "attachments": [attachment]})
+                    self.assertFalse(self.stored(scope, mid))
+                    job = self.job(queued)
+                    self.assertEqual((job["status"], job["last_error"]), ("failed", "withdrawn"))
+                    self.assertEqual(self.recorded_events(scope)[-1], {"type": "message_removed", "message_id": mid})
+                    with self.p.db.connect() as conn:
+                        row, _ = self.p.files.owned(self.user, attachment["id"], conn)
+                        self.assertIsNone(row["message_id"])
+                        self.assertEqual(row["uploader_user_id"], 1)
+                        self.assertTrue(self.p.files.storage(row).exists(), "the uploaded file itself is kept")
+                    stream.finish()
+                    await self.drain()
+                    self.assertEqual([r["prompt"]["text"] for r in self.requests[before:]], ["first", "blocker"], "the withdrawn message never runs")
+                    again = await self.q.enqueue(self.user, scope, "my text again", [attachment["id"]])
+                    self.assertEqual([a["id"] for a in again["message"]["attachments"]], [attachment["id"]])
+                    await self.drain()
+                    self.assertEqual(self.requests[-1]["prompt"]["text"].split("\n")[0], "my text again")
+                    self.assertEqual(self.q.messages(self.user, scope)["messages"][-2]["content"], "my text again")
+
+    async def test_withdrawing_an_absorbed_message_before_submission_never_reaches_runtime(self):
+        stream = self.streams["r1"] = ControlledStream()
+        self.hold.clear()
+        parent = await self.q.enqueue(self.user, "private", "first")
+        await asyncio.wait_for(self.run_started.wait(), 2)
+        dropped = await self.q.enqueue(self.user, "private", "changed my mind")
+        kept = await self.q.enqueue(self.user, "private", "keep this")
+        for child in (dropped, kept):
+            self.assertEqual(self.job(child)["payload"]["parent_job_id"], parent["job_id"])
+        self.assertEqual(await self.q.withdraw(self.user, "private", dropped["message"]["id"]), {"content": "changed my mind", "attachments": []})
+        self.assertEqual(self.job(dropped)["status"], "failed")
+        self.assertFalse(self.stored("private", dropped["message"]["id"]))
+        self.hold.set()
+        await asyncio.wait_for(stream.started.wait(), 2)
+        self.assertEqual([body["input_id"] for path, body in self.steers], [str(kept["job_id"])])
+        self.assertEqual(self.removals, [])
+        await stream.send({"type": "input_delivered", "input_id": str(kept["job_id"])})
+        stream.finish()
+        await self.drain()
+        messages = self.q.messages(self.user, "private")["messages"]
+        self.assertEqual([m["content"] for m in messages], ["first", "keep this", "answer"])
+        self.assertEqual(self.job(kept)["status"], "succeeded")
+
+    async def test_withdrawing_a_submitted_undelivered_input_removes_it_from_the_run(self):
+        self.real_files()
+        for scope in ("private", "chat-c1", "channel-1"):
+            with self.subTest(scope=scope):
+                before = len(self.requests)
+                parent, stream = await self.begin_run(scope)
+                info = self.q.scope(self.user, scope)
+                attachment = self.p.files.store(self.user, info, "notes.txt", b"notes")
+                child = await self.q.enqueue(self.user, scope, "wait, not that", [attachment["id"]])
+                self.assertIs(self.job(child)["payload"]["steer_sent"], True)
+                mid = child["message"]["id"]
+                removals = len(self.removals)
+                self.assertEqual(await self.q.withdraw(self.user, scope, mid), {"content": "wait, not that", "attachments": [attachment]})
+                self.assertEqual(self.removals[removals:], [f"/v1/runs/r{before + 1}/inputs/{child['job_id']}"])
+                self.assertEqual(self.job(child)["status"], "failed")
+                self.assertFalse(self.stored(scope, mid))
+                self.assertEqual(self.recorded_events(scope)[-1], {"type": "message_removed", "message_id": mid})
+                await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+                stream.finish()
+                await self.drain()
+                self.assertEqual(len(self.requests), before + 1, "nothing is requeued or run for the withdrawn input")
+                messages = self.q.messages(self.user, scope)["messages"]
+                self.assertEqual([m["content"] for m in messages if m["role"] == "user"], ["first"])
+                self.assertEqual(len([m for m in messages if m["role"] == "assistant"]), 1)
+                self.assertFalse(any(e["type"] == "input_delivered" for e in self.recorded_events(scope)))
+
+    async def test_message_removed_reaches_the_event_stream_without_a_message_payload(self):
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "gone")
+        await self.q.withdraw(self.user, "private", child["message"]["id"])
+        stream.finish()
+        await self.drain()
+        public = self.q.events(self.user, "private", 0)
+        removed = None
+        try:
+            async with asyncio.timeout(2):
+                while removed is None:
+                    event = json.loads((await anext(public)).split(b"data: ", 1)[1])
+                    if event["type"] == "message_removed":
+                        removed = event
+        finally:
+            await public.aclose()
+        self.assertEqual({k: v for k, v in removed.items() if k != "seq"}, {"type": "message_removed", "message_id": child["message"]["id"]})
+
+    async def test_withdraw_is_refused_once_the_ai_has_seen_or_started_the_message(self):
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "read by the AI")
+        await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+        removals = len(self.removals)
+        await self.assert_refused(409, "already_seen", self.user, "private", child["message"]["id"])
+        await self.assert_refused(409, "already_seen", self.user, "private", parent["message"]["id"])
+        self.assertEqual(len(self.removals), removals, "a delivered input is refused without asking Runtime")
+        for mid in (child["message"]["id"], parent["message"]["id"]):
+            self.assertTrue(self.stored("private", mid))
+        stream.finish()
+        await self.drain()
+        done = self.q.messages(self.user, "private")["messages"]
+        for message in done:
+            if message["role"] == "assistant":
+                await self.assert_refused(400, "Message cannot be withdrawn", self.user, "private", message["id"])
+            else:
+                await self.assert_refused(409, "already_seen", self.user, "private", message["id"])
+        await self.assert_refused(404, "Message not found", self.user, "private", 99999)
+        self.assertEqual([m["id"] for m in self.q.messages(self.user, "private")["messages"]], [m["id"] for m in done])
+
+    async def test_runtime_conflict_or_unreachable_leaves_the_input_untouched(self):
+        for status, error, expected in [(409, None, (409, "already_seen")), (404, None, (409, "already_seen")),
+                                        (500, None, (502, "Runtime could not withdraw the message")),
+                                        (200, httpx.ConnectError("down"), (502, "Runtime could not withdraw the message"))]:
+            with self.subTest(status=status, error=type(error).__name__):
+                parent, stream = await self.begin_run()
+                child = await self.q.enqueue(self.user, "private", "maybe seen")
+                self.remove_status, self.remove_error = status, error
+                await self.assert_refused(*expected, self.user, "private", child["message"]["id"])
+                self.remove_status, self.remove_error = 200, None
+                self.assertEqual(self.job(child)["status"], "running")
+                self.assertTrue(self.stored("private", child["message"]["id"]))
+                await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+                stream.finish()
+                await self.drain()
+                self.assertEqual(self.job(child)["status"], "succeeded")
+
+    async def test_withdraw_racing_delivery_has_exactly_one_outcome(self):
+        # Runtime delivers while the removal request is in flight: delivered wins.
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "race me")
+        self.remove_hold.clear()
+        self.remove_started.clear()
+        self.remove_status = 409
+        attempt = asyncio.create_task(self.q.withdraw(self.user, "private", child["message"]["id"]))
+        await asyncio.wait_for(self.remove_started.wait(), 2)
+        await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+        self.remove_hold.set()
+        with self.assertRaises(HTTPException) as caught:
+            await attempt
+        self.assertEqual((caught.exception.status_code, caught.exception.detail), (409, "already_seen"))
+        stream.finish()
+        await self.drain()
+        self.assertEqual(self.job(child)["status"], "succeeded")
+        self.assertEqual([m["content"] for m in self.q.messages(self.user, "private")["messages"]], ["first", "race me", "answer"])
+        self.assertNotIn("message_removed", [e["type"] for e in self.recorded_events()])
+        # Runtime removes it first: withdrawn wins and no delivery event can follow.
+        self.remove_status = 200
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "race me again")
+        self.remove_hold.clear()
+        self.remove_started.clear()
+        attempt = asyncio.create_task(self.q.withdraw(self.user, "private", child["message"]["id"]))
+        await asyncio.wait_for(self.remove_started.wait(), 2)
+        self.remove_hold.set()
+        self.assertEqual((await attempt)["content"], "race me again")
+        await stream.send({"type": "input_delivered", "input_id": str(child["job_id"])})
+        stream.finish()
+        await self.drain()
+        self.assertEqual(self.job(child)["status"], "failed")
+        self.assertEqual([m["content"] for m in self.q.messages(self.user, "private")["messages"]], ["first", "race me", "answer", "first", "answer"])
+
+    async def test_withdraw_while_the_parent_finishes_is_withdrawn_as_a_requeued_message(self):
+        parent, stream = await self.begin_run()
+        child = await self.q.enqueue(self.user, "private", "undelivered at turn end")
+        self.remove_hold.clear()
+        self.remove_started.clear()
+        attempt = asyncio.create_task(self.q.withdraw(self.user, "private", child["message"]["id"]))
+        await asyncio.wait_for(self.remove_started.wait(), 2)
+        stream.finish(undelivered_inputs=[str(child["job_id"])])
+        for _ in range(200):
+            if self.job(parent)["status"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(self.job(child)["status"], "queued", "undelivered input returned to the FIFO")
+        self.remove_hold.set()
+        self.assertEqual((await attempt)["content"], "undelivered at turn end")
+        await self.drain()
+        self.assertEqual(self.job(child)["status"], "failed")
+        self.assertEqual(len(self.requests), 1, "the withdrawn message never becomes its own turn")
+        self.assertEqual([m["content"] for m in self.q.messages(self.user, "private")["messages"]], ["first", "answer"])
+
+    async def test_withdraw_authorization_follows_sending_rules(self):
+        self.real_files()
+        author, other = self.q.user(1), self.q.user(2)
+        parent, stream = await self.begin_run("channel-1", author)
+        private_parent, private_stream = await self.begin_run("private", author)
+        chat_parent, chat_stream = await self.begin_run("chat-c1", author)
+        mine = await self.q.enqueue(author, "channel-1", "channel message", mode="after_turn")
+        await self.assert_refused(403, "Only the author can withdraw this message", other, "channel-1", mine["message"]["id"])
+        self.assertTrue(self.stored("channel-1", mine["message"]["id"]))
+        private = await self.q.enqueue(author, "private", "mine", mode="after_turn")
+        chat = await self.q.enqueue(author, "chat-c1", "mine too", mode="after_turn")
+        # Other users reach neither a private scope nor a chat they do not own, and ids from other scopes are unknown.
+        await self.assert_refused(404, "Message not found", other, "private", private["message"]["id"])
+        await self.assert_refused(404, "Conversation not found", other, "chat-c1", chat["message"]["id"])
+        await self.assert_refused(404, "Message not found", author, "private", mine["message"]["id"])
+        with patch("enterprise_agent_platform.queue.permissions", return_value={"read_workspace", "private_agent"}):
+            await self.assert_refused(403, "Permission denied", author, "channel-1", mine["message"]["id"])
+            await self.assert_refused(403, "Permission denied", author, "chat-c1", chat["message"]["id"])
+        for user, scope, sent in ((author, "private", private), (author, "chat-c1", chat), (author, "channel-1", mine)):
+            self.assertEqual((await self.q.withdraw(user, scope, sent["message"]["id"]))["content"], sent["message"]["content"])
+        for finished in (stream, private_stream, chat_stream):
+            finished.finish()
+        await self.drain()
+
+    async def test_schedule_occurrences_cannot_be_withdrawn(self):
+        parent, stream = await self.begin_run()
+        run_id = self.schedule_occurrence()
+        scheduled = await self.q.enqueue(self.user, "private", "scheduled", schedule_run_id=run_id)
+        self.assertEqual(self.job(scheduled)["status"], "queued")
+        await self.assert_refused(400, "Message cannot be withdrawn", self.user, "private", scheduled["message"]["id"])
+        self.assertTrue(self.stored("private", scheduled["message"]["id"]))
+        stream.finish()
+        await self.drain()
+
+    async def test_routes_send_mode_and_withdraw_over_http(self):
+        self.real_files()
+        from starlette.responses import JSONResponse
+
+        async def error(request, exc):
+            return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+        app = Starlette(routes=routes(), exception_handlers={HTTPException: error})
+        app.state.platform = self.p
+        parent, stream = await self.begin_run()
+        chat_parent, chat_stream = await self.begin_run("chat-c1")
+        channel_parent, channel_stream = await self.begin_run("channel-1")
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                for base in ("/api/conversations/private", "/api/chat/conversations/c1"):
+                    self.assertEqual((await client.post(base + "/messages", json={"content": "x", "mode": "later"})).status_code, 400)
+                    sent = await client.post(base + "/messages", json={"content": "queued text", "mode": "after_turn"})
+                    self.assertEqual(sent.status_code, 202)
+                    message = sent.json()["message"]
+                    self.assertEqual(message["metadata"]["send_mode"], "after_turn")
+                    removed = await client.delete(f"{base}/messages/{message['id']}")
+                    self.assertEqual((removed.status_code, removed.json()), (200, {"content": "queued text", "attachments": []}))
+                    again = await client.delete(f"{base}/messages/{message['id']}")
+                    self.assertEqual(again.status_code, 404)
+                inserted = await client.post("/api/conversations/private/messages", json={"content": "inserted"})
+                self.assertNotIn("send_mode", inserted.json()["message"]["metadata"])
+                await stream.send({"type": "input_delivered", "input_id": str(inserted.json()["job_id"])})
+                seen = await client.delete(f"/api/conversations/private/messages/{inserted.json()['message']['id']}")
+                self.assertEqual((seen.status_code, seen.json()), (409, {"error": "already_seen"}))
+                self.assertEqual((await client.delete("/api/conversations/private/messages/abc")).status_code, 404)
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.q.user(2)):
+                theirs = await client.post("/api/conversations/channel-1/messages", json={"content": "channel", "mode": "after_turn"})
+                self.assertEqual(theirs.status_code, 202)
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                forbidden = await client.delete(f"/api/conversations/channel-1/messages/{theirs.json()['message']['id']}")
+                self.assertEqual((forbidden.status_code, forbidden.json()["error"]), (403, "Only the author can withdraw this message"))
+        stream.finish()
+        channel_stream.finish()
+        chat_stream.finish()
+        await self.drain()
 
     async def test_startup_recovery_settles_absorbed_inputs_without_replay(self):
         self.q.stopping = True
@@ -1539,39 +1878,67 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(StopAsyncIteration):
                         await anext(stream)
 
-    async def test_legacy_default_model_and_thinking_execute(self):
+    async def test_empty_policy_model_executes_with_the_first_catalog_model(self):
         with self.p.db.connect() as conn:
-            conn.execute("UPDATE users SET model_name='',thinking_depth='none' WHERE id=1")
-        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}]}))
+            set_default_policy(conn, model="", thinking="off")
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}, {"id": "second"}]}))
         await self.q.enqueue(self.q.user(1), "private", "Use inherited settings")
         await self.drain()
         self.assertEqual(self.requests[0]["model"], {"id": "catalog-default", "thinking": "off"})
 
-    async def test_chat_follows_the_personal_model_and_thinking_until_an_administrator_sets_a_model(self):
+    async def test_request_users_without_policy_fields_run_with_their_policy_group(self):
+        # HTTP handlers receive the public projection, which never carries the model policy.
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="model-b", thinking="high")
+        caller = public_user(self.q.user(1))
+        self.assertNotIn("model_policy", caller)
+        await self.q.enqueue(caller, "private", "From the browser")
+        await self.drain()
+        self.assertEqual(self.requests[0]["model"], {"id": "model-b", "thinking": "high"})
+
+    async def test_each_usage_runs_with_its_policy_slot(self):
         cid = "11111111-1111-1111-1111-111111111111"
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Switch models',?,?,NULL)", (cid, 1, now(), now()))
-        scope = "chat-" + cid
-        await self.q.enqueue(self.user, scope, "Follows personal")
+            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Slots',?,?,NULL)", (cid, 1, now(), now()))
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+            set_default_policy(
+                conn, personal={"model": "m-personal", "thinking": "low"}, channel={"model": "m-channel", "thinking": "high"},
+                chat={"model": "m-chat", "thinking": "minimal"}, scout={"model": "m-scout", "thinking": "off"},
+                worker={"model": "m-worker", "thinking": "xhigh"})
+        chat = "chat-" + cid
+        await self.q.enqueue(self.q.user(1), "private", "personal")
         await self.drain()
-        self.assertEqual(self.requests[0]["model"], {"id": "model-a", "thinking": "medium"})
+        await self.q.enqueue(self.q.user(1), "private", "scheduled", schedule_run_id=self.schedule_occurrence())
+        await self.drain()
+        await self.q.enqueue(self.q.user(1), "channel-1", "channel")
+        await self.drain()
+        await self.q.enqueue(self.q.user(1), chat, "chat")
+        await self.drain()
+        self.assertEqual([request["model"] for request in self.requests], [
+            {"id": "m-personal", "thinking": "low"}, {"id": "m-personal", "thinking": "low"},
+            {"id": "m-channel", "thinking": "high"}, {"id": "m-chat", "thinking": "minimal"}])
+        for scope in (chat, "private", "channel-1"):
+            await self.q.compact(self.q.user(1), scope)
+            await self.drain()
+        self.assertEqual([entry["model"] for entry in self.compactions], [
+            {"id": "m-chat", "thinking": "minimal"}, {"id": "m-personal", "thinking": "low"}, {"id": "m-channel", "thinking": "high"}])
+        user = self.q.user(1)
+        for usage, expected in (("scout", {"id": "m-scout", "thinking": "off"}), ("worker", {"id": "m-worker", "thinking": "xhigh"})):
+            self.assertEqual(self.q.scope(user, "private", slot=usage)["model"], expected)
+
+    async def test_channel_agent_uses_the_triggering_users_policy_group(self):
         with self.p.db.connect() as conn:
-            conn.execute("UPDATE users SET chat_model_name='model-b' WHERE id=1")
-        await self.q.enqueue(self.user, scope, "Admin model")
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+            group = {slot: {"model": "m-light", "thinking": "off"} for slot in ("personal", "channel", "chat", "scout", "worker")}
+            conn.execute("UPDATE settings SET value=json_insert(value,'$[#]',json(?)) WHERE key='model_policies_v1'",
+                         (json.dumps({"name": "light", "label": "Light", "slots": group}),))
+            conn.execute("UPDATE users SET model_policy='light' WHERE id=2")
+        await self.q.enqueue(self.q.user(2), "channel-1", "from user two")
         await self.drain()
-        self.assertEqual(self.requests[1]["model"], {"id": "model-b", "thinking": "medium"})
-        await self.q.compact(self.user, scope)
+        await self.q.enqueue(self.q.user(1), "channel-1", "from user one")
         await self.drain()
-        self.assertEqual(self.compactions, [{"model": {"id": "model-b", "thinking": "medium"}}])
-        await self.q.enqueue(self.user, "private", "Personal AI is unaffected")
-        await self.drain()
-        self.assertEqual(self.requests[2]["model"], {"id": "model-a", "thinking": "medium"})
-        with self.p.db.connect() as conn:
-            conn.execute("UPDATE users SET model_name='',chat_model_name='',thinking_depth='none' WHERE id=1")
-        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}]}))
-        await self.q.enqueue(self.q.user(1), scope, "Catalog default with thinking off")
-        await self.drain()
-        self.assertEqual(self.requests[3]["model"], {"id": "catalog-default", "thinking": "off"})
+        self.assertEqual([request["model"]["id"] for request in self.requests], ["m-light", "model-a"])
+
 
     async def test_users_see_no_model_in_events_or_messages(self):
         await self.q.enqueue(self.user, "private", "hello")

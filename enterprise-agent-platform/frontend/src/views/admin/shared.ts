@@ -8,6 +8,14 @@ export interface ModelCatalog { models: ModelOption[]; connected: boolean }
 export interface PermissionGroup { name: string; permissions: string[] }
 
 export const THINKING_DEPTHS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+/** Fixed usage slots of a model policy group, in display order. */
+export const POLICY_SLOTS = ['personal', 'channel', 'chat', 'scout', 'worker'] as const;
+export type PolicySlot = (typeof POLICY_SLOTS)[number];
+/** `model: ''` is the system default: the first model in the live catalog. */
+export interface SlotSetting { model: string; thinking: string }
+export interface ModelPolicy { name: string; label: string; slots: Record<PolicySlot, SlotSetting> }
+/** `GET`/`PUT /api/admin/model-policies`; `members` counts every account (active or not) per group name. */
+export interface ModelPolicies { policies: ModelPolicy[]; members: Record<string, number> }
 export const PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings'] as const;
 
 export function errorText(cause: unknown): string {
@@ -68,6 +76,13 @@ export function useAdminLabels() {
     high: w('High', '高', '高'),
     xhigh: w('Extra high', '超高', '超高'),
   };
+  const slots: Record<PolicySlot, { label: string; hint: string }> = {
+    personal: { label: w('Personal AI', '个人 AI', '個人 AI'), hint: w('Personal AI conversations, schedules and background-task notices.', '个人 AI 对话、定时任务和后台任务通知。', '個人 AI 對話、排程任務和背景任務通知。') },
+    channel: { label: w('Channels', '频道', '頻道'), hint: w('The channel agent, chosen by the group of the person who sent the message.', '频道 Agent，按发消息者所在的策略组选择。', '頻道 Agent，依發訊息者所在的策略群組選擇。') },
+    chat: { label: w('Chat', '聊天', '聊天'), hint: w('Standard chat conversations.', '标准聊天对话。', '標準聊天對話。') },
+    scout: { label: w('Research subagent', '调研子智能体', '調研子智慧體'), hint: w('Research subagents the personal AI starts.', '个人 AI 启动的调研子智能体。', '個人 AI 啟動的調研子智慧體。') },
+    worker: { label: w('Task subagent', '执行子智能体', '執行子智慧體'), hint: w('Task subagents the personal AI starts.', '个人 AI 启动的执行子智能体。', '個人 AI 啟動的執行子智慧體。') },
+  };
   const permissions: Record<string, string> = {
     read_workspace: w('Read workspace', '读取工作区', '讀取工作區'),
     chat: w('Chat', '聊天', '聊天'),
@@ -80,6 +95,8 @@ export function useAdminLabels() {
     group: (name: string) => groups[name] ?? name,
     depth: (value: string) => depths[value === 'none' ? 'off' : value] ?? value,
     permission: (name: string) => permissions[name] ?? name,
+    slot: (slot: PolicySlot) => slots[slot].label,
+    slotHint: (slot: PolicySlot) => slots[slot].hint,
   };
 }
 

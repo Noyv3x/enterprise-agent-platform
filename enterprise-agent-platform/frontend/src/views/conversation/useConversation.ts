@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { request } from "../../api";
+import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
 import { mergeTask, type TaskMap, type TaskView } from "./taskState";
-import type { Compaction, LastRun, LiveRun, Message, MessagePage, ToolCall } from "./types";
+import type { Attachment, Compaction, LastRun, LiveRun, Message, MessagePage, SendMode, ToolCall } from "./types";
 
 const PAGE = 100;
 /** The panel keeps at most this much live output per call; the Runtime already limits it to 512 KiB. */
 const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
-  "input_delivered", "retry", "compaction", "run_end", "task",
+  "input_delivered", "message_removed", "retry", "compaction", "run_end", "task",
 ] as const;
+
+/** High-rate stream fragments: they commit together once per animation frame. */
+const DELTAS: Record<string, true> = { text_delta: true, thinking_delta: true, tool_input_delta: true, tool_output: true, tool_update: true };
 
 /** Platform SSE payloads (platform-api.md § SSE). */
 type StreamEvent = { seq: number } & (
@@ -25,12 +29,17 @@ type StreamEvent = { seq: number } & (
   | { type: "tool_output"; tool_call_id: string; delta: string; truncated?: boolean }
   | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { diff?: unknown; background?: { task_id?: unknown } | null } | null }
   | { type: "input_delivered"; message_id: number }
+  /** a withdrawn message: its row is gone */
+  | { type: "message_removed"; message_id: number }
   | { type: "retry" }
   | ({ type: "compaction"; phase: "queued" | "start" | "end" } & Partial<Compaction>)
   | { type: "run_end"; message?: Message | null }
   /** personal AI only: a background task or subagent changed */
   | { type: "task"; task: TaskView }
 );
+
+/** One received SSE event with its arrival time and stream-update mark. */
+type Received = { event: StreamEvent; at: number; mark: number };
 
 interface State {
   phase: "loading" | "ready" | "error";
@@ -52,6 +61,15 @@ interface State {
   taskMarks: Record<string, number>;
   tasksLoaded: boolean;
   tasksError: string;
+  /** Withdrawn messages: "leaving" while the bubble collapses (then purged), "gone" once purged; later events for
+   * them are ignored. */
+  removed: Record<number, "leaving" | "gone">;
+  /** The live reply's key; the persisted reply a run ends in inherits it (`replyKeys`), so the same component and DOM
+   * carry the turn from live to settled. */
+  runKey: number;
+  replyKeys: Record<number, string>;
+  /** Highest message id of the first page: rows up to it are restored history and do not play entrances. */
+  seenUpTo: number;
 }
 
 type Action =
@@ -61,16 +79,21 @@ type Action =
   | { type: "upsert"; messages: Message[] }
   | { type: "accepted"; message: Message }
   | { type: "compactQueued"; compaction: Compaction }
-  | { type: "event"; event: StreamEvent; at: number; mark: number }
+  /** received SSE events, applied in arrival order in one commit */
+  | { type: "events"; events: Received[] }
   /** a task snapshot requested when the stream-update mark was `mark` */
   | { type: "tasks"; tasks: TaskView[]; mark: number }
   | { type: "tasksFailed"; error: string }
   /** an action's authoritative result (stop) */
-  | { type: "task"; task: TaskView };
+  | { type: "task"; task: TaskView }
+  /** a withdrawal succeeded (also announced by SSE `message_removed`) */
+  | { type: "removed"; messageId: number }
+  /** a withdrawn bubble finished collapsing */
+  | { type: "purge"; messageId: number };
 
 const initial: State = {
   phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null,
-  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "",
+  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0,
 };
 
 function upsert(state: State, incoming: Message[]): Message[] {
@@ -79,6 +102,7 @@ function upsert(state: State, incoming: Message[]): Message[] {
   for (const message of incoming) {
     // Replayed events can announce messages older than the loaded page; those belong to "load earlier".
     if (state.nextBefore !== null && oldest !== undefined && message.id < oldest && !byId.has(message.id)) continue;
+    if (state.removed[message.id]) continue;
     byId.set(message.id, message);
   }
   return [...byId.values()].sort((a, b) => a.id - b.id);
@@ -157,8 +181,16 @@ function applyCallEvent(call: ToolCall, event: StreamEvent): ToolCall {
   }
 }
 
+/** Starts a withdrawn message's collapse; one not loaded (or already removed) is only remembered as gone. */
+function removeMessage(state: State, id: number): State {
+  if (state.removed[id]) return state;
+  const shown = state.messages.some((message) => message.id === id);
+  return { ...state, removed: { ...state.removed, [id]: shown ? "leaving" : "gone" } };
+}
+
 function applyEvent(state: State, event: StreamEvent, at: number, mark: number): State {
   if (event.type === "message") return { ...state, messages: upsert(state, [event.message]) };
+  if (event.type === "message_removed") return removeMessage(state, event.message_id);
   // Task updates are not run activity: they arrive between and after turns too.
   if (event.type === "task") {
     const { task } = event;
@@ -169,7 +201,12 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
     const calls = state.live?.calls.map((call) => (call.status === "preparing" || call.status === "running" ? { ...call, status: "cancelled" as const } : call));
     // The run becomes its reply message; the panel keeps resolving it by that id with the full streams.
     const lastRun = event.message && calls?.length ? { messageId: event.message.id, calls } : state.lastRun;
-    return { ...state, live: null, lastRun, messages: event.message ? upsert(state, [event.message]) : state.messages };
+    // The persisted reply inherits the live reply's key, so the settled turn keeps its DOM and disclosure state.
+    const replyKeys = event.message ? { ...state.replyKeys, [event.message.id]: `run-${state.runKey}` } : state.replyKeys;
+    return {
+      ...state, live: null, lastRun, replyKeys, runKey: state.runKey + 1,
+      messages: event.message ? upsert(state, [event.message]) : state.messages,
+    };
   }
   if (event.type === "compaction" && event.job_id !== undefined && event.status !== undefined) {
     const compaction: Compaction = { job_id: event.job_id, status: event.status, reason: event.reason, error: event.error, after_message_id: event.after_message_id };
@@ -253,13 +290,18 @@ function reducer(state: State, action: Action): State {
       return {
         ...state, phase: "ready", error: "", messages: action.page.messages,
         nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastRun: null, deliveredInput: null,
+        removed: {}, replyKeys: {}, seenUpTo: action.page.messages.reduce((top, message) => Math.max(top, message.id), 0),
         compaction: action.page.last_seq < state.compactionSeq ? state.compaction
           : action.page.compaction ? latestCompaction(state.compaction, action.page.compaction) : null,
       };
     case "failed":
       return { ...state, phase: "error", error: action.error };
     case "older":
-      return { ...state, messages: [...action.page.messages, ...state.messages], nextBefore: action.page.next_before_id };
+      // A page fetched before a withdrawal arrived must not bring the withdrawn message back.
+      return {
+        ...state, nextBefore: action.page.next_before_id,
+        messages: [...action.page.messages.filter((message) => !state.removed[message.id]), ...state.messages],
+      };
     case "upsert":
       return { ...state, messages: upsert(state, action.messages) };
     case "accepted": {
@@ -271,8 +313,8 @@ function reducer(state: State, action: Action): State {
     }
     case "compactQueued":
       return { ...state, compaction: latestCompaction(state.compaction, action.compaction) };
-    case "event":
-      return applyEvent(state, action.event, action.at, action.mark);
+    case "events":
+      return action.events.reduce((next, { event, at, mark }) => applyEvent(next, event, at, mark), state);
     case "tasks": {
       const tasks = { ...state.tasks };
       for (const task of action.tasks) tasks[task.id] = mergeTask(tasks[task.id], task, (state.taskMarks[task.id] ?? 0) > action.mark);
@@ -282,6 +324,13 @@ function reducer(state: State, action: Action): State {
       return { ...state, tasksError: action.error };
     case "task":
       return { ...state, tasks: { ...state.tasks, [action.task.id]: mergeTask(state.tasks[action.task.id], action.task, false) } };
+    case "removed":
+      return removeMessage(state, action.messageId);
+    case "purge":
+      return {
+        ...state, removed: { ...state.removed, [action.messageId]: "gone" },
+        messages: state.messages.filter((message) => message.id !== action.messageId),
+      };
   }
 }
 
@@ -299,10 +348,16 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
   onRunEndRef.current = onRunEnd;
   // Counts SSE task updates; a snapshot requested at an older count must not undo them.
   const taskMark = useRef(0);
+  // Stream deltas wait here for the next animation frame; any other event commits them first, in order.
+  const pending = useRef<Received[]>([]);
+  const frame = useRef(0);
 
   const load = useCallback(async () => {
     try {
-      dispatch({ type: "loaded", page: await request<MessagePage>(`${base}/messages?limit=${PAGE}`) });
+      const page = await request<MessagePage>(`${base}/messages?limit=${PAGE}`);
+      // The page supersedes deltas still waiting for their frame; the next stream replays the active run.
+      pending.current = [];
+      dispatch({ type: "loaded", page });
     } catch (error) {
       dispatch({ type: "failed", error: errorText(error) });
     }
@@ -327,6 +382,11 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
     if (after === null) return;
     // On reconnect EventSource also sends Last-Event-ID, which the Platform prefers over `after`.
     const source = new EventSource(`${base}/events?after=${after}`);
+    const commit = () => {
+      window.cancelAnimationFrame(frame.current);
+      frame.current = 0;
+      if (pending.current.length) dispatch({ type: "events", events: pending.current.splice(0) });
+    };
     const handle = (raw: Event) => {
       if (!(raw instanceof MessageEvent) || typeof raw.data !== "string") return;
       let event: StreamEvent;
@@ -336,7 +396,9 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
         return;
       }
       if (event.type === "task") taskMark.current += 1;
-      dispatch({ type: "event", event, at: Date.now(), mark: taskMark.current });
+      pending.current.push({ event, at: Date.now(), mark: taskMark.current });
+      if (!DELTAS[event.type]) commit();
+      else if (!frame.current) frame.current = window.requestAnimationFrame(commit);
       if (event.type === "run_end") {
         // Queued inputs change status without their own events; refresh the latest page once per run.
         request<MessagePage>(`${base}/messages?limit=${PAGE}`)
@@ -346,20 +408,52 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
       }
     };
     for (const type of EVENT_TYPES) source.addEventListener(type, handle);
-    return () => source.close();
+    return () => {
+      source.close();
+      window.cancelAnimationFrame(frame.current);
+      frame.current = 0;
+      pending.current = [];
+    };
   }, [base, after]);
+
+  // A withdrawn bubble collapses first, then leaves the list (at once under reduced motion).
+  const leaving = Object.entries(state.removed).flatMap(([id, phase]) => (phase === "leaving" ? [id] : [])).join(",");
+  const purgeTimers = useRef(new Map<number, number>());
+  useEffect(() => {
+    const timers = purgeTimers.current;
+    for (const id of leaving ? leaving.split(",").map(Number) : []) {
+      if (timers.has(id)) continue;
+      timers.set(id, window.setTimeout(() => {
+        timers.delete(id);
+        dispatch({ type: "purge", messageId: id });
+      }, reducedMotion() ? 0 : LEAVE_MS));
+    }
+  }, [leaving]);
+  useEffect(() => {
+    const timers = purgeTimers.current;
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, []);
 
   const loadOlder = useCallback(async () => {
     if (state.nextBefore === null) return;
     dispatch({ type: "older", page: await request<MessagePage>(`${base}/messages?before=${state.nextBefore}&limit=${PAGE}`) });
   }, [base, state.nextBefore]);
 
-  const send = useCallback(async (content: string, attachmentIds: number[]) => {
+  /** `mode` only while the agent works: insert into the running turn (when eligible) or run after it. */
+  const send = useCallback(async (content: string, attachmentIds: number[], mode?: SendMode) => {
     const result = await request<{ message: Message; job_id: number }>(`${base}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content, attachment_ids: attachmentIds }),
+      body: JSON.stringify({ content, attachment_ids: attachmentIds, ...(mode ? { mode } : {}) }),
     });
     dispatch({ type: "accepted", message: result.message });
+  }, [base]);
+
+  /** Withdraws a message the agent has not seen yet and returns its text and files for the composer. Rejects with
+   * ApiError 409 (`already_seen`) when delivery or its turn won the race. */
+  const withdraw = useCallback(async (messageId: number) => {
+    const result = await request<{ content: string; attachments: Attachment[] }>(`${base}/messages/${messageId}`, { method: "DELETE" });
+    dispatch({ type: "removed", messageId });
+    return result;
   }, [base]);
 
   const cancel = useCallback(() => request<{ ok: true }>(`${base}/cancel`, { method: "POST", body: "{}" }), [base]);
@@ -387,5 +481,5 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
 
   const compactBusy = state.compaction?.status === "queued" || state.compaction?.status === "compacting";
   const busy = compactBusy || state.live !== null || state.messages.some((message) => message.metadata?.status === "queued" || message.metadata?.status === "running");
-  return { ...state, busy, compactBusy, reload: load, loadOlder, send, cancel, compact, reset, reloadTasks: loadTasks, stopTask, fetchTask };
+  return { ...state, busy, compactBusy, reload: load, loadOlder, send, withdraw, cancel, compact, reset, reloadTasks: loadTasks, stopTask, fetchTask };
 }

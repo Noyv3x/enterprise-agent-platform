@@ -78,6 +78,19 @@ in acceptance order (an empty array when all were delivered). These cleared
 inputs never enter a later run. An uncertain delivery must not be blindly
 replayed.
 
+`DELETE /v1/runs/{run_id}/inputs/{input_id}` withdraws one accepted input
+that Pi has not yet started: HTTP 200 `{"removed":true}`. Pi's agent queue
+has no single-item removal, so Runtime clears the steering queue and
+re-steers the remaining inputs in their original order within one
+synchronous step; no turn boundary can interleave, so each input is either
+removed or delivered, never both. The removed ID stays accepted: a repeated
+`steer` with it returns success without queuing it, and it never appears in
+`undelivered_inputs`. Unknown runs return 404. The request returns 409
+`{"error":"..."}` when the input was delivered (Pi already took it from the
+queue), is unknown to the run, or the run is done. After the session prompt
+returns, admission is closed and Pi's queue is already cleared, so an
+undelivered input is still removable until `run_end`.
+
 `GET /v1/runs/{run_id}/events?after=<seq>` streams SSE JSON objects with
 monotonic `seq` and `type`. Omit `after` to replay from the beginning.
 Completed buffers remain available for ten minutes, with a 4 MiB per-run

@@ -44,10 +44,12 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/channels/{channel['id']}").status_code, 200)
         self.assertEqual(self.client.get('/api/channels').json()['channels'], [])
 
-    def test_bootstrap_carries_no_model(self):
+    def test_bootstrap_and_me_carry_no_model_policy_or_thinking(self):
+        hidden = {'model_name', 'chat_model_name', 'thinking_depth', 'model_policy', 'model', 'thinking'}
         body = self.client.get('/api/bootstrap').json()
         self.assertEqual(set(body), {'user', 'branding', 'permissions', 'channels'})
-        self.assertFalse({'model_name', 'chat_model_name'} & set(body['user']))
+        self.assertFalse(hidden & set(body['user']))
+        self.assertFalse(hidden & set(self.client.get('/api/me').json()['user']))
 
     def test_schedules_have_no_user_api(self):
         self.assertEqual(self.client.get('/api/schedules').status_code, 404)
