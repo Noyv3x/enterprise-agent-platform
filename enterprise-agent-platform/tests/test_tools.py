@@ -20,6 +20,7 @@ from enterprise_agent_platform.schedules import dispatch, next_time, tick
 from enterprise_agent_platform.tools import Browser, browser_url, fetch
 from enterprise_agent_platform.queue import Queue
 from enterprise_agent_platform.gates import Gate
+from enterprise_agent_platform.tasks import Tasks
 
 
 class ToolsTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +37,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         self.p = SimpleNamespace(db=self.db, settings=SimpleNamespace(data_dir=self.root, camofox_url='http://browser', camofox_access_key='secret'))
         self.p.gate = Gate(self.p)
         self.queue = self.p.queue = Queue(self.p)
+        self.p.tasks = Tasks(self.p)
         self.queue.stopping = True  # Exercise durable admission without launching a Runtime worker.
         self.files = self.p.files = Files(self.p)
 

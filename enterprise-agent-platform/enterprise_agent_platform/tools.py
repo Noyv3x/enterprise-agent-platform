@@ -1,5 +1,6 @@
 """Authenticated web tools and scope-owned Camofox sessions."""
 import asyncio
+from contextlib import nullcontext
 import base64
 import fcntl
 import ipaddress
@@ -222,9 +223,12 @@ class Browser:
                 fields.update(includeData='false', consume='false')
             return await self.request(uid, 'GET' if readonly else 'POST', path + '/' + action, fields)
 
-    async def gateway(self, tool, action, args, context):
+    async def gateway(self, tool, action, args, context, disconnected=None):
         if not isinstance(args, dict) or not isinstance(context, dict):
             raise HTTPException(400, 'arguments and context must be objects')
+        # A live subagent run has no conversation job of its own; it may use web tools only.
+        if tool == 'web' and self.p.tasks.child_owner(context):
+            return await self.web(action, args)
         key = context.get('scope_key', '')
         with self.p.db.connect() as conn:
             session = conn.execute('SELECT scope_key FROM queue_sessions WHERE sid=?', (context.get('sid'),)).fetchone()
@@ -251,15 +255,22 @@ class Browser:
             raise HTTPException(403, 'Tool run is not active')
         if context.get('owner_user_id') not in (None, uid):
             raise HTTPException(403, 'Tool owner does not match active job')
-        if tool in {'browser', 'schedule'} and (scope['kind'] != 'agent' or scope['scope_type'] != 'private'):
+        if tool in {'browser', 'schedule', 'tasks'} and (scope['kind'] != 'agent' or scope['scope_type'] != 'private'):
             raise HTTPException(403, 'This tool is available only to personal AI')
         if tool == 'browser':
             return result(await self.action(uid, action, args))
+        if tool == 'tasks':
+            async def never():
+                return False
+            return await self.p.tasks.gateway(user, action, args, context, disconnected or never)
         if tool == 'schedule':
             from .schedules import dispatch
             return result(await dispatch(self.p, action, args, user))
         if tool != 'web':
             raise HTTPException(404, 'Unknown tool')
+        return await self.web(action, args)
+
+    async def web(self, action, args):
         if action == 'search':
             query = args.get('query', '')
             if not isinstance(query, str) or not query.strip() or len(query) > 4096:
@@ -298,8 +309,12 @@ async def internal(request):
     require_internal(request)
     body = await body_json(request)
     try:
-        async with request.app.state.platform.gate.admit():
-            return JSONResponse(await request.app.state.platform.browser.gateway(request.path_params['tool'], body.get('action'), body.get('arguments', {}), body.get('context', {})))
+        platform = request.app.state.platform
+        tool, action = request.path_params['tool'], body.get('action')
+        # `wait` is a long poll inside an active run, which already blocks maintenance; it holds no admission.
+        admission = nullcontext() if tool == 'tasks' and action == 'wait' else platform.gate.admit()
+        async with admission:
+            return JSONResponse(await platform.browser.gateway(tool, action, body.get('arguments', {}), body.get('context', {}), request.is_disconnected))
     except httpx.HTTPError as exc:
         raise HTTPException(502, 'Tool upstream request failed') from exc
     except TimeoutError as exc:

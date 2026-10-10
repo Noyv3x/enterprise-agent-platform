@@ -4,7 +4,14 @@
  * expanded rows show the tool's real arguments and output; labels come from the caller (i18n). The caller may give
  * one per-row action (`rowAction`, the personal AI's "View in computer"): a small trailing monitor-icon button,
  * a sibling of the row button so it never toggles the row, revealed on row hover or focus like the chevron and
- * always visible on coarse pointers and narrow screens (44px there). Markup, classes and motion are upstream's. */
+ * always visible on coarse pointers and narrow screens (44px there).
+ * Personal AI tasks: a row may carry a `badge` (the `后台 · bg-n` chip of a command that moved to the background),
+ * drawn as upstream's inline chip with the row's state glyphs and, with `onSelect`, a sibling button (44px on
+ * coarse pointers and narrow screens) so it never toggles the row; and `children`, nested rows (the subagents a
+ * delegation started) under the row on the expanded detail's hairline rail, each a row-height button with the
+ * state glyph, a name, a type chip, a truncating activity line and mono meta (elapsed, tokens); on narrow screens
+ * activity and meta move to a second line. The `agents` and `clock` row glyphs (delegate, wait) are open icons.
+ * Markup, classes and motion are upstream's. */
 import { useId, useState, type ReactNode, type SyntheticEvent } from "react";
 import { createPortal } from "react-dom";
 
@@ -26,6 +33,9 @@ const Icons: Record<string, ReactNode> = {
   tool: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z" /></g>,
   /* the row action's "View in computer" glyph */
   monitor: <><rect x="3.5" y="4.5" width="17" height="11.5" rx="2.5" /><path d="M8.5 19.5h7M12 16v3.5" /></>,
+  /* personal AI task tools (open icons): delegating to subagents, waiting for background results */
+  agents: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="9" cy="8" r="3.5" /><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18.5 14.5A6.5 6.5 0 0 1 21.5 20" /></g>,
+  clock: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></g>,
 };
 
 export type ToolDetailLine = { text: string; tone?: "add" | "del" | "error" | "muted" };
@@ -41,6 +51,26 @@ export type ToolStep = {
   state: "running" | "done" | "error" | "cancelled";
   /** status text read next to the chip when not done, e.g. "Failed" */
   stateLabel?: string;
+  /** a trailing status chip, e.g. the background task a command moved to; a button when it has `onSelect` */
+  badge?: ToolBadge;
+  /** nested rows under this row, e.g. the subagents a delegation started */
+  children?: ToolChildRow[];
+};
+
+export type ToolBadge = { label: string; state: ToolStep["state"]; stateLabel: string; onSelect?: () => void };
+
+export type ToolChildRow = {
+  id: string;
+  label: string;
+  /** a short type chip after the name */
+  tag?: string;
+  state: ToolStep["state"];
+  stateLabel: string;
+  /** what the row is doing now, or its outcome */
+  activity: string;
+  /** mono trailing text (elapsed, tokens) */
+  meta?: string;
+  onSelect?: () => void;
 };
 
 export type ToolDiff = { file: string; add: number; del: number };
@@ -64,6 +94,45 @@ function RunningRing() {
       className="size-3 shrink-0 rounded-full border-[1.5px] border-line-strong border-t-ink-2"
       style={{ animation: "spin 700ms linear infinite" }}
     />
+  );
+}
+
+const CHECK = <path d="M20 6 9 17l-5-5" />;
+const WARNING = <path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />;
+
+/** The state glyph of a badge or nested row: the ring while running, a check when done, the warning mark otherwise. */
+function StateGlyph({ state }: { state: ToolStep["state"] }) {
+  if (state === "running") return <RunningRing />;
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={state === "error" ? "var(--red)" : "currentColor"} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      {state === "done" ? CHECK : WARNING}
+    </svg>
+  );
+}
+
+const GLYPH_TONE: Record<ToolStep["state"], string> = { running: "text-ink-3", done: "text-green-ink", error: "text-red", cancelled: "text-ink-3" };
+
+/** A row's trailing status chip; a sibling button of the row when it can be selected. */
+function RowBadge({ badge }: { badge: ToolBadge }) {
+  const chip = (
+    <span className="inline-flex h-5.5 max-w-[11rem] items-center gap-1.5 rounded-chip bg-field px-1.5 text-[11.5px] font-medium text-ink-2 shadow-hairline tabular-nums transition-colors duration-100 group-hover/badge:bg-hover-2">
+      <span className={`flex size-3 shrink-0 items-center justify-center ${GLYPH_TONE[badge.state]}`}><StateGlyph state={badge.state} /></span>
+      <span className="truncate">{badge.label}</span>
+    </span>
+  );
+  if (!badge.onSelect) {
+    return <span className="shrink-0" title={badge.stateLabel}>{chip}<span className="sr-only">, {badge.stateLabel}</span></span>;
+  }
+  return (
+    <button
+      type="button"
+      aria-label={`${badge.label}, ${badge.stateLabel}`}
+      title={badge.stateLabel}
+      onClick={badge.onSelect}
+      className="group/badge flex h-7 shrink-0 items-center rounded-chip pointer-coarse:h-11 max-sm:h-11"
+    >
+      {chip}
+    </button>
   );
 }
 
@@ -154,14 +223,14 @@ export default function ToolChips({
             const hasDetail = row.detail.length > 0;
             return (
             <div key={row.id} style={{ animation: "fade-up 300ms cubic-bezier(0.23,1,0.32,1) both" }}>
-              <div className="group/line relative">
+              <div className={`group/line relative${row.badge ? ` flex items-center gap-1.5${rowAction ? " pr-7 pointer-coarse:pr-11 max-sm:pr-11" : ""}` : ""}`}>
               <button
                 type="button"
                 id={`${uid}-row-${index}`}
                 aria-expanded={hasDetail ? rowOpen : undefined}
                 disabled={!hasDetail}
                 onClick={() => toggleRow(row.id)}
-                className={`group/row -mx-[3px] flex h-7 w-[calc(100%+6px)] min-w-0 items-center gap-2 rounded-control px-[3px] text-left transition-colors duration-100 enabled:hover:bg-hover-2 pointer-coarse:h-11 max-sm:h-11${rowAction ? " pr-8 pointer-coarse:pr-12 max-sm:pr-12" : ""}`}
+                className={`group/row -mx-[3px] flex h-7 ${row.badge ? "flex-1" : "w-[calc(100%+6px)]"} min-w-0 items-center gap-2 rounded-control px-[3px] text-left transition-colors duration-100 enabled:hover:bg-hover-2 pointer-coarse:h-11 max-sm:h-11${rowAction && !row.badge ? " pr-8 pointer-coarse:pr-12 max-sm:pr-12" : ""}`}
               >
                 <span className="relative flex size-4 shrink-0 items-center justify-center text-ink-3">
                   {row.state === "running" ? (
@@ -204,6 +273,7 @@ export default function ToolChips({
                   <span className={`shrink-0 text-[11.5px] font-medium ${row.state === "error" ? "text-red" : "text-ink-2"}`}>{row.stateLabel}</span>
                 )}
               </button>
+              {row.badge && <RowBadge badge={row.badge} />}
               {rowAction && (
                 <button
                   type="button"
@@ -243,6 +313,40 @@ export default function ToolChips({
                   </div>
                 </div>
               </div>
+              )}
+
+              {/* nested rows, on the detail's hairline rail */}
+              {row.children && row.children.length > 0 && (
+                <ul className="mt-0.5 mb-1 ml-2 flex flex-col gap-0.5 border-l border-line py-0.5 pl-2.5">
+                  {row.children.map((child) => (
+                    <li key={child.id} className="min-w-0">
+                      <button
+                        type="button"
+                        disabled={!child.onSelect}
+                        onClick={child.onSelect}
+                        className="-mx-[3px] flex h-7 w-[calc(100%+6px)] min-w-0 items-center gap-2 rounded-control px-[3px] text-left transition-colors duration-100 enabled:hover:bg-hover-2 pointer-coarse:h-11 max-sm:h-auto max-sm:min-h-11 max-sm:py-1"
+                      >
+                        <span className={`flex size-4 shrink-0 items-center justify-center ${GLYPH_TONE[child.state]}`}><StateGlyph state={child.state} /></span>
+                        {/* narrow screens: name and type, then activity and meta on a second line */}
+                        <span className="flex min-w-0 flex-1 items-center gap-2 max-sm:flex-col max-sm:items-stretch max-sm:gap-0.5">
+                          <span className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2 max-sm:max-w-full">
+                            <span className="min-w-0 truncate text-[12.5px] font-medium text-ink">{child.label}</span>
+                            {child.tag && (
+                              <span className="inline-flex h-5 shrink-0 items-center rounded-chip bg-field px-1.5 text-[11px] font-medium text-ink-2 shadow-hairline">{child.tag}</span>
+                            )}
+                          </span>
+                          <span className="flex min-w-0 flex-1 items-center gap-2">
+                            <span className="min-w-0 flex-1 truncate text-[11.5px] text-ink-2">
+                              {child.activity}
+                              <span className="sr-only">, {child.stateLabel}</span>
+                            </span>
+                            {child.meta && <span className="shrink-0 font-mono text-[11px] text-ink-2 tabular-nums">{child.meta}</span>}
+                          </span>
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
               )}
             </div>
             );

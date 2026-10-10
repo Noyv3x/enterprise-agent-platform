@@ -23,6 +23,15 @@ export interface FileResult { content: string; details: { returned?: number; tot
 export interface GatewayResult { content: string; data: unknown; is_error: boolean }
 /** Live sanitized terminal output as Manager commits it; never authoritative (the result is). */
 export type OutputListener = (stream: "stdout" | "stderr", data: string) => void;
+/** Manager's view of a supervised background process (`process/*` routes). */
+export interface ProcessView {
+  id: string; owner: string; scope_id: string; sandbox_id: string; name: string | null; command: string; cwd: string;
+  state: "running" | "exited" | "killed" | "failed" | "interrupted"; exit_code: number | null; reason: string;
+  attached: boolean; stdin_open: boolean; started_at: string; ended_at: string | null; log_bytes: number; seq: number; unconfirmed?: true;
+}
+export interface ProcessStartOptions { command: string; cwd: string; timeoutMs: number; name?: string; stdin: boolean }
+export interface ProcessReadOptions { offset: number; maxBytes?: number; waitMs?: number }
+export interface ProcessRead { data: string; offset_start: number; next_offset: number; retained_from: number; eof: boolean; process: ProcessView }
 // One NDJSON line carries at most the result frame (two bounded streams plus
 // JSON escaping), so a line beyond this is a protocol violation, not data.
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -30,9 +39,14 @@ export interface ExecutorTransport {
   terminal(sandbox: Sandbox, context: ToolContext, command: string, cwd: string, timeoutMs: number, signal?: AbortSignal, auditDetails?: Record<string, unknown>, onOutput?: OutputListener): Promise<ProcessResult>;
   file(sandbox: Sandbox, context: ToolContext, action: "read" | "write", args: Record<string, unknown>, signal?: AbortSignal): Promise<FileResult>;
   cancelRun(sandbox: Sandbox, runId: string): Promise<boolean>;
+  /** Starts an attached process owned by the calling run until `processDetach`. */
+  processStart(sandbox: Sandbox, context: ToolContext, options: ProcessStartOptions, signal?: AbortSignal): Promise<ProcessView>;
+  processRead(sandbox: Sandbox, processId: string, options: ProcessReadOptions, signal?: AbortSignal): Promise<ProcessRead>;
+  processDetach(sandbox: Sandbox, processId: string, signal?: AbortSignal): Promise<void>;
+  processKill(sandbox: Sandbox, context: ToolContext, processId: string, signal?: AbortSignal): Promise<ProcessView>;
 }
 export interface GatewayTransport {
-  call(tool: "web" | "browser" | "schedule", action: string, args: Record<string, unknown>, context: ToolContext, signal?: AbortSignal): Promise<GatewayResult>;
+  call(tool: "web" | "browser" | "schedule" | "tasks", action: string, args: Record<string, unknown>, context: ToolContext, signal?: AbortSignal, timeoutMs?: number): Promise<GatewayResult>;
 }
 
 export function createExecutorTransport(options: { socketPath: string; token: string; timeoutMs?: number }): ExecutorTransport {
@@ -90,6 +104,7 @@ export function createExecutorTransport(options: { socketPath: string; token: st
       req.end(JSON.stringify(body));
     return promise;
   }
+  const processOwner = (sandbox: Sandbox) => sandbox.scope_key.replace(/\/delegate\/.*$/, "");
   const identity = (sandbox: Sandbox, runId: string) => ({ run_id: runId, scope_id: sandbox.scope_key,
     lifecycle_id: sandbox.lifecycle_id, execution_context: { sandbox_id: sandbox.sandbox_id, workspace_id: sandbox.workspace_id, profile: sandbox.profile } });
   async function execute<T>(sandbox: Sandbox, context: ToolContext, endpoint: string, operation: string, action: string,
@@ -108,14 +123,26 @@ export function createExecutorTransport(options: { socketPath: string; token: st
     },
     file: (sandbox, context, action, args, signal) => execute<FileResult>(sandbox, context, "file", action === "read" ? "read_file" : "write_file", action, args, {}, signal),
     async cancelRun(sandbox, runId) { return (await post<{ confirmed: boolean }>("runs/cancel", identity(sandbox, runId))).confirmed; },
+    async processStart(sandbox, context, options, signal) {
+      const args = { command: options.command, cwd: options.cwd, timeout_ms: options.timeoutMs, ...(options.name === undefined ? {} : { name: options.name }), stdin: options.stdin, attached: true };
+      return (await execute<{ process: ProcessView }>(sandbox, context, "process/start", "process", "start", args, { command: options.command, cwd: options.cwd }, signal)).process;
+    },
+    processRead(sandbox, processId, options, signal) {
+      return post<ProcessRead>("process/read", { process_id: processId, owner: processOwner(sandbox), offset: options.offset,
+        ...(options.maxBytes === undefined ? {} : { max_bytes: options.maxBytes }), ...(options.waitMs === undefined ? {} : { wait_ms: options.waitMs }) }, signal);
+    },
+    async processDetach(sandbox, processId, signal) { await post("process/detach", { process_id: processId, owner: processOwner(sandbox) }, signal); },
+    async processKill(sandbox, context, processId, signal) {
+      return (await execute<{ process: ProcessView }>(sandbox, context, "process/kill", "process", "kill", { process_id: processId }, { process_id: processId }, signal)).process;
+    },
   };
 }
 
 export function createGatewayTransport(options: { baseUrl: string; token: string }): GatewayTransport {
-  return { async call(tool, action, args, context, signal) {
+  return { async call(tool, action, args, context, signal, timeoutMs = 120_000) {
     const response = await fetch(`${options.baseUrl.replace(/\/$/, "")}/internal/agent/tools/${tool}`, {
       method: "POST", headers: { authorization: `Bearer ${options.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ action, arguments: args, context }), signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(120_000)]),
+      body: JSON.stringify({ action, arguments: args, context }), signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs)]),
     });
     if (!response.ok) throw new Error(`Platform tool HTTP ${response.status}: ${await response.text()}`);
     return await response.json() as GatewayResult;

@@ -7,6 +7,7 @@ import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
+import { TaskNoticeRow } from "./Tasks";
 import type { LiveRun, Message, RunRef } from "./types";
 import { messageWork, splitLive, workSegments, type WorkTrace } from "./work";
 import { WorkView } from "./WorkView";
@@ -183,6 +184,8 @@ export function PendingReply({ since, queued }: { since: number; queued: boolean
   );
 }
 
+/** A system message: a background task notice (hidden once the Platform skipped it), else a centered line. */
 export function SystemLine({ message }: { message: Message }) {
+  if (message.metadata.kind === "task_notice") return message.metadata.skipped === true ? null : <TaskNoticeRow message={message} />;
   return <p className="text-center text-[12px] text-ink-2">{message.content}</p>;
 }

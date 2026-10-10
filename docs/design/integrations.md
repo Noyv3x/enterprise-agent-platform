@@ -1,6 +1,6 @@
 # Integrations
 
-Tool request/response shapes belong in the [Runtime API](../reference/runtime-api.md) and [Platform API](../reference/platform-api.md). Internal web/browser/schedule gateways require the agent-tool bearer and trusted run/scope context.
+Tool request/response shapes belong in the [Runtime API](../reference/runtime-api.md) and [Platform API](../reference/platform-api.md). Internal web/browser/schedule/tasks gateways require the agent-tool bearer and trusted run/scope context.
 
 ## Web search and fetch
 
@@ -31,6 +31,14 @@ Server packages and tenant-provided configuration remain in the workspace. The h
 Schedules are managed only by the personal AI through its `schedule` tool (list/get/create/update/pause/resume/delete/run-now and `history` for past runs); users have no schedule UI or API. Each occurrence inserts a normal durable agent job in the owner's private scope, sending the schedule's `prompt` to the personal AI as a new message. Jobs share that conversation's FIFO ordering and produce ordinary messages and usage records.
 
 Once, interval and cron timing use the configured timezone. The existing schedule/run tables remain authoritative. The tool is owner-scoped through the internal gateway. No continue-current/complete-current tool, completion decision guard or Telegram delivery remains. Standard chat and channel agents do not manage schedules.
+
+## Subagents and background tasks
+
+Personal AI only. Runtime's `task`, `job` and `wait` tools are thin calls to the internal `tasks` gateway; Platform owns the task records (`background_tasks`, identified to the model and the user as `bg-<n>`). Product behavior and limits: [product](product.md#subagents-and-background-tasks); shapes: [Platform API](../reference/platform-api.md#background-tasks).
+
+- **Subagents** are Runtime runs of kind `subagent` on their own session, in the parent's sandbox, with the tool subset of their type. Platform consumes each child's events concurrently with the conversation's FIFO (a child never occupies the conversation queue), keeps a bounded work trace and result, records usage, and pushes throttled SSE `task` events.
+- **Background processes** are supervised by Manager (not Runtime, not Platform). Runtime promotes or starts them and registers the Manager process id with Platform (`register_process`). Platform follows Manager's global state-change feed (`process/changes`, cursor kept in `settings.process_changes_cursor`) and reads current state on registration, so a process that ended before registration is still captured. Stop and input go to Manager's executor API with an audit receipt, using Platform's executor credential.
+- **Delivery.** Each finished task is delivered to the model once: by `wait` (long-poll) or by an automatic notice turn; a process whose output Runtime already returned in full (registered with `delivered:true`) is never notified. A notice is a `system` message `task_notice` plus a durable queued job; several tasks finishing before it starts share one notice, and tasks delivered in the meantime are dropped, so the AI never processes a result twice.
 
 ## Models and OAuth
 

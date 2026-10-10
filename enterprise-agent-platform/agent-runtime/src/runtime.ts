@@ -16,7 +16,7 @@ import type { AssistantMessageEvent, UserMessage } from '@earendil-works/pi-ai';
 import { LiveBuffer } from './live-events.js';
 
 export interface RunRequest {
-  kind: 'agent' | 'chat';
+  kind: 'agent' | 'chat' | 'subagent';
   sandbox: {scope_key:string; workspace_id:string; sandbox_id:string; lifecycle_id:string; profile:'agent'|'chat'; cwd:string};
   model: {id:string; thinking:ThinkingLevel; contextWindow?:number; maxTokens?:number};
   prompt: {text:string; images?:{mime:string; data:string}[]};
@@ -33,12 +33,14 @@ export interface RuntimeConfig {
   home:string; platformUrl:string; platformToken:string; executorSocket:string; executorToken:string; skillsDirectory:string;
   // Injecting a model runtime permits exercising the real Pi session with a faux provider.
   modelRuntimeFactory?: (modelId:string) => Promise<ModelRuntime>;
+  // Foreground time before personal bash promotes a command to the background; tests shorten the 60 s default.
+  promoteAfterMs?: number;
 }
 type Event = {type:string;[key:string]:unknown};
 type PendingInput = {message:UserMessage;text:string};
 type Run = {id:string; sid:string; events:RunEvents; done:boolean; cancelled:boolean; acceptingInput:boolean; initialInputPending:boolean; acceptedInputs:Set<string>; pendingInputs:Map<string,PendingInput>; sideEffects:boolean; controller:AbortController; stopping?:Promise<void>; stopConfirmed:Promise<void>; confirmStop:()=>void; finished:Promise<void>; finish:()=>void; endedAt:number; usage:{input:number;output:number;cache_read:number;cache_write:number;total:number}; text:string; error?:string};
 // `key` identifies the Platform-supplied inputs the Pi session object was built from.
-type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; key:string; runId:string; lastUsed:number};
+type Live = {session:AgentSession; manager:SessionManager; models:ModelRuntime; request:RunRequest; key:string; runId:string; lastUsed:number; watchers:Set<()=>void>};
 type Cancellation = {cancelled:boolean;run_id:string|null};
 interface RunStreams {inputs:Map<number,LiveBuffer>; outputs:Map<string,LiveBuffer>}
 const runStreams=new WeakMap<Run,RunStreams>();
@@ -48,6 +50,14 @@ const OUTPUT_LIMIT_BYTES=512*1024;
 const MAX_PENDING_INPUTS=32;
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
 const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true};
+const subagentTools=['read','bash','edit','write','grep','find','ls','web_search','web_fetch'];
+// A subagent only exists as a delegate scope of one personal user, on that user's own child session ID.
+function validateSubagent(sid:string,request:RunRequest):void {
+  const match=/^private:(\d+)\/delegate\/bg-(\d+)$/.exec(request.sandbox.scope_key);
+  if(!match||sid!==`agent-private-${match[1]}-bg-${match[2]}`)throw failure(400,'Subagent runs need a private delegate scope and matching session ID');
+  if(request.sandbox.profile!=='agent')throw failure(400,'Subagent runs need the agent profile');
+  if(!request.tools.every(name=>subagentTools.includes(name)))throw failure(400,'Invalid subagent tools');
+}
 
 function loader(request:RunRequest):ResourceLoader {
   const runtime = createExtensionRuntime();
@@ -56,7 +66,7 @@ function loader(request:RunRequest):ResourceLoader {
     getExtensions:()=>({extensions:[],errors:[],runtime}),
     getSkills:()=>({skills:request.kind==='chat'?[]:resources.skills.map(s=>({name:s.name,description:s.description,filePath:s.path,baseDir:dirname(s.path),sourceInfo:{path:s.path,source:'platform',scope:'project' as const,origin:'top-level' as const},disableModelInvocation:false})),diagnostics:[]}),
     getPrompts:()=>({prompts:[],diagnostics:[]}), getThemes:()=>({themes:[],diagnostics:[]}),
-    getAgentsFiles:()=>({agentsFiles:request.kind==='chat'||!resources.agents_md?[]:[resources.agents_md]}),
+    getAgentsFiles:()=>({agentsFiles:request.kind!=='agent'||!resources.agents_md?[]:[resources.agents_md]}),
     getSystemPrompt:()=>resources.system_prompt, getSystemPromptSource:()=>undefined,
     getAppendSystemPrompt:()=>[], getAppendSystemPromptSources:()=>[], extendResources(){}, async reload(){},
   };
@@ -98,7 +108,9 @@ export class Runtime {
     for(const skill of fixed.resources.skills)skills.set(skill.name,skill);
     fixed.resources.skills=fixed.kind==='chat'?[]:[...skills.values()];
     fixed.tools=fixed.tools.filter(name=>fixed.kind!=='chat'||chatTools[name]===true);
-    if(!/^private:\d+$/.test(fixed.sandbox.scope_key))fixed.tools=fixed.tools.filter(name=>!['browser','schedule','mcp'].includes(name));
+    // Background tools and the extended bash belong to the root personal agent only; subagents never get them.
+    const personal=fixed.kind==='agent'&&/^private:\d+$/.test(fixed.sandbox.scope_key);
+    if(!personal)fixed.tools=fixed.tools.filter(name=>!['browser','schedule','mcp','task','job','wait'].includes(name));
     fixed.sandbox.profile=fixed.kind==='chat'?'chat':'agent';
     const models=await (this.config.modelRuntimeFactory?.(fixed.model.id)??createModelRuntime(this.config.platformUrl,this.config.platformToken,()=>fixed.model.id));
     const model=await resolveModel(models,fixed.model,signal);
@@ -109,13 +121,16 @@ export class Runtime {
     const live={} as Live;
     const guard=()=>{this.compactions.get(sid)?.controller.signal.throwIfAborted();const run=this.runs.get(live.runId);if(run?.cancelled&&!run.done)throw new DOMException('Run cancelled','AbortError');};
     bindModelSession(models,sid,guard);
-    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
+    const watchers=new Set<()=>void>();
+    const inputs=(listener:()=>void)=>{watchers.add(listener);const run=this.runs.get(live.runId);if(run&&run.pendingInputs.size>0)listener();return ()=>{watchers.delete(listener);};};
+    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     session.agent.steeringMode='all';
-    Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now()});
+    Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now(),watchers});
     this.sessions.set(sid,live);return live;
   }
   async start(sid:string,request:RunRequest):Promise<{run_id:string}> {
+    if(request.kind==='subagent')validateSubagent(sid,request);
     if(this.busy.has(sid)||this.cancellations.has(sid))throw failure(409,'Session is busy');
     this.busy.add(sid);
     let live:Live;
@@ -143,7 +158,10 @@ export class Runtime {
     const message:UserMessage={role:'user',content:[{type:'text',text},...input.prompt.images.map(image=>({type:'image' as const,mimeType:image.mime,data:image.data}))],timestamp:Date.now()};
     run.acceptedInputs.add(input.input_id);
     run.pendingInputs.set(input.input_id,{message,text});
-    this.sessions.get(run.sid)!.session.agent.steer(message);
+    const live=this.sessions.get(run.sid)!;
+    live.session.agent.steer(message);
+    // A running personal bash call promotes its command to the background to hand control back.
+    for(const watcher of [...live.watchers])watcher();
   }
   private emit(run:Run,event:Event) {
     if(!run.done)run.events.emit(event);
@@ -217,7 +235,7 @@ export class Runtime {
     }else if(event.type==='tool_execution_start'){
       const args:unknown=event.args;
       const action=args&&typeof args==='object'&&'action' in args&&typeof args.action==='string'?args.action:undefined;
-      if(['bash','write','edit','mcp'].includes(event.toolName)||event.toolName==='browser'&&!['list','snapshot','screenshot','vision','links','images','downloads','stats','extract','console'].includes(action??'')||event.toolName==='schedule'&&!['list','get','history'].includes(action??''))run.sideEffects=true;
+      if(['bash','write','edit','mcp','task'].includes(event.toolName)||event.toolName==='job'&&['input','stop'].includes(action??'')||event.toolName==='browser'&&!['list','snapshot','screenshot','vision','links','images','downloads','stats','extract','console'].includes(action??'')||event.toolName==='schedule'&&!['list','get','history'].includes(action??''))run.sideEffects=true;
       this.closeInputs(run);
       this.emit(run,{type:'tool_start',tool_call_id:event.toolCallId,name:event.toolName,args:event.args});
     }else if(event.type==='tool_execution_update')this.emit(run,{type:'tool_update',tool_call_id:event.toolCallId,partial:event.partialResult});

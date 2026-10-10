@@ -50,7 +50,10 @@ type Config struct {
 	LogMaxBytes         int64
 	LogBackups          int
 	CommandMaxBytes     int64
-	activeProfile       identity.ActiveProfile
+	// Background process pools are separate from the 16 foreground slots.
+	BackgroundProcessLimit       int
+	BackgroundProcessGlobalLimit int
+	activeProfile                identity.ActiveProfile
 }
 
 func Defaults(active identity.ActiveProfile) (Config, error) {
@@ -78,32 +81,34 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		return Config{}, fmt.Errorf("resolve Manager control socket: %w", err)
 	}
 	return Config{
-		ConfigPath:          profile.DefaultConfigPath(configHome),
-		DataHome:            dataHome,
-		DataRoot:            dataRoot,
-		StateDir:            stateDir,
-		SocketPath:          socketPath,
-		GatewayAddress:      "127.0.0.1:8080",
-		LANEnabled:          false,
-		LANAddress:          "127.0.0.1:8081",
-		DirectAccessCIDRs:   []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"},
-		TrustedIngressCIDRs: []string{"127.0.0.0/8", "::1/128"},
-		PlatformURL:         "http://127.0.0.1:18080",
-		PlatformGateURL:     "http://127.0.0.1:18080",
-		ReleaseChannel:      contract.ReleaseChannel,
-		UpdateEnabled:       true,
-		UpdateInterval:      time.Minute,
-		ComposeProject:      profile.ComposeProject,
-		DockerBinary:        "docker",
-		SandboxNetwork:      profile.CoreNetwork,
-		SandboxIdle:         10 * time.Minute,
-		SandboxAgent:        SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024},
-		SandboxChat:         SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256},
-		SandboxChatIdle:     3 * time.Minute,
-		LogMaxBytes:         10 << 20,
-		LogBackups:          5,
-		CommandMaxBytes:     1 << 20,
-		activeProfile:       active,
+		ConfigPath:                   profile.DefaultConfigPath(configHome),
+		DataHome:                     dataHome,
+		DataRoot:                     dataRoot,
+		StateDir:                     stateDir,
+		SocketPath:                   socketPath,
+		GatewayAddress:               "127.0.0.1:8080",
+		LANEnabled:                   false,
+		LANAddress:                   "127.0.0.1:8081",
+		DirectAccessCIDRs:            []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fd00::/8"},
+		TrustedIngressCIDRs:          []string{"127.0.0.0/8", "::1/128"},
+		PlatformURL:                  "http://127.0.0.1:18080",
+		PlatformGateURL:              "http://127.0.0.1:18080",
+		ReleaseChannel:               contract.ReleaseChannel,
+		UpdateEnabled:                true,
+		UpdateInterval:               time.Minute,
+		ComposeProject:               profile.ComposeProject,
+		DockerBinary:                 "docker",
+		SandboxNetwork:               profile.CoreNetwork,
+		SandboxIdle:                  10 * time.Minute,
+		SandboxAgent:                 SandboxResources{Memory: "2g", MemorySwap: "2g", CPUs: "2", PidsLimit: 1024},
+		SandboxChat:                  SandboxResources{Memory: "768m", MemorySwap: "768m", CPUs: "1", PidsLimit: 256},
+		SandboxChatIdle:              3 * time.Minute,
+		LogMaxBytes:                  10 << 20,
+		LogBackups:                   5,
+		CommandMaxBytes:              1 << 20,
+		BackgroundProcessLimit:       16,
+		BackgroundProcessGlobalLimit: 128,
+		activeProfile:                active,
 	}, nil
 }
 
@@ -297,6 +302,18 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("command_max_bytes must be at least 1024")
 		}
 		c.CommandMaxBytes = n
+	case "background_process_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 1024 {
+			return fmt.Errorf("background_process_limit must be between 1 and 1024")
+		}
+		c.BackgroundProcessLimit = n
+	case "background_process_global_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 4096 {
+			return fmt.Errorf("background_process_global_limit must be between 1 and 4096")
+		}
+		c.BackgroundProcessGlobalLimit = n
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -318,7 +335,7 @@ func (c Config) Validate() error {
 	if c.ReleaseChannel == "" || c.ComposeProject == "" || c.DockerBinary == "" {
 		return fmt.Errorf("release_channel, compose_project and docker_binary are required")
 	}
-	if c.SandboxIdle <= 0 || c.LogMaxBytes <= 0 || c.CommandMaxBytes <= 0 || c.UpdateInterval < 30*time.Second {
+	if c.SandboxIdle <= 0 || c.LogMaxBytes <= 0 || c.CommandMaxBytes <= 0 || c.BackgroundProcessLimit <= 0 || c.BackgroundProcessGlobalLimit <= 0 || c.UpdateInterval < 30*time.Second {
 		return fmt.Errorf("duration and size limits must be positive")
 	}
 	mainAddress, err := validateListenAddress("listen", c.GatewayAddress, false)

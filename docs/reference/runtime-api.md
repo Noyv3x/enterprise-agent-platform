@@ -19,6 +19,15 @@ Image entries are `{mime,data}` with base64 data. Skill entries are
 conversation directory beneath `/workspace`, and only read/bash/edit/write/
 grep/find/ls/web_search/web_fetch. Chat never loads AGENTS.md or skills.
 Browser, schedules and MCP are available only to personal agent scopes.
+`kind:subagent` runs a background subagent for Platform's `task` tool: profile
+`agent`, no AGENTS.md, scope `private:<uid>/delegate/bg-<n>` and session ID
+`agent-private-<uid>-bg-<n>`, sharing the parent's sandbox and workspace.
+`tools` must be a subset of `read, bash, edit, write, grep, find, ls,
+web_search, web_fetch`; any other tool, another scope or another session ID
+is rejected with 400, so a subagent never gets `task`, `job`, `wait`, browser,
+schedule or MCP. The tools `task`, `job` and `wait` are accepted only for
+`kind:agent` in the root personal scope `private:<uid>` and are dropped
+elsewhere.
 Run and compact `model` objects also accept optional positive integer
 `contextWindow` and `maxTokens`. Platform authorizes model IDs against its
 account catalog. Runtime accepts those Codex IDs even when absent from Pi's
@@ -100,7 +109,7 @@ complete browser image content.
 `usage` contains `input`, `output`, `cache_read`, `cache_write`, `total`.
 `run_end` is always the last event. No draft events are emitted.
 `side_effects` becomes true when bash/write/edit, a mutating browser or
-schedule action, or any MCP operation starts.
+schedule action, a `task` spawn, a `job` `input`/`stop`, or any MCP operation starts.
 
 `thinking_start` and `thinking_end` surround each reasoning block's
 `thinking_delta` events, in order. A block may have no summary text, in which
@@ -159,8 +168,9 @@ Pi appends the difference (see
 rewrite.
 
 All tenant execution uses Manager's Unix executor with its separate executor
-Bearer token. The only executor endpoints are POST `/v1/executor/audit`,
-`/v1/executor/terminal`, `/v1/executor/file` and `/v1/executor/runs/cancel`.
+Bearer token. The executor endpoints are POST `/v1/executor/audit`,
+`/v1/executor/terminal`, `/v1/executor/file`, `/v1/executor/runs/cancel` and the
+`/v1/executor/process/*` routes below.
 An audit receipt is one-shot and binds the operation, arguments and complete
 identity, including `execution_context.profile`; terminal/file calls consume it.
 The only target is `sandbox`; host execution is rejected.
@@ -203,9 +213,69 @@ and 128 globally. Admission counts begin before sandbox creation or process
 startup, and slots are released when execution settles. Over-limit calls return
 the ordinary executor conflict/error response; they never start a command.
 
+**Background processes (Manager).**
+
+Background processes are Manager-supervised sandbox processes whose lifetime is
+independent of the HTTP request, of Runtime and, once detached, of the creating
+run. They use the same executor socket and Bearer token, separate pool and
+strict JSON decoding. The **owner** is the scope-family root of the creating
+call's `scope_id` (e.g. `private:7`; `/delegate/…` stripped). Unknown or
+foreign process ids both return 404; limits, name conflicts, closed stdin and
+other rejections return 409.
+
+Receipt routes (a Call like terminal; process fields are under `arguments`; the
+receipt is created by POST `/v1/executor/audit` with `operation:"process"`):
+
+| Route | action | `arguments` | audit `details` |
+| --- | --- | --- | --- |
+| POST `/v1/executor/process/start` | `start` | `{command, cwd, timeout_ms, name?, stdin, attached}` | `{command, cwd}` |
+| POST `/v1/executor/process/stdin` | `stdin` | `{process_id, data, eof?}` (data ≤ 64 KiB) | `{process_id, bytes}` (bytes = UTF-8 length; content never audited) |
+| POST `/v1/executor/process/kill` | `kill` | `{process_id}` | `{process_id}` |
+
+`timeout_ms` is 0 (no deadline) or 100–604800000; `name` is 1–48 characters
+matching `[A-Za-z0-9][A-Za-z0-9._-]*`, unique among the owner's running
+processes. Start returns `{process:View}` after the record is persisted. If the
+in-sandbox supervisor never starts, the view is `failed` with reason
+`start_failed`. Kill sends SIGTERM to the process group, SIGKILL after 5 s, and
+confirms descendant termination as foreground does; the result is state
+`killed` or a view with `"unconfirmed":true` (state `failed`). Stdin returns 409
+when stdin is not open.
+
+Receipt-free routes use flat bodies: `process/detach {process_id, owner}`
+(idempotent, sets `attached:false`); `process/list {owner, include_finished?}`
+(newest first, ≤ 200); `process/read {process_id, owner, offset?, max_bytes?,
+wait_ms?}` returning `{data, offset_start, next_offset, retained_from, eof,
+process}`; and `process/changes {after, wait_ms?}` returning `{changes:[View],
+next}`. Read `offset` -1 is the tail; `max_bytes` ≤ 262144 (default 65536);
+`wait_ms` ≤ 30000 long-polls until new bytes or a state change. Offsets are byte
+offsets of the logical (redacted) output stream; `data` is valid UTF-8 (invalid
+bytes become U+FFFD; offsets never split a rune); `eof` means ended and
+`next_offset == log_bytes`. Changes lists every process with `seq > after`
+(≤ 500, ascending, long-polled ≤ 30000 ms); `seq` is a persisted, global counter
+bumped on each state/attachment/stdin change but not by output; an `after`
+above the current counter resyncs from 0.
+
+View: `{id:"proc_<ulid>", owner, scope_id, sandbox_id, name|null, command
+(redacted, ≤ 4096 chars), cwd, state:"running"|"exited"|"killed"|"failed"|
+"interrupted", exit_code|null, reason:""|"user"|"timeout"|"system_restart"|
+"sandbox_stopped"|"start_failed"|"run_cancelled", attached, stdin_open,
+started_at, ended_at|null, log_bytes, seq, unconfirmed?}`.
+
+Run cancellation (`/v1/executor/runs/cancel`) also kills processes still
+attached to that run (reason `run_cancelled`) and never detached ones.
+A running process holds its sandbox resident (no idle stop, no obsolete-image
+replacement). Limits: 16 running per owner and 128 globally, separate from the
+16 foreground slots (`background_process_limit` / `background_process_global_limit`
+in `manager.toml`); excess returns 409 "too many background processes". Combined
+output goes through the incremental redactor into a log capped at 8 MiB; past the
+cap the oldest 4 MiB is dropped and `retained_from` advances. At Manager startup
+running processes become `interrupted` (reason `system_restart`); a sandbox stop
+by any other path marks them `sandbox_stopped`. Commands are never replayed.
+Finished processes and logs are kept 7 days or the newest 200 per owner.
+
 File supports `read` and `write`; read returns `content` and byte counts in
-`details.returned` and `details.total`. Process/task/scope-process APIs and
-patch/search file actions are not supported. Before accepting executor requests
+`details.returned` and `details.total`. Patch/search file actions are not
+supported (background processes: see the paragraphs above). Before accepting executor requests
 after startup, Manager stops running managed sandboxes; workspace, home and
 environment persist and sandboxes restart on demand. Idle stop remains active.
 File tool paths stay inside the sandbox root (chat inside its conversation directory).
@@ -227,6 +297,47 @@ The `schedule` tool's actions are `list|get|create|update|pause|resume|delete|ru
 MCP invokes `/usr/local/bin/agent-platform-mcp <base64url-json>` through the
 sandbox executor with Manager's MCP audit projection/private-output handling;
 encoded call arguments are not presented as ordinary audited shell commands.
+
+### Personal bash, background processes and task tools
+
+Only the root personal scope (`private:<uid>`, kind `agent`) gets the extended
+`bash` and the tools `task`, `job` and `wait`; channels, chat and subagents keep
+the foreground bash above.
+
+Personal `bash` takes `{command, timeout?, async?, name?, ready?:{log?, port?,
+host?, timeout?}}`. `timeout` is in seconds (default 600). Foreground commands
+allow at most 3600; `async` and `name` allow up to 604800 (Manager's limit).
+`timeout:0` means no deadline and is valid only with `async` or `name`; a named
+service without `timeout` has no deadline. `name` (1–48 characters,
+`[A-Za-z0-9][A-Za-z0-9._-]*`) starts a long-lived service with stdin open.
+`ready` needs `name` and at least one of `log` (a regex over the output) and
+`port` (probed on `host`, default 127.0.0.1, from inside the sandbox); when both
+are given both must hold. `ready.timeout` defaults to 30 s. Invalid values fail
+before any process starts.
+
+Runtime starts the command as a Manager process (`process/start`, with an audit
+receipt, `attached:true`) and follows its log with `process/read` long-polls,
+emitting `tool_output` as before. If it ends within 60 s the result has the
+foreground format (last 50 KiB / 2000 lines; non-zero exit is a tool error). When
+output was truncated the process is registered as already delivered and the text
+points to `job output bg-<n>`. At 60 s, or at once for `async`, `name` or a user
+input inserted into the run (a pending one counts), the command is promoted:
+`process/detach`, then Platform `register_process`, then the result
+`Running in the background as bg-<n> …` with `details.background =
+{task_id, process_id}`. Promotion never kills or reruns the command and its
+deadline stays. If registration fails the process is killed. For a named
+service Runtime then waits for readiness (log regex and port probe, the probe
+being a short foreground sandbox command) until `ready.timeout` and reports
+ready or not ready with an output preview. Aborting the run kills unpromoted
+processes (Manager run cancellation covers them as well); promoted ones live on.
+
+`task`, `job` and `wait` call Platform `POST /internal/agent/tools/tasks` with
+`{action,arguments,context}`: `task {agent?, tasks:[{name?,task}] (1–8),
+context?}` is `spawn`; `job {action:list|status|output|input|stop, id?, text?,
+eof?, offset?}` uses its own action name; `wait {ids?, timeout?}` is `wait`
+(`timeout` seconds, at most 1800 and the default; the HTTP deadline exceeds it
+by 30 s). Promotion uses action `register_process` with `{process_id, delivered,
+name?}` (never the command: Platform reads Manager's redacted view) and reads `data.task_id`.
 
 Runtime environment/secret mount contracts remain the deployed ones:
 `AGENT_RUNTIME_HOME`, `AGENT_RUNTIME_HOST`, `AGENT_RUNTIME_PORT`,

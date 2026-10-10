@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button } from "../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
@@ -8,6 +8,8 @@ import { Composer, type ComposerCommand } from "./conversation/Composer";
 import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
 import { ComputerContext } from "./conversation/computerView";
 import { AssistantMessage, LiveReply, PendingReply, SystemLine, UserBubble } from "./conversation/Messages";
+import { TaskOverlay } from "./conversation/Tasks";
+import { TasksContext, isRunning, stateAnnouncement, tasksValue, type TaskMap } from "./conversation/taskState";
 import type { Compaction, Message, RunRef } from "./conversation/types";
 import { conversationTurns } from "./conversation/turns";
 import { errorText, useConversation } from "./conversation/useConversation";
@@ -83,6 +85,27 @@ function CompactionRow({ compaction }: { compaction: Compaction }) {
       <span aria-hidden className="h-px flex-1 bg-line" />
       {body}
       <span aria-hidden className="h-px flex-1 bg-line" />
+    </div>
+  );
+}
+
+/** Politely announces background task state changes (started, finished, failed, stopped), never activity. The
+ * first snapshot is the starting point, not news. */
+function TaskAnnouncer({ tasks, loaded }: { tasks: TaskMap; loaded: boolean }) {
+  const w = useWords();
+  const previous = useRef<TaskMap | null>(null);
+  const [announcement, setAnnouncement] = useState<{ text: string; n: number } | null>(null);
+  useEffect(() => {
+    const before = previous.current;
+    if (!loaded) return;
+    previous.current = tasks;
+    if (!before) return;
+    const changes = Object.values(tasks).filter((task) => before[task.id] ? before[task.id].status !== task.status : isRunning(task));
+    if (changes.length) setAnnouncement((current) => ({ text: changes.map((task) => stateAnnouncement(task, w)).join(w("; ", "；", "；")), n: (current?.n ?? 0) + 1 }));
+  }, [tasks, loaded, w]);
+  return (
+    <div role="status" aria-label={w("Background tasks", "后台任务", "背景任務")} aria-live="polite" aria-atomic="true" className="sr-only">
+      {announcement && <span key={announcement.n}>{announcement.text}</span>}
     </div>
   );
 }
@@ -165,6 +188,23 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     setComputerOpen(false);
     setComputerFocus(null);
   };
+  // The task whose output viewer or sheet is open (personal AI).
+  const [openedTask, setOpenedTask] = useState<string | null>(null);
+  const knownTasks = useRef(conversation.tasks);
+  knownTasks.current = conversation.tasks;
+  const { fetchTask, reloadTasks } = conversation;
+  const openTask = useCallback((id: string) => {
+    if (knownTasks.current[id]) {
+      setOpenedTask(id);
+      return;
+    }
+    fetchTask(id).then(() => setOpenedTask(id), (reason: unknown) => setNotice({ tone: "danger", text: errorText(reason) }));
+  }, [fetchTask]);
+  const tasks = useMemo(
+    () => (personal ? tasksValue(conversation.tasks, conversation.tasksLoaded, conversation.tasksError, () => void reloadTasks(), openTask) : null),
+    [personal, conversation.tasks, conversation.tasksLoaded, conversation.tasksError, reloadTasks, openTask],
+  );
+  const shownTask = openedTask ? conversation.tasks[openedTask] : undefined;
   const channel = scope.startsWith("channel-");
   const resettable = canSend && !scope.startsWith("chat-");
   const compactionAt = compactionPlacement(conversation.compaction, messages, conversation.nextBefore === null);
@@ -498,11 +538,13 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   }
 
   return (
+    <TasksContext.Provider value={tasks}>
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {header}
       <div role="status" aria-label={w("Message delivery", "消息送达", "訊息送達")} aria-live="polite" aria-atomic="true" className="sr-only">
         {conversation.deliveredInput && <span key={conversation.deliveredInput.seq}>{w("Message delivered — the agent can now use it", "消息已送达，智能体已收到补充内容", "訊息已送達，智慧體已收到補充內容")}</span>}
       </div>
+      {personal && <TaskAnnouncer tasks={conversation.tasks} loaded={conversation.tasksLoaded} />}
       {body}
       {personal && computerOpen && (narrow ? (
         <Sheet open onClose={closeComputer} title={computerLabel} width={420}>
@@ -522,6 +564,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
           </div>
         </WindowAside>
       ))}
+      {shownTask && <TaskOverlay key={shownTask.id} task={shownTask} onClose={() => setOpenedTask(null)} onStop={conversation.stopTask} />}
       <ConfirmDialog
         open={confirmingReset}
         tone="danger"
@@ -533,6 +576,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         onCancel={() => setConfirmingReset(false)}
       />
     </div>
+    </TasksContext.Provider>
   );
 }
 

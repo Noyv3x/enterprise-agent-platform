@@ -54,6 +54,7 @@ services:
       AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE: /run/secrets/agent-platform/camofox-access-key
       AGENT_PLATFORM_MANAGER_SOCKET: /run/agent-platform-manager/manager.sock
       AGENT_PLATFORM_MANAGER_TOKEN_FILE: /run/secrets/agent-platform/manager-token
+      AGENT_PLATFORM_MANAGER_EXECUTOR_TOKEN_FILE: /run/secrets/agent-platform/manager-executor-token
     ports:
       - ${AGENT_PLATFORM_PLATFORM_BIND:-127.0.0.1:18080}:8765
     volumes:
@@ -63,6 +64,7 @@ services:
       - ${AGENT_PLATFORM_SECRETS_DIR}/agent-runtime-token:/run/secrets/agent-platform/agent-runtime-token:ro
       - ${AGENT_PLATFORM_SECRETS_DIR}/camofox-access-key:/run/secrets/agent-platform/camofox-access-key:ro
       - ${AGENT_PLATFORM_SECRETS_DIR}/manager-token:/run/secrets/agent-platform/manager-token:ro
+      - ${AGENT_PLATFORM_SECRETS_DIR}/manager-executor-token:/run/secrets/agent-platform/manager-executor-token:ro
       - ${AGENT_PLATFORM_MANAGER_CONTROL_DIR:?AGENT_PLATFORM_MANAGER_CONTROL_DIR must be set}:/run/agent-platform-manager:ro
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=256m

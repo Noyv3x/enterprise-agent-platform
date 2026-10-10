@@ -16,6 +16,8 @@ export type WorkItem =
       output: string;
       startedAt: number | null;
       endedAt: number | null;
+      /** the background task (`bg-<n>`) a promoted command keeps running as */
+      background?: string;
     };
 
 export interface WorkTrace {
@@ -30,8 +32,9 @@ export interface WorkTrace {
 
 export type Words = (en: string, zhCN?: string, zhTW?: string) => string;
 
-/** The verb a tool call reads as; the conversation's work trace and the computer panel share it. */
-export function toolVerb(name: string, w: Words): string {
+/** The verb a tool call reads as; the conversation's work trace and the computer panel share it. `args` refines
+ * the `job` verb by its action. */
+export function toolVerb(name: string, w: Words, args?: Record<string, unknown>): string {
   switch (name) {
     case "bash":
       return w("Run", "运行", "執行");
@@ -54,6 +57,25 @@ export function toolVerb(name: string, w: Words): string {
       return w("Browse", "浏览", "瀏覽");
     case "schedule":
       return w("Schedule", "定时任务", "排程任務");
+    case "task":
+      return w("Delegate", "分派子任务", "分派子任務");
+    case "wait":
+      return w("Wait for results", "等待后台结果", "等待背景結果");
+    case "job":
+      switch (args?.action) {
+        case "list":
+          return w("List background tasks", "查看后台任务", "檢視背景任務");
+        case "status":
+          return w("Check task", "查看任务状态", "檢視任務狀態");
+        case "output":
+          return w("Read task output", "读取任务输出", "讀取任務輸出");
+        case "input":
+          return w("Send input", "向任务发送输入", "向任務傳送輸入");
+        case "stop":
+          return w("Stop task", "停止后台任务", "停止背景任務");
+        default:
+          return w("Manage background task", "管理后台任务", "管理背景任務");
+      }
     default:
       return name;
   }
@@ -79,8 +101,12 @@ function epochTime(value: unknown): number | null {
   return Number.isFinite(seconds) ? seconds * 1000 : null;
 }
 
-function fromWork(work: Record<string, unknown>): WorkTrace | null {
-  if (work.v !== 1 || !Array.isArray(work.items)) return null;
+/** A `metadata.work` v1 record. A running subagent's work (`GET /api/tasks/{id}`, `live`) may end in a tool that is
+ * still running: the producer stores an unfinished tool as `cancelled` with `ended_at: null` until its `tool_end`.
+ * In a settled record such a tool was cut short. */
+export function parseWork(value: unknown, live = false): WorkTrace | null {
+  const work = record(value);
+  if (!work || work.v !== 1 || !Array.isArray(work.items)) return null;
   const items: WorkItem[] = [];
   for (const raw of work.items) {
     const item = record(raw);
@@ -93,10 +119,12 @@ function fromWork(work: Record<string, unknown>): WorkTrace | null {
       items.push({ type: "input", messageId: item.message_id, at: isoTime(item.at) });
     }
     else if (item.type === "tool") {
-      const status = item.status === "done" || item.status === "error" ? item.status : "cancelled";
+      const status = item.status === "done" || item.status === "error" ? item.status : live && item.ended_at == null ? "running" : "cancelled";
+      const background = text(record(item.background)?.task_id);
       items.push({
         type: "tool", id: text(item.id), name: text(item.name), args: record(item.args) ?? {}, status,
         output: text(item.output), startedAt: isoTime(item.started_at), endedAt: isoTime(item.ended_at),
+        ...(background ? { background } : {}),
       });
     }
   }
@@ -148,7 +176,7 @@ function fromActivity(activity: unknown[]): WorkTrace {
 export function messageWork(message: Message): WorkTrace | null {
   const work = record(message.metadata.work);
   if (work) {
-    const trace = fromWork(work);
+    const trace = parseWork(work);
     if (trace && trace.items.length) return trace;
   }
   const old = record(message.metadata.agent_work);

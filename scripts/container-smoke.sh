@@ -673,6 +673,8 @@ if environment.get("AGENT_PLATFORM_MANAGER_SOCKET") != "/run/agent-platform-mana
     raise SystemExit("Platform Manager socket contract mismatch")
 if environment.get("AGENT_PLATFORM_MANAGER_TOKEN_FILE") != "/run/secrets/agent-platform/manager-token":
     raise SystemExit("Platform Manager token contract mismatch")
+if environment.get("AGENT_PLATFORM_MANAGER_EXECUTOR_TOKEN_FILE") != "/run/secrets/agent-platform/manager-executor-token":
+    raise SystemExit("Platform Manager executor token contract mismatch")
 runtime_environment = (services["agent-runtime"].get("environment") or {})
 if runtime_environment.get("AGENT_PLATFORM_TECHNICAL_PROFILE") != "agent-platform-v1":
     raise SystemExit("Agent Runtime target technical profile mismatch")
@@ -705,8 +707,8 @@ runtime_secret_targets = {
     str(volume.get("target") or "")
     for volume in services["agent-runtime"].get("volumes") or []
 }
-if "/run/secrets/agent-platform/manager-token" not in platform_secret_targets or "/run/secrets/agent-platform/manager-executor-token" in platform_secret_targets:
-    raise SystemExit("Platform must receive only the Manager control capability")
+if "/run/secrets/agent-platform/manager-token" not in platform_secret_targets or "/run/secrets/agent-platform/manager-executor-token" not in platform_secret_targets:
+    raise SystemExit("Platform must receive the Manager control and executor capabilities")
 if "/run/secrets/agent-platform/manager-executor-token" not in runtime_secret_targets or "/run/secrets/agent-platform/manager-token" in runtime_secret_targets:
     raise SystemExit("Agent Runtime must receive only the Manager executor capability")
 platform_data = [v for v in platform.get("volumes") or [] if v.get("target") == "/var/lib/agent-platform"]

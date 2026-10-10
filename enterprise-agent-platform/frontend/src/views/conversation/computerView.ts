@@ -119,7 +119,7 @@ export function commandLine(call: ToolCall): string {
 /** The step as one line under the window, with the conversation's tool verb: "Run pytest -q", "Write handlers.py". */
 export function stepTitle(call: ToolCall, w: Words): string {
   const { args } = call;
-  const verb = toolVerb(call.name, w);
+  const verb = toolVerb(call.name, w, args);
   let subject = "";
   switch (stepKind(call.name)) {
     case "shell":
@@ -140,7 +140,11 @@ export function stepTitle(call: ToolCall, w: Words): string {
       subject = str(args.url) ? host(str(args.url)) : str(args.action);
       break;
     default:
-      subject = clip(str(args.action) || str(args.name) || [str(args.server), str(args.tool)].filter(Boolean).join(" · "));
+      // Task tools name their tasks; the job action is already in the verb.
+      subject = call.name === "job" ? str(args.id)
+        : call.name === "wait" ? (Array.isArray(args.ids) ? args.ids.filter((id): id is string => typeof id === "string").join(" ") : "")
+          : call.name === "task" ? (Array.isArray(args.tasks) ? w(`${args.tasks.length} subagents`, `${args.tasks.length} 个子智能体`, `${args.tasks.length} 個子智慧體`) : "")
+            : clip(str(args.action) || str(args.name) || [str(args.server), str(args.tool)].filter(Boolean).join(" · "));
   }
   const running = call.status === "preparing" || call.status === "running";
   // Chinese reads the running step as "正在…"; English keeps the verb and the status pill says it is working.

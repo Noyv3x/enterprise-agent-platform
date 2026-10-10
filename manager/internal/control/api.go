@@ -542,6 +542,50 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 			return
 		}
 		writeJSON(response, http.StatusOK, map[string]any{"confirmed": a.Executor.CancelRun(body)})
+	case "/v1/executor/process/start", "/v1/executor/process/stdin", "/v1/executor/process/kill":
+		var body executor.Call
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		var result map[string]any
+		var err error
+		switch request.URL.Path {
+		case "/v1/executor/process/start":
+			result, err = a.Executor.ProcessStart(request.Context(), body)
+		case "/v1/executor/process/stdin":
+			result, err = a.Executor.ProcessStdin(request.Context(), body)
+		default:
+			result, err = a.Executor.ProcessKill(request.Context(), body)
+		}
+		a.executorResult(response, result, err)
+	case "/v1/executor/process/detach":
+		var body executor.ProcessDetachRequest
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.ProcessDetach(body)
+		a.executorResult(response, result, err)
+	case "/v1/executor/process/list":
+		var body executor.ProcessListRequest
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.ProcessList(body)
+		a.executorResult(response, result, err)
+	case "/v1/executor/process/read":
+		var body executor.ProcessReadRequest
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.ProcessRead(request.Context(), body)
+		a.executorResult(response, result, err)
+	case "/v1/executor/process/changes":
+		var body executor.ProcessChangesRequest
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.ProcessChanges(request.Context(), body)
+		a.executorResult(response, result, err)
 	default:
 		writeError(response, http.StatusNotFound, "not found")
 	}
@@ -554,6 +598,10 @@ func (a *API) decodeExecutor(response http.ResponseWriter, request *http.Request
 	return true
 }
 func (a *API) executorResult(response http.ResponseWriter, result any, err error) {
+	if errors.Is(err, executor.ErrProcessNotFound) {
+		writeError(response, http.StatusNotFound, err.Error())
+		return
+	}
 	if err != nil {
 		writeError(response, http.StatusConflict, err.Error())
 		return

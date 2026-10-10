@@ -32,12 +32,16 @@ Operations retain their idempotency key, request identity, generation and persis
 
 While waiting for an operation, the CLI tolerates a restarting Manager's missing/refused/reset socket, EOF, or HTTP 503 specifically reporting `launcher startup proof pending`. It retries only its status GET, with backoff from 500 ms to 4 seconds and a ten-minute deadline; deterministic errors and unrelated HTTP failures still fail immediately. It never replays the operation POST. The command reports the actual terminal success/failure; loss of the polling connection is not evidence that the operation failed or should be submitted again.
 
-1. Wait for the Platform's natural idle boundary: no active/queued agent work or admissions.
+1. Wait for the Platform's natural idle boundary: no active/queued agent work (including queued task notices and running subagents) or admissions.
 2. Reserve with the existing operation ID, persist maintenance, and reconfirm the same reservation before stopping writers. Manager remains the ingress and serves maintenance.
 3. Stop the old writer, verify a snapshot and run the fixed migration command. Start and probe the candidate with admissions still frozen.
 4. Settle the owner-bound commit/abort reservation and restore ingress only after core and Manager readiness are confirmed.
 
 The exact readiness fields are `reserved`, `active_agent_tasks`, `queued_agent_jobs`, `running_agent_jobs`, `admissions_in_progress` and `blocker_error`. See the [Platform contract](../reference/platform-api.md).
+
+Manager-supervised background processes do not block an update. A running process keeps its sandbox resident, so the idle stop and obsolete-image replacement skip it until it ends. Replacing the Manager (startup stops all sandboxes) ends every running process: it is recorded `interrupted` with reason `system_restart` and never restarted.
+
+Running personal-AI subagents are agent work: they count in `active_agent_tasks` and block the update until they finish (or are stopped by the user), so no child is cut off by a Platform replacement. If Platform nevertheless restarts or loses a child's Runtime stream, that task becomes `interrupted` and is never replayed. A process that finishes while an update is reserved is recorded by the watcher afterwards; its task notice is created once admissions reopen.
 
 ## 提交回滚与能力降级
 

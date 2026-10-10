@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import { request } from "../../api";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
+import { mergeTask, type TaskMap, type TaskView } from "./taskState";
 import type { Compaction, LastRun, LiveRun, Message, MessagePage, ToolCall } from "./types";
 
 const PAGE = 100;
@@ -9,7 +10,7 @@ const PAGE = 100;
 const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
-  "input_delivered", "retry", "compaction", "run_end",
+  "input_delivered", "retry", "compaction", "run_end", "task",
 ] as const;
 
 /** Platform SSE payloads (platform-api.md § SSE). */
@@ -22,11 +23,13 @@ type StreamEvent = { seq: number } & (
   | { type: "tool_start"; tool_call_id: string; name: string; args: Record<string, unknown> | null }
   | { type: "tool_update"; tool_call_id: string; partial: unknown }
   | { type: "tool_output"; tool_call_id: string; delta: string; truncated?: boolean }
-  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { diff?: unknown } | null }
+  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { diff?: unknown; background?: { task_id?: unknown } | null } | null }
   | { type: "input_delivered"; message_id: number }
   | { type: "retry" }
   | ({ type: "compaction"; phase: "queued" | "start" | "end" } & Partial<Compaction>)
   | { type: "run_end"; message?: Message | null }
+  /** personal AI only: a background task or subagent changed */
+  | { type: "task"; task: TaskView }
 );
 
 interface State {
@@ -43,6 +46,12 @@ interface State {
   lastRun: LastRun | null;
   /** Kept outside the busy live reply so assistive technology announces delivery immediately. */
   deliveredInput: { messageId: number; seq: number } | null;
+  /** personal AI background tasks by id (`GET /api/tasks`, then SSE `task`) */
+  tasks: TaskMap;
+  /** per task: the stream-update mark of its latest SSE event, so an older snapshot cannot replace it */
+  taskMarks: Record<string, number>;
+  tasksLoaded: boolean;
+  tasksError: string;
 }
 
 type Action =
@@ -52,9 +61,17 @@ type Action =
   | { type: "upsert"; messages: Message[] }
   | { type: "accepted"; message: Message }
   | { type: "compactQueued"; compaction: Compaction }
-  | { type: "event"; event: StreamEvent; at: number };
+  | { type: "event"; event: StreamEvent; at: number; mark: number }
+  /** a task snapshot requested when the stream-update mark was `mark` */
+  | { type: "tasks"; tasks: TaskView[]; mark: number }
+  | { type: "tasksFailed"; error: string }
+  /** an action's authoritative result (stop) */
+  | { type: "task"; task: TaskView };
 
-const initial: State = { phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null };
+const initial: State = {
+  phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null,
+  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "",
+};
 
 function upsert(state: State, incoming: Message[]): Message[] {
   const oldest = state.messages[0]?.id;
@@ -140,8 +157,13 @@ function applyCallEvent(call: ToolCall, event: StreamEvent): ToolCall {
   }
 }
 
-function applyEvent(state: State, event: StreamEvent, at: number): State {
+function applyEvent(state: State, event: StreamEvent, at: number, mark: number): State {
   if (event.type === "message") return { ...state, messages: upsert(state, [event.message]) };
+  // Task updates are not run activity: they arrive between and after turns too.
+  if (event.type === "task") {
+    const { task } = event;
+    return { ...state, tasks: { ...state.tasks, [task.id]: mergeTask(state.tasks[task.id], task, false) }, taskMarks: { ...state.taskMarks, [task.id]: mark } };
+  }
   if (event.type === "run_end") {
     // Calls cut short by a stop or failure are not running any more.
     const calls = state.live?.calls.map((call) => (call.status === "preparing" || call.status === "running" ? { ...call, status: "cancelled" as const } : call));
@@ -209,9 +231,12 @@ function applyEvent(state: State, event: StreamEvent, at: number): State {
           calls: patchCall(live.calls, event.tool_call_id, (call) => applyCallEvent(call, event)),
           items: items.map((item) => {
             if (item.type !== "tool" || item.id !== event.tool_call_id) return item;
-            return event.type === "tool_update"
-              ? { ...item, output: outputText(event.partial) }
-              : { ...item, output: outputText(event.content_preview) || item.output, status: event.is_error ? "error" : "done", endedAt: at };
+            if (event.type === "tool_update") return { ...item, output: outputText(event.partial) };
+            const background = event.details?.background?.task_id;
+            return {
+              ...item, output: outputText(event.content_preview) || item.output, status: event.is_error ? "error" : "done", endedAt: at,
+              ...(typeof background === "string" && background ? { background } : {}),
+            };
           }),
         },
       };
@@ -247,7 +272,16 @@ function reducer(state: State, action: Action): State {
     case "compactQueued":
       return { ...state, compaction: latestCompaction(state.compaction, action.compaction) };
     case "event":
-      return applyEvent(state, action.event, action.at);
+      return applyEvent(state, action.event, action.at, action.mark);
+    case "tasks": {
+      const tasks = { ...state.tasks };
+      for (const task of action.tasks) tasks[task.id] = mergeTask(tasks[task.id], task, (state.taskMarks[task.id] ?? 0) > action.mark);
+      return { ...state, tasks, tasksLoaded: true, tasksError: "" };
+    }
+    case "tasksFailed":
+      return { ...state, tasksError: action.error };
+    case "task":
+      return { ...state, tasks: { ...state.tasks, [action.task.id]: mergeTask(state.tasks[action.task.id], action.task, false) } };
   }
 }
 
@@ -255,12 +289,16 @@ export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** History, live SSE activity and actions for one conversation scope. Remount (key) the caller per scope. */
+/** History, live SSE activity and actions for one conversation scope, plus the personal AI's background tasks.
+ * Remount (key) the caller per scope. */
 export function useConversation(scope: string, onRunEnd?: () => void) {
   const base = conversationBase(scope);
+  const withTasks = scope === "private";
   const [state, dispatch] = useReducer(reducer, initial);
   const onRunEndRef = useRef(onRunEnd);
   onRunEndRef.current = onRunEnd;
+  // Counts SSE task updates; a snapshot requested at an older count must not undo them.
+  const taskMark = useRef(0);
 
   const load = useCallback(async () => {
     try {
@@ -270,9 +308,19 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
     }
   }, [base]);
 
+  const loadTasks = useCallback(async () => {
+    const mark = taskMark.current;
+    try {
+      dispatch({ type: "tasks", tasks: (await request<{ tasks: TaskView[] }>("/api/tasks")).tasks, mark });
+    } catch (error) {
+      dispatch({ type: "tasksFailed", error: errorText(error) });
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    if (withTasks) void loadTasks();
+  }, [load, loadTasks, withTasks]);
 
   const { after } = state;
   useEffect(() => {
@@ -287,7 +335,8 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
       } catch {
         return;
       }
-      dispatch({ type: "event", event, at: Date.now() });
+      if (event.type === "task") taskMark.current += 1;
+      dispatch({ type: "event", event, at: Date.now(), mark: taskMark.current });
       if (event.type === "run_end") {
         // Queued inputs change status without their own events; refresh the latest page once per run.
         request<MessagePage>(`${base}/messages?limit=${PAGE}`)
@@ -324,7 +373,19 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
     await load();
   }, [base, load]);
 
+  const stopTask = useCallback(async (id: string) => {
+    const result = await request<{ task: TaskView }>(`/api/tasks/${encodeURIComponent(id)}/stop`, { method: "POST", body: "{}" });
+    dispatch({ type: "task", task: result.task });
+    return result.task;
+  }, []);
+  /** Brings one task into the store (e.g. opened from history beyond the listed 100). */
+  const fetchTask = useCallback(async (id: string) => {
+    const result = await request<{ task: TaskView }>(`/api/tasks/${encodeURIComponent(id)}`);
+    dispatch({ type: "task", task: result.task });
+    return result.task;
+  }, []);
+
   const compactBusy = state.compaction?.status === "queued" || state.compaction?.status === "compacting";
   const busy = compactBusy || state.live !== null || state.messages.some((message) => message.metadata?.status === "queued" || message.metadata?.status === "running");
-  return { ...state, busy, compactBusy, reload: load, loadOlder, send, cancel, compact, reset };
+  return { ...state, busy, compactBusy, reload: load, loadOlder, send, cancel, compact, reset, reloadTasks: loadTasks, stopTask, fetchTask };
 }

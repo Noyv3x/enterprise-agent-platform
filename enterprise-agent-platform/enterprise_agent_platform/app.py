@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import Database
-from . import auth, admin, oauth, queue, gates, tools, files, schedules
+from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ class Platform:
         self.browser = tools.Browser(self)
         self.files = files.Files(self)
         self.queue = queue.Queue(self)
+        self.tasks = tasks.Tasks(self)
 
     async def scheduler(self):
         while True:
@@ -174,6 +175,7 @@ def create_app(settings=None):
             if platform.settings.deployment_mode == 'container' or Path(platform.settings.manager_socket).exists():
                 await platform.gate.restore()
             await platform.queue.start()
+            await platform.tasks.start()
             scheduler = asyncio.create_task(platform.scheduler())
             yield
         finally:
@@ -182,6 +184,7 @@ def create_app(settings=None):
                 scheduler.cancel()
                 with suppress(asyncio.CancelledError):
                     await scheduler
+            await platform.tasks.stop()
             await platform.queue.stop()
             await platform.http.aclose()
 
@@ -192,7 +195,7 @@ def create_app(settings=None):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
 
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
-    for module in (auth, admin, oauth, queue, gates, tools, files):
+    for module in (auth, admin, oauth, queue, gates, tools, files, tasks):
         route_list.extend(module.routes())
     route_list.append(Route('/{path:path}', static))
     app = Starlette(routes=route_list, lifespan=lifespan, exception_handlers={HTTPException: error, json.JSONDecodeError: malformed})

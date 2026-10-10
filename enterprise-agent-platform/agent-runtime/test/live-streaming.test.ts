@@ -10,8 +10,10 @@ import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { LiveBuffer } from "../src/live-events.js";
 import { createTools } from "../src/tools.js";
 import { createExecutorTransport, type ExecutorTransport, type OutputListener, type Sandbox } from "../src/transport.js";
+import { noProcesses } from "./fakes.js";
 
-const sandbox: Sandbox = { scope_key: "private:1", workspace_id: "user-1", sandbox_id: "sandbox-1", lifecycle_id: "life-1", profile: "agent", cwd: "/workspace" };
+// A subagent scope: it keeps the foreground bash whose live output this test exercises.
+const sandbox: Sandbox = { scope_key: "private:1/delegate/bg-1", workspace_id: "user-1", sandbox_id: "sandbox-1", lifecycle_id: "life-1", profile: "agent", cwd: "/workspace" };
 const context = { sid: "s", scope_key: sandbox.scope_key, run_id: "run-1", tool_call_id: "call-1" };
 const result = { stdout: "out", stderr: "", exit_code: 0, status: "completed" };
 
@@ -122,6 +124,7 @@ test("LiveBuffer enforces its byte cap on a character boundary and reports the l
 // Runs the wrapper under sh like Manager does, forwarding stderr as live output.
 function localExecutor(directory: string): ExecutorTransport {
   return {
+    ...noProcesses,
     async terminal(_sandbox, _context, command, _cwd, _timeout, _signal, _details, onOutput?: OutputListener) {
       const child = spawn("sh", ["-c", command.replaceAll("/workspace", directory)], { stdio: ["ignore", "pipe", "pipe"] });
       let stdout = "";

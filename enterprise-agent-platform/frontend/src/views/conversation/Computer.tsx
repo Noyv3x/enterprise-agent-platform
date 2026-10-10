@@ -10,6 +10,7 @@ import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
 import { StepContent, stepChrome } from "./ActivityScreen";
 import { followedRun, runCalls, stepKind, stepTitle, type RunSteps } from "./computerView";
+import { BackgroundTasks } from "./Tasks";
 import type { BrowserLease, BrowserTab, LastRun, LiveRun, Message, StepRef, ToolCall, WorkspaceFile } from "./types";
 import { errorText } from "./useConversation";
 
@@ -381,7 +382,8 @@ export interface ComputerFocus {
 }
 
 /** Personal AI computer panel body: one window following the AI step by step, its description and status, the
- * playback bar, browser takeover and the workspace files. Fills the height its container gives it. */
+ * playback bar, browser takeover, the background tasks and the workspace files. Fills the height its container
+ * gives it. */
 export function ComputerBody({ live, lastRun, messages, focus }: {
   live: LiveRun | null;
   lastRun: LastRun | null;
@@ -562,6 +564,7 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
         </span>
       </div>
       {browser.error && !open && <p role="alert" className="shrink-0 px-0.5 text-[12.5px] text-red-ink">{browser.error}</p>}
+      <BackgroundTasks />
       <FilesDisclosure />
       <div role="status" className="sr-only">{announcement}</div>
     </div>

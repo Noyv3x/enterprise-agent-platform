@@ -152,6 +152,10 @@ class _WorkTrace:
                     item["output"] = self.preview(event.get("content_preview", []))
                     item["status"] = "error" if event.get("is_error") else "done"
                     item["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+                    background = (event.get("details") or {}).get("background")
+                    if isinstance(background, dict) and isinstance(background.get("task_id"), str):
+                        item["background"] = {"task_id": background["task_id"][:32],
+                                              "process_id": str(background.get("process_id", ""))[:64]}
                 if not self.store(item, index) and kind == "tool_end":
                     # The reserved timestamp budget guarantees terminal status
                     # survives even when the final output cannot fit.
@@ -376,6 +380,7 @@ class Queue:
             "AND scope_type=? AND scope_id=? AND json_extract(payload_json,'$.scope')=? "
             "AND json_extract(payload_json,'$.parent_job_id') IS NULL "
             "AND json_extract(payload_json,'$.operation') IS NULL "
+            "AND json_extract(payload_json,'$.notice') IS NULL "
             "AND json_extract(payload_json,'$.schedule_run_id') IS NULL ORDER BY id LIMIT 1",
             (info["scope_type"], info["scope_id"], payload["scope"])).fetchone()
         if parent is None:
@@ -505,6 +510,9 @@ class Queue:
             self.wake(self.payload_key(json.loads(row[0])))
         for key in self.unsettled:
             self.wake(key)
+        tasks = getattr(self.p, "tasks", None)
+        if tasks is not None:
+            tasks.resume()
 
     def user(self, uid):
         with self.p.db.connect() as conn:
@@ -665,6 +673,11 @@ class Queue:
                     if payload.get("operation") == "compact":
                         await self.execute_compact(job, payload, user, info)
                         continue
+                    notice = None
+                    if payload.get("notice"):
+                        notice = self.p.tasks.begin_notice(job, payload, info)
+                        if notice is None:
+                            continue
                     with self.p.db.connect() as conn:
                         table = "chat_messages" if info["kind"] == "chat" else "messages"
                         metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (payload["message_id"],)).fetchone()[0])
@@ -673,8 +686,8 @@ class Queue:
                     self.emit(key, {"type": "message", "message": self.message(info, payload["message_id"])})
                     await self.selected_model(info)
                     prompt = self.p.files.prompt(user, info, payload["attachment_ids"])
-                    prompt["text"] = payload["content"] + ("\n" + prompt["text"] if prompt["text"] else "")
-                    tools = BUILTINS + (["browser", "schedule", "mcp"] if info["kind"] == "agent" and info["channel_id"] is None else [])
+                    prompt["text"] = (payload["content"] if notice is None else notice) + ("\n" + prompt["text"] if prompt["text"] else "")
+                    tools = BUILTINS + (["browser", "schedule", "mcp", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
                     payload.update(runtime_sid=info["sid"], runtime_unsettled=True)
                     with self.p.db.connect() as conn:
                         conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))

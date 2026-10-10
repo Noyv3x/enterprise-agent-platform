@@ -21,8 +21,8 @@ async function close(server: Server) {
   server.closeAllConnections();
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
-function request(model: string, kind: 'agent' | 'chat' = 'agent'): RunRequest {
-  return {kind, sandbox:{scope_key:kind === 'chat' ? 'chat:1' : 'private:1',workspace_id:kind === 'chat' ? 'chat-user-1' : 'user-1',sandbox_id:'sandbox',lifecycle_id:'lifecycle',profile:'agent',cwd:kind === 'chat' ? '/workspace/conversation' : '/workspace'},model:{id:model,thinking:'off'},prompt:{text:'First question'},context_prefix:'<context time="first"/>',resources:{system_prompt:'Stable assistant instructions.',agents_md:{path:'/workspace/AGENTS.md',content:'PRIVATE_CONTEXT_MARKER'},skills:[{name:'example',description:'Example skill',path:'/workspace/skills/example/SKILL.md'}]},tools:['bash','web_search']};
+function request(model: string, kind: 'agent' | 'chat' = 'agent', scope?: string): RunRequest {
+  return {kind, sandbox:{scope_key:scope ?? (kind === 'chat' ? 'chat:1' : 'private:1'),workspace_id:kind === 'chat' ? 'chat-user-1' : 'user-1',sandbox_id:'sandbox',lifecycle_id:'lifecycle',profile:'agent',cwd:kind === 'chat' ? '/workspace/conversation' : '/workspace'},model:{id:model,thinking:'off'},prompt:{text:'First question'},context_prefix:'<context time="first"/>',resources:{system_prompt:'Stable assistant instructions.',agents_md:{path:'/workspace/AGENTS.md',content:'PRIVATE_CONTEXT_MARKER'},skills:[{name:'example',description:'Example skill',path:'/workspace/skills/example/SKILL.md'}]},tools:['bash','web_search']};
 }
 function steering(input_id:string,text:string,context_prefix=''): Parameters<Runtime['steer']>[1] {
   return {input_id,prompt:{text,images:[]},context_prefix};
@@ -40,12 +40,14 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
   const cancelOutcomes: ({confirmed:boolean}|{error:string})[] = [];
   let onCancel: (()=>void) | undefined;
   let onTerminal: (()=>Promise<void>) | undefined;
+  let onProcessRead: (()=>Promise<void>) | undefined;
   let terminalFrames: object[] | undefined;
   const executor = httpServer(async (req,res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
     executorCalls.push({path:req.url!,body,authorization:req.headers.authorization});
     if(req.url?.endsWith('/terminal'))await onTerminal?.();
+    if(req.url?.endsWith('/process/read'))await onProcessRead?.();
     res.setHeader('content-type','application/json');
     if(req.url?.endsWith('/runs/cancel')){
       const outcome=cancelOutcomes.shift()??{confirmed:true};
@@ -55,13 +57,18 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     }else if(terminalFrames&&req.url?.endsWith('/terminal')&&req.headers.accept==='application/x-ndjson'){
       res.setHeader('content-type','application/x-ndjson');
       res.end(terminalFrames.map(frame=>JSON.stringify(frame)+'\n').join(''));
+    }else if(req.url?.endsWith('/process/start')||req.url?.endsWith('/process/read')||req.url?.endsWith('/process/detach')||req.url?.endsWith('/process/kill')){
+      const view={id:'proc_test',owner:'private:1',scope_id:'private:1',sandbox_id:'sandbox',name:null,command:'',cwd:'/workspace',state:'running',exit_code:null,reason:'',attached:true,stdin_open:false,started_at:'2026-01-01T00:00:00Z',ended_at:null,log_bytes:0,seq:1};
+      if(req.url.endsWith('/process/read'))res.end(JSON.stringify({data:'sandbox output\n',offset_start:0,next_offset:15,retained_from:0,eof:true,process:{...view,state:'exited',exit_code:0,log_bytes:15}}));
+      else if(req.url.endsWith('/process/detach'))res.end('{}');
+      else res.end(JSON.stringify({process:{...view,...(req.url.endsWith('/process/kill')?{state:'killed',reason:'user'}:{})}}));
     }else res.end(JSON.stringify(req.url?.endsWith('/audit') ? {audit_id:body.audit_id,executor_id:'fake-executor'} : {result:{stdout:'/workspace/.pi-bash-test.log\n15\n1\nsandbox output\n',stderr:'',exit_code:0,status:'completed'}}));
   });
   const gateway = httpServer(async (req,res) => {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     gatewayCalls.push({path:req.url!,body:JSON.parse(Buffer.concat(chunks).toString()),authorization:req.headers.authorization});
     res.setHeader('content-type','application/json');
-    res.end(JSON.stringify({content:'Web result from the fake gateway',data:{url:'https://example.com'},is_error:false}));
+    res.end(JSON.stringify(req.url?.endsWith('/tasks')?{content:'bg-1',data:{task_id:'bg-1'},is_error:false}:{content:'Web result from the fake gateway',data:{url:'https://example.com'},is_error:false}));
   });
   const socket = join(home,'executor.sock');
   await listen(executor,socket);
@@ -102,7 +109,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     server = createServer(runtime,'runtime-secret');
     url = await listen(server);
   }
-  return {faux,http,start,events,reopen,home,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get url(){return url;},get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;},onTerminal(callback:()=>Promise<void>){onTerminal=callback;},streamTerminal(frames:object[]){terminalFrames=frames;}};
+  return {faux,http,start,events,reopen,home,executorCalls,gatewayCalls,usage,server,cancelOutcomes,get url(){return url;},get modelRuntimeConstructions(){return modelRuntimeConstructions;},onCancel(callback:()=>void){onCancel=callback;},onTerminal(callback:()=>Promise<void>){onTerminal=callback;},onProcessRead(callback:()=>Promise<void>){onProcessRead=callback;},streamTerminal(frames:object[]){terminalFrames=frames;}};
 }
 
 test('steering HTTP requires authentication and validates every field before looking up a run', {timeout:20_000}, async t=>{
@@ -147,7 +154,7 @@ test('steering during a tool is delivered after tool_end in the next request and
     context=>{captured.push(structuredClone(context));return fauxAssistantMessage('Used the inserted instruction');},
     context=>{captured.push(structuredClone(context));return fauxAssistantMessage('Remembered after reopen');},
   ]);
-  const body=request('runtime-proof');
+  const body=request('runtime-proof','agent','channel:1:room');
   const input=steering('tool-input','Inspect the sandbox result','<context time="inserted"/>');
   const literal=input.context_prefix+'\n'+input.prompt.text;
   const id=await f.start('agent-private-steered-tool',body);
@@ -592,7 +599,7 @@ test('HTTP runs stream real Pi text, thinking, sandbox and gateway tools, aggreg
   assert(sum('cacheRead')>0 && sum('cacheWrite')>0);
   assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Finished from sandbox and web',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:f.faux.getModel().id,side_effects:true,undelivered_inputs:[]});
   assert.deepEqual(await f.events(id,events.length-1),[events.at(-1)]);
-  assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/terminal']);
+  assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/process/start','/v1/executor/process/read']);
   assert(f.executorCalls[0] && f.executorCalls[1] && f.gatewayCalls[0]);
   assert.equal(f.executorCalls[1].body.execution_context.profile,'agent');
   assert(f.executorCalls.every(c=>c.authorization==='Bearer executor-secret'));
@@ -720,7 +727,7 @@ test('chat strips private resources and privileged tools and forces chat executi
   const f = await fixture(t);
   let captured: TranscriptContext | undefined;
   f.faux.setResponses([context=>{captured=structuredClone(context);return fauxAssistantMessage(fauxToolCall('bash',{command:'pwd'}),{stopReason:'toolUse'});},fauxAssistantMessage('Chat answer')]);
-  const body = request(f.faux.getModel().id,'chat');body.tools=['bash','web_search','web_fetch','browser','schedule','mcp'];
+  const body = request(f.faux.getModel().id,'chat');body.tools=['bash','web_search','web_fetch','browser','schedule','mcp','task','job','wait'];
   const events = await f.events(await f.start('chat-conversation',body));
   assert.equal(events.at(-1)!.status,'completed');
   const systems=captured!.messages.filter(m=>m.role==='system');
@@ -1072,7 +1079,7 @@ test('bash live output from Manager frames becomes ordered coalesced tool_output
     {type:'result',result},
   ]);
   f.faux.setResponses([fauxAssistantMessage([fauxToolCall('bash',{command:'echo live one two'},{id:'call-live'})],{stopReason:'toolUse'}),fauxAssistantMessage('done')]);
-  const id = await f.start('agent-private-output',request(f.faux.getModel().id));
+  const id = await f.start('agent-private-output',request(f.faux.getModel().id,'agent','channel:1:room'));
   const events = await f.events(id);
   const output = events.filter(e=>e.type==='tool_output');
   assert(output.length>=1&&output.length<3,'three writes within one interval are coalesced');
@@ -1092,11 +1099,114 @@ test('live bash output stops at 512 KiB with a single truncated event while tool
     {type:'result',result:{stdout:'/workspace/.pi-bash-test.log\n15\n1\nfinal\n',stderr:'',exit_code:0,status:'completed'}},
   ]);
   f.faux.setResponses([fauxAssistantMessage([fauxToolCall('bash',{command:'big'},{id:'call-big'})],{stopReason:'toolUse'}),fauxAssistantMessage('done')]);
-  const id = await f.start('agent-private-cap',request(f.faux.getModel().id));
+  const id = await f.start('agent-private-cap',request(f.faux.getModel().id,'agent','channel:1:room'));
   const events = await f.events(id);
   const output = events.filter(e=>e.type==='tool_output');
   assert.equal(output.slice(0,-1).reduce((total,e)=>total+Buffer.byteLength(String(e.delta)),0)+Buffer.byteLength(String(output.at(-1)!.delta)),512*1024);
   assert.deepEqual(output.at(-1),{...output.at(-1)!,delta:'',truncated:true});
   assert.equal(output.filter(e=>e.truncated===true).length,1);
   assert.deepEqual(events.find(e=>e.type==='tool_end')!.content_preview,[{type:'text',text:'final\n'}]);
+});
+
+function subagent(model:string,uid=1,n=7):RunRequest {
+  const body=request(model,'agent',`private:${uid}/delegate/bg-${n}`);
+  body.kind='subagent';body.tools=['read','bash','grep','web_search','web_fetch'];
+  return body;
+}
+
+test('subagent runs get exactly their tool subset, no AGENTS.md, and the foreground bash', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  let captured:TranscriptContext|undefined;
+  f.faux.setResponses([context=>{captured=structuredClone(context);return fauxAssistantMessage(fauxToolCall('bash',{command:'printf child'}),{stopReason:'toolUse'});},fauxAssistantMessage('Child report')]);
+  const events=await f.events(await f.start('agent-private-1-bg-7',subagent(f.faux.getModel().id)));
+  assert.equal(events.at(-1)!.status,'completed');
+  assert.equal(events.at(-1)!.text,'Child report');
+  const systems=captured!.messages.filter(m=>m.role==='system');
+  assert.deepEqual(systems.flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort(),['bash','grep','read','web_fetch','web_search']);
+  assert.doesNotMatch(JSON.stringify(systems),/PRIVATE_CONTEXT_MARKER/);
+  assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/terminal'],'a subagent runs foreground commands only');
+  const terminal=f.executorCalls[1]!.body;
+  assert.equal(terminal.scope_id,'private:1/delegate/bg-7');
+  assert.equal(terminal.execution_context.profile,'agent');
+});
+
+test('subagent runs are rejected outside the delegate scope, with another session ID or with tools beyond the subset', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const model=f.faux.getModel().id;
+  const attempts:[string,string,(body:RunRequest)=>void][]=[
+    ['the root personal scope','agent-private-1-bg-7',body=>{body.sandbox.scope_key='private:1';}],
+    ['a channel scope','agent-private-1-bg-7',body=>{body.sandbox.scope_key='channel:1:room';}],
+    ['a chat scope','agent-private-1-bg-7',body=>{body.sandbox.scope_key='chat:1';}],
+    ['another user\'s delegate scope under this sid','agent-private-2-bg-7',()=>{}],
+    ['a mismatched child number','agent-private-1-bg-8',()=>{}],
+    ['the parent session ID','agent-private-1',()=>{}],
+    ['the chat profile','agent-private-1-bg-7',body=>{body.sandbox.profile='chat';}],
+    ...['browser','schedule','mcp','task','job','wait'].map(tool=>[`the ${tool} tool`,'agent-private-1-bg-7',(body:RunRequest)=>{body.tools=['read',tool];}] as [string,string,(body:RunRequest)=>void]),
+  ];
+  for(const [label,sid,mutate] of attempts){
+    const body=subagent(model);mutate(body);
+    const response=await f.http(`/v1/sessions/${sid}/runs`,body);
+    assert.equal(response.status,400,label);
+  }
+  assert.deepEqual(f.executorCalls,[]);
+  assert.equal(f.faux.state.callCount,0);
+  f.faux.setResponses([fauxAssistantMessage('Still admitted')]);
+  assert.equal((await f.events(await f.start('agent-private-1-bg-7',subagent(model)))).at(-1)!.text,'Still admitted');
+});
+
+test('only the root personal agent scope gets task, job and wait', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const seen:Record<string,string[]>={};
+  for(const [sid,scope] of [['agent-private-1','private:1'],['agent-channel-1','channel:1:room'],['agent-private-1-bg-7','private:1/delegate/bg-7']] as const){
+    f.faux.setResponses([context=>{seen[scope]=context.messages.filter(m=>m.role==='system').flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort();return fauxAssistantMessage('ok');}]);
+    const body=request(f.faux.getModel().id,'agent',scope);body.tools=['bash','web_search','browser','task','job','wait'];
+    assert.equal((await f.events(await f.start(sid,body))).at(-1)!.status,'completed');
+  }
+  assert.deepEqual(seen['private:1'],['bash','browser','job','task','wait','web_search']);
+  assert.deepEqual(seen['channel:1:room'],['bash','web_search']);
+  assert.deepEqual(seen['private:1/delegate/bg-7'],['bash','web_search']);
+});
+
+test('a steering input promotes a running personal bash to a background task without rerunning it', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  f.onProcessRead(async()=>{entered.resolve();await ready.promise;});
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall('bash',{command:'make watch'},{id:'long-bash'}),{stopReason:'toolUse'}),fauxAssistantMessage('Handled the message')]);
+  const id=await f.start('agent-private-1',request(f.faux.getModel().id));
+  await entered.promise;
+  const input=steering('promote-input','Please check something else');
+  assert.equal((await f.http(`/v1/runs/${id}/steer`,input)).status,200);
+  const events=await f.events(id);
+  assert.equal(events.at(-1)!.status,'completed');
+  const end=events.find(e=>e.type==='tool_end')!;
+  assert.equal(end.is_error,false);
+  assert.deepEqual(end.details,{background:{task_id:'bg-1',process_id:'proc_test'}});
+  assert.match(JSON.stringify(end.content_preview),/Backgrounded early to handle an incoming message; the command keeps running\./);
+  assert(events.findIndex(e=>e.type==='tool_end')<events.findIndex(e=>e.type==='input_delivered'));
+  assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/process/start','/v1/executor/process/read','/v1/executor/process/detach']);
+  assert.equal(f.executorCalls[1]!.body.arguments.command,'make watch');
+  assert.equal(f.executorCalls[1]!.body.arguments.attached,true);
+  assert.deepEqual(f.gatewayCalls.map(c=>[c.path,c.body.action,c.body.arguments,c.body.context.tool_call_id]),[['/internal/agent/tools/tasks','register_process',{process_id:'proc_test',delivered:false},'long-bash']]);
+  assert.equal(events.at(-1)!.side_effects,true);
+});
+
+test('cancelling a run kills a personal bash process that was not promoted', {timeout:20_000}, async t=>{
+  const f=await fixture(t);
+  const entered=Promise.withResolvers<void>();
+  const ready=Promise.withResolvers<void>();
+  t.after(()=>ready.resolve());
+  f.onProcessRead(async()=>{entered.resolve();await ready.promise;});
+  f.faux.setResponses([fauxAssistantMessage(fauxToolCall('bash',{command:'sleep 1000'}),{stopReason:'toolUse'}),fauxAssistantMessage('Must not run')]);
+  const id=await f.start('agent-private-1',request(f.faux.getModel().id));
+  await entered.promise;
+  const response=await f.http('/v1/sessions/agent-private-1/cancel',{});
+  assert.equal(response.status,200,await response.clone().text());
+  assert.equal((await f.events(id)).at(-1)!.status,'cancelled');
+  const paths=f.executorCalls.map(c=>c.path);
+  assert(paths.includes('/v1/executor/process/kill'),'the unpromoted process must be killed by Runtime');
+  assert(paths.includes('/v1/executor/runs/cancel'));
+  assert.equal(paths.includes('/v1/executor/process/detach'),false);
+  assert.deepEqual(f.gatewayCalls,[]);
 });

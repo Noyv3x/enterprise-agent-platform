@@ -77,6 +77,10 @@ Manager binds profile and workspace at sandbox creation; omitted `execution_cont
 | `sandbox_chat_memory` / `sandbox_chat_memory_swap` | `"768m"` / `"768m"` |
 | `sandbox_chat_cpus` / `sandbox_chat_pids_limit` | `"1"` / `256` |
 | `sandbox_chat_idle` | `"3m"` |
+| `background_process_limit` / `background_process_global_limit` | `16` / `128` |
+
+Running background processes per owner and globally; excess starts return 409.
+Process records live in `<manager state>/processes/index.json` (global `seq`, records) with each log at `processes/<id>/output.log` (capped at 8 MiB; `retained_from` in `output.from` after rotation). Finished processes are kept 7 days or the newest 200 per owner.
 
 Memory/CPU values are strings, PID limits integers and idle periods Go duration strings. Existing explicit `sandbox_idle` values remain unchanged. Callers cannot configure the profile's network or rebind an existing sandbox; executor audit receipts and process identity also bind the profile.
 

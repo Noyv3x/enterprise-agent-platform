@@ -283,6 +283,35 @@ _MIGRATIONS = (
         'DROP TABLE IF EXISTS pi_schema_migrations',
     )),
     (2026100201, 'chat-model-follows-personal-ai', _chat_model_follows_personal_ai),
+    (2026101101, 'background-tasks', (
+        """CREATE TABLE IF NOT EXISTS background_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    kind TEXT NOT NULL CHECK(kind IN ('process', 'agent')),
+    external_id TEXT UNIQUE,
+    name TEXT,
+    label TEXT NOT NULL DEFAULT '',
+    agent_type TEXT CHECK(agent_type IS NULL OR agent_type IN ('scout', 'task')),
+    prompt TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running', 'completed', 'failed', 'stopped', 'interrupted')),
+    reason TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER,
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER,
+    result TEXT NOT NULL DEFAULT '' CHECK(length(CAST(result AS BLOB)) <= 65536),
+    work_json TEXT,
+    usage_json TEXT,
+    created_by_message_id INTEGER,
+    created_by_tool_call_id TEXT,
+    run_job_id INTEGER,
+    delivered_at INTEGER,
+    notice_job_id INTEGER,
+    updated_at INTEGER NOT NULL
+)""",
+        'CREATE INDEX IF NOT EXISTS idx_background_tasks_user ON background_tasks(user_id, status, id)',
+        'CREATE INDEX IF NOT EXISTS idx_background_tasks_undelivered ON background_tasks(status, delivered_at, notice_job_id)',
+    )),
 )
 
 

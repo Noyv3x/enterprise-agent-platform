@@ -6,7 +6,26 @@
   outline-offset: -2px;
 }
 
-/* On narrow windows the amount moves under the label instead of squeezing it. */
+/* On narrow windows, and in narrow containers that opt in (`task-rows-stacked`, the computer panel's background
+ * tasks), the amount moves under the label instead of squeezing it. */
+.task-rows-stacked .task-row-button {
+  padding-block: 6px;
+}
+
+.task-rows-stacked .task-row-text {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+}
+
+.task-rows-stacked .task-row-text > * {
+  max-width: 100%;
+}
+
+.task-rows-stacked .task-row-amount {
+  font-size: 12px;
+}
+
 @media (max-width: 560px) {
   .task-row-button {
     padding-block: 6px;

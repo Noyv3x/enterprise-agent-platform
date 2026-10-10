@@ -31,9 +31,13 @@ class FakeEventSource extends EventTarget {
 
 type Route = (body: Record<string, unknown>) => unknown;
 
+/** The personal AI loads its background tasks with every conversation; tests without tasks see none. */
+const DEFAULT_ROUTES: Record<string, Route> = { 'GET /api/tasks': () => ({ tasks: [] }) };
+
 function serve(routes: Record<string, Route>) {
   api.request.mockImplementation(async (path: string, options: RequestInit = {}) => {
-    const route = routes[`${options.method ?? 'GET'} ${path}`];
+    const key = `${options.method ?? 'GET'} ${path}`;
+    const route = routes[key] ?? DEFAULT_ROUTES[key];
     if (!route) throw new Error(`unexpected ${options.method ?? 'GET'} ${path}`);
     return route(options.body && typeof options.body === 'string' ? JSON.parse(options.body) : {});
   });

@@ -14,7 +14,9 @@
  * - the viewer is controlled (`open`), forwards clicks on the screen while the person holds control, and
  *   renders the caller's input row below the screen; the custom cursor shows only while interactive;
  * - labels come from the caller (i18n); the dialog traps focus, restores it, and consumes Escape before a parent sheet;
- * - the expanded viewer sits above sheets (60) and below its portaled popovers (80).
+ * - the expanded viewer sits above sheets (60) and below its portaled popovers (80);
+ * - the expanded viewer's frame (scrim, card, title bar with name, status, controls and collapse, screen inset and
+ *   input row) is exported as `ScreenViewer`, which the personal AI's process output viewer also uses.
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -173,6 +175,113 @@ export function FauxWindow({ tabs, activeTab, onTabChange, tabsLabel, address, a
   );
 }
 
+/** The expanded viewer's frame, portaled to <body> so it takes over the whole page: traps focus while mounted,
+ * restores it on unmount, and consumes Escape before a parent sheet. Mount it only while open. `focusClose` moves
+ * focus to the collapse control instead of the first control (when that one is a destructive action). */
+export function ScreenViewer({ title, status, controls, collapseLabel, onClose, inputs, screenClassName, onScreenMouseMove, onScreenMouseLeave, focusClose = false, children }: {
+  /** the dialog's name, shown at the far left of the title bar */
+  title: string;
+  status?: ReactNode;
+  controls?: ReactNode;
+  collapseLabel: string;
+  onClose: () => void;
+  /** row below the screen */
+  inputs?: ReactNode;
+  screenClassName?: string;
+  onScreenMouseMove?: (event: MouseEvent<HTMLDivElement>) => void;
+  onScreenMouseLeave?: () => void;
+  focusClose?: boolean;
+  children: ReactNode;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // Lock scroll and contain focus while the viewer is open.
+  useEffect(() => {
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialog = dialogRef.current;
+    (focusClose ? dialog?.querySelector<HTMLElement>("[data-viewer-close]") : dialog?.querySelector<HTMLElement>("button, input, [tabindex]"))?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Tab" || !dialog) return;
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, [tabindex]:not([tabindex='-1'])"));
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = overflow;
+      returnFocus?.focus();
+    };
+  }, []);
+
+  return createPortal(
+    <div
+      ref={dialogRef}
+      className="fixed inset-0 z-[70] flex items-center justify-center p-4 sm:p-6"
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        event.stopPropagation();
+        onClose();
+      }}
+    >
+      <div
+        className="absolute inset-0 bg-black/60 dark:bg-black/75"
+        style={{ animation: "fade-in 180ms ease-out both" }}
+        onClick={onClose}
+      />
+      <div
+        className="relative flex max-h-full max-w-full flex-col overflow-hidden rounded-[16px] bg-surface p-2 pt-0 shadow-overlay"
+        style={{ animation: "pop-in 240ms cubic-bezier(0.23,1,0.32,1) both" }}
+      >
+        {/* title bar — agent name far left, controls right */}
+        <div className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1.5 py-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-[13px] font-semibold text-ink">{title}</span>
+            {status}
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {controls}
+            <button
+              type="button"
+              data-viewer-close
+              aria-label={collapseLabel}
+              onClick={onClose}
+              className="primitive-icon-button text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink pointer-coarse:size-11"
+            >
+              <Ico size={15} path={collapseIcon} />
+            </button>
+          </div>
+        </div>
+
+        {/* the screen — inset with a little padding; the image sizes the window so the whole screen fits */}
+        <div
+          className={cn("relative min-h-0 overflow-hidden rounded-[8px] bg-inset", screenClassName)}
+          onMouseMove={onScreenMouseMove}
+          onMouseLeave={onScreenMouseLeave}
+        >
+          {children}
+        </div>
+        {inputs && <div className="shrink-0 pt-2">{inputs}</div>}
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export type AgentScreenLabels = {
   open: string;
   collapse: string;
@@ -247,8 +356,6 @@ export default function AgentScreen({
 }) {
   const [cursorPos, setCursorPos] = useState<{ x: number; y: number } | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const returnFocus = useRef<HTMLElement | null>(null);
 
   // tick while controlling — survives collapse (state lives in the caller, not the overlay)
   useEffect(() => {
@@ -257,36 +364,6 @@ export default function AgentScreen({
     return () => clearInterval(id);
   }, [controlling]);
   const secs = controlling && controlSince ? Math.max(0, Math.floor((now - controlSince) / 1000)) : 0;
-
-  // Lock scroll and contain focus while the viewer is open.
-  useEffect(() => {
-    if (!open) return;
-    returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const dialog = dialogRef.current;
-    dialog?.querySelector<HTMLElement>("button, input, [tabindex]")?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Tab" || !dialog) return;
-      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input, select, [tabindex]:not([tabindex='-1'])"));
-      if (!focusable.length) return;
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    const overflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = overflow;
-      returnFocus.current?.focus();
-    };
-  }, [open, onOpenChange]);
 
   const badge = controlling && (
     <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-red-tint py-0.5 pl-1.5 pr-2 text-[11.5px] font-medium tabular-nums text-red">
@@ -349,92 +426,51 @@ export default function AgentScreen({
       </div>
 
       {/* ── expanded viewer — portaled to <body> so it takes over the whole page ── */}
-      {open &&
-        createPortal(
-          <div
-            ref={dialogRef}
-            className="fixed inset-0 z-[70] flex items-center justify-center p-4 sm:p-6"
-            role="dialog"
-            aria-modal="true"
-            aria-label={agentName}
-            onKeyDown={(event) => {
-              if (event.key !== "Escape") return;
-              event.preventDefault();
-              event.stopPropagation();
-              onOpenChange(false);
-            }}
-          >
-            <div
-              className="absolute inset-0 bg-black/60 dark:bg-black/75"
-              style={{ animation: "fade-in 180ms ease-out both" }}
-              onClick={() => onOpenChange(false)}
-            />
-            <div
-              className="relative flex max-h-full max-w-full flex-col overflow-hidden rounded-[16px] bg-surface p-2 pt-0 shadow-overlay"
-              style={{ animation: "pop-in 240ms cubic-bezier(0.23,1,0.32,1) both" }}
-            >
-              {/* title bar — agent name far left, controls right */}
-              <div className="flex min-h-11 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1.5 py-1">
-                <div className="flex min-w-0 items-center gap-2">
-                  <span className="truncate text-[13px] font-semibold text-ink">{agentName}</span>
-                  {controlling ? badge : status}
-                </div>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  {controls}
-                  <button
-                    type="button"
-                    aria-label={labels.collapse}
-                    onClick={() => onOpenChange(false)}
-                    className="primitive-icon-button text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink pointer-coarse:size-11"
-                  >
-                    <Ico size={15} path={collapseIcon} />
-                  </button>
-                </div>
-              </div>
-
-              {/* the screen — inset with a little padding; the image sizes the window so the whole screen fits */}
-              <div
-                className={`relative min-h-0 overflow-hidden rounded-[8px] bg-inset ${controlling ? "[cursor:none]" : ""}`}
-                onMouseMove={(e) => {
-                  if (!controlling) return;
-                  const r = e.currentTarget.getBoundingClientRect();
-                  setCursorPos({ x: e.clientX - r.left, y: e.clientY - r.top });
-                }}
-                onMouseLeave={() => setCursorPos(null)}
-              >
-                {viewerScreen ? (
-                  <div className="relative overflow-hidden" style={{ width: "min(960px, 90vw)", height: inputs ? "min(560px, calc(100vh - 230px))" : "min(560px, calc(100vh - 150px))" }}>
-                    <FauxWindow tabs={tabs} activeTab={activeTab} address={address}>{viewerScreen}</FauxWindow>
-                  </div>
-                ) : loading || !streamSrc ? (
-                  <div className={`relative ${SCREEN_ASPECT}`} style={{ width: "min(960px, 90vw)" }}>
-                    {loading ? <LoadingScreen label={labels.connecting} /> : (
-                      <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-[13px] text-ink-2">{empty}</div>
-                    )}
-                  </div>
-                ) : (
-                  <img
-                    src={streamSrc}
-                    alt={labels.screen}
-                    className="block h-auto w-auto object-contain"
-                    style={{ maxHeight: inputs ? "calc(100vh - 230px)" : "calc(100vh - 150px)", maxWidth: "min(960px, 90vw)" }}
-                    onClick={controlling ? onScreenClick : undefined}
-                    onLoad={onFrameLoad}
-                    onError={onFrameError}
-                  />
-                )}
-                {controlling && cursorPos && (
-                  <CursorSvg
-                    className="pointer-events-none absolute z-10"
-                    style={{ left: cursorPos.x, top: cursorPos.y, filter: "drop-shadow(0 1px 1.5px rgba(0,0,0,0.35))" }}
-                  />
-                )}
-              </div>
-              {inputs && <div className="shrink-0 pt-2">{inputs}</div>}
+      {open && (
+        <ScreenViewer
+          title={agentName}
+          status={controlling ? badge : status}
+          controls={controls}
+          collapseLabel={labels.collapse}
+          onClose={() => onOpenChange(false)}
+          inputs={inputs}
+          screenClassName={controlling ? "[cursor:none]" : undefined}
+          onScreenMouseMove={(e) => {
+            if (!controlling) return;
+            const r = e.currentTarget.getBoundingClientRect();
+            setCursorPos({ x: e.clientX - r.left, y: e.clientY - r.top });
+          }}
+          onScreenMouseLeave={() => setCursorPos(null)}
+        >
+          {viewerScreen ? (
+            <div className="relative overflow-hidden" style={{ width: "min(960px, 90vw)", height: inputs ? "min(560px, calc(100vh - 230px))" : "min(560px, calc(100vh - 150px))" }}>
+              <FauxWindow tabs={tabs} activeTab={activeTab} address={address}>{viewerScreen}</FauxWindow>
             </div>
-          </div>,
-          document.body,
-        )}
+          ) : loading || !streamSrc ? (
+            <div className={`relative ${SCREEN_ASPECT}`} style={{ width: "min(960px, 90vw)" }}>
+              {loading ? <LoadingScreen label={labels.connecting} /> : (
+                <div className="absolute inset-0 flex items-center justify-center p-6 text-center text-[13px] text-ink-2">{empty}</div>
+              )}
+            </div>
+          ) : (
+            <img
+              src={streamSrc}
+              alt={labels.screen}
+              className="block h-auto w-auto object-contain"
+              style={{ maxHeight: inputs ? "calc(100vh - 230px)" : "calc(100vh - 150px)", maxWidth: "min(960px, 90vw)" }}
+              onClick={controlling ? onScreenClick : undefined}
+              onLoad={onFrameLoad}
+              onError={onFrameError}
+            />
+          )}
+          {controlling && cursorPos && (
+            <CursorSvg
+              className="pointer-events-none absolute z-10"
+              style={{ left: cursorPos.x, top: cursorPos.y, filter: "drop-shadow(0 1px 1.5px rgba(0,0,0,0.35))" }}
+            />
+          )}
+        </ScreenViewer>
+      )}
     </div>
   );
 }

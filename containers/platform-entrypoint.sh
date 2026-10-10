@@ -35,6 +35,7 @@ require_exact AGENT_PLATFORM_AGENT_RUNTIME_TOKEN_FILE /run/secrets/agent-platfor
 require_exact AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE /run/secrets/agent-platform/camofox-access-key
 require_exact AGENT_PLATFORM_MANAGER_SOCKET /run/agent-platform-manager/manager.sock
 require_exact AGENT_PLATFORM_MANAGER_TOKEN_FILE /run/secrets/agent-platform/manager-token
+require_exact AGENT_PLATFORM_MANAGER_EXECUTOR_TOKEN_FILE /run/secrets/agent-platform/manager-executor-token
 
 if [ "$(/usr/bin/id -u)" -eq 0 ]; then
   run_uid="${AGENT_PLATFORM_RUN_UID:-}"

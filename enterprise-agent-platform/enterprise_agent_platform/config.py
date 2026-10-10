@@ -14,6 +14,7 @@ class Settings:
     runtime_url: str = 'http://agent-runtime:8766'
     manager_socket: str = '/run/agent-platform-manager/manager.sock'
     manager_token_file: Path = Path('/run/secrets/agent-platform/manager-token')
+    manager_executor_token_file: Path = Path('/run/secrets/agent-platform/manager-executor-token')
     camofox_url: str = 'http://camofox:9377'
     camofox_access_key: str = ''
     searxng_url: str = 'http://searxng:8080'
@@ -53,6 +54,7 @@ class Settings:
             runtime_url=value('AGENT_RUNTIME_URL', 'http://agent-runtime:8766').rstrip('/'),
             manager_socket=value('MANAGER_SOCKET', '/run/agent-platform-manager/manager.sock'),
             manager_token_file=Path(value('MANAGER_TOKEN_FILE', '/run/secrets/agent-platform/manager-token')),
+            manager_executor_token_file=Path(value('MANAGER_EXECUTOR_TOKEN_FILE', '/run/secrets/agent-platform/manager-executor-token')),
             camofox_url=value('CAMOFOX_URL', 'http://camofox:9377').rstrip('/'),
             camofox_access_key=secret('CAMOFOX_ACCESS_KEY'),
             searxng_url=value('SEARXNG_API_URL', 'http://searxng:8080').rstrip('/'),

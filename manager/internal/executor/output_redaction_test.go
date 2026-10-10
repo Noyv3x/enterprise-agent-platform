@@ -148,3 +148,26 @@ func TestOutputRedactorLongIntroducerWhitespace(t *testing.T) {
 		}
 	}
 }
+
+func TestSettleShowsQuietTextAndKeepsMaskingAcrossIt(t *testing.T) {
+	var redactor outputRedactor
+	var output bytes.Buffer
+	emit := func(p []byte) { _, _ = output.Write(p) }
+	redactor.Write([]byte("prompt> "), emit)
+	if output.Len() != 0 {
+		t.Fatalf("undecided text published early: %q", output.String())
+	}
+	redactor.Settle(emit)
+	if output.String() != "prompt> " {
+		t.Fatalf("settle did not commit quiet text: %q", output.String())
+	}
+	redactor.Write([]byte("api_key=sk-live-sec"), emit)
+	redactor.Settle(emit)
+	redactor.Write([]byte("retvalue0123\nnext"), emit)
+	redactor.Settle(emit)
+	redactor.Flush(emit)
+	got := output.String()
+	if strings.Contains(got, "sk-live") || strings.Contains(got, "retvalue") || got != "prompt> api_key="+outputRedactionMarker+"\nnext" {
+		t.Fatalf("masking did not survive a settle: %q", got)
+	}
+}

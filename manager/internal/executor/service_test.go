@@ -39,8 +39,12 @@ func (engineStub) ExecArgs(_ driver.SandboxSpec, _ string, name string, args []s
 
 func newTestService(t *testing.T) (*Service, string) {
 	t.Helper()
+	return newTestServiceWithEngine(t, engineStub{})
+}
+
+func newTestServiceWithEngine(t *testing.T, engine driver.Engine) (*Service, string) {
+	t.Helper()
 	root := t.TempDir()
-	engine := engineStub{}
 	sandboxes, err := sandbox.Open(testActiveProfile, engine, filepath.Join(root, "data"), filepath.Join(root, "manager", "sandboxes.json"), "registry/sandbox@sha256:"+strings.Repeat("a", 64), "network", time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -54,7 +58,14 @@ func newTestService(t *testing.T) (*Service, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Service{Audits: AuditStore{Dir: filepath.Join(root, "control"), Log: auditLog}, Processes: processes, Files: files}, root
+	audits := AuditStore{Dir: filepath.Join(root, "control"), Log: auditLog}
+	background, err := NewBackgroundManager(testActiveProfile, engine, sandboxes, audits, BackgroundConfig{Dir: filepath.Join(root, "manager", "processes"), OwnerLimit: 16, GlobalLimit: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	background.TermGrace = 400 * time.Millisecond
+	sandboxes.OnStopped = background.SandboxStopped
+	return &Service{Audits: audits, Processes: processes, Background: background, Files: files}, root
 }
 func identity() Identity {
 	return Identity{RunID: "run-1", ScopeID: "private:1", LifecycleID: "life-1", ToolCallID: "tool-1", ExecutionContext: ExecutionContext{SandboxID: "private-1", WorkspaceID: "user-1"}}

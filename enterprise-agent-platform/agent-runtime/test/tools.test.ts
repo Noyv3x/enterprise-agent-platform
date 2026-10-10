@@ -10,8 +10,11 @@ import { promisify } from "node:util";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createTools } from "../src/tools.js";
 import { createExecutorTransport, createGatewayTransport, type ExecutorTransport, type Sandbox } from "../src/transport.js";
+import { noProcesses } from "./fakes.js";
 
 const sandbox: Sandbox = { scope_key: "private:1", workspace_id: "user-1", sandbox_id: "sandbox-1", lifecycle_id: "life-1", profile: "agent", cwd: "/workspace" };
+// Subagents (like channels and chat) keep the foreground bash; only the root personal scope gets the background one.
+const delegate: Sandbox = { ...sandbox, scope_key: "private:1/delegate/bg-1" };
 
 test("remote Pi tools audit exact operations and never forward host environment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-tools-"));
@@ -71,7 +74,8 @@ test("remote Pi tools audit exact operations and never forward host environment"
     const gateway = createGatewayTransport({ baseUrl: `http://127.0.0.1:${address.port}`, token: "gateway-secret" });
     const dependencies = { sandbox, executor, gateway, context: () => ({ sid: "agent-private-1", scope_key: sandbox.scope_key, run_id: "run-1", owner_user_id: 1 }), names: ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "browser", "schedule", "mcp"], skillsDirectory: join(directory, "skills") };
     const tools = createTools("/workspace", dependencies);
-    const invoke = async (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("call-1", args, undefined, undefined, {} as ExtensionToolContext);
+    const foreground = createTools("/workspace", { ...dependencies, sandbox: delegate, names: ["bash"] });
+    const invoke = async (name: string, args: Record<string, unknown>) => (name === "bash" ? foreground : tools).find(tool => tool.name === name)!.execute("call-1", args, undefined, undefined, {} as ExtensionToolContext);
     assert.match(JSON.stringify(await invoke("read", { path: "a.txt" })), /old/);
     await invoke("edit", { path: "a.txt", edits: [{ oldText: "old", newText: "new" }] });
     assert.equal(contents.get("/workspace/a.txt"), "new\n");
@@ -132,6 +136,7 @@ test("remote reads preserve large UTF-8 and binary bytes and reject clipped chun
   const shell = promisify(execFile);
   let clipped = false;
   const executor: ExecutorTransport = {
+    ...noProcesses,
     async terminal(_sandbox, _context, command) {
       const { stdout } = await shell("bash", ["-c", command.replaceAll("/workspace", directory)], { maxBuffer: 2_000_000 });
       return { stdout: (clipped && command.includes("base64") ? stdout.slice(4) : stdout).replaceAll(directory, "/workspace"), stderr: "", exit_code: 0, status: "completed" };
@@ -146,7 +151,7 @@ test("remote reads preserve large UTF-8 and binary bytes and reject clipped chun
     },
     async cancelRun() { return true; },
   };
-  const tools = createTools("/workspace", { sandbox, executor, gateway: { async call() { throw new Error("unused"); } },
+  const tools = createTools("/workspace", { sandbox: delegate, executor, gateway: { async call() { throw new Error("unused"); } },
     context: () => ({ sid: "files", scope_key: sandbox.scope_key, run_id: "files" }), names: ["read", "edit", "bash"] });
   const invoke = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("files", args, undefined, undefined, {} as ExtensionToolContext);
   try {

@@ -56,11 +56,14 @@ type Manager struct {
 	// ReclaimCapacity performs one controlled maintenance pass before a missing
 	// Sandbox image is retried, before acquiring any sandbox lifecycle lock.
 	ReclaimCapacity func(context.Context) error
-	mu              sync.Mutex
-	registry        registry
-	ensureMu        sync.Mutex
-	ensureByID      map[string]*sync.Mutex
-	profile         identity.Profile
+	// OnStopped is told after a sandbox is stopped outside the startup barrier
+	// so supervised background processes can record sandbox_stopped.
+	OnStopped  func(sandboxID string)
+	mu         sync.Mutex
+	registry   registry
+	ensureMu   sync.Mutex
+	ensureByID map[string]*sync.Mutex
+	profile    identity.Profile
 }
 
 func Open(active identity.ActiveProfile, engine driver.Engine, dataDir, statePath, image, network string, idle time.Duration) (*Manager, error) {
@@ -185,6 +188,9 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 			if err := m.Engine.StopSandbox(ctx, existing.ContainerName); err != nil {
 				return driver.SandboxSpec{}, fmt.Errorf("stop stale sandbox image: %w", err)
 			}
+			if m.OnStopped != nil {
+				m.OnStopped(sandboxID)
+			}
 			if err := m.Engine.RemoveSandbox(ctx, existing.ContainerName); err != nil {
 				return driver.SandboxSpec{}, fmt.Errorf("remove stale sandbox image: %w", err)
 			}
@@ -289,6 +295,9 @@ func (m *Manager) Reap(ctx context.Context, now time.Time) ([]string, error) {
 		if err := m.Engine.StopSandbox(ctx, record.ContainerName); err != nil {
 			unlock()
 			return stopped, err
+		}
+		if m.OnStopped != nil {
+			m.OnStopped(record.SandboxID)
 		}
 		m.mu.Lock()
 		original := m.registry.Records[record.SandboxID]

@@ -27,8 +27,12 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.conn = sqlite3.connect(":memory:")
         self.addCleanup(self.conn.close)
         self.conn.execute("CREATE TABLE durable_jobs(kind TEXT, status TEXT)")
+        self.conn.execute("CREATE TABLE background_tasks(kind TEXT, status TEXT)")
+        self.executor_token = self.root / "executor-token"
+        self.executor_token.write_text("executor-secret")
         self.platform = SimpleNamespace(
             settings=SimpleNamespace(data_dir=self.root, manager_token_file=self.token,
+                                     manager_executor_token_file=self.executor_token,
                                      manager_socket=str(self.root / "manager.sock")),
             queue=SimpleNamespace(active=0, resume=lambda: None),
             db=SimpleNamespace(connect=lambda: self.conn, schema_version=lambda: 17,
@@ -90,6 +94,32 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.platform.queue.active = 0
         self.gate.closing = True
         self.assertEqual(await self.gate.readiness("one"), {**self.idle(), "blocker_error": "service is shutting down"})
+
+    async def test_running_subagents_block_updates_but_processes_and_finished_agents_do_not(self):
+        self.conn.execute("INSERT INTO background_tasks VALUES ('process', 'running')")
+        self.conn.execute("INSERT INTO background_tasks VALUES ('agent', 'completed')")
+        self.conn.execute("INSERT INTO background_tasks VALUES ('agent', 'interrupted')")
+        self.assertEqual(await self.gate.readiness("one"), self.idle(True))
+        await self.gate.release("one", commit=False)
+        self.conn.execute("INSERT INTO background_tasks VALUES ('agent', 'running')")
+        self.conn.execute("INSERT INTO background_tasks VALUES ('agent', 'running')")
+        self.platform.queue.active = 1
+        self.assertEqual(await self.gate.readiness("two"), {**self.idle(), "active_agent_tasks": 3})
+        self.assertIsNone(self.gate.reserved)
+        self.assertEqual((await self.gate.health())["active_agent_tasks"], 3)
+
+    async def test_executor_requests_use_the_executor_credential_and_report_the_upstream_status(self):
+        server = await self.start_manager([self.response(b'{"ok":true}'), self.response(b'{"error":"busy"}', 409)])
+        self.assertEqual(await manager_request(self.platform, "POST", "/v1/executor/process/list", {}, executor=True), {"ok": True})
+        self.assertIn(b"Bearer executor-secret", self.requests[0])
+        self.assertNotIn(b"first-token", self.requests[0])
+        with self.assertRaises(ManagerClientError) as raised:
+            await manager_request(self.platform, "POST", "/v1/executor/process/stdin", {}, executor=True)
+        self.assertEqual(raised.exception.upstream_status, 409)
+        self.executor_token.unlink()
+        with self.assertRaisesRegex(ManagerClientError, "token is unavailable"):
+            await manager_request(self.platform, "POST", "/v1/executor/process/list", {}, executor=True)
+        server.close()
 
     async def test_commit_publishes_before_release_failed_commit_held_abort_does_not_publish(self):
         self.assertEqual(await self.gate.release("never-reserved", commit=False), {"released": True})

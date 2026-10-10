@@ -14,7 +14,9 @@ import (
 type Service struct {
 	Audits    AuditStore
 	Processes *ProcessManager
-	Files     FileService
+	// Background supervises processes that outlive their request and run.
+	Background *BackgroundManager
+	Files      FileService
 }
 
 func (s *Service) Audit(request AuditRequest) (AuditReceipt, error) {
@@ -174,7 +176,11 @@ func (s *Service) File(ctx context.Context, call Call) (map[string]any, error) {
 	return map[string]any{"content": content, "details": details}, nil
 }
 func (s *Service) CancelRun(identity RunIdentity) bool {
-	return s.Processes.CancelRun(identity)
+	foreground := s.Processes.CancelRun(identity)
+	if s.Background == nil {
+		return foreground
+	}
+	return s.Background.CancelRun(identity) && foreground
 }
 func decodeArguments(raw json.RawMessage, value any) error {
 	if len(raw) == 0 {

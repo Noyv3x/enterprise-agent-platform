@@ -220,7 +220,7 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 		default:
 		}
 	}
-	execution, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes)
+	execution, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes, executor.BackgroundConfig{Dir: filepath.Join(cfg.StateDir, "processes"), OwnerLimit: cfg.BackgroundProcessLimit, GlobalLimit: cfg.BackgroundProcessGlobalLimit})
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +235,7 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 	return app, nil
 }
 
-func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64) (*executor.Service, error) {
+func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64, background executor.BackgroundConfig) (*executor.Service, error) {
 	processes, err := executor.NewProcessManager(active, engine, sandboxes, commandMaxBytes)
 	if err != nil {
 		return nil, err
@@ -244,7 +244,13 @@ func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sa
 	if err != nil {
 		return nil, err
 	}
-	return &executor.Service{Audits: executor.AuditStore{Dir: auditDir, Log: audit}, Processes: processes, Files: files}, nil
+	audits := executor.AuditStore{Dir: auditDir, Log: audit}
+	supervised, err := executor.NewBackgroundManager(active, engine, sandboxes, audits, background)
+	if err != nil {
+		return nil, err
+	}
+	sandboxes.OnStopped = supervised.SandboxStopped
+	return &executor.Service{Audits: audits, Processes: processes, Background: supervised, Files: files}, nil
 }
 
 func preflightCommand(arguments []string) error {
@@ -310,6 +316,13 @@ func serveCommandWithBuild(arguments []string, cfg config.Config, builder func(c
 	cleanupCancel()
 	if err != nil {
 		return fmt.Errorf("stop managed sandboxes before executor startup: %w", err)
+	}
+	// Every sandbox process is gone now: persisted running processes become
+	// interrupted (system_restart) and are never replayed.
+	if app.api != nil && app.api.Executor != nil && app.api.Executor.Background != nil {
+		if err := app.api.Executor.Background.Recover(); err != nil {
+			return fmt.Errorf("record interrupted background processes: %w", err)
+		}
 	}
 	listener, err := control.Listen(app.config.SocketPath)
 	if err != nil {

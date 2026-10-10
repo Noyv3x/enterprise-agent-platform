@@ -60,6 +60,7 @@ async function mount(messages: Message[] = []) {
       return { ok: true };
     }
     if (path.startsWith("/api/workspace/files")) return { files: [] };
+    if (path === "/api/tasks") return { tasks: [] };
     throw new Error(`unexpected ${method} ${path}`);
   });
   const aside = document.createElement("div");

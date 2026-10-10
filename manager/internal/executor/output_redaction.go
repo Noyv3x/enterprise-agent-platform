@@ -56,6 +56,7 @@ type outputRedactor struct {
 	escaped    bool
 	urlMasked  bool
 	previewing bool
+	settling   bool
 }
 
 func (r *outputRedactor) Write(p []byte, emit func([]byte)) {
@@ -69,6 +70,16 @@ func (r *outputRedactor) Write(p []byte, emit func([]byte)) {
 
 func (r *outputRedactor) Flush(emit func([]byte)) {
 	r.drain(true, emit)
+}
+
+// Settle commits the undecided text suffix without ending the stream, so a
+// quiet long-lived process is not shown late. Masking in progress (value,
+// quoted, PEM and URL state) carries on across the settle; only an introducer
+// split exactly at a settle point and finished later can escape recognition.
+func (r *outputRedactor) Settle(emit func([]byte)) {
+	r.settling = true
+	r.drain(false, emit)
+	r.settling = false
 }
 
 // Preview sanitizes the undecided suffix without advancing the stream. The
@@ -196,7 +207,7 @@ func (r *outputRedactor) drain(final bool, emit func([]byte)) {
 		// Only commit matches whose start is outside the undecided suffix.
 		// This prevents a shorter match winning before a longer introducer arrives.
 		safe := len(r.pending)
-		if !final {
+		if !final && !r.settling {
 			safe -= outputRedactionWindow
 			if safe < 0 {
 				safe = 0

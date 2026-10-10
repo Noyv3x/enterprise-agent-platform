@@ -1,9 +1,10 @@
 import { memo, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ThinkingState, { TraceProse, TraceStep, TraceThinking } from "../../components/ui/beautiful/primitives/ThinkingState";
-import ToolChips, { type ToolDetailLine, type ToolDiff, type ToolDiffLine, type ToolStep } from "../../components/ui/beautiful/primitives/ToolChips";
+import ToolChips, { type ToolChildRow, type ToolDetailLine, type ToolDiff, type ToolDiffLine, type ToolStep } from "../../components/ui/beautiful/primitives/ToolChips";
 import { useWords } from "../../words";
 import { ComputerContext, fileName } from "./computerView";
 import { Markdown } from "./Markdown";
+import { TASK_TOOL_STATE, TasksContext, agentTypeLabel, isRunning, promotedTaskId, taskElapsed, taskStatusLabel, tokenCount, type TasksValue, type TaskView } from "./taskState";
 import { formatThinking } from "./thinking";
 import type { RunRef } from "./types";
 import { toolVerb, type WorkItem, type WorkTrace, type Words } from "./work";
@@ -44,7 +45,7 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
   const { args } = tool;
   const path = arg(args, "path");
   let icon = "tool";
-  let label = toolVerb(tool.name, w);
+  let label = toolVerb(tool.name, w, args);
   let chip = "";
   let mono = true;
   let input: ToolDetailLine[] = [];
@@ -111,6 +112,26 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
       chip = arg(args, "action") || arg(args, "name");
       input = lines(JSON.stringify(args, null, 2), "muted");
       break;
+    case "task": {
+      const assignments: unknown[] = Array.isArray(args.tasks) ? args.tasks : [];
+      icon = "agents";
+      chip = assignments.map((entry) => {
+        const item = entry && typeof entry === "object" ? entry as Record<string, unknown> : {};
+        return arg(item, "name") || arg(item, "task").split("\n", 1)[0].slice(0, 60);
+      }).filter(Boolean).join(" · ");
+      mono = false;
+      input = lines(JSON.stringify(args, null, 2), "muted");
+      break;
+    }
+    case "job":
+      icon = "run";
+      chip = [arg(args, "id"), arg(args, "action") === "input" ? arg(args, "text") : ""].filter(Boolean).join("  ");
+      input = lines(JSON.stringify(args, null, 2), "muted");
+      break;
+    case "wait":
+      icon = "clock";
+      chip = Array.isArray(args.ids) && args.ids.length ? args.ids.filter((id): id is string => typeof id === "string").join(" ") : w("Any task", "任一任务", "任一任務");
+      break;
     default: {
       const json = Object.keys(args).length ? JSON.stringify(args) : "";
       chip = arg(args, "_preview") || arg(args, "detail") || [arg(args, "server"), arg(args, "tool")].filter(Boolean).join(" · ") || json;
@@ -133,10 +154,48 @@ function describe(tool: ToolItem, w: Words): { step: ToolStep; diff?: ToolDiff; 
   };
 }
 
+/** A subagent under the `task` row that started it: name, type chip, activity, then id, elapsed time and tokens. */
+function subagentRow(task: TaskView, tasks: TasksValue, now: number, w: Words): ToolChildRow {
+  const activity = isRunning(task)
+    ? task.current ? `${toolVerb(task.current.tool, w)} ${task.current.summary}`.trim() : w("Thinking", "思考中", "思考中")
+    : task.status === "completed" && task.result_preview ? task.result_preview.split("\n").find((line) => line.trim()) ?? taskStatusLabel(task, w)
+      : taskStatusLabel(task, w);
+  const meta = [task.id, taskElapsed(task, now), task.usage ? tokenCount(task.usage.total_tokens, w) : null].filter(Boolean).join(" · ");
+  return {
+    id: task.id, label: task.name || task.id, tag: agentTypeLabel(task.agent_type, w), state: TASK_TOOL_STATE[task.status],
+    stateLabel: taskStatusLabel(task, w), activity, meta, onSelect: () => tasks.open(task.id),
+  };
+}
+
 function ToolGroup({ tools, run }: { tools: ToolItem[]; run: RunRef }) {
   const w = useWords();
   const computer = useContext(ComputerContext);
-  const described = tools.map((tool) => describe(tool, w));
+  const tasks = useContext(TasksContext);
+  const agents = tasks ? tools.flatMap((tool) => tool.name === "task" ? (tasks.byToolCall.get(tool.id) ?? []).filter((task) => task.kind === "agent") : []) : [];
+  // Elapsed times of running subagents tick even after the turn ended.
+  const now = useNow(agents.some(isRunning));
+  const described = tools.map((tool) => {
+    const { step, ...rest } = describe(tool, w);
+    if (tool.name === "task" && tasks) {
+      const children = agents.filter((task) => task.created_by_tool_call_id === tool.id).map((task) => subagentRow(task, tasks, now, w));
+      return { ...rest, step: { ...step, children } };
+    }
+    const background = tool.name === "bash" ? tool.background ?? promotedTaskId(tool.output) : null;
+    if (!background) return { ...rest, step };
+    const task = tasks?.byId.get(background);
+    return {
+      ...rest,
+      step: {
+        ...step,
+        badge: {
+          label: w(`Background · ${background}`, `后台 · ${background}`, `背景 · ${background}`),
+          state: task ? TASK_TOOL_STATE[task.status] : "running",
+          stateLabel: task ? taskStatusLabel(task, w) : w("Running", "运行中", "執行中"),
+          onSelect: tasks ? () => tasks.open(background) : undefined,
+        },
+      },
+    };
+  });
   const diffs = new Map<string, ToolDiff>();
   const diffLines: Record<string, ToolDiffLine[]> = {};
   for (const { diff, diffLines: rows } of described) {
@@ -166,7 +225,7 @@ function seconds(ms: number): string {
 }
 
 /** Re-renders every second while `active`. */
-function useNow(active: boolean): number {
+export function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!active) return;
@@ -199,6 +258,7 @@ function activeLabel(items: WorkItem[], w: Words): string {
   const last = items[items.length - 1];
   if (last?.type === "tool" && last.status === "running") {
     if (last.name === "web_search" || last.name === "web_fetch") return w("Searching the web", "正在搜索网页", "正在搜尋網頁");
+    if (last.name === "wait") return w("Waiting for background results", "正在等待后台结果", "正在等待背景結果");
     return w("Running tools", "正在使用工具", "正在使用工具");
   }
   return w("Thinking", "思考中", "思考中");

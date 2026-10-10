@@ -47,7 +47,7 @@ Image builds compile Runtime TypeScript and frontend static assets on the build 
 
 Defaults are configurable in M1's `manager.toml`; see [exact keys and types](../reference/data-layout.md#sandbox-profiles). Profile and workspace are bound at creation; omitted `execution_context.profile` defaults to `agent`. Chat has no attachments mount; Platform copies uploads into each conversation directory. Chat file tools enforce that directory; bash starts there but may access the user's other conversations. No per-conversation containers are created.
 
-M1 prefetches the sandbox image during update pulls. Idle stop preserves data. The sandbox image includes office-document tools and the stdio MCP helper; installing workspace dependencies must not require host execution or host credentials.
+M1 prefetches the sandbox image during update pulls. Idle stop preserves data but never stops a sandbox that hosts a running background process (an obsolete image is likewise replaced only after its processes end). The sandbox image includes office-document tools and the stdio MCP helper; installing workspace dependencies must not require host execution or host credentials.
 
 The image keeps its existing tini entrypoint and sudo capability: no additional Docker `--init` or `no-new-privileges` flag is added, preserving pip/npm installs that need system dependencies or global paths inside the sandbox.
 

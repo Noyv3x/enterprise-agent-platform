@@ -134,6 +134,8 @@ func validateOperationAction(operation, action string) error {
 	switch operation {
 	case "terminal":
 		valid = action == "run"
+	case "process":
+		valid = action == "start" || action == "stdin" || action == "kill"
 	case "read_file":
 		valid = action == "read"
 	case "write_file":

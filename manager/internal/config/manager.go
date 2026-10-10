@@ -188,7 +188,9 @@ sandbox_chat_memory_swap = %q
 sandbox_chat_cpus = %q
 sandbox_chat_pids_limit = %d
 sandbox_chat_idle = %q
-`, c.SandboxAgent.Memory, c.SandboxAgent.MemorySwap, c.SandboxAgent.CPUs, c.SandboxAgent.PidsLimit, c.SandboxChat.Memory, c.SandboxChat.MemorySwap, c.SandboxChat.CPUs, c.SandboxChat.PidsLimit, c.SandboxChatIdle.String())
+background_process_limit = %d
+background_process_global_limit = %d
+`, c.SandboxAgent.Memory, c.SandboxAgent.MemorySwap, c.SandboxAgent.CPUs, c.SandboxAgent.PidsLimit, c.SandboxChat.Memory, c.SandboxChat.MemorySwap, c.SandboxChat.CPUs, c.SandboxChat.PidsLimit, c.SandboxChatIdle.String(), c.BackgroundProcessLimit, c.BackgroundProcessGlobalLimit)
 }
 
 func formatStringArray(values []string) string {

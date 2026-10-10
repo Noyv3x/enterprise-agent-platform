@@ -93,7 +93,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
         self.assertEqual(settings, {'keep'})
-        self.assertEqual(db.schema_version(), 2026100201)
+        self.assertEqual(db.schema_version(), 2026101101)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -106,10 +106,43 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026100201)
+        self.assertEqual(self.db.schema_version(), 2026101101)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101, 2026100201])
+                             [2026082901, 2026100101, 2026100201, 2026101101])
+
+    def test_background_tasks_migration_is_additive_idempotent_and_constrained(self):
+        import sqlite3
+        db = self.old_database()
+        db.migrate(db.path.parent)
+        with db.connect() as conn:
+            # A database as 2026100201 left it: no task table yet, live data present.
+            conn.execute('DROP TABLE background_tasks')
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101101')
+            counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
+        db.migrate(db.path.parent)
+        self.assertEqual(db.schema_version(), 2026101101)
+        before = self.shape(db)
+        with db.connect() as conn:
+            applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0]
+            self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)
+            columns = [row[1] for row in conn.execute('PRAGMA table_info(background_tasks)')]
+        self.assertEqual(columns, ['id', 'user_id', 'kind', 'external_id', 'name', 'label', 'agent_type', 'prompt', 'status', 'reason',
+                                   'exit_code', 'started_at', 'ended_at', 'result', 'work_json', 'usage_json', 'created_by_message_id',
+                                   'created_by_tool_call_id', 'run_job_id', 'delivered_at', 'notice_job_id', 'updated_at'])
+        db.migrate(db.path.parent)
+        self.assertEqual(self.shape(db), before)
+        with db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0], applied)
+            self.assertEqual(conn.execute('SELECT count(*) FROM background_tasks').fetchone()[0], 0)
+            insert = ("INSERT INTO background_tasks(user_id,kind,external_id,status,result,started_at,updated_at) "
+                      "VALUES (?,?,?,?,?,1,1)")
+            conn.execute(insert, (1, 'process', 'proc_a', 'running', 'x' * 65536))
+            for bad in ((1, 'process', 'proc_b', 'running', 'x' * 65537), (1, 'daemon', 'proc_c', 'running', ''),
+                        (1, 'process', 'proc_d', 'paused', ''), (1, 'process', 'proc_a', 'running', ''),
+                        (99, 'process', 'proc_e', 'running', '')):
+                with self.assertRaises(sqlite3.IntegrityError, msg=bad):
+                    conn.execute(insert, bad)
 
     def before_chat_model_change(self):
         """A database as 2026100101 left it: chat model policies and a model on every conversation."""

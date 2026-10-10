@@ -61,8 +61,9 @@ function Clipped({ call, className = "" }: { call: ToolCall; className?: string 
   return <p className={`${NOTE} ${className}`}>{w("Only part of this step was kept", "仅保留了部分内容", "僅保留了部分內容")}</p>;
 }
 
-/** The window's scrolling frame: follows the end while `stick` holds; a reader scrolling up stops it. */
-function FollowEnd({ signal, follow, role, label, children }: { signal: unknown; follow: boolean; role?: "log"; label: string; children: ReactNode }) {
+/** The window's scrolling frame: follows the end while `stick` holds; a reader scrolling up stops it. The process
+ * output viewer uses it too. */
+export function FollowEnd({ signal, follow, role, label, children }: { signal: unknown; follow: boolean; role?: "log"; label: string; children: ReactNode }) {
   const node = useRef<HTMLDivElement>(null);
   const stick = useRef(follow);
   useLayoutEffect(() => {

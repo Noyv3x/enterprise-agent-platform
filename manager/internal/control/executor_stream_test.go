@@ -53,7 +53,12 @@ func newStreamAPI(t *testing.T) *API {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &executor.Service{Audits: executor.AuditStore{Dir: filepath.Join(root, "control"), Log: logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)}, Processes: processes, Files: files}
+	audits := executor.AuditStore{Dir: filepath.Join(root, "control"), Log: logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)}
+	background, err := executor.NewBackgroundManager(profile, engine, sandboxes, audits, executor.BackgroundConfig{Dir: filepath.Join(root, "manager", "processes"), OwnerLimit: 2, GlobalLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &executor.Service{Audits: audits, Processes: processes, Background: background, Files: files}
 	return &API{Executor: service, ExecutorToken: streamExecutorToken}
 }
 

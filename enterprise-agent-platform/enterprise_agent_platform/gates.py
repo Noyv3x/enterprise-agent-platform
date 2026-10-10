@@ -16,17 +16,19 @@ MAX_MANAGER_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class ManagerClientError(HTTPException):
-    def __init__(self, detail):
+    def __init__(self, detail, upstream_status=None):
         super().__init__(502, detail)
+        self.upstream_status = upstream_status
 
 
 class ManagerResponseUncertainError(ManagerClientError):
     """The request may have taken effect; never automatically replay it."""
 
 
-def _token(platform):
+def _token(platform, executor=False):
+    path = platform.settings.manager_executor_token_file if executor else platform.settings.manager_token_file
     try:
-        token = platform.settings.manager_token_file.read_text(encoding="utf-8").strip()
+        token = path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError) as exc:
         raise ManagerClientError("manager token is unavailable") from exc
     if not token or any(c in token for c in "\r\n\x00"):
@@ -107,9 +109,12 @@ class Gate:
                 "SELECT status, COUNT(*) FROM durable_jobs "
                 "WHERE kind = 'agent' AND status IN ('queued', 'running') GROUP BY status"
             ).fetchall())
+            # Running subagents are agent work. Processes are Manager's and never block an update.
+            subagents = conn.execute(
+                "SELECT COUNT(*) FROM background_tasks WHERE kind = 'agent' AND status = 'running'").fetchone()[0]
         return {
             "reserved": False,
-            "active_agent_tasks": self.platform.queue.active,
+            "active_agent_tasks": self.platform.queue.active + subagents,
             "queued_agent_jobs": counts.get("queued", 0),
             "running_agent_jobs": counts.get("running", 0),
             "admissions_in_progress": self.admissions,
@@ -215,14 +220,14 @@ def routes():
     ]
 
 
-async def manager_request(platform, method, path, body=None):
+async def manager_request(platform, method, path, body=None, *, executor=False, timeout=10):
     if not path.startswith("/") or path.startswith("//") or any(c in path for c in "\r\n\x00"):
         raise ValueError("manager API path is invalid")
-    token = _token(platform)
+    token = _token(platform, executor)
     transport = httpx.AsyncHTTPTransport(uds=str(platform.settings.manager_socket), retries=0)
     status = None
     try:
-        async with httpx.AsyncClient(transport=transport, timeout=10, trust_env=False) as client:
+        async with httpx.AsyncClient(transport=transport, timeout=timeout, trust_env=False) as client:
             async with client.stream(
                 method, "http://localhost" + path, json=body,
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -244,7 +249,7 @@ async def manager_request(platform, method, path, body=None):
                     raise error("manager returned invalid JSON; outcome is uncertain" if successful
                                 else "manager returned invalid error JSON") from exc
                 if not successful:
-                    raise ManagerClientError(f"manager HTTP {status}: {str(decoded.get('error') or 'request failed')[:1024]}")
+                    raise ManagerClientError(f"manager HTTP {status}: {str(decoded.get('error') or 'request failed')[:1024]}", status)
                 return decoded
     except (httpx.HTTPError, OSError) as exc:
         error = ManagerClientError if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)) else ManagerResponseUncertainError

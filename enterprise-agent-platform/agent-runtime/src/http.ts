@@ -3,7 +3,7 @@ import { createServer as nodeCreateServer, type IncomingMessage, type ServerResp
 import type { Runtime } from './runtime.js';
 
 type Service = Pick<Runtime, 'start' | 'steer' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
-const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp'];
+const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
   return Object.assign(new Error(message), { status });
@@ -29,7 +29,7 @@ function validateSteer(value: unknown): asserts value is Parameters<Runtime['ste
   if (typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
 }
 function validateRun(value: unknown): asserts value is Parameters<Runtime['start']>[1] {
-  if (!object(value) || !['agent', 'chat'].includes(String(value.kind))) throw failure(400, 'Invalid run kind');
+  if (!object(value) || !['agent', 'chat', 'subagent'].includes(String(value.kind))) throw failure(400, 'Invalid run kind');
   const { sandbox, model, prompt, resources } = value;
   if (!object(sandbox) || !['scope_key', 'workspace_id', 'sandbox_id', 'lifecycle_id', 'cwd'].every(key => text(sandbox[key])) || !['agent', 'chat'].includes(String(sandbox.profile))) throw failure(400, 'Invalid sandbox');
   validateModel(model);

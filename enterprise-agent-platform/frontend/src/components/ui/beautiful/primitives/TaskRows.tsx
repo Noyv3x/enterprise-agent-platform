@@ -2,7 +2,10 @@
  * Adaptations: the demo tick sequence is replaced by a real `status` per row (done / running / failed /
  * pending / idle) with an optional `pill` override and an optional expanded `children` slot for actions;
  * rows may be controlled (`open`/`onToggleRow`); labels come from the caller's i18n; the failed pill's
- * retry glyph is static because nothing retries automatically. */
+ * retry glyph is static because nothing retries automatically. A row with `onSelect` (the personal AI's
+ * background tasks) opens something else instead of expanding: the same row button, its chevron turned to
+ * point right, no detail and no `aria-expanded`. In a narrow container the caller may add `task-rows-stacked`
+ * to `className` so the amount sits under the label, as it already does on narrow windows (task-rows.css). */
 import { useId, useState, type ReactNode } from "react";
 import "./task-rows.css";
 
@@ -76,6 +79,8 @@ export type TaskRow = {
   details: TaskDetail[];
   /** Extra expanded content under the detail lines (actions, notes). */
   children?: ReactNode;
+  /** Selecting the row opens something else; the row does not expand. */
+  onSelect?: () => void;
 };
 
 export type TaskRowsLabels = {
@@ -160,7 +165,7 @@ export default function TaskRows({
       }${className ? ` ${className}` : ""}`}
     >
       {rows.map((row, i) => {
-        const open = openState[row.key] ?? false;
+        const open = !row.onSelect && (openState[row.key] ?? false);
         const detailId = `${idPrefix}-task-row-${row.key}-detail`;
         return (
           <div
@@ -176,9 +181,13 @@ export default function TaskRows({
           >
             <button
               type="button"
-              aria-expanded={open}
-              aria-controls={detailId}
+              aria-expanded={row.onSelect ? undefined : open}
+              aria-controls={row.onSelect ? undefined : detailId}
               onClick={() => {
+                if (row.onSelect) {
+                  row.onSelect();
+                  return;
+                }
                 if (!controlledOpen) setManualOpen((current) => ({ ...current, [row.key]: !open }));
                 onToggleRow?.(row.key, !open);
               }}
@@ -201,7 +210,7 @@ export default function TaskRows({
                 <svg
                   width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
                   className="transition-transform duration-300"
-                  style={{ transform: open ? "rotate(180deg)" : "rotate(0)" }}
+                  style={{ transform: row.onSelect ? "rotate(-90deg)" : open ? "rotate(180deg)" : "rotate(0)" }}
                 >
                   <path d="M6 9l6 6 6-6" />
                 </svg>
@@ -209,7 +218,7 @@ export default function TaskRows({
             </button>
 
             {/* dropdown detail — same expandable grammar as Chain of Thought */}
-            <div
+            {!row.onSelect && <div
               id={detailId}
               className="grid transition-[grid-template-rows,opacity] duration-300"
               style={{
@@ -243,7 +252,7 @@ export default function TaskRows({
                   </div>
                 </div>
               </div>
-            </div>
+            </div>}
           </div>
         );
       })}
