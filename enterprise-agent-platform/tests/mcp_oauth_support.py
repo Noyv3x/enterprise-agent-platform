@@ -3,6 +3,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import secrets
 import time
@@ -24,11 +25,14 @@ from enterprise_agent_platform.mcp.store import SecretStore
 
 
 PUBLIC = '93.184.216.34'
+HOST_INTERFACE_NETWORKS = net.interface_networks
 
 
 class fake_network:
     """Real loopback servers behind public-looking `*.test` names: DNS answers come from `answers` (default: a public address)
-    and every connection the guard has already approved is routed to 127.0.0.1. Usable with `with` and `async with`."""
+    and every connection the guard has already approved is routed to 127.0.0.1. Unless a test sets them itself, Platform's
+    own interface subnets are pinned to a documentation range, so the outcome never depends on the test machine's real
+    networks (CI runners use 10.x addresses). Usable with `with` and `async with`."""
 
     def __init__(self, answers=None):
         self.answers = answers if answers is not None else {}
@@ -45,6 +49,8 @@ class fake_network:
             return await connect(backend, '127.0.0.1' if host in known else host, port, timeout=timeout, local_address=local_address, socket_options=socket_options)
 
         self.patches = [patch.object(net, 'resolve', resolve), patch.object(AutoBackend, 'connect_tcp', route)]
+        if net.interface_networks is HOST_INTERFACE_NETWORKS:
+            self.patches.append(patch.object(net, 'interface_networks', lambda: [ipaddress.ip_network('198.51.100.0/24')]))
         for item in self.patches:
             item.start()
         return answers
