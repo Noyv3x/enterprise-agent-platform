@@ -142,6 +142,11 @@ function describe(tool: ToolItem, w: Words): Described {
       input = lines(JSON.stringify(args, null, 2), "muted");
       break;
     }
+    case "artifact":
+      // publish names the artifact (its title, else its sandbox path); list has no subject.
+      icon = "write";
+      chip = arg(args, "title") || path;
+      break;
     default: {
       const json = Object.keys(args).length ? JSON.stringify(args) : "";
       chip = arg(args, "_preview") || arg(args, "detail") || [arg(args, "server"), arg(args, "tool")].filter(Boolean).join(" · ") || json;

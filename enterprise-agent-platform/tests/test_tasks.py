@@ -18,6 +18,7 @@ from enterprise_agent_platform.db import Database
 from policy_support import set_default_policy
 from enterprise_agent_platform.gates import Gate, ManagerClientError
 from enterprise_agent_platform.queue import Queue, _WorkTrace
+from enterprise_agent_platform.artifacts import Artifacts
 from enterprise_agent_platform.skills import Skills
 from enterprise_agent_platform.tasks import (
     SUBAGENT_TOOLS, Tasks, TaskError, classify, notice_text, parse_id, routes, view,
@@ -36,7 +37,7 @@ class Files:
     def for_message(self, info, mid):
         return []
 
-    async def deliver(self, user, info, mid, text):
+    async def deliver(self, user, info, mid, text, job_id=None):
         return []
 
 
@@ -242,6 +243,7 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
                                      public_base_url="http://platform", trusted_proxy=False,
                                      agent_tool_token="tool-secret", builtin_skills_dir=root / "builtin"))
         self.p.skills = Skills(self.p)
+        self.p.artifacts = Artifacts(self.p)
         self.p.gate = Gate(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}]}))
         self.q = self.p.queue = Queue(self.p)

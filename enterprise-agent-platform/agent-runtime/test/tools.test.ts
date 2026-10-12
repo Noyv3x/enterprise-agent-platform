@@ -183,6 +183,32 @@ test("skill is a gateway tool for personal and channel root scopes only, skill r
   }
 });
 
+test("artifact is a gateway tool for every root scope, forwards to the artifacts route and publish gets the long timeout", async () => {
+  const calls: { tool: string; action: string; args: Record<string, unknown>; timeout: number | undefined }[] = [];
+  const gateway = { async call(tool: string, action: string, args: Record<string, unknown>, _context: unknown, _signal: unknown, timeout?: number) {
+    calls.push({ tool, action, args, timeout });
+    return { content: "Published as version 2", data: { version: 2 }, is_error: false };
+  } } as unknown as Parameters<typeof createTools>[1]["gateway"];
+  const build = (value: Sandbox, artifacts: boolean, cwd = "/workspace") => createTools(cwd, { sandbox: value, executor: noProcesses as unknown as ExecutorTransport, gateway, artifacts, names: ["read", "artifact", "skill"], context: () => ({ sid: "s", scope_key: value.scope_key, run_id: "r" }) });
+  const channel: Sandbox = { ...sandbox, scope_key: "channel:7:main-agent" };
+  const chat: Sandbox = { ...sandbox, profile: "chat", scope_key: "chat:1" };
+  assert.deepEqual(build(sandbox, true).map(tool => tool.name).sort(), ["artifact", "read"]);
+  assert.deepEqual(build(channel, true).map(tool => tool.name).sort(), ["artifact", "read"]);
+  assert.deepEqual(build(chat, true, "/workspace/conversation-a").map(tool => tool.name).sort(), ["artifact", "read"]);
+  assert.deepEqual(build(sandbox, false).map(tool => tool.name).sort(), ["read"]);
+  const artifact = build(chat, true).find(tool => tool.name === "artifact")!;
+  assert.match(artifact.description, /same path/);
+  assert.match(artifact.description, /folder/);
+  assert.match(artifact.description, /MEDIA/);
+  const result = await artifact.execute("a1", { action: "publish", path: "/workspace/site", entry: "index.html", title: "Site" }, undefined, undefined, {} as ExtensionToolContext);
+  assert.equal(JSON.stringify(result.content), JSON.stringify([{ type: "text", text: "Published as version 2" }]));
+  await artifact.execute("a2", { action: "list" }, undefined, undefined, {} as ExtensionToolContext);
+  assert.deepEqual(calls, [
+    { tool: "artifacts", action: "publish", args: { path: "/workspace/site", entry: "index.html", title: "Site" }, timeout: 300_000 },
+    { tool: "artifacts", action: "list", args: {}, timeout: 120_000 },
+  ]);
+});
+
 test("remote reads preserve large UTF-8 and binary bytes and reject clipped chunks before edit", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-remote-files-"));
   const shell = promisify(execFile);

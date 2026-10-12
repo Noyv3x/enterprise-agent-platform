@@ -5,6 +5,7 @@ import LoadingState from "../../components/ui/beautiful/primitives/LoadingState"
 import StreamingText, { type StreamingAction } from "../../components/ui/beautiful/primitives/StreamingText";
 import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
+import { ArtifactCards, baseName, messageArtifacts } from "../artifacts/ArtifactCards";
 import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
 import { TaskNoticeRow } from "./Tasks";
@@ -12,15 +13,16 @@ import type { LiveRun, Message } from "./types";
 import { messageWork, splitLive, workSegments, type WorkTrace } from "./work";
 import { WorkView } from "./WorkView";
 
-/** `MEDIA: /workspace/x` lines stay in stored text; the attachment card replaces the ones it delivered. */
+/** `MEDIA: /workspace/x` lines stay in stored text; the attachment or artifact card replaces the ones it delivered. */
 export function visibleContent(message: Message): string {
-  if (!message.attachments.length) return message.content;
-  const names = new Set(message.attachments.map((attachment) => attachment.filename));
+  const artifacts = messageArtifacts(message);
+  if (!message.attachments.length && !artifacts.length) return message.content;
+  const names = new Set([...message.attachments.map((attachment) => attachment.filename), ...artifacts.map((artifact) => baseName(artifact.path))]);
   return message.content
     .split("\n")
     .filter((line) => {
       const media = /^\s*MEDIA:\s*(\S.*?)\s*$/.exec(line);
-      return !media || !names.has(media[1].split("/").pop() ?? "");
+      return !media || !names.has(baseName(media[1]));
     })
     .join("\n")
     .trim();
@@ -110,6 +112,7 @@ export const Reply = memo(function Reply({ message, run, inserted = NO_MESSAGES,
   const w = useWords();
   const [entrance] = useState(enter);
   const persisted = useMemo(() => (message ? messageWork(message) : null), [message]);
+  const published = useMemo(() => (message ? messageArtifacts(message) : run?.artifacts ?? []), [message, run?.artifacts]);
   const items = run?.items;
   const live = useMemo(() => (items ? splitLive(items) : null), [items]);
   const startedAt = run?.startedAt ?? null;
@@ -151,6 +154,7 @@ export const Reply = memo(function Reply({ message, run, inserted = NO_MESSAGES,
         {content ? <Markdown content={content} /> : undefined}
       </StreamingText>,
     );
+    if (published.length > 0) rows.push(<ArtifactCards key="artifacts" artifacts={published} />);
     if (message.attachments.length > 0) rows.push(<AttachmentCards key="files" attachments={message.attachments} />);
   } else if (run && live) {
     if (live.answer) {
@@ -160,6 +164,7 @@ export const Reply = memo(function Reply({ message, run, inserted = NO_MESSAGES,
         </StreamingText>,
       );
     }
+    if (published.length > 0) rows.push(<ArtifactCards key="artifacts" artifacts={published} />);
     const notice = run.notice === "retry" ? w("Connection hiccup, retrying", "连接波动，正在重试", "連線不穩，正在重試")
       : run.notice === "compaction" ? w("Compacting context", "正在压缩上下文", "正在壓縮上下文") : null;
     if (notice || (!live.work.length && !live.answer)) {

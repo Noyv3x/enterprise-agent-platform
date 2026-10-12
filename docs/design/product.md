@@ -20,10 +20,22 @@ Messages sent during an interactive run are inserted into that run at the AI's n
 
 - Login, users, administrators and permission groups; administrators can sign in as another active account (管理员代入) from the account editor.
 - Attachment upload/download, document previews, generated-file links and personal workspace files.
+- Artifacts (作品): what the AI publishes for the user to look at, versioned, in a viewer panel (see [Artifacts](#artifacts)).
 - Model policy groups, Codex device OAuth, token usage and cache-hit reporting.
 - Branding, theme and three locales.
 - Scheduled tasks are not a user feature and have no user page; the personal AI creates, changes and reviews them through its own `schedule` tool, and each occurrence runs in the owner's personal AI.
 - Host Manager update status and controls.
+
+## Artifacts
+
+The AI publishes things the user should look at as **artifacts** in all three conversation modes, much like Claude Artifacts, instead of leaving a file to download. Supported content: articles (Markdown), single HTML pages, complete multi-file websites (HTML, CSS, JS and assets; links and resources work), SVG, Mermaid diagrams, charts (an HTML page using any chart library), tables (CSV/TSV), code, images and PDF. The AI publishes with its `artifact` tool, or by a standalone `MEDIA:` line for the previewable text kinds (HTML, Markdown, SVG, Mermaid, CSV/TSV); Office files, PDFs and other downloads stay ordinary attachments.
+
+- **Versions.** An artifact is the published path in a conversation. Publishing the same path again creates a new version; identical content creates none. The user can switch versions, diff text versions and download any version. The AI is told to keep the path when revising rather than creating `v2`/`v3` copies.
+- **Isolation.** Artifact pages run isolated and never receive the user's session or the platform APIs. Network access from artifact pages is deliberately unrestricted (any CDN, any fetch); see [security](security-and-trust.md#artifacts) for the risk.
+- **Scopes.** Personal AI artifacts belong to the owner, chat artifacts to the conversation (deleted with it) and channel artifacts to everyone who can read the channel.
+- **Limits.** At most 1000 files, 32 MiB per file and 50 MiB per version.
+
+Not provided yet: click-to-annotate feedback on a page, AI self-check screenshots of an artifact and running dev-server previews. Interfaces: [Platform API](../reference/platform-api.md#artifacts), [frontend](frontend.md).
 
 ## Pi-native resources
 

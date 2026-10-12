@@ -99,12 +99,12 @@ describe("Computer panel", () => {
     document.body.innerHTML = "";
   });
 
-  it("is one window with no view switcher, the live browser when there is no step", async () => {
+  it("is one window with no step-view switcher, the live browser when there is no step", async () => {
     tabs = [{ tabId: "t1", url: "https://example.com/", title: "Example" }];
     const panel = await mount();
     expect(within(panel).getAllByRole("region", { name: "Computer screen" })).toHaveLength(1);
-    expect(within(panel).queryByRole("tablist")).not.toBeInTheDocument();
-    expect(within(panel).queryByRole("tab")).not.toBeInTheDocument();
+    // The side window's only tabs choose between Artifacts and Computer.
+    expect(within(panel).getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Artifacts", "Computer"]);
     expect(within(panel).queryByRole("button", { name: /follow/i })).not.toBeInTheDocument();
     expect(await within(windowOf(panel)).findByRole("img", { name: "Browser screen: Example" })).toBeVisible();
     expect(within(windowOf(panel)).getByText("https://example.com/")).toBeVisible();

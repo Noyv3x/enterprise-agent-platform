@@ -33,7 +33,7 @@ export interface WorkTrace {
 export type Words = (en: string, zhCN?: string, zhTW?: string) => string;
 
 /** The verb a tool call reads as; the conversation's work trace and the computer panel share it. `args` refines
- * the `job` and `skill` verbs by their action. */
+ * the `job`, `skill` and `artifact` verbs by their action. */
 export function toolVerb(name: string, w: Words, args?: Record<string, unknown>): string {
   switch (name) {
     case "bash":
@@ -72,6 +72,8 @@ export function toolVerb(name: string, w: Words, args?: Record<string, unknown>)
         default:
           return w("View skills", "查看技能", "檢視技能");
       }
+    case "artifact":
+      return args?.action === "list" ? w("List artifacts", "查看作品", "檢視作品") : w("Publish artifact", "发布作品", "發佈作品");
     case "job":
       switch (args?.action) {
         case "list":

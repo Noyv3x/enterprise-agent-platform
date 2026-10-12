@@ -1,10 +1,15 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ApiError } from "../api";
 import { Button } from "../components/ui/beautiful/atoms/Button";
+import { SegmentedControl } from "../components/ui/beautiful/atoms/SegmentedControl";
 import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../words";
+import { ArtifactsContext, type ArtifactOpener } from "./artifacts/ArtifactCards";
+import { ArtifactPanel } from "./artifacts/ArtifactPanel";
+import { KindIcon } from "./artifacts/kinds";
+import { useArtifacts } from "./artifacts/useArtifacts";
 import { Composer, type ComposerCommand, type ComposerSeed } from "./conversation/Composer";
 import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
 import { ComputerContext } from "./conversation/computerView";
@@ -20,6 +25,10 @@ import { errorText, useConversation } from "./conversation/useConversation";
 /** Reader within this distance of the bottom keeps following new output (harness value). */
 const STICK_PX = 120;
 const NO_ITEMS: LiveRun["items"] = [];
+const NO_ARTIFACTS: LiveRun["artifacts"] = [];
+
+/** What the side window shows: the 作品 panel (every scope) or the personal AI's computer. */
+type AsidePanel = "artifacts" | "computer";
 
 export interface ConversationProps {
   /** `private`, `channel-<id>` or `chat-<uuid>` (API route form). */
@@ -162,7 +171,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const w = useWords();
   const { narrow } = useShell();
   const conversation = useConversation(scope, onRunEnd);
-  const [computerOpen, setComputerOpen] = useState(scope === "private" && !narrow);
+  const [aside, setAside] = useState<AsidePanel | null>(scope === "private" && !narrow ? "computer" : null);
   // A step chosen with "View in computer"; cleared on close so reopening the panel follows the AI.
   const [computerFocus, setComputerFocus] = useState<ComputerFocus | null>(null);
   const [notice, setNotice] = useState<{ tone: "info" | "success" | "danger"; text: string } | null>(null);
@@ -188,14 +197,27 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const personal = scope === "private";
   const computer = useMemo(() => (personal ? {
     show: (run: RunRef, callId: string) => {
-      setComputerOpen(true);
+      setAside("computer");
       setComputerFocus((current) => ({ step: { run, callId }, n: (current?.n ?? 0) + 1 }));
     },
   } : null), [personal]);
-  const closeComputer = () => {
-    setComputerOpen(false);
+  const closeAside = () => {
+    setAside(null);
     setComputerFocus(null);
   };
+  const artifacts = useArtifacts({
+    scope, published: conversation.published, lastPublished: conversation.lastPublished, shown: aside === "artifacts", narrow,
+    reveal: () => setAside("artifacts"),
+  });
+  const { open: openArtifact, selection: artifactSelection } = artifacts;
+  const artifactsShown = aside === "artifacts";
+  const opener = useMemo<ArtifactOpener>(() => ({
+    open: (id, version) => {
+      openArtifact(id, version);
+      setAside("artifacts");
+    },
+    current: artifactsShown && artifactSelection ? { id: artifactSelection.id, version: artifactSelection.version } : null,
+  }), [openArtifact, artifactsShown, artifactSelection]);
   // The task whose output viewer or sheet is open (personal AI).
   const [openedTask, setOpenedTask] = useState<string | null>(null);
   const knownTasks = useRef(conversation.tasks);
@@ -442,6 +464,32 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const defaultTitle = personal ? w("Personal AI", "个人 AI", "個人 AI")
     : scope.startsWith("chat-") ? w("Chat", "聊天", "聊天") : w("Channel", "频道", "頻道");
   const computerLabel = w("Computer", "电脑", "電腦");
+  const artifactsLabel = w("Artifacts", "作品", "作品");
+  const asideButton = (panel: AsidePanel, label: string, icon: ReactNode) => (
+    <button
+      type="button"
+      aria-pressed={aside === panel}
+      onClick={() => (aside === panel ? closeAside() : setAside(panel))}
+      className={`flex h-7 items-center gap-1.5 rounded-[7px] px-2 text-[12.5px] font-medium transition-colors duration-100 touch:h-11 ${
+        aside === panel ? "bg-hover-2 text-ink" : "text-ink-2 hover:bg-hover hover:text-ink"
+      }`}
+    >
+      {icon}
+      {/* phones keep the icon; the label stays the button's name */}
+      <span className="max-sm:sr-only">{label}</span>
+    </button>
+  );
+  const asideLabel = aside === "computer" ? computerLabel : artifactsLabel;
+  const closeLabel = aside === "computer" ? w("Close computer", "关闭电脑面板", "關閉電腦面板") : w("Close artifacts", "关闭作品面板", "關閉作品面板");
+  // Personal AI: 作品 and 电脑 share the side window.
+  const switcher = personal ? (
+    <SegmentedControl
+      options={[artifactsLabel, computerLabel]}
+      value={asideLabel}
+      onChange={(label) => setAside(label === computerLabel ? "computer" : "artifacts")}
+      className="shrink-0 touch:h-11"
+    />
+  ) : null;
 
   const header = (
     <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-3 sm:pl-4 touch:h-14">
@@ -450,19 +498,8 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       {meta && <span className="min-w-0 shrink truncate text-[12px] text-ink-2">{meta}</span>}
       <div className="ml-auto flex shrink-0 items-center gap-0.5 text-ink-3">
         {actions}
-        {personal && (
-          <button
-            type="button"
-            aria-pressed={computerOpen}
-            onClick={() => (computerOpen ? closeComputer() : setComputerOpen(true))}
-            className={`flex h-7 items-center gap-1.5 rounded-[7px] px-2 text-[12.5px] font-medium transition-colors duration-100 touch:h-11 ${
-              computerOpen ? "bg-hover-2 text-ink" : "text-ink-2 hover:bg-hover hover:text-ink"
-            }`}
-          >
-            <Icon name="monitor" size={15} />
-            {computerLabel}
-          </button>
-        )}
+        {asideButton("artifacts", artifactsLabel, <KindIcon kind="site" size={15} />)}
+        {personal && asideButton("computer", computerLabel, <Icon name="monitor" size={15} />)}
         {items.length > 0 && (
           <Menu
             label={w("Conversation actions", "对话操作", "對話操作")}
@@ -560,7 +597,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       rows.push(
         <Reply
           key={`run-${conversation.runKey}`}
-          run={live ?? { items: NO_ITEMS, thinkingIndex: null, calls: [], startedAt: lastRunning ?? Date.now(), notice: null }}
+          run={live ?? { items: NO_ITEMS, thinkingIndex: null, calls: [], startedAt: lastRunning ?? Date.now(), notice: null, artifacts: NO_ARTIFACTS }}
           starting={!live}
           inserted={inserted}
           renderInput={renderInput}
@@ -618,7 +655,13 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         )}
       </>
     );
-    body = <ComputerContext.Provider value={computer}><Welcome {...welcomeProps} empty={empty} thread={thread} composerRef={composerBox} composer={composer} /></ComputerContext.Provider>;
+    body = (
+      <ComputerContext.Provider value={computer}>
+        <ArtifactsContext.Provider value={opener}>
+          <Welcome {...welcomeProps} empty={empty} thread={thread} composerRef={composerBox} composer={composer} />
+        </ArtifactsContext.Provider>
+      </ComputerContext.Provider>
+    );
   }
 
   return (
@@ -630,22 +673,38 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       </div>
       {personal && <TaskAnnouncer tasks={conversation.tasks} loaded={conversation.tasksLoaded} />}
       {body}
-      {personal && computerOpen && (narrow ? (
-        <Sheet open onClose={closeComputer} title={computerLabel} width={420}>
-          <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
+      {aside && (narrow ? (
+        <Sheet open onClose={closeAside} title={asideLabel} width={aside === "computer" ? 420 : 760}>
+          {aside === "computer" ? (
+            <>
+              {switcher && <div className="mb-4">{switcher}</div>}
+              <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
+            </>
+          ) : (
+            <div className="flex h-full min-h-0 flex-col gap-4">
+              {switcher}
+              <ArtifactPanel state={artifacts} />
+            </div>
+          )}
         </Sheet>
       ) : (
-        <WindowAside label={computerLabel} className="w-[380px]">
-          <div className="flex h-11 shrink-0 items-center justify-between border-b border-line px-3 sm:pl-4">
-            <span className="text-[13px] font-semibold text-ink">{computerLabel}</span>
-            <button type="button" aria-label={w("Close computer", "关闭电脑面板", "關閉電腦面板")} onClick={closeComputer}
+        <WindowAside label={asideLabel} className={aside === "computer" ? "w-[380px]" : "w-[clamp(400px,44vw,760px)]"}>
+          <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-line px-3 sm:pl-4">
+            {switcher ?? <span className="text-[13px] font-semibold text-ink">{asideLabel}</span>}
+            <button type="button" aria-label={closeLabel} onClick={closeAside}
               className="flex size-6 items-center justify-center rounded-[6px] text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink touch:size-11">
               <Icon name="close" size={13} strokeWidth={2.2} />
             </button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto p-4">
-            <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
-          </div>
+          {aside === "computer" ? (
+            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+              <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
+            </div>
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3">
+              <ArtifactPanel state={artifacts} />
+            </div>
+          )}
         </WindowAside>
       ))}
       {shownTask && <TaskOverlay key={shownTask.id} task={shownTask} onClose={() => setOpenedTask(null)} onStop={conversation.stopTask} />}

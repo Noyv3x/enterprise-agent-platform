@@ -1,4 +1,5 @@
 """Scope-bound attachments and workspace downloads."""
+import asyncio
 import base64
 import hashlib
 import io
@@ -24,6 +25,8 @@ from .auth import current_user
 from .db import now
 
 MAX_FILE = 32 * 1024 * 1024
+# A MEDIA delivery of these text kinds publishes an artifact version; images, PDFs, Office files and others stay attachments.
+MEDIA_ARTIFACT_EXTENSIONS = frozenset({'.html', '.htm', '.md', '.markdown', '.svg', '.mmd', '.mermaid', '.csv', '.tsv'})
 
 
 def contained(root, value):
@@ -268,7 +271,8 @@ class Files:
             raise
         return attachment(row, info['kind'] == 'chat')
 
-    async def deliver(self, user, scope_info, message_id, text):
+    async def deliver(self, user, scope_info, message_id, text, job_id=None):
+        """Store MEDIA files as attachments, except previewable text kinds, which publish artifact versions."""
         delivered = []
         for value in dict.fromkeys(re.findall(r'^MEDIA:\s*(.+?)\s*$', text, flags=re.MULTILINE)):
             cwd = scope_info['sandbox'].get('cwd', '/workspace').rstrip('/') + '/'
@@ -276,6 +280,9 @@ class Files:
                 continue
             try:
                 relative = value[len(cwd):]
+                if Path(relative).suffix.lower() in MEDIA_ARTIFACT_EXTENSIONS:
+                    await asyncio.to_thread(self.p.artifacts.publish, user, scope_info, value, None, None, job_id, message_id)
+                    continue
                 data = bounded_read(open_workspace(scope_info['workspace'], relative))
                 delivered.append(self.store(user, scope_info, Path(relative).name, data, 'agent_generated', message_id))
             except (HTTPException, OSError):

@@ -107,6 +107,9 @@ files. Mark uncertain paths or APIs as items to confirm during implementation.
 
 After writing the plan:
 
+- publish the plan document with the `artifact` tool (`publish`, with its absolute
+  sandbox path) so the user reads it in the artifact panel, and when you revise
+  it publish the same path again instead of saving a copy;
 - give the user the plan path and a compact summary;
 - call out unresolved decisions and risky steps;
 - wait for explicit authorization before implementation;

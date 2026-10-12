@@ -14,6 +14,8 @@ export interface ToolDependencies {
   gateway: GatewayTransport;
   /** Whether the scope may use the `skill` gateway tool (personal or channel root run; never chat or subagents). */
   skills?: boolean;
+  /** Whether the scope may use the `artifact` gateway tool (every root run: personal, chat and channel; never subagents). */
+  artifacts?: boolean;
   /** Live bash output (sanitized by Manager), in order; the tool result stays authoritative. */
   output?: (toolCallId: string, text: string) => void;
   /** Personal bash only: subscribes to user input inserted into the run (fires at once when some is pending). */
@@ -99,6 +101,19 @@ const SKILL_DESCRIPTION = [
   "To save a workflow you just carried out as a reusable skill, install with `content`: a lowercase hyphenated name, a description saying when to use it, and a body with the steps.",
   "Users often paste install instructions written for Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI or OpenCode. Do the same thing here with this tool instead of their commands or paths, and tell the user in one plain sentence, in their language, that the instructions were for another product and how you adapted them.",
   "Installed skills are usable from the next message. Install, update and remove need the user's install permission.",
+].join(" ");
+const artifactSchema = Type.Object({
+  action: Type.Union([Type.Literal("publish"), Type.Literal("list")]),
+  path: Type.Optional(Type.String({ description: "Absolute sandbox path of the file, or of the site folder, to publish" })),
+  title: Type.Optional(Type.String()), entry: Type.Optional(Type.String({ description: "Entry file inside a site folder; defaults to index.html" })),
+});
+const ARTIFACT_PUBLISH_TIMEOUT_MS = 300_000;
+const ARTIFACT_DESCRIPTION = [
+  "Publish something the user should look at to the artifact panel next to the conversation: a document or report (.md), a web page, slides or chart (.html, any chart library), a diagram (.mmd Mermaid or .svg), a table (.csv/.tsv), or source code.",
+  "Actions: publish {path, title?, entry?} snapshots the file as a new version and reports the version number; list shows this conversation's artifacts with kind, latest version and path.",
+  "Write the file in the workspace first and pass its absolute path. To revise, edit the same file and publish the same path again: that creates a new version, so never write v2/v3 copies.",
+  "A multi-file website is published as its folder, with relative links and assets inside it; `entry` names the entry file (default index.html).",
+  "Pages run isolated and cannot reach platform APIs. Use MEDIA: only for files the user should download (DOCX, XLSX, PPTX, PDF, archives), not for things to view.",
 ].join(" ");
 const MCP_DESCRIPTION = [
   "List configured MCP servers or call an MCP tool in the sandbox.",
@@ -256,7 +271,7 @@ exit "$s"`;
         return text(result.stdout.split("\n").slice(0, args.limit ?? 100).join("\n") || "No matches", { exit_code: result.exit_code });
       } } satisfies ToolDefinition<typeof grepSchema>,
   ];
-  function remote(name: string, tool: "web" | "browser" | "schedule" | "tasks" | "skills", parameters: ToolDefinition["parameters"], action?: string, description = `Use the platform ${name} service.`, timeoutMs?: (params: Record<string, unknown>) => number): ToolDefinition {
+  function remote(name: string, tool: "web" | "browser" | "schedule" | "tasks" | "skills" | "artifacts", parameters: ToolDefinition["parameters"], action?: string, description = `Use the platform ${name} service.`, timeoutMs?: (params: Record<string, unknown>) => number): ToolDefinition {
     return { name, label: name, description, parameters,
       execute: async (_id, input) => {
         const params = Parse(gatewayArguments, input);
@@ -288,6 +303,7 @@ exit "$s"`;
     tools.push(remote("wait", "tasks", waitSchema, "wait", WAIT_DESCRIPTION, params => (Math.min(typeof params.timeout === "number" ? params.timeout : WAIT_MAX_SECONDS, WAIT_MAX_SECONDS) + 30) * 1000));
   }
   if (skillScope) tools.push(remote("skill", "skills", skillSchema, undefined, SKILL_DESCRIPTION, params => (params.action === "install" || params.action === "update" ? 210_000 : 120_000)));
+  if (dependencies.artifacts === true) tools.push(remote("artifact", "artifacts", artifactSchema, undefined, ARTIFACT_DESCRIPTION, params => (params.action === "publish" ? ARTIFACT_PUBLISH_TIMEOUT_MS : 120_000)));
   if (personal) {
     tools.push(remote("browser", "browser", Type.Object({
       action: Type.String({ description: "list, new_tab, navigate, snapshot, screenshot, close, click, type, scroll, back, forward, refresh, press, wait, links, images, downloads, stats, extract, viewport, cleanup" }),

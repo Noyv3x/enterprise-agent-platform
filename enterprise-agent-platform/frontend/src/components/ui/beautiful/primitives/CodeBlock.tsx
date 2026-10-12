@@ -1,9 +1,12 @@
 /* Adapted from Beautiful UI components/primitives/CodeBlock.tsx (MIT, see ../NOTICE).
  * Adaptations: real code from the message instead of the demo file; the Diff view is parsed from a unified diff
- * (```diff fences) and keeps a Copy action next to its stat; the panel fills the reading column (`fill`); the
- * line-number gutter widens for 3+ digit listings; labels come from the caller (i18n). Markup and classes are
- * upstream's. Accessibility: text that upstream draws in ink-3 or a base hue (strings/numbers, diff stats, gutter
- * numbers, hunk headers, Copy) uses ink-2 or the matching *-ink token, so it keeps 4.5:1 on page and diff tints. */
+ * (```diff fences, artifact version diffs) and keeps a Copy action next to its stat; inside a hunk, rows are counted
+ * against its header, so a removed `-- x` line is a row, not a `---` file header; the panel fills the reading column
+ * (`fill`) or, for the artifact panel, its parent's height with the body scrolling (`fillHeight`, instead of the
+ * 480px cap); the line-number gutter widens for 3+ digit listings; labels come from the caller (i18n). Markup and
+ * classes are upstream's. Accessibility: text that upstream draws in ink-3 or a base hue (strings/numbers, diff stats,
+ * gutter numbers, hunk headers, Copy) uses ink-2 or the matching *-ink token, so it keeps 4.5:1 on page and diff
+ * tints. */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 /* ─────────────────────────────────────────────────────────
@@ -50,31 +53,40 @@ function highlight(text: string): ReactNode[] {
   return nodes;
 }
 
-/** Parses a unified diff into gutter rows; `---`/`+++` file headers name the file instead of rendering. */
+/** Parses a unified diff into gutter rows; `---`/`+++` file headers name the file instead of rendering. Rows inside a
+ * hunk are counted against its header (a missing count is 1), so content lines are never taken for file headers. */
 export function parseUnifiedDiff(source: string): { rows: DiffRow[]; file: string | null } {
   const rows: DiffRow[] = [];
   let file: string | null = null;
   let oldLine = 1;
   let newLine = 1;
+  let oldLeft = 0;
+  let newLeft = 0;
   for (const line of source.split("\n")) {
-    if (/^(\+\+\+|---) /.test(line)) {
+    if (oldLeft <= 0 && newLeft <= 0 && /^(\+\+\+|---) /.test(line)) {
       const name = line.slice(4).trim().replace(/^[ab]\//, "");
       if (name !== "/dev/null" && line.startsWith("+++")) file = name;
       else if (name !== "/dev/null" && file === null) file = name;
       continue;
     }
-    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
     if (hunk) {
       oldLine = Number(hunk[1]);
-      newLine = Number(hunk[2]);
+      newLine = Number(hunk[3]);
+      oldLeft = Number(hunk[2] ?? 1);
+      newLeft = Number(hunk[4] ?? 1);
       rows.push({ num: null, type: "hunk", text: line });
     } else if (line.startsWith("+")) {
       rows.push({ num: newLine++, type: "add", text: line.slice(1) });
+      newLeft--;
     } else if (line.startsWith("-")) {
       rows.push({ num: oldLine++, type: "del", text: line.slice(1) });
+      oldLeft--;
     } else {
       rows.push({ num: newLine++, type: "ctx", text: line.startsWith(" ") ? line.slice(1) : line });
       oldLine++;
+      oldLeft--;
+      newLeft--;
     }
   }
   return { rows, file };
@@ -98,9 +110,11 @@ export type CodeBlockProps = {
   labels: CodeBlockLabels;
   /** fill the parent width instead of the gallery's fixed measure */
   fill?: boolean;
+  /** fill the parent's height too; the body scrolls instead of capping at 480px */
+  fillHeight?: boolean;
 };
 
-export default function CodeBlock({ variant = "Code", code, filename, labels, fill = false }: CodeBlockProps) {
+export default function CodeBlock({ variant = "Code", code, filename, labels, fill = false, fillHeight = false }: CodeBlockProps) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
@@ -122,9 +136,9 @@ export default function CodeBlock({ variant = "Code", code, filename, labels, fi
   const gutter = Math.max(20, digits * 7 + 6);
 
   return (
-    <div className={`w-full ${fill ? "" : "max-w-105"} overflow-hidden rounded-card bg-surface shadow-card`}>
+    <div className={`w-full ${fill ? "" : "max-w-105"} ${fillHeight ? "flex h-full flex-col" : ""} overflow-hidden rounded-card bg-surface shadow-card`}>
       {/* header — file · (diff stat) · copy */}
-      <div className="flex h-11 items-center gap-2 border-b border-line px-4 text-[12.5px]">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line px-4 text-[12.5px]">
         <span className="inline-flex min-w-0 items-center gap-[7px]">
           <FileIcon />
           <span className="truncate font-mono leading-none text-ink">{diff?.file ?? filename}</span>
@@ -154,7 +168,7 @@ export default function CodeBlock({ variant = "Code", code, filename, labels, fi
       </div>
 
       {/* body — equal 12px inset on top / left / right; lines wrap */}
-      <div className="max-h-[480px] overflow-y-auto py-3 font-mono text-[12.5px] leading-[1.65] text-ink-2" tabIndex={0}>
+      <div className={`${fillHeight ? "min-h-0 flex-1" : "max-h-[480px]"} overflow-y-auto py-3 font-mono text-[12.5px] leading-[1.65] text-ink-2`} tabIndex={0}>
         <div className="relative">
           <span className="pointer-events-none absolute inset-y-0 w-px bg-line" style={{ left: gutter }} />
           {diff

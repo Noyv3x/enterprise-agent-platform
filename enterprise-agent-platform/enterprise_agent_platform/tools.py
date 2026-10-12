@@ -238,15 +238,15 @@ class Browser:
         key = context.get('scope_key', '')
         with self.p.db.connect() as conn:
             session = conn.execute('SELECT scope_key FROM queue_sessions WHERE sid=?', (context.get('sid'),)).fetchone()
-            jobs = conn.execute("SELECT payload_json FROM durable_jobs WHERE kind='agent' AND status='running' AND json_extract(payload_json,'$.parent_job_id') IS NULL").fetchall()
-            payload = None
+            jobs = conn.execute("SELECT id,payload_json FROM durable_jobs WHERE kind='agent' AND status='running' AND json_extract(payload_json,'$.parent_job_id') IS NULL").fetchall()
+            payload, job_id = None, None
             for job in jobs:
                 candidate = json.loads(job['payload_json'])
                 name = candidate.get('scope', '')
                 candidate_key = (f"private:{candidate.get('user_id')}" if name == 'private' else
                                  'channel:' + name[8:] + ':main-agent' if name.startswith('channel-') else name)
                 if session and candidate_key == session['scope_key']:
-                    payload = candidate
+                    payload, job_id = candidate, job['id']
                     break
             user = conn.execute('SELECT * FROM users WHERE id=? AND active=1', (payload['user_id'],)).fetchone() if payload else None
         if not user:
@@ -272,6 +272,8 @@ class Browser:
         if tool == 'schedule':
             from .schedules import dispatch
             return result(await dispatch(self.p, action, args, user))
+        if tool == 'artifacts':
+            return await self.p.artifacts.gateway(user, scope, action, args, job_id)
         if tool == 'skills':
             if scope['kind'] != 'agent':
                 raise HTTPException(403, 'This tool is available only to personal and channel AI')

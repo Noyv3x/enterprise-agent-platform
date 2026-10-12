@@ -145,7 +145,8 @@ export function stepTitle(call: ToolCall, w: Words): string {
         : call.name === "wait" ? (Array.isArray(args.ids) ? args.ids.filter((id): id is string => typeof id === "string").join(" ") : "")
           : call.name === "task" ? (Array.isArray(args.tasks) ? w(`${args.tasks.length} subagents`, `${args.tasks.length} 个子智能体`, `${args.tasks.length} 個子智慧體`) : "")
             : call.name === "skill" ? clip(str(args.name) || str(args.url) || str(args.path))
-              : clip(str(args.action) || str(args.name) || [str(args.server), str(args.tool)].filter(Boolean).join(" · "));
+              : call.name === "artifact" ? clip(str(args.title) || fileName(str(args.path)))
+                : clip(str(args.action) || str(args.name) || [str(args.server), str(args.tool)].filter(Boolean).join(" · "));
   }
   const running = call.status === "preparing" || call.status === "running";
   // Chinese reads the running step as "正在…"; English keeps the verb and the status pill says it is working.

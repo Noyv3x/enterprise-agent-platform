@@ -122,7 +122,7 @@ describe('thinking blocks', () => {
 
   it('keeps overall work headings accurate when a settled answer gains an inserted-message segment', () => {
     const first = thinking('Before the insertion', NOW - 10_000, NOW - 5_000);
-    const run: LiveRun = { items: [first, { type: 'text', text: 'Initial answer' }], thinkingIndex: null, calls: [], startedAt: NOW - 10_000, notice: null };
+    const run: LiveRun = { items: [first, { type: 'text', text: 'Initial answer' }], thinkingIndex: null, calls: [], startedAt: NOW - 10_000, notice: null, artifacts: [] };
     const renderRun = (current: LiveRun) => <I18nProvider><Reply run={current} renderInput={() => <p>Inserted request</p>} /></I18nProvider>;
     const { rerender } = render(renderRun(run));
     expect(screen.getByRole('button', { name: 'Thought for 10s' })).toBeVisible();

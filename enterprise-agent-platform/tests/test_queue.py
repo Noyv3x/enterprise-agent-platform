@@ -18,6 +18,7 @@ from enterprise_agent_platform.db import Database, now
 from policy_support import set_default_policy
 from enterprise_agent_platform.auth import issue_session, public_user
 from enterprise_agent_platform.queue import Queue, _WorkTrace, authenticated_events, routes
+from enterprise_agent_platform.artifacts import Artifacts
 from enterprise_agent_platform.skills import Skills
 
 
@@ -41,7 +42,7 @@ class Files:
     def release(self, info, mid, conn):
         pass
 
-    async def deliver(self, user, info, mid, text):
+    async def deliver(self, user, info, mid, text, job_id=None):
         return []
 
 
@@ -178,6 +179,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(runtime))
         self.p = SimpleNamespace(db=db, http=self.http, gate=Gate(), files=Files(), settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test", builtin_skills_dir=root / "builtin"))
         self.p.skills = Skills(self.p)
+        self.p.artifacts = Artifacts(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}, {"id": "model-b"}]}))
         self.q = self.p.queue = Queue(self.p)
         self.user = self.q.user(1)

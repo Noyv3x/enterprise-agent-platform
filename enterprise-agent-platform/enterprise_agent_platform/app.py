@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import Database
-from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills
+from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills, artifacts
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ class Platform:
         self.oauth = oauth.OAuth(self)
         self.browser = tools.Browser(self)
         self.files = files.Files(self)
+        self.artifacts = artifacts.Artifacts(self)
         self.queue = queue.Queue(self)
         self.tasks = tasks.Tasks(self)
         self.skills = skills.Skills(self)
@@ -152,7 +153,9 @@ class BoundaryMiddleware:
                     # Handlers have finished mutations. Do not keep a read-only SSE
                     # connection or a slow file download blocking an update forever.
                     await admission.aclose()
-                    message['headers'] += [(b'x-content-type-options', b'nosniff'), (b'x-frame-options', b'SAMEORIGIN'), (b'referrer-policy', b'same-origin')]
+                    present = {name.lower() for name, _ in message['headers']}
+                    # A handler's own policy (the artifact view route's) wins over these defaults.
+                    message['headers'] += [(name, value) for name, value in ((b'x-content-type-options', b'nosniff'), (b'x-frame-options', b'SAMEORIGIN'), (b'referrer-policy', b'same-origin')) if name not in present]
                 await send(message)
             await self.app(scope, receive, secured_send)
 
@@ -190,13 +193,13 @@ def create_app(settings=None):
             await platform.http.aclose()
 
     async def error(request, exc):
-        return JSONResponse({'error': exc.detail, **({'code': exc.code, **exc.payload} if isinstance(exc, skills.SkillError) else {})}, status_code=exc.status_code)
+        return JSONResponse({'error': exc.detail, **({'code': exc.code, **exc.payload} if isinstance(exc, (skills.SkillError, artifacts.ArtifactError)) else {})}, status_code=exc.status_code)
 
     async def malformed(request, exc):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
 
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
-    for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills):
+    for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills, artifacts):
         route_list.extend(module.routes())
     route_list.append(Route('/{path:path}', static))
     app = Starlette(routes=route_list, lifespan=lifespan, exception_handlers={HTTPException: error, json.JSONDecodeError: malformed})

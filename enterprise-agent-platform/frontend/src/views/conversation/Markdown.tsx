@@ -8,6 +8,7 @@ import remarkParse from "remark-parse";
 import { unified } from "unified";
 import "katex/dist/katex.min.css";
 import CodeBlock from "../../components/ui/beautiful/primitives/CodeBlock";
+import { MermaidDiagram } from "../artifacts/renderers/MermaidDiagram";
 import { useWords } from "../../words";
 
 interface HastNode {
@@ -38,12 +39,15 @@ function textOf(node: ReactNode): string {
   return isValidElement<{ children?: ReactNode }>(node) ? textOf(node.props.children) : "";
 }
 
-function Pre({ children }: ComponentPropsWithoutRef<"pre">) {
+/** A fenced block: ```mermaid draws its diagram once the block is complete (`live` is the streaming tail, whose
+ * source may still be cut off), other fences are CodeBlocks, diff/patch in the Diff variant. */
+function Pre({ children, live = false }: ComponentPropsWithoutRef<"pre"> & { live?: boolean }) {
   const w = useWords();
   const first = Children.toArray(children)[0];
   const code = isValidElement<{ className?: string; children?: ReactNode }>(first) ? first : null;
   const language = /(?:^|\s)language-(\S+)/.exec(code?.props.className ?? "")?.[1];
   const value = textOf(code?.props.children ?? children).replace(/\n$/, "");
+  if (language === "mermaid" && !live) return <MermaidDiagram source={value} />;
   return (
     <CodeBlock
       fill
@@ -62,6 +66,7 @@ const components: Components = {
   // Remote images are never fetched from message text; files arrive as authorized attachments.
   img: ({ alt }) => <span>{alt}</span>,
 };
+const streamingComponents: Components = { ...components, pre: (props) => <Pre {...props} live /> };
 
 const katexOptions = { output: "htmlAndMathml" as const, trust: false, maxExpand: 1000, maxSize: 20 };
 const REMARK: Options["remarkPlugins"] = [remarkGfm, remarkMath, remarkBreaks];
@@ -103,15 +108,15 @@ function splitBlocks(previous: Blocks | null, content: string): Blocks {
 
 const Block = memo(function Block({ source, streaming }: { source: string; streaming: boolean }) {
   return (
-    <ReactMarkdown skipHtml components={components} remarkPlugins={REMARK} rehypePlugins={streaming ? REHYPE_STREAMING : REHYPE}>
+    <ReactMarkdown skipHtml components={streaming ? streamingComponents : components} remarkPlugins={REMARK} rehypePlugins={streaming ? REHYPE_STREAMING : REHYPE}>
       {source}
     </ReactMarkdown>
   );
 });
 
-/** Agent Markdown (GFM, math, line breaks) with Beautiful UI code blocks; `streaming` adds the live caret.
- * Rendered per top-level block: while text streams in, settled blocks keep their elements and only the tail is
- * parsed and rendered again. */
+/** Agent Markdown (GFM, math, line breaks) with Beautiful UI code blocks and Mermaid diagrams; `streaming` adds the
+ * live caret. Rendered per top-level block: while text streams in, settled blocks keep their elements and only the
+ * tail is parsed and rendered again. */
 export const Markdown = memo(function Markdown({ content, streaming = false }: { content: string; streaming?: boolean }) {
   const previous = useRef<Blocks | null>(null);
   const blocks = useMemo(() => (previous.current = splitBlocks(previous.current, content)), [content]);

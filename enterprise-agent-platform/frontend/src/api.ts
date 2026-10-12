@@ -52,6 +52,41 @@ export interface OrgSkill extends SkillView { groups: string[] }
 export interface BuiltinSkill extends SkillView { org_enabled: boolean }
 export interface AdminSkills { org: OrgSkill[]; builtin: BuiltinSkill[]; groups: string[] }
 
+/** What an artifact (作品) shows as, derived from its entry extension (platform-api.md § Artifacts). */
+export type ArtifactKind = 'web' | 'site' | 'markdown' | 'mermaid' | 'svg' | 'table' | 'code' | 'image' | 'pdf';
+
+/** One artifact of a conversation scope. `scope` is the `?scope=` form; `entry` is the latest version's entry relpath. */
+export interface ArtifactView {
+  id: number;
+  scope: string;
+  path: string;
+  kind: ArtifactKind;
+  title: string;
+  entry: string;
+  latest_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `GET /api/artifacts/{id}`: one version (newest first); `message_id` is null until the reply is persisted. */
+export interface ArtifactVersion {
+  version: number;
+  entry: string;
+  created_at: string;
+  total_size: number;
+  file_count: number;
+  message_id: number | null;
+}
+
+/** `GET /api/artifacts/{id}/versions/{v}/files` */
+export interface ArtifactFile { path: string; size: number; mime: string }
+
+/** `GET /api/artifacts/{id}/versions/{v}/source?path=`: text only, at most 2 MB. */
+export interface ArtifactSource { content: string; truncated: boolean; mime: string }
+
+/** `metadata.artifacts[]` of the assistant message whose run published that version. */
+export interface ArtifactRef { id: number; version: number; title: string; kind: ArtifactKind; path: string }
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   headers.set('Accept', 'application/json');

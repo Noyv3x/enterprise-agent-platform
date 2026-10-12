@@ -23,3 +23,12 @@ describe('skill tool verbs', () => {
     expect(stepTitle(call({ action: 'list' }), zh)).toBe('查看技能');
   });
 });
+
+describe('artifact tool verbs', () => {
+  it('reads publishing as 发布作品 in the trace and the computer', () => {
+    expect(toolVerb('artifact', zh, { action: 'publish', path: '/workspace/deck.html' })).toBe('发布作品');
+    expect(toolVerb('artifact', zh, { action: 'list' })).toBe('查看作品');
+    const call: ToolCall = { id: 'a', name: 'artifact', args: { action: 'publish', path: '/workspace/out/deck.html', title: '发布会' }, status: 'running', input: '', output: '', truncated: false, streamed: false, diff: '' };
+    expect(stepTitle(call, zh)).toBe('正在发布作品 发布会');
+  });
+});

@@ -19,7 +19,8 @@ Image entries are `{mime,data}` with base64 data. Skill entries are
 conversation directory beneath `/workspace`, and only read/bash/edit/write/
 grep/find/ls/web_search/web_fetch; it never loads AGENTS.md but does advertise
 the skill catalog Platform sends. Browser, schedules and MCP are available only
-to personal agent scopes; `skill` to personal and channel root scopes.
+to personal agent scopes; `skill` to personal and channel root scopes; `artifact`
+to every root scope (personal, chat and channel), never subagents.
 `kind:subagent` runs a background subagent for Platform's `task` tool: profile
 `agent`, no AGENTS.md, scope `private:<uid>/delegate/bg-<n>` and session ID
 `agent-private-<uid>-bg-<n>`, sharing the parent's sandbox and workspace.
@@ -321,6 +322,20 @@ for other products (`.claude/skills`, `~/.codex/skills`, ...) to this tool and t
 save a workflow as a skill with `content`. The `mcp` tool description names
 `/workspace/.agent-platform/mcp.json` and its `mcpServers` shape and gives the same
 translation rule for `claude mcp add` and similar.
+
+The `artifact` tool (root runs in every scope; Runtime drops it from subagents and
+subagent requests naming it are rejected) calls Platform
+`POST /internal/agent/tools/artifacts` with `{action,arguments,context}`. `action`
+is `publish|list`; `publish` takes `path` (absolute sandbox path of a file or, for a
+site, a folder), optional `title` and `entry` (a site's entry file, default
+`index.html`) and snapshots it as a new artifact version; `list` takes no arguments
+and returns this conversation's artifacts. Platform returns the standard
+`{content,data,is_error}` result; Runtime applies a 300 s timeout to `publish`
+(large sites are read out of the sandbox) and the default 120 s to `list`. The
+description tells the model to publish what the user should look at, to keep the
+same path across revisions (a new version, never `v2` copies), to publish a site as
+its folder with an entry file, and to use `MEDIA:` only for downloadable files such
+as DOCX, XLSX, PPTX and PDF.
 
 Web, browser and schedule tools call Platform
 `POST /internal/agent/tools/{web|browser|schedule}` using agent-tool-token

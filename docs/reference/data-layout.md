@@ -28,6 +28,7 @@ The account database supplies `~`; installer/Manager do not trust HOME/XDG overr
   data/
     platform.db{,-wal,-shm}
     attachments/
+    artifacts/blobs/<sha256>      # content-addressed artifact file bytes, written by Platform; no other path structure
     skills/org/<name>/            # organization skills, written by Platform
     upload-staging/
     workspaces/
@@ -99,6 +100,6 @@ The schema-1 checkpoint includes Manager state and operation records. Legacy `ma
 
 ## 备份与恢复
 
-Before upgrade, stop the sole writer and save a verified full recovery point outside the deployment root: database with consistent WAL state, attachments, workspaces, environments, Runtime data, Manager configuration/secrets/state and release metadata. A SQLite-only snapshot is not a full backup.
+Before upgrade, stop the sole writer and save a verified full recovery point outside the deployment root: database with consistent WAL state, attachments, artifact blobs, workspaces, environments, Runtime data, Manager configuration/secrets/state and release metadata. A SQLite-only snapshot is not a full backup.
 
 After a release rollback the restored database snapshot does not contain writes made after the snapshot, and Runtime history of the rolled-back generation excludes later v3 turns. Preserve new writes before any rollback; prefer forward repair after traffic has resumed. Never mix recovery points or treat conversation replay as recovery. See [automatic updates](../operations/auto-update.md).

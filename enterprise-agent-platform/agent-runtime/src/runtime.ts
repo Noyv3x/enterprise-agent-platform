@@ -49,7 +49,7 @@ const OUTPUT_INTERVAL_MS=125;
 const OUTPUT_LIMIT_BYTES=512*1024;
 const MAX_PENDING_INPUTS=32;
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
-const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true};
+const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true,artifact:true};
 const subagentTools=['read','bash','edit','write','grep','find','ls','web_search','web_fetch'];
 // A subagent only exists as a delegate scope of one personal user, on that user's own child session ID.
 function validateSubagent(sid:string,request:RunRequest):void {
@@ -109,6 +109,9 @@ export class Runtime {
     // Skill management is for root runs in a personal or channel scope; never chat or subagents.
     const skillScope=fixed.kind==='agent'&&(personal||/^channel:\d+:/.test(fixed.sandbox.scope_key));
     if(!skillScope)fixed.tools=fixed.tools.filter(name=>name!=='skill');
+    // Artifacts are published by root runs in every scope (personal, chat, channel); never by subagents.
+    const artifactScope=fixed.kind!=='subagent';
+    if(!artifactScope)fixed.tools=fixed.tools.filter(name=>name!=='artifact');
     fixed.sandbox.profile=fixed.kind==='chat'?'chat':'agent';
     const models=await (this.config.modelRuntimeFactory?.(fixed.model.id)??createModelRuntime(this.config.platformUrl,this.config.platformToken,()=>fixed.model.id));
     const model=await resolveModel(models,fixed.model,signal);
@@ -121,7 +124,7 @@ export class Runtime {
     bindModelSession(models,sid,guard);
     const watchers=new Set<()=>void>();
     const inputs=(listener:()=>void)=>{watchers.add(listener);const run=this.runs.get(live.runId);if(run&&run.pendingInputs.size>0)listener();return ()=>{watchers.delete(listener);};};
-    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
+    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,artifacts:artifactScope,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     session.agent.steeringMode='all';
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now(),watchers});

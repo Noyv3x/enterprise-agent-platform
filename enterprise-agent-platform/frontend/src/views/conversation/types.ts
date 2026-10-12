@@ -1,3 +1,4 @@
+import type { ArtifactRef } from "../../api";
 import type { WorkItem } from "./work";
 
 export interface Attachment {
@@ -24,6 +25,8 @@ export interface Message {
     inserted_into?: number;
     delivery?: "pending" | "delivered";
     reply_to?: { message_id: number };
+    /** assistant replies: the artifact versions their run published (platform-api.md § Artifacts) */
+    artifacts?: ArtifactRef[];
     /** recorded only for after-turn messages */
     send_mode?: "after_turn";
     [key: string]: unknown;
@@ -79,6 +82,8 @@ export interface LiveRun {
   /** epoch ms the first event of this run arrived */
   startedAt: number;
   notice: "retry" | "compaction" | null;
+  /** artifact versions published so far (SSE `artifact`), one per artifact, newest version */
+  artifacts: ArtifactRef[];
 }
 
 /** A finished run's streamed calls, keyed by the assistant message the run became (run_end's message). */

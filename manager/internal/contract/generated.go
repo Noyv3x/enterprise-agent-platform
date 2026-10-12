@@ -4,7 +4,7 @@ package contract
 const (
 	SchemaVersion                    = 2
 	ReleaseChannel                   = "main"
-	DatabaseSchemaVersion            = 2026101301
+	DatabaseSchemaVersion            = 2026101401
 	ContainerDataRoot                = "/var/lib/agent-platform"
 	ContainerWorkspace               = "/workspace"
 	ContainerAgentHome               = "/home/agent"

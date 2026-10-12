@@ -860,6 +860,25 @@ test('the platform skill catalog reaches Pi unchanged and the skill tool exists 
   assert.deepEqual(await toolsFor('subagent','private:1/delegate/bg-1'),['read']);
 });
 
+test('the artifact tool exists for personal, channel and chat root runs and subagent requests naming it are rejected', {timeout:30_000}, async t=>{
+  const f = await fixture(t);
+  const toolsFor = async (kind:'agent'|'chat',scope?:string) => {
+    let captured: TranscriptContext | undefined;
+    f.faux.setResponses([context=>{captured=structuredClone(context);return fauxAssistantMessage('Done');}]);
+    const body = request(f.faux.getModel().id,kind,scope);
+    body.tools = ['read','artifact'];
+    await f.events(await f.start(`artifact-${kind}-${scope ?? 'default'}`.replaceAll(/[^A-Za-z0-9-]/g,'-'),body));
+    return captured!.messages.filter(m=>m.role==='system').flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort();
+  };
+  assert.deepEqual(await toolsFor('agent'),['artifact','read']);
+  assert.deepEqual(await toolsFor('agent','channel:7:main-agent'),['artifact','read']);
+  assert.deepEqual(await toolsFor('chat'),['artifact','read']);
+  const subagent = request(f.faux.getModel().id,'agent','private:1/delegate/bg-1');
+  subagent.kind = 'subagent';
+  subagent.tools = ['read','artifact'];
+  assert.equal((await f.http('/v1/sessions/agent-private-1-bg-1/runs',subagent)).status,400);
+});
+
 test('active session rejects a concurrent run and cancellation terminates SSE and releases the session', {timeout:20_000}, async t=>{
   const f = await fixture(t);
   const entered = Promise.withResolvers<void>();

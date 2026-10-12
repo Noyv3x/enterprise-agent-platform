@@ -3,7 +3,7 @@ import { createServer as nodeCreateServer, type IncomingMessage, type ServerResp
 import type { Runtime } from './runtime.js';
 
 type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
-const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait', 'skill'];
+const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait', 'skill', 'artifact'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
   return Object.assign(new Error(message), { status });

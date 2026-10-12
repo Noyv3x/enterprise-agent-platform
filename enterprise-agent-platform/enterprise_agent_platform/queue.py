@@ -18,7 +18,17 @@ from .files import bounded_read, ensure_workspace, open_workspace
 from .skills import skill_guidance
 
 
-BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"]
+BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch", "artifact"]
+
+
+def artifact_guidance(cwd):
+    """System prompt section, every scope: what to publish as an artifact and what to deliver as a download."""
+    return ("Publish what the user should look at with the `artifact` tool (action publish, an absolute path under "
+            f"{cwd}/): documents and reports (Markdown), web pages, complete multi-file websites (publish the folder; its entry "
+            "defaults to index.html), slides as HTML, diagrams (Mermaid .mmd or SVG), charts (an HTML page using any chart library) "
+            "and tables (CSV). Keep the same path when you revise something: that creates a new version the user can compare, so do not "
+            "create v2/v3 copies. Use a standalone "
+            f"MEDIA: {cwd}/path line only for downloadable files such as DOCX, XLSX, PPTX and PDF.")
 
 
 def timestamp(value):
@@ -684,7 +694,7 @@ class Queue:
             row = conn.execute("SELECT value FROM settings WHERE key='ui_branding_v1'").fetchone()
         branding = json.loads(row[0]) if row else {}
         prompt = f"You are {branding.get('agent_name', 'Assistant')}, the assistant in {branding.get('product_name', 'Agent Platform')}. "
-        prompt += f"Use your available tools to help the user. Deliver files with a standalone MEDIA: {info['sandbox']['cwd']}/path line."
+        prompt += f"Use your available tools to help the user. {artifact_guidance(info['sandbox']['cwd'])}"
         agents = None
         if info["kind"] == "agent":
             prompt += " Maintain lasting workspace guidance in AGENTS.md. Use advertised skills when relevant.\n\n"
@@ -818,6 +828,7 @@ class Queue:
                 return
             child_mids = self.settle_inputs(conn, job["id"], info, status, event.get("error"))
             mid = self.insert_message(conn, info, user, "assistant", event.get("text", ""), assistant_metadata)
+            self.p.artifacts.link(conn, info, mid, job["id"])
             table = "chat_messages" if info["kind"] == "chat" else "messages"
             old_metadata = json.loads(conn.execute(f"SELECT metadata_json FROM {table} WHERE id=?", (payload["message_id"],)).fetchone()[0])
             conn.execute(f"UPDATE {table} SET metadata_json=? WHERE id=?", (json.dumps({**old_metadata, **metadata}), payload["message_id"]))
@@ -833,7 +844,7 @@ class Queue:
         for child_mid in child_mids:
             self.emit(info["scope_key"], {"type": "message", "message": self.message(info, child_mid)})
         try:
-            await self.p.files.deliver(user, info, mid, event.get("text", ""))
+            await self.p.files.deliver(user, info, mid, event.get("text", ""), job["id"])
         except Exception as exc:
             event["error"] = assistant_metadata["error"] = f"File delivery failed: {exc}"
             event["status"] = assistant_metadata["status"] = "interrupted"
@@ -864,6 +875,9 @@ class Queue:
                         failed_mids.append(child_mid)
             for changed_mid in [payload["message_id"], *failed_mids]:
                 self.emit(info["scope_key"], {"type": "message", "message": self.message(info, changed_mid)})
+        with self.p.db.connect() as conn:
+            # MEDIA-published versions exist only now; a failed delivery also rewrote the metadata above.
+            self.p.artifacts.link(conn, info, mid, job["id"], final=True)
         event["message"] = self.message(info, mid)
         self.emit(info["scope_key"], event)
 
@@ -1037,6 +1051,7 @@ async def chat(request):
             await p.queue.runtime("DELETE", f"/v1/sessions/{info['sid']}")
             with p.db.connect() as conn:
                 conn.execute("UPDATE chat_conversations SET deleted_at=?,updated_at=? WHERE id=?", (now(), now(), cid))
+            p.artifacts.delete_scope("chat", cid)
             shutil.rmtree(info["workspace"])
             return JSONResponse({"ok": True})
         body = await body_json(request)

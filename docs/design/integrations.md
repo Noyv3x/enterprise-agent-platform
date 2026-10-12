@@ -1,6 +1,6 @@
 # Integrations
 
-Tool request/response shapes belong in the [Runtime API](../reference/runtime-api.md) and [Platform API](../reference/platform-api.md). Internal web/browser/schedule/tasks gateways require the agent-tool bearer and trusted run/scope context.
+Tool request/response shapes belong in the [Runtime API](../reference/runtime-api.md) and [Platform API](../reference/platform-api.md). Internal web/browser/schedule/tasks/skills/artifacts gateways require the agent-tool bearer and trusted run/scope context.
 
 ## Web search and fetch
 
@@ -13,6 +13,10 @@ All three conversation modes can search/fetch. Chat's sandbox has no network; it
 Personal AI uses managed Camofox with a Platform-derived per-scope identity. The computer panel displays screenshot previews and permits human takeover. One holder owns an expiring lease; agent browser actions return busy while a human holds it. Releasing or expiring the lease returns control to the agent. Browser support is absent from channels and standard chat.
 
 Camofox is a separate managed capability. Its outage may degrade browsing without making core login/conversation services unavailable.
+
+## Artifacts and MEDIA
+
+The AI shows things to the user in two ways. Runtime's `artifact` tool (publish, list) is a thin call to the internal `artifacts` gateway in every root run (personal, chat and channel; never subagents), and Platform owns the artifact records and blobs. A standalone `MEDIA: <sandbox cwd>/path` line in the final reply keeps delivering downloads as before, with one change: a MEDIA file of a previewable text kind (`.html`, `.htm`, `.md`, `.markdown`, `.svg`, `.mmd`, `.mermaid`, `.csv`, `.tsv`) publishes an artifact version instead of creating an attachment (the same snapshot, limits and version rules as the tool; the run's reply links to it like any other published version). Images, PDFs, Office files and every other extension stay attachments, so existing DOCX/XLSX/PPTX/PDF skills are unchanged. A MEDIA delivery that cannot be published (outside the workspace, over a limit, vanished) is skipped, as attachments are. The `MEDIA:` line stays in the message text. Platform's system prompt tells the AI, in every scope, to publish what the user should look at with `artifact`, keep the same path when revising and use MEDIA only for downloads; built-in skills whose deliverable is an HTML or Markdown document say the same. See [Platform API](../reference/platform-api.md#artifacts) and [security](security-and-trust.md#artifacts).
 
 ## MCP
 

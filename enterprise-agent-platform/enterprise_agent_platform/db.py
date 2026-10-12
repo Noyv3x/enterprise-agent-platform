@@ -385,6 +385,35 @@ _MIGRATIONS = (
     )),
     (2026101201, 'model-policy-groups', _model_policy_groups),
     (2026101301, 'skills', _skills),
+    (2026101401, 'artifacts', (
+        """CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope_type TEXT NOT NULL CHECK(scope_type IN ('private', 'chat', 'channel')),
+    scope_id TEXT NOT NULL,
+    owner_user_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    latest_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(scope_type, scope_id, path)
+)""",
+        """CREATE TABLE IF NOT EXISTS artifact_versions (
+    artifact_id INTEGER NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    entry TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    total_size INTEGER NOT NULL,
+    file_count INTEGER NOT NULL,
+    message_id INTEGER,
+    job_id INTEGER,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(artifact_id, version)
+)""",
+        'CREATE INDEX IF NOT EXISTS idx_artifacts_scope ON artifacts(scope_type, scope_id, updated_at)',
+        'CREATE INDEX IF NOT EXISTS idx_artifact_versions_job ON artifact_versions(job_id)',
+    )),
 )
 
 

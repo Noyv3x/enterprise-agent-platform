@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { request } from "../../api";
+import { request, type ArtifactRef, type ArtifactView } from "../../api";
 import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
@@ -11,7 +11,7 @@ const PAGE = 100;
 const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
-  "input_delivered", "message_removed", "retry", "compaction", "run_end", "task",
+  "input_delivered", "message_removed", "retry", "compaction", "run_end", "task", "artifact",
 ] as const;
 
 /** High-rate stream fragments: they commit together once per animation frame. */
@@ -36,6 +36,8 @@ type StreamEvent = { seq: number } & (
   | { type: "run_end"; message?: Message | null }
   /** personal AI only: a background task or subagent changed */
   | { type: "task"; task: TaskView }
+  /** an artifact version was published in the current run */
+  | { type: "artifact"; artifact: ArtifactView; version: number }
 );
 
 /** One received SSE event with its arrival time and stream-update mark. */
@@ -70,6 +72,10 @@ interface State {
   replyKeys: Record<number, string>;
   /** Highest message id of the first page: rows up to it are restored history and do not play entrances. */
   seenUpTo: number;
+  /** Artifacts as the stream announced them (newest version each), merged over the panel's list. */
+  published: Record<number, ArtifactView>;
+  /** The most recent publish, so the panel can follow it; `seq` tells repeated versions apart. */
+  lastPublished: { id: number; version: number; seq: number } | null;
 }
 
 type Action =
@@ -93,7 +99,7 @@ type Action =
 
 const initial: State = {
   phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null,
-  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0,
+  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0, published: {}, lastPublished: null,
 };
 
 function upsert(state: State, incoming: Message[]): Message[] {
@@ -214,7 +220,22 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
   }
   // Automatic Pi compaction is run activity, never the durable manual operation.
   if (event.type === "compaction" && event.phase === "end" && state.live === null) return state;
-  const live: LiveRun = state.live ?? { items: [], thinkingIndex: null, calls: [], startedAt: at, notice: null };
+  const live: LiveRun = state.live ?? { items: [], thinkingIndex: null, calls: [], startedAt: at, notice: null, artifacts: [] };
+  if (event.type === "artifact") {
+    const { artifact, version } = event;
+    const known = state.published[artifact.id];
+    const ref: ArtifactRef = { id: artifact.id, version, title: artifact.title, kind: artifact.kind, path: artifact.path };
+    // One card per artifact in the live reply, at its newest version.
+    const artifacts = live.artifacts.some((item) => item.id === artifact.id)
+      ? live.artifacts.map((item) => (item.id === artifact.id && item.version <= version ? ref : item))
+      : [...live.artifacts, ref];
+    return {
+      ...state,
+      live: { ...live, artifacts },
+      published: known && known.latest_version > artifact.latest_version ? state.published : { ...state.published, [artifact.id]: artifact },
+      lastPublished: { id: artifact.id, version, seq: event.seq },
+    };
+  }
   if (event.type === "tool_input_start" || event.type === "tool_input_delta" || event.type === "tool_output") {
     return { ...state, live: { ...live, calls: patchCall(live.calls, event.tool_call_id, (call) => applyCallEvent(call, event)) } };
   }

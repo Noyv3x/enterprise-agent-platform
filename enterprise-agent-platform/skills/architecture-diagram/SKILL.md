@@ -29,7 +29,12 @@ read({"path":"/opt/agent-platform/skills/builtin/architecture-diagram/templates/
 5. Use `write` with `path` and the complete HTML `content` to save the completed
    document to a user-selected workspace-relative `.html` path, or default to
    `architecture-diagram.html`. The bundled template is read-only.
-6. Inspect the generated source and report the path. Do not claim visual
+6. Publish the saved file with the `artifact` tool (`publish`, with the absolute
+   sandbox path of the file and a short `title`) so the user sees the diagram in
+   the artifact panel. To revise it, edit the same file and publish the same path
+   again: that creates a new version, so do not save `-v2` copies. Do not use a
+   `MEDIA:` line for it.
+7. Inspect the generated source and report the path. Do not claim visual
    correctness unless it was actually rendered or reviewed.
 
 ## Semantic palette
