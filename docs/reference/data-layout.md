@@ -83,7 +83,7 @@ Manager binds profile and workspace at sandbox creation; omitted `execution_cont
 | `mcp_connection_limit` / `mcp_connection_global_limit` | `8` / `64` |
 
 Running background processes (and, separately, MCP stdio connections) per owner and globally; excess starts return 409.
-Process records live in `<manager state>/processes/index.json` (global `seq`, records) with each log at `processes/<id>/output.log` (capped at 8 MiB; `retained_from` in `output.from` after rotation). Finished processes are kept 7 days or the newest 200 per owner.
+Process records live in `<manager state>/processes/index.json` (global `seq`, records; a named service's declared `port` is part of its record) with each log at `processes/<id>/output.log` (capped at 8 MiB; `retained_from` in `output.from` after rotation). Finished processes are kept 7 days or the newest 200 per owner.
 
 Memory/CPU values are strings, PID limits integers and idle periods Go duration strings. Existing explicit `sandbox_idle` values remain unchanged. Callers cannot configure the profile's network or rebind an existing sandbox; executor audit receipts and process identity also bind the profile.
 

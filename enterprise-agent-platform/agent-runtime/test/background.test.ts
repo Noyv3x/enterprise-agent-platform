@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { plan } from "../src/background.js";
 import { createTools } from "../src/tools.js";
 import type { GatewayResult, Sandbox } from "../src/transport.js";
 import { FakeProcesses, fakeGateway, noProcesses, personal } from "./fakes.js";
@@ -172,6 +173,11 @@ test("personal bash validates async, timeout, name and ready before starting any
   await reject({ name: "svc", ready: { port: 70_000 } }, /port must be/);
   await reject({ name: "svc", ready: { port: 80, host: "bad host; rm" } }, /host/);
   await reject({ name: "svc", ready: { port: 80, timeout: 0 } }, /ready\.timeout/);
+  await reject({ port: 3000 }, /port requires name/);
+  await reject({ name: "svc", port: 0 }, /port must be an integer/);
+  await reject({ name: "svc", port: 65_536 }, /port must be an integer/);
+  await reject({ name: "svc", port: 1.5 }, /port must be an integer/);
+  await reject({ name: "svc", port: 3000, ready: { port: 3001 } }, /differ/);
   assert.equal(h.processes.starts.length, 0);
   assert.equal(h.gateway.calls.length, 0);
 
@@ -192,6 +198,15 @@ test("personal bash validates async, timeout, name and ready before starting any
     await running;
     assert.equal(limited.processes.starts[0]!.options.timeoutMs, timeoutMs, JSON.stringify(args));
   }
+});
+
+test("a named service's port, explicit or from ready.port, is passed to the process start", async () => {
+  const explicit = harness();
+  await explicit.invoke("bash", { command: "npm run dev", name: "web", port: 5173 });
+  assert.deepEqual(explicit.processes.starts[0]!.options, { command: "npm run dev", cwd: "/workspace", timeoutMs: 0, name: "web", port: 5173, stdin: true });
+  assert.equal(plan({ command: "x", name: "web", port: 3000, ready: { port: 3000 } }).port, 3000);
+  assert.equal(plan({ command: "x", name: "web", ready: { port: 4000 } }).port, 4000);
+  assert.equal(plan({ command: "x", name: "web", ready: { log: "up" } }).port, undefined);
 });
 
 test("a named service waits for its log line, reports ready and stays running", async () => {
@@ -342,7 +357,7 @@ test("task, job and wait exist only in the root personal scope", () => {
   const personalBash = createTools("/workspace", { sandbox: personal, executor: { ...noProcesses } as never, gateway: fakeGateway(() => registered()), names: ["bash"], context: () => ({ sid: "s", scope_key: "private:1", run_id: "r" }) })[0]!;
   const foreignBash = createTools("/workspace", { sandbox: { ...personal, scope_key: "channel:2:room" }, executor: { ...noProcesses } as never, gateway: fakeGateway(() => registered()), names: ["bash"], context: () => ({ sid: "s", scope_key: "channel:2:room", run_id: "r" }) })[0]!;
   const properties = (tool: typeof personalBash) => Object.keys((tool.parameters as { properties: Record<string, unknown> }).properties).sort();
-  assert.deepEqual(properties(personalBash), ["async", "command", "name", "ready", "timeout"]);
+  assert.deepEqual(properties(personalBash), ["async", "command", "name", "port", "ready", "timeout"]);
   assert.deepEqual(properties(foreignBash), ["command", "timeout"]);
 });
 

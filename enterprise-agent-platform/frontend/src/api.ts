@@ -52,20 +52,51 @@ export interface OrgSkill extends SkillView { groups: string[] }
 export interface BuiltinSkill extends SkillView { org_enabled: boolean }
 export interface AdminSkills { org: OrgSkill[]; builtin: BuiltinSkill[]; groups: string[] }
 
-/** What an artifact (作品) shows as, derived from its entry extension (platform-api.md § Artifacts). */
-export type ArtifactKind = 'web' | 'site' | 'markdown' | 'mermaid' | 'svg' | 'table' | 'code' | 'image' | 'pdf';
+/** What an artifact (作品) shows as, derived from its entry extension (platform-api.md § Artifacts); `live` is a running
+ * website preview bound to a named background service, without versions or files. */
+export type ArtifactKind = 'web' | 'site' | 'markdown' | 'mermaid' | 'svg' | 'table' | 'code' | 'image' | 'pdf' | 'live';
 
-/** One artifact of a conversation scope. `scope` is the `?scope=` form; `entry` is the latest version's entry relpath. */
+/** One artifact of a conversation scope. `scope` is the `?scope=` form; `entry` is the latest version's entry relpath
+ * (null for `live`, whose `latest_version` is 0). A live artifact in `GET /api/artifacts?scope=` may carry its
+ * `preview`, so list rows and cards know its state before it is opened. */
 export interface ArtifactView {
   id: number;
   scope: string;
   path: string;
   kind: ArtifactKind;
   title: string;
-  entry: string;
+  entry: string | null;
   latest_version: number;
   created_at: string;
   updated_at: string;
+  preview?: ArtifactPreview;
+}
+
+/** A live artifact's preview (`GET /api/artifacts/{id}` and SSE `artifact`): the page is `base_path` plus `path`
+ * without its leading slash, stable across restarts of the service. `stopped` between runs resumes as `running` (with
+ * the new `task_id`, `bg-<n>`) when the service starts again; `revoked` (结束预览) means the link is dead until a later
+ * `preview` call makes a fresh one. */
+export interface ArtifactPreview {
+  state: 'waiting' | 'running' | 'stopped';
+  base_path: string;
+  path: string;
+  service: string;
+  task_id: string | null;
+  revoked: boolean;
+}
+
+/** One `artifact_feedback` item of a sent message: an element or region picked in a page, or quoted text. `version`
+ * is null for a live preview. Stored messages add the artifact's `title` and `artifact_kind`. */
+export interface ArtifactFeedback {
+  artifact_id: number;
+  version: number | null;
+  path: string;
+  kind: 'element' | 'region' | 'quote';
+  selector?: string;
+  text?: string;
+  rect?: { x: number; y: number; w: number; h: number };
+  title?: string;
+  artifact_kind?: ArtifactKind;
 }
 
 /** `GET /api/artifacts/{id}`: one version (newest first); `message_id` is null until the reply is persisted. */

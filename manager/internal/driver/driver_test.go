@@ -1534,3 +1534,42 @@ func TestCheckCapacityDeduplicatesSnapshotAndDockerOnSameFilesystem(t *testing.T
 		t.Fatalf("same-filesystem requirements were summed twice: %v", err)
 	}
 }
+
+func TestResolveSandboxIPRequiresRunningOwnedContainerWithCoreAddress(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name, output, want, fail string
+	}{
+		{name: "owned", output: "true\ttrue\t" + hash + "\t172.20.0.5\n", want: "172.20.0.5"},
+		{name: "stopped", output: "false\ttrue\t" + hash + "\t172.20.0.5\n", fail: "not running"},
+		{name: "unlabelled", output: "true\t\t\t172.20.0.5\n", fail: "not the managed sandbox"},
+		{name: "foreign hash", output: "true\ttrue\t" + strings.Repeat("b", 64) + "\t172.20.0.5\n", fail: "not the managed sandbox"},
+		{name: "off network", output: "true\ttrue\t" + hash + "\t\n", fail: "no IPv4 address"},
+		{name: "ipv6", output: "true\ttrue\t" + hash + "\tfd00::5\n", fail: "no IPv4 address"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &recordingRunner{results: func(args []string) (Result, error) { return Result{Stdout: tc.output}, nil }}
+			docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker"}
+			ip, err := docker.ResolveSandboxIP(context.Background(), "agent-sandbox-abc", hash, "agent-platform_core")
+			if tc.fail != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.fail) {
+					t.Fatalf("error = %v, want %q", err, tc.fail)
+				}
+				return
+			}
+			if err != nil || ip != tc.want {
+				t.Fatalf("ip = %q, %v", ip, err)
+			}
+			args := strings.Join(runner.calls[0].args, " ")
+			if !strings.Contains(args, `Networks "agent-platform_core"`) || !strings.HasSuffix(args, " agent-sandbox-abc") {
+				t.Fatalf("inspect did not pin the network and container: %s", args)
+			}
+		})
+	}
+	docker := DockerCLI{Profile: testActiveProfile, Runner: &recordingRunner{}, Binary: "docker"}
+	for _, bad := range [][3]string{{"", hash, "net"}, {"x y", hash, "net"}, {"x", "short", "net"}, {"x", hash, "a;b"}} {
+		if _, err := docker.ResolveSandboxIP(context.Background(), bad[0], bad[1], bad[2]); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
+	}
+}

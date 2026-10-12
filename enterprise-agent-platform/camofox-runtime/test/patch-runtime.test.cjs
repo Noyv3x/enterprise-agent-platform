@@ -48,6 +48,9 @@ test("locked Camoufox patch installs atomic pointer control idempotently", () =>
     assert.match(pointerRoute, /points\.length < 2 \|\| points\.length > 64/);
     assert.match(pointerRoute, /atMs > 10000/);
     assert.match(pointerRoute, /finally \{[\s\S]*tabState\.page\.mouse\.up/);
+    assert.match(patched, /b\.newContext\(contextOptions, \{ agentPlatformUserId: String\(key\) \}\)/);
+    assert.equal(patched.match(/newContext\(contextOptions/g)?.length, 1);
+    assert.match(patched, /options\.clip = \{ x: clipX, y: clipY, width: clipWidth, height: clipHeight \}/);
     assert.match(patched, /scale: 'css'/);
     assert.equal(
       patched.match(/app\.post\('\/tabs\/:tabId\/pointer'/g)?.length,

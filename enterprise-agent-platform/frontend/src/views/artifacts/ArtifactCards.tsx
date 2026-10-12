@@ -1,19 +1,21 @@
 import { createContext, useContext } from "react";
 import { useWords } from "../../words";
 import type { Message } from "../conversation/types";
-import { KindIcon, kindLabel } from "./kinds";
-import type { ArtifactKind, ArtifactRef } from "../../api";
+import { KindIcon, kindLabel, previewLabel } from "./kinds";
+import type { ArtifactKind, ArtifactPreview, ArtifactRef } from "../../api";
 
 /** Opens the 作品 panel at one artifact version; provided by the conversation. */
 export interface ArtifactOpener {
   open: (id: number, version: number) => void;
   /** the artifact version the panel shows, so its card reads as open */
   current: { id: number; version: number } | null;
+  /** a live artifact's preview state, for its card */
+  previewOf?: (id: number) => ArtifactPreview | null;
 }
 
 export const ArtifactsContext = createContext<ArtifactOpener | null>(null);
 
-const KINDS: Record<ArtifactKind, true> = { web: true, site: true, markdown: true, mermaid: true, svg: true, table: true, code: true, image: true, pdf: true };
+const KINDS: Record<ArtifactKind, true> = { web: true, site: true, markdown: true, mermaid: true, svg: true, table: true, code: true, image: true, pdf: true, live: true };
 
 /** The artifact versions an assistant message's run published (`metadata.artifacts`), one per artifact at its newest
  * version; malformed entries are skipped. */
@@ -36,7 +38,8 @@ export function baseName(path: string): string {
   return path.replace(/\/+$/, "").split("/").pop() ?? "";
 }
 
-/** A published artifact in a reply: kind icon, title, "v3 · 网页" and 打开, which opens the panel at that version. */
+/** A published artifact in a reply: kind icon, title, "v3 · 网页" (a live preview: "网站预览 · 运行中") and 打开, which
+ * opens the panel at that version. */
 export function ArtifactCards({ artifacts }: { artifacts: ArtifactRef[] }) {
   const w = useWords();
   const opener = useContext(ArtifactsContext);
@@ -44,7 +47,9 @@ export function ArtifactCards({ artifacts }: { artifacts: ArtifactRef[] }) {
     <div className="flex w-full max-w-95 flex-col gap-2">
       {artifacts.map((artifact, index) => {
         const title = artifact.title || baseName(artifact.path);
-        const meta = `v${artifact.version} · ${kindLabel(artifact.kind, w)}`;
+        const meta = artifact.kind === "live"
+          ? [kindLabel("live", w), previewLabel(opener?.previewOf?.(artifact.id), w)].filter(Boolean).join(" · ")
+          : `v${artifact.version} · ${kindLabel(artifact.kind, w)}`;
         const open = opener?.current?.id === artifact.id && opener.current.version === artifact.version;
         return (
           <button

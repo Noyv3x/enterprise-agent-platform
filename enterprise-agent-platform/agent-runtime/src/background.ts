@@ -16,7 +16,7 @@ const HOST = /^[A-Za-z0-9._:-]{1,255}$/;
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export interface BashArguments {
-  command: string; timeout?: number; async?: boolean; name?: string;
+  command: string; timeout?: number; async?: boolean; name?: string; port?: number;
   ready?: { log?: string; port?: number; host?: string; timeout?: number };
 }
 export interface BackgroundDependencies {
@@ -33,7 +33,7 @@ export interface BackgroundDependencies {
   promoteAfterMs?: number;
 }
 interface Plan {
-  background: boolean; timeoutMs: number; name?: string;
+  background: boolean; timeoutMs: number; name?: string; port?: number;
   ready?: { log?: RegExp; logSource?: string; port?: number; host: string; timeoutMs: number };
 }
 type ToolText = { content: { type: "text"; text: string }[]; details: unknown };
@@ -43,6 +43,10 @@ const result = (text: string, details: unknown = {}): ToolText => ({ content: [{
 export function plan(args: BashArguments): Plan {
   const background = args.async === true || args.name !== undefined;
   if (args.name !== undefined && !NAME.test(args.name)) throw new Error("name must be 1-48 characters: letters, digits, '.', '_' or '-', starting with a letter or digit");
+  if (args.port !== undefined) {
+    if (args.name === undefined) throw new Error("port requires name");
+    if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65535) throw new Error("port must be an integer from 1 to 65535");
+  }
   let ready: Plan["ready"];
   if (args.ready !== undefined) {
     if (args.name === undefined) throw new Error("ready requires name");
@@ -53,6 +57,7 @@ export function plan(args: BashArguments): Plan {
     if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 3600) throw new Error("ready.timeout must be greater than 0 and at most 3600 seconds");
     let pattern: RegExp | undefined;
     if (log !== undefined) { try { pattern = new RegExp(log, "m"); } catch { throw new Error("ready.log is not a valid regular expression"); } }
+    if (args.port !== undefined && port !== undefined && port !== args.port) throw new Error("port and ready.port differ; give one port");
     ready = { ...(pattern ? { log: pattern, logSource: log } : {}), ...(port === undefined ? {} : { port }), host, timeoutMs: timeout * 1000 };
   }
   const timeout = args.timeout;
@@ -63,7 +68,8 @@ export function plan(args: BashArguments): Plan {
     if (!background) throw new Error("timeout 0 (no deadline) is valid only with async or name");
     seconds = 0;
   } else seconds = Math.min(timeout, background ? BACKGROUND_MAX_SECONDS : FOREGROUND_MAX_SECONDS);
-  return { background, timeoutMs: seconds === 0 ? 0 : Math.max(100, Math.round(seconds * 1000)), ...(args.name === undefined ? {} : { name: args.name }), ...(ready ? { ready } : {}) };
+  const servicePort = args.port ?? ready?.port;
+  return { background, timeoutMs: seconds === 0 ? 0 : Math.max(100, Math.round(seconds * 1000)), ...(args.name === undefined ? {} : { name: args.name }), ...(servicePort === undefined ? {} : { port: servicePort }), ...(ready ? { ready } : {}) };
 }
 
 /** Keeps what the foreground result needs: the byte and line totals plus a bounded tail. */
@@ -103,7 +109,7 @@ export async function runBash(args: BashArguments, dependencies: BackgroundDepen
   const settings = plan(args);
   const { context, signal } = dependencies.call();
   signal?.throwIfAborted();
-  const proc = await executor.processStart(sandbox, context, { command: args.command, cwd, timeoutMs: settings.timeoutMs, ...(settings.name === undefined ? {} : { name: settings.name }), stdin: settings.name !== undefined }, signal);
+  const proc = await executor.processStart(sandbox, context, { command: args.command, cwd, timeoutMs: settings.timeoutMs, ...(settings.name === undefined ? {} : { name: settings.name }), ...(settings.port === undefined ? {} : { port: settings.port }), stdin: settings.name !== undefined }, signal);
   const kill = async () => { try { await executor.processKill(sandbox, context, proc.id); } catch { /* Manager run cancellation is the backstop */ } };
   const trigger = new AbortController();
   type Reason = "threshold" | "input" | "async";

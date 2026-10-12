@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { ApiError, request, type ArtifactRef, type ArtifactView } from "../../api";
+import { ApiError, request, type ArtifactFeedback, type ArtifactPreview, type ArtifactRef, type ArtifactView } from "../../api";
 import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
@@ -37,8 +37,9 @@ type StreamEvent = { seq: number } & (
   | { type: "run_end"; message?: Message | null }
   /** personal AI only: a background task or subagent changed */
   | { type: "task"; task: TaskView }
-  /** an artifact version was published in the current run */
-  | { type: "artifact"; artifact: ArtifactView; version: number }
+  /** an artifact version was published in the current run. A live preview's (version 0) carries `preview` and its
+   * `cause`: a `preview` tool call (the run's card) or a `state` change (stop, resume, revoke: the state only). */
+  | { type: "artifact"; artifact: ArtifactView; version: number; preview?: ArtifactPreview; cause?: "preview" | "state" }
   /** a connector needs the user's sign-in or secret values (personal AI management) */
   | ({ type: "mcp_action_required" } & McpActionRequired)
   /** a connector asks the run's user for input */
@@ -82,6 +83,8 @@ interface State {
   published: Record<number, ArtifactView>;
   /** The most recent publish, so the panel can follow it; `seq` tells repeated versions apart. */
   lastPublished: { id: number; version: number; seq: number } | null;
+  /** Live previews' states as the stream announced them, with the event's seq. */
+  previews: Record<number, { preview: ArtifactPreview; seq: number }>;
   /** MCP sign-in and secrets cards, one per connector and kind; they outlive the run until handled or dismissed */
   mcpActions: McpActionRequired[];
   /** the active run's elicitations in arrival order; a run's end removes them (Platform cancels any still open) */
@@ -115,7 +118,7 @@ type Action =
 
 const initial: State = {
   phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null,
-  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0, published: {}, lastPublished: null,
+  tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0, published: {}, lastPublished: null, previews: {},
   mcpActions: [], elicitations: [],
 };
 
@@ -252,6 +255,15 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
   }
   // Automatic Pi compaction is run activity, never the durable manual operation.
   if (event.type === "compaction" && event.phase === "end" && state.live === null) return state;
+  if (event.type === "artifact" && event.preview) {
+    const { artifact, preview } = event;
+    const previews = { ...state.previews, [artifact.id]: { preview, seq: event.seq } };
+    // Only a `preview` tool call in a run makes a card (and may reveal the panel); a state change updates the state.
+    if (event.cause !== "preview" || state.live === null) {
+      return { ...state, previews, published: { ...state.published, [artifact.id]: artifact } };
+    }
+    state = { ...state, previews };
+  }
   const live: LiveRun = state.live ?? { items: [], thinkingIndex: null, calls: [], startedAt: at, notice: null, artifacts: [] };
   if (event.type === "artifact") {
     const { artifact, version } = event;
@@ -503,19 +515,20 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
     dispatch({ type: "older", page: await request<MessagePage>(`${base}/messages?before=${state.nextBefore}&limit=${PAGE}`) });
   }, [base, state.nextBefore]);
 
-  /** `mode` only while the agent works: insert into the running turn (when eligible) or run after it. */
-  const send = useCallback(async (content: string, attachmentIds: number[], mode?: SendMode) => {
+  /** `mode` only while the agent works: insert into the running turn (when eligible) or run after it. `feedback` is the
+   * message's 圈选反馈 (`artifact_feedback`). */
+  const send = useCallback(async (content: string, attachmentIds: number[], mode?: SendMode, feedback: ArtifactFeedback[] = []) => {
     const result = await request<{ message: Message; job_id: number }>(`${base}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content, attachment_ids: attachmentIds, ...(mode ? { mode } : {}) }),
+      body: JSON.stringify({ content, attachment_ids: attachmentIds, ...(mode ? { mode } : {}), ...(feedback.length ? { artifact_feedback: feedback } : {}) }),
     });
     dispatch({ type: "accepted", message: result.message });
   }, [base]);
 
-  /** Withdraws a message the agent has not seen yet and returns its text and files for the composer. Rejects with
-   * ApiError 409 (`already_seen`) when delivery or its turn won the race. */
+  /** Withdraws a message the agent has not seen yet and returns its text, files and stored `artifact_feedback` (raw;
+   * see feedbackItems) for the composer. Rejects with ApiError 409 (`already_seen`) when delivery or its turn won the race. */
   const withdraw = useCallback(async (messageId: number) => {
-    const result = await request<{ content: string; attachments: Attachment[] }>(`${base}/messages/${messageId}`, { method: "DELETE" });
+    const result = await request<{ content: string; attachments: Attachment[]; artifact_feedback?: unknown }>(`${base}/messages/${messageId}`, { method: "DELETE" });
     dispatch({ type: "removed", messageId });
     return result;
   }, [base]);

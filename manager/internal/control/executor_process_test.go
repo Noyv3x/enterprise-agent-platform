@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -135,5 +136,63 @@ func TestProcessRoutesEndToEnd(t *testing.T) {
 	_, after := processPost(t, server.URL, "read", map[string]any{"process_id": body["process"].(map[string]any)["id"], "owner": "private:1"}, token)
 	if state := after["process"].(map[string]any); state["state"] != "killed" || state["reason"] != "run_cancelled" {
 		t.Fatalf("run cancel: %v", after)
+	}
+}
+
+func TestProxyRouteIsRawAuthenticatedAndDispatchedBeforeJSONRoutes(t *testing.T) {
+	api := newStreamAPI(t)
+	server := httptest.NewServer(api)
+	defer server.Close()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(r.Method + " " + r.URL.RequestURI()))
+	}))
+	defer upstream.Close()
+	port, _ := strconv.Atoi(upstream.URL[strings.LastIndex(upstream.URL, ":")+1:])
+	status, body := processPost(t, server.URL, "start", processCall(t, api, "private:1", "start", map[string]any{"command": "sleep 60", "name": "web", "port": port}, map[string]any{"command": "sleep 60", "cwd": ""}), streamExecutorToken)
+	if status != http.StatusOK {
+		t.Fatalf("start: %d %v", status, body)
+	}
+	view := body["process"].(map[string]any)
+	id := view["id"].(string)
+	if view["port"] != float64(port) {
+		t.Fatalf("view: %v", view)
+	}
+	defer processPost(t, server.URL, "kill", processCall(t, api, "private:1", "kill", map[string]any{"process_id": id}, map[string]any{"process_id": id}), streamExecutorToken)
+
+	do := func(method, path, token, owner string) (*http.Response, string) {
+		request, _ := http.NewRequest(method, server.URL+"/v1/executor/proxy/"+id+path, strings.NewReader("x"))
+		if token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		if owner != "" {
+			request.Header.Set("X-Owner", owner)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, _ := io.ReadAll(response.Body)
+		return response, string(data)
+	}
+	if response, _ := do("GET", "/", "", "private:1"); response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("the proxy must require the executor bearer: %d", response.StatusCode)
+	}
+	if response, _ := do("GET", "/", "wrong", "private:1"); response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong bearer: %d", response.StatusCode)
+	}
+	response, text := do("PUT", "/a%2Fb/c?q=1", streamExecutorToken, "private:1")
+	if response.StatusCode != http.StatusOK || text != "PUT /a%2Fb/c?q=1" {
+		t.Fatalf("raw route: %d %q", response.StatusCode, text)
+	}
+	if response.Header.Get("Content-Type") != "text/html" || response.Header.Get("Cache-Control") != "" {
+		t.Fatalf("the upstream owns content type and caching: %v", response.Header)
+	}
+	if response, _ := do("GET", "/", streamExecutorToken, "private:9"); response.StatusCode != http.StatusNotFound {
+		t.Fatalf("foreign owner: %d", response.StatusCode)
+	}
+	if response, _ := do("GET", "", streamExecutorToken, "private:1"); response.StatusCode != http.StatusOK {
+		t.Fatalf("bare process path: %d", response.StatusCode)
 	}
 }

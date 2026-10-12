@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { request, type McpPrompt, type SkillList, type SkillView } from "../../api";
 import PromptBar, { clipboardFiles, type PromptCommand, type PromptSendOption } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
+import { feedbackLabel, type FeedbackItem } from "../artifacts/feedback";
 import { formatBytes } from "./Attachments";
 import { loadMcpCatalog } from "./mcpCatalog";
 import { McpPromptDialog, promptFailure, renderMcpPrompt } from "./McpPromptDialog";
@@ -52,10 +53,13 @@ export interface ComposerProps {
   placeholder: string;
   /** applied whenever `seed.n` changes */
   seed?: ComposerSeed | null;
+  /** 圈选反馈 waiting to be sent: each a screenshot chip and a context chip. `onSend` sends them; the composer only shows
+   * them, waits for screenshots being captured, and removes one on request. */
+  feedback?: { items: FeedbackItem[]; remove: (key: string, part: "item" | "shot") => void };
 }
 
 export function Composer({
-  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], catalogScope, placeholder, seed,
+  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], catalogScope, placeholder, seed, feedback,
 }: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
@@ -128,9 +132,10 @@ export function Composer({
     input.current?.focus();
   }, [seed]);
 
-  const uploading = uploads.some((upload) => !upload.attachment && !upload.error);
+  const feedbackItems = feedback?.items ?? [];
+  const uploading = uploads.some((upload) => !upload.attachment && !upload.error) || feedbackItems.some((item) => item.shot?.state === "capturing");
   const ready = uploads.flatMap((upload) => (upload.attachment ? [upload.attachment.id] : []));
-  const canSend = !sending && !uploading && (text.trim() !== "" || ready.length > 0);
+  const canSend = !sending && !uploading && (text.trim() !== "" || ready.length > 0 || feedbackItems.length > 0);
 
   const upload = (files: File[]) => {
     setError("");
@@ -228,14 +233,34 @@ export function Composer({
         draft={text}
         onDraftChange={setText}
         inputRef={input}
-        attachments={uploads.map((item) => ({
-          key: item.key,
-          name: item.name,
-          state: item.error ? "error" : item.attachment ? "ready" : "uploading",
-          detail: item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…")),
-        }))}
+        attachments={[
+          ...uploads.map((item) => ({
+            key: item.key,
+            name: item.name,
+            state: item.error ? "error" as const : item.attachment ? "ready" as const : "uploading" as const,
+            detail: item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…")),
+          })),
+          ...feedbackItems.flatMap((item) => {
+            const label = feedbackLabel(item.feedback, w, item.tag);
+            const { shot } = item;
+            return [
+              { key: `context:${item.key}`, name: label, state: "ready" as const, context: true },
+              ...(shot ? [{
+                key: `shot:${item.key}`,
+                name: w(`Screenshot · ${label}`, `截图 · ${label}`, `截圖 · ${label}`),
+                state: shot.state === "capturing" ? "uploading" as const : shot.state,
+                detail: shot.state === "error" ? shot.error : shot.state === "capturing" ? w("Capturing…", "正在截图…", "正在截圖…") : undefined,
+                thumb: shot.state === "ready" ? shot.attachment.preview_url ?? undefined : undefined,
+              }] : []),
+            ];
+          }),
+        ]}
         onAttach={upload}
-        onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
+        onRemoveAttachment={(key) => {
+          if (typeof key === "number") setUploads((current) => current.filter((item) => item.key !== key));
+          else if (key.startsWith("shot:")) feedback?.remove(key.slice(5), "shot");
+          else if (key.startsWith("context:")) feedback?.remove(key.slice(8), "item");
+        }}
         commands={menu}
         onCommand={(key) => {
           if (key.startsWith(PROMPT_KEY)) {

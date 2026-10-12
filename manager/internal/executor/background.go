@@ -57,6 +57,7 @@ type ProcessView struct {
 	ScopeID     string  `json:"scope_id"`
 	SandboxID   string  `json:"sandbox_id"`
 	Name        *string `json:"name"`
+	Port        *int    `json:"port"`
 	Command     string  `json:"command"`
 	CWD         string  `json:"cwd"`
 	State       string  `json:"state"`
@@ -76,6 +77,7 @@ type processRecord struct {
 	ID          string     `json:"id"`
 	Owner       string     `json:"owner"`
 	Name        *string    `json:"name"`
+	Port        *int       `json:"port,omitempty"`
 	Command     string     `json:"command"`
 	CWD         string     `json:"cwd"`
 	State       string     `json:"state"`
@@ -104,6 +106,7 @@ type processStartArguments struct {
 	CWD       string  `json:"cwd,omitempty"`
 	TimeoutMS int     `json:"timeout_ms"`
 	Name      *string `json:"name,omitempty"`
+	Port      *int    `json:"port,omitempty"`
 	Stdin     bool    `json:"stdin"`
 	Attached  bool    `json:"attached"`
 }
@@ -178,7 +181,11 @@ type BackgroundManager struct {
 	TermGrace       time.Duration
 	KeepPerOwner    int
 	StartTimeout    time.Duration
-	Now             func() time.Time
+	// Proxy tunes the sandbox service proxy (zero values are the defaults).
+	Proxy ProxyLimits
+	Now   func() time.Time
+
+	proxy proxyState
 
 	mu    sync.Mutex
 	seq   int64
@@ -292,7 +299,7 @@ func (m *BackgroundManager) bumpLocked(p *bgProcess) error {
 func (m *BackgroundManager) viewLocked(p *bgProcess) ProcessView {
 	view := ProcessView{
 		ID: p.rec.ID, Owner: p.rec.Owner, ScopeID: p.rec.Identity.ScopeID, SandboxID: p.rec.Identity.ExecutionContext.SandboxID,
-		Name: p.rec.Name, Command: p.rec.Command, CWD: p.rec.CWD, State: p.rec.State, ExitCode: p.rec.ExitCode,
+		Name: p.rec.Name, Port: p.rec.Port, Command: p.rec.Command, CWD: p.rec.CWD, State: p.rec.State, ExitCode: p.rec.ExitCode,
 		Reason: p.rec.Reason, Attached: p.rec.Attached, StdinOpen: p.rec.StdinOpen,
 		StartedAt: p.rec.StartedAt.UTC().Format(time.RFC3339Nano), LogBytes: p.log.Total(), Seq: p.rec.Seq,
 		Unconfirmed: p.rec.Unconfirmed,
@@ -359,6 +366,14 @@ func validateProcessStart(args processStartArguments) error {
 	}
 	if args.Name != nil && (len(*args.Name) < 1 || len(*args.Name) > processNameMaximum || !processNamePattern.MatchString(*args.Name)) {
 		return errors.New("name must be 1-48 characters of [A-Za-z0-9._-] starting with a letter or digit")
+	}
+	if args.Port != nil {
+		if args.Name == nil {
+			return errors.New("port requires a named service")
+		}
+		if *args.Port < 1 || *args.Port > 65535 {
+			return errors.New("port must be 1-65535")
+		}
 	}
 	return nil
 }
@@ -548,7 +563,7 @@ func (m *BackgroundManager) Start(ctx context.Context, call Call, args processSt
 		visible: false, log: log, display: display,
 		done: make(chan struct{}), started: make(chan struct{}), hard: make(chan struct{}),
 		rec: processRecord{
-			ID: id, Owner: owner, Name: args.Name, Command: truncateRunes(display, processViewCommandMaximumRunes), CWD: cwd,
+			ID: id, Owner: owner, Name: args.Name, Port: args.Port, Command: truncateRunes(display, processViewCommandMaximumRunes), CWD: cwd,
 			State: "running", Attached: args.Attached, StdinOpen: args.Stdin, StartedAt: m.now(), TimeoutMS: args.TimeoutMS,
 			Identity: call.Identity, AuditID: call.AuditID, ExecutorID: call.ExecutorID,
 		},

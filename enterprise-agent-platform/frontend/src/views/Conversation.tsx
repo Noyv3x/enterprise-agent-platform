@@ -6,8 +6,9 @@ import { StatusPill } from "../components/ui/beautiful/atoms/StatusPill";
 import { ConfirmDialog, Icon, Menu, NavigationButton, Notice, Sheet, WindowAside, useShell, type MenuItem } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../words";
-import { ArtifactsContext, type ArtifactOpener } from "./artifacts/ArtifactCards";
+import { ArtifactsContext, messageArtifacts, type ArtifactOpener } from "./artifacts/ArtifactCards";
 import { ArtifactPanel } from "./artifacts/ArtifactPanel";
+import { MAX_FEEDBACK, feedbackAttachmentIds, feedbackItems, feedbackPayload, useArtifactFeedback, type FeedbackSink } from "./artifacts/feedback";
 import { KindIcon } from "./artifacts/kinds";
 import { useArtifacts } from "./artifacts/useArtifacts";
 import { Composer, type ComposerCommand, type ComposerSeed } from "./conversation/Composer";
@@ -208,11 +209,13 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     setAside(null);
     setComputerFocus(null);
   };
+  // Live preview cards in the transcript read their state from the artifact list, fetched at once for them.
+  const liveCards = useMemo(() => messages.some((message) => messageArtifacts(message).some((artifact) => artifact.kind === "live")), [messages]);
   const artifacts = useArtifacts({
-    scope, published: conversation.published, lastPublished: conversation.lastPublished, shown: aside === "artifacts", narrow,
-    reveal: () => setAside("artifacts"),
+    scope, published: conversation.published, lastPublished: conversation.lastPublished, previews: conversation.previews, shown: aside === "artifacts",
+    liveCards, narrow, reveal: () => setAside("artifacts"),
   });
-  const { open: openArtifact, selection: artifactSelection } = artifacts;
+  const { open: openArtifact, selection: artifactSelection, previewOf } = artifacts;
   const artifactsShown = aside === "artifacts";
   const opener = useMemo<ArtifactOpener>(() => ({
     open: (id, version) => {
@@ -220,7 +223,13 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       setAside("artifacts");
     },
     current: artifactsShown && artifactSelection ? { id: artifactSelection.id, version: artifactSelection.version } : null,
-  }), [openArtifact, artifactsShown, artifactSelection]);
+    previewOf,
+  }), [openArtifact, artifactsShown, artifactSelection, previewOf]);
+  // 圈选反馈 waiting in the composer; only people who can post annotate.
+  const feedback = useArtifactFeedback();
+  const feedbackSink: FeedbackSink | null = canSend
+    ? { count: feedback.items.length, add: feedback.add, toComposer: narrow ? () => setAside(null) : undefined }
+    : null;
   // The task whose output viewer or sheet is open (personal AI).
   const [openedTask, setOpenedTask] = useState<string | null>(null);
   const knownTasks = useRef(conversation.tasks);
@@ -341,6 +350,13 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     stick.current = true;
     await conversation.send(text, attachmentIds, mode);
   };
+  /** The composer's message also carries the waiting feedback and its screenshots. */
+  const sendComposed = async (text: string, attachmentIds: number[], mode?: SendMode) => {
+    const items = feedback.items;
+    stick.current = true;
+    await conversation.send(text, [...attachmentIds, ...feedbackAttachmentIds(items)], mode, feedbackPayload(items));
+    feedback.sent(items.map((item) => item.key));
+  };
 
   const resend = (request: Message) => {
     // Bound attachments cannot be re-sent; put the text back so the person re-attaches deliberately.
@@ -357,9 +373,19 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     setWithdrawing((current) => new Set(current).add(message.id));
     try {
       const restored = await conversation.withdraw(message.id);
-      // The bubble collapses first; then its text and files return to the composer, above any draft.
-      window.setTimeout(() => setSeed((current) => ({ text: restored.content, attachments: restored.attachments, prepend: true, n: (current?.n ?? 0) + 1 })),
-        reducedMotion() ? 0 : LEAVE_MS);
+      // The bubble collapses first; then its text, files and feedback contexts return to the composer, above any draft.
+      // Its screenshots are among its files: they come back as attachments, apart from the contexts.
+      window.setTimeout(() => {
+        setSeed((current) => ({ text: restored.content, attachments: restored.attachments, prepend: true, n: (current?.n ?? 0) + 1 }));
+        const dropped = feedback.restore(feedbackItems(restored.artifact_feedback));
+        if (dropped > 0) {
+          setNotice({ tone: "info", text: w(
+            `${dropped} feedback ${dropped === 1 ? "note was" : "notes were"} not restored: at most ${MAX_FEEDBACK} can wait in the composer`,
+            `有 ${dropped} 条反馈未恢复：输入框最多保留 ${MAX_FEEDBACK} 条`,
+            `有 ${dropped} 則回饋未恢復：輸入框最多保留 ${MAX_FEEDBACK} 則`,
+          ) });
+        }
+      }, reducedMotion() ? 0 : LEAVE_MS);
     } catch (reason) {
       if (reason instanceof ApiError && reason.status === 409) {
         setSeen((current) => new Set(current).add(message.id));
@@ -534,7 +560,8 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const composer = canSend ? (
     <Composer
       ensureScope={async () => scope}
-      onSend={send}
+      onSend={sendComposed}
+      feedback={feedback}
       working={conversation.busy}
       onStop={requestStop}
       queued={queuedMessages.length}
@@ -712,7 +739,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
           ) : (
             <div className="flex h-full min-h-0 flex-col gap-4">
               {switcher}
-              <ArtifactPanel state={artifacts} />
+              <ArtifactPanel state={artifacts} feedback={feedbackSink} owner={userId} />
             </div>
           )}
         </Sheet>
@@ -731,7 +758,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
             </div>
           ) : (
             <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3">
-              <ArtifactPanel state={artifacts} />
+              <ArtifactPanel state={artifacts} feedback={feedbackSink} owner={userId} />
             </div>
           )}
         </WindowAside>

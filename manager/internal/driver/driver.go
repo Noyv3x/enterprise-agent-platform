@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -207,6 +208,14 @@ type ManagedSandboxState struct {
 type ManagedSandboxRetirer interface {
 	InspectManagedSandbox(context.Context, string, string) (ManagedSandboxState, error)
 	RemoveStoppedManagedSandbox(context.Context, string, string) error
+}
+
+// SandboxEndpointResolver is the narrow capability behind the executor proxy:
+// it resolves a Manager-owned, running sandbox container to its IPv4 address on
+// the given Docker network. It re-proves the ownership labels on every call and
+// never accepts an address, so callers cannot aim it at anything else.
+type SandboxEndpointResolver interface {
+	ResolveSandboxIP(ctx context.Context, name, agentHash, network string) (string, error)
 }
 
 // CapacityChecker is an optional Engine capability used before downloading a
@@ -1365,6 +1374,39 @@ func (d DockerCLI) InspectManagedSandbox(ctx context.Context, name, agentHash st
 		Exists: true, Running: fields[0] == "true",
 		Owned: fields[1] == "true" && fields[2] == agentHash,
 	}, nil
+}
+
+func (d DockerCLI) ResolveSandboxIP(ctx context.Context, name, agentHash, network string) (string, error) {
+	if !safeName(name) || !validAgentHash(agentHash) || !safeName(network) {
+		return "", errors.New("invalid managed sandbox identity")
+	}
+	profile, err := d.technicalProfile()
+	if err != nil {
+		return "", err
+	}
+	result, err := d.runner().Run(ctx, d.binary(), []string{
+		"inspect", "--format",
+		fmt.Sprintf("{{.State.Running}}\t{{index .Config.Labels %q}}\t{{index .Config.Labels %q}}\t{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{end}}", profile.Label("sandbox"), profile.Label("id"), network),
+		name,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("inspect managed sandbox %s: %w", name, err)
+	}
+	fields := strings.Split(strings.TrimRight(result.Stdout, "\r\n"), "\t")
+	if len(fields) != 4 {
+		return "", errors.New("Docker returned invalid managed sandbox metadata")
+	}
+	if fields[0] != "true" {
+		return "", errors.New("sandbox is not running")
+	}
+	if fields[1] != "true" || fields[2] != agentHash {
+		return "", errors.New("container is not the managed sandbox")
+	}
+	address, err := netip.ParseAddr(fields[3])
+	if err != nil || !address.Is4() || address.IsUnspecified() {
+		return "", fmt.Errorf("sandbox has no IPv4 address on network %s", network)
+	}
+	return address.String(), nil
 }
 
 func (d DockerCLI) RemoveStoppedManagedSandbox(ctx context.Context, name, agentHash string) error {

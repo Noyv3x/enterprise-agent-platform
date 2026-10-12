@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { request, type ArtifactView, type ArtifactVersion } from "../../api";
+import { request, type ArtifactPreview, type ArtifactView, type ArtifactVersion } from "../../api";
 import { errorText } from "../conversation/useConversation";
 
 /** The artifact version the panel shows. `follow` (viewing the latest) moves it to each new version; null until the
@@ -9,7 +9,9 @@ export interface ArtifactSelection { id: number; version: number; follow: boolea
 /** The panel's note about the open artifact: it moved to a new version, or a newer one exists. */
 export interface VersionNotice { type: "updated" | "newer"; version: number; seq: number }
 
-interface Detail { artifact: ArtifactView; versions: ArtifactVersion[] }
+/** `GET /api/artifacts/{id}`; `round` is the refresh round it was fetched in, `previewSeq` the stream's newest preview
+ * seq for it when it was requested (a later streamed state wins over it). */
+interface Detail { artifact: ArtifactView; versions: ArtifactVersion[]; preview?: ArtifactPreview; round: number; previewSeq: number }
 
 /** The 作品 panel's data and actions (useArtifacts). */
 export interface ArtifactsState {
@@ -31,20 +33,29 @@ export interface ArtifactsState {
   /** back to the list */
   back: () => void;
   reloadDetail: () => void;
+  /** a live artifact's preview, the newest of the detail and the stream; null until known */
+  previewOf: (id: number) => ArtifactPreview | null;
+  /** fetches the open artifact again (a live preview after 停止服务) */
+  refreshDetail: () => void;
 }
 
 /** How long "已更新到 vN" stays in the toolbar. */
 const UPDATED_MS = 4000;
 
-/** The conversation's artifacts and the 作品 panel's selection: the list (fetched once the panel shows, kept current
- * by SSE `artifact`), the open artifact's versions, following new versions, and revealing a new artifact on desktop. */
-export function useArtifacts({ scope, published, lastPublished, shown, narrow, reveal }: {
+/** The conversation's artifacts and the 作品 panel's selection: the list (fetched once the panel shows, or at once when
+ * the transcript has live preview cards whose state it carries; kept current by SSE `artifact`), the open artifact's
+ * versions, following new versions, and revealing a new artifact on desktop. */
+export function useArtifacts({ scope, published, lastPublished, previews, shown, liveCards = false, narrow, reveal }: {
   scope: string;
   /** artifacts as the stream announced them */
   published: Record<number, ArtifactView>;
   lastPublished: { id: number; version: number; seq: number } | null;
+  /** live previews' states as the stream announced them */
+  previews: Record<number, { preview: ArtifactPreview; seq: number }>;
   /** the 作品 panel is on screen */
   shown: boolean;
+  /** the transcript shows live preview cards */
+  liveCards?: boolean;
   narrow: boolean;
   /** shows the 作品 panel (a publish on desktop) */
   reveal: () => void;
@@ -56,6 +67,9 @@ export function useArtifacts({ scope, published, lastPublished, shown, narrow, r
   const [selection, setSelection] = useState<ArtifactSelection | null>(null);
   const [notice, setNotice] = useState<VersionNotice | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [round, setRound] = useState(0);
+  const streamed = useRef(previews);
+  streamed.current = previews;
 
   const loadList = useCallback(async () => {
     setListError("");
@@ -67,17 +81,20 @@ export function useArtifacts({ scope, published, lastPublished, shown, narrow, r
   }, [scope]);
   const listRequested = useRef(false);
   useEffect(() => {
-    if (!shown || listRequested.current) return;
+    if ((!shown && !liveCards) || listRequested.current) return;
     listRequested.current = true;
     void loadList();
-  }, [shown, loadList]);
+  }, [shown, liveCards, loadList]);
 
   /** Every known artifact at its newest known state, newest update first. */
   const artifacts = useMemo(() => {
     const byId = new Map<number, ArtifactView>();
     const take = (artifact: ArtifactView) => {
       const known = byId.get(artifact.id);
-      if (!known || known.latest_version < artifact.latest_version) byId.set(artifact.id, artifact);
+      // A live preview stays at version 0: its newest update wins.
+      if (!known || known.latest_version < artifact.latest_version || (known.latest_version === artifact.latest_version && known.updated_at < artifact.updated_at)) {
+        byId.set(artifact.id, artifact);
+      }
     };
     for (const artifact of loaded ?? []) take(artifact);
     for (const detail of Object.values(details)) take(detail.artifact);
@@ -92,28 +109,30 @@ export function useArtifacts({ scope, published, lastPublished, shown, narrow, r
   const latest = artifact?.latest_version ?? 0;
   const knownTop = detail?.versions.reduce((top, item) => Math.max(top, item.version), 0) ?? 0;
 
-  // The open artifact's versions: fetched on open, and once more when a newer version than the listed ones arrives.
+  // The open artifact's versions: fetched on open, once more when a newer version than the listed ones arrives, and on
+  // refreshDetail.
   const attempted = useRef(new Set<string>());
   useEffect(() => {
-    if (selectedId === null || (detail && knownTop >= latest)) return;
-    const key = `${selectedId}:${latest}:${attempt}`;
+    if (selectedId === null || (detail && knownTop >= latest && detail.round >= round)) return;
+    const key = `${selectedId}:${latest}:${attempt}:${round}`;
     if (attempted.current.has(key)) return;
     attempted.current.add(key);
-    request<Detail>(`/api/artifacts/${selectedId}`).then(
+    const previewSeq = streamed.current[selectedId]?.seq ?? 0;
+    request<Omit<Detail, "round" | "previewSeq">>(`/api/artifacts/${selectedId}`).then(
       (result) => {
-        setDetails((current) => ({ ...current, [selectedId]: result }));
+        setDetails((current) => ({ ...current, [selectedId]: { ...result, round, previewSeq } }));
         setDetailError(null);
       },
       (error: unknown) => setDetailError({ id: selectedId, text: errorText(error) }),
     );
-  }, [selectedId, detail, knownTop, latest, attempt]);
+  }, [selectedId, detail, knownTop, latest, attempt, round]);
 
   /** Newest first; a version the stream announced before the list was refetched shows at once. */
   const versions = useMemo(() => {
     const listed = detail?.versions ?? [];
     if (!artifact || listed.some((item) => item.version === artifact.latest_version) || !listed.length) return [...listed].sort((a, b) => b.version - a.version);
     return [
-      { version: artifact.latest_version, entry: artifact.entry, created_at: artifact.updated_at, total_size: 0, file_count: 0, message_id: null },
+      { version: artifact.latest_version, entry: artifact.entry ?? "", created_at: artifact.updated_at, total_size: 0, file_count: 0, message_id: null },
       ...listed,
     ].sort((a, b) => b.version - a.version);
   }, [detail, artifact]);
@@ -182,10 +201,20 @@ export function useArtifacts({ scope, published, lastPublished, shown, narrow, r
     setAttempt((value) => value + 1);
   }, []);
 
+  const refreshDetail = useCallback(() => setRound((value) => value + 1), []);
+
+  /** The stream's state when it is newer than the fetched detail, else the detail's, else the list's. */
+  const previewOf = useCallback((id: number) => {
+    const stream = previews[id];
+    const fetched = details[id];
+    if (stream && (!fetched?.preview || stream.seq > fetched.previewSeq)) return stream.preview;
+    return fetched?.preview ?? loaded?.find((item) => item.id === id)?.preview ?? null;
+  }, [previews, details, loaded]);
+
   return {
     list, listError, reloadList: loadList,
     selection, artifact, versions, detailLoaded: Boolean(detail),
     detailError: detailError && detailError.id === selectedId ? detailError.text : "",
-    notice, open, chooseVersion, back, reloadDetail,
+    notice, open, chooseVersion, back, reloadDetail, previewOf, refreshDetail,
   };
 }

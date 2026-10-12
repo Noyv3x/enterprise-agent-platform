@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -27,7 +28,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from .auth import current_user
+from .auth import body_json, current_user
 from .db import now
 from .files import MAX_FILE, open_workspace
 
@@ -64,6 +65,61 @@ TEXT_MIMES = ('application/json', 'application/xml', 'application/javascript', '
 VIEW_CSP = ("sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads "
             "allow-presentation allow-pointer-lock; frame-ancestors 'self'")
 BLOB = re.compile(r'[0-9a-f]{64}')
+# The renderer's own requests also forbid external frames: the screenshot service is an unfiltered browser, so a page must
+# not embed another origin and have it photographed. Ordinary user viewing keeps unrestricted network (product decision).
+RENDER_CSP = VIEW_CSP + "; frame-src 'self' data: blob:; child-src 'self' data: blob:"
+RENDER_TOKEN_TTL = 300
+RENDER_QUERY = '__eap_render'
+RUNTIME_FILE = 'artifact-runtime.js'
+HTML_INJECT_LIMIT = 8 * 1024 * 1024
+VIEW_HEADERS = {'Content-Security-Policy': VIEW_CSP, 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
+                'Access-Control-Allow-Origin': '*', 'Cross-Origin-Resource-Policy': 'cross-origin', 'X-Frame-Options': 'SAMEORIGIN'}
+RENDERABLE_KINDS = ('web', 'site', 'svg')
+RENDERABLE_MIMES = ('text/html', 'image/svg+xml')
+CAPTURE_PADDING = 24
+_HTML_TOKENS = re.compile(rb'<!--.*?(?:-->|\Z)|<(?P<tag>head|html|script)(?=[\s/>])[^>]*>?', re.IGNORECASE | re.DOTALL)
+_DOCTYPE = re.compile(rb'\A(?:\xef\xbb\xbf)?\s*<!doctype[^>]*>', re.IGNORECASE)
+_runtime_cache = {}
+
+
+def runtime_asset(settings):
+    """`(path, hash)` of the built page helper, or None when the frontend build has none; the hash follows the content."""
+    path = settings.frontend_dir / RUNTIME_FILE
+    try:
+        item = path.stat()
+    except OSError:
+        return None
+    key = (str(path), item.st_mtime_ns, item.st_size)
+    if _runtime_cache.get('key') != key:
+        _runtime_cache.update(key=key, hash=hashlib.sha256(path.read_bytes()).hexdigest()[:12])
+    return path, _runtime_cache['hash']
+
+
+def inject_helper(body, version):
+    """HTML with the page helper as its first script: first element of `<head>`, else after `<html>`, else at the start
+    (after a leading doctype), and never after a page script that precedes those."""
+    doctype = _DOCTYPE.match(body)
+    start = doctype.end() if doctype else 3 if body.startswith(b'\xef\xbb\xbf') else 0
+    head = html = script = None
+    for match in _HTML_TOKENS.finditer(body):
+        name = match.group('tag')
+        if name is None:
+            continue
+        name = name.lower()
+        if name == b'head':
+            head = match.end()
+            break
+        if name == b'html' and html is None:
+            html = match.end()
+        elif name == b'script':
+            script = match.start()
+            break
+    position = head if head is not None else html if html is not None else start
+    if script is not None:
+        position = min(position, script)
+    position = max(position, start)
+    tag = f'<script src="/{RUNTIME_FILE}?v={version}"></script>'.encode()
+    return body[:position] + tag + body[position:]
 
 
 class ArtifactError(HTTPException):
@@ -174,6 +230,28 @@ def _read(directory, name):
 def _size_check(files):
     if sum(len(data) for data in files.values()) > MAX_TOTAL:
         raise ArtifactError(413, 'artifact_too_large', 'An artifact version is limited to 50 MiB in total')
+
+
+def _bounded(args, name, default, low, high):
+    value = args.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise ArtifactError(400, 'artifact_invalid', f'{name} must be an integer from {low} to {high}')
+    return value
+
+
+def resolve_page(manifest, entry, page):
+    """The manifest path a site-relative `page` names (a directory resolves to its index.html, empty to the entry)."""
+    parts = [part for part in (page or '').split('/') if part]
+    if any(part in ('..', '.') or '\\' in part or '\0' in part for part in parts):
+        raise ArtifactError(404, 'artifact_page_not_found', f'No page {page} in this version')
+    relative = '/'.join(parts)
+    if relative in manifest:
+        return relative
+    if not relative:
+        return entry
+    if relative + '/index.html' in manifest:
+        return relative + '/index.html'
+    raise ArtifactError(404, 'artifact_page_not_found', f'No page {page} in this version')
 
 
 class Artifacts:
@@ -311,26 +389,100 @@ class Artifacts:
         return view, version, True
 
     def view(self, conn, ident):
-        row = conn.execute('SELECT a.*,v.entry FROM artifacts a JOIN artifact_versions v ON v.artifact_id=a.id AND v.version=a.latest_version '
+        row = conn.execute('SELECT a.*,v.entry FROM artifacts a LEFT JOIN artifact_versions v ON v.artifact_id=a.id AND v.version=a.latest_version '
                            'WHERE a.id=?', (ident,)).fetchone()
         return view_of(row)
 
     def listing(self, info):
         scope_type, scope_id = scope_ref(info)
         with self.p.db.connect() as conn:
-            return self.rows(conn, 'a.scope_type=? AND a.scope_id=?', (scope_type, scope_id))
+            views = self.rows(conn, 'a.scope_type=? AND a.scope_id=?', (scope_type, scope_id))
+        for view in views:
+            if view['kind'] == 'live':
+                view['preview'] = self.p.live.status(view['id'])
+        return views
 
     def rows(self, conn, where, args):
         return [view_of(row) for row in conn.execute(
-            'SELECT a.*,v.entry FROM artifacts a JOIN artifact_versions v ON v.artifact_id=a.id AND v.version=a.latest_version '
+            'SELECT a.*,v.entry FROM artifacts a LEFT JOIN artifact_versions v ON v.artifact_id=a.id AND v.version=a.latest_version '
             f'WHERE {where} ORDER BY a.updated_at DESC, a.id DESC', args)]
+
+    def locate(self, info, args):
+        """The artifact row an `artifact view` call names by `id` or sandbox `path`, within the call's own scope."""
+        scope_type, scope_id = scope_ref(info)
+        with self.p.db.connect() as conn:
+            if args.get('id') is not None:
+                ident = args['id']
+                if isinstance(ident, str) and ident.strip().isascii() and ident.strip().isdigit():
+                    ident = int(ident.strip())
+                if not isinstance(ident, int) or isinstance(ident, bool):
+                    raise ArtifactError(400, 'artifact_invalid', 'id must be an integer')
+                row = conn.execute('SELECT * FROM artifacts WHERE id=? AND scope_type=? AND scope_id=?', (ident, scope_type, scope_id)).fetchone()
+            elif args.get('path') is not None:
+                if isinstance(args['path'], str) and args['path'].startswith('live:'):
+                    canonical = args['path'].strip()
+                else:
+                    canonical, _ = self.sandbox_path(info, args['path'])
+                row = conn.execute('SELECT * FROM artifacts WHERE scope_type=? AND scope_id=? AND path=?', (scope_type, scope_id, canonical)).fetchone()
+            else:
+                raise ArtifactError(400, 'artifact_invalid', 'view needs the artifact path or id')
+        if row is None:
+            raise ArtifactError(404, 'artifact_not_found', 'No such artifact in this conversation')
+        return row
+
+    def page_url(self, row, number, page):
+        """`(view URL path, resolved page)` of a renderable page of one version, with a freshly minted token."""
+        with self.p.db.connect() as conn:
+            if row['kind'] not in RENDERABLE_KINDS:
+                raise ArtifactError(400, 'artifact_not_renderable', f"{row['kind']} artifacts have no page to render")
+            try:
+                version, manifest = self.version(conn, row['id'], row['latest_version'] if number is None else number)
+            except HTTPException:
+                raise ArtifactError(404, 'artifact_not_found', 'No such artifact version') from None
+        relative = resolve_page(manifest, version['entry'], page)
+        if manifest[relative]['mime'].split(';')[0] not in RENDERABLE_MIMES:
+            raise ArtifactError(400, 'artifact_not_renderable', f'{relative} is not an HTML or SVG page')
+        token, _ = self.mint(row['id'], version['version'], renderer=True)
+        return f'/artifact-view/{token}/{quote(relative)}', relative, version['version']
+
+    async def view_pages(self, user, info, args):
+        """The `artifact view` self-check: screenshots of a published version or a running live preview."""
+        row = await asyncio.to_thread(self.locate, info, args)
+        width = _bounded(args, 'width', 1280, 320, 1920)
+        height = _bounded(args, 'height', 800, 200, 4000)
+        full_page = args.get('full_page', True)
+        if not isinstance(full_page, bool):
+            raise ArtifactError(400, 'artifact_invalid', 'full_page must be a boolean')
+        page = args.get('page')
+        if page is not None and not isinstance(page, str):
+            raise ArtifactError(400, 'artifact_invalid', 'page must be a site-relative path')
+        number = args.get('version')
+        if number is not None and (not isinstance(number, int) or isinstance(number, bool) or number < 1):
+            raise ArtifactError(400, 'artifact_invalid', 'version must be a positive integer')
+        if row['kind'] == 'live':
+            path, relative = self.p.live.render_target(row, page)
+            number = None
+        else:
+            path, relative, number = await asyncio.to_thread(self.page_url, row, number, page)
+        rendered = await self.p.renderer.render(user['id'], path, width, height, full_page)
+        from .artifact_render import MAX_SEGMENTS, segments
+        images, truncated = await asyncio.to_thread(segments, rendered.image, height, full_page)
+        label = f"{row['title']} (id {row['id']})" + (f' v{number}' if number else '') + f' page {relative or "/"}'
+        text = f'Rendered {label} at {width}x{height}: page size {rendered.page_width}x{rendered.page_height}px, {len(images)} image(s)'
+        text += f' (truncated after {MAX_SEGMENTS} screens).' if truncated else '.'
+        text += (f'\nConsole messages ({len(rendered.log)}):\n' + '\n'.join('- ' + item for item in rendered.log)
+                 if rendered.log else '\nNo console errors.')
+        data = {'artifact_id': row['id'], 'version': number, 'page': relative, 'width': width, 'height': height,
+                'page_width': rendered.page_width, 'page_height': rendered.page_height, 'console': rendered.log, 'truncated': truncated,
+                'images': [{'mimeType': 'image/jpeg', 'data': base64.b64encode(image).decode()} for image in images]}
+        return {'content': text, 'data': data, 'is_error': False}
 
     async def gateway(self, user, info, action, args, job_id):
         """The `artifact` tool for root runs in every scope."""
         try:
             if action == 'publish':
                 view, version, created = await asyncio.to_thread(self.publish, user, info, args.get('path'), args.get('title'), args.get('entry'), job_id)
-                label = f"{view['title']} ({view['kind']}, {view['path']})"
+                label = f"{view['title']} (id {view['id']}, {view['kind']}, {view['path']})"
                 if created:
                     text = f'Published {label} as version {version}. The user can open it in the artifact panel.'
                 else:
@@ -339,9 +491,14 @@ class Artifacts:
                 return {'content': text, 'data': {'artifact': view, 'version': version, 'created': created}, 'is_error': False}
             if action == 'list':
                 views = self.listing(info)
-                lines = [f"{item['title']} [{item['kind']}] v{item['latest_version']} {item['path']}" for item in views]
+                lines = [f"{item['title']} [id {item['id']}, {item['kind']}] " + (f"v{item['latest_version']} " if item['kind'] != 'live' else '') + item['path']
+                         for item in views]
                 return {'content': '\n'.join(lines) or 'No artifacts have been published in this conversation.',
                         'data': {'artifacts': views}, 'is_error': False}
+            if action == 'view':
+                return await self.view_pages(user, info, args)
+            if action == 'preview':
+                return await self.p.live.preview(user, info, args, job_id)
             raise ArtifactError(400, 'artifact_invalid', 'Unsupported artifact action')
         except ArtifactError as exc:
             return {'content': exc.detail, 'data': {'error': exc.code, **exc.payload}, 'is_error': True}
@@ -383,6 +540,8 @@ class Artifacts:
         with self.blob_lock, self.p.db.connect() as conn:
             conn.execute('BEGIN IMMEDIATE')
             doomed = set()
+            previews = [row[0] for row in conn.execute('SELECT p.preview_id FROM artifact_previews p JOIN artifacts a ON a.id=p.artifact_id '
+                                                       'WHERE a.scope_type=? AND a.scope_id=?', (scope_type, scope_id))]
             for row in conn.execute('SELECT v.manifest_json FROM artifact_versions v JOIN artifacts a ON a.id=v.artifact_id '
                                     'WHERE a.scope_type=? AND a.scope_id=?', (scope_type, scope_id)):
                 doomed.update(item['sha256'] for item in json.loads(row[0]).values())
@@ -392,27 +551,37 @@ class Artifacts:
             # Unlink while still holding the lock: a publish that dedups against a doomed blob waits and then rewrites it.
             for sha in doomed:
                 self.blob(sha).unlink(missing_ok=True)
+        for preview_id in previews:
+            self.p.live.close(preview_id)
 
     # -- view tokens -----------------------------------------------------------------------------
 
     def sign(self, body):
         return _b64(hmac.new(self.p.settings.session_secret.encode(), b'artifact-view\n' + body.encode(), hashlib.sha256).digest())
 
-    def mint(self, artifact_id, version):
-        """`(token, expires_at)`: read access to exactly one version until the expiry."""
-        expires = int(time.time()) + TOKEN_TTL
-        body = f'{artifact_id}.{version}.{expires}'
+    def mint(self, artifact_id, version, renderer=False):
+        """`(token, expires_at)`: read access to exactly one version until the expiry. A renderer token is short-lived and makes
+        the view route add the frame restrictions of `RENDER_CSP`; the flag is part of the signed body."""
+        expires = int(time.time()) + (RENDER_TOKEN_TTL if renderer else TOKEN_TTL)
+        body = f'{artifact_id}.{version}.{expires}' + ('.r' if renderer else '')
         return f'{body}.{self.sign(body)}', datetime.fromtimestamp(expires, timezone.utc).isoformat()
+
+    def grant(self, token):
+        """`(artifact id, version, renderer)` of a valid unexpired token, else None."""
+        parts = token.split('.')
+        renderer = len(parts) == 5 and parts[3] == 'r'
+        if len(parts) not in (4, 5) or (len(parts) == 5 and not renderer) or not token.isascii() \
+                or not all(part.isdigit() for part in parts[:3]):
+            return None
+        body = '.'.join(parts[:-1])
+        if not hmac.compare_digest(self.sign(body).encode(), parts[-1].encode()) or int(parts[2]) <= time.time():
+            return None
+        return int(parts[0]), int(parts[1]), renderer
 
     def verify(self, token):
         """`(artifact id, version)` of a valid unexpired token, else None."""
-        parts = token.split('.')
-        if len(parts) != 4 or not token.isascii() or not all(part.isdigit() for part in parts[:3]):
-            return None
-        body = '.'.join(parts[:3])
-        if not hmac.compare_digest(self.sign(body).encode(), parts[3].encode()) or int(parts[2]) <= time.time():
-            return None
-        return int(parts[0]), int(parts[1])
+        granted = self.grant(token)
+        return granted[:2] if granted else None
 
     # -- reading ---------------------------------------------------------------------------------
 
@@ -455,11 +624,15 @@ async def artifact_detail(request):
     user = current_user(request)
     ident, _ = _ids(request)
     with p.db.connect() as conn:
-        p.artifacts.readable(user, conn, ident)
+        artifact = p.artifacts.readable(user, conn, ident)
         versions = [{'version': row['version'], 'entry': row['entry'], 'created_at': row['created_at'], 'total_size': row['total_size'],
                      'file_count': row['file_count'], 'message_id': row['message_id']}
                     for row in conn.execute('SELECT * FROM artifact_versions WHERE artifact_id=? ORDER BY version DESC', (ident,))]
-        return JSONResponse({'artifact': p.artifacts.view(conn, ident), 'versions': versions})
+        view = p.artifacts.view(conn, ident)
+    body = {'artifact': view, 'versions': versions}
+    if artifact['kind'] == 'live':
+        body['preview'] = p.live.status(ident)
+    return JSONResponse(body)
 
 
 async def artifact_files(request):
@@ -545,12 +718,12 @@ async def artifact_view_url(request):
 async def artifact_view(request):
     """Serve one version's tree to a bearer view token: no cookies, opaque-origin sandbox, a bad token is a plain 404."""
     p = request.app.state.platform
-    granted = p.artifacts.verify(request.path_params['token'])
+    granted = p.artifacts.grant(request.path_params['token'])
     if granted is None:
         raise HTTPException(404, 'Not found')
     with p.db.connect() as conn:
         try:
-            row, manifest = p.artifacts.version(conn, *granted)
+            row, manifest = p.artifacts.version(conn, *granted[:2])
         except HTTPException:
             raise HTTPException(404, 'Not found') from None
     parts = [part for part in request.path_params.get('path', '').split('/') if part]
@@ -572,10 +745,90 @@ async def artifact_view(request):
     path = p.artifacts.blob(item['sha256']) if item else None
     if path is None or not path.is_file():
         raise HTTPException(404, 'Not found')
-    return FileResponse(path, media_type=with_charset(item['mime']), headers={
-        'Content-Security-Policy': VIEW_CSP, 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
-        'Access-Control-Allow-Origin': '*', 'Cross-Origin-Resource-Policy': 'cross-origin',
-        'Cache-Control': 'private, max-age=7200', 'X-Frame-Options': 'SAMEORIGIN'})
+    headers = {**VIEW_HEADERS, 'Cache-Control': 'private, max-age=7200'}
+    if granted[2]:
+        headers['Content-Security-Policy'] = RENDER_CSP
+    asset = runtime_asset(p.settings)
+    if item['mime'].split(';')[0] == 'text/html' and asset is not None and item['size'] <= HTML_INJECT_LIMIT:
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            raise HTTPException(404, 'Not found') from exc
+        return Response(inject_helper(data, asset[1]), media_type=with_charset(item['mime']), headers=headers)
+    return FileResponse(path, media_type=with_charset(item['mime']), headers=headers)
+
+
+async def artifact_runtime(request):
+    """The page helper build output, public and cacheable: it carries no secrets and is the same for every artifact."""
+    asset = runtime_asset(request.app.state.platform.settings)
+    if asset is None:
+        raise HTTPException(404, 'Not found')
+    current = request.query_params.get('v') == asset[1]
+    return FileResponse(asset[0], media_type='text/javascript; charset=utf-8', headers={
+        'Access-Control-Allow-Origin': '*', 'Cross-Origin-Resource-Policy': 'cross-origin', 'X-Content-Type-Options': 'nosniff',
+        'Cache-Control': 'public, max-age=31536000, immutable' if current else 'no-cache'})
+
+
+def _capture_spec(body):
+    """`(page, clip, width, height)` from a capture body; `clip` is the rectangle plus padding in full-page pixels. A rectangle that
+    starts left of or above the page is clamped to the page edge (it may not lie entirely outside)."""
+    def number(value, low, high):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not low <= value <= high:
+            raise ArtifactError(400, 'capture_invalid', 'rect and viewport must be finite numbers in range')
+        return value
+    rect, viewport = body.get('rect'), body.get('viewport')
+    if not isinstance(rect, dict) or not isinstance(viewport, dict):
+        raise ArtifactError(400, 'capture_invalid', 'rect and viewport objects are required')
+    x, y = number(rect.get('x'), -1_000_000, 1_000_000), number(rect.get('y'), -1_000_000, 1_000_000)
+    w = number(rect.get('w', rect.get('width')), 1, 20000)
+    h = number(rect.get('h', rect.get('height')), 1, 20000)
+    if x < 0:
+        x, w = 0, w + x
+    if y < 0:
+        y, h = 0, h + y
+    if w <= 0 or h <= 0:
+        raise ArtifactError(422, 'capture_invalid', 'The selected region is outside the page')
+    width = number(viewport.get('w', viewport.get('width')), 320, 1920)
+    height = number(viewport.get('h', viewport.get('height')), 200, 4000)
+    page = body.get('path')
+    if page is not None and not isinstance(page, str):
+        raise ArtifactError(400, 'capture_invalid', 'path must be a string')
+    pad = CAPTURE_PADDING
+    return page, (x - pad, y - pad, w + 2 * pad, h + 2 * pad), int(width), int(height)
+
+
+async def artifact_capture(request):
+    """Render the picked spot, crop it and keep it as the caller's own pending upload in the artifact's scope."""
+    p = request.app.state.platform
+    user = current_user(request)
+    ident, number = _ids(request)
+    live = request.url.path.endswith('/live/capture')
+    with p.db.connect() as conn:
+        row = p.artifacts.readable(user, conn, ident)
+    if (row['kind'] == 'live') != live:
+        raise HTTPException(404, 'Artifact not found')
+    page, clip, width, height = _capture_spec(await body_json(request))
+    info = p.queue.scope(user, scope_name(row['scope_type'], row['scope_id']))
+    if live:
+        path, _ = p.live.render_target(row, page)
+        label = 'live'
+    else:
+        path, _, number = await asyncio.to_thread(p.artifacts.page_url, row, number, page)
+        label = f'v{number}'
+    rendered = await p.renderer.render(user['id'], path, width, height, True, clip)
+    attachment = await asyncio.to_thread(p.files.store, user, info, f"annotation-{ident}-{label}.png", rendered.image)
+    return JSONResponse({'attachment': attachment})
+
+
+async def artifact_live_stop(request):
+    p = request.app.state.platform
+    user = current_user(request)
+    ident, _ = _ids(request)
+    with p.db.connect() as conn:
+        row = p.artifacts.readable(user, conn, ident)
+    if row['kind'] != 'live':
+        raise HTTPException(404, 'Artifact not found')
+    return JSONResponse({'preview': p.live.revoke(ident)})
 
 
 def routes():
@@ -583,4 +836,8 @@ def routes():
             Route('/api/artifacts/{id}/versions/{version}/source', artifact_source),
             Route('/api/artifacts/{id}/versions/{version}/download', artifact_download),
             Route('/api/artifacts/{id}/versions/{version}/view', artifact_view_url, methods=['POST']),
-            Route('/api/artifacts/{id}', artifact_detail), Route('/artifact-view/{token}/{path:path}', artifact_view)]
+            Route('/api/artifacts/{id}/versions/{version}/capture', artifact_capture, methods=['POST']),
+            Route('/api/artifacts/{id}/live/capture', artifact_capture, methods=['POST']),
+            Route('/api/artifacts/{id}/live', artifact_live_stop, methods=['DELETE']),
+            Route('/api/artifacts/{id}', artifact_detail), Route('/artifact-view/{token}/{path:path}', artifact_view),
+            Route('/artifact-runtime.js', artifact_runtime)]

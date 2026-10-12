@@ -1458,7 +1458,7 @@ class MigrationTests(unittest.TestCase):
             root = Path(temp)
             db = Database(root / 'platform.db')
             db.migrate(root)
-            self.assertEqual(db.schema_version(), 2026101501)
+            self.assertEqual(db.schema_version(), 2026102001)
             with db.connect() as conn:
                 tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'mcp_%'")}
                 self.assertEqual(tables, {'mcp_connectors', 'mcp_secrets', 'mcp_channel_connectors', 'mcp_calls', 'mcp_catalog_cache'})

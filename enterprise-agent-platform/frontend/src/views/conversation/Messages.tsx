@@ -6,6 +6,8 @@ import StreamingText, { type StreamingAction } from "../../components/ui/beautif
 import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { ArtifactCards, baseName, messageArtifacts } from "../artifacts/ArtifactCards";
+import { messageFeedback } from "../artifacts/feedback";
+import { FeedbackChips } from "../artifacts/FeedbackChips";
 import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
 import { TaskNoticeRow } from "./Tasks";
@@ -59,6 +61,7 @@ export function UserBubble({ message, showAuthor, mine, queuePosition, pending =
   const w = useWords();
   const content = visibleContent(message);
   const name = showAuthor ? authorName(message) : null;
+  const feedback = messageFeedback(message);
   let label: string | null = null;
   if (message.metadata.status === "queued") {
     const ahead = queuePosition && queuePosition > 1 ? queuePosition - 1 : 0;
@@ -72,6 +75,7 @@ export function UserBubble({ message, showAuthor, mine, queuePosition, pending =
     <div className={`flex flex-col gap-1.5 ${mine ? "items-end pl-10 sm:pl-24" : "items-start pr-10 sm:pr-24"}`}>
       {name && <EntityChip name={name} color={authorColor(message)} className="mx-0" />}
       {message.attachments.length > 0 && <AttachmentCards attachments={message.attachments} />}
+      {feedback.length > 0 && <FeedbackChips items={feedback} align={mine ? "end" : "start"} />}
       {content && (
         <div title={timeLabel(message)} className="max-w-full rounded-xl bg-field px-3.5 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-ink shadow-hairline [overflow-wrap:anywhere]">
           {content}

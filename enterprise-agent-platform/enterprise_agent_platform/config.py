@@ -17,6 +17,7 @@ class Settings:
     manager_executor_token_file: Path = Path('/run/secrets/agent-platform/manager-executor-token')
     camofox_url: str = 'http://camofox:9377'
     camofox_access_key: str = ''
+    artifact_render_base_url: str = 'http://platform:8765'
     searxng_url: str = 'http://searxng:8080'
     public_base_url: str = 'http://127.0.0.1:8080'
     trusted_proxy: bool = False
@@ -58,6 +59,7 @@ class Settings:
             manager_executor_token_file=Path(value('MANAGER_EXECUTOR_TOKEN_FILE', '/run/secrets/agent-platform/manager-executor-token')),
             camofox_url=value('CAMOFOX_URL', 'http://camofox:9377').rstrip('/'),
             camofox_access_key=secret('CAMOFOX_ACCESS_KEY'),
+            artifact_render_base_url=value('ARTIFACT_RENDER_BASE_URL', 'http://platform:8765').rstrip('/'),
             searxng_url=value('SEARXNG_API_URL', 'http://searxng:8080').rstrip('/'),
             public_base_url=value('PUBLIC_BASE_URL', 'http://127.0.0.1:8080').rstrip('/'),
             trusted_proxy=value('TRUSTED_PROXY').lower() in ('1', 'true', 'yes'),

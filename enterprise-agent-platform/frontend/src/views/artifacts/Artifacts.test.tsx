@@ -53,7 +53,7 @@ function publishOnServer(id: number, version: number, title = "Launch deck", kin
   };
   const versions = [...(existing?.versions ?? [])];
   for (let next = (versions[versions.length - 1]?.version ?? 0) + 1; next <= version; next++) {
-    versions.push({ version: next, entry: view.entry, created_at: stamp(next), total_size: 1000, file_count: 1, message_id: null });
+    versions.push({ version: next, entry: view.entry ?? "", created_at: stamp(next), total_size: 1000, file_count: 1, message_id: null });
   }
   store[id] = { view, versions };
   return view;

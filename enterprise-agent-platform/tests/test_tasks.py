@@ -20,6 +20,7 @@ from enterprise_agent_platform.db import Database
 from policy_support import set_default_policy
 from enterprise_agent_platform.gates import Gate, ManagerClientError
 from enterprise_agent_platform.queue import Queue, _WorkTrace
+from enterprise_agent_platform.artifact_live import Live
 from enterprise_agent_platform.artifacts import Artifacts
 from enterprise_agent_platform.skills import Skills
 from enterprise_agent_platform.tasks import (
@@ -247,6 +248,7 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         self.p.skills = Skills(self.p)
         self.p.artifacts = Artifacts(self.p)
         self.p.mcp = McpService(self.p)
+        self.p.live = Live(self.p)
         self.p.gate = Gate(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}]}))
         self.q = self.p.queue = Queue(self.p)

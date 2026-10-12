@@ -36,6 +36,10 @@ func (hostExecEngine) ExecArgs(_ driver.SandboxSpec, _ string, name string, args
 	return name, args
 }
 
+func (hostExecEngine) ResolveSandboxIP(context.Context, string, string, string) (string, error) {
+	return "127.0.0.1", nil
+}
+
 func newStreamAPI(t *testing.T) *API {
 	t.Helper()
 	root := t.TempDir()

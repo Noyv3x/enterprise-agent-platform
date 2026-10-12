@@ -490,6 +490,22 @@ _MIGRATIONS = (
         'CREATE INDEX IF NOT EXISTS idx_artifact_versions_job ON artifact_versions(job_id)',
     )),
     (2026101501, 'mcp', _mcp),
+    (2026102001, 'artifact-previews', (
+        """CREATE TABLE IF NOT EXISTS artifact_previews (
+    artifact_id INTEGER PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    preview_id TEXT NOT NULL UNIQUE,
+    service TEXT NOT NULL,
+    port INTEGER,
+    start_path TEXT NOT NULL DEFAULT '/',
+    base_aware INTEGER NOT NULL DEFAULT 0,
+    task_id INTEGER,
+    state TEXT NOT NULL DEFAULT 'waiting' CHECK(state IN ('waiting', 'running', 'stopped')),
+    revoked_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)""",
+        'CREATE INDEX IF NOT EXISTS idx_artifact_previews_task ON artifact_previews(task_id)',
+    )),
 )
 
 

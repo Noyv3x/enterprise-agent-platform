@@ -32,7 +32,8 @@ def main():
     if args.command == 'serve':
         import uvicorn
         from .app import create_app
-        uvicorn.run(create_app(settings), host=args.host or settings.host, port=args.port or settings.port)
+        uvicorn.run(create_app(settings), host=args.host or settings.host, port=args.port or settings.port,
+                    ws='websockets-sansio')
         return
     db = Database(settings.database_path)
     db.migrate(settings.data_dir)

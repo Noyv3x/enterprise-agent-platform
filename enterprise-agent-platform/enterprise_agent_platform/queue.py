@@ -1,6 +1,8 @@
 """Durable conversations with mid-run inputs; uncertain execution is never replayed."""
 import asyncio
+import html
 import json
+import math
 import shutil
 import time
 import uuid
@@ -12,6 +14,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from .artifacts import scope_ref
 from .auth import body_json, current_user, model_slot, permissions
 from .db import now
 from .files import bounded_read, ensure_workspace, open_workspace
@@ -21,14 +24,44 @@ from .skills import skill_guidance
 BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch", "artifact"]
 
 
-def artifact_guidance(cwd):
-    """System prompt section, every scope: what to publish as an artifact and what to deliver as a download."""
+def artifact_guidance(cwd, personal=False):
+    """System prompt section, every scope: what to publish as an artifact, what to deliver as a download, the self-check
+    before delivery; the personal AI also learns live previews."""
     return ("Publish what the user should look at with the `artifact` tool (action publish, an absolute path under "
             f"{cwd}/): documents and reports (Markdown), web pages, complete multi-file websites (publish the folder; its entry "
             "defaults to index.html), slides as HTML, diagrams (Mermaid .mmd or SVG), charts (an HTML page using any chart library) "
             "and tables (CSV). Keep the same path when you revise something: that creates a new version the user can compare, so do not "
             "create v2/v3 copies. Use a standalone "
-            f"MEDIA: {cwd}/path line only for downloadable files such as DOCX, XLSX, PPTX and PDF.")
+            f"MEDIA: {cwd}/path line only for downloadable files such as DOCX, XLSX, PPTX and PDF. "
+            "Self-check before you say you are done: after publishing or revising HTML pages, slides or sites, call `artifact` with "
+            "action view (path or id, optional page, width, height, full_page) to look at screenshots of what you built (ids are shown in publish, list and preview results), check for "
+            "overlapping or cut-off text, overflow, broken images and console errors, fix them and republish. For a long deck, view it at "
+            "the deck's intended size (width and height)."
+            + (" To let the user watch a dev server, call `artifact` with action preview (service, port, path, base_aware) FIRST: it returns the "
+               "base path (stable for that service) and framework guidance; then start or restart the named background service (bash with name "
+               "and port, listening on 0.0.0.0) configured with that base path. Restarting the service keeps the same preview URL." if personal else ""))
+
+
+FEEDBACK_KINDS = ('element', 'region', 'quote')
+MAX_FEEDBACK = 5
+FEEDBACK_TEXT = 1000
+
+
+def feedback_prefix(items):
+    """The escaped `<artifact-feedback>` block that opens a prompt carrying annotate feedback; page text is data, not markup."""
+    if not items:
+        return ''
+    def value(text):
+        return html.escape(' '.join(str(text).split()), quote=True)
+    lines = ['<artifact-feedback>']
+    for item in items:
+        parts = [f'artifact="{value(item["artifact_path"])}"', f'version="{item["version"] if item["version"] is not None else "live"}"']
+        for key in ('path', 'kind', 'selector', 'text'):
+            if item.get(key) is not None:
+                parts.append(f'{"page" if key == "path" else key}="{value(item[key])}"')
+        lines.append('- ' + ' '.join(parts))
+    lines.append('</artifact-feedback>')
+    return '\n'.join(lines) + '\n'
 
 
 def timestamp(value):
@@ -346,14 +379,59 @@ class Queue:
                 yield b": keepalive\n\n"
                 await asyncio.sleep(1)
 
-    async def enqueue(self, user, scope, content, attachment_ids=None, schedule_run_id=None, mode="insert"):
+    def feedback(self, user, info, raw):
+        """Normalized annotate-feedback items for a message; each names a readable artifact of this very conversation."""
+        if raw is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > MAX_FEEDBACK:
+            raise HTTPException(400, f"artifact_feedback must be a list of at most {MAX_FEEDBACK} items")
+        scope_type, scope_id = scope_ref(info)
+        items = []
+
+        def text(entry, key, limit, clip=False):
+            value = entry.get(key)
+            if value is not None and not isinstance(value, str):
+                raise HTTPException(400, f"artifact_feedback {key} must be a string")
+            if value is not None and len(value) > limit:
+                if not clip:
+                    raise HTTPException(400, f"artifact_feedback {key} must be at most {limit} characters")
+                value = value[:limit]
+            return value
+        with self.p.db.connect() as conn:
+            for entry in raw:
+                if not isinstance(entry, dict) or not isinstance(entry.get("artifact_id"), int) or isinstance(entry["artifact_id"], bool):
+                    raise HTTPException(400, "artifact_feedback items need an integer artifact_id")
+                row = self.p.artifacts.readable(user, conn, entry["artifact_id"])
+                if (row["scope_type"], row["scope_id"]) != (scope_type, scope_id):
+                    raise HTTPException(400, "artifact_feedback must name an artifact of this conversation")
+                if entry.get("kind") not in FEEDBACK_KINDS:
+                    raise HTTPException(400, "artifact_feedback kind must be element, region or quote")
+                version = entry.get("version")
+                if row["kind"] == "live":
+                    version = None
+                elif not isinstance(version, int) or isinstance(version, bool) or not 1 <= version <= row["latest_version"]:
+                    raise HTTPException(400, "artifact_feedback version must be an existing version of the artifact")
+                rect = entry.get("rect")
+                if rect is not None:
+                    keys = ("x", "y", "w", "h")
+                    if (not isinstance(rect, dict) or set(rect) != set(keys)
+                            or any(isinstance(rect[k], bool) or not isinstance(rect[k], (int, float)) or not math.isfinite(rect[k]) for k in keys)):
+                        raise HTTPException(400, "artifact_feedback rect must be {x,y,w,h} numbers")
+                item = {"artifact_id": row["id"], "version": version, "path": text(entry, "path", 500, clip=True), "kind": entry["kind"],
+                        "selector": text(entry, "selector", 500, clip=True), "text": text(entry, "text", FEEDBACK_TEXT), "rect": rect,
+                        "title": row["title"], "artifact_kind": row["kind"], "artifact_path": row["path"]}
+                items.append({key: value for key, value in item.items() if value is not None or key == "version"})
+        return items
+
+    async def enqueue(self, user, scope, content, attachment_ids=None, schedule_run_id=None, mode="insert", artifact_feedback=None):
         if mode not in ("insert", "after_turn"):
             raise HTTPException(400, "Unknown send mode")
-        if not isinstance(content, str) or (not content.strip() and not attachment_ids):
+        if not isinstance(content, str) or (not content.strip() and not attachment_ids and not artifact_feedback):
             raise HTTPException(400, "Message content is required")
         if len(content.encode()) > 1024 * 1024 or len(attachment_ids or []) > 32:
             raise HTTPException(413, "Message exceeds the Runtime prompt budget")
         info = self.scope(user, scope)
+        feedback = self.feedback(user, info, artifact_feedback)
         if info["channel_id"] is not None and "chat" not in permissions(self.p.db, user):
             raise HTTPException(403, "Permission denied")
         async with self.p.gate.admit(), self.lock(info["scope_key"]):
@@ -364,10 +442,12 @@ class Queue:
                         return {"message": self.message(info, existing["source_message_id"]), "job_id": existing["durable_job_id"]}
                 mid = self.insert_message(conn, info, user, "user", content,
                                           {"status": "queued", "author_user_id": user["id"], "author_display_name": user["display_name"],
-                                           **({"send_mode": "after_turn"} if mode == "after_turn" else {})})
+                                           **({"send_mode": "after_turn"} if mode == "after_turn" else {}),
+                                           **({"artifact_feedback": feedback} if feedback else {})})
                 self.p.files.bind(user, info, mid, attachment_ids or [], conn=conn)
                 payload = {"user_id": user["id"], "scope": scope, "message_id": mid, "content": content,
-                           "attachment_ids": attachment_ids or [], "schedule_run_id": schedule_run_id}
+                           "attachment_ids": attachment_ids or [], "schedule_run_id": schedule_run_id,
+                           **({"artifact_feedback": feedback} if feedback else {})}
                 job = conn.execute("INSERT INTO durable_jobs(kind,scope_type,scope_id,dedupe_key,payload_json,status,created_at,updated_at) VALUES ('agent',?,?,?,?, 'queued',?,?)",
                                    (info["scope_type"], info["scope_id"], str(uuid.uuid4()), json.dumps(payload), int(time.time()), int(time.time()))).lastrowid
                 if schedule_run_id:
@@ -446,7 +526,8 @@ class Queue:
             payload = json.loads(row["payload_json"])
             author = self.user(payload["user_id"])
             prompt = self.p.files.prompt(author, info, payload["attachment_ids"])
-            prompt["text"] = self.p.skills.invoke(author, info, payload["content"]) + ("\n" + prompt["text"] if prompt["text"] else "")
+            prompt["text"] = (feedback_prefix(payload.get("artifact_feedback")) + self.p.skills.invoke(author, info, payload["content"])
+                              + ("\n" + prompt["text"] if prompt["text"] else ""))
             with self.p.db.connect() as conn:
                 sent = conn.execute(
                     "UPDATE durable_jobs SET payload_json=json_set(payload_json,'$.steer_sent',json('true')),updated_at=? "
@@ -537,7 +618,7 @@ class Queue:
                 self.p.files.release(info, message_id, conn)
                 conn.execute(f"DELETE FROM {table} WHERE id=?", (message_id,))
                 self.emit(info["scope_key"], {"type": "message_removed", "message_id": message_id}, conn)
-        return {"content": row["content"], "attachments": attachments}
+        return {"content": row["content"], "attachments": attachments, "artifact_feedback": metadata.get("artifact_feedback", [])}
 
     def input_delivered(self, parent_job_id, info, input_id):
         with self.p.db.connect() as conn:
@@ -694,7 +775,7 @@ class Queue:
             row = conn.execute("SELECT value FROM settings WHERE key='ui_branding_v1'").fetchone()
         branding = json.loads(row[0]) if row else {}
         prompt = f"You are {branding.get('agent_name', 'Assistant')}, the assistant in {branding.get('product_name', 'Agent Platform')}. "
-        prompt += f"Use your available tools to help the user. {artifact_guidance(info['sandbox']['cwd'])}"
+        prompt += f"Use your available tools to help the user. {artifact_guidance(info['sandbox']['cwd'], info['kind'] == 'agent' and info['channel_id'] is None)}"
         agents = None
         if info["kind"] == "agent":
             prompt += " Maintain lasting workspace guidance in AGENTS.md. Use advertised skills when relevant.\n\n"
@@ -744,7 +825,8 @@ class Queue:
                     await self.selected_model(info)
                     prompt = self.p.files.prompt(user, info, payload["attachment_ids"])
                     text = payload["content"] if notice is None else notice
-                    prompt["text"] = (self.p.skills.invoke(user, info, text) if notice is None else text) + ("\n" + prompt["text"] if prompt["text"] else "")
+                    prompt["text"] = (feedback_prefix(payload.get("artifact_feedback")) + (self.p.skills.invoke(user, info, text) if notice is None else text)
+                                      + ("\n" + prompt["text"] if prompt["text"] else ""))
                     tools = BUILTINS + (["skill"] if info["kind"] == "agent" else []) + (["browser", "schedule", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
                     mcp = await self.p.mcp.run_payload(user, info)
                     if mcp is not None:
@@ -1095,7 +1177,8 @@ async def conversation_route(request):
         if request.method == "POST":
             body = await request.json()
             mode = body.get("mode", "insert")
-            return JSONResponse(await queue.enqueue(user, scope, body.get("content"), body.get("attachment_ids"), mode=mode), status_code=202)
+            return JSONResponse(await queue.enqueue(user, scope, body.get("content"), body.get("attachment_ids"), mode=mode,
+                                                        artifact_feedback=body.get("artifact_feedback")), status_code=202)
         return JSONResponse(queue.messages(user, scope, request.query_params.get("before"), request.query_params.get("limit", 100)))
     if action == "events":
         queue.scope(user, scope)

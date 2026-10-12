@@ -45,6 +45,10 @@ const PATHS = {
   history: <><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9" /><path d="M4.5 4.5V9H9M12 8v4l2.75 1.75" /></>,
   folder: <path d="M3.5 7.5a2 2 0 0 1 2-2h4l2 2h7a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-9.5Z" />,
   browser: <><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><path d="M3.5 9h17M6.5 6.75h.01M9 6.75h.01" /></>,
+  /* a pointer over a dashed frame: 圈选 (annotate an artifact) */
+  annotate: <><path d="M10 3.5H8M16 3.5h-2M3.5 8v2M3.5 14v2M20.5 8v2M8 20.5H6a2.5 2.5 0 0 1-2.5-2.5M3.5 6A2.5 2.5 0 0 1 6 3.5M18 3.5A2.5 2.5 0 0 1 20.5 6" /><path d="m12.5 12.5 7.5 2.75-3.25 1.5-1.5 3.25z" /></>,
+  quote: <path d="M9.5 7.5H6.5a1.5 1.5 0 0 0-1.5 1.5v2.5A1.5 1.5 0 0 0 6.5 13H9v.5c0 1.5-1 2.75-2.75 3.25M19 7.5h-3a1.5 1.5 0 0 0-1.5 1.5v2.5A1.5 1.5 0 0 0 16 13h2.5v.5c0 1.5-1 2.75-2.75 3.25M9.5 7.5V13M19 7.5V13" />,
+  stop: <rect x="6" y="6" width="12" height="12" rx="2.5" />,
 } satisfies Record<string, ReactNode>;
 
 export type IconName = keyof typeof PATHS;

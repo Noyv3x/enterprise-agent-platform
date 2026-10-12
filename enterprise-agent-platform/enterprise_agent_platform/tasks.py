@@ -408,6 +408,7 @@ class Tasks:
                                  "cacheRead": usage.get("cache_read", 0), "cacheWrite": usage.get("cache_write", 0)}),
                      _ts()))
         if changed:
+            self.p.live.task_ended(tid)
             self.emit(self.row(tid))
             self.signal()
             self.notify_later(self.row(tid)["user_id"])
@@ -480,6 +481,7 @@ class Tasks:
                 tid = conn.execute("SELECT id FROM background_tasks WHERE external_id=?", (process_id,)).fetchone()["id"]
             return _ok(f"bg-{tid}", {"task_id": f"bg-{tid}"})
         self.ensure_watcher()
+        self.p.live.process_started(uid, name if isinstance(name, str) else None, tid)
         # The row exists now, so the watcher sees every later change. Read again to cover any change since `first`.
         current = await self.find_process(uid, process_id) or first
         await self.apply_process(tid, current)

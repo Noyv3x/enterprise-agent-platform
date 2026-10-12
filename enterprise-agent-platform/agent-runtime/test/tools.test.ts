@@ -8,6 +8,7 @@ import test from "node:test";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import { Parse } from "typebox/value";
 import { createTools } from "../src/tools.js";
 import { createExecutorTransport, createGatewayTransport, type ExecutorTransport, type Sandbox } from "../src/transport.js";
 import { noProcesses } from "./fakes.js";
@@ -204,6 +205,44 @@ test("artifact is a gateway tool for every root scope, forwards to the artifacts
     { tool: "artifacts", action: "publish", args: { path: "/workspace/site", entry: "index.html", title: "Site" }, timeout: 300_000 },
     { tool: "artifacts", action: "list", args: {}, timeout: 120_000 },
   ]);
+});
+
+test("artifact view returns its images as model image blocks, preview forwards its arguments and the schema validates both", async () => {
+  const calls: { action: string; args: Record<string, unknown>; timeout: number | undefined }[] = [];
+  let data: unknown = { page_width: 1280, images: [{ data: "AAAA", mimeType: "image/jpeg" }, { data: "BBBB", mimeType: "image/jpeg" }] };
+  const gateway = { async call(_tool: string, action: string, args: Record<string, unknown>, _context: unknown, _signal: unknown, timeout?: number) {
+    calls.push({ action, args, timeout });
+    return { content: "Page 1280x2400, 2 images, no console errors", data, is_error: false };
+  } } as unknown as Parameters<typeof createTools>[1]["gateway"];
+  const artifact = createTools("/workspace", { sandbox, executor: noProcesses as unknown as ExecutorTransport, gateway, artifacts: true, names: ["artifact"], context: () => ({ sid: "s", scope_key: sandbox.scope_key, run_id: "r" }) }).find(tool => tool.name === "artifact")!;
+  assert.match(artifact.description, /call `view`/);
+  assert.match(artifact.description, /console errors/);
+  assert.match(artifact.description, /base path/);
+  assert.match(artifact.description, /0\.0\.0\.0/);
+  assert.match(artifact.description, /call this FIRST[\s\S]*Then start \(or restart\)/);
+
+  const view = await artifact.execute("v1", { action: "view", path: "/workspace/site", width: 390, full_page: false }, undefined, undefined, {} as ExtensionToolContext);
+  assert.deepEqual(view.content, [
+    { type: "text", text: "Page 1280x2400, 2 images, no console errors" },
+    { type: "image", mimeType: "image/jpeg", data: "AAAA" },
+    { type: "image", mimeType: "image/jpeg", data: "BBBB" },
+  ]);
+  assert.deepEqual(view.details, { page_width: 1280 });
+
+  data = { preview_id: "p", base_path: "/artifact-live/p/" };
+  const preview = await artifact.execute("p1", { action: "preview", service: "web", port: 5173, path: "/", title: "Dev", base_aware: true }, undefined, undefined, {} as ExtensionToolContext);
+  assert.deepEqual(preview.content, [{ type: "text", text: "Page 1280x2400, 2 images, no console errors" }]);
+  assert.deepEqual(calls, [
+    { action: "view", args: { path: "/workspace/site", width: 390, full_page: false }, timeout: 180_000 },
+    { action: "preview", args: { service: "web", port: 5173, path: "/", title: "Dev", base_aware: true }, timeout: 120_000 },
+  ]);
+
+  for (const bad of [[{ data: "x" }], "no", Array.from({ length: 9 }, () => ({ data: "x", mimeType: "image/jpeg" }))]) {
+    data = { images: bad };
+    await assert.rejects(artifact.execute("v2", { action: "view", id: 3 }, undefined, undefined, {} as ExtensionToolContext), /Invalid artifact image/);
+  }
+  for (const bad of [{ action: "view", width: 100 }, { action: "view", width: 5000 }, { action: "view", version: 0 }, { action: "view", id: "7" }, { action: "view", id: 0 }, { action: "preview", port: 70_000 }, { action: "screenshot" }])
+    assert.throws(() => Parse(artifact.parameters, bad));
 });
 
 test("remote reads preserve large UTF-8 and binary bytes and reject clipped chunks before edit", async () => {

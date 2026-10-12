@@ -8,8 +8,13 @@ import LoadingState from "../../components/ui/beautiful/primitives/LoadingState"
 import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { baseName } from "./ArtifactCards";
-import { KindIcon, kindLabel } from "./kinds";
+import type { FeedbackSink, FramePick } from "./feedback";
+import { frameStorageKey } from "./frameStorage";
+import { KindIcon, kindLabel, previewLabel } from "./kinds";
+import { LiveViewer } from "./LiveViewer";
+import { QuoteLayer } from "./QuoteLayer";
 import { ArtifactDiff, ArtifactPreview, ArtifactSourceView } from "./renderers";
+import { ANNOTATABLE, AnnotateStrip, AnnotateToggle, EXPAND_ICON, ICON_BUTTON, useAnnotate } from "./toolbar";
 import { TEXT_KINDS, type ArtifactRendererProps } from "./types";
 import type { ArtifactsState } from "./useArtifacts";
 import { useViewUrl } from "./useViewUrl";
@@ -17,19 +22,18 @@ import { WebFrame, type FrameWidth } from "./WebFrame";
 
 type Mode = "preview" | "source" | "diff";
 
-const ICON_BUTTON = "primitive-icon-button shrink-0 text-ink-2 transition-colors duration-100 hover:bg-hover hover:text-ink aria-disabled:pointer-events-none aria-disabled:opacity-40 touch:size-11";
-
-/* maximize-2, as the computer window's open control */
-const expandIcon = <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>;
-
 function when(iso: string): string {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(intlLocale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
-/** The 作品 panel's content: the conversation's artifacts, or the open one with its toolbar and preview. */
-export function ArtifactPanel({ state }: { state: ArtifactsState }) {
-  return state.selection ? <ArtifactViewer state={state} /> : <ArtifactList state={state} />;
+/** The 作品 panel's content: the conversation's artifacts, or the open one with its toolbar and preview. `feedback`
+ * (null when the person cannot post) enables 圈选; `owner` keys the pages' kept storage per account. */
+export function ArtifactPanel({ state, feedback = null, owner }: { state: ArtifactsState; feedback?: FeedbackSink | null; owner?: number }) {
+  if (!state.selection) return <ArtifactList state={state} />;
+  return state.artifact?.kind === "live"
+    ? <LiveViewer state={state} feedback={feedback} owner={owner} />
+    : <ArtifactViewer state={state} feedback={feedback} owner={owner} />;
 }
 
 function ArtifactList({ state }: { state: ArtifactsState }) {
@@ -75,7 +79,9 @@ function ArtifactList({ state }: { state: ArtifactsState }) {
             <span className="flex min-w-0 flex-1 flex-col">
               <span className="truncate text-[13px] font-medium text-ink">{artifact.title || baseName(artifact.path)}</span>
               <span className="truncate text-[12px] text-ink-2 tabular-nums">
-                {[`v${artifact.latest_version}`, kindLabel(artifact.kind, w), when(artifact.updated_at)].filter(Boolean).join(" · ")}
+                {(artifact.kind === "live"
+                  ? [kindLabel(artifact.kind, w), previewLabel(state.previewOf(artifact.id), w)]
+                  : [`v${artifact.latest_version}`, kindLabel(artifact.kind, w), when(artifact.updated_at)]).filter(Boolean).join(" · ")}
               </span>
             </span>
             <Icon name="chevronRight" size={14} className="shrink-0 text-ink-3" />
@@ -103,13 +109,14 @@ function sourceLoader(sources: SourceCache, id: number, version: number, entry: 
   };
 }
 
-function ArtifactViewer({ state }: { state: ArtifactsState }) {
+function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; feedback: FeedbackSink | null; owner?: number }) {
   const w = useWords();
   const { selection, artifact, versions, notice } = state;
   const [mode, setMode] = useState<Mode>("preview");
   const [width, setWidth] = useState<FrameWidth>("desktop");
   const [nonce, setNonce] = useState(0);
   const [expanded, setExpanded] = useState(false);
+  const annotate = useAnnotate(feedback);
   const sources = useRef<SourceCache>(new Map()).current;
   const id = selection?.id ?? null;
   const version = selection?.version ?? null;
@@ -139,6 +146,20 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
 
   const title = artifact.title || baseName(artifact.path);
   const web = artifact.kind === "web" || artifact.kind === "site";
+  const annotatable = feedback && mode === "preview" ? ANNOTATABLE[artifact.kind] : undefined;
+  const annotating = annotate.on && Boolean(annotatable);
+  const frame: FrameAnnotation = {
+    inspecting: annotating && annotatable === "page",
+    quoting: annotating && annotatable === "text",
+    onPick: (pick) => annotate.add({
+      feedback: { artifact_id: id, version, path: pick.path, kind: pick.kind, selector: pick.selector, text: pick.text, rect: pick.rect, title },
+      tag: pick.tag,
+      capture: { path: `/api/artifacts/${id}/versions/${version}/capture`, body: { path: pick.path, rect: pick.rect, viewport: pick.viewport } },
+    }),
+    onInspectExit: () => annotate.setOn(false),
+    onQuote: (text) => annotate.add({ feedback: { artifact_id: id, version, path: current.entry, kind: "quote", text, title } }),
+    storageKey: frameStorageKey(owner, id),
+  };
   const previous = versions.find((item) => item.version < version);
   const diffable = Boolean(TEXT_KINDS[artifact.kind]) && Boolean(previous);
   const shownMode: Mode = mode === "diff" && !diffable ? "source" : mode;
@@ -194,6 +215,7 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
             className="shrink-0 touch:h-11"
           />
         )}
+        {annotatable && <AnnotateToggle on={annotate.on} onChange={annotate.setOn} />}
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
           <button type="button" aria-label={w("Refresh", "刷新", "重新整理")} title={w("Refresh", "刷新", "重新整理")} className={ICON_BUTTON} onClick={() => setNonce((value) => value + 1)}>
             <Icon name="refresh" size={14} />
@@ -207,6 +229,8 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
           </a>
         </div>
       </div>
+
+      {annotating && feedback && <AnnotateStrip page={annotatable === "page"} feedback={feedback} note={annotate.note} onDone={() => annotate.setOn(false)} />}
 
       <div role="status" aria-live="polite" aria-label={w("Version updates", "版本更新", "版本更新")} className="empty:hidden">
         {notice?.type === "updated" && notice.version === version && (
@@ -234,12 +258,12 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
           actions={
             <button type="button" aria-label={w("Enlarge", "放大", "放大")} title={w("Enlarge", "放大", "放大")} onClick={() => setExpanded(true)}
               className="primitive-icon-button size-6 text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink touch:size-11">
-              <Ico size={13} path={expandIcon} />
+              <Ico size={13} path={EXPAND_ICON} />
             </button>
           }
         >
           {expanded ? null : (
-            <ArtifactBody key={`${id}:${version}:${nonce}`} sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} />
+            <ArtifactBody key={`${id}:${version}:${nonce}`} sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} frame={frame} />
           )}
         </FauxWindow>
       </section>
@@ -248,7 +272,7 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
         <ScreenViewer title={`${title} · v${version}`} collapseLabel={w("Collapse", "收起", "收起")} onClose={() => setExpanded(false)}>
           <div className="relative overflow-hidden" style={{ width: "min(1280px, 92vw)", height: "calc(100vh - 120px)" }}>
             <FauxWindow tabs={[{ id: "artifact", label: title }]} address={web ? artifact.path : null}>
-              <ArtifactBody sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} />
+              <ArtifactBody sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} frame={frame} />
             </FauxWindow>
           </div>
         </ScreenViewer>
@@ -257,8 +281,18 @@ function ArtifactViewer({ state }: { state: ArtifactsState }) {
   );
 }
 
+/** What 圈选 needs from the preview: the page inspector or text quoting, and the page's kept storage. */
+interface FrameAnnotation {
+  inspecting: boolean;
+  quoting: boolean;
+  onPick: (pick: FramePick) => void;
+  onInspectExit: () => void;
+  onQuote: (text: string) => void;
+  storageKey: string;
+}
+
 /** One version in the chosen mode: the web frame or a kind renderer, the source, or the diff with the previous version. */
-function ArtifactBody({ sources, artifact, current, previous, mode, width, viewUrl, viewError }: {
+function ArtifactBody({ sources, artifact, current, previous, mode, width, viewUrl, viewError, frame }: {
   sources: SourceCache;
   artifact: ArtifactView;
   current: ArtifactVersion;
@@ -267,6 +301,7 @@ function ArtifactBody({ sources, artifact, current, previous, mode, width, viewU
   width: FrameWidth;
   viewUrl: string | null;
   viewError: string;
+  frame: FrameAnnotation;
 }) {
   const w = useWords();
   const { version, entry } = current;
@@ -287,7 +322,12 @@ function ArtifactBody({ sources, artifact, current, previous, mode, width, viewU
       </div>
     );
   } else if (artifact.kind === "web" || artifact.kind === "site") {
-    body = <WebFrame src={viewUrl} title={artifact.title || baseName(artifact.path)} width={width} />;
+    body = (
+      <WebFrame src={viewUrl} title={artifact.title || baseName(artifact.path)} width={width} inspecting={frame.inspecting}
+        onPick={frame.onPick} onInspectExit={frame.onInspectExit} storageKey={frame.storageKey} />
+    );
+  } else if (ANNOTATABLE[artifact.kind] === "text") {
+    body = <QuoteLayer active={frame.quoting} onQuote={frame.onQuote}><ArtifactPreview {...props} /></QuoteLayer>;
   } else {
     body = <ArtifactPreview {...props} />;
   }

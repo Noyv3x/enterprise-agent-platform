@@ -29,7 +29,7 @@ export interface ProcessView {
   state: "running" | "exited" | "killed" | "failed" | "interrupted"; exit_code: number | null; reason: string;
   attached: boolean; stdin_open: boolean; started_at: string; ended_at: string | null; log_bytes: number; seq: number; unconfirmed?: true;
 }
-export interface ProcessStartOptions { command: string; cwd: string; timeoutMs: number; name?: string; stdin: boolean }
+export interface ProcessStartOptions { command: string; cwd: string; timeoutMs: number; name?: string; port?: number; stdin: boolean }
 export interface ProcessReadOptions { offset: number; maxBytes?: number; waitMs?: number }
 export interface ProcessRead { data: string; offset_start: number; next_offset: number; retained_from: number; eof: boolean; process: ProcessView }
 // One NDJSON line carries at most the result frame (two bounded streams plus
@@ -124,7 +124,7 @@ export function createExecutorTransport(options: { socketPath: string; token: st
     file: (sandbox, context, action, args, signal) => execute<FileResult>(sandbox, context, "file", action === "read" ? "read_file" : "write_file", action, args, {}, signal),
     async cancelRun(sandbox, runId) { return (await post<{ confirmed: boolean }>("runs/cancel", identity(sandbox, runId))).confirmed; },
     async processStart(sandbox, context, options, signal) {
-      const args = { command: options.command, cwd: options.cwd, timeout_ms: options.timeoutMs, ...(options.name === undefined ? {} : { name: options.name }), stdin: options.stdin, attached: true };
+      const args = { command: options.command, cwd: options.cwd, timeout_ms: options.timeoutMs, ...(options.name === undefined ? {} : { name: options.name }), ...(options.port === undefined ? {} : { port: options.port }), stdin: options.stdin, attached: true };
       return (await execute<{ process: ProcessView }>(sandbox, context, "process/start", "process", "start", args, { command: options.command, cwd: options.cwd }, signal)).process;
     },
     processRead(sandbox, processId, options, signal) {

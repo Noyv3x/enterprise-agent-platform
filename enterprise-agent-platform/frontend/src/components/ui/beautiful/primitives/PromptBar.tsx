@@ -19,7 +19,9 @@
  * - the send button uses the accent token (brand colour) per docs/design/frontend.md;
  * - accessibility: controls grow to 44px through the app's `touch:` variant (coarse pointers and narrow screens)
  *   rather than `pointer-coarse:` alone, the grid columns size to those targets, and the placeholder uses ink-2 for
- *   4.5:1 contrast.
+ *   4.5:1 contrast;
+ * - chips (platform addition for 圈选反馈): an attachment may carry a `thumb` (an image preview drawn in the icon's
+ *   place) or be a `context` chip (the accent tint, a pointer glyph and a wider label) for an annotated artifact spot.
  * Markup, classes, radii and motion are upstream's. */
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createShader, playSweep, accentChain, ACCENTS, type ShaderController } from "glimm";
@@ -88,6 +90,10 @@ export type PromptAttachment = {
   state: "uploading" | "ready" | "error";
   /** error text, or size once uploaded */
   detail?: string;
+  /** an image preview shown once ready */
+  thumb?: string;
+  /** a feedback context rather than a file */
+  context?: boolean;
 };
 
 export type PromptBarLabels = {
@@ -651,9 +657,9 @@ export default function PromptBar({
             {attachments.map((file) => (
               <span
                 key={file.key}
-                title={file.detail}
-                className={`flex h-6.5 max-w-full items-center gap-1.5 bg-field py-1 pr-1 pl-1.5 text-[11.5px] shadow-hairline ${
-                  file.state === "error" ? "text-red" : "text-ink-2"
+                title={file.context ? file.name : file.detail}
+                className={`flex h-6.5 max-w-full items-center gap-1.5 py-1 pr-1 pl-1.5 text-[11.5px] shadow-hairline ${
+                  file.context ? "bg-accent-tint text-accent-ink" : file.state === "error" ? "bg-field text-red" : "bg-field text-ink-2"
                 } ${pill ? "rounded-full" : "rounded-chip"}`}
                 style={{ animation: "pop-in 200ms cubic-bezier(0.23,1,0.32,1) both" }}
               >
@@ -661,16 +667,22 @@ export default function PromptBar({
                   <span aria-hidden className="size-3 shrink-0 rounded-full border-[1.5px] border-line-strong border-t-ink-2" style={{ animation: "spin 700ms linear infinite" }} />
                 ) : file.state === "error" ? (
                   <Icon size={12}><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" /></Icon>
+                ) : file.context ? (
+                  <Icon size={12}><path d="m12.5 12.5 7.5 2.75-3.25 1.5-1.5 3.25zM10 3.5H8M16 3.5h-2M3.5 8v2M3.5 14v2M20.5 8v2M8 20.5H6a2.5 2.5 0 0 1-2.5-2.5M3.5 6A2.5 2.5 0 0 1 6 3.5M18 3.5A2.5 2.5 0 0 1 20.5 6" /></Icon>
+                ) : file.thumb ? (
+                  <img src={file.thumb} alt="" className="size-4 shrink-0 rounded-[3px] object-cover shadow-hairline" />
                 ) : (
                   <Icon size={12}><g><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></g></Icon>
                 )}
-                <span className="max-w-36 truncate">{file.name}</span>
+                <span className={`truncate ${file.context ? "max-w-64 font-medium" : "max-w-36"}`}>{file.name}</span>
                 {file.detail && <span className={`max-w-48 truncate ${file.state === "error" ? "" : "text-ink-2"}`}>{file.detail}</span>}
                 <button
                   type="button"
                   aria-label={labels.remove(file.name)}
                   onClick={() => onRemoveAttachment?.(file.key)}
-                  className={`-my-1 flex size-6 shrink-0 items-center justify-center text-ink-3 transition-colors duration-100 hover:bg-line/70 hover:text-ink touch:size-11 ${
+                  className={`-my-1 flex size-6 shrink-0 items-center justify-center transition-colors duration-100 hover:bg-line/70 hover:text-ink touch:size-11 ${
+                    file.context ? "text-accent-ink" : "text-ink-3"
+                  } ${
                     pill ? "rounded-full" : "rounded-[5px]"
                   }`}
                 >

@@ -264,13 +264,16 @@ receipt is created by POST `/v1/executor/audit` with `operation:"process"`):
 
 | Route | action | `arguments` | audit `details` |
 | --- | --- | --- | --- |
-| POST `/v1/executor/process/start` | `start` | `{command, cwd, timeout_ms, name?, stdin, attached}` | `{command, cwd}` |
+| POST `/v1/executor/process/start` | `start` | `{command, cwd, timeout_ms, name?, port?, stdin, attached}` | `{command, cwd}` |
 | POST `/v1/executor/process/stdin` | `stdin` | `{process_id, data, eof?}` (data ≤ 64 KiB) | `{process_id, bytes}` (bytes = UTF-8 length; content never audited) |
 | POST `/v1/executor/process/kill` | `kill` | `{process_id}` | `{process_id}` |
 
 `timeout_ms` is 0 (no deadline) or 100–604800000; `name` is 1–48 characters
 matching `[A-Za-z0-9][A-Za-z0-9._-]*`, unique among the owner's running
-processes. Start returns `{process:View}` after the record is persisted. If the
+processes. `port` (optional, 1–65535, only with a `name`) declares the TCP port
+the service listens on inside the sandbox; it is persisted in the record, shown
+in the view and is the only port the [proxy route](#sandbox-service-proxy) will
+dial. Start returns `{process:View}` after the record is persisted. If the
 in-sandbox supervisor never starts, the view is `failed` with reason
 `start_failed`. Kill sends SIGTERM to the process group, SIGKILL after 5 s, and
 confirms descendant termination as foreground does; the result is state
@@ -295,7 +298,33 @@ View: `{id:"proc_<ulid>", owner, scope_id, sandbox_id, name|null, command
 (redacted, ≤ 4096 chars), cwd, state:"running"|"exited"|"killed"|"failed"|
 "interrupted", exit_code|null, reason:""|"user"|"timeout"|"system_restart"|
 "sandbox_stopped"|"start_failed"|"run_cancelled", attached, stdin_open,
-started_at, ended_at|null, log_bytes, seq, unconfirmed?}`.
+started_at, ended_at|null, log_bytes, seq, unconfirmed?, port|null}`.
+
+### Sandbox service proxy
+
+`ANY /v1/executor/proxy/{process_id}/{path…}` is a raw streaming route (not a
+JSON receipt route), dispatched before the JSON routes with the same Bearer
+token. The `X-Owner` header carries the owner (scope-family root) and is
+removed before forwarding. Query strings pass through unchanged. Manager
+answers 404 for an unknown or foreign process id, a missing/empty `X-Owner`, a
+process that is not `running`, or one without a `port` (indistinguishable from
+one another); 502 when the sandbox container cannot be resolved or dialled,
+429 above 32 concurrent streams for the owner, 413 for a request body over
+32 MiB, 504 when the upstream sends no response headers for 120 s.
+
+Manager inspects the process's sandbox container, requires the Manager
+ownership labels, a running state and an IPv4 address on the core network, and
+dials exactly `<ip>:<port>` with a 10 s dial timeout (the resolved address is cached for 30 s and dropped after a failed dial); the destination is never
+taken from the request. Upstream redirects are returned to the caller as-is,
+never followed. Request headers `Cookie`, `Authorization`,
+`Proxy-Authorization`, `Forwarded`, `X-Forwarded-*`, `X-Real-Ip`, `X-Owner`,
+hop-by-hop headers and the headers they name are dropped; `Host` is set to
+`localhost:<port>`. Request and response bodies stream with backpressure; a
+response that stalls for 120 s is cut. WebSocket upgrades (`Connection:
+Upgrade`, `Upgrade: websocket`) are relayed as a raw byte tunnel with a 1 h
+lifetime and a 10 min idle limit; the `Upgrade`, `Connection` and
+`Sec-WebSocket-*` headers are the only hop-by-hop ones forwarded. Active
+requests and tunnels end as soon as the process leaves `running`.
 
 Run cancellation (`/v1/executor/runs/cancel`) also kills processes still
 attached to that run (reason `run_cancelled`) and never detached ones.
@@ -399,12 +428,31 @@ subagent requests naming it are rejected) calls Platform
 is `publish|list`; `publish` takes `path` (absolute sandbox path of a file or, for a
 site, a folder), optional `title` and `entry` (a site's entry file, default
 `index.html`) and snapshots it as a new artifact version; `list` takes no arguments
-and returns this conversation's artifacts. Platform returns the standard
-`{content,data,is_error}` result; Runtime applies a 300 s timeout to `publish`
-(large sites are read out of the sandbox) and the default 120 s to `list`. The
-description tells the model to publish what the user should look at, to keep the
-same path across revisions (a new version, never `v2` copies), to publish a site as
-its folder with an entry file, and to use `MEDIA:` only for downloadable files such
+and returns this conversation's artifacts. `view` is the AI self-check: it takes
+`id` (integer) or `path` (the published path, or `live:<service>` for a live preview), optional `version`, `page` (site-relative path), `width` (1280;
+320–1920), `height` (800) and `full_page` (true), and returns text (page size, image
+count, console messages) plus up to 8 JPEG screenshots in `data.images` as
+`[{data (base64), mimeType}]`. Runtime turns them into model image blocks after the
+text (as for browser screenshots) and keeps them out of `details`; a malformed or
+more than 8 `images` array fails the call. Render failures are typed Platform errors:
+`render_blocked` (422), `render_rate_limited` (429) and `render_unavailable`.
+`preview` (personal AI only; Platform
+rejects it elsewhere) takes `service` (the name of a running or about-to-run bash
+service), optional `port`, `path` (default `/`), `title` and `base_aware` (default
+false) and returns the artifact id and the preview's base path with per-framework
+base-path guidance. The base path is stable across restarts of the service and is
+revoked only by an explicit stop.
+Platform returns the standard `{content,data,is_error}` result; Runtime applies a
+300 s timeout to `publish` (large sites are read out of the sandbox), 180 s to `view`
+(it renders pages) and the default 120 s to `list` and `preview`. The description
+tells the model to publish what the user should look at, to keep the same path across
+revisions (a new version, never `v2` copies), to publish a site as its folder with an
+entry file, to run `view` after publishing or revising HTML pages, slides or sites
+and fix overlapping or cut-off text, overflow, broken images and console errors
+before saying it is done (a long deck at its intended size), to call `preview` first
+for the stable base path, then start or restart the dev server as the named bash
+service with `port` (listening on 0.0.0.0 and serving under that base path), and to
+use `MEDIA:` only for downloadable files such
 as DOCX, XLSX, PPTX and PDF.
 
 Web, browser and schedule tools call Platform
@@ -456,13 +504,17 @@ Only the root personal scope (`private:<uid>`, kind `agent`) gets the extended
 `bash` and the tools `task`, `job` and `wait`; channels, chat and subagents keep
 the foreground bash above.
 
-Personal `bash` takes `{command, timeout?, async?, name?, ready?:{log?, port?,
+Personal `bash` takes `{command, timeout?, async?, name?, port?, ready?:{log?, port?,
 host?, timeout?}}`. `timeout` is in seconds (default 600). Foreground commands
 allow at most 3600; `async` and `name` allow up to 604800 (Manager's limit).
 `timeout:0` means no deadline and is valid only with `async` or `name`; a named
 service without `timeout` has no deadline. `name` (1–48 characters,
 `[A-Za-z0-9][A-Za-z0-9._-]*`) starts a long-lived service with stdin open.
-`ready` needs `name` and at least one of `log` (a regex over the output) and
+`port` (1–65535, needs `name`) declares the TCP port the service serves on inside
+the sandbox, for live website previews; Runtime passes it, or `ready.port` when
+`port` is absent, as `port` in the Manager `process/start` arguments (both given
+and different is an error). `ready` needs `name` and at least one of `log` (a regex
+over the output) and
 `port` (probed on `host`, default 127.0.0.1, from inside the sandbox); when both
 are given both must hold. `ready.timeout` defaults to 30 s. Invalid values fail
 before any process starts.

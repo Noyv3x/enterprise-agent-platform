@@ -135,6 +135,92 @@ function isBlockedMetadataHostname(hostname) {
   return blockedMetadataHosts.has(host) || host.endsWith(".metadata.google.internal");
 }
 
+// Strict egress for artifact renderer contexts (userId `artifact-render:<uuid>`). The renderer runs untrusted page
+// JavaScript, so unlike ordinary agent browsing it may reach only public addresses plus the exact render base host(s)
+// listed in AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS (`host` or `host:port`, comma separated; compose: `platform:8765`).
+const renderIdentityPrefix = "artifact-render:";
+
+function isRenderIdentity(userId) {
+  return String(userId || "").startsWith(renderIdentityPrefix);
+}
+
+function parseAllowedHosts(raw) {
+  const entries = [];
+  for (const item of String(raw || "").split(/[\s,]+/)) {
+    if (!item.trim()) continue;
+    let target;
+    try {
+      target = new URL(`http://${item.trim()}`);
+    } catch {
+      throw new Error(`invalid render allowed host: ${item}`);
+    }
+    entries.push({ hostname: normalizeHostname(target.hostname), port: target.port ? Number(target.port) : null });
+  }
+  return entries;
+}
+
+const strictRenderPolicy = { allowed: parseAllowedHosts(process.env.AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS) };
+
+function isPublicIpv4Number(numeric) {
+  const within = (base, bits) => (numeric >>> (32 - bits)) === (parseIpv4(base) >>> (32 - bits));
+  return !(
+    within("0.0.0.0", 8) || within("10.0.0.0", 8) || within("100.64.0.0", 10) || within("127.0.0.0", 8)
+    || within("169.254.0.0", 16) || within("172.16.0.0", 12) || within("192.0.0.0", 24) || within("192.0.2.0", 24)
+    || within("192.168.0.0", 16) || within("198.18.0.0", 15) || within("198.51.100.0", 24)
+    || within("203.0.113.0", 24) || (numeric >>> 28) >= 14
+  );
+}
+
+function isStrictlyPublicAddress(rawAddress) {
+  const address = normalizeHostname(rawAddress);
+  const family = net.isIP(address);
+  if (family === 4) return isPublicIpv4Number(parseIpv4(address));
+  if (family !== 6) return false;
+  const numeric = parseIpv6(address);
+  if (numeric === null) return false;
+  if ((numeric >> 32n) === 0xffffn) return isPublicIpv4Number(Number(numeric & 0xffffffffn));
+  // Only global unicast 2000::/3, minus documentation space and 6to4 (which embeds arbitrary IPv4 addresses).
+  return (numeric >> 125n) === 1n && (numeric >> 96n) !== 0x20010db8n && (numeric >> 112n) !== 0x2002n;
+}
+
+function strictAllowedEntry(hostname, port, policy) {
+  const host = normalizeHostname(hostname);
+  return (policy?.allowed || []).find((entry) => entry.hostname === host && (entry.port === null || entry.port === port)) || null;
+}
+
+function urlPort(target) {
+  return Number(target.port || (["https:", "wss:"].includes(target.protocol) ? 443 : 80));
+}
+
+async function inspectStrictTarget(rawUrl, lookup = dns.lookup, policy = strictRenderPolicy) {
+  let target;
+  try {
+    target = new URL(String(rawUrl));
+  } catch {
+    return { blocked: false, reason: "not-a-url" };
+  }
+  if (!["http:", "https:", "ws:", "wss:"].includes(target.protocol)) {
+    return { blocked: false, reason: "non-network-scheme" };
+  }
+  const hostname = normalizeHostname(target.hostname);
+  if (isBlockedMetadataHostname(hostname)) return { blocked: true, reason: "metadata-hostname", hostname };
+  if (strictAllowedEntry(hostname, urlPort(target), policy)) return { blocked: false, reason: "render-base-host", hostname };
+  if (net.isIP(hostname)) {
+    const blocked = !isStrictlyPublicAddress(hostname);
+    return { blocked, reason: blocked ? "strict-non-public-address" : "public-address", hostname };
+  }
+  try {
+    const answers = await lookup(hostname, { all: true, verbatim: true });
+    if (!answers?.length) return { blocked: true, reason: "dns-resolution-failed", hostname };
+    for (const answer of answers) {
+      if (!isStrictlyPublicAddress(answer.address)) return { blocked: true, reason: "strict-dns-resolved-to-non-public", hostname };
+    }
+  } catch {
+    return { blocked: true, reason: "dns-resolution-failed", hostname };
+  }
+  return { blocked: false, reason: "public-hostname", hostname };
+}
+
 async function inspectNetworkTarget(rawUrl, lookup = dns.lookup, { resolveDns = true } = {}) {
   let target;
   try {
@@ -212,7 +298,7 @@ function configuredPinningLookup() {
 
 const pinningLookup = configuredPinningLookup();
 
-async function resolvePinnedNetworkTarget(rawHostname, lookup = pinningLookup) {
+async function resolvePinnedNetworkTarget(rawHostname, lookup = pinningLookup, { strict = null, port = null } = {}) {
   const hostname = normalizeHostname(rawHostname);
   if (!hostname) {
     throw new PinningProxyError("network target has no hostname");
@@ -221,8 +307,14 @@ async function resolvePinnedNetworkTarget(rawHostname, lookup = pinningLookup) {
     const decision = { blocked: true, reason: "metadata-hostname", hostname };
     throw new PinningProxyError("blocked metadata hostname", { blocked: true, decision });
   }
+  // Strict (renderer) mode: public addresses only, except the exact render base host, which stays pinned to its answers.
+  const strictHost = strict ? strictAllowedEntry(hostname, port, strict) : null;
   if (net.isIP(hostname)) {
-    if (isBlockedNetworkAddress(hostname)) {
+    if (strict && !strictHost && !isStrictlyPublicAddress(hostname)) {
+      const decision = { blocked: true, reason: "strict-non-public-address", hostname };
+      throw new PinningProxyError("blocked non-public address", { blocked: true, decision });
+    }
+    if (!strict && isBlockedNetworkAddress(hostname)) {
       const decision = { blocked: true, reason: "metadata-or-link-local-address", hostname };
       throw new PinningProxyError("blocked metadata or link-local address", { blocked: true, decision });
     }
@@ -250,7 +342,9 @@ async function resolvePinnedNetworkTarget(rawHostname, lookup = pinningLookup) {
       decision: { hostname, reason: "dns-resolution-failed" },
     });
   }
-  const denied = usable.find((answer) => isBlockedNetworkAddress(answer.address));
+  const denied = strict
+    ? (strictHost ? undefined : usable.find((answer) => !isStrictlyPublicAddress(answer.address)))
+    : usable.find((answer) => isBlockedNetworkAddress(answer.address));
   if (denied) {
     const decision = {
       blocked: true,
@@ -383,7 +477,7 @@ function trackSocket(sockets, socket) {
   return socket;
 }
 
-function createPinningProxy({ lookup = pinningLookup } = {}) {
+function createPinningProxy({ lookup = pinningLookup, strict = null } = {}) {
   const sockets = new Set();
   let proxyUrl = "";
 
@@ -411,7 +505,7 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
     response.once("finish", cleanup);
     void (async () => {
       const target = parseAbsoluteProxyTarget(request.url, new Set(["http:"]));
-      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup);
+      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup, { strict, port: targetPort(target, 80) });
       if (request.aborted || response.destroyed) return;
       upstream = http.request(
         {
@@ -470,7 +564,7 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
     clientSocket.once("error", () => upstreamSocket?.destroy());
     void (async () => {
       const target = parseConnectTarget(request.url);
-      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup);
+      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup, { strict, port: target.port });
       upstreamSocket = trackSocket(
         sockets,
         net.connect({ host: pinned.address, family: pinned.family, port: target.port }),
@@ -506,7 +600,7 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
     clientSocket.once("error", () => upstreamSocket?.destroy());
     void (async () => {
       const target = parseAbsoluteProxyTarget(request.url, new Set(["http:", "ws:"]));
-      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup);
+      const pinned = await resolvePinnedNetworkTarget(target.hostname, lookup, { strict, port: targetPort(target, 80) });
       upstreamSocket = trackSocket(
         sockets,
         net.connect({
@@ -578,29 +672,36 @@ function createPinningProxy({ lookup = pinningLookup } = {}) {
   };
 }
 
-let managedPinningProxy = null;
-let managedPinningProxyPromise = null;
+const managedPinningProxies = new Map();
 
-async function ensureManagedPinningProxy() {
-  if (!managedPinningProxyPromise) {
-    managedPinningProxy = createPinningProxy();
-    managedPinningProxyPromise = managedPinningProxy.listen().then((url) => {
-      reportProxyPolicy(`connection-pinning proxy active at ${url}`);
+async function ensureManagedPinningProxy(strict = false) {
+  const kind = strict ? "strict" : "default";
+  if (!managedPinningProxies.has(kind)) {
+    const proxy = createPinningProxy({ strict: strict ? strictRenderPolicy : null });
+    const ready = proxy.listen().then((url) => {
+      reportProxyPolicy(`connection-pinning proxy (${kind}) active at ${url}`);
       return url;
     });
+    managedPinningProxies.set(kind, { proxy, ready });
   }
-  return managedPinningProxyPromise;
+  return managedPinningProxies.get(kind).ready;
 }
 
 function stopManagedPinningProxy() {
-  void managedPinningProxy?.close().catch(() => {});
+  for (const { proxy } of managedPinningProxies.values()) void proxy.close().catch(() => {});
 }
 
 process.once("SIGTERM", stopManagedPinningProxy);
 process.once("SIGINT", stopManagedPinningProxy);
 
+function inspectForContext(rawUrl, options) {
+  return options.strict
+    ? inspectStrictTarget(rawUrl, options.lookup || dns.lookup, options.strict)
+    : inspectNetworkTarget(rawUrl, dns.lookup, options);
+}
+
 async function guardHttpRoute(route, options = {}) {
-  const decision = await inspectNetworkTarget(route.request().url(), dns.lookup, options);
+  const decision = await inspectForContext(route.request().url(), options);
   if (decision.blocked) {
     reportBlockedNetworkTarget("request", decision);
     await route.abort("blockedbyclient");
@@ -609,7 +710,7 @@ async function guardHttpRoute(route, options = {}) {
 }
 
 async function guardWebSocketRoute(route, options = {}) {
-  const decision = await inspectNetworkTarget(route.url(), dns.lookup, options);
+  const decision = await inspectForContext(route.url(), options);
   if (decision.blocked) {
     reportBlockedNetworkTarget("websocket", decision);
     route.close({ code: 1008, reason: "blocked network target" });
@@ -643,7 +744,7 @@ function reportProxyPolicyOnce(policy) {
   reportProxyPolicy(policy);
 }
 
-async function managedContextOptions(options, inheritedPolicy) {
+async function managedContextOptions(options, inheritedPolicy, strict = false) {
   const contextHasUpstreamProxy = hasConfiguredProxy(options);
   if (contextHasUpstreamProxy || inheritedPolicy.upstreamProxy) {
     // Remote-proxy DNS cannot be pinned without replacing or MITMing the
@@ -654,7 +755,7 @@ async function managedContextOptions(options, inheritedPolicy) {
     );
     return { ...options, serviceWorkers: "block" };
   }
-  const proxyUrl = await ensureManagedPinningProxy();
+  const proxyUrl = await ensureManagedPinningProxy(strict);
   return {
     ...options,
     serviceWorkers: "block",
@@ -662,12 +763,13 @@ async function managedContextOptions(options, inheritedPolicy) {
   };
 }
 
-async function guardCreatedContext(context) {
+async function guardCreatedContext(context, strict = false) {
   try {
     // Hostname resolution is performed by either the connection-pinning proxy
     // or the operator's explicit upstream proxy. The route layer still blocks
     // known metadata hostnames and every literal metadata/link-local address.
-    return await installContextNetworkGuard(context, { resolveDns: false });
+    // Renderer contexts also resolve names here, so even an operator proxy cannot reach non-public targets.
+    return await installContextNetworkGuard(context, strict ? { strict: strictRenderPolicy } : { resolveDns: false });
   } catch (error) {
     await context?.close().catch(() => {});
     throw error;
@@ -679,10 +781,12 @@ function patchBrowser(browser, policy = { upstreamProxy: true, source: "unknown"
   Object.defineProperty(browser, browserGuardInstalled, { value: true });
   Object.defineProperty(browser, browserProxyPolicy, { value: policy });
   const originalNewContext = browser.newContext;
-  browser.newContext = async function managedNewContext(options = {}) {
-    const protectedOptions = await managedContextOptions(options, this[browserProxyPolicy] || policy);
+  // The patched Camofox session code passes the owner id as a second argument (patch-runtime.cjs); Playwright ignores it.
+  browser.newContext = async function managedNewContext(options = {}, meta = {}) {
+    const strict = isRenderIdentity(meta?.agentPlatformUserId);
+    const protectedOptions = await managedContextOptions(options, this[browserProxyPolicy] || policy, strict);
     const context = await originalNewContext.call(this, protectedOptions);
-    return guardCreatedContext(context);
+    return guardCreatedContext(context, strict);
   };
   for (const context of browser.contexts?.() || []) {
     reportProxyPolicyOnce(
@@ -739,6 +843,10 @@ try {
 module.exports = {
   createPinningProxy,
   inspectNetworkTarget,
+  inspectStrictTarget,
+  isRenderIdentity,
+  isStrictlyPublicAddress,
+  parseAllowedHosts,
   installContextNetworkGuard,
   isBlockedMetadataHostname,
   isBlockedNetworkAddress,

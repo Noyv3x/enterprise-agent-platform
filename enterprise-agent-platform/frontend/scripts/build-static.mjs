@@ -8,6 +8,7 @@ import {
   constants as zlibConstants,
   gzip as gzipCallback,
 } from "node:zlib";
+import { writeArtifactRuntime } from "./build-artifact-runtime.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const frontendDir = resolve(scriptDir, "..");
@@ -63,6 +64,7 @@ export async function precompressStaticAssets(outputDir) {
 
 async function main() {
   await runVite();
+  await writeArtifactRuntime(staticDir);
   await precompressStaticAssets(staticDir);
   process.stdout.write(`Static build written to ${staticDir}\n`);
 }

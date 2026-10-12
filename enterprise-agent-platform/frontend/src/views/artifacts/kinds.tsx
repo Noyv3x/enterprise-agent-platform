@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { ArtifactPreview } from "../../api";
 import type { ArtifactKind } from "./types";
 import type { Words } from "../conversation/work";
 
@@ -23,7 +24,19 @@ export function kindLabel(kind: ArtifactKind, w: Words): string {
       return w("Image", "图片", "圖片");
     case "pdf":
       return "PDF";
+    case "live":
+      return w("Live preview", "网站预览", "網站預覽");
   }
+}
+
+/** A live preview's state: 等待启动, 运行中, 已停止 (resumes when the service starts again) or 已结束 (revoked); "" while
+ * unknown. */
+export function previewLabel(preview: ArtifactPreview | null | undefined, w: Words): string {
+  if (!preview) return "";
+  if (preview.revoked) return w("Ended", "已结束", "已結束");
+  if (preview.state === "waiting") return w("Waiting to start", "等待启动", "等待啟動");
+  if (preview.state === "running") return w("Running", "运行中", "執行中");
+  return w("Stopped", "已停止", "已停止");
 }
 
 /* 24px line glyphs in the style of the controls' Icon set, one per kind. */
@@ -37,6 +50,7 @@ const GLYPHS: Record<ArtifactKind, ReactNode> = {
   code: <path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M13.5 5.5l-3 13" />,
   image: <><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><circle cx="9" cy="10" r="1.75" /><path d="m20.5 16-4.5-4.5-8 8" /></>,
   pdf: <><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z" /><path d="M14 3.5v5h5" /><path d="M8.5 16.5v-4h1.25a1.25 1.25 0 0 1 0 2.5H8.5" /></>,
+  live: <><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><path d="M3.5 9h17" /><path d="M9.5 15.5a3.5 3.5 0 0 1 5 0M7.5 13.25a6.5 6.5 0 0 1 9 0" /></>,
 };
 
 export function KindIcon({ kind, size = 15 }: { kind: ArtifactKind; size?: number }) {

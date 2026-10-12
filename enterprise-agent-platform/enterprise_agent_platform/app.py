@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import Database
-from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills, artifacts, mcp
+from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills, artifacts, artifact_live, artifact_render, mcp
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +32,8 @@ class Platform:
         self.browser = tools.Browser(self)
         self.files = files.Files(self)
         self.artifacts = artifacts.Artifacts(self)
+        self.renderer = artifact_render.Renderer(self)
+        self.live = artifact_live.Live(self)
         self.queue = queue.Queue(self)
         self.tasks = tasks.Tasks(self)
         self.skills = skills.Skills(self)
@@ -142,7 +144,9 @@ class BoundaryMiddleware:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
-        bypass = scope['path'].startswith('/internal/manager/') or scope['path'] == '/healthz'
+        # Live previews proxy a sandbox service and change no Platform state: they must neither hold the update gate while HTML is
+        # buffered nor stall maintenance.
+        bypass = scope['path'].startswith(('/internal/manager/', '/artifact-live/')) or scope['path'] == '/healthz'
         async with AsyncExitStack() as admission:
             if not bypass:
                 try:
@@ -201,7 +205,7 @@ def create_app(settings=None):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
 
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
-    for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills, artifacts):
+    for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills, artifacts, artifact_live):
         route_list.extend(module.routes())
     route_list.extend(mcp.routes(platform.mcp))
     route_list.append(Route('/{path:path}', static))

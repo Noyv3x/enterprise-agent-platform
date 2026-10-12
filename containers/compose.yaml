@@ -102,6 +102,7 @@ services:
     environment:
       AGENT_PLATFORM_TECHNICAL_PROFILE: agent-platform-v1
       AGENT_PLATFORM_CAMOFOX_BIND_HOST: 0.0.0.0
+      AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS: platform:8765
       CAMOFOX_PORT: "9377"
       CAMOFOX_HOST: 0.0.0.0
       AGENT_PLATFORM_CAMOFOX_ACCESS_KEY_FILE: /run/secrets/agent-platform/camofox-access-key

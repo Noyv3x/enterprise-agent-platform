@@ -94,7 +94,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
         self.assertEqual(settings, {'keep', 'model_policies_v1'})
-        self.assertEqual(db.schema_version(), 2026101501)
+        self.assertEqual(db.schema_version(), 2026102001)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -107,10 +107,10 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026101501)
+        self.assertEqual(self.db.schema_version(), 2026102001)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401, 2026101501])
+                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401, 2026101501, 2026102001])
 
     def test_background_tasks_migration_is_additive_idempotent_and_constrained(self):
         import sqlite3
@@ -122,7 +122,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101101')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026101501)
+        self.assertEqual(db.schema_version(), 2026102001)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0]
@@ -230,7 +230,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(slots, {'personal': ('admin-model', 'off'), 'channel': ('admin-model', 'off'), 'worker': ('admin-model', 'off'),
                                  'chat': ('admin-chat', 'off'), 'scout': ('admin-chat', 'off')})
         self.assertEqual(users, {1: 'default', 2: 'default', 3: 'default', 4: 'default'})
-        self.assertEqual(db.schema_version(), 2026101501)
+        self.assertEqual(db.schema_version(), 2026102001)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101201').fetchone()[0]
@@ -291,7 +291,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(after['agent-only'], ['private_agent', 'read_workspace', 'install_extensions'])
         self.assertEqual(after['viewer'], ['read_workspace'])
         self.assertEqual(after['done'], ['chat', 'install_extensions'])
-        self.assertEqual(db.schema_version(), 2026101501)
+        self.assertEqual(db.schema_version(), 2026102001)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101301').fetchone()[0]
@@ -317,7 +317,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101401')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026101501)
+        self.assertEqual(db.schema_version(), 2026102001)
         before = self.shape(db)
         with db.connect() as conn:
             self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)
@@ -338,6 +338,34 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM artifacts WHERE id=1')  # versions cascade
             self.assertEqual(conn.execute('SELECT count(*) FROM artifact_versions').fetchone()[0], 0)
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101401')
+        db.migrate(db.path.parent)  # a forced re-run changes nothing
+        self.assertEqual(self.shape(db), before)
+
+    def test_artifact_previews_migration_is_additive_idempotent_and_cascades(self):
+        import sqlite3
+        db = self.old_database()
+        db.migrate(db.path.parent)
+        with db.connect() as conn:
+            conn.execute('DROP TABLE artifact_previews')
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026102001')
+            counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'artifacts', 'background_tasks')}
+        db.migrate(db.path.parent)
+        self.assertEqual(db.schema_version(), 2026102001)
+        before = self.shape(db)
+        with db.connect() as conn:
+            self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)
+            self.assertEqual([row[1] for row in conn.execute('PRAGMA table_info(artifact_previews)')],
+                             ['artifact_id', 'preview_id', 'service', 'port', 'start_path', 'base_aware', 'task_id', 'state', 'revoked_at', 'created_at', 'updated_at'])
+            conn.execute("INSERT INTO artifacts(scope_type,scope_id,owner_user_id,path,kind,title,latest_version,created_at,updated_at) VALUES('private','1',1,'live:web','live','web',0,'t','t')")
+            conn.execute("INSERT INTO artifact_previews(artifact_id,preview_id,service,created_at,updated_at) VALUES(1,'abc','web',1,1)")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO artifact_previews(artifact_id,preview_id,service,created_at,updated_at) VALUES(1,'other','web',1,1)")
+            conn.execute("INSERT INTO artifacts(scope_type,scope_id,owner_user_id,path,kind,title,latest_version,created_at,updated_at) VALUES('private','1',1,'live:db','live','db',0,'t','t')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO artifact_previews(artifact_id,preview_id,service,created_at,updated_at) VALUES(2,'abc','db',1,1)")
+            conn.execute('DELETE FROM artifacts WHERE id=1')  # the preview cascades
+            self.assertEqual(conn.execute('SELECT count(*) FROM artifact_previews').fetchone()[0], 0)
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026102001')
         db.migrate(db.path.parent)  # a forced re-run changes nothing
         self.assertEqual(self.shape(db), before)
 

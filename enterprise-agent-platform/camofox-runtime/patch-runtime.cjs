@@ -205,6 +205,19 @@ const screenshotEncodingAfter = `    const { tabState } = found;
       : 65;
     const options = { type: format, fullPage, scale: 'css' };
     if (format === 'jpeg') options.quality = quality;
+    // Optional page-coordinate clip (artifact renderer): bounds the work of a full-page capture to the rectangle needed.
+    const clipX = Number(req.query.clipX ?? 0);
+    const clipY = Number(req.query.clipY ?? 0);
+    const clipWidth = Number(req.query.clipWidth);
+    const clipHeight = Number(req.query.clipHeight);
+    if (req.query.clipWidth !== undefined || req.query.clipHeight !== undefined) {
+      if (![clipX, clipY, clipWidth, clipHeight].every(Number.isFinite) || clipX < 0 || clipY < 0 || clipX > 1000000
+          || clipY > 1000000 || clipWidth < 1 || clipWidth > 16384 || clipHeight < 1 || clipHeight > 32768) {
+        return res.status(400).json({ error: 'invalid clip' });
+      }
+      options.fullPage = true;
+      options.clip = { x: clipX, y: clipY, width: clipWidth, height: clipHeight };
+    }
     const buffer = await tabState.page.screenshot(options);
     pluginEvents.emit('tab:screenshot', { userId, tabId: req.params.tabId, buffer });
     res.set('Content-Type', format === 'jpeg' ? 'image/jpeg' : 'image/png');
@@ -451,6 +464,11 @@ const displayAfter = `    let displayStartupError = null;
       vdDisplay = undefined;
     }`;
 
+// The preload's strict renderer egress policy keys on the Camofox user id, which upstream does not hand to
+// browser.newContext. Pass it as an ignored second argument that the preload's wrapper reads.
+const contextOwnerBefore = "const context = await b.newContext(contextOptions);";
+const contextOwnerAfter = "const context = await b.newContext(contextOptions, { agentPlatformUserId: String(key) });";
+
 let patched = fs.readFileSync(target, "utf8");
 
 function applyExactPatch(label, before, after) {
@@ -463,6 +481,7 @@ function applyExactPatch(label, before, after) {
 }
 
 applyExactPatch("graceful-shutdown", gracefulBefore, gracefulAfter);
+applyExactPatch("context-owner-for-network-policy", contextOwnerBefore, contextOwnerAfter);
 applyExactPatch("structured-log-redaction", loggingBefore, loggingAfter);
 applyExactPatch("owned-virtual-display-cleanup", cleanupBefore, cleanupAfter);
 applyExactPatch("proxy-retry-display-cleanup", proxyRetryCleanupBefore, proxyRetryCleanupAfter);

@@ -66,6 +66,14 @@ func (a *API) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 			writeError(response, http.StatusUnauthorized, "executor authentication failed")
 			return
 		}
+		if rest, ok := strings.CutPrefix(request.URL.EscapedPath(), "/v1/executor/proxy/"); ok {
+			// Raw streaming route: the upstream owns the content type and caching.
+			response.Header().Del("Content-Type")
+			response.Header().Del("Cache-Control")
+			processID, path, _ := strings.Cut(rest, "/")
+			a.Executor.ServeProxy(response, request, processID, "/"+path)
+			return
+		}
 		a.executorRoute(response, request)
 		return
 	}

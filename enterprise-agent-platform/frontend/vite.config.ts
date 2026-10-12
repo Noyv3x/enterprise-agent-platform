@@ -42,8 +42,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://127.0.0.1:8765",
-      // Artifact pages are served by the Platform too (platform-api.md § Artifacts).
-      "/artifact-view": "http://127.0.0.1:8765"
+      // Artifact pages, live previews (with their HMR WebSockets) and the page runtime are served by the Platform too
+      // (platform-api.md § Artifacts).
+      "/artifact-view": "http://127.0.0.1:8765",
+      "/artifact-live": { target: "http://127.0.0.1:8765", ws: true },
+      "/artifact-runtime.js": "http://127.0.0.1:8765"
     }
   }
 });
