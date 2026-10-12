@@ -458,8 +458,10 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(self.anonymous.get(v2.replace('index.html', 'only-v2.js')).text, 'export {}')
         # Tampering with any field or the signature, expiry, junk and a missing artifact are plain 404s.
         aid, version, expires, signature = token.split('.')
+        # Always a different signature: a fixed replacement could equal the real one by chance.
+        tampered = signature[:-2] + ('AB' if signature[-2:] != 'AB' else 'AC')
         forged = [f'{aid}.2.{expires}.{signature}', f'{int(aid) + 1}.{version}.{expires}.{signature}', f'{aid}.{version}.{int(expires) + 99}.{signature}',
-                  f'{aid}.{version}.{expires}.{signature[:-2]}AA', f'{aid}.{version}.{expires}.', 'garbage', f'{aid}.{version}.{expires}.{signature}.x',
+                  f'{aid}.{version}.{expires}.{tampered}', f'{aid}.{version}.{expires}.', 'garbage', f'{aid}.{version}.{expires}.{signature}.x',
                   f'{aid}.{version}.-5.{signature}']
         for value in forged:
             self.assertEqual(self.anonymous.get(f'/artifact-view/{value}/index.html').status_code, 404, value)
