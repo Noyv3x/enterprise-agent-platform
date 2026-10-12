@@ -87,6 +87,101 @@ export interface ArtifactSource { content: string; truncated: boolean; mime: str
 /** `metadata.artifacts[]` of the assistant message whose run published that version. */
 export interface ArtifactRef { id: number; version: number; title: string; kind: ArtifactKind; path: string }
 
+export type McpTransport = 'http' | 'sse' | 'stdio';
+export type McpAuth = 'none' | 'headers' | 'oauth';
+export type McpCredentialMode = 'shared' | 'per_user';
+/** `pending_confirmation`: added by the AI or by an import, and unusable until the user confirms it (POST …/confirm). */
+export type McpStatus = 'connected' | 'needs_auth' | 'needs_secrets' | 'error' | 'idle' | 'pending_confirmation';
+
+/** One MCP connector (连接器) as Platform shows it (platform-api.md § MCP). Secret values never leave Platform:
+ * `secrets_set` only says which header/env keys hold a value for the credential owner (the caller, or the
+ * organization for a shared connector). `source` is `manual`, `ai`, `import:<format>` or `legacy`. */
+export interface McpConnectorView {
+  id: number;
+  scope: 'org' | 'personal';
+  name: string;
+  label: string;
+  transport: McpTransport;
+  url?: string | null;
+  command?: string | null;
+  args?: string[];
+  cwd?: string | null;
+  header_keys: string[];
+  env_keys: string[];
+  auth: McpAuth;
+  credential_mode: McpCredentialMode;
+  enabled: boolean;
+  disabled_tools: string[];
+  status: McpStatus;
+  last_error?: string | null;
+  secrets_set: Record<string, boolean>;
+  groups?: string[];
+  tool_count?: number | null;
+  timeout_s?: number | null;
+  source: string;
+  manageable: boolean;
+  oauth_warning?: 'https_required' | null;
+}
+
+/** `GET /api/mcp/connectors?scope=private|chat` */
+export interface McpConnectorList { connectors: McpConnectorView[]; can_install: boolean; oauth_warning?: 'https_required' | null }
+
+/** `GET /api/admin/mcp/connectors`: `oauth` is the scopes and any pre-registered client (its secret only as set or not). */
+export interface McpAdminConnector extends McpConnectorView {
+  groups: string[];
+  oauth?: { scopes: string[]; client_id: string | null; client_secret_set: boolean } | null;
+}
+/** `oauth_redirect_uri` is the callback address to register with a provider for a pre-registered client. */
+export interface McpAdminConnectors { connectors: McpAdminConnector[]; groups: string[]; oauth_warning?: 'https_required' | null; oauth_redirect_uri?: string | null }
+
+export interface McpToolView { name: string; description?: string | null; read_only: boolean; enabled: boolean }
+/** `GET …/connectors/{id}/catalog` */
+export interface McpCatalog {
+  tools: McpToolView[];
+  prompts: { name: string; title?: string | null; description?: string | null }[];
+  resources: { uri: string; name?: string | null; description?: string | null }[];
+}
+/** `POST …/connectors/{id}/test` */
+export interface McpTestResult { ok: boolean; server?: { name: string; version?: string | null } | null; tools: number; error?: string | null }
+
+/** `GET /api/mcp/import/detected`: foreign config files found in the personal workspace. */
+export interface McpDetectedFile { path: string; format: string; servers: string[] }
+/** What an import or `mcp add` still needs from the user (OAuth sign-in, or secret values). `connector` is the name. */
+export interface McpMissing { connector: string; kind: 'oauth' | 'secrets'; keys?: string[] }
+/** A foreign entry that was not imported: `reason` is `exists`, `local_not_allowed` or another code with `message`. */
+export interface McpSkipped { name: string; reason: string; message?: string | null }
+export interface McpImportResult { connectors: McpConnectorView[]; missing: McpMissing[]; skipped?: (McpSkipped | string)[] }
+
+/** `GET /api/admin/mcp/calls`: one audited tool call; never its content. */
+export interface McpCallRow {
+  id: number;
+  /** epoch seconds */
+  at: number;
+  user_id: number | null;
+  username?: string | null;
+  display_name?: string | null;
+  scope_key: string;
+  connector_id: number | null;
+  connector_name?: string | null;
+  connector_label?: string | null;
+  tool: string;
+  status: 'ok' | 'error' | 'cancelled' | 'timeout';
+  duration_ms: number;
+}
+
+/** A channel manager's reduced view of a connector: `origin` is the server URL's origin only, without its path. */
+export interface McpChannelConnector extends Pick<McpConnectorView, 'id' | 'name' | 'label' | 'transport' | 'auth' | 'enabled' | 'status'> { scope: 'org'; origin: string }
+/** `GET /api/channels/{id}/mcp`: the shared organization connectors the channel may use, and those it does. */
+export interface McpChannelConnectors { connectors: McpChannelConnector[]; connector_ids: number[] }
+
+export interface McpPromptArgument { name: string; description?: string | null; required?: boolean }
+/** `GET /api/mcp/prompts?scope=`: offered in the composer as `/<connector>:<name>`. */
+export interface McpPrompt { connector: string; connector_label: string; name: string; title?: string | null; description?: string | null; arguments: McpPromptArgument[] }
+/** `connectors` is every connector available in the scope (the trace labels use it). */
+export interface McpPromptList { prompts: McpPrompt[]; connectors: { name: string; label: string }[] }
+/** `POST /api/mcp/prompts/render` */
+export interface McpPromptRender { text: string }
+
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers);
   headers.set('Accept', 'application/json');

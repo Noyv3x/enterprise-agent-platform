@@ -199,8 +199,8 @@ class Tasks:
             "AND json_extract(payload_json,'$.runtime_run_id')=?", (context.get("run_id"),)).fetchone()
         return (row["id"], json.loads(row["payload_json"]).get("message_id")) if row else (None, None)
 
-    def child_owner(self, context):
-        """The active user owning a live subagent run, if the context is exactly that run."""
+    def child_run(self, context):
+        """`(active user, task row)` of a live subagent run, if the context is exactly that run."""
         match = re.fullmatch(r"agent-private-(\d+)-bg-(\d+)", str(context.get("sid", "")))
         if not match:
             return None
@@ -211,10 +211,18 @@ class Tasks:
             return None
         with self.p.db.connect() as conn:
             row = conn.execute(
-                "SELECT u.* FROM background_tasks t JOIN users u ON u.id=t.user_id "
+                "SELECT u.*,t.agent_type AS task_agent_type FROM background_tasks t JOIN users u ON u.id=t.user_id "
                 "WHERE t.id=? AND t.user_id=? AND t.kind='agent' AND t.status='running' AND u.active=1",
                 (tid, uid)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        user = dict(row)
+        return user, user.pop("task_agent_type")
+
+    def child_owner(self, context):
+        """The active user owning a live subagent run, if the context is exactly that run."""
+        found = self.child_run(context)
+        return found[0] if found else None
 
     # -- lifecycle ---------------------------------------------------------------------------------
 
@@ -320,6 +328,7 @@ class Tasks:
             info = self.p.queue.scope(user, "private", authorize=False, slot=SUBAGENT_SLOT[row["agent_type"]])
             model = await self.p.queue.selected_model(info)
             sid = f"agent-private-{uid}-bg-{tid}"
+            mcp = await self.p.mcp.run_payload(user, info, row["agent_type"])
             sandbox = {**info["sandbox"], "scope_key": f"private:{uid}/delegate/bg-{tid}"}
             result = await self.p.queue.runtime("POST", f"/v1/sessions/{sid}/runs", json={
                 "kind": "subagent", "sandbox": sandbox, "model": model,
@@ -328,7 +337,8 @@ class Tasks:
                                               "user": user["display_name"], "tz": user["timezone"]}),
                 "resources": {"system_prompt": SUBAGENT_PROMPT.format(id=f"bg-{tid}", capability=CAPABILITY[row["agent_type"]]),
                               "agents_md": None, "skills": self.p.skills.catalog(user, info)},
-                "tools": SUBAGENT_TOOLS[row["agent_type"]]})
+                "tools": SUBAGENT_TOOLS[row["agent_type"]] + (["mcp", *[entry["name"] for entry in mcp["tools"]]] if mcp is not None else []),
+                **({"mcp": mcp} if mcp is not None else {})})
             started = True
             run_id = self.runs[tid] = result["run_id"]
             if tid in self.stop_requested:

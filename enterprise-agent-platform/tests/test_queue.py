@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import tempfile
+import time
 import unittest
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 
+from enterprise_agent_platform.mcp import McpService
 from enterprise_agent_platform.db import Database, now
 from policy_support import set_default_policy
 from enterprise_agent_platform.auth import issue_session, public_user
@@ -180,6 +182,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.p = SimpleNamespace(db=db, http=self.http, gate=Gate(), files=Files(), settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test", builtin_skills_dir=root / "builtin"))
         self.p.skills = Skills(self.p)
         self.p.artifacts = Artifacts(self.p)
+        self.p.mcp = McpService(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}, {"id": "model-b"}]}))
         self.q = self.p.queue = Queue(self.p)
         self.user = self.q.user(1)
@@ -1814,6 +1817,34 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                          ["/alpha build it", "/quiet and then this", "/not-a-skill keep as is", "answer"])
         self.assertEqual(parent["message"]["content"], "/alpha build it")
 
+    async def test_runs_carry_the_mcp_payload_of_connectors_available_in_the_scope(self):
+        svc = self.p.mcp
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',1)")
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('c1',1,'t','now','now')")
+        catalog = {"server": {"name": "s", "version": "", "protocol": "x", "instructions": ""}, "prompts": [], "resources": [], "fetched_at": int(time.time()),
+                   "tools": [{"name": "look", "title": "", "description": "Looks", "input_schema": {"type": "object"}, "read_only": True}]}
+        for scope in ("private", "channel-3", "chat-c1"):
+            await self.q.enqueue(self.user, scope, "hello")
+            await self.drain()
+        private, channel, chat = self.requests
+        self.assertEqual(private["mcp"], {"tools": [], "deferred": False})
+        self.assertIn("mcp", private["tools"])
+        for request in (channel, chat):
+            self.assertNotIn("mcp", request)
+            self.assertNotIn("mcp", request["tools"])
+        org = svc.create(self.user, {"name": "wiki", "transport": "http", "url": "https://wiki.example/mcp"}, "org")
+        svc.store.cache_put(org["id"], None, catalog)
+        svc.store.set_channel(3, [org["id"]], 1)
+        self.requests.clear()
+        for scope in ("private", "channel-3", "chat-c1"):
+            await self.q.enqueue(self.user, scope, "again")
+            await self.drain()
+        for request in self.requests:
+            self.assertIn("mcp", request["tools"])
+            self.assertEqual([(t["name"], t["connector"], t["tool"], t["read_only"]) for t in request["mcp"]["tools"]],
+                             [("mcp__wiki__look", "wiki", "look", True)])
+
     async def test_runs_advertise_the_skill_tool_and_the_guidance_by_scope(self):
         with self.p.db.connect() as conn:
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',1)")
@@ -1834,8 +1865,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("only with the `skill` tool", prompt)
             self.assertIn("one plain sentence, in their language", prompt)
             self.assertIn(".claude/skills", prompt)
-        self.assertIn("/workspace/.agent-platform/mcp.json", private["resources"]["system_prompt"])
-        self.assertIn('"mcpServers"', private["resources"]["system_prompt"])
+        self.assertIn("`mcp` tool", private["resources"]["system_prompt"])
+        self.assertNotIn('"mcpServers"', private["resources"]["system_prompt"])
         self.assertIn("claude mcp add", private["resources"]["system_prompt"])
         self.assertNotIn("mcp", channel["resources"]["system_prompt"].lower())
         self.assertNotIn("Agent Skills", chat["resources"]["system_prompt"])

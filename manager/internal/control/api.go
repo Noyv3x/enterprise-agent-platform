@@ -505,6 +505,12 @@ func (a *API) logs(response http.ResponseWriter, request *http.Request) {
 	}
 	writeJSON(response, http.StatusOK, map[string]any{"content": content})
 }
+
+const (
+	executorBodyLimit = 2 << 20
+	mcpSendBodyLimit  = 4 << 20
+)
+
 func (a *API) executorRoute(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		writeError(response, http.StatusMethodNotAllowed, "method not allowed")
@@ -513,7 +519,8 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 	switch request.URL.Path {
 	case "/v1/executor/audit":
 		var body executor.AuditRequest
-		if !a.decodeExecutor(response, request, &body) {
+		// A receipt for an MCP send carries the message (up to 1 MiB, doubled by escaping).
+		if !a.decodeExecutorLimit(response, request, &body, mcpSendBodyLimit) {
 			return
 		}
 		result, err := a.Executor.Audit(body)
@@ -558,6 +565,33 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 			result, err = a.Executor.ProcessKill(request.Context(), body)
 		}
 		a.executorResult(response, result, err)
+	case "/v1/executor/mcp/start", "/v1/executor/mcp/send", "/v1/executor/mcp/stop":
+		var body executor.Call
+		limit := int64(executorBodyLimit)
+		if request.URL.Path == "/v1/executor/mcp/send" {
+			limit = mcpSendBodyLimit
+		}
+		if !a.decodeExecutorLimit(response, request, &body, limit) {
+			return
+		}
+		var result map[string]any
+		var err error
+		switch request.URL.Path {
+		case "/v1/executor/mcp/start":
+			result, err = a.Executor.MCPStart(request.Context(), body)
+		case "/v1/executor/mcp/send":
+			result, err = a.Executor.MCPSend(request.Context(), body)
+		default:
+			result, err = a.Executor.MCPStop(request.Context(), body)
+		}
+		a.executorResult(response, result, err)
+	case "/v1/executor/mcp/recv":
+		var body executor.MCPRecvRequest
+		if !a.decodeExecutor(response, request, &body) {
+			return
+		}
+		result, err := a.Executor.MCPRecv(request.Context(), body)
+		a.executorResult(response, result, err)
 	case "/v1/executor/process/detach":
 		var body executor.ProcessDetachRequest
 		if !a.decodeExecutor(response, request, &body) {
@@ -591,14 +625,17 @@ func (a *API) executorRoute(response http.ResponseWriter, request *http.Request)
 	}
 }
 func (a *API) decodeExecutor(response http.ResponseWriter, request *http.Request, value any) bool {
-	if err := decode(request, value); err != nil {
+	return a.decodeExecutorLimit(response, request, value, executorBodyLimit)
+}
+func (a *API) decodeExecutorLimit(response http.ResponseWriter, request *http.Request, value any, limit int64) bool {
+	if err := decodeLimit(request, value, limit); err != nil {
 		writeError(response, http.StatusBadRequest, err.Error())
 		return false
 	}
 	return true
 }
 func (a *API) executorResult(response http.ResponseWriter, result any, err error) {
-	if errors.Is(err, executor.ErrProcessNotFound) {
+	if errors.Is(err, executor.ErrProcessNotFound) || errors.Is(err, executor.ErrMCPConnectionNotFound) {
 		writeError(response, http.StatusNotFound, err.Error())
 		return
 	}
@@ -669,8 +706,11 @@ func authorized(request *http.Request, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) == 1
 }
 func decode(request *http.Request, value any) error {
+	return decodeLimit(request, value, executorBodyLimit)
+}
+func decodeLimit(request *http.Request, value any, limit int64) error {
 	defer request.Body.Close()
-	reader := http.MaxBytesReader(nil, request.Body, 2<<20)
+	reader := http.MaxBytesReader(nil, request.Body, limit)
 	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {

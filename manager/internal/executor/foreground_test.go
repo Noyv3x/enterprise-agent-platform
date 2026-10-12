@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -165,53 +164,6 @@ func TestForegroundRejectsRemovedExecutionModes(t *testing.T) {
 	}
 	if _, err := service.Processes.Run(context.Background(), Call{Identity: identity(), Target: "host"}, terminalArguments{Command: "true"}); err == nil {
 		t.Fatal("host command executed")
-	}
-}
-
-func TestPrivateMCPReturnsRawOutputWithoutRetention(t *testing.T) {
-	service, root := newTestService(t)
-	secret := "mcp-private-secret-canary"
-	args, _ := json.Marshal(terminalArguments{Command: "printf 'Bearer " + secret + "'; printf 'stderr-private' >&2"})
-	request := AuditRequest{Identity: identity(), AuditID: "mcp-private", Target: "sandbox", Operation: "terminal", Action: "run", Arguments: args, Details: map[string]any{"tool": "mcp", "action": "call", "arguments": map[string]any{"server": "local", "tool": "echo", "arguments": map[string]any{"token": secret}}}}
-	receipt, err := service.Audit(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	call := callForReceipt(request, receipt, "run", args)
-	response, err := service.Terminal(context.Background(), call)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := response["result"].(ProcessSnapshot)
-	if result.Stdout != "Bearer "+secret || result.Stderr != "stderr-private" {
-		t.Fatalf("MCP output was redacted before delivery: %+v", result)
-	}
-	if strings.Contains(result.Command, secret) || !strings.Contains(result.Command, "MCP call") {
-		t.Fatalf("unsafe MCP command projection: %q", result.Command)
-	}
-	if _, err := service.Terminal(context.Background(), call); err == nil {
-		t.Fatal("MCP receipt was replayed")
-	}
-	err = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if strings.Contains(string(data), secret) || strings.Contains(string(data), "stderr-private") {
-			return fmt.Errorf("MCP output retained at %s", path)
-		}
-		for _, suffix := range []string{".pid", ".out", ".err", ".exit"} {
-			if strings.HasSuffix(path, suffix) {
-				return fmt.Errorf("command artifact created: %s", path)
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 

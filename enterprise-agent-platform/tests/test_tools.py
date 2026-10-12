@@ -15,6 +15,7 @@ import httpx
 from starlette.exceptions import HTTPException
 
 from enterprise_agent_platform.db import Database
+from enterprise_agent_platform.mcp import McpService
 from enterprise_agent_platform.files import Files, contained, office_preview, open_workspace, bounded_read
 from enterprise_agent_platform.schedules import dispatch, next_time, tick
 from enterprise_agent_platform.tools import Browser, browser_url, fetch
@@ -38,6 +39,7 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         self.p = SimpleNamespace(db=self.db, settings=SimpleNamespace(data_dir=self.root, camofox_url='http://browser', camofox_access_key='secret', builtin_skills_dir=self.root / 'builtin'))
         self.p.skills = Skills(self.p)
         self.p.gate = Gate(self.p)
+        self.p.mcp = McpService(self.p)
         self.queue = self.p.queue = Queue(self.p)
         self.p.tasks = Tasks(self.p)
         self.queue.stopping = True  # Exercise durable admission without launching a Runtime worker.

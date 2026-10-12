@@ -45,7 +45,7 @@ Running personal-AI subagents are agent work: they count in `active_agent_tasks`
 
 ## 提交回滚与能力降级
 
-Core readiness covers Manager, Platform, Runtime and public ingress. Camofox and SearXNG may be degraded independently; MCP is workspace configuration, not a managed release service.
+Core readiness covers Manager, Platform, Runtime and public ingress. Camofox and SearXNG may be degraded independently; MCP connectors are tenant configuration, not a managed release service: a Platform restart or update drops every MCP connection, pending elicitation and pending OAuth flow (users connect again); connections reconnect lazily on the next use and a `tools/call` is never replayed.
 
 Before commit, a failed candidate is stopped and the validated snapshot/previous generation restored by the same operation. After commit, preserve new business writes and settle forward; do not automatically overwrite them with old data. A failed response does not prove an operation had no effect. Manager control and maintenance remain available for diagnosis.
 

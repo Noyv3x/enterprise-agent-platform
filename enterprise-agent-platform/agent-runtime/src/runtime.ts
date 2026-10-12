@@ -9,6 +9,7 @@ import { createModelRuntime } from './credentials.js';
 import { sessionPath } from './session-path.js';
 import { compactSession, compactStored, type CompactionOutcome } from './compact.js';
 import { createTools } from './tools.js';
+import { systemPrompt, type McpPayload } from './mcp.js';
 import { createExecutorTransport, createGatewayTransport } from './transport.js';
 import { bindModelSession, resolveModel } from './models.js';
 import { RunEvents } from './events.js';
@@ -23,6 +24,8 @@ export interface RunRequest {
   context_prefix?:string;
   resources: {system_prompt:string; agents_md?:{path:string;content:string}|null; skills:{name:string;description:string;location:string}[]};
   tools:string[];
+  /** Validated at the HTTP boundary; Platform decides which connectors and tools the scope sees. */
+  mcp?:McpPayload;
 }
 export interface SteerRequest {
   input_id:string;
@@ -49,14 +52,15 @@ const OUTPUT_INTERVAL_MS=125;
 const OUTPUT_LIMIT_BYTES=512*1024;
 const MAX_PENDING_INPUTS=32;
 export function failure(status:number,message:string): Error & {status:number} { return Object.assign(new Error(message),{status}); }
-const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true,artifact:true};
-const subagentTools=['read','bash','edit','write','grep','find','ls','web_search','web_fetch'];
+const chatTools:Record<string,true> = {read:true,bash:true,edit:true,write:true,grep:true,find:true,ls:true,web_search:true,web_fetch:true,artifact:true,mcp:true};
+const subagentTools=['read','bash','edit','write','grep','find','ls','web_search','web_fetch','mcp'];
 // A subagent only exists as a delegate scope of one personal user, on that user's own child session ID.
 function validateSubagent(sid:string,request:RunRequest):void {
   const match=/^private:(\d+)\/delegate\/bg-(\d+)$/.exec(request.sandbox.scope_key);
   if(!match||sid!==`agent-private-${match[1]}-bg-${match[2]}`)throw failure(400,'Subagent runs need a private delegate scope and matching session ID');
   if(request.sandbox.profile!=='agent')throw failure(400,'Subagent runs need the agent profile');
-  if(!request.tools.every(name=>subagentTools.includes(name)))throw failure(400,'Invalid subagent tools');
+  const mcpNames=request.mcp?.tools.map(tool=>tool.name)??[];
+  if(!request.tools.every(name=>subagentTools.includes(name)||mcpNames.includes(name)))throw failure(400,'Invalid subagent tools');
 }
 
 function loader(request:RunRequest):ResourceLoader {
@@ -67,7 +71,7 @@ function loader(request:RunRequest):ResourceLoader {
     getSkills:()=>({skills:resources.skills.map(s=>({name:s.name,description:s.description,filePath:s.location,baseDir:dirname(s.location),sourceInfo:{path:s.location,source:'platform',scope:'project' as const,origin:'top-level' as const},disableModelInvocation:false})),diagnostics:[]}),
     getPrompts:()=>({prompts:[],diagnostics:[]}), getThemes:()=>({themes:[],diagnostics:[]}),
     getAgentsFiles:()=>({agentsFiles:request.kind!=='agent'||!resources.agents_md?[]:[resources.agents_md]}),
-    getSystemPrompt:()=>resources.system_prompt, getSystemPromptSource:()=>undefined,
+    getSystemPrompt:()=>systemPrompt(resources.system_prompt,request.mcp), getSystemPromptSource:()=>undefined,
     getAppendSystemPrompt:()=>[], getAppendSystemPromptSources:()=>[], extendResources(){}, async reload(){},
   };
 }
@@ -96,7 +100,7 @@ export class Runtime {
     for(const [id,run] of this.runs) if(run.done&&now-run.endedAt>10*60_000){run.events.dispose();this.runs.delete(id);}
   }
   private async open(sid:string,request:RunRequest,signal:AbortSignal):Promise<Live> {
-    const key=JSON.stringify([request.kind,request.sandbox,request.resources,request.tools]);
+    const key=JSON.stringify([request.kind,request.sandbox,request.resources,request.tools,request.mcp??null]);
     const existing=this.sessions.get(sid);
     if(existing?.key===key)return existing;
     // Changed inputs (e.g. an edited AGENTS.md): a new Pi object on the same transcript lets Pi append the difference.
@@ -105,7 +109,9 @@ export class Runtime {
     fixed.tools=fixed.tools.filter(name=>fixed.kind!=='chat'||chatTools[name]===true);
     // Background tools and the extended bash belong to the root personal agent only; subagents never get them.
     const personal=fixed.kind==='agent'&&/^private:\d+$/.test(fixed.sandbox.scope_key);
-    if(!personal)fixed.tools=fixed.tools.filter(name=>!['browser','schedule','mcp','task','job','wait'].includes(name));
+    if(!personal)fixed.tools=fixed.tools.filter(name=>!['browser','schedule','task','job','wait'].includes(name));
+    // MCP proxy tools are exactly the validated payload entries (Platform already chose them for the scope); the name allowlist follows them.
+    fixed.tools=[...fixed.tools.filter(name=>!name.startsWith('mcp__')),...(fixed.mcp?.tools.map(tool=>tool.name)??[])];
     // Skill management is for root runs in a personal or channel scope; never chat or subagents.
     const skillScope=fixed.kind==='agent'&&(personal||/^channel:\d+:/.test(fixed.sandbox.scope_key));
     if(!skillScope)fixed.tools=fixed.tools.filter(name=>name!=='skill');
@@ -124,7 +130,7 @@ export class Runtime {
     bindModelSession(models,sid,guard);
     const watchers=new Set<()=>void>();
     const inputs=(listener:()=>void)=>{watchers.add(listener);const run=this.runs.get(live.runId);if(run&&run.pendingInputs.size>0)listener();return ()=>{watchers.delete(listener);};};
-    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,artifacts:artifactScope,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
+    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,artifacts:artifactScope,inputs,...(fixed.mcp?{mcp:fixed.mcp}:{}),...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     session.agent.steeringMode='all';
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now(),watchers});
@@ -254,7 +260,7 @@ export class Runtime {
     }else if(event.type==='tool_execution_start'){
       const args:unknown=event.args;
       const action=args&&typeof args==='object'&&'action' in args&&typeof args.action==='string'?args.action:undefined;
-      if(['bash','write','edit','mcp','task'].includes(event.toolName)||event.toolName==='job'&&['input','stop'].includes(action??'')||event.toolName==='browser'&&!['list','snapshot','screenshot','vision','links','images','downloads','stats','extract','console'].includes(action??'')||event.toolName==='schedule'&&!['list','get','history'].includes(action??''))run.sideEffects=true;
+      if(['bash','write','edit','mcp','task'].includes(event.toolName)||event.toolName.startsWith('mcp__')||event.toolName==='job'&&['input','stop'].includes(action??'')||event.toolName==='browser'&&!['list','snapshot','screenshot','vision','links','images','downloads','stats','extract','console'].includes(action??'')||event.toolName==='schedule'&&!['list','get','history'].includes(action??''))run.sideEffects=true;
       this.closeInputs(run);
       this.emit(run,{type:'tool_start',tool_call_id:event.toolCallId,name:event.toolName,args:event.args});
     }else if(event.type==='tool_execution_update')this.emit(run,{type:'tool_update',tool_call_id:event.toolCallId,partial:event.partialResult});

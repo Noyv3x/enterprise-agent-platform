@@ -53,7 +53,10 @@ type Config struct {
 	// Background process pools are separate from the 16 foreground slots.
 	BackgroundProcessLimit       int
 	BackgroundProcessGlobalLimit int
-	activeProfile                identity.ActiveProfile
+	// MCP stdio connections have their own pools; they hold no sandbox resident.
+	MCPConnectionLimit       int
+	MCPConnectionGlobalLimit int
+	activeProfile            identity.ActiveProfile
 }
 
 func Defaults(active identity.ActiveProfile) (Config, error) {
@@ -108,6 +111,8 @@ func Defaults(active identity.ActiveProfile) (Config, error) {
 		CommandMaxBytes:              1 << 20,
 		BackgroundProcessLimit:       16,
 		BackgroundProcessGlobalLimit: 128,
+		MCPConnectionLimit:           8,
+		MCPConnectionGlobalLimit:     64,
 		activeProfile:                active,
 	}, nil
 }
@@ -314,6 +319,18 @@ func set(c *Config, key, value string) error {
 			return fmt.Errorf("background_process_global_limit must be between 1 and 4096")
 		}
 		c.BackgroundProcessGlobalLimit = n
+	case "mcp_connection_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 256 {
+			return fmt.Errorf("mcp_connection_limit must be between 1 and 256")
+		}
+		c.MCPConnectionLimit = n
+	case "mcp_connection_global_limit":
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 1024 {
+			return fmt.Errorf("mcp_connection_global_limit must be between 1 and 1024")
+		}
+		c.MCPConnectionGlobalLimit = n
 	default:
 		return fmt.Errorf("unknown setting %q", key)
 	}
@@ -335,7 +352,7 @@ func (c Config) Validate() error {
 	if c.ReleaseChannel == "" || c.ComposeProject == "" || c.DockerBinary == "" {
 		return fmt.Errorf("release_channel, compose_project and docker_binary are required")
 	}
-	if c.SandboxIdle <= 0 || c.LogMaxBytes <= 0 || c.CommandMaxBytes <= 0 || c.BackgroundProcessLimit <= 0 || c.BackgroundProcessGlobalLimit <= 0 || c.UpdateInterval < 30*time.Second {
+	if c.SandboxIdle <= 0 || c.LogMaxBytes <= 0 || c.CommandMaxBytes <= 0 || c.BackgroundProcessLimit <= 0 || c.BackgroundProcessGlobalLimit <= 0 || c.MCPConnectionLimit <= 0 || c.MCPConnectionGlobalLimit <= 0 || c.UpdateInterval < 30*time.Second {
 		return fmt.Errorf("duration and size limits must be positive")
 	}
 	mainAddress, err := validateListenAddress("listen", c.GatewayAddress, false)

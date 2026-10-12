@@ -1,9 +1,9 @@
-import { memo, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
+import { memo, useContext, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
 import { parseUnifiedDiff, type DiffRow } from "../../components/ui/beautiful/primitives/CodeBlock";
 import { useWords } from "../../words";
 import { commandLine, fileName, headLines, host, stepKind, str, tailLines } from "./computerView";
 import type { ToolCall } from "./types";
-import { toolVerb, type Words } from "./work";
+import { McpLabelsContext, toolVerb, type McpLabels, type Words } from "./work";
 
 /* What the computer window shows for one step, by kind: a terminal transcript, a file, search results, a fetched
  * page, a page card for an older browser step, or any other tool's arguments and result. Every view is a scrolling
@@ -254,11 +254,12 @@ function clipValue(value: unknown): string {
 /** An argument summary (a few keys, short values) and the result text. */
 function DetailView({ call, limits, note }: { call: ToolCall; limits: Limits; note?: string }) {
   const w = useWords();
+  const labels = useContext(McpLabelsContext);
   const entries = useMemo(() => Object.entries(call.args).filter(([key]) => key !== "_preview").slice(0, 8), [call.args]);
   const tail = useMemo(() => tailLines(call.output, limits.lastLines), [call.output, limits.lastLines]);
   const failed = call.status === "error";
   return (
-    <FollowEnd label={toolVerb(call.name, w)} signal={call} follow={running(call)}>
+    <FollowEnd label={toolVerb(call.name, w, call.args, labels)} signal={call} follow={running(call)}>
       <div className="flex flex-col gap-3 px-4 py-3">
         <Clipped call={call} />
         {entries.length > 0 && (
@@ -285,7 +286,7 @@ function DetailView({ call, limits, note }: { call: ToolCall; limits: Limits; no
 }
 
 /** The window chrome for a step: its title tab and, for URLs and queries, the address row. */
-export function stepChrome(call: ToolCall, w: Words): { tab: string; address: string | null } {
+export function stepChrome(call: ToolCall, w: Words, labels: McpLabels = {}): { tab: string; address: string | null } {
   const url = str(call.args.url);
   switch (stepKind(call.name)) {
     case "shell":
@@ -299,7 +300,7 @@ export function stepChrome(call: ToolCall, w: Words): { tab: string; address: st
     case "browser":
       return { tab: url ? host(url) : w("Browser", "浏览器", "瀏覽器"), address: url || null };
     default:
-      return { tab: toolVerb(call.name, w), address: null };
+      return { tab: toolVerb(call.name, w, call.args, labels), address: null };
   }
 }
 

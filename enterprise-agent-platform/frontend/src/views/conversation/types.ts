@@ -127,3 +127,53 @@ export interface WorkspaceFile {
   is_dir: boolean;
   size_bytes: number;
 }
+
+/** The connector an MCP card is about (SSE `mcp_action_required`, `mcp_elicitation`). */
+export interface McpConnectorRef {
+  id: number;
+  name: string;
+  label: string;
+  scope?: "org" | "personal";
+}
+
+/** Where an action card's credentials would go and who added the connector. The label is free text anyone adding a
+ * connector chooses, so the card shows the destination itself: the URL origin of a remote connector, or the command
+ * of a local one. `pending_confirmation`: added by the AI or an import and not yet confirmed by the user, so no
+ * credential is asked for before 确认并启用. */
+export interface McpActionConnector extends McpConnectorRef {
+  transport: "http" | "sse" | "stdio";
+  destination: string;
+  source: "ai" | "import" | "manual";
+  state: "pending_confirmation" | "active";
+}
+
+/** SSE `mcp_action_required`: the user must confirm a connector the AI or an import added (`confirm`, when nothing
+ * else is needed yet), sign in to it (OAuth) or enter its secret values; the AI never asks for them in the chat.
+ * `keys` are the missing secret names. */
+export interface McpActionRequired {
+  connector: McpActionConnector;
+  kind: "confirm" | "oauth" | "secrets";
+  keys?: string[];
+}
+
+/** SSE `mcp_elicitation`: a connector asks the user who started the run for input, through a form built from
+ * `schema` or by visiting `url`. Platform cancels it at `expires_at`. */
+export interface McpElicitation {
+  id: string;
+  user_id: number;
+  connector: McpConnectorRef;
+  mode: "form" | "url";
+  message: string;
+  schema?: Record<string, unknown> | null;
+  url?: string | null;
+  expires_at: string;
+}
+
+/** How an elicitation ended: an answer (`accept`, `decline`, `cancel`), Platform's timeout, or `gone` when Platform
+ * no longer knows it (answered elsewhere or expired) by the time this browser answered. */
+export type ElicitationOutcome = "accept" | "decline" | "cancel" | "timeout" | "gone";
+
+export interface ElicitationState {
+  request: McpElicitation;
+  outcome: ElicitationOutcome | null;
+}

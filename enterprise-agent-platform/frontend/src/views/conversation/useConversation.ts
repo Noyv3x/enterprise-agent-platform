@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { request, type ArtifactRef, type ArtifactView } from "../../api";
+import { ApiError, request, type ArtifactRef, type ArtifactView } from "../../api";
 import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
 import { mergeTask, type TaskMap, type TaskView } from "./taskState";
-import type { Attachment, Compaction, LastRun, LiveRun, Message, MessagePage, SendMode, ToolCall } from "./types";
+import type { Attachment, Compaction, ElicitationOutcome, ElicitationState, LastRun, LiveRun, McpActionRequired, McpElicitation, Message, MessagePage, SendMode, ToolCall } from "./types";
 
 const PAGE = 100;
 /** The panel keeps at most this much live output per call; the Runtime already limits it to 512 KiB. */
@@ -12,6 +12,7 @@ const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
   "input_delivered", "message_removed", "retry", "compaction", "run_end", "task", "artifact",
+  "mcp_action_required", "mcp_elicitation", "mcp_elicitation_resolved",
 ] as const;
 
 /** High-rate stream fragments: they commit together once per animation frame. */
@@ -38,6 +39,11 @@ type StreamEvent = { seq: number } & (
   | { type: "task"; task: TaskView }
   /** an artifact version was published in the current run */
   | { type: "artifact"; artifact: ArtifactView; version: number }
+  /** a connector needs the user's sign-in or secret values (personal AI management) */
+  | ({ type: "mcp_action_required" } & McpActionRequired)
+  /** a connector asks the run's user for input */
+  | ({ type: "mcp_elicitation" } & McpElicitation)
+  | { type: "mcp_elicitation_resolved"; id: string; action: "accept" | "decline" | "cancel"; reason?: string }
 );
 
 /** One received SSE event with its arrival time and stream-update mark. */
@@ -76,6 +82,10 @@ interface State {
   published: Record<number, ArtifactView>;
   /** The most recent publish, so the panel can follow it; `seq` tells repeated versions apart. */
   lastPublished: { id: number; version: number; seq: number } | null;
+  /** MCP sign-in and secrets cards, one per connector and kind; they outlive the run until handled or dismissed */
+  mcpActions: McpActionRequired[];
+  /** the active run's elicitations in arrival order; a run's end removes them (Platform cancels any still open) */
+  elicitations: ElicitationState[];
 }
 
 type Action =
@@ -95,11 +105,18 @@ type Action =
   /** a withdrawal succeeded (also announced by SSE `message_removed`) */
   | { type: "removed"; messageId: number }
   /** a withdrawn bubble finished collapsing */
-  | { type: "purge"; messageId: number };
+  | { type: "purge"; messageId: number }
+  /** this browser's answer to an elicitation was accepted, or Platform no longer knows it */
+  | { type: "elicitationAnswered"; id: string; outcome: ElicitationOutcome }
+  /** the user closed a handled (or unwanted) MCP card */
+  | { type: "mcpActionDismissed"; connectorId: number; kind: McpActionRequired["kind"] }
+  /** the user confirmed a connector the AI or an import added; every card for it may now ask for credentials */
+  | { type: "mcpConnectorConfirmed"; connectorId: number };
 
 const initial: State = {
   phase: "loading", error: "", messages: [], nextBefore: null, live: null, compaction: null, compactionSeq: 0, after: null, lastRun: null, deliveredInput: null,
   tasks: {}, taskMarks: {}, tasksLoaded: false, tasksError: "", removed: {}, runKey: 0, replyKeys: {}, seenUpTo: 0, published: {}, lastPublished: null,
+  mcpActions: [], elicitations: [],
 };
 
 function upsert(state: State, incoming: Message[]): Message[] {
@@ -202,6 +219,21 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
     const { task } = event;
     return { ...state, tasks: { ...state.tasks, [task.id]: mergeTask(state.tasks[task.id], task, false) }, taskMarks: { ...state.taskMarks, [task.id]: mark } };
   }
+  // MCP cards are not run output: an action card outlives its run, and an elicitation sits beside the live reply.
+  if (event.type === "mcp_action_required") {
+    const action: McpActionRequired = { connector: event.connector, kind: event.kind, keys: event.keys };
+    const others = state.mcpActions.filter((item) => item.connector.id !== action.connector.id || item.kind !== action.kind);
+    return { ...state, mcpActions: [...others, action] };
+  }
+  if (event.type === "mcp_elicitation") {
+    if (state.elicitations.some((item) => item.request.id === event.id)) return state;
+    const { type: _type, seq: _seq, ...request } = event;
+    return { ...state, elicitations: [...state.elicitations, { request, outcome: null }] };
+  }
+  if (event.type === "mcp_elicitation_resolved") {
+    const outcome: ElicitationOutcome = event.reason === "timeout" ? "timeout" : event.action;
+    return { ...state, elicitations: state.elicitations.map((item) => (item.request.id === event.id && !item.outcome ? { ...item, outcome } : item)) };
+  }
   if (event.type === "run_end") {
     // Calls cut short by a stop or failure are not running any more.
     const calls = state.live?.calls.map((call) => (call.status === "preparing" || call.status === "running" ? { ...call, status: "cancelled" as const } : call));
@@ -210,7 +242,7 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
     // The persisted reply inherits the live reply's key, so the settled turn keeps its DOM and disclosure state.
     const replyKeys = event.message ? { ...state.replyKeys, [event.message.id]: `run-${state.runKey}` } : state.replyKeys;
     return {
-      ...state, live: null, lastRun, replyKeys, runKey: state.runKey + 1,
+      ...state, live: null, lastRun, replyKeys, runKey: state.runKey + 1, elicitations: [],
       messages: event.message ? upsert(state, [event.message]) : state.messages,
     };
   }
@@ -312,6 +344,8 @@ function reducer(state: State, action: Action): State {
         ...state, phase: "ready", error: "", messages: action.page.messages,
         nextBefore: action.page.next_before_id, after: action.page.last_seq, live: null, lastRun: null, deliveredInput: null,
         removed: {}, replyKeys: {}, seenUpTo: action.page.messages.reduce((top, message) => Math.max(top, message.id), 0),
+        // the stream from the new watermark replays the active run's open elicitations
+        elicitations: [],
         compaction: action.page.last_seq < state.compactionSeq ? state.compaction
           : action.page.compaction ? latestCompaction(state.compaction, action.page.compaction) : null,
       };
@@ -351,6 +385,15 @@ function reducer(state: State, action: Action): State {
       return {
         ...state, removed: { ...state.removed, [action.messageId]: "gone" },
         messages: state.messages.filter((message) => message.id !== action.messageId),
+      };
+    case "elicitationAnswered":
+      return { ...state, elicitations: state.elicitations.map((item) => (item.request.id === action.id && !item.outcome ? { ...item, outcome: action.outcome } : item)) };
+    case "mcpActionDismissed":
+      return { ...state, mcpActions: state.mcpActions.filter((item) => item.connector.id !== action.connectorId || item.kind !== action.kind) };
+    case "mcpConnectorConfirmed":
+      return {
+        ...state,
+        mcpActions: state.mcpActions.map((item) => (item.connector.id === action.connectorId ? { ...item, connector: { ...item.connector, state: "active" } } : item)),
       };
   }
 }
@@ -500,7 +543,28 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
     return result.task;
   }, []);
 
+  /** Answers an elicitation of this run. Platform no longer knowing it (answered in another tab, or expired) settles
+   * the card as `gone`; other failures (`elicitation_forbidden`, network) reject for the card to show. */
+  const answerElicitation = useCallback(async (id: string, action: "accept" | "decline" | "cancel", content?: Record<string, unknown>) => {
+    try {
+      await request<{ ok: true }>(`/api/mcp/elicitations/${encodeURIComponent(id)}`, { method: "POST", body: JSON.stringify(content ? { action, content } : { action }) });
+      dispatch({ type: "elicitationAnswered", id, outcome: action });
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 404) dispatch({ type: "elicitationAnswered", id, outcome: "gone" });
+      else throw reason;
+    }
+  }, []);
+  const dismissMcpAction = useCallback((connectorId: number, kind: McpActionRequired["kind"]) => dispatch({ type: "mcpActionDismissed", connectorId, kind }), []);
+  /** Confirms and enables a connector the AI or an import added (`POST …/confirm`); rejects for the card to show. */
+  const confirmMcpConnector = useCallback(async (connectorId: number) => {
+    await request<{ connector: unknown }>(`/api/mcp/connectors/${connectorId}/confirm`, { method: "POST", body: "{}" });
+    dispatch({ type: "mcpConnectorConfirmed", connectorId });
+  }, []);
+
   const compactBusy = state.compaction?.status === "queued" || state.compaction?.status === "compacting";
   const busy = compactBusy || state.live !== null || state.messages.some((message) => message.metadata?.status === "queued" || message.metadata?.status === "running");
-  return { ...state, busy, compactBusy, reload: load, loadOlder, send, withdraw, cancel, compact, reset, reloadTasks: loadTasks, stopTask, fetchTask };
+  return {
+    ...state, busy, compactBusy, reload: load, loadOlder, send, withdraw, cancel, compact, reset, reloadTasks: loadTasks, stopTask, fetchTask,
+    answerElicitation, dismissMcpAction, confirmMcpConnector,
+  };
 }

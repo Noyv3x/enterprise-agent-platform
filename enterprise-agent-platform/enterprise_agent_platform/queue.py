@@ -745,7 +745,10 @@ class Queue:
                     prompt = self.p.files.prompt(user, info, payload["attachment_ids"])
                     text = payload["content"] if notice is None else notice
                     prompt["text"] = (self.p.skills.invoke(user, info, text) if notice is None else text) + ("\n" + prompt["text"] if prompt["text"] else "")
-                    tools = BUILTINS + (["skill"] if info["kind"] == "agent" else []) + (["browser", "schedule", "mcp", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
+                    tools = BUILTINS + (["skill"] if info["kind"] == "agent" else []) + (["browser", "schedule", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
+                    mcp = await self.p.mcp.run_payload(user, info)
+                    if mcp is not None:
+                        tools.append("mcp")
                     payload.update(runtime_sid=info["sid"], runtime_unsettled=True)
                     with self.p.db.connect() as conn:
                         conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
@@ -753,7 +756,7 @@ class Queue:
                     result = await self.runtime("POST", f"/v1/sessions/{info['sid']}/runs", json={
                         "kind": info["kind"], "sandbox": info["sandbox"], "model": info["model"], "prompt": prompt,
                         "context_prefix": json.dumps({"time": now(), "user": user["display_name"], "tz": user["timezone"]}),
-                        "resources": self.resources(info, user), "tools": tools})
+                        "resources": self.resources(info, user), "tools": tools, **({"mcp": mcp} if mcp is not None else {})})
                     run_id = result["run_id"]
                     payload["runtime_run_id"] = run_id
                     with self.p.db.connect() as conn:

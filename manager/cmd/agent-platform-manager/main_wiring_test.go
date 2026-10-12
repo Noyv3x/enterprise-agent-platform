@@ -68,9 +68,12 @@ func TestExecutionWiringRetainsTargetFileProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := logstore.New(filepath.Join(root, "audit.jsonl"), 1<<20, 2)
-	service, err := newExecutionService(active, engine, sandboxes, filepath.Join(root, "control"), audit, 1<<20, executor.BackgroundConfig{Dir: filepath.Join(root, "processes"), OwnerLimit: 16, GlobalLimit: 128})
+	service, err := newExecutionService(active, engine, sandboxes, filepath.Join(root, "control"), audit, 1<<20, executor.BackgroundConfig{Dir: filepath.Join(root, "processes"), OwnerLimit: 16, GlobalLimit: 128}, executor.MCPConfig{Dir: filepath.Join(root, "mcp"), OwnerLimit: 8, GlobalLimit: 64})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if service.MCP == nil || sandboxes.OnStopped == nil {
+		t.Fatal("the MCP channel and the shared sandbox stop hook must be wired")
 	}
 	arguments, err := json.Marshal(map[string]any{"path": "/workspace/.agent-platform/attachments/note.txt"})
 	if err != nil {

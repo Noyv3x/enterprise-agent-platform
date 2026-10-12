@@ -787,8 +787,10 @@ class GatewayToolTests(SkillCase):
                 self.assertIn(path, text)
             self.assertIn('one plain sentence, in their language', text)
             self.assertIn("the user's own computer, a desktop app, an app restart", text)
-        self.assertIn('/workspace/.agent-platform/mcp.json', personal)
-        self.assertIn('"mcpServers"', personal)
+        self.assertIn('`mcp` tool', personal)
+        self.assertIn('`import`', personal)
+        self.assertIn('secure form', personal)
+        self.assertNotIn('"mcpServers"', personal)
         for foreign in ('claude mcp add', 'codex mcp add', '.mcp.json', '~/.claude.json', '~/.codex/config.toml', 'claude_desktop_config.json'):
             self.assertIn(foreign, personal)
         self.assertNotIn('mcp', channel.lower())

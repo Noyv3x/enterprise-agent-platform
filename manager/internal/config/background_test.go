@@ -40,3 +40,32 @@ func TestBackgroundProcessLimitsRejectInvalidValues(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPConnectionLimitsDefaultParseValidateAndSurviveRender(t *testing.T) {
+	base, err := Defaults(testActiveProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.MCPConnectionLimit != 8 || base.MCPConnectionGlobalLimit != 64 {
+		t.Fatalf("defaults: %d/%d", base.MCPConnectionLimit, base.MCPConnectionGlobalLimit)
+	}
+	configured, err := loadReader(base, strings.NewReader("mcp_connection_limit = 3\nmcp_connection_global_limit = 11\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := loadReader(base, strings.NewReader(render(configured)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.MCPConnectionLimit != 3 || reloaded.MCPConnectionGlobalLimit != 11 {
+		t.Fatalf("limits lost on persistence: %d/%d", reloaded.MCPConnectionLimit, reloaded.MCPConnectionGlobalLimit)
+	}
+	for _, setting := range []string{
+		"mcp_connection_limit = 0", "mcp_connection_limit = 300", `mcp_connection_limit = "x"`,
+		"mcp_connection_global_limit = 0", "mcp_connection_global_limit = 2000",
+	} {
+		if _, err := loadReader(base, strings.NewReader(setting)); err == nil {
+			t.Fatalf("accepted %s", setting)
+		}
+	}
+}

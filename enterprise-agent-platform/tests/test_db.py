@@ -94,7 +94,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
         self.assertEqual(settings, {'keep', 'model_policies_v1'})
-        self.assertEqual(db.schema_version(), 2026101401)
+        self.assertEqual(db.schema_version(), 2026101501)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -107,10 +107,10 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026101401)
+        self.assertEqual(self.db.schema_version(), 2026101501)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401])
+                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401, 2026101501])
 
     def test_background_tasks_migration_is_additive_idempotent_and_constrained(self):
         import sqlite3
@@ -122,7 +122,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101101')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026101401)
+        self.assertEqual(db.schema_version(), 2026101501)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0]
@@ -230,7 +230,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(slots, {'personal': ('admin-model', 'off'), 'channel': ('admin-model', 'off'), 'worker': ('admin-model', 'off'),
                                  'chat': ('admin-chat', 'off'), 'scout': ('admin-chat', 'off')})
         self.assertEqual(users, {1: 'default', 2: 'default', 3: 'default', 4: 'default'})
-        self.assertEqual(db.schema_version(), 2026101401)
+        self.assertEqual(db.schema_version(), 2026101501)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101201').fetchone()[0]
@@ -291,7 +291,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(after['agent-only'], ['private_agent', 'read_workspace', 'install_extensions'])
         self.assertEqual(after['viewer'], ['read_workspace'])
         self.assertEqual(after['done'], ['chat', 'install_extensions'])
-        self.assertEqual(db.schema_version(), 2026101401)
+        self.assertEqual(db.schema_version(), 2026101501)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101301').fetchone()[0]
@@ -317,7 +317,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101401')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026101401)
+        self.assertEqual(db.schema_version(), 2026101501)
         before = self.shape(db)
         with db.connect() as conn:
             self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)

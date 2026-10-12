@@ -21,7 +21,7 @@ RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian
       python3-pip python3-pypdf python3-reportlab python3-venv python3-xlsxwriter \
       ripgrep sudo tini unzip util-linux \
     && python3 -m pip install --break-system-packages --no-cache-dir --no-deps \
-      python-pptx==0.6.21 \
+      python-pptx==0.6.21 uv==0.13.0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupmod --new-name agent node \
     && usermod --login agent --home /home/agent --move-home node \
@@ -29,11 +29,10 @@ RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian
     && chmod 0440 /etc/sudoers.d/agent-platform \
     && install -d -o 1000 -g 1000 -m 0700 /workspace /opt/agent-env
 COPY containers/agent-sandbox-entrypoint.sh /usr/local/bin/agent-sandbox-entrypoint
-COPY containers/agent-sandbox-mcp-client.mjs /usr/local/bin/agent-platform-mcp
 COPY containers/agent-sandbox-skills.py /usr/local/bin/agent-platform-skills
 COPY enterprise-agent-platform/skills /opt/agent-platform/skills/builtin
 # Built-in skills are root-owned and world-readable; scripts run in place.
-RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint /usr/local/bin/agent-platform-mcp /usr/local/bin/agent-platform-skills \
+RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint /usr/local/bin/agent-platform-skills \
     && chmod -R go-w,a+rX /opt/agent-platform/skills/builtin
 LABEL org.opencontainers.image.title="Agent Platform Sandbox" \
       org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \

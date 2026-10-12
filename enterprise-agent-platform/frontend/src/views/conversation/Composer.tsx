@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { request, type SkillList, type SkillView } from "../../api";
+import { request, type McpPrompt, type SkillList, type SkillView } from "../../api";
 import PromptBar, { clipboardFiles, type PromptCommand, type PromptSendOption } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
+import { loadMcpCatalog } from "./mcpCatalog";
+import { McpPromptDialog, promptFailure, renderMcpPrompt } from "./McpPromptDialog";
 import { uploadPath } from "./routes";
 import type { Attachment, SendMode } from "./types";
 import { errorText } from "./useConversation";
+
+const PROMPT_KEY = "mcp-prompt:";
 
 interface Upload {
   key: number;
@@ -41,16 +45,17 @@ export interface ComposerProps {
   inserting?: boolean;
   pendingInputs?: number;
   commands?: ComposerCommand[];
-  /** the skill catalog (`GET /api/skills?scope=…`) the `/` menu lists next to `commands`: `private`, `chat` or
-   * `channel-<id>`; picking a skill puts `/<name> ` at the start of the message */
-  skillScope?: string;
+  /** the scope of the `/` menu's catalogs: `private`, `chat` or `channel-<id>`. It lists the scope's skills (`GET
+   * /api/skills`; picking one puts `/<name> ` at the start of the message) and its MCP prompts (`GET
+   * /api/mcp/prompts`, as `/<connector>:<prompt>`; picking one asks for its arguments and inserts the rendered text) */
+  catalogScope?: string;
   placeholder: string;
   /** applied whenever `seed.n` changes */
   seed?: ComposerSeed | null;
 }
 
 export function Composer({
-  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], skillScope, placeholder, seed,
+  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], catalogScope, placeholder, seed,
 }: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
@@ -59,24 +64,54 @@ export function Composer({
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState("");
   const [skills, setSkills] = useState<SkillView[]>([]);
+  const [prompts, setPrompts] = useState<McpPrompt[]>([]);
+  /** the prompt whose argument form is open */
+  const [picked, setPicked] = useState<McpPrompt | null>(null);
+  const [rendering, setRendering] = useState(false);
   const nextKey = useRef(0);
   const input = useRef<HTMLTextAreaElement>(null);
 
-  // Without the catalog the menu still offers the commands; Platform reads `/name` whether or not it was picked here.
+  // Without the catalogs the menu still offers the commands; Platform reads `/name` whether or not it was picked here.
   useEffect(() => {
     setSkills([]);
-    if (!skillScope) return;
+    setPrompts([]);
+    if (!catalogScope) return;
     let current = true;
-    request<SkillList>(`/api/skills?scope=${encodeURIComponent(skillScope)}`)
+    request<SkillList>(`/api/skills?scope=${encodeURIComponent(catalogScope)}`)
       .then((list) => { if (current) setSkills(list.skills.filter((skill) => skill.enabled)); })
       .catch(() => {});
+    loadMcpCatalog(catalogScope)
+      .then((catalog) => { if (current) setPrompts(catalog.prompts); })
+      .catch(() => {});
     return () => { current = false; };
-  }, [skillScope]);
+  }, [catalogScope]);
   const skillTag = w("Skill", "技能", "技能");
   const menu: PromptCommand[] = [
     ...commands,
     ...skills.map((skill) => ({ key: `skill:${skill.key}`, name: `/${skill.name}`, desc: skill.description, insert: `/${skill.name} `, leading: true, tag: skillTag })),
+    ...prompts.map((prompt, index) => ({
+      key: `${PROMPT_KEY}${index}`, name: `/${prompt.connector}:${prompt.name}`, desc: prompt.description || prompt.title || "", tag: prompt.connector_label,
+    })),
   ];
+
+  /** The rendered prompt joins the draft below what is already written; the person reviews it before sending. */
+  const insertPrompt = (rendered: string) => {
+    setPicked(null);
+    setText((current) => (current.trim() ? `${current.trimEnd()}\n\n${rendered}` : rendered));
+    input.current?.focus();
+  };
+  const pickPrompt = (prompt: McpPrompt) => {
+    if (prompt.arguments.length) {
+      setPicked(prompt);
+      return;
+    }
+    if (!catalogScope) return;
+    setRendering(true);
+    setError("");
+    renderMcpPrompt(catalogScope, prompt, {})
+      .then(insertPrompt, (reason: unknown) => setError(promptFailure(reason, prompt, w)))
+      .finally(() => setRendering(false));
+  };
 
   useEffect(() => {
     if (!seed) return;
@@ -177,47 +212,60 @@ export function Composer({
     </>
   ) : null;
   const status = error ? <span className="text-red" role="alert">{error}</span>
-    : count && modes ? <span className="flex flex-wrap gap-x-3">{count}<span>{modes}</span></span>
-      : count ?? modes;
+    : rendering ? <span role="status">{w("Loading the prompt…", "正在获取提示词…", "正在取得提示詞…")}</span>
+      : count && modes ? <span className="flex flex-wrap gap-x-3">{count}<span>{modes}</span></span>
+        : count ?? modes;
+  // The menu's name for what it lists, e.g. 命令、技能和提示词.
+  const catalog = skills.length && prompts.length ? w("commands, skills and prompts", "命令、技能和提示词", "命令、技能和提示詞")
+    : skills.length ? w("commands and skills", "命令和技能", "命令和技能")
+      : prompts.length ? w("commands and prompts", "命令和提示词", "命令和提示詞") : w("commands", "命令", "命令");
 
   return (
-    <PromptBar
-      tall
-      placeholder={inserting ? w("Add a message to this run…", "补充消息，加入当前任务…", "補充訊息，加入目前任務…") : placeholder}
-      draft={text}
-      onDraftChange={setText}
-      inputRef={input}
-      attachments={uploads.map((item) => ({
-        key: item.key,
-        name: item.name,
-        state: item.error ? "error" : item.attachment ? "ready" : "uploading",
-        detail: item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…")),
-      }))}
-      onAttach={upload}
-      onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
-      commands={menu}
-      onCommand={(key) => commands.find((command) => command.key === key)?.run()}
-      canSend={canSend}
-      onSend={(option) => void submit(option === "after_turn" ? "after_turn" : undefined)}
-      sendOptions={sendOptions}
-      working={working}
-      onStop={onStop ? () => void stop() : undefined}
-      stopping={stopping}
-      status={status}
-      labels={{
-        prompt: w("Message", "消息", "訊息"),
-        attach: w("Attach files", "添加附件", "新增附件"),
-        remove: (name) => `${w("Remove", "移除", "移除")} ${name}`,
-        chooseModel: w("Model", "模型", "模型"),
-        send: w("Send", "发送", "傳送"),
-        stop: w("Stop", "停止", "停止"),
-        commandsHint: skills.length ? w("Commands and skills", "命令和技能", "命令和技能") : w("Commands", "命令", "命令"),
-        noMatches: (query) => skills.length
-          ? w(`No commands or skills match “${query}”`, `没有匹配“${query}”的命令或技能`, `沒有符合「${query}」的命令或技能`)
-          : w(`No commands match “${query}”`, `没有匹配“${query}”的命令`, `沒有符合「${query}」的命令`),
-        dropFiles: w("Drop files to attach", "松开以添加附件", "放開以新增附件"),
-        sendOptions: w("Send options", "发送方式", "傳送方式"),
-      }}
-    />
+    <>
+      <PromptBar
+        tall
+        placeholder={inserting ? w("Add a message to this run…", "补充消息，加入当前任务…", "補充訊息，加入目前任務…") : placeholder}
+        draft={text}
+        onDraftChange={setText}
+        inputRef={input}
+        attachments={uploads.map((item) => ({
+          key: item.key,
+          name: item.name,
+          state: item.error ? "error" : item.attachment ? "ready" : "uploading",
+          detail: item.error || (item.attachment ? formatBytes(item.attachment.size_bytes) : w("Uploading…", "上传中…", "上傳中…")),
+        }))}
+        onAttach={upload}
+        onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
+        commands={menu}
+        onCommand={(key) => {
+          if (key.startsWith(PROMPT_KEY)) {
+            const prompt = prompts[Number(key.slice(PROMPT_KEY.length))];
+            if (prompt) pickPrompt(prompt);
+          } else commands.find((command) => command.key === key)?.run();
+        }}
+        canSend={canSend}
+        onSend={(option) => void submit(option === "after_turn" ? "after_turn" : undefined)}
+        sendOptions={sendOptions}
+        working={working}
+        onStop={onStop ? () => void stop() : undefined}
+        stopping={stopping}
+        status={status}
+        labels={{
+          prompt: w("Message", "消息", "訊息"),
+          attach: w("Attach files", "添加附件", "新增附件"),
+          remove: (name) => `${w("Remove", "移除", "移除")} ${name}`,
+          chooseModel: w("Model", "模型", "模型"),
+          send: w("Send", "发送", "傳送"),
+          stop: w("Stop", "停止", "停止"),
+          commandsHint: catalog.charAt(0).toUpperCase() + catalog.slice(1),
+          noMatches: (query) => w(`Nothing matches “${query}”`, `没有匹配“${query}”的${catalog}`, `沒有符合「${query}」的${catalog}`),
+          dropFiles: w("Drop files to attach", "松开以添加附件", "放開以新增附件"),
+          sendOptions: w("Send options", "发送方式", "傳送方式"),
+        }}
+      />
+      {picked && catalogScope && (
+        <McpPromptDialog prompt={picked} scope={catalogScope} onInsert={insertPrompt} onClose={() => { setPicked(null); input.current?.focus(); }} />
+      )}
+    </>
   );
 }

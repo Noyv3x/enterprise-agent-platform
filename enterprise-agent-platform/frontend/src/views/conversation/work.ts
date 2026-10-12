@@ -1,3 +1,4 @@
+import { createContext } from "react";
 import type { Message } from "./types";
 
 /** One entry of an assistant turn's work, in arrival order (platform-api.md § Assistant message work trace). */
@@ -32,9 +33,56 @@ export interface WorkTrace {
 
 export type Words = (en: string, zhCN?: string, zhTW?: string) => string;
 
+/** Connector labels by connector name (`GET /api/mcp/prompts` `connectors`), for MCP rows; a connector without one
+ * reads as its name. */
+export type McpLabels = Record<string, string>;
+export const McpLabelsContext = createContext<McpLabels>({});
+
+/** `mcp__<connector>__<tool>`: connector names never contain `_`, so the first `__` after the prefix splits them. */
+export function mcpToolName(name: string): { connector: string; tool: string } | null {
+  if (!name.startsWith("mcp__")) return null;
+  const rest = name.slice(5);
+  const at = rest.indexOf("__");
+  return at > 0 && at + 2 < rest.length ? { connector: rest.slice(0, at), tool: rest.slice(at + 2) } : null;
+}
+
+/** The `mcp` tool's action. Traces of the removed per-call helper carried `{server, tool}` without one: a call. */
+function mcpAction(args: Record<string, unknown> | undefined): string {
+  return typeof args?.action === "string" ? args.action : args?.tool ? "call" : "list";
+}
+
+/** What an `mcp` tool call is about: 「<label> · <tool>」 for a call or a schema, the resource URI, the connector's
+ * label, or the imported file. */
+export function mcpSubject(args: Record<string, unknown>, labels: McpLabels): string {
+  const text = (key: string) => (typeof args[key] === "string" ? args[key] as string : "");
+  const proxied = mcpToolName(text("name"));
+  const connector = proxied?.connector || text("connector") || text("server") || (mcpAction(args) === "call" ? "" : text("name"));
+  const label = connector ? labels[connector] || connector : "";
+  const tool = proxied?.tool || text("tool");
+  switch (mcpAction(args)) {
+    case "call":
+    case "describe":
+      return [label, tool].filter(Boolean).join(" · ") || text("name");
+    case "read_resource":
+      return text("uri") || label;
+    case "import":
+      return text("path");
+    case "add":
+      return text("label") || label;
+    default:
+      return label;
+  }
+}
+
 /** The verb a tool call reads as; the conversation's work trace and the computer panel share it. `args` refines
- * the `job`, `skill` and `artifact` verbs by their action. */
-export function toolVerb(name: string, w: Words, args?: Record<string, unknown>): string {
+ * the `job`, `skill`, `artifact` and `mcp` verbs by their action. A connector's tool (`mcp__<connector>__<tool>`)
+ * reads as a whole phrase, 「调用 <label> · <tool>」, with `labels` naming the connector. */
+export function toolVerb(name: string, w: Words, args?: Record<string, unknown>, labels: McpLabels = {}): string {
+  const proxied = mcpToolName(name);
+  if (proxied) {
+    const subject = `${labels[proxied.connector] || proxied.connector} · ${proxied.tool}`;
+    return w(`Call ${subject}`, `调用 ${subject}`, `呼叫 ${subject}`);
+  }
   switch (name) {
     case "bash":
       return w("Run", "运行", "執行");
@@ -74,6 +122,28 @@ export function toolVerb(name: string, w: Words, args?: Record<string, unknown>)
       }
     case "artifact":
       return args?.action === "list" ? w("List artifacts", "查看作品", "檢視作品") : w("Publish artifact", "发布作品", "發佈作品");
+    case "mcp":
+      switch (mcpAction(args)) {
+        case "call":
+          return w("Call", "调用", "呼叫");
+        case "list_resources":
+        case "read_resource":
+          return w("Read resource", "读取资源", "讀取資源");
+        case "add":
+          return w("Add connector", "添加连接器", "新增連接器");
+        case "import":
+          return w("Import config", "导入配置", "匯入設定");
+        case "remove":
+          return w("Remove connector", "删除连接器", "刪除連接器");
+        case "connect":
+          return w("Request sign-in", "请求连接", "請求連接");
+        case "enable":
+          return w("Enable connector", "启用连接器", "啟用連接器");
+        case "disable":
+          return w("Disable connector", "停用连接器", "停用連接器");
+        default:
+          return w("View connectors", "查看连接器", "檢視連接器");
+      }
     case "job":
       switch (args?.action) {
         case "list":

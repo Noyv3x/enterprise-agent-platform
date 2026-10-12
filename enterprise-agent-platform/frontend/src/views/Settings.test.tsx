@@ -106,7 +106,7 @@ describe('Settings', () => {
   it('opens the Skills tab from its address and shows it only for accounts with a skill catalog', async () => {
     api.request.mockResolvedValue({ skills: [], can_install: false });
     window.location.hash = '#settings/skills';
-    const { unmount } = render(<I18nProvider><ThemeProvider><Settings user={alice} onSaved={vi.fn()} skillScope="chat" /></ThemeProvider></I18nProvider>);
+    const { unmount } = render(<I18nProvider><ThemeProvider><Settings user={alice} onSaved={vi.fn()} scope="chat" /></ThemeProvider></I18nProvider>);
     expect(screen.getByRole('tab', { name: 'Skills' })).toHaveAttribute('aria-selected', 'true');
     expect(await screen.findByRole('region', { name: 'Built-in' })).toBeVisible();
     expect(api.request).toHaveBeenCalledWith('/api/skills?scope=chat');

@@ -58,7 +58,11 @@ func newStreamAPI(t *testing.T) *API {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &executor.Service{Audits: audits, Processes: processes, Background: background, Files: files}
+	channels, err := executor.NewMCPManager(profile, engine, sandboxes, executor.MCPConfig{Dir: filepath.Join(root, "manager", "mcp"), OwnerLimit: 2, GlobalLimit: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := &executor.Service{Audits: audits, Processes: processes, Background: background, MCP: channels, Files: files}
 	return &API{Executor: service, ExecutorToken: streamExecutorToken}
 }
 

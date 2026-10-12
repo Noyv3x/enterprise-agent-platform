@@ -41,7 +41,6 @@ type boundedBuffer struct {
 	value     bytes.Buffer
 	limit     int64
 	truncated bool
-	private   bool
 	redactor  outputRedactor
 	stream    string
 	live      *liveOutput
@@ -50,11 +49,7 @@ type boundedBuffer struct {
 func (b *boundedBuffer) Write(p []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.private {
-		b.writeSanitizedLocked(p)
-	} else {
-		b.redactor.Write(p, b.writeSanitizedLocked)
-	}
+	b.redactor.Write(p, b.writeSanitizedLocked)
 	return len(p), nil
 }
 func (b *boundedBuffer) writeSanitizedLocked(p []byte) {
@@ -64,7 +59,7 @@ func (b *boundedBuffer) writeSanitizedLocked(p []byte) {
 		b.truncated = true
 	}
 	_, _ = b.value.Write(p)
-	if b.live != nil && !b.private {
+	if b.live != nil {
 		b.live.append(b.stream, p)
 	}
 }
@@ -72,10 +67,7 @@ func (b *boundedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	result := b.value.String()
-	pending := ""
-	if !b.private {
-		pending = b.redactor.Preview()
-	}
+	pending := b.redactor.Preview()
 	remaining := max(0, b.limit-int64(len(result)))
 	truncated := b.truncated || int64(len(pending)) > remaining
 	if int64(len(pending)) > remaining {
@@ -90,9 +82,7 @@ func (b *boundedBuffer) String() string {
 func (b *boundedBuffer) Flush() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.private {
-		b.redactor.Flush(b.writeSanitizedLocked)
-	}
+	b.redactor.Flush(b.writeSanitizedLocked)
 }
 
 func NewProcessManager(active technicalidentity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, maxOutput int64) (*ProcessManager, error) {
@@ -296,11 +286,8 @@ func (m *ProcessManager) Run(requestContext context.Context, call Call, args ter
 	defer stdin.Close()
 	reader, writer := io.Pipe()
 	command.Stdout = writer
-	stdout := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput, stream: "stdout"}
-	stderr := &boundedBuffer{limit: m.MaxOutput, private: args.PrivateOutput, stream: "stderr"}
-	if !args.PrivateOutput {
-		stdout.live, stderr.live = args.live, args.live
-	}
+	stdout := &boundedBuffer{limit: m.MaxOutput, stream: "stdout", live: args.live}
+	stderr := &boundedBuffer{limit: m.MaxOutput, stream: "stderr", live: args.live}
 	command.Stderr = stderr
 	if err := command.Start(); err != nil {
 		reader.Close()

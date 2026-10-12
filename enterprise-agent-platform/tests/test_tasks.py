@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import re
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ import httpx
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 
+from enterprise_agent_platform.mcp import McpService
 from enterprise_agent_platform import tasks as tasks_module
 from enterprise_agent_platform.auth import issue_session
 from enterprise_agent_platform.db import Database
@@ -244,6 +246,7 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
                                      agent_tool_token="tool-secret", builtin_skills_dir=root / "builtin"))
         self.p.skills = Skills(self.p)
         self.p.artifacts = Artifacts(self.p)
+        self.p.mcp = McpService(self.p)
         self.p.gate = Gate(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}]}))
         self.q = self.p.queue = Queue(self.p)
@@ -333,6 +336,24 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         return int(result["data"]["task_id"].removeprefix("bg-"))
 
     # -- subagents ---------------------------------------------------------------------------------
+
+    async def test_children_get_the_parents_mcp_tools_filtered_by_type(self):
+        connector = self.p.mcp.create(self.q.user(1), {"name": "srv", "transport": "http", "url": "https://x.example/mcp"}, "personal")
+        self.p.mcp.store.cache_put(connector["id"], 1, {
+            "server": {"name": "s", "version": "", "protocol": "x", "instructions": ""}, "prompts": [], "resources": [], "fetched_at": int(time.time()),
+            "tools": [{"name": "look", "title": "", "description": "d", "input_schema": {"type": "object"}, "read_only": True},
+                      {"name": "change", "title": "", "description": "d", "input_schema": {"type": "object"}, "read_only": False}]})
+        await self.parent()
+        for agent in ("scout", "task"):
+            await self.call("spawn", {"agent": agent, "tasks": [{"task": f"Do {agent} work"}]})
+        await self.until(lambda: len([r for r in self.runs if r[0] != "agent-private-1"]) == 2)
+        bodies = {body["prompt"]["text"].split("Do ")[1].split(" work")[0]: body for sid, run, body in self.runs if sid != "agent-private-1"}
+        self.assertEqual([t["tool"] for t in bodies["scout"]["mcp"]["tools"]], ["look"])
+        self.assertEqual([t["tool"] for t in bodies["task"]["mcp"]["tools"]], ["look", "change"])
+        for agent, body in bodies.items():
+            names = [t["name"] for t in body["mcp"]["tools"]]
+            self.assertEqual(body["tools"][-(len(names) + 1):], ["mcp", *names])
+            self.assertFalse(body["mcp"]["deferred"])
 
     async def test_spawn_starts_children_with_the_tools_of_their_type(self):
         stream = await self.parent()

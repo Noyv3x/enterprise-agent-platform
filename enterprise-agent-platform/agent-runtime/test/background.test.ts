@@ -328,9 +328,9 @@ test("task, job and wait forward to the tasks gateway with the call context", as
 });
 
 test("task, job and wait exist only in the root personal scope", () => {
-  const names = ["bash", "task", "job", "wait", "browser", "schedule", "mcp"];
+  const names = ["bash", "task", "job", "wait", "browser", "schedule"];
   const scopes: [string, Sandbox, string[]][] = [
-    ["root personal", personal, ["bash", "browser", "job", "mcp", "schedule", "task", "wait"]],
+    ["root personal", personal, ["bash", "browser", "job", "schedule", "task", "wait"]],
     ["subagent", { ...personal, scope_key: "private:1/delegate/bg-4" }, ["bash"]],
     ["channel", { ...personal, scope_key: "channel:2:room" }, ["bash"]],
     ["chat", { ...personal, scope_key: "chat:3", profile: "chat" }, ["bash"]],

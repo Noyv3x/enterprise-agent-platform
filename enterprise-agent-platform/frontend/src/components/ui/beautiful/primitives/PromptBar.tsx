@@ -6,7 +6,8 @@
  *   (`clipboardFiles`, also used by callers that accept pastes outside the textarea);
  *   `/` commands, the model list and send/stop come from props; a command may insert text instead of running
  *   (`insert`, listed only while its token starts the draft when `leading`) and carry a quiet `tag`; a long
- *   command list scrolls inside the menu, keeping the active row in view;
+ *   command list scrolls inside the menu, keeping the active row in view; command tokens may contain `:` so
+ *   namespaced names such as `/notion:summarize` keep filtering as they are typed;
  * - a stop control takes the dictation slot while the agent is working (send remains available for steering);
  * - send options (platform addition for steering): when the caller passes `sendOptions`, a chevron before send and
  *   a long press on send open a send-mode menu built like the model menu (pop-in above the composer, GlideMenu
@@ -105,7 +106,7 @@ export type PromptBarLabels = {
 
 /* the last /word being typed at the start of the draft or after whitespace */
 function parseSlash(draft: string): { query: string; start: number } | null {
-  const match = /(^|\s)\/([\w-]*)$/.exec(draft);
+  const match = /(^|\s)\/([\w:-]*)$/.exec(draft);
   if (!match) return null;
   return { query: match[2].toLowerCase(), start: match.index + match[1].length };
 }

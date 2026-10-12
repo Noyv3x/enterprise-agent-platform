@@ -1,7 +1,7 @@
 import { createContext } from "react";
 import { partialArgs } from "./partialJson";
 import type { LastRun, LiveRun, Message, RunRef, ToolCall } from "./types";
-import { messageWork, toolVerb, type Words } from "./work";
+import { mcpSubject, mcpToolName, messageWork, toolVerb, type McpLabels, type Words } from "./work";
 
 /** How the computer window renders a step. */
 export type StepKind = "shell" | "file" | "browser" | "search" | "fetch" | "other";
@@ -117,9 +117,9 @@ export function commandLine(call: ToolCall): string {
 }
 
 /** The step as one line under the window, with the conversation's tool verb: "Run pytest -q", "Write handlers.py". */
-export function stepTitle(call: ToolCall, w: Words): string {
+export function stepTitle(call: ToolCall, w: Words, labels: McpLabels = {}): string {
   const { args } = call;
-  const verb = toolVerb(call.name, w, args);
+  const verb = toolVerb(call.name, w, args, labels);
   let subject = "";
   switch (stepKind(call.name)) {
     case "shell":
@@ -140,13 +140,15 @@ export function stepTitle(call: ToolCall, w: Words): string {
       subject = str(args.url) ? host(str(args.url)) : str(args.action);
       break;
     default:
-      // Task tools name their tasks; the job and skill actions are already in the verb.
+      // Task tools name their tasks; the job and skill actions and a connector's tool are already in the verb.
       subject = call.name === "job" ? str(args.id)
         : call.name === "wait" ? (Array.isArray(args.ids) ? args.ids.filter((id): id is string => typeof id === "string").join(" ") : "")
           : call.name === "task" ? (Array.isArray(args.tasks) ? w(`${args.tasks.length} subagents`, `${args.tasks.length} 个子智能体`, `${args.tasks.length} 個子智慧體`) : "")
             : call.name === "skill" ? clip(str(args.name) || str(args.url) || str(args.path))
               : call.name === "artifact" ? clip(str(args.title) || fileName(str(args.path)))
-                : clip(str(args.action) || str(args.name) || [str(args.server), str(args.tool)].filter(Boolean).join(" · "));
+                : call.name === "mcp" ? clip(mcpSubject(args, labels))
+                  : mcpToolName(call.name) ? ""
+                    : clip(str(args.action) || str(args.name));
   }
   const running = call.status === "preparing" || call.status === "running";
   // Chinese reads the running step as "正在…"; English keeps the verb and the status pill says it is working.

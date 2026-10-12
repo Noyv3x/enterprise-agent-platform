@@ -42,18 +42,13 @@ test("remote Pi tools audit exact operations and never forward host environment"
       const value = body.action === "read" ? full.slice(body.arguments.offset ?? 0, (body.arguments.offset ?? 0) + body.arguments.limit) : "written";
       res.end(JSON.stringify({ content: value, details: { returned: value.length, total: full.length } }));
     } else {
-      if (audit.body.details.tool === "mcp") {
-        const encoded = String(body.arguments.command).split("'")[1]!;
-        const params = JSON.parse(Buffer.from(encoded, "base64url").toString());
-        assert.deepEqual(audit.body.details, params.action === "list" ? { tool: "mcp", action: "list", arguments: {} } : { tool: "mcp", action: "call", arguments: { server: "docs", tool: "lookup" } });
-        assert.equal(JSON.stringify(audit.body.details).includes("private-document"), false);
-      } else assert.equal(audit.body.details.command, body.arguments.command);
+      assert.equal(audit.body.details.command, body.arguments.command);
       assert.equal(body.arguments.background, false);
       assert.equal("env" in body.arguments, false);
       assert.ok(Number.isFinite(body.arguments.timeout_ms));
       assert.ok(body.arguments.timeout_ms > 0 && body.arguments.timeout_ms <= 3_600_000);
       const command: string = body.arguments.command;
-      const stdout = command.startsWith("/usr/local/bin/agent-platform-mcp") ? JSON.stringify(audit.body.details.action === "call" ? { result: { token: "private-document" } } : { servers: ["docs"] }) : command.includes("rg --files") ? "a.txt\u0000" : command.includes("rg --no-heading") ? "a.txt:1:new\n" : command.includes("-printf") ? "a.txt\u0000" : command.includes("mktemp") ? "/workspace/.pi-bash-test.log\n5\n0\nhello" : "";
+      const stdout = command.includes("rg --files") ? "a.txt\u0000" : command.includes("rg --no-heading") ? "a.txt:1:new\n" : command.includes("-printf") ? "a.txt\u0000" : command.includes("mktemp") ? "/workspace/.pi-bash-test.log\n5\n0\nhello" : "";
       res.end(JSON.stringify({ result: { stdout, stderr: "", exit_code: 0, status: "completed" } }));
     }
   });
@@ -96,22 +91,21 @@ test("remote Pi tools audit exact operations and never forward host environment"
     assert.match(JSON.stringify(await invoke("grep", { pattern: "new" })), /a.txt:1:new/);
     assert.match(JSON.stringify(await invoke("find", { pattern: "*.txt" })), /a.txt/);
     assert.match(JSON.stringify(await invoke("ls", {})), /a.txt/);
-    assert.match(JSON.stringify(await invoke("mcp", { action: "list" })), /docs/);
-    const mcp = await invoke("mcp", { action: "call", server: "docs", tool: "lookup", arguments: { token: "private-document" } });
-    assert.deepEqual(mcp.details, { result: { token: "private-document" } });
+    await invoke("mcp", { action: "call", connector: "docs", tool: "lookup", arguments: { q: "x" } });
     await invoke("web_search", { query: "Pi" });
     await invoke("web_fetch", { url: "https://example.org", max_chars: 1000 });
     await invoke("browser", { action: "navigate", url: "https://example.org" });
     await invoke("schedule", { action: "create", name: "Reminder", prompt: "hello" });
-    assert.deepEqual(gatewayBodies.map(body => [body.path, body.action]), [["/internal/agent/tools/web", "search"], ["/internal/agent/tools/web", "fetch"], ["/internal/agent/tools/browser", "navigate"], ["/internal/agent/tools/schedule", "create"]]);
+    assert.deepEqual(gatewayBodies.map(body => [body.path, body.action]), [["/internal/agent/tools/mcp", "call"], ["/internal/agent/tools/web", "search"], ["/internal/agent/tools/web", "fetch"], ["/internal/agent/tools/browser", "navigate"], ["/internal/agent/tools/schedule", "create"]]);
+    assert.deepEqual(gatewayBodies[0]?.arguments, { connector: "docs", tool: "lookup", arguments: { q: "x" } });
     assert.equal(gatewayBodies[0]?.context.tool_call_id, "call-1");
-    assert.equal(gatewayBodies[1]?.arguments.max_chars, 1000);
+    assert.equal(gatewayBodies[2]?.arguments.max_chars, 1000);
     assert.equal(await executor.cancelRun(sandbox, "run-1"), true);
     const before = calls.length;
     await assert.rejects(invoke("read", { path: "/etc/passwd" }), /outside/);
     assert.equal(calls.length, before);
     const chatTools = createTools("/workspace/conversation-a", { ...dependencies, sandbox: { ...sandbox, profile: "chat", scope_key: "chat:1" } });
-    assert.equal(chatTools.some(tool => ["browser", "schedule", "mcp"].includes(tool.name)), false);
+    assert.equal(chatTools.some(tool => ["browser", "schedule"].includes(tool.name)), false);
     for (const name of ["read", "write", "edit", "grep", "find", "ls"]) {
       const tool = chatTools.find(value => value.name === name)!;
       await assert.rejects(tool.execute("chat-call", { path: "../conversation-b", content: "x", edits: [{ oldText: "x", newText: "y" }], pattern: "x" }, undefined, undefined, {} as ExtensionToolContext), /outside/);
@@ -124,7 +118,7 @@ test("remote Pi tools audit exact operations and never forward host environment"
   }
 });
 
-test("skill is a gateway tool for personal and channel root scopes only, skill roots are read-only, and mcp names its config", async () => {
+test("skill is a gateway tool for personal and channel root scopes only, and skill roots are read-only", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-skill-tool-"));
   const shell = promisify(execFile);
   const gatewayCalls: { tool: string; action: string; args: Record<string, unknown>; scope: string }[] = [];
@@ -148,13 +142,16 @@ test("skill is a gateway tool for personal and channel root scopes only, skill r
   const chat: Sandbox = { ...sandbox, profile: "chat", scope_key: "chat:1" };
   try {
     assert.deepEqual(build(sandbox).map(tool => tool.name).sort(), ["mcp", "read", "skill", "write"]);
-    assert.deepEqual(build(channel).map(tool => tool.name).sort(), ["read", "skill", "write"]);
-    assert.deepEqual(build(chat, "/workspace/conversation-a").map(tool => tool.name).sort(), ["read", "write"]);
+    assert.deepEqual(build(channel).map(tool => tool.name).sort(), ["mcp", "read", "skill", "write"]);
+    assert.deepEqual(build(chat, "/workspace/conversation-a").map(tool => tool.name).sort(), ["mcp", "read", "write"]);
     assert.deepEqual(build(sandbox, "/workspace", false).map(tool => tool.name).sort(), ["mcp", "read", "write"]);
     const personal = build(sandbox);
     const mcp = personal.find(tool => tool.name === "mcp")!;
-    assert.match(mcp.description, /\/workspace\/\.agent-platform\/mcp\.json/);
-    assert.match(mcp.description, /mcpServers/);
+    assert.match(mcp.description, /import/);
+    assert.match(mcp.description, /claude mcp add/);
+    assert.match(mcp.description, /untrusted/);
+    assert.doesNotMatch(JSON.stringify([build(channel), build(chat, "/workspace/conversation-a")].map(tools => tools.find(tool => tool.name === "mcp")!.description)), /import|claude mcp add/);
+    assert.doesNotMatch(JSON.stringify(personal), /agent-platform-mcp|\.agent-platform\/mcp\.json/);
     const skill = build(channel).find(tool => tool.name === "skill")!;
     assert.match(skill.description, /\.claude\/skills/);
     assert.match(skill.description, /another product|other product|Claude Code/);

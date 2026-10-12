@@ -7,7 +7,7 @@ import { Markdown } from "./Markdown";
 import { TASK_TOOL_STATE, TasksContext, agentTypeLabel, isRunning, promotedTaskId, taskElapsed, taskStatusLabel, tokenCount, type TasksValue, type TaskView } from "./taskState";
 import { formatThinking } from "./thinking";
 import type { RunRef } from "./types";
-import { toolVerb, type WorkItem, type WorkTrace, type Words } from "./work";
+import { McpLabelsContext, mcpSubject, mcpToolName, toolVerb, type McpLabels, type WorkItem, type WorkTrace, type Words } from "./work";
 
 type ToolItem = Extract<WorkItem, { type: "tool" }>;
 type ThinkingItem = Extract<WorkItem, { type: "thinking" }>;
@@ -44,11 +44,11 @@ function editPairs(args: Record<string, unknown>): { oldText: string; newText: s
 type Described = { step: ToolStep; diff?: ToolDiff; diffLines?: ToolDiffLine[] };
 
 /** How one tool call reads as a ToolChips row (and, for file writes, a diff chip). */
-function describe(tool: ToolItem, w: Words): Described {
+function describe(tool: ToolItem, w: Words, labels: McpLabels): Described {
   const { args } = tool;
   const path = arg(args, "path");
   let icon = "tool";
-  let label = toolVerb(tool.name, w, args);
+  let label = toolVerb(tool.name, w, args, labels);
   let chip = "";
   let mono = true;
   let input: ToolDetailLine[] = [];
@@ -147,9 +147,16 @@ function describe(tool: ToolItem, w: Words): Described {
       icon = "write";
       chip = arg(args, "title") || path;
       break;
+    case "mcp":
+      // the call's arguments are the connector tool's own; the subject names connector and tool, a URI or a file
+      chip = mcpSubject(args, labels);
+      mono = arg(args, "action") === "read_resource" || arg(args, "action") === "import";
+      input = lines(JSON.stringify(args, null, 2), "muted");
+      break;
     default: {
       const json = Object.keys(args).length ? JSON.stringify(args) : "";
-      chip = arg(args, "_preview") || arg(args, "detail") || [arg(args, "server"), arg(args, "tool")].filter(Boolean).join(" · ") || json;
+      // a connector's tool already names connector and tool in its verb; its arguments are the detail
+      chip = mcpToolName(tool.name) ? "" : arg(args, "_preview") || arg(args, "detail") || json;
       input = json ? lines(JSON.stringify(args, null, 2), "muted") : [];
     }
   }
@@ -177,9 +184,9 @@ function SubagentMeta({ task }: { task: TaskView }) {
 }
 
 /** A subagent under the `task` row that started it: name, type chip, activity, then id, elapsed time and tokens. */
-function subagentRow(task: TaskView, tasks: TasksValue, w: Words): ToolChildRow {
+function subagentRow(task: TaskView, tasks: TasksValue, w: Words, labels: McpLabels): ToolChildRow {
   const activity = isRunning(task)
-    ? task.current ? `${toolVerb(task.current.tool, w)} ${task.current.summary}`.trim() : w("Thinking", "思考中", "思考中")
+    ? task.current ? `${toolVerb(task.current.tool, w, undefined, labels)} ${task.current.summary}`.trim() : w("Thinking", "思考中", "思考中")
     : task.status === "completed" && task.result_preview ? task.result_preview.split("\n").find((line) => line.trim()) ?? taskStatusLabel(task, w)
       : taskStatusLabel(task, w);
   return {
@@ -194,12 +201,13 @@ const ToolGroup = memo(function ToolGroup({ tools, run }: { tools: ToolItem[]; r
   const w = useWords();
   const computer = useContext(ComputerContext);
   const tasks = useContext(TasksContext);
-  const cache = useMemo(() => new WeakMap<ToolItem, Described>(), [w]);
+  const labels = useContext(McpLabelsContext);
+  const cache = useMemo(() => new WeakMap<ToolItem, Described>(), [w, labels]);
   const described = useMemo(() => tools.map((tool) => {
     let entry = cache.get(tool);
-    if (!entry) cache.set(tool, entry = describe(tool, w));
+    if (!entry) cache.set(tool, entry = describe(tool, w, labels));
     return entry;
-  }), [cache, tools, w]);
+  }), [cache, tools, w, labels]);
   const { diffs, diffLines } = useMemo(() => {
     const files = new Map<string, ToolDiff>();
     const lines: Record<string, ToolDiffLine[]> = {};
@@ -215,7 +223,7 @@ const ToolGroup = memo(function ToolGroup({ tools, run }: { tools: ToolItem[]; r
   const steps = described.map(({ step }, index) => {
     const tool = tools[index];
     if (tool.name === "task" && tasks) {
-      return { ...step, children: agents.filter((task) => task.created_by_tool_call_id === tool.id).map((task) => subagentRow(task, tasks, w)) };
+      return { ...step, children: agents.filter((task) => task.created_by_tool_call_id === tool.id).map((task) => subagentRow(task, tasks, w, labels)) };
     }
     const background = tool.name === "bash" ? tool.background ?? promotedTaskId(tool.output) : null;
     if (!background) return step;

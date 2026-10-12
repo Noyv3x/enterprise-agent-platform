@@ -5,6 +5,7 @@ import { ConfirmDialog, EmptyState, Field, Icon, Notice, PageHeader, Sheet, Text
 import RecordsTable, { RecordsSearch, RecordsToolbar, type RecordColumn } from '../components/ui/beautiful/primitives/RecordsTable';
 import { useWords } from '../words';
 import { useRecordsLabels } from './admin/shared';
+import { ChannelConnectors } from './mcp/ChannelConnectors';
 
 export interface Channel { id: number; name: string; description: string; archived: boolean }
 
@@ -113,6 +114,7 @@ export function Channels({ channels, onChange, onOpen, admin, permissions }: { c
           <TextArea value={description} rows={3} maxRows={8} onChange={(event) => setDescription(event.target.value)} />
         </Field>
       </form>
+      {editing !== 'new' && <ChannelConnectors channelId={editing.id} />}
       {editing !== 'new' && <section className="mt-6 flex items-center justify-between gap-3 border-t border-line pt-5" aria-label={w('Archive channel', '归档频道', '封存頻道')}>
         <p className="text-[12px] leading-[1.45] text-ink-2">{w('Archiving hides the channel for everyone. Its history is kept.', '归档后所有人都看不到该频道，历史记录会保留。', '封存後所有人都看不到該頻道，歷史記錄會保留。')}</p>
         <Button size="sm" className="shrink-0 bg-red-tint text-red-ink shadow-none hover:bg-red-tint hover:brightness-95" disabled={busy} onClick={() => setArchiving(editing)}>{w('Archive', '归档', '封存')}</Button>

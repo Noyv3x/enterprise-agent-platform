@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import Database
-from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills, artifacts
+from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills, artifacts, mcp
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ class Platform:
         self.queue = queue.Queue(self)
         self.tasks = tasks.Tasks(self)
         self.skills = skills.Skills(self)
+        self.mcp = mcp.McpService(self)
 
     async def scheduler(self):
         while True:
@@ -190,10 +191,11 @@ def create_app(settings=None):
                     await scheduler
             await platform.tasks.stop()
             await platform.queue.stop()
+            await platform.mcp.close()
             await platform.http.aclose()
 
     async def error(request, exc):
-        return JSONResponse({'error': exc.detail, **({'code': exc.code, **exc.payload} if isinstance(exc, (skills.SkillError, artifacts.ArtifactError)) else {})}, status_code=exc.status_code)
+        return JSONResponse({'error': exc.detail, **({'code': exc.code, **exc.payload} if isinstance(exc, (skills.SkillError, artifacts.ArtifactError, mcp.McpError)) else {})}, status_code=exc.status_code)
 
     async def malformed(request, exc):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
@@ -201,6 +203,7 @@ def create_app(settings=None):
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
     for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills, artifacts):
         route_list.extend(module.routes())
+    route_list.extend(mcp.routes(platform.mcp))
     route_list.append(Route('/{path:path}', static))
     app = Starlette(routes=route_list, lifespan=lifespan, exception_handlers={HTTPException: error, json.JSONDecodeError: malformed})
     app.state.platform = platform

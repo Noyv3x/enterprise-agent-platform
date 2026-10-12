@@ -6,9 +6,9 @@ The platform is a shared, browser-based product built around plain Pi. Platform 
 
 | Mode | Ownership and tools |
 | --- | --- |
-| Personal AI | One persistent workspace and sandbox per user; Pi file/shell tools, web search/fetch, browser with human takeover, schedules the personal AI manages itself with its schedule tool, workspace-configured MCP, and [subagents and background tasks](#subagents-and-background-tasks) (`task`, `job`, `wait`, background and service `bash`). |
-| Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch, plus the channel workspace's skills. Visibility and management use existing permission groups, not a new membership table. |
-| Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP or AGENTS.md context. Chat can use built-in and organization skills (no workspace skills). |
+| Personal AI | One persistent workspace and sandbox per user; Pi file/shell tools, web search/fetch, browser with human takeover, schedules the personal AI manages itself with its schedule tool, MCP connectors (remote servers and local servers in its sandbox), and [subagents and background tasks](#subagents-and-background-tasks) (`task`, `job`, `wait`, background and service `bash`). |
+| Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch, plus the channel workspace's skills and the organization [MCP connectors](#mcp-connectors) with shared credentials that a channel manager enabled for it. Visibility and management use existing permission groups, not a new membership table. |
+| Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch, plus remote [MCP connectors](#mcp-connectors) (its sandbox has no network, so no local servers); no browser, schedules or AGENTS.md context. Chat can use built-in and organization skills (no workspace skills). |
 
 Standard chat supports create, rename and delete. Titles are never generated automatically: a new chat starts as `New chat` and changes only when the user renames it. Users neither see nor change any model or thinking depth, in the personal AI or in chat. Each account belongs to one administrator-managed model policy group (策略组) that sets a model and thinking depth per usage slot: personal AI (also schedules and background-task notices), channel main agent, chat (whose reasoning summaries are shown too), `scout` subagents and `task` subagents. A lower-spec group can serve accounts that do only simple work.
 
@@ -47,7 +47,19 @@ Skills follow the open Agent Skills standard (agentskills.io, the format Claude 
 
 Installing, updating and removing personal skills (by the user or the AI) needs the `install_extensions` permission; administrators can withhold it per permission group. Without it, the user's personal skills are not offered to the AI and the install controls are hidden. Users can switch individual skills off for themselves.
 
-Users often paste setup instructions written for other AI products (Claude Code, Claude Desktop/claude.ai, Codex, Cursor, Gemini CLI, OpenCode). The AI is told to carry out their intent with this platform's conventions: the `skill` tool for skills and `/workspace/.agent-platform/mcp.json` for MCP servers. A sandbox start-up step additionally moves skills that a literal install left in `.claude/skills`, `.codex/skills` or `.agents/skills` into the standard directory.
+Users often paste setup instructions written for other AI products (Claude Code, Claude Desktop/claude.ai, Codex, Cursor, Gemini CLI, OpenCode). The AI is told to carry out their intent with this platform's conventions: the `skill` tool for skills and the `mcp` tool's `import` and `add` for MCP servers. A sandbox start-up step additionally moves skills that a literal install left in `.claude/skills`, `.codex/skills` or `.agents/skills` into the standard directory.
+
+## MCP connectors
+
+MCP connectors give the AI tools, resources and prompts from other systems (Notion, GitHub, an internal service, a local `npx`/`uvx` server). Design and limits: [integrations](integrations.md#mcp); shapes: [Platform API](../reference/platform-api.md#mcp).
+
+- **Organization connectors** are added by administrators and assigned to permission groups. Credentials are per user (each user clicks 连接 and signs in, or enters their own key) or shared (the administrator connects once). Channels can use only shared ones, and only when a channel manager enabled them for that channel.
+- **Personal connectors** are added by the user in 设置 → 连接器 or by the AI, and need the existing `install_extensions` permission (administrators can withhold it per group). Local servers run persistently in the user's own sandbox; chat has no local servers because its sandbox has no network.
+- Sign-in is one click; API keys and headers are entered in a secure form and never through the chat; the AI is told never to ask for them. Credentials live in Platform only: Runtime, the model and the sandbox never see remote tokens or keys.
+- Each tool is a directly callable tool for the AI (with a deferred catalog when there are many); administrators and owners can switch individual tools off. Subagents get the parent's tools: `scout` only read-only ones, `task` all.
+- Prompts a server offers appear in the composer `/` menu as `/<connector>:<prompt>`. A server's request for input appears in the conversation as a form or a link; only the person whose message started the run can answer it.
+- Config files for other products (`claude mcp add`, `.mcp.json`, `claude_desktop_config.json`, `~/.codex/config.toml`, Cursor, VS Code, OpenCode) found in the workspace are offered for one-click import and are never enabled automatically; pasted instructions are translated by the AI through the `mcp` tool's `import`.
+- Tool output is untrusted data. Every call is audited (who, which connector and tool, status and duration, never content). Sampling is not supported.
 
 ## Subagents and background tasks
 

@@ -199,10 +199,7 @@ type bgProcess struct {
 	hard        chan struct{}
 	hardOnce    sync.Once
 
-	controlMu     sync.Mutex
-	control       *os.File
-	controlClosed bool
-	controlBroken bool
+	control controlPipe
 
 	stopReason string // guarded by BackgroundManager.mu
 }
@@ -326,7 +323,9 @@ func (m *BackgroundManager) CheckOwner(id, owner string) error {
 	return err
 }
 
-func newProcessID(now time.Time) (string, error) {
+func newProcessID(now time.Time) (string, error) { return newULIDID("proc_", now) }
+
+func newULIDID(prefix string, now time.Time) (string, error) {
 	var raw [16]byte
 	milliseconds := uint64(now.UnixMilli())
 	for i := range 6 {
@@ -345,7 +344,7 @@ func newProcessID(now time.Time) (string, error) {
 		encoded[i] = alphabet[digit.Int64()]
 		value.Rsh(value, 5)
 	}
-	return "proc_" + string(encoded), nil
+	return prefix + string(encoded), nil
 }
 
 func validateProcessStart(args processStartArguments) error {
@@ -628,7 +627,7 @@ func (m *BackgroundManager) Start(ctx context.Context, call Call, args processSt
 		return ProcessView{}, err
 	}
 	controlRead.Close()
-	p.control = controlWrite
+	p.control.file = controlWrite
 	go m.supervise(p, command, reader, writer)
 
 	m.mu.Lock()
@@ -668,38 +667,6 @@ func (m *BackgroundManager) Start(ctx context.Context, call Call, args processSt
 
 func (p *bgProcess) hardKill() {
 	p.hardOnce.Do(func() { close(p.hard) })
-}
-
-// sendControl writes one framed control line. A write that cannot finish
-// poisons the channel (a partial frame would corrupt the framing); a hard kill
-// still works because it closes the lease instead.
-func (p *bgProcess) sendControl(frames ...map[string]any) error {
-	p.controlMu.Lock()
-	defer p.controlMu.Unlock()
-	if p.controlClosed || p.controlBroken {
-		return errors.New("process control channel is closed")
-	}
-	for _, frame := range frames {
-		line, err := json.Marshal(frame)
-		if err != nil {
-			return err
-		}
-		_ = p.control.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := p.control.Write(append(line, '\n')); err != nil {
-			p.controlBroken = true
-			return fmt.Errorf("process control channel failed: %w", err)
-		}
-	}
-	return nil
-}
-
-func (p *bgProcess) closeControl() {
-	p.controlMu.Lock()
-	defer p.controlMu.Unlock()
-	if !p.controlClosed {
-		p.controlClosed = true
-		_ = p.control.Close()
-	}
 }
 
 func (m *BackgroundManager) supervise(p *bgProcess, command *exec.Cmd, reader *io.PipeReader, writer *io.PipeWriter) {
@@ -745,7 +712,7 @@ func (m *BackgroundManager) supervise(p *bgProcess, command *exec.Cmd, reader *i
 	select {
 	case waitErr = <-waited:
 	case <-p.hard:
-		p.closeControl()
+		p.control.close()
 		select {
 		case waitErr = <-waited:
 		case <-time.After(5 * time.Second):
@@ -840,7 +807,7 @@ func (m *BackgroundManager) kill(p *bgProcess, reason string) {
 		p.stopReason = reason
 	}
 	m.mu.Unlock()
-	_ = p.sendControl(map[string]any{"t": "s", "s": int(syscall.SIGTERM)})
+	_ = p.control.send(map[string]any{"t": "s", "s": int(syscall.SIGTERM)})
 	select {
 	case <-p.done:
 		return
@@ -892,7 +859,7 @@ func (m *BackgroundManager) Stdin(id, owner, data string, eof bool) (ProcessView
 	if eof {
 		frames = append(frames, map[string]any{"t": "e"})
 	}
-	if err := p.sendControl(frames...); err != nil {
+	if err := p.control.send(frames...); err != nil {
 		return ProcessView{}, err
 	}
 	m.mu.Lock()

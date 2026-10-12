@@ -13,6 +13,8 @@ import { useArtifacts } from "./artifacts/useArtifacts";
 import { Composer, type ComposerCommand, type ComposerSeed } from "./conversation/Composer";
 import { ComputerBody, type ComputerFocus } from "./conversation/Computer";
 import { ComputerContext } from "./conversation/computerView";
+import { ElicitationCard, McpActionCard } from "./conversation/McpCards";
+import { loadMcpCatalog } from "./conversation/mcpCatalog";
 import { PendingReply, Reply, SystemLine, UserBubble, type RenderInput } from "./conversation/Messages";
 import { LEAVE_MS, reducedMotion } from "./conversation/motion";
 import { Movable } from "./conversation/Movable";
@@ -21,6 +23,7 @@ import { TasksContext, isRunning, stateAnnouncement, tasksValue, type TaskMap } 
 import type { Compaction, LiveRun, Message, RunRef, SendMode } from "./conversation/types";
 import { conversationTurns } from "./conversation/turns";
 import { errorText, useConversation } from "./conversation/useConversation";
+import { McpLabelsContext, type McpLabels } from "./conversation/work";
 
 /** Reader within this distance of the bottom keeps following new output (harness value). */
 const STICK_PX = 120;
@@ -237,6 +240,16 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
   const shownTask = openedTask ? conversation.tasks[openedTask] : undefined;
   const channel = scope.startsWith("channel-");
   const resettable = canSend && !scope.startsWith("chat-");
+  // Skills and MCP prompts of a chat come from the chat catalog; the connector labels name MCP rows in the trace.
+  const catalogScope = scope.startsWith("chat-") ? "chat" : scope;
+  const [mcpLabels, setMcpLabels] = useState<McpLabels>({});
+  useEffect(() => {
+    let current = true;
+    loadMcpCatalog(catalogScope)
+      .then((catalog) => { if (current) setMcpLabels(Object.fromEntries(catalog.connectors.map((connector) => [connector.name, connector.label]))); })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [catalogScope]);
   const compactionAt = compactionPlacement(conversation.compaction, messages, conversation.nextBefore === null);
   const compactionRow = conversation.compaction && compactionAt !== null ? <CompactionRow compaction={conversation.compaction} /> : null;
   const empty = phase === "ready" && messages.length === 0 && !live && !compactionRow;
@@ -528,7 +541,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       inserting={Boolean(running || live) && !queuedMessages.length && !conversation.compactBusy}
       pendingInputs={inserted.filter((message) => message.metadata.delivery === "pending").length}
       commands={commands}
-      skillScope={scope.startsWith("chat-") ? "chat" : scope}
+      catalogScope={catalogScope}
       seed={seed}
       placeholder={empty && personal
         ? w("Ask your agent to research, write files or run code…", "让智能体查资料、写文件或运行代码…", "讓智慧體查資料、寫檔案或執行程式…")
@@ -604,6 +617,21 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         />,
       );
     }
+    // A connector's request for input waits beside the live reply; sign-in and secrets cards stay until handled.
+    for (const item of conversation.elicitations) {
+      rows.push(
+        <ElicitationCard key={`mcp-elicitation-${item.request.id}`} state={item} onAnswer={conversation.answerElicitation}
+          mine={canSend && (userId === undefined || item.request.user_id === userId)} />,
+      );
+    }
+    if (canSend) {
+      for (const action of conversation.mcpActions) {
+        rows.push(
+          <McpActionCard key={`mcp-action-${action.connector.id}-${action.kind}`} action={action} listScope={personal ? "private" : "chat"}
+            onConfirm={conversation.confirmMcpConnector} onDismiss={() => conversation.dismissMcpAction(action.connector.id, action.kind)} />,
+        );
+      }
+    }
     for (const message of queuedMessages) pushMessage(message, "queued");
     if (!live && !running && firstQueued) rows.push(<PendingReply key="pending" since={Date.parse(firstQueued.created_at) || Date.now()} queued />);
     if (compactionAt === "end") rows.push(compactionKeyed);
@@ -666,6 +694,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
 
   return (
     <TasksContext.Provider value={tasks}>
+    <McpLabelsContext.Provider value={mcpLabels}>
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {header}
       <div role="status" aria-label={w("Message delivery", "消息送达", "訊息送達")} aria-live="polite" aria-atomic="true" className="sr-only">
@@ -735,6 +764,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
         onCancel={() => setConfirmingStop(false)}
       />
     </div>
+    </McpLabelsContext.Provider>
     </TasksContext.Provider>
   );
 }

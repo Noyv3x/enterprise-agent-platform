@@ -21,7 +21,7 @@ Only Manager owns Docker. Platform and Runtime do not execute tenant commands in
 1. Platform authenticates and authorizes a message, inserting it and a `durable_jobs` agent job in one transaction.
 2. A per-session FIFO worker selects the model, sandbox identity, stable resources and tool set, then submits one Runtime run.
 3. Runtime resumes or creates the conversation's Pi session. Pi owns model turns, retry and compaction; changing time/user/timezone context is prefixed to the user message.
-4. File and shell tools call Manager's audited executor. Web, browser and schedule tools call Platform's authenticated internal gateways; MCP runs its stdio client in the sandbox.
+4. File and shell tools call Manager's audited executor. Web, browser and schedule tools call Platform's authenticated internal gateways; MCP clients run in Platform; local stdio servers run in the owner's sandbox behind Manager's lossless stdio channel.
 5. Runtime emits text/thinking deltas, tool activity, retry/compaction events and a final result. Platform persists the final message and usage; the frontend displays Platform history and streaming updates.
 
 A lost Runtime run becomes interrupted. Platform never resubmits a run whose effects may already have occurred. Pi's model-call retry is not job replay.

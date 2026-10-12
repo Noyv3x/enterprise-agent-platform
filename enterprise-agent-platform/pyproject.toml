@@ -20,6 +20,8 @@ dependencies = [
   "Pillow==12.3.0",
   "pypdf==6.19.0",
   "PyYAML==6.0.3",
+  "mcp==2.3.0",
+  "httpx2==2.13.1",
 ]
 
 [project.scripts]

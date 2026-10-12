@@ -159,7 +159,7 @@ func (l *liveOutput) drain(emit func(any) error) {
 // TerminalStream runs Terminal like Service.Terminal and additionally calls
 // emit with output frames as sanitized output is committed. emit is invoked
 // from one goroutine at a time and never concurrently with the caller after
-// TerminalStream returns. Private output is never emitted.
+// TerminalStream returns.
 func (s *Service) TerminalStream(ctx context.Context, call Call, emit func(any) error) (map[string]any, error) {
 	live := newLiveOutput()
 	done := make(chan struct{})

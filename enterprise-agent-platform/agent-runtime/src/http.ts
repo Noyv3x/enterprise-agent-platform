@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { createServer as nodeCreateServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Runtime } from './runtime.js';
+import { validateMcp } from './mcp.js';
 
 type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
 const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait', 'skill', 'artifact'];
@@ -36,7 +37,11 @@ function validateRun(value: unknown): asserts value is Parameters<Runtime['start
   validatePrompt(prompt);
   if (value.context_prefix !== undefined && typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
   if (!object(resources) || typeof resources.system_prompt !== 'string' || !Array.isArray(resources.skills) || !resources.skills.every(skill => object(skill) && text(skill.name) && typeof skill.description === 'string' && text(skill.location)) || (resources.agents_md !== null && resources.agents_md !== undefined && (!object(resources.agents_md) || !text(resources.agents_md.path) || typeof resources.agents_md.content !== 'string'))) throw failure(400, 'Invalid resources');
-  if (!Array.isArray(value.tools) || !value.tools.every(tool => typeof tool === 'string' && tools.includes(tool))) throw failure(400, 'Invalid tools');
+  // `mcp__*` names are the payload's proxy tools; validateMcp checks each against `mcp.tools`.
+  if (!Array.isArray(value.tools) || !value.tools.every(tool => typeof tool === 'string' && (tools.includes(tool) || tool.startsWith('mcp__')))) throw failure(400, 'Invalid tools');
+  if (value.mcp !== undefined) {
+    try { validateMcp(value.mcp, value.tools as string[]); } catch (error) { throw failure(400, `Invalid mcp: ${(error as Error).message}`); }
+  } else if (value.tools.some(tool => tool.startsWith('mcp__'))) throw failure(400, 'Invalid tools');
 }
 function json(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });

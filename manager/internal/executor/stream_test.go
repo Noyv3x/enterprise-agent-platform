@@ -111,23 +111,6 @@ func TestTerminalStreamNeverEmitsSecretSplitAcrossWrites(t *testing.T) {
 	}
 }
 
-func TestTerminalStreamNeverStreamsPrivateMCPOutput(t *testing.T) {
-	service, _ := newTestService(t)
-	details := map[string]any{"tool": "mcp", "action": "call", "arguments": map[string]any{"server": "local", "tool": "echo"}}
-	call := auditedTerminalCall(t, service, "stream-private", "printf private-output; printf private-err >&2", details)
-	var log frameLog
-	response, err := service.TerminalStream(context.Background(), call, log.emit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result := response["result"].(ProcessSnapshot); result.Stdout != "private-output" || result.Stderr != "private-err" {
-		t.Fatalf("unexpected private result: %+v", result)
-	}
-	if len(log.frames) != 0 {
-		t.Fatalf("private output was streamed: %+v", log.frames)
-	}
-}
-
 func TestTerminalStreamCapsStreamedBytesButNotResult(t *testing.T) {
 	service, _ := newTestService(t)
 	service.Processes.MaxOutput = 2 << 20

@@ -220,7 +220,7 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 		default:
 		}
 	}
-	execution, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes, executor.BackgroundConfig{Dir: filepath.Join(cfg.StateDir, "processes"), OwnerLimit: cfg.BackgroundProcessLimit, GlobalLimit: cfg.BackgroundProcessGlobalLimit})
+	execution, err := newExecutionService(active, docker, sandboxes, filepath.Join(cfg.StateDir, "control"), audit, cfg.CommandMaxBytes, executor.BackgroundConfig{Dir: filepath.Join(cfg.StateDir, "processes"), OwnerLimit: cfg.BackgroundProcessLimit, GlobalLimit: cfg.BackgroundProcessGlobalLimit}, executor.MCPConfig{Dir: filepath.Join(cfg.StateDir, "mcp"), OwnerLimit: cfg.MCPConnectionLimit, GlobalLimit: cfg.MCPConnectionGlobalLimit})
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +235,7 @@ func buildWithConfig(cfg config.Config) (*application, error) {
 	return app, nil
 }
 
-func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64, background executor.BackgroundConfig) (*executor.Service, error) {
+func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sandboxes *sandbox.Manager, auditDir string, audit *logstore.Store, commandMaxBytes int64, background executor.BackgroundConfig, mcp executor.MCPConfig) (*executor.Service, error) {
 	processes, err := executor.NewProcessManager(active, engine, sandboxes, commandMaxBytes)
 	if err != nil {
 		return nil, err
@@ -249,8 +249,17 @@ func newExecutionService(active identity.ActiveProfile, engine driver.Engine, sa
 	if err != nil {
 		return nil, err
 	}
-	sandboxes.OnStopped = supervised.SandboxStopped
-	return &executor.Service{Audits: audits, Processes: processes, Background: supervised, Files: files}, nil
+	channels, err := executor.NewMCPManager(active, engine, sandboxes, mcp)
+	if err != nil {
+		return nil, err
+	}
+	// One stop hook feeds both supervisors; MCP connections hold no residency,
+	// so an idle stop must end them here.
+	sandboxes.OnStopped = func(sandboxID string) {
+		supervised.SandboxStopped(sandboxID)
+		channels.SandboxStopped(sandboxID)
+	}
+	return &executor.Service{Audits: audits, Processes: processes, Background: supervised, MCP: channels, Files: files}, nil
 }
 
 func preflightCommand(arguments []string) error {

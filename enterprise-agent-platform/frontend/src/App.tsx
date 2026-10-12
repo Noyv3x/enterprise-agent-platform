@@ -139,7 +139,7 @@ function Shell() {
   } else if (route.view === 'admin') {
     view = <Admin />;
   } else {
-    view = <Settings user={user} onSaved={next => setSession({ ...session, user: next })} skillScope={access.private ? 'private' : access.chat ? 'chat' : null} />;
+    view = <Settings user={user} onSaved={next => setSession({ ...session, user: next })} scope={access.private ? 'private' : access.chat ? 'chat' : null} />;
   }
 
   return (

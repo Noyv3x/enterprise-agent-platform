@@ -10,22 +10,24 @@ import { useI18n, type Locale } from '../i18n';
 import { LOCALE_OPTIONS } from '../shell/preferences';
 import { useWords } from '../words';
 import { browserTimezone, timezoneOptions } from './settings/timezones';
+import { ConnectorSettings } from './settings/Connectors';
 import { SkillSettings } from './settings/Skills';
 
 type Outcome = { tone: 'success' | 'danger'; text: string } | null;
-type Tab = 'general' | 'skills';
+type Tab = 'general' | 'skills' | 'connectors';
 
 const THEMES: readonly ThemePreference[] = ['light', 'dark', 'system'];
 const buttonTouch = 'touch:h-11 touch:px-4';
 
-/** `#settings` opens General; `#settings/skills` opens Skills. */
+/** `#settings` opens General; `#settings/skills` and `#settings/connectors` open those tabs. */
 function tabFromHash(): Tab {
-  return window.location.hash === '#settings/skills' ? 'skills' : 'general';
+  const hash = window.location.hash;
+  return hash === '#settings/skills' ? 'skills' : hash === '#settings/connectors' ? 'connectors' : 'general';
 }
 
-/** `skillScope` is the catalog the Skills tab shows: the personal AI's when the account may use it, else chat's;
- * null hides the tab. */
-export function Settings({ user, onSaved, skillScope = null }: { user: User; onSaved: (u: User) => void; skillScope?: 'private' | 'chat' | null }) {
+/** `scope` is the catalog the Skills and Connectors tabs show: the personal AI's when the account may use it, else
+ * chat's; null hides both tabs. */
+export function Settings({ user, onSaved, scope = null }: { user: User; onSaved: (u: User) => void; scope?: 'private' | 'chat' | null }) {
   const [tab, setTab] = useState<Tab>(tabFromHash);
   useEffect(() => {
     const sync = () => setTab(tabFromHash());
@@ -89,21 +91,24 @@ export function Settings({ user, onSaved, skillScope = null }: { user: User; onS
   };
 
   const none = w('Not set', '未设置', '未設定');
-  // The Skills tab shows only when the account has a skill catalog.
-  const skills = tab === 'skills' ? skillScope : null;
+  // The Skills and Connectors tabs show only when the account has a catalog.
+  const shown: Tab = scope ? tab : 'general';
+  const descriptions: Record<Tab, string> = {
+    general: w('Your profile, appearance and sign-in password.', '你的个人资料、外观和登录密码。', '你的個人資料、外觀與登入密碼。'),
+    skills: w('Skills your AI can use. Start a message with /name to call one directly.', 'AI 可以使用的技能。在消息开头输入 /技能名 可以直接调用。', 'AI 可以使用的技能。在訊息開頭輸入 /技能名稱 可以直接呼叫。'),
+    connectors: w('Services your AI can use through MCP. Keys and sign-ins stay on the platform; the AI never sees them.', 'AI 可以通过 MCP 使用的服务。密钥和登录信息保存在平台上，AI 永远看不到。', 'AI 可以透過 MCP 使用的服務。金鑰和登入資訊儲存在平台上，AI 永遠看不到。'),
+  };
   return <>
     <PageHeader
       title={w('Settings', '设置', '設定')}
-      description={skills
-        ? w('Skills your AI can use. Start a message with /name to call one directly.', 'AI 可以使用的技能。在消息开头输入 /技能名 可以直接调用。', 'AI 可以使用的技能。在訊息開頭輸入 /技能名稱 可以直接呼叫。')
-        : w('Your profile, appearance and sign-in password.', '你的个人资料、外观和登录密码。', '你的個人資料、外觀與登入密碼。')}
-      tabs={skillScope ? [{ key: 'general', label: w('General', '通用', '一般') }, { key: 'skills', label: w('Skills', '技能', '技能') }] : undefined}
-      activeTab={skillScope ? (skills ? 'skills' : 'general') : undefined}
-      onTabChange={(key: string) => { setTab(key as Tab); window.location.hash = key === 'skills' ? 'settings/skills' : 'settings'; }}
+      description={descriptions[shown]}
+      tabs={scope ? [{ key: 'general', label: w('General', '通用', '一般') }, { key: 'skills', label: w('Skills', '技能', '技能') }, { key: 'connectors', label: w('Connectors', '连接器', '連接器') }] : undefined}
+      activeTab={scope ? shown : undefined}
+      onTabChange={(key: string) => { setTab(key as Tab); window.location.hash = key === 'general' ? 'settings' : `settings/${key}`; }}
     />
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="flex max-w-[880px] flex-col gap-4 p-4 sm:p-6">
-        {skills ? <SkillSettings scope={skills} /> : <>
+        {scope && shown === 'skills' ? <SkillSettings scope={scope} /> : scope && shown === 'connectors' ? <ConnectorSettings scope={scope} /> : <>
         <FormSection title={w('Profile', '个人资料', '個人資料')} onSubmit={() => void saveProfile()}
           description={w('Your name is shown to colleagues in channels; the time zone is used for schedules and for the time the AI sees.', '名称会在频道中显示给同事；时区用于定时任务和 AI 看到的当前时间。', '名稱會在頻道中顯示給同事；時區用於排程任務與 AI 看到的目前時間。')}
           footer={<FormActions><Button type="submit" variant="primary" size="sm" className={buttonTouch} disabled={profileSaving || !profileDirty || !displayName.trim()} aria-busy={profileSaving || undefined}>{w('Save profile', '保存资料', '儲存資料')}</Button></FormActions>}>

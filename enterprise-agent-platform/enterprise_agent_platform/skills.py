@@ -1062,7 +1062,7 @@ def _tool(content, data):
 def skill_guidance(personal):
     """System prompt section on skills and on setup instructions written for other products.
 
-    The MCP bullet applies to the personal AI only: channels have no MCP tool.
+    The MCP bullet applies to the personal AI only: only it manages connectors.
     """
     lines = [
         'Skills here use the Agent Skills format (a folder with SKILL.md). Install, update, remove or save skills only with the `skill` tool, '
@@ -1072,11 +1072,11 @@ def skill_guidance(personal):
     ]
     if personal:
         lines.append(
-            '- configure MCP servers in `/workspace/.agent-platform/mcp.json` (used through the `mcp` tool) instead of `claude mcp add`, '
-            '`codex mcp add`, `.mcp.json`, `~/.claude.json`, `~/.codex/config.toml` or `claude_desktop_config.json`. Its exact format is '
-            '`{"mcpServers":{"<id>":{"command":"<executable on PATH or a path inside /workspace>","args":["..."],"env":{"NAME":"value"},"cwd":"/workspace"}}}`: '
-            'the id matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`, at most 32 servers, only `command` (required), `args`, `env` and `cwd` are accepted, '
-            'only local stdio servers work (no url, type or headers), and the server process receives only the listed `env` plus PATH, HOME and LANG;')
+            '- set up MCP servers (remote or local) with the `mcp` tool instead of `claude mcp add`, `codex mcp add`, `.mcp.json`, `~/.claude.json`, '
+            '`~/.codex/config.toml` or `claude_desktop_config.json`: call `import` with the pasted snippet or command line (or `path` of a config file '
+            'in the workspace), or `add` for one server. Never write `/workspace/.agent-platform/mcp.json` yourself. Never ask for API keys or tokens in chat '
+            'and never put secret values in tool arguments: declare `env_keys` or `header_keys` (or let `import` report what is missing) and the user fills '
+            'them in a secure form; servers that need sign-in show the user a Connect button. Local servers run persistently in the user\'s sandbox, remote ones from the platform;')
     lines += [
         '- tell the user in one plain sentence, in their language, that the instructions were for another product and how you adapted them;',
         "- if a step cannot work here (the user's own computer, a desktop app, an app restart), say so plainly.",

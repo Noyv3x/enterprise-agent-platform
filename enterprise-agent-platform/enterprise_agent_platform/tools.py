@@ -229,12 +229,19 @@ class Browser:
                 fields.update(includeData='false', consume='false')
             return await self.request(uid, 'GET' if readonly else 'POST', path + '/' + action, fields)
 
+    @staticmethod
+    async def never():
+        return False
+
     async def gateway(self, tool, action, args, context, disconnected=None):
         if not isinstance(args, dict) or not isinstance(context, dict):
             raise HTTPException(400, 'arguments and context must be objects')
         # A live subagent run has no conversation job of its own; it may use web tools only.
         if tool == 'web' and self.p.tasks.child_owner(context):
             return await self.web(action, args)
+        if tool == 'mcp' and (child := self.p.tasks.child_run(context)):
+            user, agent_type = child
+            return await self.p.mcp.gateway.handle(user, self.p.tasks.scope(user['id']), action, args, context, disconnected or self.never, agent_type)
         key = context.get('scope_key', '')
         with self.p.db.connect() as conn:
             session = conn.execute('SELECT scope_key FROM queue_sessions WHERE sid=?', (context.get('sid'),)).fetchone()
@@ -263,6 +270,8 @@ class Browser:
             raise HTTPException(403, 'Tool owner does not match active job')
         if tool in {'browser', 'schedule', 'tasks'} and (scope['kind'] != 'agent' or scope['scope_type'] != 'private'):
             raise HTTPException(403, 'This tool is available only to personal AI')
+        if tool == 'mcp':
+            return await self.p.mcp.gateway.handle(user, scope, action, args, context, disconnected or self.never)
         if tool == 'browser':
             return result(await self.action(uid, action, args))
         if tool == 'tasks':

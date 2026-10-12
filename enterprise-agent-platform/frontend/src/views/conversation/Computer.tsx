@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { request } from "../../api";
 import { Button } from "../../components/ui/beautiful/atoms/Button";
 import { StatusPill } from "../../components/ui/beautiful/atoms/StatusPill";
@@ -13,6 +13,7 @@ import { followedRun, runCalls, stepKind, stepTitle, type RunSteps } from "./com
 import { BackgroundTasks } from "./Tasks";
 import type { BrowserLease, BrowserTab, LastRun, LiveRun, Message, StepRef, ToolCall, WorkspaceFile } from "./types";
 import { errorText } from "./useConversation";
+import { McpLabelsContext } from "./work";
 
 const STATE_POLL_MS = 3000;
 const FRAME_DELAY_MS = 1200;
@@ -340,6 +341,7 @@ function PlaybackBar({ steps, index, onSeek, following, live, onBack, disabled }
   disabled: boolean;
 }) {
   const w = useWords();
+  const labels = useContext(McpLabelsContext);
   const count = steps.length;
   const stepping = !disabled && count > 1;
   const nav = "primitive-icon-button shrink-0 text-ink-2 transition-colors duration-100 enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-40 touch:size-11";
@@ -359,7 +361,7 @@ function PlaybackBar({ steps, index, onSeek, following, live, onBack, disabled }
         disabled={!stepping}
         label={w("Step", "步骤", "步驟")}
         valueText={(at) => {
-          const title = stepTitle(steps[at], w);
+          const title = stepTitle(steps[at], w, labels);
           return w(`Step ${at + 1} of ${count}: ${title}`, `第 ${at + 1} 步，共 ${count} 步：${title}`, `第 ${at + 1} 步，共 ${count} 步：${title}`);
         }}
       />
@@ -391,6 +393,7 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
   focus: ComputerFocus | null;
 }) {
   const w = useWords();
+  const labels = useContext(McpLabelsContext);
   const browser = useAgentBrowser();
   const [open, setOpen] = useState(false);
 
@@ -463,13 +466,13 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
 
   const { tab } = browser;
   const browserName = tab?.title || tab?.url || w("Browser", "浏览器", "瀏覽器");
-  const name = holding || !call ? browserName : stepTitle(call, w);
+  const name = holding || !call ? browserName : stepTitle(call, w, labels);
   // The step rendered in the window (null: the live browser).
   const step = liveBrowser || !call || !shown ? null : { calls: shown.calls, call };
   let tabs: WindowTab[];
   let address: string | null;
   if (step) {
-    const chrome = stepChrome(step.call, w);
+    const chrome = stepChrome(step.call, w, labels);
     tabs = [{ id: step.call.id, label: chrome.tab }];
     address = chrome.address;
   } else {

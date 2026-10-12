@@ -344,6 +344,81 @@ def _skills(conn: sqlite3.Connection) -> None:
                  (json.dumps(groups),))
 
 
+def _mcp(conn: sqlite3.Connection) -> None:
+    """MCP connector tables, then every legacy `<workspace>/.agent-platform/mcp.json` as personal local connectors (idempotent)."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS mcp_connectors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope TEXT NOT NULL CHECK(scope IN ('org', 'personal')),
+    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    transport TEXT NOT NULL CHECK(transport IN ('http', 'sse', 'stdio')),
+    url TEXT NOT NULL DEFAULT '',
+    command TEXT NOT NULL DEFAULT '',
+    args_json TEXT NOT NULL DEFAULT '[]',
+    cwd TEXT NOT NULL DEFAULT '',
+    env_keys_json TEXT NOT NULL DEFAULT '[]',
+    header_keys_json TEXT NOT NULL DEFAULT '[]',
+    auth TEXT NOT NULL DEFAULT 'none' CHECK(auth IN ('none', 'headers', 'oauth')),
+    credential_mode TEXT NOT NULL DEFAULT 'shared' CHECK(credential_mode IN ('shared', 'per_user')),
+    oauth_json TEXT NOT NULL DEFAULT '{}',
+    groups_json TEXT NOT NULL DEFAULT '["*"]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    disabled_tools_json TEXT NOT NULL DEFAULT '[]',
+    source_json TEXT NOT NULL DEFAULT '{"kind":"manual"}',
+    timeout_s INTEGER NOT NULL DEFAULT 120,
+    created_by INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+)""")
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_connectors_identity ON mcp_connectors(scope, COALESCE(owner_user_id, 0), name)')
+    conn.execute("""CREATE TABLE IF NOT EXISTS mcp_secrets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connector_id INTEGER NOT NULL REFERENCES mcp_connectors(id) ON DELETE CASCADE,
+    user_id INTEGER,
+    kind TEXT NOT NULL CHECK(kind IN ('header', 'env', 'oauth_tokens', 'oauth_client')),
+    name TEXT NOT NULL,
+    value TEXT NOT NULL,
+    issuer TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+)""")
+    # SQLite treats NULL users (shared) as distinct, so uniqueness is enforced on the coalesced owner.
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_secrets_identity ON mcp_secrets(connector_id, COALESCE(user_id, 0), kind, name)')
+    conn.execute("""CREATE TABLE IF NOT EXISTS mcp_channel_connectors (
+    channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    connector_id INTEGER NOT NULL REFERENCES mcp_connectors(id) ON DELETE CASCADE,
+    enabled_by INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY(channel_id, connector_id)
+)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS mcp_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at INTEGER NOT NULL,
+    user_id INTEGER,
+    scope_key TEXT NOT NULL,
+    connector_id INTEGER NOT NULL,
+    connector_name TEXT NOT NULL DEFAULT '',
+    tool TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ok', 'error', 'cancelled', 'timeout')),
+    duration_ms INTEGER NOT NULL
+)""")
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_mcp_calls_connector ON mcp_calls(connector_id, id)')
+    conn.execute("""CREATE TABLE IF NOT EXISTS mcp_catalog_cache (
+    connector_id INTEGER NOT NULL REFERENCES mcp_connectors(id) ON DELETE CASCADE,
+    user_id INTEGER,
+    server_json TEXT NOT NULL,
+    tools_json TEXT NOT NULL,
+    prompts_json TEXT NOT NULL,
+    resources_json TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+)""")
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_catalog_identity ON mcp_catalog_cache(connector_id, COALESCE(user_id, 0))')
+    data_dir = getattr(conn, 'data_dir', None)
+    if data_dir is not None:
+        from .mcp.imports import import_legacy_workspaces
+        import_legacy_workspaces(conn, data_dir)
+
+
 # (version, name, SQL statements or a callable taking the open connection). Append only; versions must increase.
 _MIGRATIONS = (
     (2026100101, 'drop-pre-pi-rollback-compat', (
@@ -414,6 +489,7 @@ _MIGRATIONS = (
         'CREATE INDEX IF NOT EXISTS idx_artifacts_scope ON artifacts(scope_type, scope_id, updated_at)',
         'CREATE INDEX IF NOT EXISTS idx_artifact_versions_job ON artifact_versions(job_id)',
     )),
+    (2026101501, 'mcp', _mcp),
 )
 
 

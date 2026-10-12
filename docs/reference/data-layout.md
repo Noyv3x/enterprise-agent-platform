@@ -58,7 +58,7 @@ remain persistent and sandboxes restart on demand.
 
 Personal `user-<id>` and channel `channels/channel-<id>` workspaces mount at `/workspace`. Chat workspace ID `chat-user-<id>` mounts `workspaces/chat/user-<id>` there; each conversation sets cwd to `/workspace/<conversation_id>`. One chat sandbox serves each user, not each conversation. File tools restrict the conversation directory; bash can reach that user's other chat files.
 
-Workspace memory is `AGENTS.md`. Personal and channel skills use `.agent-platform/skills/<name>/SKILL.md` (agent profile only; chat has no workspace skills). `.agent-platform/skills-archive/` holds skills the sandbox safety net displaced; it is never discovered or deleted. MCP uses `.agent-platform/mcp.json` and `.agent-platform/mcp/<server>/`. No dedicated memory/skill state system is active.
+Workspace memory is `AGENTS.md`. Personal and channel skills use `.agent-platform/skills/<name>/SKILL.md` (agent profile only; chat has no workspace skills). `.agent-platform/skills-archive/` holds skills the sandbox safety net displaced; it is never discovered or deleted. Local MCP servers are personal connectors stored in Platform's database (see [integrations](../design/integrations.md)); a workspace `.agent-platform/mcp.json` is only an import source and is never read at run time. Manager keeps MCP stdio channels in memory only: protocol frames are never written to disk, a connection id does not survive a sandbox stop or a Manager restart, and only the server's stderr reaches a redacted, capped log. No dedicated memory/skill state system is active.
 
 Persistent home and environment mount at `/home/agent` and `/opt/agent-env`. Every sandbox profile, agent and chat, also mounts `<data_root>/data/skills/org` read-only at `/opt/agent-platform/skills/org`. Manager creates it with mode 0755 (owned by the deployment identity) before creating the sandbox; Platform writes organization skills there world-readable (directories 0755, files 0644, executables 0755). Built-in skills are not a mount: the sandbox image bakes them, root-owned and world-readable, at `/opt/agent-platform/skills/builtin`, and scripts run in place. The paths come from `container_paths` in the container contract (`skills_builtin`, `skills_org`). Agent attachment mounts remain scope-specific and read-only. Chat has no attachment mount: Platform copies uploads into its conversation directory. Database attachment paths remain relative; downloads require ownership and path validation.
 
@@ -80,8 +80,9 @@ Manager binds profile and workspace at sandbox creation; omitted `execution_cont
 | `sandbox_chat_cpus` / `sandbox_chat_pids_limit` | `"1"` / `256` |
 | `sandbox_chat_idle` | `"3m"` |
 | `background_process_limit` / `background_process_global_limit` | `16` / `128` |
+| `mcp_connection_limit` / `mcp_connection_global_limit` | `8` / `64` |
 
-Running background processes per owner and globally; excess starts return 409.
+Running background processes (and, separately, MCP stdio connections) per owner and globally; excess starts return 409.
 Process records live in `<manager state>/processes/index.json` (global `seq`, records) with each log at `processes/<id>/output.log` (capped at 8 MiB; `retained_from` in `output.from` after rotation). Finished processes are kept 7 days or the newest 200 per owner.
 
 Memory/CPU values are strings, PID limits integers and idle periods Go duration strings. Existing explicit `sandbox_idle` values remain unchanged. Callers cannot configure the profile's network or rebind an existing sandbox; executor audit receipts and process identity also bind the profile.

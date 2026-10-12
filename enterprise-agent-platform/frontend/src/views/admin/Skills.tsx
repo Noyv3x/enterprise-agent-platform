@@ -3,17 +3,17 @@ import { request, type AdminSkills, type BuiltinSkill, type OrgSkill } from '../
 import { Button } from '../../components/ui/beautiful/atoms/Button';
 import { SegmentedControl } from '../../components/ui/beautiful/atoms/SegmentedControl';
 import { Switch } from '../../components/ui/beautiful/atoms/Switch';
-import { ConfirmDialog, EmptyState, Field, Icon, MultiSelect, Notice } from '../../components/ui/beautiful/controls';
+import { ConfirmDialog, EmptyState, Icon, Notice } from '../../components/ui/beautiful/controls';
 import LoadingState from '../../components/ui/beautiful/primitives/LoadingState';
 import RecordsTable, { RecordStatus, RecordTag, RecordTagList, RecordsSearch, RecordsToolbar, type RecordColumn } from '../../components/ui/beautiful/primitives/RecordsTable';
 import { useWords } from '../../words';
 import { InstallDialog } from '../skills/InstallDialog';
 import { SkillSheet } from '../skills/SkillSheet';
 import { matches, useSkillLabels } from '../skills/skills';
+import { ALL_GROUPS as ALL, GroupAssignment } from './GroupAssignment';
 import { errorText, formatTime, useAdminLabels, useRecordsLabels, useResource } from './shared';
 
 type View = 'org' | 'builtin';
-const ALL = '*';
 const DANGER_BUTTON = 'bg-red-tint text-red-ink shadow-none hover:bg-red-tint hover:brightness-95';
 
 /** Admin → Skills: organization skills (install, assign to everyone or chosen permission groups, enable, update,
@@ -33,6 +33,7 @@ export function Skills() {
   const orgLabels = useRecordsLabels(w('Organization skills', '组织技能', '組織技能'));
   const builtinLabels = useRecordsLabels(w('Built-in skills', '内置技能', '內建技能'));
   const views: Record<View, string> = { org: w('Organization', '组织技能', '組織技能'), builtin: w('Built-in', '内置技能', '內建技能') };
+  const assignmentHints = useAssignmentHints();
 
   if (data.state !== 'ready' || !data.data) {
     return <div className="p-4 sm:p-6">
@@ -157,29 +158,18 @@ export function Skills() {
     <InstallDialog open={installing} onClose={() => setInstalling(false)} endpoint="/api/admin/skills"
       fields={{ groups: installGroups }} ready={installGroups.length > 0}
       onInstalled={(skill) => { setNotice({ tone: 'success', text: w(`${skill.name} is installed for the chosen groups.`, `已安装 ${skill.name}，所选权限组可以使用。`, `已安裝 ${skill.name}，所選權限群組可以使用。`) }); void data.reload(true); }}>
-      <GroupAssignment value={installGroups} onChange={setInstallGroups} groups={groups} />
+      <GroupAssignment value={installGroups} onChange={setInstallGroups} groups={groups} hints={assignmentHints} />
     </InstallDialog>
   </div>;
 }
 
-/** Everyone (`["*"]`) or chosen permission groups. */
-function GroupAssignment({ value, onChange, groups, disabled = false }: { value: string[]; onChange: (value: string[]) => void; groups: string[]; disabled?: boolean }) {
+/** The assignment copy for a skill. */
+function useAssignmentHints() {
   const w = useWords();
-  const admin = useAdminLabels();
-  const everyone = w('Everyone', '所有人', '所有人');
-  const chosen = w('Chosen groups', '指定权限组', '指定權限群組');
-  const all = value.includes(ALL);
-  // Groups the skill names that no longer exist stay visible so the administrator can remove them.
-  const options = Array.from(new Set([...groups, ...value.filter((group) => group !== ALL)]));
-  return <Field group label={w('Available to', '可使用的权限组', '可使用的權限群組')}
-    error={!all && value.length === 0 ? w('Choose at least one group.', '请至少选择一个权限组。', '請至少選擇一個權限群組。') : undefined}
-    hint={all ? w('Every account can use this skill.', '所有账户都可以使用这个技能。', '所有帳戶都可以使用這個技能。') : w('Only accounts in these groups can use this skill.', '只有这些权限组的账户可以使用这个技能。', '只有這些權限群組的帳戶可以使用這個技能。')}>
-    <SegmentedControl options={[everyone, chosen]} value={all ? everyone : chosen} className="w-full touch:h-11"
-      onChange={(label) => { if (!disabled) onChange(label === everyone ? [ALL] : []); }} />
-    {!all && <MultiSelect values={value} disabled={disabled} placeholder={w('Choose permission groups', '选择权限组', '選擇權限群組')}
-      aria-label={w('Permission groups', '权限组', '權限群組')}
-      options={options.map((group) => ({ value: group, label: admin.group(group) }))} onChange={onChange} />}
-  </Field>;
+  return {
+    everyone: w('Every account can use this skill.', '所有账户都可以使用这个技能。', '所有帳戶都可以使用這個技能。'),
+    chosen: w('Only accounts in these groups can use this skill.', '只有这些权限组的账户可以使用这个技能。', '只有這些權限群組的帳戶可以使用這個技能。'),
+  };
 }
 
 /** One organization skill: its assignment and switch (saved together), update from its link, delete. */
@@ -192,6 +182,7 @@ function OrgSkillSheet({ skill, groups, onClose, onChanged, onDeleted }: {
 }) {
   const w = useWords();
   const labels = useSkillLabels();
+  const assignmentHints = useAssignmentHints();
   const formId = useId();
   const [assigned, setAssigned] = useState<string[]>(skill.groups);
   const [enabled, setEnabled] = useState(skill.enabled);
@@ -231,7 +222,7 @@ function OrgSkillSheet({ skill, groups, onClose, onChanged, onDeleted }: {
     </>}>
       <form id={formId} noValidate className="flex flex-col gap-4 rounded-card bg-surface p-4 shadow-card" onSubmit={(event) => { event.preventDefault(); if (dirty && assigned.length) void save(); }}>
         {error && error.kind !== 'delete' && <Notice tone="danger" title={error.kind === 'update' ? w('The skill was not updated', '技能未更新', '技能未更新') : w('The change was not saved', '更改未保存', '變更未儲存')}>{error.text}</Notice>}
-        <GroupAssignment value={assigned} onChange={setAssigned} groups={groups} disabled={busy !== null} />
+        <GroupAssignment value={assigned} onChange={setAssigned} groups={groups} disabled={busy !== null} hints={assignmentHints} />
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <div className="text-[12.5px] font-medium text-ink">{w('Enabled', '启用', '啟用')}</div>
