@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { request } from "../../api";
+import { request, type SkillList, type SkillView } from "../../api";
 import PromptBar, { clipboardFiles, type PromptCommand, type PromptSendOption } from "../../components/ui/beautiful/primitives/PromptBar";
 import { useWords } from "../../words";
 import { formatBytes } from "./Attachments";
@@ -41,13 +41,16 @@ export interface ComposerProps {
   inserting?: boolean;
   pendingInputs?: number;
   commands?: ComposerCommand[];
+  /** the skill catalog (`GET /api/skills?scope=…`) the `/` menu lists next to `commands`: `private`, `chat` or
+   * `channel-<id>`; picking a skill puts `/<name> ` at the start of the message */
+  skillScope?: string;
   placeholder: string;
   /** applied whenever `seed.n` changes */
   seed?: ComposerSeed | null;
 }
 
 export function Composer({
-  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], placeholder, seed,
+  ensureScope, onSend, working = false, onStop, queued = 0, inserting = false, pendingInputs = 0, commands = [], skillScope, placeholder, seed,
 }: ComposerProps) {
   const w = useWords();
   const [text, setText] = useState("");
@@ -55,8 +58,25 @@ export function Composer({
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState("");
+  const [skills, setSkills] = useState<SkillView[]>([]);
   const nextKey = useRef(0);
   const input = useRef<HTMLTextAreaElement>(null);
+
+  // Without the catalog the menu still offers the commands; Platform reads `/name` whether or not it was picked here.
+  useEffect(() => {
+    setSkills([]);
+    if (!skillScope) return;
+    let current = true;
+    request<SkillList>(`/api/skills?scope=${encodeURIComponent(skillScope)}`)
+      .then((list) => { if (current) setSkills(list.skills.filter((skill) => skill.enabled)); })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [skillScope]);
+  const skillTag = w("Skill", "技能", "技能");
+  const menu: PromptCommand[] = [
+    ...commands,
+    ...skills.map((skill) => ({ key: `skill:${skill.key}`, name: `/${skill.name}`, desc: skill.description, insert: `/${skill.name} `, leading: true, tag: skillTag })),
+  ];
 
   useEffect(() => {
     if (!seed) return;
@@ -175,7 +195,7 @@ export function Composer({
       }))}
       onAttach={upload}
       onRemoveAttachment={(key) => setUploads((current) => current.filter((item) => item.key !== key))}
-      commands={commands}
+      commands={menu}
       onCommand={(key) => commands.find((command) => command.key === key)?.run()}
       canSend={canSend}
       onSend={(option) => void submit(option === "after_turn" ? "after_turn" : undefined)}
@@ -191,8 +211,10 @@ export function Composer({
         chooseModel: w("Model", "模型", "模型"),
         send: w("Send", "发送", "傳送"),
         stop: w("Stop", "停止", "停止"),
-        commandsHint: w("Commands", "命令", "命令"),
-        noMatches: (query) => w(`No commands match “${query}”`, `没有匹配“${query}”的命令`, `沒有符合「${query}」的命令`),
+        commandsHint: skills.length ? w("Commands and skills", "命令和技能", "命令和技能") : w("Commands", "命令", "命令"),
+        noMatches: (query) => skills.length
+          ? w(`No commands or skills match “${query}”`, `没有匹配“${query}”的命令或技能`, `沒有符合「${query}」的命令或技能`)
+          : w(`No commands match “${query}”`, `没有匹配“${query}”的命令`, `沒有符合「${query}」的命令`),
         dropFiles: w("Drop files to attach", "松开以添加附件", "放開以新增附件"),
         sendOptions: w("Send options", "发送方式", "傳送方式"),
       }}

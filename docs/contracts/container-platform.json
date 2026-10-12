@@ -2,12 +2,14 @@
   "schema_version": 2,
   "policy": "container-platform",
   "release_channel": "main",
-  "database_schema_version": 2026101201,
+  "database_schema_version": 2026101301,
   "container_paths": {
     "data_root": "/var/lib/agent-platform",
     "workspace": "/workspace",
     "agent_home": "/home/agent",
-    "agent_env": "/opt/agent-env"
+    "agent_env": "/opt/agent-env",
+    "skills_builtin": "/opt/agent-platform/skills/builtin",
+    "skills_org": "/opt/agent-platform/skills/org"
   },
   "execution_targets": [
     "sandbox"

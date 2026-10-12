@@ -4,11 +4,13 @@ package contract
 const (
 	SchemaVersion                    = 2
 	ReleaseChannel                   = "main"
-	DatabaseSchemaVersion            = 2026101201
+	DatabaseSchemaVersion            = 2026101301
 	ContainerDataRoot                = "/var/lib/agent-platform"
 	ContainerWorkspace               = "/workspace"
 	ContainerAgentHome               = "/home/agent"
 	ContainerAgentEnv                = "/opt/agent-env"
+	ContainerSkillsBuiltin           = "/opt/agent-platform/skills/builtin"
+	ContainerSkillsOrg               = "/opt/agent-platform/skills/org"
 	SandboxIdleSeconds               = 1800
 	MigrationBackupRetentionSeconds  = 604800
 	ObsoleteArtifactRetentionSeconds = 3600

@@ -26,10 +26,17 @@ Secret files and Manager state remain owner-only. The database's secret flag is 
 
 ## Files and untrusted content
 
-Resolve tool paths within the allowed workspace (chat file tools: conversation directory). Validate ownership and resolved paths for downloads, previews and `MEDIA: /workspace/<path>` output; a model-written path is not authorization. Bundled `/platform-skills/` content is read-only.
+Resolve tool paths within the allowed workspace (chat file tools: conversation directory). Validate ownership and resolved paths for downloads, previews and `MEDIA: /workspace/<path>` output; a model-written path is not authorization. Built-in and organization skill directories are read-only in sandboxes.
 
 Attachments, websites, browser pages, MCP output and workspace instructions may contain hostile instructions. They do not grant host capabilities or change authenticated ownership. Do not claim heuristic text scanning, model obedience or a confirmation dialog is an isolation boundary.
 
+## Installed skills
+
+A skill is instructions plus scripts that the AI follows with the user's own sandbox capabilities; installing one grants no host capability, but it can steer the AI, so installed skills are as untrusted as other workspace instructions. Personal and channel skills live in the tenant workspace and are tenant-writable. Organization skills are written only by Platform for administrators (`system_settings`), are mounted read-only and are the one tier that is shared across users; built-in skills ship in the image, root-owned and world-readable.
+
+The sandbox skills safety net runs as root at agent-sandbox start, on directories the tenant controls (workspace and home). It therefore opens each trusted root and descends one component at a time with `O_NOFOLLOW`, skips any path that crosses a symlink, performs every mkdir, rename, link and ownership change relative to those directory file descriptors, copies links as links when moving across mounts, only handles real directories, and moves displaced skills to `.agent-platform/skills-archive/` instead of deleting them. Its links and moves stay inside the tenant's own workspace and home mounts, so it grants no new access; the chat profile is excluded.
+
+Installing, updating or removing a personal or channel skill, by the user or by the AI's `skill` tool, requires the acting user's `install_extensions` permission, checked server-side from the live permission group; without it personal skills are also not loaded into the catalog. Administrators always hold it. Downloads use the web-fetch SSRF rules (public addresses only, redirects re-validated, connections pinned to the checked address, streamed with a size cap) and archives are extracted by Platform with path-confinement, no links or devices, and file-count and size limits; the install never executes anything. Skill APIs authorize by owner: a personal skill is reachable only by its owner and a channel skill only by users who may read the channel.
 ## Web and browser
 
 Web fetch accepts public HTTP(S) destinations only, with address checks repeated on every redirect, bounded time/response size and safe HTML extraction. Reject local/private/link-local destinations and unsafe schemes. Search results are untrusted URLs, not permission to access internal services. Chat web tools run through Platform; chat bash has no network.

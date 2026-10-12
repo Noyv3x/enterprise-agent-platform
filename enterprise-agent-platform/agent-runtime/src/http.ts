@@ -3,7 +3,7 @@ import { createServer as nodeCreateServer, type IncomingMessage, type ServerResp
 import type { Runtime } from './runtime.js';
 
 type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
-const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait'];
+const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait', 'skill'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
   return Object.assign(new Error(message), { status });
@@ -35,7 +35,7 @@ function validateRun(value: unknown): asserts value is Parameters<Runtime['start
   validateModel(model);
   validatePrompt(prompt);
   if (value.context_prefix !== undefined && typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
-  if (!object(resources) || typeof resources.system_prompt !== 'string' || !Array.isArray(resources.skills) || !resources.skills.every(skill => object(skill) && text(skill.name) && typeof skill.description === 'string' && text(skill.path)) || (resources.agents_md !== null && resources.agents_md !== undefined && (!object(resources.agents_md) || !text(resources.agents_md.path) || typeof resources.agents_md.content !== 'string'))) throw failure(400, 'Invalid resources');
+  if (!object(resources) || typeof resources.system_prompt !== 'string' || !Array.isArray(resources.skills) || !resources.skills.every(skill => object(skill) && text(skill.name) && typeof skill.description === 'string' && text(skill.location)) || (resources.agents_md !== null && resources.agents_md !== undefined && (!object(resources.agents_md) || !text(resources.agents_md.path) || typeof resources.agents_md.content !== 'string'))) throw failure(400, 'Invalid resources');
   if (!Array.isArray(value.tools) || !value.tools.every(tool => typeof tool === 'string' && tools.includes(tool))) throw failure(400, 'Invalid tools');
 }
 function json(response: ServerResponse, status: number, value: unknown): void {

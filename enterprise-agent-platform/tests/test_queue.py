@@ -18,6 +18,7 @@ from enterprise_agent_platform.db import Database, now
 from policy_support import set_default_policy
 from enterprise_agent_platform.auth import issue_session, public_user
 from enterprise_agent_platform.queue import Queue, _WorkTrace, authenticated_events, routes
+from enterprise_agent_platform.skills import Skills
 
 
 class Gate:
@@ -175,7 +176,8 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(200, json={"ok": True})
 
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(runtime))
-        self.p = SimpleNamespace(db=db, http=self.http, gate=Gate(), files=Files(), settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test"))
+        self.p = SimpleNamespace(db=db, http=self.http, gate=Gate(), files=Files(), settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test", builtin_skills_dir=root / "builtin"))
+        self.p.skills = Skills(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}, {"id": "model-b"}]}))
         self.q = self.p.queue = Queue(self.p)
         self.user = self.q.user(1)
@@ -1774,6 +1776,69 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.q.start()
         await self.drain()
         self.assertEqual([r["prompt"]["text"] for r in self.requests], ["durable content"])
+
+    def write_builtin_skill(self, name, extra=""):
+        folder = self.p.settings.builtin_skills_dir / name
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Does {name} things\n{extra}---\nbody\n")
+
+    @staticmethod
+    def invoked(name):
+        directory = f"/opt/agent-platform/skills/builtin/{name}"
+        return (f'[The user invoked the "{name}" skill. Read {directory}/SKILL.md first and follow it; '
+                f"resolve its relative paths against {directory}.]")
+
+    async def test_explicit_skill_invocation_prefixes_the_first_prompt_and_inserted_inputs(self):
+        self.write_builtin_skill("alpha")
+        self.write_builtin_skill("quiet", "disable-model-invocation: true\n")
+        stream = self.streams["r1"] = ControlledStream()
+        self.hold.clear()
+        parent = await self.q.enqueue(self.user, "private", "/alpha build it")
+        await asyncio.wait_for(self.run_started.wait(), 2)
+        inserted = [await self.q.enqueue(self.user, "private", text) for text in ("/quiet and then this", "/not-a-skill keep as is")]
+        self.hold.set()
+        await asyncio.wait_for(stream.started.wait(), 2)
+        self.assertEqual(self.requests[0]["prompt"]["text"], self.invoked("alpha") + "\nbuild it")
+        self.assertEqual([body["prompt"]["text"] for path, body in self.steers],
+                         [self.invoked("quiet") + "\nand then this", "/not-a-skill keep as is"])
+        # The hidden skill is invocable but not advertised.
+        self.assertEqual([skill["name"] for skill in self.requests[0]["resources"]["skills"]], ["alpha"])
+        self.assertEqual(self.requests[0]["resources"]["skills"][0]["location"], "/opt/agent-platform/skills/builtin/alpha/SKILL.md")
+        await stream.send(*[{"type": "input_delivered", "input_id": str(item["job_id"])} for item in inserted])
+        stream.finish()
+        await self.drain()
+        # What the user sees is exactly what they typed.
+        self.assertEqual([m["content"] for m in self.q.messages(self.user, "private")["messages"]],
+                         ["/alpha build it", "/quiet and then this", "/not-a-skill keep as is", "answer"])
+        self.assertEqual(parent["message"]["content"], "/alpha build it")
+
+    async def test_runs_advertise_the_skill_tool_and_the_guidance_by_scope(self):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',1)")
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('c1',1,'t','now','now')")
+        self.write_builtin_skill("alpha")
+        for scope in ("private", "channel-3", "chat-c1"):
+            await self.q.enqueue(self.user, scope, "hello")
+            await self.drain()
+        private, channel, chat = self.requests
+        self.assertIn("skill", private["tools"])
+        self.assertIn("mcp", private["tools"])
+        self.assertIn("skill", channel["tools"])
+        self.assertNotIn("mcp", channel["tools"])
+        self.assertNotIn("skill", chat["tools"])
+        for request in (private, channel):
+            prompt = request["resources"]["system_prompt"]
+            self.assertIn("Agent Skills format", prompt)
+            self.assertIn("only with the `skill` tool", prompt)
+            self.assertIn("one plain sentence, in their language", prompt)
+            self.assertIn(".claude/skills", prompt)
+        self.assertIn("/workspace/.agent-platform/mcp.json", private["resources"]["system_prompt"])
+        self.assertIn('"mcpServers"', private["resources"]["system_prompt"])
+        self.assertIn("claude mcp add", private["resources"]["system_prompt"])
+        self.assertNotIn("mcp", channel["resources"]["system_prompt"].lower())
+        self.assertNotIn("Agent Skills", chat["resources"]["system_prompt"])
+        # Chat still gets the built-in catalog; it has no workspace skills.
+        self.assertEqual([skill["name"] for skill in chat["resources"]["skills"]], ["alpha"])
 
     async def test_resources_never_read_symlinks_or_symlinked_parents(self):
         info = self.q.scope(self.user, "private")

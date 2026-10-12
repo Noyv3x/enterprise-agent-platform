@@ -160,6 +160,7 @@ describe("routes", () => {
 
   it("parses every hash route and gates it by permission", () => {
     expect(parseRoute("#admin/usage")).toEqual({ view: "admin" });
+    expect(parseRoute("#settings/skills")).toEqual({ view: "settings" });
     expect(parseRoute("#chat-abc")).toEqual({ view: "chat", id: "abc" });
     expect(parseRoute("#chat")).toEqual({ view: "chat", id: null });
     expect(parseRoute("#channel-7")).toEqual({ view: "channel", id: 7 });

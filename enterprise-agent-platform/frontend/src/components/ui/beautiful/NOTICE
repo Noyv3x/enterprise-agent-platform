@@ -15,6 +15,7 @@ Layout
                   informational text uses ink-2 (≥ 4.5:1); `color-scheme` follows the `.dark` theme.
   atoms/          upstream components/atoms, with the `cn` import path and "use client" adjusted.
                   Switch and SegmentedControl use non-submit buttons so form settings change without submitting;
+                  Switch also takes `disabled` (a setting the account cannot change, or one being saved);
                   further component-specific accessibility adaptations are documented inline.
   primitives/     upstream components/primitives. Each primitive keeps upstream markup, class names, tokens,
                   radii and motion. Allowed adaptations: demo data and scripted timers replaced by props and

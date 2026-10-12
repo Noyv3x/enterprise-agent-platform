@@ -327,7 +327,7 @@ class Tasks:
                 "context_prefix": json.dumps({"time": datetime.now(timezone.utc).isoformat(),
                                               "user": user["display_name"], "tz": user["timezone"]}),
                 "resources": {"system_prompt": SUBAGENT_PROMPT.format(id=f"bg-{tid}", capability=CAPABILITY[row["agent_type"]]),
-                              "agents_md": None, "skills": []},
+                              "agents_md": None, "skills": self.p.skills.catalog(user, info)},
                 "tools": SUBAGENT_TOOLS[row["agent_type"]]})
             started = True
             run_id = self.runs[tid] = result["run_id"]

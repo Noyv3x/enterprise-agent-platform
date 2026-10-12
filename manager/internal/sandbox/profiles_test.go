@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Noyv3x/enterprise-agent-platform/manager/internal/driver"
 )
 
 func TestProfilesBindRecoverAndReapIndependently(t *testing.T) {
@@ -114,5 +116,39 @@ func TestRecoveryRejectsChangedChatProfile(t *testing.T) {
 	}
 	if _, err := Open(testActiveProfile, engine, data, state, image, "core", 10*time.Minute); err == nil {
 		t.Fatal("recovery accepted a chat workspace rebound to agent profile")
+	}
+}
+
+func TestEnsureMountsSharedOrganizationSkillsForEveryProfile(t *testing.T) {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	manager, err := Open(testActiveProfile, &sandboxEngine{}, data, filepath.Join(root, "manager", "sandboxes.json"), "sandbox@sha256:"+strings.Repeat("a", 64), "core", 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(data, "skills", "org")
+	for _, test := range []struct{ id, workspace, profile string }{
+		{"agent", "user-7", "agent"},
+		{"chat", "chat-user-7", "chat"},
+	} {
+		var spec driver.SandboxSpec
+		if test.profile == "chat" {
+			spec, err = manager.Ensure(context.Background(), test.id, test.workspace, time.Unix(1, 0), "chat")
+		} else {
+			spec, err = manager.Ensure(context.Background(), test.id, test.workspace, time.Unix(1, 0))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spec.OrgSkills != want || spec.Profile != test.profile {
+			t.Fatalf("%s spec: OrgSkills=%q Profile=%q", test.id, spec.OrgSkills, spec.Profile)
+		}
+	}
+	info, err := os.Lstat(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("organization skills directory mode = %v, want directory 0755", info.Mode())
 	}
 }

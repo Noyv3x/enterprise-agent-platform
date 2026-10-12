@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { readFile, realpath } from "node:fs/promises";
 import { posix as path } from "node:path";
 import { createReadTool, createEditTool, createWriteTool, createFindTool, createLsTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -13,7 +12,8 @@ export interface ToolDependencies {
   names: string[];
   executor: ExecutorTransport;
   gateway: GatewayTransport;
-  skillsDirectory?: string;
+  /** Whether the scope may use the `skill` gateway tool (personal or channel root run; never chat or subagents). */
+  skills?: boolean;
   /** Live bash output (sanitized by Manager), in order; the tool result stays authoritative. */
   output?: (toolCallId: string, text: string) => void;
   /** Personal bash only: subscribes to user input inserted into the run (fires at once when some is pending). */
@@ -86,10 +86,30 @@ const SCHEDULE_DESCRIPTION = [
   "Actions: list, get, create, update, pause, resume, delete, run_now and history (past runs); all but list and create need `schedule_id`.",
   "Timing (`schedule`): {type:\"once\", at:<RFC3339 time with offset or Z>}, {type:\"interval\", every_seconds:<n>} or {type:\"cron\", expression:<cron>}. Cron fires in `timezone`, an IANA name that defaults to the user's timezone.",
 ].join(" ");
+const SKILL_ROOT = "/opt/agent-platform/skills";
+const skillSchema = Type.Object({
+  action: Type.Union(["list", "info", "install", "update", "remove"].map(value => Type.Literal(value))),
+  name: Type.Optional(Type.String()), url: Type.Optional(Type.String()), path: Type.Optional(Type.String()), subpath: Type.Optional(Type.String()),
+  replace: Type.Optional(Type.Boolean()),
+  content: Type.Optional(Type.Object({ name: Type.String(), description: Type.String(), body: Type.String(), files: Type.Optional(Type.Record(Type.String(), Type.String())) })),
+});
+const SKILL_DESCRIPTION = [
+  "Manage Agent Skills (a folder with SKILL.md) for this workspace. Use it for every skill install, update, remove or save; never copy skills into .claude/skills, ~/.codex/skills, .agents/skills or any other product's directory.",
+  "Actions: list (visible skills with tier and source); info {name}; install with exactly one source: {url} (GitHub repo/tree/blob URL, .zip, .tar.gz, .skill or raw SKILL.md URL), {path} (workspace directory, zip or .skill file) or {content:{name,description,body,files?}}; optional {subpath} picks one skill from a multi-skill archive and {replace:true} overwrites an existing one; update {name} re-fetches a URL-installed skill; remove {name}.",
+  "To save a workflow you just carried out as a reusable skill, install with `content`: a lowercase hyphenated name, a description saying when to use it, and a body with the steps.",
+  "Users often paste install instructions written for Claude Code, Claude Desktop, Codex, Cursor, Gemini CLI or OpenCode. Do the same thing here with this tool instead of their commands or paths, and tell the user in one plain sentence, in their language, that the instructions were for another product and how you adapted them.",
+  "Installed skills are usable from the next message. Install, update and remove need the user's install permission.",
+].join(" ");
+const MCP_DESCRIPTION = [
+  "List configured MCP servers or call an MCP tool in the sandbox.",
+  "Servers are configured only in /workspace/.agent-platform/mcp.json, as {\"mcpServers\":{\"<id>\":{\"command\":\"<workspace path>\",\"args\":[],\"env\":{},\"cwd\":\"/workspace\"}}} (stdio servers; server ids are letters, digits, . _ -).",
+  "When the user pastes MCP setup written for another product (`claude mcp add`, `codex mcp add`, `.mcp.json`, ~/.claude.json, ~/.codex/config.toml, claude_desktop_config.json), write the equivalent server into that file instead, tell the user in one plain sentence, in their language, that the instructions were for another product and how you adapted them, and say plainly if a step cannot work here.",
+].join(" ");
 
 export function createTools(cwd: string, dependencies: ToolDependencies): ToolDefinition[] {
   const { sandbox, executor, gateway } = dependencies;
   const personal = sandbox.profile === "agent" && /^private:\d+$/.test(sandbox.scope_key);
+  const skillScope = dependencies.skills === true && sandbox.profile === "agent" && (personal || /^channel:\d+:/.test(sandbox.scope_key));
   const root = sandbox.profile === "chat" ? path.resolve(cwd) : "/workspace";
   if (!inside("/workspace", path.resolve(cwd))) throw new Error("Tool cwd must be inside /workspace");
   const calls = new AsyncLocalStorage<{ context: ToolContext; signal: AbortSignal | undefined; reads: Map<string, Promise<Buffer>> }>();
@@ -115,25 +135,20 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
     const call = current();
     return executor.file(sandbox, call.context, action, args, call.signal);
   }
-  async function skill(value: string): Promise<string | undefined> {
-    if (!value.startsWith("/platform-skills/")) return undefined;
-    if (sandbox.profile === "chat") throw new Error("Skills are unavailable in chat");
-    const directory = await realpath(dependencies.skillsDirectory ?? "/app/skills");
-    const resolved = await realpath(path.resolve(directory, value.slice("/platform-skills/".length)));
-    if (!inside(directory, resolved)) throw new Error("Skill path escapes bundled skills");
-    return resolved;
-  }
+  // Built-in and organization skills are read-only sandbox paths outside /workspace; only reads may reach them.
+  const skillPath = (value: string) => inside(SKILL_ROOT, path.resolve(cwd, value)) && path.resolve(cwd, value) !== SKILL_ROOT;
+  const skillGuard = (value: string) => `p=$(realpath -e -- ${quote(path.resolve(cwd, value))}) && case "$p" in ${quote(SKILL_ROOT)}/*) ;; *) exit 1;; esac`;
   function readRemote(value: string): Promise<Buffer> {
     const reads = current().reads;
     let result = reads.get(value);
     if (!result) { result = loadRemote(value); reads.set(value, result); }
     return result;
   }
-  async function binaryRemote(value: string, total: number): Promise<Buffer> {
+  async function binaryRemote(checkedPath: string, total: number): Promise<Buffer> {
     const chunks: Buffer[] = [];
     for (let offset = 0; offset < total; offset += 196_608) {
       const count = Math.min(196_608, total - offset);
-      const encoded = await checked(`${guard(value)} && test "$(stat -c %s -- "$p")" -eq ${total} && dd if="$p" bs=196608 iflag=skip_bytes,count_bytes skip=${offset} count=${count} status=none | base64 -w0`);
+      const encoded = await checked(`${checkedPath} && test "$(stat -c %s -- "$p")" -eq ${total} && dd if="$p" bs=196608 iflag=skip_bytes,count_bytes skip=${offset} count=${count} status=none | base64 -w0`);
       const bytes = Buffer.from(encoded, "base64");
       if (bytes.length !== count || bytes.toString("base64") !== encoded) throw new Error("Incomplete sandbox binary read");
       chunks.push(bytes);
@@ -141,8 +156,11 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
     return Buffer.concat(chunks, total);
   }
   async function loadRemote(value: string): Promise<Buffer> {
-    const bundled = await skill(value);
-    if (bundled) return readFile(bundled);
+    if (skillPath(value)) {
+      const total = Number((await checked(`${skillGuard(value)} && stat -c %s -- "$p"`)).trim());
+      if (!Number.isSafeInteger(total) || total < 0) throw new Error("Invalid skill file size");
+      return binaryRemote(skillGuard(value), total);
+    }
     const absolute = confined(value);
     const chunks: Buffer[] = [];
     let offset = 0;
@@ -156,7 +174,7 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
       total = result.details.total!;
       // Manager decodes each byte range separately, including split UTF-8.
       // Never let an unverified, clipped terminal buffer reach Pi's edit tool.
-      if (result.content.includes("\ufffd")) return binaryRemote(absolute, total);
+      if (result.content.includes("\ufffd")) return binaryRemote(guard(absolute), total);
       const bytes = Buffer.from(result.content);
       if (bytes.length !== returned || offset + returned > total) throw new Error("Incomplete sandbox file read");
       chunks.push(bytes);
@@ -167,8 +185,7 @@ export function createTools(cwd: string, dependencies: ToolDependencies): ToolDe
     return Buffer.concat(chunks, total);
   }
   const access = async (value: string) => {
-    const bundled = await skill(value);
-    if (bundled) return;
+    if (skillPath(value)) { await checked(skillGuard(value)); return; }
     await file("read", { path: confined(value), limit: 1 });
   };
   const writeRemote = async (value: string, content: string) => { await file("write", { path: confined(value), content }); };
@@ -239,7 +256,7 @@ exit "$s"`;
         return text(result.stdout.split("\n").slice(0, args.limit ?? 100).join("\n") || "No matches", { exit_code: result.exit_code });
       } } satisfies ToolDefinition<typeof grepSchema>,
   ];
-  function remote(name: string, tool: "web" | "browser" | "schedule" | "tasks", parameters: ToolDefinition["parameters"], action?: string, description = `Use the platform ${name} service.`, timeoutMs?: (params: Record<string, unknown>) => number): ToolDefinition {
+  function remote(name: string, tool: "web" | "browser" | "schedule" | "tasks" | "skills", parameters: ToolDefinition["parameters"], action?: string, description = `Use the platform ${name} service.`, timeoutMs?: (params: Record<string, unknown>) => number): ToolDefinition {
     return { name, label: name, description, parameters,
       execute: async (_id, input) => {
         const params = Parse(gatewayArguments, input);
@@ -270,6 +287,7 @@ exit "$s"`;
     tools.push(remote("job", "tasks", jobSchema, undefined, JOB_DESCRIPTION));
     tools.push(remote("wait", "tasks", waitSchema, "wait", WAIT_DESCRIPTION, params => (Math.min(typeof params.timeout === "number" ? params.timeout : WAIT_MAX_SECONDS, WAIT_MAX_SECONDS) + 30) * 1000));
   }
+  if (skillScope) tools.push(remote("skill", "skills", skillSchema, undefined, SKILL_DESCRIPTION, params => (params.action === "install" || params.action === "update" ? 210_000 : 120_000)));
   if (personal) {
     tools.push(remote("browser", "browser", Type.Object({
       action: Type.String({ description: "list, new_tab, navigate, snapshot, screenshot, close, click, type, scroll, back, forward, refresh, press, wait, links, images, downloads, stats, extract, viewport, cleanup" }),
@@ -288,7 +306,7 @@ exit "$s"`;
         Type.Object({ type: Type.Literal("cron"), expression: Type.String() }),
       ])),
     }), undefined, SCHEDULE_DESCRIPTION));
-    tools.push({ name: "mcp", label: "mcp", description: "List configured MCP servers or call an MCP tool in the sandbox.",
+    tools.push({ name: "mcp", label: "mcp", description: MCP_DESCRIPTION,
       parameters: mcpSchema,
       execute: async (_id, params) => {
         const result = await terminal(`/usr/local/bin/agent-platform-mcp ${quote(Buffer.from(JSON.stringify(params)).toString("base64url"))}`, 35_000,

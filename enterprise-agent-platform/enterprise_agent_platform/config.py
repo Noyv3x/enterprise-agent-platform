@@ -23,6 +23,7 @@ class Settings:
     frontend_dir: Path = Path(__file__).parent / 'static'
     host: str = '127.0.0.1'
     port: int = 8765
+    builtin_skills_dir: Path = Path('/opt/agent-platform/skills/builtin')
     deployment_mode: str = 'development'
 
     @property
@@ -61,5 +62,6 @@ class Settings:
             public_base_url=value('PUBLIC_BASE_URL', 'http://127.0.0.1:8080').rstrip('/'),
             trusted_proxy=value('TRUSTED_PROXY').lower() in ('1', 'true', 'yes'),
             host=value('HOST', '127.0.0.1'), port=int(value('PORT', '8765')),
+            builtin_skills_dir=Path(value('BUILTIN_SKILLS_DIR', '/opt/agent-platform/skills/builtin')),
             deployment_mode=value('DEPLOYMENT_MODE', 'development'),
         )

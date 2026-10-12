@@ -20,7 +20,7 @@ test('actual Codex payload preserves cache affinity, instructions and resource u
   faux.setResponses(Array.from({length:5},()=> (context:TranscriptContext,options:SimpleStreamOptions|undefined)=>{
     captures.push({context:structuredClone(context),options});return fauxAssistantMessage('A stable answer');
   }));
-  const config={home,platformUrl:'http://127.0.0.1:1',platformToken:'unused',executorSocket:join(home,'absent.sock'),executorToken:'unused',skillsDirectory:join(home,'skills'),modelRuntimeFactory:async()=>models};
+  const config={home,platformUrl:'http://127.0.0.1:1',platformToken:'unused',executorSocket:join(home,'absent.sock'),executorToken:'unused',modelRuntimeFactory:async()=>models};
   let runtime=new Runtime(config);
   let server=createServer(runtime,'secret');
   server.listen(0,'127.0.0.1');await once(server,'listening');

@@ -94,7 +94,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
         self.assertEqual(settings, {'keep', 'model_policies_v1'})
-        self.assertEqual(db.schema_version(), 2026101201)
+        self.assertEqual(db.schema_version(), 2026101301)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -107,10 +107,10 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026101201)
+        self.assertEqual(self.db.schema_version(), 2026101301)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201])
+                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301])
 
     def test_background_tasks_migration_is_additive_idempotent_and_constrained(self):
         import sqlite3
@@ -122,7 +122,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101101')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026101201)
+        self.assertEqual(db.schema_version(), 2026101301)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0]
@@ -230,7 +230,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(slots, {'personal': ('admin-model', 'off'), 'channel': ('admin-model', 'off'), 'worker': ('admin-model', 'off'),
                                  'chat': ('admin-chat', 'off'), 'scout': ('admin-chat', 'off')})
         self.assertEqual(users, {1: 'default', 2: 'default', 3: 'default', 4: 'default'})
-        self.assertEqual(db.schema_version(), 2026101201)
+        self.assertEqual(db.schema_version(), 2026101301)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101201').fetchone()[0]
@@ -265,6 +265,104 @@ class DatabaseTests(unittest.TestCase):
         with self.db.connect() as conn:
             conn.execute("INSERT INTO users(id,username,display_name,password_hash,created_at) VALUES(1,'new','new','hash',1)")
             self.assertEqual(conn.execute('SELECT model_policy FROM users').fetchone()[0], 'default')
+
+    def test_skills_migration_adds_install_extensions_to_personal_and_chat_groups_and_is_idempotent(self):
+        db = self.legacy_users_database('skills', [])
+        groups = [{'name': 'admin', 'permissions': ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings']},
+                  {'name': 'member', 'permissions': ['read_workspace', 'chat', 'private_agent']},
+                  {'name': 'chatter', 'permissions': ['chat']},
+                  {'name': 'agent-only', 'permissions': ['private_agent', 'read_workspace']},
+                  {'name': 'viewer', 'permissions': ['read_workspace']},
+                  {'name': 'done', 'permissions': ['chat', 'install_extensions']}]
+        with db.connect() as conn:
+            conn.execute('DROP TABLE skills')
+            conn.execute('DROP TABLE skill_preferences')
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101301')
+            conn.execute("INSERT INTO settings(key,value,secret,updated_at) VALUES('permission_groups_v1',?,0,1)", (json.dumps(groups),))
+        db.migrate(db.path.parent)
+
+        def stored():
+            with db.connect() as conn:
+                return {group['name']: group['permissions'] for group in json.loads(conn.execute("SELECT value FROM settings WHERE key='permission_groups_v1'").fetchone()[0])}
+        after = stored()
+        self.assertEqual(after['admin'][-1], 'install_extensions')
+        self.assertEqual(after['member'], ['read_workspace', 'chat', 'private_agent', 'install_extensions'])
+        self.assertEqual(after['chatter'], ['chat', 'install_extensions'])
+        self.assertEqual(after['agent-only'], ['private_agent', 'read_workspace', 'install_extensions'])
+        self.assertEqual(after['viewer'], ['read_workspace'])
+        self.assertEqual(after['done'], ['chat', 'install_extensions'])
+        self.assertEqual(db.schema_version(), 2026101301)
+        before = self.shape(db)
+        with db.connect() as conn:
+            applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101301').fetchone()[0]
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101301')
+        db.migrate(db.path.parent)  # a forced re-run must not duplicate the permission
+        self.assertEqual(stored(), after)
+        self.assertEqual(self.shape(db), before)
+        with db.connect() as conn:
+            conn.execute("INSERT INTO skills(tier,owner_id,name,installed_at,updated_at) VALUES('org',NULL,'x',1,1)")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO skills(tier,owner_id,name,installed_at,updated_at) VALUES('org',NULL,'x',1,1)")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO skills(tier,owner_id,name,installed_at,updated_at) VALUES('builtin',NULL,'y',1,1)")
+        self.assertEqual(self.shape(self.db), before)
+
+    def test_skills_migration_also_grants_the_default_group_names(self):
+        db = self.legacy_users_database('names', [])
+        groups = [{'name': 'admin', 'permissions': ['read_workspace']}, {'name': 'manager', 'permissions': []},
+                  {'name': 'member', 'permissions': ['read_workspace']}, {'name': 'viewer', 'permissions': ['read_workspace']}]
+        with db.connect() as conn:
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101301')
+            conn.execute("INSERT INTO settings(key,value,secret,updated_at) VALUES('permission_groups_v1',?,0,1)", (json.dumps(groups),))
+        db.migrate(db.path.parent)
+        db.migrate(db.path.parent)
+        with db.connect() as conn:
+            stored = {g['name']: g['permissions'] for g in json.loads(conn.execute("SELECT value FROM settings WHERE key='permission_groups_v1'").fetchone()[0])}
+        self.assertEqual(stored, {'admin': ['read_workspace', 'install_extensions'], 'manager': ['install_extensions'],
+                                  'member': ['read_workspace', 'install_extensions'], 'viewer': ['read_workspace']})
+
+    def test_skills_migration_normalizes_hash_suffixed_skill_directories(self):
+        def skill(directory, dirname, name):
+            folder = directory / dirname
+            folder.mkdir(parents=True)
+            (folder / 'SKILL.md').write_text(f'---\nname: {name}\ndescription: d\n---\n')
+        base = self.root / 'data'
+        db = Database(base / 'platform.db')
+        db.migrate(base)
+        user = base / 'workspaces' / 'user-3' / '.agent-platform' / 'skills'
+        channel = base / 'workspaces' / 'channels' / 'channel-7' / '.agent-platform' / 'skills'
+        skill(user, 'html-presentations-56eb1e92', 'html-presentations')   # renamed
+        skill(user, 'other-0a1b2c3d', 'different-name')                    # frontmatter disagrees
+        skill(user, 'taken-11111111', 'taken')                             # target exists
+        skill(user, 'taken', 'taken')
+        skill(user, 'plain-dir', 'plain-dir')                              # no hash
+        skill(user, 'upper-abcdefgh', 'upper')                             # not 8 hex
+        skill(channel, 'shared-deadbeef', 'Shared')
+        outside = self.root / 'outside'
+        skill(outside, 'evil-12345678', 'evil')
+        (user / 'linked-aaaaaaaa').symlink_to(outside / 'evil-12345678', target_is_directory=True)
+        linked_ws = base / 'workspaces' / 'user-4'
+        (linked_ws / '.agent-platform').mkdir(parents=True)
+        (linked_ws / '.agent-platform' / 'skills').symlink_to(outside, target_is_directory=True)
+        with db.connect() as conn:
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101301')
+        db.migrate(base)
+        self.assertEqual(sorted(p.name for p in user.iterdir()),
+                         ['html-presentations', 'linked-aaaaaaaa', 'other-0a1b2c3d', 'plain-dir', 'taken', 'taken-11111111', 'upper-abcdefgh'])
+        self.assertEqual([p.name for p in channel.iterdir()], ['shared'])
+        self.assertTrue((outside / 'evil-12345678').is_dir())
+        self.assertFalse((outside / 'evil').exists())
+        with db.connect() as conn:
+            conn.execute('DELETE FROM schema_migrations WHERE version=2026101301')
+        db.migrate(base)  # idempotent
+        self.assertEqual(len(list(user.iterdir())), 7)
+
+    def test_skills_migration_without_stored_groups_leaves_the_defaults(self):
+        with self.db.connect() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM settings WHERE key='permission_groups_v1'").fetchone())
+        from enterprise_agent_platform.auth import DEFAULT_GROUPS
+        self.assertEqual({name: 'install_extensions' in perms for name, perms in DEFAULT_GROUPS.items()},
+                         {'admin': True, 'manager': True, 'member': True, 'viewer': False})
 
     def test_foreign_keys_and_rollback(self):
         import sqlite3

@@ -17,7 +17,7 @@ from starlette.routing import Route
 
 from .config import Settings
 from .db import Database
-from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks
+from . import auth, admin, oauth, queue, gates, tools, files, schedules, tasks, skills
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ class Platform:
         self.files = files.Files(self)
         self.queue = queue.Queue(self)
         self.tasks = tasks.Tasks(self)
+        self.skills = skills.Skills(self)
 
     async def scheduler(self):
         while True:
@@ -189,13 +190,13 @@ def create_app(settings=None):
             await platform.http.aclose()
 
     async def error(request, exc):
-        return JSONResponse({'error': exc.detail}, status_code=exc.status_code)
+        return JSONResponse({'error': exc.detail, **({'code': exc.code, **exc.payload} if isinstance(exc, skills.SkillError) else {})}, status_code=exc.status_code)
 
     async def malformed(request, exc):
         return JSONResponse({'error': 'Invalid JSON request'}, status_code=400)
 
     route_list = [Route('/healthz', health), Route('/api/bootstrap', bootstrap), Route('/api/channels', channels, methods=['GET', 'POST']), Route('/api/channels/{id:int}', channel, methods=['PATCH', 'DELETE'])]
-    for module in (auth, admin, oauth, queue, gates, tools, files, tasks):
+    for module in (auth, admin, oauth, queue, gates, tools, files, tasks, skills):
         route_list.extend(module.routes())
     route_list.append(Route('/{path:path}', static))
     app = Starlette(routes=route_list, lifespan=lifespan, exception_handlers={HTTPException: error, json.JSONDecodeError: malformed})

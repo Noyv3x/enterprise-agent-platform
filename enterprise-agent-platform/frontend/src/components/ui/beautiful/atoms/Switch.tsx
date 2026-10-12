@@ -2,10 +2,13 @@ export function Switch({
   checked,
   onChange,
   label,
+  disabled = false,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label?: string;
+  /** Adaptation: a setting the account cannot change, or one being saved. */
+  disabled?: boolean;
 }) {
   return (
     <button
@@ -14,9 +17,11 @@ export function Switch({
       role="switch"
       aria-checked={checked}
       aria-label={label}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`relative h-6 w-10 shrink-0 rounded-full transition-colors duration-200
         touch:before:absolute touch:before:-inset-x-1 touch:before:-inset-y-2.5
+        disabled:cursor-not-allowed disabled:opacity-50
         ${checked ? "bg-ink" : "bg-line-strong"}`}
     >
       <span

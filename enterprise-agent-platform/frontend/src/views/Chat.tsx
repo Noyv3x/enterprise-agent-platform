@@ -62,6 +62,7 @@ function NewChat({ userName }: { userName?: string }) {
               ensureScope={async () => `chat-${(await ensure()).id}`}
               onSend={send}
               placeholder={w("Ask anything…", "问点什么…", "問點什麼…")}
+              skillScope="chat"
             />
           </div>
         </div>

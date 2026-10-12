@@ -72,7 +72,7 @@ test("remote Pi tools audit exact operations and never forward host environment"
     const address = gatewayServer.address() as { port: number };
     const executor = createExecutorTransport({ socketPath: join(directory, "executor.sock"), token: "executor-secret" });
     const gateway = createGatewayTransport({ baseUrl: `http://127.0.0.1:${address.port}`, token: "gateway-secret" });
-    const dependencies = { sandbox, executor, gateway, context: () => ({ sid: "agent-private-1", scope_key: sandbox.scope_key, run_id: "run-1", owner_user_id: 1 }), names: ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "browser", "schedule", "mcp"], skillsDirectory: join(directory, "skills") };
+    const dependencies = { sandbox, executor, gateway, context: () => ({ sid: "agent-private-1", scope_key: sandbox.scope_key, run_id: "run-1", owner_user_id: 1 }), names: ["read", "write", "edit", "bash", "grep", "find", "ls", "web_search", "web_fetch", "browser", "schedule", "mcp"] };
     const tools = createTools("/workspace", dependencies);
     const foreground = createTools("/workspace", { ...dependencies, sandbox: delegate, names: ["bash"] });
     const invoke = async (name: string, args: Record<string, unknown>) => (name === "bash" ? foreground : tools).find(tool => tool.name === name)!.execute("call-1", args, undefined, undefined, {} as ExtensionToolContext);
@@ -109,13 +109,6 @@ test("remote Pi tools audit exact operations and never forward host environment"
     assert.equal(await executor.cancelRun(sandbox, "run-1"), true);
     const before = calls.length;
     await assert.rejects(invoke("read", { path: "/etc/passwd" }), /outside/);
-    await mkdir(join(directory, "skills", "demo"), { recursive: true });
-    await writeFile(join(directory, "skills", "demo", "SKILL.md"), "bundled skill");
-    assert.match(JSON.stringify(await invoke("read", { path: "/platform-skills/demo/SKILL.md" })), /bundled skill/);
-    await assert.rejects(invoke("write", { path: "/platform-skills/demo/SKILL.md", content: "no" }), /outside/);
-    await writeFile(join(directory, "outside"), "private");
-    await symlink(join(directory, "outside"), join(directory, "skills", "escape"));
-    await assert.rejects(invoke("read", { path: "/platform-skills/escape" }), /escapes/);
     assert.equal(calls.length, before);
     const chatTools = createTools("/workspace/conversation-a", { ...dependencies, sandbox: { ...sandbox, profile: "chat", scope_key: "chat:1" } });
     assert.equal(chatTools.some(tool => ["browser", "schedule", "mcp"].includes(tool.name)), false);
@@ -127,6 +120,65 @@ test("remote Pi tools audit exact operations and never forward host environment"
   } finally {
     executorServer.close(); gatewayServer.close();
     await Promise.all([once(executorServer, "close"), once(gatewayServer, "close")]);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("skill is a gateway tool for personal and channel root scopes only, skill roots are read-only, and mcp names its config", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-skill-tool-"));
+  const shell = promisify(execFile);
+  const gatewayCalls: { tool: string; action: string; args: Record<string, unknown>; scope: string }[] = [];
+  const filesCalled: string[] = [];
+  const executor: ExecutorTransport = {
+    ...noProcesses,
+    async terminal(_sandbox, _context, command) {
+      const { stdout } = await shell("bash", ["-c", command.replaceAll("/opt/agent-platform/skills", join(directory, "skills"))], { maxBuffer: 2_000_000 });
+      return { stdout, stderr: "", exit_code: 0, status: "completed" };
+    },
+    async file(_sandbox, _context, _action, args) { filesCalled.push(String(args.path)); return { content: "", details: { total: 0, returned: 0 } }; },
+    async cancelRun() { return true; },
+  };
+  const gateway = { async call(tool: string, action: string, args: Record<string, unknown>, context: { scope_key: string }) {
+    gatewayCalls.push({ tool, action, args, scope: context.scope_key });
+    return { content: "ok", data: { done: true }, is_error: false };
+  } } as unknown as Parameters<typeof createTools>[1]["gateway"];
+  const names = ["read", "write", "skill", "mcp"];
+  const build = (value: Sandbox, cwd = "/workspace", skills = true) => createTools(cwd, { sandbox: value, executor, gateway, skills, names, context: () => ({ sid: "s", scope_key: value.scope_key, run_id: "r" }) });
+  const channel: Sandbox = { ...sandbox, scope_key: "channel:7:main-agent" };
+  const chat: Sandbox = { ...sandbox, profile: "chat", scope_key: "chat:1" };
+  try {
+    assert.deepEqual(build(sandbox).map(tool => tool.name).sort(), ["mcp", "read", "skill", "write"]);
+    assert.deepEqual(build(channel).map(tool => tool.name).sort(), ["read", "skill", "write"]);
+    assert.deepEqual(build(chat, "/workspace/conversation-a").map(tool => tool.name).sort(), ["read", "write"]);
+    assert.deepEqual(build(sandbox, "/workspace", false).map(tool => tool.name).sort(), ["mcp", "read", "write"]);
+    const personal = build(sandbox);
+    const mcp = personal.find(tool => tool.name === "mcp")!;
+    assert.match(mcp.description, /\/workspace\/\.agent-platform\/mcp\.json/);
+    assert.match(mcp.description, /mcpServers/);
+    const skill = build(channel).find(tool => tool.name === "skill")!;
+    assert.match(skill.description, /\.claude\/skills/);
+    assert.match(skill.description, /another product|other product|Claude Code/);
+    const result = await skill.execute("call-1", { action: "install", content: { name: "my-flow", description: "Does the flow", body: "1. step" }, replace: true }, undefined, undefined, {} as ExtensionToolContext);
+    assert.equal(JSON.stringify(result.content), JSON.stringify([{ type: "text", text: "ok" }]));
+    await personal.find(tool => tool.name === "skill")!.execute("call-2", { action: "list" }, undefined, undefined, {} as ExtensionToolContext);
+    assert.deepEqual(gatewayCalls, [
+      { tool: "skills", action: "install", args: { content: { name: "my-flow", description: "Does the flow", body: "1. step" }, replace: true }, scope: "channel:7:main-agent" },
+      { tool: "skills", action: "list", args: {}, scope: "private:1" },
+    ]);
+
+    // Built-in and organization skills are readable from every profile, never writable, and never escape their root.
+    await mkdir(join(directory, "skills", "builtin", "demo"), { recursive: true });
+    await writeFile(join(directory, "skills", "builtin", "demo", "SKILL.md"), "skill body");
+    await writeFile(join(directory, "outside"), "private");
+    await symlink(join(directory, "outside"), join(directory, "skills", "builtin", "escape"));
+    for (const tools of [personal, build(chat, "/workspace/conversation-a")]) {
+      const read = tools.find(tool => tool.name === "read")!;
+      assert.match(JSON.stringify(await read.execute("r", { path: "/opt/agent-platform/skills/builtin/demo/SKILL.md" }, undefined, undefined, {} as ExtensionToolContext)), /skill body/);
+      await assert.rejects(read.execute("r", { path: "/opt/agent-platform/skills/builtin/escape" }, undefined, undefined, {} as ExtensionToolContext));
+      await assert.rejects(tools.find(tool => tool.name === "write")!.execute("w", { path: "/opt/agent-platform/skills/builtin/demo/SKILL.md", content: "no" }, undefined, undefined, {} as ExtensionToolContext), /outside/);
+    }
+    assert.deepEqual(filesCalled, []);
+  } finally {
     await rm(directory, { recursive: true, force: true });
   }
 });

@@ -17,6 +17,7 @@ for path in \
   containers/camofox.Dockerfile \
   containers/agent-sandbox.Dockerfile \
   containers/agent-sandbox-entrypoint.sh \
+  containers/agent-sandbox-skills.py \
   containers/compose.yaml \
   containers/compose.dev.yaml \
   containers/release-manifest.schema.json \

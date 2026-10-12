@@ -28,6 +28,7 @@ The account database supplies `~`; installer/Manager do not trust HOME/XDG overr
   data/
     platform.db{,-wal,-shm}
     attachments/
+    skills/org/<name>/            # organization skills, written by Platform
     upload-staging/
     workspaces/
       user-<id>/
@@ -56,9 +57,9 @@ remain persistent and sandboxes restart on demand.
 
 Personal `user-<id>` and channel `channels/channel-<id>` workspaces mount at `/workspace`. Chat workspace ID `chat-user-<id>` mounts `workspaces/chat/user-<id>` there; each conversation sets cwd to `/workspace/<conversation_id>`. One chat sandbox serves each user, not each conversation. File tools restrict the conversation directory; bash can reach that user's other chat files.
 
-Workspace memory is `AGENTS.md`. Enabled skills use `.agent-platform/skills/<name>/SKILL.md`. MCP uses `.agent-platform/mcp.json` and `.agent-platform/mcp/<server>/`. No dedicated memory/skill state system is active.
+Workspace memory is `AGENTS.md`. Personal and channel skills use `.agent-platform/skills/<name>/SKILL.md` (agent profile only; chat has no workspace skills). `.agent-platform/skills-archive/` holds skills the sandbox safety net displaced; it is never discovered or deleted. MCP uses `.agent-platform/mcp.json` and `.agent-platform/mcp/<server>/`. No dedicated memory/skill state system is active.
 
-Persistent home and environment mount at `/home/agent` and `/opt/agent-env`. Agent attachment mounts remain scope-specific and read-only. Chat has no attachment mount: Platform copies uploads into its conversation directory. Database attachment paths remain relative; downloads require ownership and path validation.
+Persistent home and environment mount at `/home/agent` and `/opt/agent-env`. Every sandbox profile, agent and chat, also mounts `<data_root>/data/skills/org` read-only at `/opt/agent-platform/skills/org`. Manager creates it with mode 0755 (owned by the deployment identity) before creating the sandbox; Platform writes organization skills there world-readable (directories 0755, files 0644, executables 0755). Built-in skills are not a mount: the sandbox image bakes them, root-owned and world-readable, at `/opt/agent-platform/skills/builtin`, and scripts run in place. The paths come from `container_paths` in the container contract (`skills_builtin`, `skills_org`). Agent attachment mounts remain scope-specific and read-only. Chat has no attachment mount: Platform copies uploads into its conversation directory. Database attachment paths remain relative; downloads require ownership and path validation.
 
 ## Sandbox profiles
 

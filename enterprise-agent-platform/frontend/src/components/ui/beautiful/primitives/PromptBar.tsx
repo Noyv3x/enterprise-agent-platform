@@ -4,7 +4,9 @@
  *   attach (+, paste, drag and drop) reports files to the caller, which owns uploads and chip state; paste reads
  *   the clipboard's file items (some browsers and apps leave `files` empty) and names unnamed images
  *   (`clipboardFiles`, also used by callers that accept pastes outside the textarea);
- *   `/` commands, the model list and send/stop come from props;
+ *   `/` commands, the model list and send/stop come from props; a command may insert text instead of running
+ *   (`insert`, listed only while its token starts the draft when `leading`) and carry a quiet `tag`; a long
+ *   command list scrolls inside the menu, keeping the active row in view;
  * - a stop control takes the dictation slot while the agent is working (send remains available for steering);
  * - send options (platform addition for steering): when the caller passes `sendOptions`, a chevron before send and
  *   a long press on send open a send-mode menu built like the model menu (pop-in above the composer, GlideMenu
@@ -69,7 +71,9 @@ function Icon({ children, size = 15, strokeWidth = 1.8 }: { children: ReactNode;
   );
 }
 
-export type PromptCommand = { key: string; name: string; desc: string };
+/** `insert` replaces the typed `/token` with that text instead of reporting `onCommand`; `leading` lists the command
+ * only while the token starts the draft; `tag` is a quiet label at the end of the row. */
+export type PromptCommand = { key: string; name: string; desc: string; insert?: string; leading?: boolean; tag?: string };
 export type PromptModel = { key: string; name: string; tag?: string };
 /** A way to send while the agent works; Enter and Alt+Enter each pick the option bound to them. */
 export type PromptSendOption = { key: string; label: string; shortcut: "enter" | "alt-enter" };
@@ -105,6 +109,12 @@ function parseSlash(draft: string): { query: string; start: number } | null {
   if (!match) return null;
   return { query: match[2].toLowerCase(), start: match.index + match[1].length };
 }
+
+/* The command list's height bounds: three rows at least, about nine at most. MENU_CHROME is the 8px gap above the
+ * composer plus the menu's padding and footer hint. */
+const LIST_MIN = 108;
+const LIST_MAX = 320;
+const MENU_CHROME = 52;
 
 export default function PromptBar({
   variant = "Rounded",
@@ -186,6 +196,7 @@ export default function PromptBar({
   const measureRef = useRef<HTMLSpanElement>(null);
   const modelRef = useRef<HTMLButtonElement>(null);
   const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const listScrollRef = useRef<HTMLDivElement>(null);
   const modelRowRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const glimmRef = useRef<HTMLCanvasElement>(null);
   const shaderRef = useRef<ShaderController | null>(null);
@@ -201,7 +212,7 @@ export default function PromptBar({
 
   const token = dismissed || commands.length === 0 ? null : parseSlash(draft);
   const query = token?.query ?? "";
-  const rows = token ? commands.filter((c) => c.name.slice(1).toLowerCase().startsWith(query)) : [];
+  const rows = token ? commands.filter((c) => (!c.leading || token.start === 0) && c.name.slice(1).toLowerCase().startsWith(query)) : [];
   const menuOpen = token !== null;
   const hasModels = models !== undefined;
   const selectedModel = models?.find((m) => m.key === model);
@@ -215,8 +226,30 @@ export default function PromptBar({
    * toggling its own background — matches the gliding pill in the nav */
   useLayoutEffect(() => {
     const target = rowRefs.current[active];
-    if (target) setRowBox({ top: target.offsetTop, height: target.offsetHeight });
+    if (!target) return;
+    setRowBox({ top: target.offsetTop, height: target.offsetHeight });
+    // Keep the active row inside the scrolling list without scrolling the page around it.
+    const list = listScrollRef.current;
+    if (!list) return;
+    if (target.offsetTop < list.scrollTop) list.scrollTop = target.offsetTop;
+    else if (target.offsetTop + target.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = target.offsetTop + target.offsetHeight - list.clientHeight;
   }, [menuOpen, query, active, rows.length]);
+
+  /* The menu grows up from the composer; a long list fits the room above it, up to the nearest scrolling or
+   * clipping ancestor (the transcript in an empty conversation), so its first rows are never cut off. */
+  const [listMax, setListMax] = useState(LIST_MAX);
+  useLayoutEffect(() => {
+    const anchor = composerAnchorRef.current;
+    if (!menuOpen || !anchor) return;
+    let top = 0;
+    for (let node = anchor.parentElement; node; node = node.parentElement) {
+      if (getComputedStyle(node).overflowY !== "visible") {
+        top = node.getBoundingClientRect().top;
+        break;
+      }
+    }
+    setListMax(Math.max(LIST_MIN, Math.min(LIST_MAX, anchor.getBoundingClientRect().top - top - MENU_CHROME)));
+  }, [menuOpen, wide]);
 
   /* same gliding highlight in the model menu — floats to the hovered
    * row, falling back to the currently-selected model */
@@ -360,9 +393,13 @@ export default function PromptBar({
   }, [modelOpen]);
 
   const pick = (row: PromptCommand) => {
-    onDraftChange(token ? draft.slice(0, token.start).trimEnd() : draft);
+    const before = token ? draft.slice(0, token.start) : draft;
     setDismissed(false);
-    onCommand?.(row.key);
+    if (row.insert !== undefined) onDraftChange(before + row.insert);
+    else {
+      onDraftChange(token ? before.trimEnd() : draft);
+      onCommand?.(row.key);
+    }
     inputRef.current?.focus();
   };
 
@@ -402,10 +439,12 @@ export default function PromptBar({
           className="absolute inset-x-0 bottom-full z-10 mb-2 rounded-[10px] bg-surface p-1 shadow-raised"
           style={{ animation: "pop-in 180ms cubic-bezier(0.23,1,0.32,1) both", transformOrigin: "bottom center" }}
         >
+          {/* a long list scrolls here; the gliding highlight scrolls with its rows */}
+          <div ref={listScrollRef} className="relative overflow-y-auto overscroll-contain" style={{ maxHeight: listMax }}>
           {/* single gliding highlight — appears once a row is hovered */}
           <span
             aria-hidden
-            className="pointer-events-none absolute inset-x-1 rounded-[6px] bg-hover"
+            className="pointer-events-none absolute inset-x-0 rounded-[6px] bg-hover"
             style={{
               top: rowBox?.top ?? 0,
               height: rowBox?.height ?? 0,
@@ -432,14 +471,16 @@ export default function PromptBar({
                 setEngaged(true);
               }}
               onClick={() => pick(row)}
-              className="relative z-10 flex h-9 w-full items-center gap-2.5 rounded-[6px] px-2 text-left pointer-coarse:h-11"
+              className="relative z-10 flex h-9 w-full items-center gap-2.5 rounded-[6px] px-2 text-left pointer-coarse:h-11 touch:h-11"
             >
               <span className="shrink-0 font-mono text-[12.5px] font-medium text-ink">
                 {row.name}
               </span>
               <span className="min-w-0 flex-1 truncate text-[12px] text-ink-2">{row.desc}</span>
+              {row.tag && <span className="shrink-0 text-[11px] text-ink-2">{row.tag}</span>}
             </button>
           ))}
+          </div>
           </div>
           {rows.length === 0 && (
             <div className="flex h-9 items-center px-2 text-[12px] text-ink-2">

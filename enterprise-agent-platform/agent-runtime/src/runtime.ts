@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ServerResponse } from 'node:http';
-import { createAgentSession, createExtensionRuntime, loadSkillsFromDir, SettingsManager, SessionManager, type AgentSession, type AgentSessionEvent, type ModelRuntime, type ResourceLoader } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, createExtensionRuntime, SettingsManager, SessionManager, type AgentSession, type AgentSessionEvent, type ModelRuntime, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import { createModelRuntime } from './credentials.js';
 import { sessionPath } from './session-path.js';
@@ -21,7 +21,7 @@ export interface RunRequest {
   model: {id:string; thinking:ThinkingLevel; contextWindow?:number; maxTokens?:number};
   prompt: {text:string; images?:{mime:string; data:string}[]};
   context_prefix?:string;
-  resources: {system_prompt:string; agents_md?:{path:string;content:string}|null; skills:{name:string;description:string;path:string}[]};
+  resources: {system_prompt:string; agents_md?:{path:string;content:string}|null; skills:{name:string;description:string;location:string}[]};
   tools:string[];
 }
 export interface SteerRequest {
@@ -30,7 +30,7 @@ export interface SteerRequest {
   context_prefix:string;
 }
 export interface RuntimeConfig {
-  home:string; platformUrl:string; platformToken:string; executorSocket:string; executorToken:string; skillsDirectory:string;
+  home:string; platformUrl:string; platformToken:string; executorSocket:string; executorToken:string;
   // Injecting a model runtime permits exercising the real Pi session with a faux provider.
   modelRuntimeFactory?: (modelId:string) => Promise<ModelRuntime>;
   // Foreground time before personal bash promotes a command to the background; tests shorten the 60 s default.
@@ -64,7 +64,7 @@ function loader(request:RunRequest):ResourceLoader {
   const resources = structuredClone(request.resources);
   return {
     getExtensions:()=>({extensions:[],errors:[],runtime}),
-    getSkills:()=>({skills:request.kind==='chat'?[]:resources.skills.map(s=>({name:s.name,description:s.description,filePath:s.path,baseDir:dirname(s.path),sourceInfo:{path:s.path,source:'platform',scope:'project' as const,origin:'top-level' as const},disableModelInvocation:false})),diagnostics:[]}),
+    getSkills:()=>({skills:resources.skills.map(s=>({name:s.name,description:s.description,filePath:s.location,baseDir:dirname(s.location),sourceInfo:{path:s.location,source:'platform',scope:'project' as const,origin:'top-level' as const},disableModelInvocation:false})),diagnostics:[]}),
     getPrompts:()=>({prompts:[],diagnostics:[]}), getThemes:()=>({themes:[],diagnostics:[]}),
     getAgentsFiles:()=>({agentsFiles:request.kind!=='agent'||!resources.agents_md?[]:[resources.agents_md]}),
     getSystemPrompt:()=>resources.system_prompt, getSystemPromptSource:()=>undefined,
@@ -83,9 +83,7 @@ export class Runtime {
   private executor;
   private gateway;
   private timer;
-  private bundled:RunRequest['resources']['skills'];
   constructor(private config:RuntimeConfig) {
-    this.bundled=loadSkillsFromDir({dir:config.skillsDirectory,source:'platform'}).skills.map(s=>({name:s.name,description:s.description,path:'/platform-skills/'+relative(config.skillsDirectory,s.filePath)}));
     this.executor=createExecutorTransport({socketPath:config.executorSocket,token:config.executorToken});
     this.gateway=createGatewayTransport({baseUrl:config.platformUrl,token:config.platformToken});
     mkdirSync(join(config.home,'sessions-v3'),{recursive:true});
@@ -104,13 +102,13 @@ export class Runtime {
     // Changed inputs (e.g. an edited AGENTS.md): a new Pi object on the same transcript lets Pi append the difference.
     if(existing){existing.session.dispose();this.sessions.delete(sid);}
     const fixed=structuredClone(request);
-    const skills=new Map(this.bundled.map(s=>[s.name,s]));
-    for(const skill of fixed.resources.skills)skills.set(skill.name,skill);
-    fixed.resources.skills=fixed.kind==='chat'?[]:[...skills.values()];
     fixed.tools=fixed.tools.filter(name=>fixed.kind!=='chat'||chatTools[name]===true);
     // Background tools and the extended bash belong to the root personal agent only; subagents never get them.
     const personal=fixed.kind==='agent'&&/^private:\d+$/.test(fixed.sandbox.scope_key);
     if(!personal)fixed.tools=fixed.tools.filter(name=>!['browser','schedule','mcp','task','job','wait'].includes(name));
+    // Skill management is for root runs in a personal or channel scope; never chat or subagents.
+    const skillScope=fixed.kind==='agent'&&(personal||/^channel:\d+:/.test(fixed.sandbox.scope_key));
+    if(!skillScope)fixed.tools=fixed.tools.filter(name=>name!=='skill');
     fixed.sandbox.profile=fixed.kind==='chat'?'chat':'agent';
     const models=await (this.config.modelRuntimeFactory?.(fixed.model.id)??createModelRuntime(this.config.platformUrl,this.config.platformToken,()=>fixed.model.id));
     const model=await resolveModel(models,fixed.model,signal);
@@ -123,7 +121,7 @@ export class Runtime {
     bindModelSession(models,sid,guard);
     const watchers=new Set<()=>void>();
     const inputs=(listener:()=>void)=>{watchers.add(listener);const run=this.runs.get(live.runId);if(run&&run.pendingInputs.size>0)listener();return ()=>{watchers.delete(listener);};};
-    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skillsDirectory:this.config.skillsDirectory,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
+    const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,inputs,...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
     const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     session.agent.steeringMode='all';
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now(),watchers});

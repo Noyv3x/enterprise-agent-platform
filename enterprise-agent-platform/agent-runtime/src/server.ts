@@ -40,7 +40,6 @@ async function main(): Promise<void> {
     platformToken,
     executorSocket: process.env.AGENT_MANAGER_EXECUTOR_SOCKET ?? '/run/agent-platform-manager/manager.sock',
     executorToken,
-    skillsDirectory: process.env.AGENT_RUNTIME_SKILLS_DIRECTORY ?? '/app/skills',
   });
   const server = createServer(runtime, token, maximum);
   let stopping = false;

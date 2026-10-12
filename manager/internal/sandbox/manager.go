@@ -160,6 +160,7 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 	if spec.Image == "" {
 		return driver.SandboxSpec{}, errors.New("sandbox image is not configured")
 	}
+	spec.OrgSkills = m.orgSkillsPath()
 	paths := []string{spec.Workspace, spec.Home, spec.Environment, filepath.Join(envRoot, "logs")}
 	if spec.Attachments != "" {
 		paths = append(paths, filepath.Join(spec.Workspace, m.profile.InternalWorkspaceDirectory, "attachments"), spec.Attachments)
@@ -168,6 +169,10 @@ func (m *Manager) Ensure(ctx context.Context, sandboxID, workspaceID string, now
 		if err := ensureOwnedDirectoryBelow(m.DataDir, path, uid, gid); err != nil {
 			return driver.SandboxSpec{}, fmt.Errorf("prepare sandbox bind root %s: %w", path, err)
 		}
+	}
+
+	if err := ensureSharedReadableDirectoryBelow(m.DataDir, spec.OrgSkills, uid, gid); err != nil {
+		return driver.SandboxSpec{}, fmt.Errorf("prepare organization skills mount %s: %w", spec.OrgSkills, err)
 	}
 
 	var replacement *replacementState
@@ -510,6 +515,12 @@ func (m *Manager) validateRegistry() error {
 	return nil
 }
 
+// orgSkillsPath is where Platform publishes organization skills; every sandbox
+// profile mounts it read-only.
+func (m *Manager) orgSkillsPath() string {
+	return filepath.Join(m.DataDir, "skills", "org")
+}
+
 func (m *Manager) lockEnsure(sandboxID string) func() {
 	m.ensureMu.Lock()
 	lock := m.ensureByID[sandboxID]
@@ -545,7 +556,7 @@ func (m *Manager) specForRecord(record Record) (driver.SandboxSpec, error) {
 			return driver.SandboxSpec{}, err
 		}
 	}
-	spec := driver.SandboxSpec{ContainerName: record.ContainerName, AgentHash: record.SandboxHash, Image: record.Image, Network: m.Network, Workspace: workspace, Home: home, Environment: environment, Attachments: attachments, UID: record.UID, GID: record.GID}
+	spec := driver.SandboxSpec{ContainerName: record.ContainerName, AgentHash: record.SandboxHash, Image: record.Image, Network: m.Network, Workspace: workspace, Home: home, Environment: environment, Attachments: attachments, OrgSkills: m.orgSkillsPath(), UID: record.UID, GID: record.GID}
 	m.applyResources(&spec, record.Profile)
 	return spec, nil
 }

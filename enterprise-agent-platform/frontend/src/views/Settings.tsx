@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { request } from '../api';
 import type { User } from '../api';
 import { Button } from '../components/ui/beautiful/atoms/Button';
@@ -10,13 +10,28 @@ import { useI18n, type Locale } from '../i18n';
 import { LOCALE_OPTIONS } from '../shell/preferences';
 import { useWords } from '../words';
 import { browserTimezone, timezoneOptions } from './settings/timezones';
+import { SkillSettings } from './settings/Skills';
 
 type Outcome = { tone: 'success' | 'danger'; text: string } | null;
+type Tab = 'general' | 'skills';
 
 const THEMES: readonly ThemePreference[] = ['light', 'dark', 'system'];
 const buttonTouch = 'touch:h-11 touch:px-4';
 
-export function Settings({ user, onSaved }: { user: User; onSaved: (u: User) => void }) {
+/** `#settings` opens General; `#settings/skills` opens Skills. */
+function tabFromHash(): Tab {
+  return window.location.hash === '#settings/skills' ? 'skills' : 'general';
+}
+
+/** `skillScope` is the catalog the Skills tab shows: the personal AI's when the account may use it, else chat's;
+ * null hides the tab. */
+export function Settings({ user, onSaved, skillScope = null }: { user: User; onSaved: (u: User) => void; skillScope?: 'private' | 'chat' | null }) {
+  const [tab, setTab] = useState<Tab>(tabFromHash);
+  useEffect(() => {
+    const sync = () => setTab(tabFromHash());
+    window.addEventListener('hashchange', sync);
+    return () => window.removeEventListener('hashchange', sync);
+  }, []);
   const w = useWords();
   const { locale, setLocale } = useI18n();
   const { preference, setPreference } = useTheme();
@@ -74,10 +89,21 @@ export function Settings({ user, onSaved }: { user: User; onSaved: (u: User) => 
   };
 
   const none = w('Not set', '未设置', '未設定');
+  // The Skills tab shows only when the account has a skill catalog.
+  const skills = tab === 'skills' ? skillScope : null;
   return <>
-    <PageHeader title={w('Settings', '设置', '設定')} description={w('Your profile, appearance and sign-in password.', '你的个人资料、外观和登录密码。', '你的個人資料、外觀與登入密碼。')} />
+    <PageHeader
+      title={w('Settings', '设置', '設定')}
+      description={skills
+        ? w('Skills your AI can use. Start a message with /name to call one directly.', 'AI 可以使用的技能。在消息开头输入 /技能名 可以直接调用。', 'AI 可以使用的技能。在訊息開頭輸入 /技能名稱 可以直接呼叫。')
+        : w('Your profile, appearance and sign-in password.', '你的个人资料、外观和登录密码。', '你的個人資料、外觀與登入密碼。')}
+      tabs={skillScope ? [{ key: 'general', label: w('General', '通用', '一般') }, { key: 'skills', label: w('Skills', '技能', '技能') }] : undefined}
+      activeTab={skillScope ? (skills ? 'skills' : 'general') : undefined}
+      onTabChange={(key: string) => { setTab(key as Tab); window.location.hash = key === 'skills' ? 'settings/skills' : 'settings'; }}
+    />
     <div className="min-h-0 flex-1 overflow-y-auto">
       <div className="flex max-w-[880px] flex-col gap-4 p-4 sm:p-6">
+        {skills ? <SkillSettings scope={skills} /> : <>
         <FormSection title={w('Profile', '个人资料', '個人資料')} onSubmit={() => void saveProfile()}
           description={w('Your name is shown to colleagues in channels; the time zone is used for schedules and for the time the AI sees.', '名称会在频道中显示给同事；时区用于定时任务和 AI 看到的当前时间。', '名稱會在頻道中顯示給同事；時區用於排程任務與 AI 看到的目前時間。')}
           footer={<FormActions><Button type="submit" variant="primary" size="sm" className={buttonTouch} disabled={profileSaving || !profileDirty || !displayName.trim()} aria-busy={profileSaving || undefined}>{w('Save profile', '保存资料', '儲存資料')}</Button></FormActions>}>
@@ -133,6 +159,7 @@ export function Settings({ user, onSaved }: { user: User; onSaved: (u: User) => 
             { key: 'group', label: w('Permission group', '权限组', '權限群組'), value: user.permission_group || none },
           ]} />
         </FormSection>
+        </>}
       </div>
     </div>
   </>;

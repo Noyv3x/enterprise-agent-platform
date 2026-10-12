@@ -143,12 +143,17 @@ type SandboxSpec struct {
 	Home          string
 	Environment   string
 	Attachments   string
-	Memory        string
-	MemorySwap    string
-	CPUs          string
-	PidsLimit     int
-	UID           int
-	GID           int
+	// OrgSkills is the host organization-skills directory, bound read-only for
+	// every profile. Profile is "agent" or "chat" and selects the entrypoint's
+	// workspace safety net.
+	OrgSkills  string
+	Profile    string
+	Memory     string
+	MemorySwap string
+	CPUs       string
+	PidsLimit  int
+	UID        int
+	GID        int
 }
 
 // SandboxEnsureResult describes the Docker state changed by one ensure call so
@@ -1183,7 +1188,7 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 		return SandboxEnsureResult{}, fmt.Errorf("prepare sandbox image: %w", err)
 	}
 	args := []string{"create", "--name", spec.ContainerName, "--label", profile.Label("sandbox") + "=true", "--label", profile.Label("id") + "=" + spec.AgentHash,
-		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("%s_AGENT_UID=%d", profile.EnvironmentPrefix, spec.UID), "--env", fmt.Sprintf("%s_AGENT_GID=%d", profile.EnvironmentPrefix, spec.GID), "--workdir", contract.ContainerWorkspace,
+		"--network", spec.Network, "--user", "0:0", "--env", fmt.Sprintf("%s_AGENT_UID=%d", profile.EnvironmentPrefix, spec.UID), "--env", fmt.Sprintf("%s_AGENT_GID=%d", profile.EnvironmentPrefix, spec.GID), "--env", fmt.Sprintf("%s_SANDBOX_PROFILE=%s", profile.EnvironmentPrefix, spec.Profile), "--workdir", contract.ContainerWorkspace,
 		"--mount", bindMount(spec.Workspace, contract.ContainerWorkspace), "--mount", bindMount(spec.Home, contract.ContainerAgentHome), "--mount", bindMount(spec.Environment, contract.ContainerAgentEnv)}
 	if spec.Memory == "" {
 		spec.Memory = "2g"
@@ -1198,6 +1203,9 @@ func (d DockerCLI) EnsureSandboxWithResult(ctx context.Context, spec SandboxSpec
 		spec.PidsLimit = 1024
 	}
 	args = append(args, "--memory", spec.Memory, "--memory-swap", spec.MemorySwap, "--cpus", spec.CPUs, "--pids-limit", strconv.Itoa(spec.PidsLimit))
+	if spec.OrgSkills != "" {
+		args = append(args, "--mount", bindMount(spec.OrgSkills, contract.ContainerSkillsOrg)+",readonly")
+	}
 	if spec.Attachments != "" {
 		args = append(args, "--mount", bindMount(spec.Attachments, contract.ContainerWorkspace+"/"+profile.InternalWorkspaceDirectory+"/attachments")+",readonly")
 	}

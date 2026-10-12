@@ -102,4 +102,25 @@ describe('Settings', () => {
       unmount();
     }
   });
+
+  it('opens the Skills tab from its address and shows it only for accounts with a skill catalog', async () => {
+    api.request.mockResolvedValue({ skills: [], can_install: false });
+    window.location.hash = '#settings/skills';
+    const { unmount } = render(<I18nProvider><ThemeProvider><Settings user={alice} onSaved={vi.fn()} skillScope="chat" /></ThemeProvider></I18nProvider>);
+    expect(screen.getByRole('tab', { name: 'Skills' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByRole('region', { name: 'Built-in' })).toBeVisible();
+    expect(api.request).toHaveBeenCalledWith('/api/skills?scope=chat');
+    // Chat has no personal skills, so there is nothing to install there.
+    expect(screen.queryByRole('button', { name: 'Install skill' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('tab', { name: 'General' }));
+    expect(window.location.hash).toBe('#settings');
+    expect(screen.getByRole('button', { name: 'Save profile' })).toBeVisible();
+    unmount();
+
+    window.location.hash = '#settings/skills';
+    render(<I18nProvider><ThemeProvider><Settings user={alice} onSaved={vi.fn()} /></ThemeProvider></I18nProvider>);
+    expect(screen.queryByRole('tab', { name: 'Skills' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save profile' })).toBeVisible();
+    window.location.hash = '';
+  });
 });

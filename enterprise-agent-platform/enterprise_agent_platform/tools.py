@@ -83,9 +83,9 @@ async def browser_url(url):
             raise HTTPException(400, 'Browser destination is a protected network')
 
 
-async def fetch(url, max_chars=100000):
-    """Pin each request to its validated address, retaining TLS hostname verification."""
-    async with asyncio.timeout(30), httpx.AsyncClient(trust_env=False, timeout=10) as client:
+async def download(url, limit, message, deadline=30):
+    """Pinned GET with every redirect revalidated, streamed under a size cap: `(final_url, body, content_type, encoding)`."""
+    async with asyncio.timeout(deadline), httpx.AsyncClient(trust_env=False, timeout=10) as client:
         for _ in range(6):
             parts, address = await public_url(url)
             # Host and SNI retain the original origin while TCP uses the checked IP.
@@ -102,16 +102,22 @@ async def fetch(url, max_chars=100000):
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
                     body.extend(chunk)
-                    if len(body) > 2 * 1024 * 1024:
-                        raise HTTPException(413, 'Web response exceeds 2 MiB')
-                text = body.decode(response.encoding or 'utf-8', errors='replace')
-                if 'html' in response.headers.get('content-type', ''):
-                    document = BeautifulSoup(text, 'html.parser')
-                    for element in document(['script', 'style', 'noscript']):
-                        element.decompose()
-                    text = markdownify(str(document))
-                return {'url': url, 'content': text[:max_chars]}
+                    if len(body) > limit:
+                        raise HTTPException(413, message)
+                return url, bytes(body), response.headers.get('content-type', ''), response.encoding
     raise HTTPException(400, 'Too many redirects')
+
+
+async def fetch(url, max_chars=100000):
+    """Pin each request to its validated address, retaining TLS hostname verification."""
+    url, body, content_type, encoding = await download(url, 2 * 1024 * 1024, 'Web response exceeds 2 MiB')
+    text = body.decode(encoding or 'utf-8', errors='replace')
+    if 'html' in content_type:
+        document = BeautifulSoup(text, 'html.parser')
+        for element in document(['script', 'style', 'noscript']):
+            element.decompose()
+        text = markdownify(str(document))
+    return {'url': url, 'content': text[:max_chars]}
 
 
 def result(data):
@@ -266,6 +272,10 @@ class Browser:
         if tool == 'schedule':
             from .schedules import dispatch
             return result(await dispatch(self.p, action, args, user))
+        if tool == 'skills':
+            if scope['kind'] != 'agent':
+                raise HTTPException(403, 'This tool is available only to personal and channel AI')
+            return await self.p.skills.gateway(user, scope, action, args)
         if tool != 'web':
             raise HTTPException(404, 'Unknown tool')
         return await self.web(action, args)

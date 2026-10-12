@@ -20,6 +20,7 @@ from enterprise_agent_platform.schedules import dispatch, next_time, tick
 from enterprise_agent_platform.tools import Browser, browser_url, fetch
 from enterprise_agent_platform.queue import Queue
 from enterprise_agent_platform.gates import Gate
+from enterprise_agent_platform.skills import Skills
 from enterprise_agent_platform.tasks import Tasks
 
 
@@ -34,7 +35,8 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
                 conn.execute('INSERT INTO users(id,username,display_name,password_hash,timezone,created_at) VALUES(?,?,?,?,?,?)', (ident, f'user{ident}', 'User', 'unused', 'UTC', int(time.time())))
         with self.db.connect() as conn:
             self.user = dict(conn.execute('SELECT * FROM users WHERE id=1').fetchone())
-        self.p = SimpleNamespace(db=self.db, settings=SimpleNamespace(data_dir=self.root, camofox_url='http://browser', camofox_access_key='secret'))
+        self.p = SimpleNamespace(db=self.db, settings=SimpleNamespace(data_dir=self.root, camofox_url='http://browser', camofox_access_key='secret', builtin_skills_dir=self.root / 'builtin'))
+        self.p.skills = Skills(self.p)
         self.p.gate = Gate(self.p)
         self.queue = self.p.queue = Queue(self.p)
         self.p.tasks = Tasks(self.p)
@@ -106,6 +108,33 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as raised:
                 await browser.gateway(tool, 'list', {}, context)
             self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_skills_tool_serves_personal_and_channel_root_runs_only(self):
+        with self.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES(3,'Shared',?)", (int(time.time()),))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('c1',1,'t','now','now')")
+        browser = Browser(self.p)
+        content = {'name': 'flow', 'description': 'A saved workflow', 'body': 'steps'}
+        info, context = await self.running_scope('private')
+        installed = await browser.gateway('skills', 'install', {'content': content}, context)
+        self.assertFalse(installed['is_error'])
+        self.assertTrue((info['workspace'] / '.agent-platform' / 'skills' / 'flow' / 'SKILL.md').exists())
+        listed = await browser.gateway('skills', 'list', {}, context)
+        self.assertEqual([item['name'] for item in listed['data']['skills']], ['flow'])
+        self.queue.running.clear()
+        info, context = await self.running_scope('channel-3')
+        channel = await browser.gateway('skills', 'install', {'content': content}, context)
+        self.assertFalse(channel['is_error'])
+        self.assertTrue((info['workspace'] / '.agent-platform' / 'skills' / 'flow' / 'SKILL.md').exists())
+        self.queue.running.clear()
+        _, context = await self.running_scope('chat-c1')
+        with self.assertRaises(HTTPException) as raised:
+            await browser.gateway('skills', 'list', {}, context)
+        self.assertEqual(raised.exception.status_code, 403)
+        # A subagent session has no root job of its own, so it cannot reach the tool.
+        with self.assertRaises(HTTPException) as raised:
+            await browser.gateway('skills', 'list', {}, {'sid': 'agent-private-1-bg-7', 'scope_key': 'private:1/delegate/bg-7', 'run_id': 'child-run'})
+        self.assertEqual(raised.exception.status_code, 403)
 
     async def test_absorbed_channel_author_never_becomes_tool_principal(self):
         with self.db.connect() as conn:

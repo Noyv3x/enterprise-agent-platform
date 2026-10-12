@@ -18,6 +18,7 @@ from enterprise_agent_platform.db import Database
 from policy_support import set_default_policy
 from enterprise_agent_platform.gates import Gate, ManagerClientError
 from enterprise_agent_platform.queue import Queue, _WorkTrace
+from enterprise_agent_platform.skills import Skills
 from enterprise_agent_platform.tasks import (
     SUBAGENT_TOOLS, Tasks, TaskError, classify, notice_text, parse_id, routes, view,
 )
@@ -239,7 +240,8 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
             settings=SimpleNamespace(data_dir=root, runtime_url="http://runtime", runtime_token="test",
                                      manager_executor_token_file=self.token, session_secret="secret",
                                      public_base_url="http://platform", trusted_proxy=False,
-                                     agent_tool_token="tool-secret"))
+                                     agent_tool_token="tool-secret", builtin_skills_dir=root / "builtin"))
+        self.p.skills = Skills(self.p)
         self.p.gate = Gate(self.p)
         self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "model-a"}]}))
         self.q = self.p.queue = Queue(self.p)
@@ -332,6 +334,11 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_spawn_starts_children_with_the_tools_of_their_type(self):
         stream = await self.parent()
+        root = self.p.settings.data_dir
+        for base, name, extra in ((root / "builtin", "shared", ""), (root / "builtin", "quiet", "disable-model-invocation: true\n"),
+                                  (root / "workspaces" / "user-1" / ".agent-platform" / "skills", "mine", "")):
+            (base / name).mkdir(parents=True)
+            (base / name / "SKILL.md").write_text(f"---\nname: {name}\ndescription: Does {name}\n{extra}---\n")
         out = await self.call("spawn", {"agent": "scout", "context": "Shared facts",
                                         "tasks": [{"name": "docs", "task": "Read the docs\nthoroughly"}, {"task": "Read the code"}]})
         self.assertFalse(out["is_error"])
@@ -349,7 +356,9 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["sandbox"]["workspace_id"], "user-1")
             self.assertEqual(body["model"]["id"], "model-a")
             self.assertIsNone(body["resources"]["agents_md"])
-            self.assertEqual(body["resources"]["skills"], [])
+            self.assertEqual(body["resources"]["skills"], [
+                {"name": "mine", "description": "Does mine", "location": "/workspace/.agent-platform/skills/mine/SKILL.md"},
+                {"name": "shared", "description": "Does shared", "location": "/opt/agent-platform/skills/builtin/shared/SKILL.md"}])
             self.assertIn(f"bg-{tid}", body["resources"]["system_prompt"])
             self.assertIn("read-only", body["resources"]["system_prompt"])
         first = self.row(ids[0])

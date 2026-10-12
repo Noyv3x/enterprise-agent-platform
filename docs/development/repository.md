@@ -5,11 +5,12 @@ Read [product boundaries](../design/product.md), [architecture](../design/system
 | Path | Owner/responsibility |
 | --- | --- |
 | `enterprise-agent-platform/enterprise_agent_platform/` | Python Platform: auth, SQLite, durable queue, chat, tools, OAuth and Manager integration. |
-| `enterprise-agent-platform/agent-runtime/` | TypeScript Pi AgentSession host, remote tools and sessions. |
+| `enterprise-agent-platform/agent-runtime/` | TypeScript Pi AgentSession host, remote tools and sessions. It ships no skills. |
+| `enterprise-agent-platform/skills/` | Built-in skills (`<name>/SKILL.md` plus scripts, templates and references), moved out of `agent-runtime/`. The sandbox and Platform images copy them to `/opt/agent-platform/skills/builtin`; the Runtime image does not. |
 | `enterprise-agent-platform/frontend/` | React/Vite product views, API client, localization and preserved visual design. |
 | `enterprise-agent-platform/camofox-runtime/` | Browser service adapter. |
 | `manager/` | Go host Manager: ingress, lifecycle, executor, release and sandbox profiles. |
-| `containers/` | Image/entrypoint/Compose and sandbox helper contracts. |
+| `containers/` | Image/entrypoint/Compose and sandbox helper contracts, including the sandbox skills safety net (`agent-sandbox-skills.py`) and its tests (`test_agent_sandbox_skills.py`, run by `scripts/test.sh scripts`). |
 | `scripts/`, `.github/workflows/` | Local checks, release assembly, smoke and CI. |
 | `docs/design/`, `docs/reference/`, `docs/operations/` | Product intent, precise interfaces and operator procedures. |
 | `docs/contracts/` | Machine-readable shared values; generate consumers with docs_sync. |

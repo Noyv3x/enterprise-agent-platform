@@ -15,10 +15,11 @@ that session is busy. Platform owns admission and stable session IDs:
 ```
 
 Image entries are `{mime,data}` with base64 data. Skill entries are
-`{name,description,path}`. Chat uses `kind:chat`, `profile:chat`, a
+`{name,description,location}`. Chat uses `kind:chat`, `profile:chat`, a
 conversation directory beneath `/workspace`, and only read/bash/edit/write/
-grep/find/ls/web_search/web_fetch. Chat never loads AGENTS.md or skills.
-Browser, schedules and MCP are available only to personal agent scopes.
+grep/find/ls/web_search/web_fetch; it never loads AGENTS.md but does advertise
+the skill catalog Platform sends. Browser, schedules and MCP are available only
+to personal agent scopes; `skill` to personal and channel root scopes.
 `kind:subagent` runs a background subagent for Platform's `task` tool: profile
 `agent`, no AGENTS.md, scope `private:<uid>/delegate/bg-<n>` and session ID
 `agent-private-<uid>-bg-<n>`, sharing the parent's sandbox and workspace.
@@ -298,10 +299,28 @@ but may access that user's other files. Pi read/edit/write/find/ls use remote
 operations; custom bash keeps output capture and large-output spill files
 inside the sandbox, while grep invokes sandbox `rg`. Binary reads use bounded,
 byte-count-verified chunks so truncated transport output cannot reach edit.
-`/platform-skills/` reads map read-only to `/app/skills/`.
-Runtime reads bundled SKILL.md frontmatter once on startup and advertises
-that catalog for agent sessions. Request workspace skills override bundled
-skills with the same name. Chat sessions never advertise either catalog.
+Built-in and organization skills are read-only sandbox paths
+(`/opt/agent-platform/skills/builtin/<name>/`, `/opt/agent-platform/skills/org/<name>/`).
+Runtime ships no skills and has no skill directory: the catalog is exactly
+`resources.skills` as Platform built it for the run, `[{name,description,location}]`
+with `location` the sandbox path of SKILL.md. Runtime passes it to Pi unchanged,
+for agent, subagent and chat runs alike (chat's catalog holds only built-in and
+organization skills); it never merges, filters or adds entries. The `read`
+tool (every profile) may read files under `/opt/agent-platform/skills/` through
+a root-confined, symlink-resolving sandbox command; `write`/`edit`/`find`/`ls`/`grep`
+keep their workspace confinement, so these roots are never writable.
+
+The `skill` tool (root personal and channel runs only, never chat or subagents;
+Runtime drops it elsewhere and subagent requests naming it are rejected) calls
+Platform `POST /internal/agent/tools/skills` with `{action,arguments,context}`.
+`action` is `list|info|install|update|remove`; `arguments` carries `name`, `url`,
+`path`, `subpath`, `replace` and `content:{name,description,body,files?}` as the
+model passed them, and Platform returns the standard `{content,data,is_error}`
+result. Its description tells the model to translate install instructions written
+for other products (`.claude/skills`, `~/.codex/skills`, ...) to this tool and to
+save a workflow as a skill with `content`. The `mcp` tool description names
+`/workspace/.agent-platform/mcp.json` and its `mcpServers` shape and gives the same
+translation rule for `claude mcp add` and similar.
 
 Web, browser and schedule tools call Platform
 `POST /internal/agent/tools/{web|browser|schedule}` using agent-tool-token

@@ -30,7 +30,11 @@ RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian
     && install -d -o 1000 -g 1000 -m 0700 /workspace /opt/agent-env
 COPY containers/agent-sandbox-entrypoint.sh /usr/local/bin/agent-sandbox-entrypoint
 COPY containers/agent-sandbox-mcp-client.mjs /usr/local/bin/agent-platform-mcp
-RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint /usr/local/bin/agent-platform-mcp
+COPY containers/agent-sandbox-skills.py /usr/local/bin/agent-platform-skills
+COPY enterprise-agent-platform/skills /opt/agent-platform/skills/builtin
+# Built-in skills are root-owned and world-readable; scripts run in place.
+RUN chmod 0755 /usr/local/bin/agent-sandbox-entrypoint /usr/local/bin/agent-platform-mcp /usr/local/bin/agent-platform-skills \
+    && chmod -R go-w,a+rX /opt/agent-platform/skills/builtin
 LABEL org.opencontainers.image.title="Agent Platform Sandbox" \
       org.opencontainers.image.source="https://github.com/Noyv3x/enterprise-agent-platform" \
       io.agent-platform.role="sandbox" \

@@ -135,6 +135,13 @@ function describe(tool: ToolItem, w: Words): Described {
       icon = "clock";
       chip = Array.isArray(args.ids) && args.ids.length ? args.ids.filter((id): id is string => typeof id === "string").join(" ") : w("Any task", "任一任务", "任一任務");
       break;
+    case "skill": {
+      // install names its source (a link, a workspace path or new content); the others name the skill.
+      const content = args.content && typeof args.content === "object" ? args.content as Record<string, unknown> : {};
+      chip = arg(args, "name") || arg(args, "url") || arg(args, "path") || arg(content, "name");
+      input = lines(JSON.stringify(args, null, 2), "muted");
+      break;
+    }
     default: {
       const json = Object.keys(args).length ? JSON.stringify(args) : "";
       chip = arg(args, "_preview") || arg(args, "detail") || [arg(args, "server"), arg(args, "tool")].filter(Boolean).join(" · ") || json;

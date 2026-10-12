@@ -1,7 +1,6 @@
 """Durable conversations with mid-run inputs; uncertain execution is never replayed."""
 import asyncio
 import json
-import os
 import shutil
 import time
 import uuid
@@ -16,6 +15,7 @@ from starlette.routing import Route
 from .auth import body_json, current_user, model_slot, permissions
 from .db import now
 from .files import bounded_read, ensure_workspace, open_workspace
+from .skills import skill_guidance
 
 
 BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"]
@@ -436,7 +436,7 @@ class Queue:
             payload = json.loads(row["payload_json"])
             author = self.user(payload["user_id"])
             prompt = self.p.files.prompt(author, info, payload["attachment_ids"])
-            prompt["text"] = payload["content"] + ("\n" + prompt["text"] if prompt["text"] else "")
+            prompt["text"] = self.p.skills.invoke(author, info, payload["content"]) + ("\n" + prompt["text"] if prompt["text"] else "")
             with self.p.db.connect() as conn:
                 sent = conn.execute(
                     "UPDATE durable_jobs SET payload_json=json_set(payload_json,'$.steer_sent',json('true')),updated_at=? "
@@ -679,43 +679,22 @@ class Queue:
                 conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job_id))
             self.unsettled.pop(key, None)
 
-    def resources(self, info):
+    def resources(self, info, user):
         with self.p.db.connect() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key='ui_branding_v1'").fetchone()
         branding = json.loads(row[0]) if row else {}
         prompt = f"You are {branding.get('agent_name', 'Assistant')}, the assistant in {branding.get('product_name', 'Agent Platform')}. "
         prompt += f"Use your available tools to help the user. Deliver files with a standalone MEDIA: {info['sandbox']['cwd']}/path line."
-        agents, skills = None, []
+        agents = None
         if info["kind"] == "agent":
-            prompt += " Maintain lasting workspace guidance in AGENTS.md. Use advertised skills when relevant."
+            prompt += " Maintain lasting workspace guidance in AGENTS.md. Use advertised skills when relevant.\n\n"
+            prompt += skill_guidance(personal=info["channel_id"] is None)
             try:
                 content = bounded_read(open_workspace(info["workspace"], "AGENTS.md")).decode("utf-8")
                 agents = {"path": "/workspace/AGENTS.md", "content": content}
             except (OSError, HTTPException, UnicodeError):
                 pass
-            try:
-                directory = open_workspace(info["workspace"], ".agent-platform/skills", directory=True)
-            except (OSError, HTTPException):
-                names = []
-            else:
-                try:
-                    names = sorted(os.listdir(directory))
-                finally:
-                    os.close(directory)
-            for skill_name in names:
-                relative = f".agent-platform/skills/{skill_name}/SKILL.md"
-                try:
-                    text = bounded_read(open_workspace(info["workspace"], relative)).decode("utf-8")
-                except (OSError, HTTPException, UnicodeError):
-                    continue
-                metadata = {}
-                if text.startswith("---\n"):
-                    for line in text.split("---", 2)[1].splitlines():
-                        name, _, value = line.partition(":")
-                        metadata[name.strip()] = value.strip().strip("\"'")
-                skills.append({"name": metadata.get("name", skill_name), "description": metadata.get("description", ""),
-                               "path": "/workspace/" + relative})
-        return {"system_prompt": prompt, "agents_md": agents, "skills": skills}
+        return {"system_prompt": prompt, "agents_md": agents, "skills": self.p.skills.catalog(user, info)}
 
     async def worker(self, key):
         try:
@@ -754,8 +733,9 @@ class Queue:
                     self.emit(key, {"type": "message", "message": self.message(info, payload["message_id"])})
                     await self.selected_model(info)
                     prompt = self.p.files.prompt(user, info, payload["attachment_ids"])
-                    prompt["text"] = (payload["content"] if notice is None else notice) + ("\n" + prompt["text"] if prompt["text"] else "")
-                    tools = BUILTINS + (["browser", "schedule", "mcp", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
+                    text = payload["content"] if notice is None else notice
+                    prompt["text"] = (self.p.skills.invoke(user, info, text) if notice is None else text) + ("\n" + prompt["text"] if prompt["text"] else "")
+                    tools = BUILTINS + (["skill"] if info["kind"] == "agent" else []) + (["browser", "schedule", "mcp", "task", "job", "wait"] if info["kind"] == "agent" and info["channel_id"] is None else [])
                     payload.update(runtime_sid=info["sid"], runtime_unsettled=True)
                     with self.p.db.connect() as conn:
                         conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
@@ -763,7 +743,7 @@ class Queue:
                     result = await self.runtime("POST", f"/v1/sessions/{info['sid']}/runs", json={
                         "kind": info["kind"], "sandbox": info["sandbox"], "model": info["model"], "prompt": prompt,
                         "context_prefix": json.dumps({"time": now(), "user": user["display_name"], "tz": user["timezone"]}),
-                        "resources": self.resources(info), "tools": tools})
+                        "resources": self.resources(info, user), "tools": tools})
                     run_id = result["run_id"]
                     payload["runtime_run_id"] = run_id
                     with self.p.db.connect() as conn:

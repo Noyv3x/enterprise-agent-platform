@@ -68,5 +68,11 @@ for mount_root in /workspace /home/agent /opt/agent-env; do
   chmod 0700 "$mount_root"
 done
 
+# Skills safety net (agent profile only; the helper ignores any other profile).
+# A failure here must never keep the sandbox from starting.
+/usr/local/bin/agent-platform-skills --profile "${AGENT_PLATFORM_SANDBOX_PROFILE:-}" \
+  --uid "$agent_uid" --gid "$agent_gid" \
+  || printf 'Agent Sandbox entrypoint: skills safety net failed; continuing\n' >&2
+
 [ "$#" -gt 0 ] || fail "no sandbox command was provided"
 exec setpriv --reuid="$agent_uid" --regid="$agent_gid" --init-groups -- /usr/bin/tini -- "$@"

@@ -29,7 +29,9 @@ func validateWorkspaceProfile(workspace, profile string) error {
 
 func (m *Manager) applyResources(spec *driver.SandboxSpec, profile string) {
 	resources := m.AgentResources
+	spec.Profile = "agent"
 	if profile == "chat" {
+		spec.Profile = "chat"
 		resources = m.ChatResources
 		spec.Network = "none"
 	}

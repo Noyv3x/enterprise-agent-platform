@@ -16,7 +16,14 @@ import (
 // symlink, non-directory, or owned by an identity other than the Manager's
 // deployment UID/GID.
 func ensureOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
-	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, true)
+	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, true, 0o700)
+}
+
+// ensureSharedReadableDirectoryBelow is ensureOwnedDirectoryBelow for a bind
+// root every sandbox mounts read-only: the final directory is 0755 so the
+// unprivileged agent can read what Platform (the deployment identity) writes.
+func ensureSharedReadableDirectoryBelow(dataDir, target string, uid, gid int) error {
+	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, true, 0o755)
 }
 
 // validateOwnedDirectoryBelow proves an existing persisted bind without
@@ -24,10 +31,10 @@ func ensureOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
 // registry: a missing directory is evidence that the old record is incomplete,
 // not permission to manufacture the fact needed to accept it.
 func validateOwnedDirectoryBelow(dataDir, target string, uid, gid int) error {
-	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, false)
+	return walkOwnedDirectoryBelow(dataDir, target, uid, gid, false, 0o700)
 }
 
-func walkOwnedDirectoryBelow(dataDir, target string, uid, gid int, create bool) error {
+func walkOwnedDirectoryBelow(dataDir, target string, uid, gid int, create bool, finalMode uint32) error {
 	base := filepath.Clean(dataDir)
 	target = filepath.Clean(target)
 	if !filepath.IsAbs(base) || !filepath.IsAbs(target) {
@@ -71,7 +78,7 @@ func walkOwnedDirectoryBelow(dataDir, target string, uid, gid int, create bool) 
 			return fmt.Errorf("validate sandbox directory %q: %w", part, err)
 		}
 		if index == len(parts)-1 {
-			if err := syscall.Fchmod(nextFD, 0o700); err != nil {
+			if err := syscall.Fchmod(nextFD, finalMode); err != nil {
 				_ = syscall.Close(nextFD)
 				return fmt.Errorf("restrict sandbox bind root %q: %w", part, err)
 			}

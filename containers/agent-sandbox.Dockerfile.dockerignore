@@ -1,3 +1,5 @@
 **
 !containers/
 !containers/**
+!enterprise-agent-platform/skills/
+!enterprise-agent-platform/skills/**

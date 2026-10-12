@@ -75,30 +75,11 @@ Useful parameters:
 
 ## Bundled helper script
 
-Supporting files are not executable directly from the read-only Skill package.
-To use the helper:
-
-1. Read it:
-
-```text
-read({"path":"/platform-skills/arxiv/scripts/search_arxiv.py"})
-```
-
-2. Copy the complete returned file text into the Agent workspace, without the
-   read result's line-number labels or truncation notices:
-
-```text
-write({
-  "path":".agent-platform/tools/search_arxiv.py",
-  "content":"<exact helper file text returned by read>"
-})
-```
-
-3. Run the workspace copy:
+The helper is part of this skill and runs in place; no copy is needed:
 
 ```text
 bash({
-  "command":"python3 .agent-platform/tools/search_arxiv.py 'retrieval augmented generation' --max 10 --sort date",
+  "command":"python3 /opt/agent-platform/skills/builtin/arxiv/scripts/search_arxiv.py 'retrieval augmented generation' --max 10 --sort date",
   "timeout":60
 })
 ```
@@ -106,10 +87,10 @@ bash({
 The script uses only the Python standard library. It supports:
 
 ```text
-python3 .agent-platform/tools/search_arxiv.py "topic words"
-python3 .agent-platform/tools/search_arxiv.py --author "Author Name" --max 5
-python3 .agent-platform/tools/search_arxiv.py --category cs.AI --sort date
-python3 .agent-platform/tools/search_arxiv.py --id 2402.03300
+python3 /opt/agent-platform/skills/builtin/arxiv/scripts/search_arxiv.py "topic words"
+python3 /opt/agent-platform/skills/builtin/arxiv/scripts/search_arxiv.py --author "Author Name" --max 5
+python3 /opt/agent-platform/skills/builtin/arxiv/scripts/search_arxiv.py --category cs.AI --sort date
+python3 /opt/agent-platform/skills/builtin/arxiv/scripts/search_arxiv.py --id 2402.03300
 ```
 
 ## Citation and related-work data

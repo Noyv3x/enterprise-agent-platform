@@ -23,7 +23,7 @@ source.
 4. Read the bundled template when a structural reference is useful:
 
 ```text
-read({"path":"/platform-skills/architecture-diagram/templates/template.html"})
+read({"path":"/opt/agent-platform/skills/builtin/architecture-diagram/templates/template.html"})
 ```
 
 5. Use `write` with `path` and the complete HTML `content` to save the completed

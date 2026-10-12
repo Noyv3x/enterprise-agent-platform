@@ -46,7 +46,7 @@ export interface ExecutorTransport {
   processKill(sandbox: Sandbox, context: ToolContext, processId: string, signal?: AbortSignal): Promise<ProcessView>;
 }
 export interface GatewayTransport {
-  call(tool: "web" | "browser" | "schedule" | "tasks", action: string, args: Record<string, unknown>, context: ToolContext, signal?: AbortSignal, timeoutMs?: number): Promise<GatewayResult>;
+  call(tool: "web" | "browser" | "schedule" | "tasks" | "skills", action: string, args: Record<string, unknown>, context: ToolContext, signal?: AbortSignal, timeoutMs?: number): Promise<GatewayResult>;
 }
 
 export function createExecutorTransport(options: { socketPath: string; token: string; timeoutMs?: number }): ExecutorTransport {

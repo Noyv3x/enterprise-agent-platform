@@ -302,6 +302,48 @@ def _model_policy_groups(conn: sqlite3.Connection) -> None:
             conn.execute(f'ALTER TABLE users DROP COLUMN {column}')
 
 
+def _skills(conn: sqlite3.Connection) -> None:
+    """Skill tables, `install_extensions` for the default groups and groups using the personal AI or chat, and hash-suffixed skill directory names."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS skills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier TEXT NOT NULL CHECK(tier IN ('org', 'personal', 'channel')),
+    owner_id INTEGER,
+    name TEXT NOT NULL,
+    source_json TEXT NOT NULL DEFAULT '{}',
+    groups_json TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    installed_by INTEGER,
+    installed_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(tier, owner_id, name)
+)""")
+    # SQLite treats NULL owners as distinct; organization names must still be unique.
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_skills_identity ON skills(tier, COALESCE(owner_id, 0), name)')
+    conn.execute("""CREATE TABLE IF NOT EXISTS skill_preferences (
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    skill_key TEXT NOT NULL,
+    enabled INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, skill_key)
+)""")
+    data_dir = getattr(conn, 'data_dir', None)
+    if data_dir is not None:
+        # The sandbox must not be the first to rename `<n>-<8 hex>` directories: the first catalog is built before it starts.
+        from .skills import normalize_hashed_directories
+        normalize_hashed_directories(data_dir)
+    row = conn.execute("SELECT value FROM settings WHERE key='permission_groups_v1'").fetchone()
+    if row is None:
+        return
+    groups = json.loads(row[0])
+    for group in groups:
+        permissions = group['permissions']
+        if 'install_extensions' not in permissions and (group['name'] in ('admin', 'manager', 'member')
+                                                        or 'private_agent' in permissions or 'chat' in permissions):
+            permissions.append('install_extensions')
+    conn.execute("UPDATE settings SET value=?,updated_at=CAST(strftime('%s','now') AS INTEGER) WHERE key='permission_groups_v1'",
+                 (json.dumps(groups),))
+
+
 # (version, name, SQL statements or a callable taking the open connection). Append only; versions must increase.
 _MIGRATIONS = (
     (2026100101, 'drop-pre-pi-rollback-compat', (
@@ -342,6 +384,7 @@ _MIGRATIONS = (
         'CREATE INDEX IF NOT EXISTS idx_background_tasks_undelivered ON background_tasks(status, delivered_at, notice_job_id)',
     )),
     (2026101201, 'model-policy-groups', _model_policy_groups),
+    (2026101301, 'skills', _skills),
 )
 
 
@@ -376,6 +419,7 @@ class Database:
         with (data_dir / '.pi-migration.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             with self.connect() as conn:
+                conn.data_dir = data_dir
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript("BEGIN IMMEDIATE;\n" + _SCHEMA)
                 for version, name, statements in _MIGRATIONS:

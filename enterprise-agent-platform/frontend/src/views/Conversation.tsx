@@ -491,6 +491,7 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       inserting={Boolean(running || live) && !queuedMessages.length && !conversation.compactBusy}
       pendingInputs={inserted.filter((message) => message.metadata.delivery === "pending").length}
       commands={commands}
+      skillScope={scope.startsWith("chat-") ? "chat" : scope}
       seed={seed}
       placeholder={empty && personal
         ? w("Ask your agent to research, write files or run code…", "让智能体查资料、写文件或运行代码…", "讓智慧體查資料、寫檔案或執行程式…")

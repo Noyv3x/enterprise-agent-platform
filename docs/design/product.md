@@ -7,8 +7,8 @@ The platform is a shared, browser-based product built around plain Pi. Platform 
 | Mode | Ownership and tools |
 | --- | --- |
 | Personal AI | One persistent workspace and sandbox per user; Pi file/shell tools, web search/fetch, browser with human takeover, schedules the personal AI manages itself with its schedule tool, workspace-configured MCP, and [subagents and background tasks](#subagents-and-background-tasks) (`task`, `job`, `wait`, background and service `bash`). |
-| Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch. Visibility and management use existing permission groups, not a new membership table. |
-| Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP, skills or AGENTS.md context. |
+| Channels | A shared conversation and workspace per channel; Pi file/shell tools and web search/fetch, plus the channel workspace's skills. Visibility and management use existing permission groups, not a new membership table. |
+| Standard chat | Many conversations per user, each with its own working directory and history. Pi file/shell tools and web search/fetch only; no browser, schedules, MCP or AGENTS.md context. Chat can use built-in and organization skills (no workspace skills). |
 
 Standard chat supports create, rename and delete. Titles are never generated automatically: a new chat starts as `New chat` and changes only when the user renames it. Users neither see nor change any model or thinking depth, in the personal AI or in chat. Each account belongs to one administrator-managed model policy group (策略组) that sets a model and thinking depth per usage slot: personal AI (also schedules and background-task notices), channel main agent, chat (whose reasoning summaries are shown too), `scout` subagents and `task` subagents. A lower-spec group can serve accounts that do only simple work.
 
@@ -27,7 +27,15 @@ Messages sent during an interactive run are inserted into that run at the AI's n
 
 ## Pi-native resources
 
-Long-term memory is workspace `AGENTS.md`, editable by the agent using ordinary tools. Skills are `SKILL.md` packages advertised through Pi. There is no dedicated memory or skill administration system. Retry, compaction and transcript persistence use Pi's `AgentSession` and `SessionManager`.
+Long-term memory is workspace `AGENTS.md`, editable by the agent using ordinary tools. There is no dedicated memory system. Retry, compaction and transcript persistence use Pi's `AgentSession` and `SessionManager`.
+
+## Skills
+
+Skills follow the open Agent Skills standard (agentskills.io, the format Claude and Codex also use): a folder with a `SKILL.md`. There are three tiers. **Built-in** skills ship with the platform. **Organization** skills are installed and assigned to permission groups by administrators. **Personal** skills (channel skills in a channel) are installed by the user or by the AI. A user can call a skill explicitly by starting a message with `/<skill-name>`; the composer's `/` menu lists the scope's skills.
+
+Installing, updating and removing personal skills (by the user or the AI) needs the `install_extensions` permission; administrators can withhold it per permission group. Without it, the user's personal skills are not offered to the AI and the install controls are hidden. Users can switch individual skills off for themselves.
+
+Users often paste setup instructions written for other AI products (Claude Code, Claude Desktop/claude.ai, Codex, Cursor, Gemini CLI, OpenCode). The AI is told to carry out their intent with this platform's conventions: the `skill` tool for skills and `/workspace/.agent-platform/mcp.json` for MCP servers. A sandbox start-up step additionally moves skills that a literal install left in `.claude/skills`, `.codex/skills` or `.agents/skills` into the standard directory.
 
 ## Subagents and background tasks
 
@@ -44,7 +52,7 @@ Interfaces: [Platform API](../reference/platform-api.md#background-tasks), [Runt
 
 ## Removed features
 
-No Telegram, mail, approvals, host execution, todo system, live file drafts, learning reviews, dedicated memory/skill management, execution-review or `needs_review` machinery. Subagents and background processes exist only in the personal AI (see above); channels and standard chat stay foreground-only. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
+No Telegram, mail, approvals, host execution, todo system, live file drafts, learning reviews, dedicated memory management, execution-review or `needs_review` machinery. Subagents and background processes exist only in the personal AI (see above); channels and standard chat stay foreground-only. There is no recurring-schedule continue/complete decision guard, regex completion guard or Firecrawl stack.
 
 Tables of removed features are dropped by migration. Historical messages remain readable, including old `agent_work` activity rendered read-only; this does not imply continued support for their old actions.
 

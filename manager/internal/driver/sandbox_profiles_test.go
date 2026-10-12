@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestSandboxCreateResourceFlags(t *testing.T) {
 				return Result{}, nil
 			}}
 			docker := DockerCLI{Profile: testActiveProfile, Runner: runner, Binary: "docker"}
-			spec := SandboxSpec{ContainerName: "agent-platform-sandbox-test", AgentHash: "abc", Image: image, Network: test.network, Workspace: "/data/workspace", Home: "/data/home", Environment: "/data/env", Attachments: test.attachments, Memory: test.memory, MemorySwap: test.memory, CPUs: test.cpus, PidsLimit: test.pids, UID: 1000, GID: 1000}
+			spec := SandboxSpec{ContainerName: "agent-platform-sandbox-test", AgentHash: "abc", Image: image, Network: test.network, Workspace: "/data/workspace", Home: "/data/home", Environment: "/data/env", Attachments: test.attachments, OrgSkills: "/data/skills/org", Profile: test.name, Memory: test.memory, MemorySwap: test.memory, CPUs: test.cpus, PidsLimit: test.pids, UID: 1000, GID: 1000}
 			if _, err := docker.EnsureSandboxWithResult(context.Background(), spec); err != nil {
 				t.Fatal(err)
 			}
@@ -55,9 +56,15 @@ func TestSandboxCreateResourceFlags(t *testing.T) {
 					t.Fatalf("%s = %q, want %q; %v", key, flags[key], value, create)
 				}
 			}
-			wantMounts := 3
+			wantMounts := 4
 			if test.attachments != "" {
-				wantMounts = 4
+				wantMounts = 5
+			}
+			if !slices.Contains(mounts, "type=bind,src=/data/skills/org,dst=/opt/agent-platform/skills/org,readonly") {
+				t.Fatalf("organization skills must be bound read-only for every profile: %v", mounts)
+			}
+			if !slices.Contains(create, "AGENT_PLATFORM_SANDBOX_PROFILE="+test.name) {
+				t.Fatalf("sandbox profile env missing: %v", create)
 			}
 			if len(mounts) != wantMounts {
 				t.Fatalf("unexpected mounts: %v", mounts)

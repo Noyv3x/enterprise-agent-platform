@@ -42,7 +42,7 @@ export function parseRoute(hash: string): Route {
     }
   }
   if (key === "admin" || key.startsWith("admin/")) return { view: "admin" };
-  if (key === "settings") return { view: "settings" };
+  if (key === "settings" || key.startsWith("settings/")) return { view: "settings" };
   return { view: "unknown" };
 }
 

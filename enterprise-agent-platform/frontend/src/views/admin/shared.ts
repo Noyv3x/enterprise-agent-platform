@@ -16,7 +16,7 @@ export interface SlotSetting { model: string; thinking: string }
 export interface ModelPolicy { name: string; label: string; slots: Record<PolicySlot, SlotSetting> }
 /** `GET`/`PUT /api/admin/model-policies`; `members` counts every account (active or not) per group name. */
 export interface ModelPolicies { policies: ModelPolicy[]; members: Record<string, number> }
-export const PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings'] as const;
+export const PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'install_extensions', 'manage_channels', 'manage_users', 'system_settings'] as const;
 
 export function errorText(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
@@ -87,6 +87,7 @@ export function useAdminLabels() {
     read_workspace: w('Read workspace', '读取工作区', '讀取工作區'),
     chat: w('Chat', '聊天', '聊天'),
     private_agent: w('Personal AI', '个人 AI', '個人 AI'),
+    install_extensions: w('Install skills and connectors', '安装技能和连接器', '安裝技能和連接器'),
     manage_channels: w('Manage channels', '管理频道', '管理頻道'),
     manage_users: w('Manage accounts', '管理账户', '管理帳戶'),
     system_settings: w('System settings', '系统设置', '系統設定'),

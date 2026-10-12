@@ -24,6 +24,7 @@ for component in "${components[@]}"; do
         ;;
       scripts)
         "$PYTHON_BIN" -m unittest discover -s scripts/tests
+        "$PYTHON_BIN" -m unittest discover -s containers -p 'test_*.py'
         ;;
       manager)
         cd manager

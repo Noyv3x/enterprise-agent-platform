@@ -38,7 +38,8 @@ ENV PATH="/opt/venv/bin:$PATH" \
     AGENT_PLATFORM_AGENT_RUNTIME_URL=http://agent-runtime:8766 \
     AGENT_PLATFORM_CAMOFOX_URL=http://camofox:9377 \
     AGENT_PLATFORM_SEARXNG_API_URL=http://searxng:8080 \
-    AGENT_PLATFORM_DEPLOYMENT_MODE=container
+    AGENT_PLATFORM_DEPLOYMENT_MODE=container \
+    AGENT_PLATFORM_BUILTIN_SKILLS_DIR=/opt/agent-platform/skills/builtin
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libmagic1 \
     && rm -rf /var/lib/apt/lists/* \
@@ -46,8 +47,10 @@ RUN apt-get update \
     && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin agent-platform \
     && install -d -o 1000 -g 1000 -m 0700 /var/lib/agent-platform
 COPY --from=python-build /opt/venv /opt/venv
+COPY enterprise-agent-platform/skills /opt/agent-platform/skills/builtin
 COPY containers/platform-entrypoint.sh /usr/local/bin/agent-platform-entrypoint
-RUN chmod 0755 /usr/local/bin/agent-platform-entrypoint
+RUN chmod 0755 /usr/local/bin/agent-platform-entrypoint \
+    && chmod -R go-w,a+rX /opt/agent-platform/skills/builtin
 ARG SOURCE_COMMIT=unknown
 ARG RELEASE_VERSION=development
 LABEL org.opencontainers.image.title="Agent Platform" \

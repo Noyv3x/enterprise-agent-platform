@@ -16,8 +16,8 @@ from starlette.routing import Route
 from .db import MODEL_SLOTS
 
 
-PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings']
-DEFAULT_GROUPS = {'admin': PERMISSIONS, 'manager': PERMISSIONS[:4], 'member': PERMISSIONS[:3], 'viewer': PERMISSIONS[:1]}
+PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings', 'install_extensions']
+DEFAULT_GROUPS = {'admin': PERMISSIONS, 'manager': PERMISSIONS[:4] + ['install_extensions'], 'member': PERMISSIONS[:3] + ['install_extensions'], 'viewer': PERMISSIONS[:1]}
 USER_FIELDS = 'id username display_name role position permission_group timezone active'.split()
 TTL = 7 * 86400
 COOKIE_NAME = 'agent_platform_session'

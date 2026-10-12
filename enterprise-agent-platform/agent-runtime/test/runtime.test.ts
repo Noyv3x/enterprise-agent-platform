@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { createServer as httpServer, type Server } from 'node:http';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentSession, ModelRuntime } from '@earendil-works/pi-coding-agent';
@@ -22,7 +22,7 @@ async function close(server: Server) {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 function request(model: string, kind: 'agent' | 'chat' = 'agent', scope?: string): RunRequest {
-  return {kind, sandbox:{scope_key:scope ?? (kind === 'chat' ? 'chat:1' : 'private:1'),workspace_id:kind === 'chat' ? 'chat-user-1' : 'user-1',sandbox_id:'sandbox',lifecycle_id:'lifecycle',profile:'agent',cwd:kind === 'chat' ? '/workspace/conversation' : '/workspace'},model:{id:model,thinking:'off'},prompt:{text:'First question'},context_prefix:'<context time="first"/>',resources:{system_prompt:'Stable assistant instructions.',agents_md:{path:'/workspace/AGENTS.md',content:'PRIVATE_CONTEXT_MARKER'},skills:[{name:'example',description:'Example skill',path:'/workspace/skills/example/SKILL.md'}]},tools:['bash','web_search']};
+  return {kind, sandbox:{scope_key:scope ?? (kind === 'chat' ? 'chat:1' : 'private:1'),workspace_id:kind === 'chat' ? 'chat-user-1' : 'user-1',sandbox_id:'sandbox',lifecycle_id:'lifecycle',profile:'agent',cwd:kind === 'chat' ? '/workspace/conversation' : '/workspace'},model:{id:model,thinking:'off'},prompt:{text:'First question'},context_prefix:'<context time="first"/>',resources:{system_prompt:'Stable assistant instructions.',agents_md:{path:'/workspace/AGENTS.md',content:'PRIVATE_CONTEXT_MARKER'},skills:[{name:'example',description:'Example skill',location:'/workspace/.agent-platform/skills/example/SKILL.md'}]},tools:['bash','web_search']};
 }
 function steering(input_id:string,text:string,context_prefix=''): Parameters<Runtime['steer']>[1] {
   return {input_id,prompt:{text,images:[]},context_prefix};
@@ -33,8 +33,6 @@ function userTexts(messages:TranscriptContext['messages']):string[] {
 type WireEvent = {seq:number;type:string;[key:string]:unknown};
 async function fixture(t: TestContext, constructionGate?: {entered:()=>void;ready:Promise<void>}) {
   const home = await mkdtemp(join(tmpdir(),'pi-runtime-proof-'));
-  await mkdir(join(home,'skills','bundled-example'),{recursive:true});
-  await writeFile(join(home,'skills','bundled-example','SKILL.md'),'---\nname: bundled-example\ndescription: Bundled fixture skill\n---\nRead only on demand.\n');
   const executorCalls: {path:string;body:any;authorization:string|undefined}[] = [];
   const gatewayCalls: {path:string;body:any;authorization:string|undefined}[] = [];
   const cancelOutcomes: ({confirmed:boolean}|{error:string})[] = [];
@@ -82,7 +80,7 @@ async function fixture(t: TestContext, constructionGate?: {entered:()=>void;read
     return stream;
   }});
   let modelRuntimeConstructions=0;
-  const newRuntime = () => new Runtime({home,platformUrl,platformToken:'tools-secret',executorSocket:socket,executorToken:'executor-secret',skillsDirectory:join(home,'skills'),modelRuntimeFactory:async()=>{
+  const newRuntime = () => new Runtime({home,platformUrl,platformToken:'tools-secret',executorSocket:socket,executorToken:'executor-secret',modelRuntimeFactory:async()=>{
     modelRuntimeConstructions++;
     constructionGate?.entered();await constructionGate?.ready;return models;
   }});
@@ -509,7 +507,7 @@ test('steering preserves registered skill commands literally and passes images a
   const skillPath=join(f.home,'literal-skill.md');
   await writeFile(skillPath,'---\nname: x\ndescription: Literal steering test skill\n---\nSKILL_EXPANSION_MUST_NOT_APPEAR\n');
   const body=request('runtime-proof');
-  body.resources.skills=[{name:'x',description:'Literal steering test skill',path:skillPath}];
+  body.resources.skills=[{name:'x',description:'Literal steering test skill',location:skillPath}];
   let continuation:TranscriptContext|undefined;
   f.faux.setResponses([
     async()=>{entered.resolve();await ready.promise;return fauxAssistantMessage('Before literal inputs');},
@@ -788,6 +786,7 @@ test('unchanged resources add no prompt update; an edited AGENTS.md is appended 
   const systems = (index:number) => captured[index]!.messages.filter(m=>m.role==='system');
   const prefixKept = (later:number) => assert.deepEqual(captured[later]!.messages.slice(0,captured[later-1]!.messages.length),captured[later-1]!.messages);
   const body = request(f.faux.getModel().id);
+  body.resources.skills = [{name:'example',description:'Catalog fixture skill',location:'/opt/agent-platform/skills/builtin/example/SKILL.md'}];
   await f.events(await f.start('agent-private-1',body));
   const second = structuredClone(body);
   second.context_prefix = '<context time="second"/>';second.prompt.text='Second question';
@@ -797,7 +796,7 @@ test('unchanged resources add no prompt update; an edited AGENTS.md is appended 
   const leading = JSON.stringify(systems(1));
   assert.equal(systems(1).length,1);
   assert.match(leading,/PRIVATE_CONTEXT_MARKER/);
-  assert.match(leading,/platform-skills\/bundled-example\/SKILL.md/);
+  assert.match(leading,/opt\/agent-platform\/skills\/builtin\/example\/SKILL.md/);
   assert.doesNotMatch(leading,/time=/);
   assert.deepEqual(systems(1).flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort(),['bash','web_search']);
   const last = captured[1]!.messages.at(-1)!;
@@ -830,9 +829,35 @@ test('chat strips private resources and privileged tools and forces chat executi
   assert.equal(events.at(-1)!.status,'completed');
   const systems=captured!.messages.filter(m=>m.role==='system');
   assert.deepEqual(systems.flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort(),['bash','web_fetch','web_search']);
-  assert.doesNotMatch(JSON.stringify(systems),/PRIVATE_CONTEXT_MARKER|SKILL.md/);
+  assert.doesNotMatch(JSON.stringify(systems),/PRIVATE_CONTEXT_MARKER/);
+  assert.match(JSON.stringify(systems),/\.agent-platform\/skills\/example\/SKILL.md/);
   assert.equal(f.executorCalls.find(c=>c.path.endsWith('/terminal'))!.body.execution_context.profile,'chat');
   assert.equal(f.executorCalls.find(c=>c.path.endsWith('/terminal'))!.body.arguments.cwd,'/workspace/conversation');
+});
+
+test('the platform skill catalog reaches Pi unchanged and the skill tool exists only for personal and channel root runs', {timeout:30_000}, async t=>{
+  const f = await fixture(t);
+  const catalog = [{name:'alpha',description:'Alpha fixture skill',location:'/opt/agent-platform/skills/builtin/alpha/SKILL.md'},{name:'beta',description:'Beta fixture skill',location:'/workspace/.agent-platform/skills/beta/SKILL.md'}];
+  const toolsFor = async (kind:'agent'|'chat'|'subagent',scope?:string) => {
+    let captured: TranscriptContext | undefined;
+    f.faux.setResponses([context=>{captured=structuredClone(context);return fauxAssistantMessage('Done');}]);
+    const body = request(f.faux.getModel().id,kind === 'chat' ? 'chat' : 'agent',scope);
+    body.kind = kind;
+    body.tools = kind === 'subagent' ? ['read'] : ['read','skill'];
+    body.resources.skills = structuredClone(catalog);
+    await f.events(await f.start(kind === 'subagent' ? 'agent-private-1-bg-1' : `skill-${kind}-${scope ?? 'default'}`.replaceAll(/[^A-Za-z0-9-]/g,'-'),body));
+    const systems = captured!.messages.filter(m=>m.role==='system');
+    for (const skill of catalog) {
+      assert.ok(JSON.stringify(systems).includes(skill.location));
+      assert.ok(JSON.stringify(systems).includes(skill.description));
+    }
+    assert.doesNotMatch(JSON.stringify(systems),/platform-skills/);
+    return systems.flatMap(m=>m.toolsAdded?.map(tool=>tool.name)??[]).sort();
+  };
+  assert.deepEqual(await toolsFor('agent'),['read','skill']);
+  assert.deepEqual(await toolsFor('agent','channel:7:main-agent'),['read','skill']);
+  assert.deepEqual(await toolsFor('chat'),['read']);
+  assert.deepEqual(await toolsFor('subagent','private:1/delegate/bg-1'),['read']);
 });
 
 test('active session rejects a concurrent run and cancellation terminates SSE and releases the session', {timeout:20_000}, async t=>{
@@ -1126,7 +1151,7 @@ test('manual compaction requires a selected model and generates its summary usin
 test('cancellation deadline preserves admission fence until pending construction settles', {timeout:10_000}, async t=>{
   const home=await mkdtemp(join(tmpdir(),'pi-cancel-deadline-'));
   const construction=Promise.withResolvers<ModelRuntime>();
-  const runtime=new Runtime({home,platformUrl:'http://127.0.0.1:1',platformToken:'unused',executorSocket:join(home,'absent.sock'),executorToken:'unused',skillsDirectory:join(home,'skills'),modelRuntimeFactory:()=>construction.promise});
+  const runtime=new Runtime({home,platformUrl:'http://127.0.0.1:1',platformToken:'unused',executorSocket:join(home,'absent.sock'),executorToken:'unused',modelRuntimeFactory:()=>construction.promise});
   t.after(async()=>{t.mock.timers.reset();construction.reject(new Error('Test cleanup'));await runtime.close();await rm(home,{recursive:true,force:true});});
   const body=request('runtime-proof');
   const starting=runtime.start('agent-private-1',body);
