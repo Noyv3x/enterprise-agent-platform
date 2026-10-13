@@ -215,16 +215,22 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     scope, published: conversation.published, lastPublished: conversation.lastPublished, previews: conversation.previews, shown: aside === "artifacts",
     liveCards, narrow, reveal: () => setAside("artifacts"),
   });
-  const { open: openArtifact, selection: artifactSelection, previewOf } = artifacts;
+  const { open: openArtifact, selection: artifactSelection, previewOf, file: shownFile, openFile } = artifacts;
   const artifactsShown = aside === "artifacts";
   const opener = useMemo<ArtifactOpener>(() => ({
     open: (id, version) => {
       openArtifact(id, version);
       setAside("artifacts");
     },
-    current: artifactsShown && artifactSelection ? { id: artifactSelection.id, version: artifactSelection.version } : null,
+    current: artifactsShown && !shownFile && artifactSelection ? { id: artifactSelection.id, version: artifactSelection.version } : null,
     previewOf,
-  }), [openArtifact, artifactsShown, artifactSelection, previewOf]);
+    // Attachments show in the 作品 panel's file mode.
+    openFile: (file) => {
+      openFile(file);
+      setAside("artifacts");
+    },
+    currentFile: artifactsShown && shownFile ? shownFile.id : null,
+  }), [openArtifact, artifactsShown, artifactSelection, previewOf, shownFile, openFile]);
   // 圈选反馈 waiting in the composer; only people who can post annotate.
   const feedback = useArtifactFeedback();
   const feedbackSink: FeedbackSink | null = canSend
@@ -613,8 +619,9 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
     const welcomeProps = {
       eyebrow: personal ? (userName ? w(`Hello ${userName}`, `你好，${userName}`, `你好，${userName}`) : defaultTitle) : String(title ?? defaultTitle),
       question: personal ? w("What can I help you with?", "今天要做什么？", "今天要做什麼？")
-        : canSend ? w("Start the conversation — the agent answers everyone here", "开始对话，智能体会回复这里的每个人", "開始對話，智慧體會回覆這裡的每個人")
-          : w("No messages yet", "还没有消息", "還沒有訊息"),
+        : !canSend ? w("No messages yet", "还没有消息", "還沒有訊息")
+          : channel ? w("Start the conversation — the agent answers everyone here", "开始对话，智能体会回复这里的每个人", "開始對話，智慧體會回覆這裡的每個人")
+            : w("What would you like to ask?", "想问点什么？", "想問點什麼？"),
       starters,
       onStarter: (text: string) => setSeed((current) => ({ text, n: (current?.n ?? 0) + 1 })),
     };
@@ -730,15 +737,12 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
       {personal && <TaskAnnouncer tasks={conversation.tasks} loaded={conversation.tasksLoaded} />}
       {body}
       {aside && (narrow ? (
-        <Sheet open onClose={closeAside} title={asideLabel} width={aside === "computer" ? 420 : 760}>
+        <Sheet open onClose={closeAside} title={asideLabel} width={aside === "computer" ? 420 : 760} bodyClassName="flex flex-col p-0">
+          {switcher && <div className="shrink-0 border-b border-line px-3 py-2">{switcher}</div>}
           {aside === "computer" ? (
-            <>
-              {switcher && <div className="mb-4">{switcher}</div>}
-              <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
-            </>
+            <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
           ) : (
-            <div className="flex h-full min-h-0 flex-col gap-4">
-              {switcher}
+            <div className="flex min-h-0 flex-1 flex-col">
               <ArtifactPanel state={artifacts} feedback={feedbackSink} owner={userId} />
             </div>
           )}
@@ -753,11 +757,11 @@ function ConversationScope({ scope, title, meta, actions, menuItems = [], onRunE
             </button>
           </div>
           {aside === "computer" ? (
-            <div className="min-h-0 flex-1 overflow-y-auto p-4">
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
               <ComputerBody live={live} lastRun={conversation.lastRun} messages={messages} focus={computerFocus} />
             </div>
           ) : (
-            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto p-3">
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
               <ArtifactPanel state={artifacts} feedback={feedbackSink} owner={userId} />
             </div>
           )}

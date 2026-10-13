@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Search the arXiv Atom API and print readable paper metadata."""
+"""Search the arXiv Atom API and print readable paper metadata.
+
+Needs network access (personal AI sandbox); the chat sandbox has none, use web tools there.
+"""
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import urllib.error
@@ -58,37 +62,56 @@ def fetch(params: dict[str, str], *, timeout: int) -> ET.Element:
         return ET.fromstring(response.read())
 
 
-def render(root: ET.Element) -> int:
-    entries = root.findall("a:entry", ATOM)
+def parse_entries(root: ET.Element) -> list[dict]:
+    entries = []
+    for entry in root.findall("a:entry", ATOM):
+        full_id = text(entry, "a:id").rsplit("/abs/", 1)[-1]
+        base_id = re.sub(r"v\d+$", "", full_id)
+        entries.append(
+            {
+                "id": full_id,
+                "base_id": base_id,
+                "title": text(entry, "a:title"),
+                "authors": [text(a, "a:name") for a in entry.findall("a:author", ATOM)],
+                "published": text(entry, "a:published")[:10],
+                "updated": text(entry, "a:updated")[:10],
+                "categories": [n.get("term", "") for n in entry.findall("a:category", ATOM)],
+                "abstract": text(entry, "a:summary"),
+                # Version-pinned links: a later fetch reads the revision whose metadata was reviewed.
+                "url": f"https://arxiv.org/abs/{full_id}",
+                "pdf": f"https://arxiv.org/pdf/{full_id}",
+                "latest_pdf": f"https://arxiv.org/pdf/{base_id}",
+            }
+        )
+    return entries
+
+
+def render(root: ET.Element, *, abstract_chars: int, as_json: bool, start: int) -> int:
+    entries = parse_entries(root)
     total = root.find(f"{{{OPEN_SEARCH}}}totalResults")
-    if total is not None and total.text:
-        print(f"Found {total.text.strip()} result(s); showing {len(entries)}.\n")
+    total_text = total.text.strip() if total is not None and total.text else "unknown"
+    if as_json:
+        print(json.dumps({"total_results": total_text, "start": start, "entries": entries}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"Found {total_text} result(s); showing {len(entries)} from offset {start}.\n")
     if not entries:
         print("No results found.")
         return 0
 
-    for index, entry in enumerate(entries, start=1):
-        raw_id = text(entry, "a:id")
-        full_id = raw_id.rsplit("/abs/", 1)[-1]
-        base_id = re.sub(r"v\d+$", "", full_id)
-        authors = ", ".join(
-            text(author, "a:name") for author in entry.findall("a:author", ATOM)
-        )
-        categories = ", ".join(
-            node.get("term", "") for node in entry.findall("a:category", ATOM)
-        )
-        summary = text(entry, "a:summary")
-        published = text(entry, "a:published")[:10]
-        updated = text(entry, "a:updated")[:10]
-
-        print(f"{index}. {text(entry, 'a:title')}")
-        print(f"   ID: {full_id}")
-        print(f"   Authors: {authors or 'Unknown'}")
-        print(f"   Published: {published or 'Unknown'} | Updated: {updated or 'Unknown'}")
-        print(f"   Categories: {categories or 'Unknown'}")
-        print(f"   Abstract: {summary[:500]}{'...' if len(summary) > 500 else ''}")
-        print(f"   URL: https://arxiv.org/abs/{base_id}")
-        print(f"   PDF: https://arxiv.org/pdf/{base_id}")
+    for index, item in enumerate(entries, start=start + 1):
+        abstract = item["abstract"]
+        if abstract_chars and len(abstract) > abstract_chars:
+            shown = f"{abstract[:abstract_chars]} [TRUNCATED: showing {abstract_chars} of {len(abstract)} characters; use --abstract-chars 0 or fetch the abstract page for the rest]"
+        else:
+            shown = abstract
+        print(f"{index}. {item['title']}")
+        print(f"   ID: {item['id']}  (versioned; cite this)")
+        print(f"   Authors: {', '.join(item['authors']) or 'Unknown'}")
+        print(f"   Published: {item['published'] or 'Unknown'} | Updated: {item['updated'] or 'Unknown'}")
+        print(f"   Categories: {', '.join(item['categories']) or 'Unknown'}")
+        print(f"   Abstract: {shown}")
+        print(f"   URL: {item['url']}")
+        print(f"   PDF: {item['pdf']}")
         print()
     return 0
 
@@ -100,6 +123,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--category", help="arXiv category such as cs.AI")
     result.add_argument("--id", dest="identifiers", help="one or more comma-separated IDs")
     result.add_argument("--max", dest="max_results", type=int, default=5)
+    result.add_argument("--start", type=int, default=0, help="result offset for pagination")
+    result.add_argument(
+        "--abstract-chars",
+        type=int,
+        default=500,
+        help="abstract characters to print; 0 prints the full abstract (truncation is always marked)",
+    )
+    result.add_argument("--json", action="store_true", help="print JSON with full abstracts")
     result.add_argument(
         "--sort",
         choices=("relevance", "date", "updated"),
@@ -113,6 +144,9 @@ def main() -> int:
     args = parser().parse_args()
     if not 1 <= args.max_results <= 100:
         print("error: --max must be between 1 and 100", file=sys.stderr)
+        return 2
+    if args.start < 0 or args.abstract_chars < 0:
+        print("error: --start and --abstract-chars must be 0 or greater", file=sys.stderr)
         return 2
     if not 1 <= args.timeout <= 120:
         print("error: --timeout must be between 1 and 120 seconds", file=sys.stderr)
@@ -132,12 +166,18 @@ def main() -> int:
         )
         params.update(
             {
+                "start": str(args.start),
                 "max_results": str(args.max_results),
                 "sortBy": sort_map[args.sort],
                 "sortOrder": "descending",
             }
         )
-        return render(fetch(params, timeout=args.timeout))
+        return render(
+            fetch(params, timeout=args.timeout),
+            abstract_chars=args.abstract_chars,
+            as_json=args.json,
+            start=args.start,
+        )
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

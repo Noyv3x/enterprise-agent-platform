@@ -2,6 +2,8 @@
 import asyncio
 import base64
 import hashlib
+import codecs
+import hmac
 import io
 import mimetypes
 import os
@@ -9,24 +11,27 @@ import stat
 import re
 import time
 import uuid
-import zipfile
-from xml.etree import ElementTree
+from datetime import datetime, timezone
 from urllib.parse import quote
 from contextlib import nullcontext
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
-from pypdf import PdfReader
 from starlette.exceptions import HTTPException
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from .auth import current_user
 from .db import now
+from .file_viewer import CORS, OFFICE_KINDS, VIEW_HEADERS, shell, wants_lang, wants_raw
 
 MAX_FILE = 32 * 1024 * 1024
-# A MEDIA delivery of these text kinds publishes an artifact version; images, PDFs, Office files and others stay attachments.
-MEDIA_ARTIFACT_EXTENSIONS = frozenset({'.html', '.htm', '.md', '.markdown', '.svg', '.mmd', '.mermaid', '.csv', '.tsv'})
+# A MEDIA delivery of these viewable kinds publishes an artifact version; images and other files stay attachments.
+MEDIA_ARTIFACT_EXTENSIONS = frozenset({'.html', '.htm', '.md', '.markdown', '.svg', '.mmd', '.mermaid', '.csv', '.tsv',
+                                       '.docx', '.xlsx', '.pptx', '.pdf'})
+VIEW_TOKEN_TTL = 7200
+TEXT_VIEW_LIMIT = 2 * 1024 * 1024
+TEXT_VIEW_KINDS = ('web', 'markdown', 'mermaid', 'table', 'code')
 
 
 def contained(root, value):
@@ -97,59 +102,27 @@ def descriptor_response(fd, filename, mime='application/octet-stream'):
         'Content-Length': str(os.fstat(fd).st_size)})
 
 
-def office_preview(data, suffix):
-    """Bounded text-only OOXML extraction; no archive extraction or external entities."""
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        entries = archive.infolist()
-        if len(entries) > 2048 or sum(item.file_size for item in entries) > 64 * 1024 * 1024:
-            raise ValueError('Office archive exceeds preview limits')
-        names = set(archive.namelist())
-        def xml(name):
-            item = archive.getinfo(name)
-            if item.file_size > 8 * 1024 * 1024 or item.flag_bits & 1:
-                raise ValueError('Office XML exceeds preview limits')
-            raw = archive.read(name)
-            declarations = raw.replace(b'\x00', b'').upper()
-            if b'<!DOCTYPE' in declarations or b'<!ENTITY' in declarations:
-                raise ValueError('XML entities are forbidden')
-            return ElementTree.fromstring(raw)
-        def texts(node):
-            return ''.join(item.text or '' for item in node.iter() if item.tag.rsplit('}', 1)[-1] == 't')[:1000]
-        lines = []
-        if suffix == '.docx':
-            for node in xml('word/document.xml').iter():
-                if node.tag.rsplit('}', 1)[-1] == 'p':
-                    lines.append(texts(node))
-                    if len(lines) >= 100:
-                        break
-        elif suffix == '.pptx':
-            slides = sorted((name for name in names if re.fullmatch(r'ppt/slides/slide\d+\.xml', name)), key=lambda name: int(re.search(r'(\d+)\.xml', name)[1]))
-            for index, name in enumerate(slides[:12], 1):
-                lines.append(f'Slide {index}')
-                lines.extend(texts(node) for node in xml(name).iter() if node.tag.rsplit('}', 1)[-1] == 'p')
-        else:
-            shared = [texts(node) for node in xml('xl/sharedStrings.xml') if node.tag.rsplit('}', 1)[-1] == 'si'] if 'xl/sharedStrings.xml' in names else []
-            sheets = sorted(name for name in names if re.fullmatch(r'xl/worksheets/sheet\d+\.xml', name))
-            for name in sheets[:5]:
-                lines.append(name.rsplit('/', 1)[-1])
-                for row in [node for node in xml(name).iter() if node.tag.rsplit('}', 1)[-1] == 'row'][:100]:
-                    cells = []
-                    for cell in list(row)[:30]:
-                        value = next((node.text or '' for node in cell if node.tag.rsplit('}', 1)[-1] == 'v'), '')
-                        if cell.get('t') == 's':
-                            value = shared[int(value)]
-                        elif cell.get('t') == 'inlineStr':
-                            value = texts(cell)
-                        cells.append(value[:1000])
-                    lines.append('\t'.join(cells))
-        return '\n'.join(lines)[:100000]
+def view_kind(filename, mime):
+    """How the panel shows an attachment: `pdf|docx|xlsx|pptx|image|text|other` (by file name first, then MIME type)."""
+    from .artifacts import EXTENSION_KIND, TEXT_MIMES
+    suffix = Path(filename).suffix.lower()
+    if suffix in ('.docx', '.xlsx', '.pptx'):
+        return suffix[1:]
+    if suffix == '.pdf' or mime == 'application/pdf':
+        return 'pdf'
+    if mime.startswith('image/'):
+        return 'image'
+    if mime.startswith('text/') or mime in TEXT_MIMES or EXTENSION_KIND.get(suffix) in TEXT_VIEW_KINDS:
+        return 'text'
+    return 'other'
 
 
 def attachment(row, chat=False):
     ident = -row['id'] if chat else row['id']
-    preview = row['mime_type'].startswith(('image/', 'text/')) or row['mime_type'] == 'application/pdf' or Path(row['filename']).suffix.lower() in {'.docx', '.xlsx', '.pptx'}
+    kind = view_kind(row['filename'], row['mime_type'])
     return {'id': ident, 'filename': row['filename'], 'mime_type': row['mime_type'], 'size_bytes': row['size_bytes'],
-            'url': f'/api/attachments/{ident}', 'preview_url': f'/api/attachments/{ident}/preview' if preview else None}
+            'url': f'/api/attachments/{ident}', 'preview_url': f'/api/attachments/{ident}/preview' if row['mime_type'].startswith('image/') else None,
+            'view_kind': kind}
 
 
 class Files:
@@ -162,7 +135,7 @@ class Files:
     def storage(self, row):
         return self.p.settings.data_dir / 'attachments' / row['storage_path']
 
-    def owned(self, user, ident, conn):
+    def find(self, ident, conn):
         chat = ident < 0
         table = 'chat_attachments' if chat else 'attachments'
         row = conn.execute(f'SELECT * FROM {table} WHERE id=?', (abs(ident),)).fetchone()
@@ -170,6 +143,10 @@ class Files:
             row = conn.execute('SELECT * FROM pending_attachments WHERE id=?', (ident,)).fetchone()
         if not row:
             raise HTTPException(404, 'Attachment not found')
+        return row, chat
+
+    def owned(self, user, ident, conn):
+        row, chat = self.find(ident, conn)
         if row['message_id'] is None and row['uploader_user_id'] != user['id']:
             raise HTTPException(404, 'Attachment not found')
         scope = 'chat-' + row['conversation_id'] if chat else ('private' if row['scope_type'] == 'private' else 'channel-' + str(row['scope_id']))
@@ -177,6 +154,38 @@ class Files:
         if not chat and (info['scope_type'] != row['scope_type'] or str(info['scope_id']) != str(row['scope_id'])):
             raise HTTPException(404, 'Attachment not found')
         return row, info
+
+    # -- view tokens -----------------------------------------------------------------------------
+
+    def sign(self, body, sha256):
+        # The file's content hash is signed but not carried: a token stops working if the id is ever reused for other bytes.
+        digest = hmac.new(self.p.settings.session_secret.encode(), b'attachment-view\n' + body.encode() + b'\n' + sha256.encode(), hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
+
+    def mint(self, ident, sha256):
+        """`(token, expires_at)`: read access to exactly one attachment for 2 h; stateless, no user identity."""
+        expires = int(time.time()) + VIEW_TOKEN_TTL
+        body = f'{ident}.{expires}'
+        return f'{body}.{self.sign(body, sha256)}', datetime.fromtimestamp(expires, timezone.utc).isoformat()
+
+    def grant(self, token):
+        """`(attachment id, expiry, signature)` of a well-formed unexpired token, else None; `verify` checks the signature."""
+        parts = token.split('.')
+        if len(parts) != 3 or not token.isascii() or not re.fullmatch(r'-?\d+', parts[0]) or not parts[1].isdigit() or int(parts[1]) <= time.time():
+            return None
+        return int(parts[0]), parts[1], parts[2]
+
+    def verify(self, granted, row):
+        ident, expires, signature = granted
+        return hmac.compare_digest(self.sign(f'{ident}.{expires}', row['sha256']).encode(), signature.encode())
+
+    def alive(self, ident, row, conn):
+        """A view token follows its conversation: a deleted chat or archived channel serves nothing, like the download route."""
+        if ident < 0:
+            return conn.execute('SELECT 1 FROM chat_conversations WHERE id=? AND deleted_at IS NULL', (row['conversation_id'],)).fetchone() is not None
+        if row['scope_type'] == 'channel':
+            return conn.execute('SELECT 1 FROM channels WHERE id=? AND archived=0', (row['scope_id'],)).fetchone() is not None
+        return True
 
     def bind(self, user, info, message_id, attachment_ids, conn=None):
         with nullcontext(conn) if conn is not None else self.p.db.connect() as db:
@@ -272,7 +281,7 @@ class Files:
         return attachment(row, info['kind'] == 'chat')
 
     async def deliver(self, user, scope_info, message_id, text, job_id=None):
-        """Store MEDIA files as attachments, except previewable text kinds, which publish artifact versions."""
+        """Store MEDIA files as attachments, except the viewable kinds (text, Office, PDF), which publish artifact versions."""
         delivered = []
         for value in dict.fromkeys(re.findall(r'^MEDIA:\s*(.+?)\s*$', text, flags=re.MULTILINE)):
             cwd = scope_info['sandbox'].get('cwd', '/workspace').rstrip('/') + '/'
@@ -324,27 +333,68 @@ async def download(request):
     if not path.is_file():
         raise HTTPException(404, 'Attachment bytes not found')
     if request.url.path.endswith('/preview'):
+        if not row['mime_type'].startswith('image/'):
+            raise HTTPException(415, 'No preview for this file type')
         try:
-            if row['mime_type'].startswith('image/'):
-                with Image.open(path) as image:
-                    image.thumbnail((1600, 1600))
-                    stream = io.BytesIO()
-                    image.convert('RGB').save(stream, 'PNG')
-                return Response(stream.getvalue(), media_type='image/png')
-            if row['mime_type'] == 'application/pdf':
-                PdfReader(path)
-                return Response(path.read_bytes(), media_type='application/pdf', headers={'Content-Security-Policy': "sandbox"})
-            suffix = Path(row['filename']).suffix.lower()
-            if suffix in {'.docx', '.xlsx', '.pptx'}:
-                return Response(office_preview(path.read_bytes(), suffix), media_type='text/plain')
-            if row['mime_type'].startswith('text/'):
-                with path.open('rb') as stream:
-                    text = stream.read(100000).decode('utf-8', errors='replace')
-                return Response(text, media_type='text/plain')
-        except (UnidentifiedImageError, OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+            with Image.open(path) as image:
+                image.thumbnail((1600, 1600))
+                stream = io.BytesIO()
+                image.convert('RGB').save(stream, 'PNG')
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
             raise HTTPException(422, 'Cannot preview this document') from exc
-        raise HTTPException(415, 'No preview for this file type')
+        return Response(stream.getvalue(), media_type='image/png')
     return descriptor_response(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), row['filename'], row['mime_type'])
+
+
+async def attachment_view_url(request):
+    """Mint a view token under the download's own authorization (ownership, scope, pending uploads, chat ids)."""
+    p = request.app.state.platform
+    user = current_user(request)
+    try:
+        ident = int(request.path_params['id'])
+    except ValueError as exc:
+        raise HTTPException(404, 'Attachment not found') from exc
+    with p.db.connect() as conn:
+        row, _ = p.files.owned(user, ident, conn)
+    if not p.files.storage(row).is_file():
+        raise HTTPException(404, 'Attachment bytes not found')
+    token, expires = p.files.mint(ident, row['sha256'])
+    return JSONResponse({'url': f"/attachment-view/{token}/{quote(row['filename'])}", 'kind': view_kind(row['filename'], row['mime_type']),
+                         'expires_at': expires})
+
+
+async def attachment_view(request):
+    """Serve one attachment to a bearer view token: no cookies; Office files as the sandboxed viewer page (bytes with `?raw=1`)."""
+    p = request.app.state.platform
+    granted = p.files.grant(request.path_params['token'])
+    if granted is None:
+        raise HTTPException(404, 'Not found')
+    with p.db.connect() as conn:
+        try:
+            row, _ = p.files.find(granted[0], conn)
+        except HTTPException:
+            raise HTTPException(404, 'Not found') from None
+        if not p.files.verify(granted, row) or not p.files.alive(granted[0], row, conn):
+            raise HTTPException(404, 'Not found')
+    path = p.files.storage(row)
+    if not path.is_file():
+        raise HTTPException(404, 'Not found')
+    kind = view_kind(row['filename'], row['mime_type'])
+    # Only the Office bytes fetched by the opaque-origin viewer need CORS; every other answer is read as a document, not fetched.
+    headers = {**{name: value for name, value in VIEW_HEADERS.items() if name not in CORS}, 'Cache-Control': 'private, max-age=7200'}
+    if kind in OFFICE_KINDS:
+        if not wants_raw(request):
+            return shell(kind, row['filename'], lang=wants_lang(request))
+        return FileResponse(path, media_type=row['mime_type'], headers={**headers, **CORS})
+    if kind == 'text':
+        with path.open('rb') as stream:
+            data = stream.read(TEXT_VIEW_LIMIT + 1)
+        text = codecs.getincrementaldecoder('utf-8')(errors='replace').decode(data[:TEXT_VIEW_LIMIT], final=len(data) <= TEXT_VIEW_LIMIT)
+        return Response(text, media_type='text/plain; charset=utf-8', headers=headers)
+    if kind == 'other':
+        return FileResponse(path, media_type='application/octet-stream', filename=row['filename'], content_disposition_type='attachment',
+                            headers={**headers, 'Content-Security-Policy': 'sandbox'})
+    return FileResponse(path, media_type='application/pdf' if kind == 'pdf' else row['mime_type'], headers=headers)
 
 
 async def workspace(request):
@@ -371,4 +421,5 @@ async def workspace(request):
 
 def routes():
     return [Route('/api/attachments', upload, methods=['POST']), Route('/api/attachments/{id}/preview', download),
-            Route('/api/attachments/{id}', download), Route('/api/workspace/files', workspace), Route('/api/workspace/download', workspace)]
+            Route('/api/attachments/{id}/view', attachment_view_url, methods=['POST']),
+            Route('/attachment-view/{token}/{name:path}', attachment_view), Route('/api/attachments/{id}', download), Route('/api/workspace/files', workspace), Route('/api/workspace/download', workspace)]

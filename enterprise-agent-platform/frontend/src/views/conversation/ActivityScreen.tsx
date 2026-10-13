@@ -1,14 +1,15 @@
 import { memo, useContext, useLayoutEffect, useMemo, useRef, type ReactNode } from "react";
-import { parseUnifiedDiff, type DiffRow } from "../../components/ui/beautiful/primitives/CodeBlock";
+import type { DiffRow } from "../../components/ui/beautiful/primitives/CodeBlock";
 import { useWords } from "../../words";
-import { commandLine, fileName, headLines, host, stepKind, str, tailLines } from "./computerView";
+import { commandLine, fileName, headLines, host, parsePatch, stepKind, str, tailLines, type PatchRow } from "./computerView";
 import type { ToolCall } from "./types";
 import { McpLabelsContext, toolVerb, type McpLabels, type Words } from "./work";
 
-/* What the computer window shows for one step, by kind: a terminal transcript, a file, search results, a fetched
- * page, a page card for an older browser step, or any other tool's arguments and result. Every view is a scrolling
- * frame that follows the end while the step streams (until the reader scrolls up) and reuses CodeBlock's look
- * (mono 12.5px, 1.65 leading, a hairline gutter, green/red row tints). Only part of long text is rendered. */
+/* What the computer window shows for one step, by kind: a terminal transcript, a file (a finished edit or write as
+ * its unified patch with old/new line numbers), search results, a fetched page, a page card for an older browser
+ * step, or any other tool's arguments and result. Every view is a scrolling frame that follows the end while the step
+ * streams (until the reader scrolls up) and reuses CodeBlock's look (mono 12.5px, 1.65 leading, a hairline gutter,
+ * green/red row tints). Only part of long text is rendered. */
 
 /** Same stick rule as the conversation: following the end until the reader scrolls up past this distance. */
 const STICK_PX = 120;
@@ -131,13 +132,10 @@ function Terminal({ calls, index, limits }: { calls: readonly ToolCall[]; index:
 
 type Rows = { rows: DiffRow[]; cut: boolean };
 
-/** The listing a file step shows: written/read content as numbered lines, edits as removed and added blocks. */
+/** The listing a file step shows without a patch: written/read content as numbered lines, edits as removed and added
+ * blocks (while the call streams, and for a write whose old file could not be compared). */
 function fileRows(call: ToolCall, max: number): Rows {
   if (call.name === "edit") {
-    if (call.status === "done" && call.diff) {
-      const rows = parseUnifiedDiff(call.diff).rows;
-      return { rows: rows.slice(-max), cut: rows.length > max };
-    }
     // Edits arrive as `edits: [{oldText,newText}]` or a single pair.
     const edits: unknown[] = Array.isArray(call.args.edits) ? call.args.edits : [call.args];
     const rows: DiffRow[] = [];
@@ -174,26 +172,82 @@ function Listing({ rows }: { rows: DiffRow[] }) {
   );
 }
 
+/** A unified patch in CodeBlock's Diff look (row tints, green bar / red hatch, hunk headers in ink-2) with two
+ * gutters, the old and the new line number, inset 4px so the 3px bar never covers the old number; removed and added
+ * rows are named for screen readers. */
+function PatchListing({ rows }: { rows: PatchRow[] }) {
+  const w = useWords();
+  const digits = String(Math.max(0, ...rows.map((row) => Math.max(row.old ?? 0, row.new ?? 0)))).length;
+  const gutter = Math.max(20, digits * 7 + 6);
+  const added = w("Added", "新增", "新增");
+  const removed = w("Removed", "删除", "刪除");
+  return (
+    <div className={`relative ${MONO} text-ink-2`}>
+      <span className="pointer-events-none absolute inset-y-0 w-px bg-line" style={{ left: 4 + gutter * 2 }} />
+      {rows.map((row, at) => {
+        const add = row.type === "add";
+        const del = row.type === "del";
+        const number = `select-none text-center text-[11px] ${add ? "text-green-ink" : del ? "text-red-ink" : "text-ink-2"}`;
+        return (
+          <div key={at} className={`relative grid items-start pl-1 ${add ? "bg-green-tint" : del ? "bg-red-tint" : row.type === "hunk" && at > 0 ? "mt-2" : ""}`} style={{ gridTemplateColumns: `${gutter}px ${gutter}px minmax(0,1fr)` }}>
+            {(add || del) && <span className="absolute inset-y-0 left-0 w-[3px]" style={{ background: add ? "var(--green)" : HATCH }} />}
+            <span aria-hidden className={number}>{row.old ?? ""}</span>
+            <span aria-hidden className={number}>{row.new ?? ""}</span>
+            <code className="break-words whitespace-pre-wrap pl-1 pr-3">
+              {(add || del) && <span className="sr-only">{add ? added : removed}: </span>}
+              {row.text || "\u200b"}
+            </code>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function FileView({ call, limits }: { call: ToolCall; limits: Limits }) {
   const w = useWords();
-  const view = useMemo(() => fileRows(call, limits.rows), [call, limits.rows]);
+  // A finished edit or write with a patch shows it; otherwise (streaming, no patch) the arguments or content.
+  const patch = useMemo(() => {
+    if (!call.patch || call.status !== "done" || (call.name !== "edit" && call.name !== "write")) return null;
+    const parsed = parsePatch(call.patch);
+    return parsed.rows.length ? { ...parsed, rows: parsed.rows.slice(0, limits.rows), clipped: parsed.rows.length > limits.rows } : null;
+  }, [call, limits.rows]);
+  const view = useMemo(() => (patch ? null : fileRows(call, limits.rows)), [patch, call, limits.rows]);
   const path = str(call.args.path);
   return (
     <div className="absolute inset-0 flex flex-col bg-surface">
       <div className="flex h-8 shrink-0 items-center gap-2 border-b border-line px-3 text-[12px]">
         <span className="min-w-0 flex-1 truncate font-mono text-ink-2" title={path}>{path || "…"}</span>
+        {patch && (
+          <span className="inline-flex shrink-0 items-center gap-2 font-mono tabular-nums">
+            <span className="text-green-ink">+{patch.added}</span>
+            <span className="text-red-ink">−{patch.removed}</span>
+            <span className="sr-only">{w(`${patch.added} added, ${patch.removed} removed`, `新增 ${patch.added} 行，删除 ${patch.removed} 行`, `新增 ${patch.added} 行，刪除 ${patch.removed} 行`)}</span>
+          </span>
+        )}
         <span className="inline-flex shrink-0 items-center gap-1.5 text-ink-2">
           <StateMark status={call.status} label={stateLabel(call.status, w)} />
           {stateLabel(call.status, w)}
         </span>
       </div>
       <div className="relative min-h-0 flex-1">
-        <FollowEnd label={path ? `${w("File", "文件", "檔案")}: ${path}` : w("File", "文件", "檔案")} signal={call} follow={running(call)}>
+        {/* The patch opens at its first hunk: a fresh frame, no longer following the streamed content's end. */}
+        <FollowEnd key={patch ? "patch" : "content"} label={path ? `${w("File", "文件", "檔案")}: ${path}` : w("File", "文件", "檔案")} signal={call} follow={running(call)}>
           <div className="py-2">
             <Clipped call={call} className="px-3 pb-1" />
-            {view.cut && <p className={`px-3 pb-1 ${NOTE}`}>{w(`Showing the last ${view.rows.length} lines`, `仅显示最后 ${view.rows.length} 行`, `僅顯示最後 ${view.rows.length} 行`)}</p>}
-            {view.rows.length ? <Listing rows={view.rows} />
-              : <p className={`px-3 ${NOTE}`}>{running(call) ? w("Waiting for content…", "等待内容…", "等待內容…") : w("No content", "没有内容", "沒有內容")}</p>}
+            {patch ? (
+              <>
+                {(call.patchCut || patch.cut) && <p className={`px-3 pb-1 ${NOTE}`}>{w("Only part of this change is shown", "仅显示部分改动", "僅顯示部分改動")}</p>}
+                {patch.clipped && <p className={`px-3 pb-1 ${NOTE}`}>{w(`Showing the first ${patch.rows.length} lines of the change`, `仅显示改动的前 ${patch.rows.length} 行`, `僅顯示改動的前 ${patch.rows.length} 行`)}</p>}
+                <PatchListing rows={patch.rows} />
+              </>
+            ) : view && (
+              <>
+                {view.cut && <p className={`px-3 pb-1 ${NOTE}`}>{w(`Showing the last ${view.rows.length} lines`, `仅显示最后 ${view.rows.length} 行`, `僅顯示最後 ${view.rows.length} 行`)}</p>}
+                {view.rows.length ? <Listing rows={view.rows} />
+                  : <p className={`px-3 ${NOTE}`}>{running(call) ? w("Waiting for content…", "等待内容…", "等待內容…") : w("No content", "没有内容", "沒有內容")}</p>}
+              </>
+            )}
             {call.status === "error" && call.output && <p className={`px-3 pt-2 ${MONO} text-red-ink`}>{call.output}</p>}
           </div>
         </FollowEnd>

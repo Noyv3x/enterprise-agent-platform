@@ -51,6 +51,15 @@ function reply(id: number, tools: Record<string, unknown>[] = []): Message {
   return { id, role: "assistant", content: `Reply ${id}.`, metadata: { status: "completed", ...(work ? { work } : {}) }, created_at: "2026-10-01T05:22:12Z", attachments: [] };
 }
 
+/** Pi edit's `details.patch` (4 lines of context) and a write's patch for a new file. */
+const EDIT_PATCH = "--- app.py\n+++ app.py\n@@ -8,4 +8,4 @@\n def total(rows):\n-    return sum(rows)\n+    return round(sum(rows), 2)\n \n print(total([1, 2]))\n\\ No newline at end of file\n";
+const WRITE_PATCH = "--- notes.md\n+++ notes.md\n@@ -0,0 +1,2 @@\n+# 周报\n+完成\n";
+
+/** The old and new line numbers in the gutters of the patch row holding `code`. */
+function numbers(code: HTMLElement): string[] {
+  return Array.from(code.parentElement!.querySelectorAll(":scope > span[aria-hidden]"), (span) => span.textContent ?? "");
+}
+
 let tabs: BrowserTab[] = [];
 let lease: { holder_user_id: number; expires_at: string } | null = null;
 
@@ -198,6 +207,42 @@ describe("Computer panel", () => {
     expect(within(panel).getByText("3 / 3")).toBeVisible();
   });
 
+  it("shows a finished edit and write as their unified patch with old and new line numbers", async () => {
+    const panel = await mount();
+    emit({ type: "tool_input_start", tool_call_id: "e1", name: "edit" });
+    emit({ type: "tool_start", tool_call_id: "e1", name: "edit", args: { path: "app.py", edits: [{ oldText: "    return sum(rows)", newText: "    return round(sum(rows), 2)" }] } });
+    // While it runs: the arguments as removed and added blocks.
+    expect(within(windowOf(panel)).getByText("return sum(rows)")).toBeVisible();
+    emit({ type: "tool_end", tool_call_id: "e1", is_error: false, content_preview: text("Successfully replaced 1 block(s) in app.py."),
+      details: { patch: EDIT_PATCH, diff: " 8 def total(rows):\n-9     return sum(rows)\n+9     return round(sum(rows), 2)", firstChangedLine: 9 } });
+    let win = windowOf(panel);
+    expect(within(win).getByText("@@ -8,4 +8,4 @@")).toBeVisible();
+    expect(numbers(within(win).getByText("def total(rows):"))).toEqual(["8", "8"]);
+    expect(numbers(within(win).getByText("return sum(rows)"))).toEqual(["9", ""]);
+    expect(numbers(within(win).getByText("return round(sum(rows), 2)"))).toEqual(["", "9"]);
+    expect(numbers(within(win).getByText("print(total([1, 2]))"))).toEqual(["11", "11"]);
+    expect(within(win).getByText("+1")).toBeVisible();
+    expect(within(win).getByText("−1")).toBeVisible();
+    // Pi's display diff never reaches the screen.
+    expect(within(win).queryByText(/-9 {5}return/)).not.toBeInTheDocument();
+
+    emit({ type: "tool_input_start", tool_call_id: "w1", name: "write" });
+    emit({ type: "tool_start", tool_call_id: "w1", name: "write", args: { path: "notes.md", content: "# 周报\n完成\n" } });
+    emit({ type: "tool_end", tool_call_id: "w1", is_error: false, content_preview: text("Successfully wrote to notes.md"), details: { patch: WRITE_PATCH } });
+    win = windowOf(panel);
+    expect(numbers(within(win).getByText("# 周报"))).toEqual(["", "1"]);
+    expect(numbers(within(win).getByText("完成"))).toEqual(["", "2"]);
+    expect(within(win).getByText("+2")).toBeVisible();
+    expect(within(win).getByText("−0")).toBeVisible();
+    expect(within(win).queryByText("Only part of this change is shown")).not.toBeInTheDocument();
+
+    // Runtime cut a large patch on whole lines to fit its event budget and flagged it.
+    emit({ type: "tool_input_start", tool_call_id: "w2", name: "write" });
+    emit({ type: "tool_start", tool_call_id: "w2", name: "write", args: { path: "big.md", content: "# 周报\n完成\n" } });
+    emit({ type: "tool_end", tool_call_id: "w2", is_error: false, content_preview: text("Successfully wrote to big.md"), details: { patch: WRITE_PATCH, patch_truncated: true } });
+    expect(within(windowOf(panel)).getByText("Only part of this change is shown")).toBeVisible();
+  });
+
   it("reviews an earlier step that new steps and a new run never move, then returns to live", async () => {
     const user = userEvent.setup();
     const panel = await mount();
@@ -277,6 +322,22 @@ describe("Computer panel", () => {
     // The status under the window (the file header inside it repeats the step state).
     expect(within(panel).getAllByText("Done").filter((node) => !win.contains(node))).toHaveLength(1);
     expect(within(panel).queryByRole("button", { name: /back to/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the same patch after a reload from the persisted work trace, noting a clipped one", async () => {
+    const user = userEvent.setup();
+    const panel = await mount([reply(5, [
+      { ...tool("e1", "edit", { path: "app.py", edits: [{ oldText: "    return sum(rows)", newText: "    return round(sum(rows), 2)" }] }), patch: EDIT_PATCH },
+      { ...tool("w1", "write", { path: "notes.md", content: "# 周报\n完成\n" }), patch: WRITE_PATCH.split("\n").slice(0, 4).join("\n") + "\n", patch_truncated: true },
+    ])]);
+    let win = windowOf(panel);
+    expect(numbers(within(win).getByText("# 周报"))).toEqual(["", "1"]);
+    expect(within(win).queryByText("完成")).not.toBeInTheDocument();
+    expect(within(win).getByText("Only part of this change is shown")).toBeVisible();
+    await user.click(within(panel).getByRole("button", { name: "Previous step" }));
+    win = windowOf(panel);
+    expect(numbers(within(win).getByText("return round(sum(rows), 2)"))).toEqual(["", "9"]);
+    expect(numbers(within(win).getByText("print(total([1, 2]))"))).toEqual(["11", "11"]);
   });
 
   it("pins the live browser while a person holds it and resumes following after handing back", async () => {

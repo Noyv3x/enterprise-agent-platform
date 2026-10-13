@@ -13,6 +13,12 @@ const listeners = new Set<() => void>();
 let loading: Promise<void> | null = null;
 let account: number | null = null;
 let generation = 0;
+/** Chats the user renamed in this cache generation: a generated title never replaces their name. */
+const renamed = new Set<string>();
+/** Counts local title changes; `titledAt` holds the count at each chat's latest one, so a list request that started
+ * earlier keeps the newer local title instead of the title it read. */
+let titleChanges = 0;
+const titledAt = new Map<string, number>();
 
 /** Start a fresh cache before rendering a different authenticated account. */
 export function setChatAccount(userId: number | null) {
@@ -39,15 +45,23 @@ function ordered(list: ChatConversation[]): ChatConversation[] {
 export function refreshChats(): Promise<void> {
   if (loading) return loading;
   const started = generation;
+  const since = titleChanges;
   const pending = request<{ conversations: ChatConversation[] }>("/api/chat/conversations")
     .then((list) => {
-      if (started === generation) set({ conversations: ordered(list.conversations), error: "" });
+      if (started !== generation) return;
+      // Cleared before publishing: views that mount on this list (an opened chat) may ask for a fresh read at once.
+      loading = null;
+      const local = new Map((state.conversations ?? []).map((item) => [item.id, item.title]));
+      const conversations = list.conversations.map((item) => {
+        const title = local.get(item.id);
+        return title !== undefined && (titledAt.get(item.id) ?? 0) > since ? { ...item, title } : item;
+      });
+      set({ conversations: ordered(conversations), error: "" });
     })
     .catch((reason: unknown) => {
-      if (started === generation) set({ error: reason instanceof Error ? reason.message : String(reason) });
-    })
-    .finally(() => {
-      if (started === generation) loading = null;
+      if (started !== generation) return;
+      loading = null;
+      set({ error: reason instanceof Error ? reason.message : String(reason) });
     });
   loading = pending;
   return pending;
@@ -69,7 +83,13 @@ export async function updateChat(id: string, patch: { title?: string }): Promise
     method: "PATCH",
     body: JSON.stringify(patch),
   });
-  if (started === generation) set({ conversations: ordered((state.conversations ?? []).map((item) => (item.id === id ? conversation : item))) });
+  if (started !== generation) return conversation;
+  // Only a rename Platform accepted outranks generated titles; a refused one leaves the chat eligible.
+  if (patch.title !== undefined) {
+    renamed.add(id);
+    titledAt.set(id, ++titleChanges);
+  }
+  set({ conversations: ordered((state.conversations ?? []).map((item) => (item.id === id ? conversation : item))) });
   return conversation;
 }
 
@@ -83,6 +103,20 @@ export async function deleteChat(id: string): Promise<void> {
 export function touchChat(id: string, updatedAt: string) {
   if (!state.conversations?.some((item) => item.id === id)) return;
   set({ conversations: ordered(state.conversations.map((item) => (item.id === id ? { ...item, updated_at: updatedAt } : item))) });
+}
+
+/** Apply a title Platform generated (SSE `conversation_title`) to the list the sidebar and the header read. A rename
+ * by the user wins, also when the generated title's event arrives after the rename's response. */
+export function applyChatTitle(id: string, title: string) {
+  if (!title || renamed.has(id) || !state.conversations?.some((item) => item.id === id && item.title !== title)) return;
+  titledAt.set(id, ++titleChanges);
+  set({ conversations: state.conversations.map((item) => (item.id === id ? { ...item, title } : item)) });
+}
+
+/** Re-read a loaded list, e.g. when a chat or the chat list is shown again: a title generated while that chat's
+ * stream was closed is never replayed to it. */
+export function revalidateChats() {
+  if (state.conversations !== null) void refreshChats();
 }
 
 /** Subscribe and load once per cache generation, including an account switch while mounted. */
@@ -99,5 +133,7 @@ export function useChats(enabled = true): ChatState {
 export function resetChatStore() {
   generation++;
   loading = null;
+  renamed.clear();
+  titledAt.clear();
   set({ conversations: null, error: "" });
 }

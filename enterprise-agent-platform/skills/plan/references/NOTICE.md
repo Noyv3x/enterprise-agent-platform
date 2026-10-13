@@ -9,6 +9,17 @@ Copyright (c) 2025 Nous Research
 
 Copyright (c) 2025 Jesse Vincent
 
+## What was changed
+
+- Selective refresh against [obra/superpowers](https://github.com/obra/superpowers)
+  v7.0.0 `writing-plans`: exact interfaces and test specificity, no-placeholder
+  rule, and a self-review step. Its execution framework, commit steps and
+  worktree automation were not adopted.
+- Kept the plan-only trigger of the original skill.
+- Added for this platform: `references/business-plan.md` (written for this
+  platform, not from upstream), same-path artifact revisions, and
+  scope-relative output.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

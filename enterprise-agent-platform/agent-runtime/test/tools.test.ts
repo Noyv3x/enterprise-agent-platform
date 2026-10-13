@@ -294,6 +294,76 @@ test("remote reads preserve large UTF-8 and binary bytes and reject clipped chun
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
+test("write returns a unified patch against the content it replaced; edit returns Pi's patch without the display diff", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-write-patch-"));
+  const shell = promisify(execFile);
+  const reads: string[] = [];
+  const executor: ExecutorTransport = {
+    ...noProcesses,
+    async terminal(_sandbox, _context, command) {
+      const { stdout } = await shell("bash", ["-c", command.replaceAll("/workspace", directory)], { maxBuffer: 4_000_000 });
+      // A file that grows right after the write's size probe.
+      if (command.includes("grows.txt") && command.includes("stat -c %s")) await writeFile(join(directory, "grows.txt"), "y".repeat(3_000_000));
+      return { stdout: stdout.replaceAll(directory, "/workspace"), stderr: "", exit_code: 0, status: "completed" };
+    },
+    async file(_sandbox, _context, action, args) {
+      const filename = String(args.path).replace("/workspace", directory);
+      if (action === "write") { await writeFile(filename, String(args.content)); return { content: "", details: {} }; }
+      reads.push(String(args.path));
+      const data = await readFile(filename);
+      const offset = Number(args.offset ?? 0);
+      const bytes = data.subarray(offset, offset + Number(args.limit));
+      return { content: bytes.toString("utf8"), details: { total: data.length, returned: bytes.length } };
+    },
+    async cancelRun() { return true; },
+  };
+  const tools = createTools("/workspace", { sandbox, executor, gateway: { async call() { throw new Error("unused"); } },
+    context: () => ({ sid: "patch", scope_key: sandbox.scope_key, run_id: "patch" }), names: ["write", "edit"] });
+  const invoke = (name: string, args: Record<string, unknown>) => tools.find(tool => tool.name === name)!.execute("patch", args, undefined, undefined, {} as ExtensionToolContext);
+  const lines = (count: number, changed?: number) => Array.from({ length: count }, (_, at) => at + 1 === changed ? "changed" : `line ${at + 1}`).join("\n") + "\n";
+  try {
+    const created = await invoke("write", { path: "notes/新.md", content: "一\n二\n" });
+    assert.deepEqual(created.details, { patch: "--- notes/新.md\n+++ notes/新.md\n@@ -0,0 +1,2 @@\n+一\n+二\n" });
+    assert.equal(await readFile(join(directory, "notes", "新.md"), "utf8"), "一\n二\n");
+
+    await writeFile(join(directory, "list.txt"), lines(20));
+    const overwritten = await invoke("write", { path: "/workspace/list.txt", content: lines(20, 10) });
+    assert.deepEqual(overwritten.details, { patch: [
+      "--- /workspace/list.txt", "+++ /workspace/list.txt", "@@ -7,7 +7,7 @@",
+      " line 7", " line 8", " line 9", "-line 10", "+changed", " line 11", " line 12", " line 13", "",
+    ].join("\n") });
+
+    // Binary or oversized previous content is not compared: the write succeeds with no patch.
+    await writeFile(join(directory, "image.bin"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
+    assert.equal((await invoke("write", { path: "image.bin", content: "text now\n" })).details, undefined);
+    await writeFile(join(directory, "huge.txt"), "x".repeat(1024 * 1024 + 1));
+    assert.equal((await invoke("write", { path: "huge.txt", content: "small\n" })).details, undefined);
+    assert.equal(await readFile(join(directory, "huge.txt"), "utf8"), "small\n");
+    assert.equal((await invoke("write", { path: "small.txt", content: "z".repeat(1024 * 1024 + 1) })).details, undefined);
+
+    // A file that grew past the bound after the size probe is read only up to its first chunk.
+    await writeFile(join(directory, "grows.txt"), "small\n");
+    reads.length = 0;
+    assert.equal((await invoke("write", { path: "grows.txt", content: "new\n" })).details, undefined);
+    assert.deepEqual(reads, ["/workspace/grows.txt"]);
+    assert.equal(await readFile(join(directory, "grows.txt"), "utf8"), "new\n");
+
+    // Rewriting a ~1 MiB file with entirely different lines exceeds the diff's edit bound: quick, written, no patch.
+    const numbered = (prefix: string) => Array.from({ length: 87_000 }, (_, at) => `${prefix} ${String(at).padStart(7, "0")}\n`).join("");
+    await writeFile(join(directory, "rewrite.txt"), numbered("old"));
+    const started = performance.now();
+    const rewritten = await invoke("write", { path: "rewrite.txt", content: numbered("new") });
+    assert.ok(performance.now() - started < 3000, `rewrite took ${performance.now() - started} ms`);
+    assert.equal(rewritten.details, undefined);
+    assert.equal(await readFile(join(directory, "rewrite.txt"), "utf8"), numbered("new"));
+
+    const edited = await invoke("edit", { path: "list.txt", edits: [{ oldText: "line 2\n", newText: "line two\n" }] });
+    const details = edited.details as Record<string, unknown>;
+    assert.equal("diff" in details, false);
+    assert.match(String(details.patch), /^--- list\.txt\n\+\+\+ list\.txt\n@@ -1,\d+ \+1,\d+ @@\n line 1\n-line 2\n\+line two\n/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("browser screenshot and vision deliver image content without image details", async () => {
   const image = { mimeType: "image/png", data: "iVBORw0KGgo=", bytes: 8 };
   const tools = createTools("/workspace", { sandbox, executor: {} as ExecutorTransport,

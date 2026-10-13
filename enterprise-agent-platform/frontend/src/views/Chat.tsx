@@ -1,15 +1,21 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { request } from "../api";
 import { Button } from "../components/ui/beautiful/atoms/Button";
 import { ConfirmDialog, Dialog, EmptyState, Icon, NavigationButton, Notice, TextField } from "../components/ui/beautiful/controls";
 import LoadingState from "../components/ui/beautiful/primitives/LoadingState";
 import { useWords } from "../words";
 import { Conversation } from "./Conversation";
-import { createChat, deleteChat, refreshChats, updateChat, useChats } from "./chat/chatStore";
+import { createChat, deleteChat, refreshChats, revalidateChats, updateChat, useChats } from "./chat/chatStore";
 import { Composer } from "./conversation/Composer";
 import { conversationBase } from "./conversation/routes";
 import type { ChatConversation, Message } from "./conversation/types";
 import { errorText } from "./conversation/useConversation";
+
+/** The area name 纯聊天模式, shared with the sidebar item: blank, loading and missing chats have no title of their own. */
+function useModeName() {
+  const w = useWords();
+  return w("Plain chat", "纯聊天模式", "純聊天模式");
+}
 
 function ChatHeader({ title }: { title: string }) {
   return (
@@ -45,9 +51,10 @@ function NewChat({ userName }: { userName?: string }) {
   };
 
   const untitled = w("New chat", "新聊天", "新聊天");
+  const mode = useModeName();
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <ChatHeader title={untitled} />
+      <ChatHeader title={mode} />
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex min-h-full w-full max-w-[720px] flex-col justify-center px-4 py-10 sm:px-8">
           <h1 className="text-[26px] font-normal tracking-[-0.02em] text-ink" style={{ animation: "fade-up 450ms cubic-bezier(0.16,1,0.3,1) both" }}>
@@ -80,6 +87,8 @@ function OpenChat({ chat, userName }: { chat: ChatConversation; userName?: strin
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const untitled = w("New chat", "新聊天", "新聊天");
+  // A title generated while this chat was not open never reaches its stream again; re-read the list on opening it.
+  useEffect(() => revalidateChats(), []);
 
   const rename = async () => {
     setPending(true);
@@ -155,12 +164,13 @@ function OpenChat({ chat, userName }: { chat: ChatConversation; userName?: strin
 /** Standard chat: `#chat` starts a new conversation, `#chat-<id>` opens one from the shared chat list. */
 export function Chat({ id, userName }: { id?: string; userName?: string }) {
   const w = useWords();
+  const mode = useModeName();
   const { conversations, error } = useChats();
 
   if (!conversations) {
     return (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <ChatHeader title={w("Chat", "聊天", "聊天")} />
+        <ChatHeader title={mode} />
         <div className="flex flex-1 items-center justify-center p-6">
           {error ? (
             <Notice tone="danger" title={w("Chats could not be loaded", "无法加载对话", "無法載入對話")}
@@ -178,7 +188,7 @@ export function Chat({ id, userName }: { id?: string; userName?: string }) {
   if (!chat) {
     return (
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <ChatHeader title={w("Chat", "聊天", "聊天")} />
+        <ChatHeader title={mode} />
         <div className="flex flex-1 items-center justify-center">
           <EmptyState
             icon="chat"

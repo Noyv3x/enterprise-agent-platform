@@ -1,6 +1,7 @@
 import type { Api, Model } from '@earendil-works/pi-ai';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { EffortStore } from './effort.js';
 
 export interface ModelSelection {
   id: string;
@@ -11,7 +12,7 @@ export interface ModelSelection {
 
 // Platform authorizes model IDs when resolving credentials. Its live Codex
 // catalog can lead the SDK's bundled catalog; retain the native wire protocol.
-export async function resolveModel(runtime: ModelRuntime, selection: ModelSelection, signal?: AbortSignal): Promise<Model<Api>> {
+export async function resolveModel(runtime: ModelRuntime, selection: Omit<ModelSelection, 'thinking'>, signal?: AbortSignal): Promise<Model<Api>> {
   const injected = runtime.getModels().find(model => model.id === selection.id &&
     model.provider !== 'openai-codex' && runtime.getRegisteredNativeProvider(model.provider));
   const provider = injected?.provider ?? 'openai-codex';
@@ -30,27 +31,43 @@ export async function resolveModel(runtime: ModelRuntime, selection: ModelSelect
   };
 }
 
-const bindings = new WeakMap<ModelRuntime, { sid: string; beforeRequest: (() => void) | undefined }>();
+const bindings = new WeakMap<ModelRuntime, { sid: string; beforeRequest: (() => void) | undefined; effort: EffortStore | undefined }>();
 // Pi's summary/retry machinery stays untouched. Apply conversation routing at
 // the final runtime boundary, after summarization chooses a random ID/no cache.
-export function bindModelSession(runtime: ModelRuntime, sid: string, beforeRequest?: () => void): void {
+// Conversation requests (not Pi's `cacheRetention:"none"` summarizations) also
+// pass through the stable-effort planner when one is supplied.
+export function bindModelSession(runtime: ModelRuntime, sid: string, beforeRequest?: () => void, effort?: EffortStore): void {
   const existing = bindings.get(runtime);
   if (existing) {
     existing.sid = sid;
     existing.beforeRequest = beforeRequest;
+    existing.effort = effort;
     return;
   }
-  const binding = { sid, beforeRequest };
+  const binding = { sid, beforeRequest, effort };
   bindings.set(runtime, binding);
   let delegating = false;
   const wrap = <K extends 'stream' | 'streamSimple' | 'complete' | 'completeSimple'>(method: K) => {
     const original = runtime[method].bind(runtime);
     runtime[method] = ((model: Model<Api>, context: Parameters<ModelRuntime['streamSimple']>[1], options?: Parameters<ModelRuntime['streamSimple']>[2]) => {
-      if (!delegating) binding.beforeRequest?.();
+      let onPayload = options?.onPayload;
+      if (!delegating) {
+        binding.beforeRequest?.();
+        const planner = options?.cacheRetention === 'none' ? undefined : binding.effort;
+        if (planner) {
+          const inner = options?.onPayload;
+          onPayload = async (payload: unknown, selected: Model<Api>) => {
+            const replaced = await inner?.(payload, selected);
+            const next = replaced ?? payload;
+            planner.plan(selected, next);
+            return replaced;
+          };
+        }
+      }
       const previous = delegating;
       delegating = true;
       try {
-        return original(model, context, { ...options, sessionId: binding.sid, cacheRetention: 'short' });
+        return original(model, context, { ...options, ...(onPayload ? { onPayload } : {}), sessionId: binding.sid, cacheRetention: 'short' });
       } finally {
         delegating = previous;
       }

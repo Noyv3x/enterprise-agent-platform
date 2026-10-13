@@ -383,9 +383,9 @@ export interface ComputerFocus {
   n: number;
 }
 
-/** Personal AI computer panel body: one window following the AI step by step, its description and status, the
- * playback bar, browser takeover, the background tasks and the workspace files. Fills the height its container
- * gives it. */
+/** Personal AI computer panel body: one screen following the AI step by step, flush with its panel (contract G: no
+ * window-in-window), its description and status, the playback bar, browser takeover, the background tasks and the
+ * workspace files. Fills the height its container gives it; the container adds no padding. */
 export function ComputerBody({ live, lastRun, messages, focus }: {
   live: LiveRun | null;
   lastRun: LastRun | null;
@@ -516,7 +516,7 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-3">
+    <div className="flex min-h-0 flex-1 flex-col">
       <AgentScreen
         className="min-h-[300px] flex-1"
         agentName={name}
@@ -558,17 +558,19 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
           window: w("Computer screen", "电脑画面", "電腦畫面"),
         }}
       />
-      {playback}
-      <div className="flex shrink-0 flex-wrap items-center gap-2">
-        {holding ? handBack : takeControl}
-        <span className="text-[12px] text-ink-2">
-          {holding ? w("The agent waits until you hand control back.", "交还控制前，智能体会等待。", "交還控制前，智慧體會等待。")
-            : w("Take control to sign in or finish a step yourself.", "需要登录或亲自操作时，可接管浏览器。", "需要登入或親自操作時，可接管瀏覽器。")}
-        </span>
+      <div className="flex shrink-0 flex-col gap-2.5 px-3 pb-3">
+        {playback}
+        <div className="flex flex-wrap items-center gap-2">
+          {holding ? handBack : takeControl}
+          <span className="text-[12px] text-ink-2">
+            {holding ? w("The agent waits until you hand control back.", "交还控制前，智能体会等待。", "交還控制前，智慧體會等待。")
+              : w("Take control to sign in or finish a step yourself.", "需要登录或亲自操作时，可接管浏览器。", "需要登入或親自操作時，可接管瀏覽器。")}
+          </span>
+        </div>
+        {browser.error && !open && <p role="alert" className="text-[12.5px] text-red-ink">{browser.error}</p>}
+        <BackgroundTasks />
+        <FilesDisclosure />
       </div>
-      {browser.error && !open && <p role="alert" className="shrink-0 px-0.5 text-[12.5px] text-red-ink">{browser.error}</p>}
-      <BackgroundTasks />
-      <FilesDisclosure />
       <div role="status" className="sr-only">{announcement}</div>
     </div>
   );

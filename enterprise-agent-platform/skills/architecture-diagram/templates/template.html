@@ -3,48 +3,73 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>System architecture</title>
   <style>
+    /* Light theme by default; dark follows the viewer's setting. Both are solid colors
+       (no translucency), so lines never show through boxes and contrast is predictable. */
     :root {
-      color-scheme: dark;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-        "Liberation Mono", "Courier New", monospace;
-      background: #020617;
-      color: #e2e8f0;
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei",
+        "Noto Sans CJK SC", "Noto Sans", sans-serif;
+      --page: #f8fafc;  --ink: #0f172a;  --ink-2: #475569;  --line: #64748b;
+      --card: #ffffff;  --rule: #cbd5e1; --grid: #e2e8f0;
+      --fe-fill: #cffafe; --fe-stroke: #0e7490;
+      --be-fill: #d1fae5; --be-stroke: #047857;
+      --db-fill: #ede9fe; --db-stroke: #6d28d9;
+      --cloud-fill: #fef3c7; --cloud-stroke: #b45309;
+      --sec-fill: #ffe4e6; --sec-stroke: #be123c;
+      --q-fill: #ffedd5;  --q-stroke: #c2410c;
+      --ext-fill: #e2e8f0; --ext-stroke: #475569;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #020617; --ink: #f1f5f9; --ink-2: #cbd5e1; --line: #94a3b8;
+        --card: #0f172a; --rule: #334155; --grid: #1e293b;
+        --fe-fill: #083344; --fe-stroke: #22d3ee;
+        --be-fill: #064e3b; --be-stroke: #34d399;
+        --db-fill: #2e1065; --db-stroke: #a78bfa;
+        --cloud-fill: #2a1d07; --cloud-stroke: #fbbf24;
+        --sec-fill: #4c0519; --sec-stroke: #fb7185;
+        --q-fill: #431407;  --q-stroke: #fb923c;
+        --ext-fill: #1e293b; --ext-stroke: #94a3b8;
+      }
     }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; padding: 32px; }
-    main { width: min(1120px, 100%); margin: 0 auto; }
-    header { margin-bottom: 20px; }
-    h1 { margin: 0 0 8px; font-size: clamp(22px, 4vw, 34px); }
-    header p, footer { color: #94a3b8; }
-    .diagram {
-      overflow-x: auto;
-      border: 1px solid #1e293b;
-      border-radius: 16px;
-      background: rgba(15, 23, 42, .72);
-      padding: 20px;
-    }
-    svg { display: block; width: 100%; min-width: 820px; height: auto; }
-    .node-title { fill: #f8fafc; font-size: 15px; font-weight: 700; }
-    .node-detail { fill: #cbd5e1; font-size: 11px; }
-    .flow-label { fill: #94a3b8; font-size: 10px; }
-    .boundary-label { fill: #fbbf24; font-size: 11px; font-weight: 700; }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-      margin-top: 16px;
-    }
-    .card {
-      border: 1px solid #1e293b;
-      border-radius: 12px;
-      background: #0f172a;
-      padding: 14px;
-    }
-    .card h2 { margin: 0 0 8px; font-size: 14px; }
-    .card p { margin: 0; color: #cbd5e1; font-size: 12px; line-height: 1.55; }
-    footer { margin-top: 16px; font-size: 11px; }
+    body { margin: 0; padding: clamp(12px, 3vw, 32px); background: var(--page); color: var(--ink);
+           line-height: 1.5; }
+    main { width: min(1040px, 100%); margin: 0 auto; }
+    h1 { margin: 0 0 6px; font-size: clamp(20px, 4vw, 30px); line-height: 1.25; }
+    header p { margin: 0 0 16px; color: var(--ink-2); }
+    /* Narrow panels: the SVG keeps a readable minimum width and the card scrolls sideways
+       instead of shrinking the labels. The component list below never needs scrolling. */
+    .diagram { overflow-x: auto; border: 1px solid var(--rule); border-radius: 12px;
+               background: var(--card); padding: 8px; }
+    svg { display: block; width: 100%; min-width: 600px; height: auto; }
+    .node-title { fill: var(--ink); font-size: 17px; font-weight: 700; }
+    .node-detail, .flow-label, .legend-text { fill: var(--ink-2); font-size: 14px; }
+    .boundary-label { fill: var(--cloud-stroke); font-size: 13px; font-weight: 700; letter-spacing: .04em; }
+    .flow { fill: none; stroke: var(--line); stroke-width: 2; }
+    .flow.sensitive { stroke: var(--sec-stroke); stroke-dasharray: 7 5; }
+    .arrow-head { fill: var(--line); }
+    .boundary { fill: var(--cloud-fill); fill-opacity: .35; stroke: var(--cloud-stroke); stroke-width: 2; stroke-dasharray: 8 5; }
+    .node { stroke-width: 2; }
+    .frontend { fill: var(--fe-fill); stroke: var(--fe-stroke); }
+    .backend  { fill: var(--be-fill); stroke: var(--be-stroke); }
+    .database { fill: var(--db-fill); stroke: var(--db-stroke); }
+    .security { fill: var(--sec-fill); stroke: var(--sec-stroke); }
+    .queue    { fill: var(--q-fill);  stroke: var(--q-stroke); }
+    .external { fill: var(--ext-fill); stroke: var(--ext-stroke); }
+    .legend-box { fill: var(--card); stroke: var(--rule); }
+    .grid-line { stroke: var(--grid); stroke-width: 1; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+               gap: 12px; margin-top: 16px; }
+    .card { border: 1px solid var(--rule); border-radius: 10px; background: var(--card); padding: 12px 14px; }
+    .card h2 { margin: 0 0 6px; font-size: 15px; }
+    .card p { margin: 0; color: var(--ink-2); font-size: 14px; }
+    .scroll-hint { margin: 6px 0 0; color: var(--ink-2); font-size: 13px; }
+    @media (min-width: 700px) { .scroll-hint { display: none; } }
+    footer { margin-top: 16px; color: var(--ink-2); font-size: 13px; }
   </style>
 </head>
 <body>
@@ -55,74 +80,58 @@
     </header>
 
     <section class="diagram" aria-label="Architecture diagram">
-      <svg viewBox="0 0 1000 540" role="img" aria-labelledby="diagram-title diagram-desc">
+      <svg viewBox="0 0 760 420" role="img" aria-labelledby="diagram-title diagram-desc">
         <title id="diagram-title">Example three-tier system architecture</title>
         <desc id="diagram-desc">
-          A browser calls an API service inside a cloud boundary. The service
-          reads and writes a database. Arrows show HTTPS and SQL flows.
+          A browser calls an API service inside a cloud boundary over HTTPS.
+          The service reads and writes a database over SQL.
         </desc>
         <defs>
           <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
-            <path d="M40 0H0V40" fill="none" stroke="#1e293b" stroke-width=".7"/>
+            <path d="M40 0H0V40" fill="none" class="grid-line"/>
           </pattern>
           <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
-                  markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+                  markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M0 0L10 5L0 10Z" class="arrow-head"/>
           </marker>
         </defs>
+        <rect width="760" height="420" fill="url(#grid)"/>
 
-        <rect width="1000" height="540" rx="12" fill="#020617"/>
-        <rect width="1000" height="540" rx="12" fill="url(#grid)"/>
+        <!-- 1. Boundaries first, 2. connections, 3. nodes, 4. legend (outside every boundary). -->
+        <rect class="boundary" x="270" y="70" width="470" height="250" rx="16"/>
+        <text x="290" y="98" class="boundary-label">CLOUD REGION</text>
 
-        <!-- Connections are drawn before nodes. -->
-        <path d="M260 235H420" fill="none" stroke="#64748b" stroke-width="2"
-              marker-end="url(#arrow)"/>
-        <text x="340" y="222" text-anchor="middle" class="flow-label">HTTPS / JSON</text>
-        <path d="M650 235H785" fill="none" stroke="#64748b" stroke-width="2"
-              marker-end="url(#arrow)"/>
-        <text x="718" y="222" text-anchor="middle" class="flow-label">SQL / TLS</text>
+        <path class="flow" d="M170 195H300" marker-end="url(#arrow)"/>
+        <text x="220" y="181" text-anchor="middle" class="flow-label">HTTPS</text>
+        <path class="flow" d="M480 195H590" marker-end="url(#arrow)"/>
+        <text x="535" y="181" text-anchor="middle" class="flow-label">SQL / TLS</text>
 
-        <!-- Cloud boundary. -->
-        <rect x="380" y="90" width="570" height="330" rx="18"
-              fill="rgba(120,53,15,.12)" stroke="#fbbf24" stroke-width="2"
-              stroke-dasharray="8 5"/>
-        <text x="405" y="122" class="boundary-label">CLOUD REGION</text>
+        <rect class="node frontend" x="30" y="150" width="140" height="90" rx="10"/>
+        <text x="100" y="192" text-anchor="middle" class="node-title">Web client</text>
+        <text x="100" y="216" text-anchor="middle" class="node-detail">Browser</text>
 
-        <!-- External/browser node: opaque mask then semantic fill. -->
-        <rect x="70" y="185" width="190" height="100" rx="10" fill="#0f172a"/>
-        <rect x="70" y="185" width="190" height="100" rx="10"
-              fill="rgba(8,51,68,.55)" stroke="#22d3ee" stroke-width="2"/>
-        <text x="165" y="228" text-anchor="middle" class="node-title">Web client</text>
-        <text x="165" y="253" text-anchor="middle" class="node-detail">Browser interface</text>
+        <rect class="node backend" x="300" y="140" width="180" height="110" rx="10"/>
+        <text x="390" y="190" text-anchor="middle" class="node-title">API service</text>
+        <text x="390" y="214" text-anchor="middle" class="node-detail">Auth, business logic</text>
 
-        <!-- Backend node. -->
-        <rect x="420" y="175" width="230" height="120" rx="10" fill="#0f172a"/>
-        <rect x="420" y="175" width="230" height="120" rx="10"
-              fill="rgba(6,78,59,.55)" stroke="#34d399" stroke-width="2"/>
-        <text x="535" y="225" text-anchor="middle" class="node-title">API service</text>
-        <text x="535" y="251" text-anchor="middle" class="node-detail">Authentication · business logic</text>
+        <rect class="node database" x="590" y="150" width="130" height="90" rx="10"/>
+        <text x="655" y="192" text-anchor="middle" class="node-title">Database</text>
+        <text x="655" y="216" text-anchor="middle" class="node-detail">Persistent state</text>
 
-        <!-- Database node. -->
-        <rect x="785" y="185" width="130" height="100" rx="10" fill="#0f172a"/>
-        <rect x="785" y="185" width="130" height="100" rx="10"
-              fill="rgba(76,29,149,.55)" stroke="#a78bfa" stroke-width="2"/>
-        <text x="850" y="228" text-anchor="middle" class="node-title">Database</text>
-        <text x="850" y="253" text-anchor="middle" class="node-detail">Persistent state</text>
-
-        <!-- Legend stays outside the cloud boundary. -->
-        <g transform="translate(70 465)">
-          <rect width="880" height="48" rx="9" fill="#0f172a" stroke="#1e293b"/>
-          <circle cx="30" cy="24" r="6" fill="#22d3ee"/>
-          <text x="44" y="28" class="node-detail">Frontend</text>
-          <circle cx="170" cy="24" r="6" fill="#34d399"/>
-          <text x="184" y="28" class="node-detail">Backend</text>
-          <circle cx="300" cy="24" r="6" fill="#a78bfa"/>
-          <text x="314" y="28" class="node-detail">Database</text>
-          <circle cx="440" cy="24" r="6" fill="#fbbf24"/>
-          <text x="454" y="28" class="node-detail">Cloud boundary</text>
+        <g transform="translate(30 350)">
+          <rect class="legend-box" width="700" height="48" rx="9"/>
+          <rect class="node frontend" x="18" y="16" width="16" height="16" rx="4"/>
+          <text x="42" y="30" class="legend-text">Frontend</text>
+          <rect class="node backend" x="150" y="16" width="16" height="16" rx="4"/>
+          <text x="174" y="30" class="legend-text">Backend</text>
+          <rect class="node database" x="280" y="16" width="16" height="16" rx="4"/>
+          <text x="304" y="30" class="legend-text">Database</text>
+          <rect class="boundary" x="410" y="16" width="16" height="16" rx="4"/>
+          <text x="434" y="30" class="legend-text">Cloud boundary</text>
         </g>
       </svg>
     </section>
+    <p class="scroll-hint">Swipe the diagram sideways to see all of it; the list below has the same content.</p>
 
     <section class="summary" aria-label="Architecture summary">
       <article class="card">
@@ -131,15 +140,15 @@
       </article>
       <article class="card">
         <h2>Data</h2>
-        <p>The API is the only component permitted to access persistent state.</p>
+        <p>Only the API service reads or writes persistent state.</p>
       </article>
       <article class="card">
         <h2>Boundary</h2>
-        <p>Backend and database services run inside one cloud region.</p>
+        <p>The API service and the database run inside one cloud region.</p>
       </article>
     </section>
 
-    <footer>Standalone HTML · inline CSS and SVG · no external resources</footer>
+    <footer>Standalone HTML, inline CSS and SVG, no external resources.</footer>
   </main>
 </body>
 </html>

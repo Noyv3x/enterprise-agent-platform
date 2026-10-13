@@ -19,7 +19,7 @@ from enterprise_agent_platform.mcp import McpService
 from enterprise_agent_platform.db import Database, now
 from policy_support import set_default_policy
 from enterprise_agent_platform.auth import issue_session, public_user
-from enterprise_agent_platform.queue import Queue, _WorkTrace, authenticated_events, routes
+from enterprise_agent_platform.queue import WORK_PATCH_BYTES, WORK_TRACE_BYTES, Queue, _WorkTrace, authenticated_events, routes
 from enterprise_agent_platform.artifacts import Artifacts
 from enterprise_agent_platform.skills import Skills
 
@@ -124,6 +124,14 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.remove_hold.set()
         self.remove_status = 200
         self.remove_error = None
+        self.runtime_extra = {}
+        self.title_requests = []
+        self.title_timeout = None
+        self.title_started = asyncio.Event()
+        self.title_hold = asyncio.Event()
+        self.title_hold.set()
+        self.title_reply = lambda: httpx.Response(200, json={"title": "成都三日行程", "model": "model-title",
+                                                              "usage": {"input": 40, "output": 6, "cache_read": 4, "cache_write": 0, "total": 46}})
 
         async def runtime(request):
             self.calls.append((request.method, request.url.path))
@@ -168,7 +176,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                                    "status": "cancelled" if run_id in self.cancelled_runs else "completed",
                                    "text": "answer", "model": "model-a",
                                    "usage": {"input": 10, "output": 2, "cache_read": 8, "cache_write": 1, "total": 21},
-                                   "undelivered_inputs": []})
+                                   "undelivered_inputs": [], **self.runtime_extra})
                 return httpx.Response(200, text="".join("data: " + json.dumps(e) + "\n\n" for e in events))
             if request.url.path.endswith("/compact"):
                 self.compactions.append(json.loads(request.content))
@@ -176,6 +184,12 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 self.compact_started.set()
                 await self.compact_hold.wait()
                 return httpx.Response(200, json=self.compact_result)
+            if request.url.path == "/v1/titles":
+                self.title_requests.append(json.loads(request.content))
+                self.title_timeout = request.extensions["timeout"]["read"]
+                self.title_started.set()
+                await self.title_hold.wait()
+                return self.title_reply()
             return httpx.Response(200, json={"ok": True})
 
         self.http = httpx.AsyncClient(transport=httpx.MockTransport(runtime))
@@ -325,7 +339,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         from enterprise_agent_platform.files import Files as WorkspaceFiles
         self.p.files = WorkspaceFiles(self.p)
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES ('steering',1,'Steering',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES ('steering',1,'Steering',?,?)", (now(), now()))
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
             conn.execute("UPDATE users SET display_name='Channel Author',timezone='Asia/Tokyo' WHERE id=2")
         for scope, uid, name, timezone in [
@@ -658,7 +672,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         from enterprise_agent_platform.files import Files as WorkspaceFiles
         self.p.files = WorkspaceFiles(self.p)
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES ('c1',1,'Chat',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES ('c1',1,'Chat',?,?)", (now(), now()))
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
 
     async def test_after_turn_is_never_absorbed_and_runs_as_its_own_turn_after_the_current_one(self):
@@ -1128,7 +1142,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_interruption_and_queued_cancellation_keep_reply_to(self):
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES ('interrupted',1,'Interrupted',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES ('interrupted',1,'Interrupted',?,?)", (now(), now()))
         self.loss = True
         interrupted = await self.q.enqueue(self.user, "chat-interrupted", "uncertain chat")
         await self.drain()
@@ -1224,7 +1238,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(work["truncated"])
 
     def test_work_trace_bound_reserves_thinking_end_times_with_input_eviction(self):
-        limit = 96 * 1024
+        limit = WORK_TRACE_BYTES
         instant = datetime(2026, 10, 4, tzinfo=timezone.utc)
         marker = {"type": "input", "message_id": 42, "at": instant.isoformat(timespec="microseconds")}
         victim_length = len(json.dumps(marker)) - len(json.dumps({"type": "thinking", "text": ""})) - 25
@@ -1235,11 +1249,13 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                         clock.now.return_value = instant
                         trace = _WorkTrace()
                         trace.add({"type": "thinking_delta", "delta": "v" * victim_length})
-                        for index in range(22):
+                        index = 0
+                        while len(json.dumps(trace.data).encode("utf-8")) < limit - 12000:
                             trace.add({"type": "text_delta", "delta": "p" * 4000})
                             trace.add({"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}})
                             trace.add({"type": "tool_end", "tool_call_id": str(index),
                                        "is_error": False, "content_preview": []})
+                            index += 1
                         trace.add({"type": "thinking_start"})
                         room = limit - len(json.dumps(trace.data).encode("utf-8")) - 40
                         width = len(json.dumps(character).encode("utf-8")) - 2
@@ -1332,10 +1348,10 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         tools = [item for item in work["items"] if item["type"] == "tool"]
         self.assertEqual([item["id"] for item in tools], [str(index) for index in range(1, 199)])
         self.assertEqual((tools[-1]["status"], tools[-1]["output"]), ("done", "finished"))
-        self.assertLessEqual(len(json.dumps(work).encode("utf-8")), 96 * 1024)
+        self.assertLessEqual(len(json.dumps(work).encode("utf-8")), WORK_TRACE_BYTES)
 
     def test_work_input_markers_evict_non_input_items_at_json_byte_limit(self):
-        limit = 96 * 1024
+        limit = WORK_TRACE_BYTES
         for character in ("x", "漢", "😀"):
             with self.subTest(character=character):
                 trace = _WorkTrace()
@@ -1555,6 +1571,66 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                 message = await self.run_work(events)
                 self.assertNotIn("work", message["metadata"])
 
+    def test_work_keeps_a_bounded_patch_for_edit_and_write_only(self):
+        patch = "--- a.py\n+++ a.py\n@@ -1,3 +1,3 @@\n one\n-two\n+二\n three\n"
+        trace = _WorkTrace()
+        for ident, name, details in [
+            ("edit", "edit", {"patch": patch, "diff": "-2 two\n+2 二", "firstChangedLine": 2}),
+            ("write", "write", {"patch": patch}),
+            ("cut", "write", {"patch": patch, "patch_truncated": True}),
+            ("read", "read", {"patch": patch}),
+            ("failed", "edit", None),
+        ]:
+            trace.add({"type": "tool_start", "tool_call_id": ident, "name": name, "args": {"path": "a.py"}})
+            trace.add({"type": "tool_end", "tool_call_id": ident, "is_error": details is None,
+                       "content_preview": [{"type": "text", "text": "ok"}], "details": details})
+        items = {item["id"]: item for item in trace.finish()["items"]}
+        self.assertEqual(items["edit"]["patch"], patch)
+        self.assertEqual(items["write"]["patch"], patch)
+        self.assertNotIn("diff", items["edit"])
+        self.assertNotIn("patch", items["read"])
+        self.assertNotIn("patch", items["failed"])
+        self.assertNotIn("patch_truncated", items["write"])
+        self.assertEqual((items["cut"]["patch"], items["cut"]["patch_truncated"]), (patch, True))
+        self.assertFalse(trace.data["truncated"])
+
+        hunk = "--- big.txt\n+++ big.txt\n@@ -0,0 +1,4000 @@\n" + "".join(f"+行 {index}\n" for index in range(4000))
+        trace = _WorkTrace()
+        trace.add({"type": "tool_start", "tool_call_id": "big", "name": "write", "args": {"path": "big.txt"}})
+        trace.add({"type": "tool_end", "tool_call_id": "big", "is_error": False, "content_preview": [],
+                   "details": {"patch": hunk}})
+        item = trace.finish()["items"][0]
+        self.assertTrue(item["patch_truncated"])
+        self.assertTrue(trace.data["truncated"])
+        self.assertTrue(hunk.startswith(item["patch"]) and item["patch"].endswith("\n"))
+        self.assertLessEqual(len(json.dumps(item["patch"]).encode("utf-8")), WORK_PATCH_BYTES)
+        self.assertGreater(len(json.dumps(item["patch"]).encode("utf-8")), WORK_PATCH_BYTES - 64)
+
+    def test_work_drops_a_patch_that_cannot_fit_before_the_final_output(self):
+        trace = _WorkTrace()
+        trace.add({"type": "tool_start", "tool_call_id": "edit", "name": "edit", "args": {}})
+        while len(json.dumps(trace.data).encode("utf-8")) < WORK_TRACE_BYTES - 6000:
+            trace.add({"type": "text_delta", "delta": "p" * 4000})
+            trace.add({"type": "thinking_delta", "delta": "t"})
+        trace.add({"type": "tool_end", "tool_call_id": "edit", "is_error": False,
+                   "content_preview": [{"type": "text", "text": "Replaced 1 block"}],
+                   "details": {"patch": "--- a\n+++ a\n@@ -1 +1 @@\n" + "+x\n" * 4000}})
+        item = trace.data["items"][0]
+        self.assertEqual((item["status"], item["output"]), ("done", "Replaced 1 block"))
+        self.assertNotIn("patch", item)
+        self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), WORK_TRACE_BYTES)
+
+    async def test_work_patch_reloads_from_history_unchanged(self):
+        patch = "--- notes.md\n+++ notes.md\n@@ -0,0 +1,2 @@\n+# 周报\n+完成\n"
+        message = await self.run_work([
+            {"type": "tool_start", "tool_call_id": "w", "name": "write", "args": {"path": "notes.md", "content": "# 周报\n完成\n"}},
+            {"type": "tool_end", "tool_call_id": "w", "is_error": False,
+             "content_preview": [{"type": "text", "text": "Successfully wrote to notes.md"}], "details": {"patch": patch}},
+        ])
+        self.assertEqual(message["metadata"]["work"]["items"][0]["patch"], patch)
+        history = [entry for entry in self.q.messages(self.user, "private")["messages"] if entry["role"] == "assistant"]
+        self.assertEqual(history[-1]["metadata"]["work"]["items"][0]["patch"], patch)
+
     async def test_worker_cancellation_keeps_work_already_received(self):
         received = asyncio.Event()
         never = asyncio.Event()
@@ -1637,7 +1713,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
 
         def checked_add(trace, event):
             original_add(trace, event)
-            self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), 96 * 1024)
+            self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), WORK_TRACE_BYTES)
 
         for text in ("x" * 4000, "漢😀" * 2000):
             with self.subTest(unicode=text.startswith("漢")):
@@ -1646,7 +1722,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                     {"type": "tool_update", "tool_call_id": "retained",
                      "partial": {"content": [{"type": "text", "text": "First page"}]}},
                 ]
-                for index in range(40):
+                for index in range(WORK_TRACE_BYTES // 4000 + 1):
                     events.extend([
                         {"type": "thinking_delta", "delta": text},
                         {"type": "tool_start", "tool_call_id": str(index), "name": "read", "args": {}},
@@ -1660,7 +1736,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                     message = await self.run_work(events)
                 self.assertEqual(message["metadata"]["status"], "completed")
                 work = message["metadata"]["work"]
-                self.assertLessEqual(len(json.dumps(work).encode("utf-8")), 96 * 1024)
+                self.assertLessEqual(len(json.dumps(work).encode("utf-8")), WORK_TRACE_BYTES)
                 self.assertTrue(work["truncated"])
                 self.assertEqual(work["items"][1], {"type": "thinking", "text": text})
                 retained = work["items"][0]
@@ -1976,13 +2052,32 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(StopAsyncIteration):
                         await anext(stream)
 
+    def chat_conversation(self, cid, title="New chat", state="placeholder"):
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,title_state,created_at,updated_at) VALUES (?,?,?,?,?,?)", (cid, 1, title, state, now(), now()))
+        return "chat-" + cid
+
+    def set_catalog(self, *models):
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": list(models)}))
+
+    async def titled(self):
+        await asyncio.gather(*list(self.q.titling.values()))
+
+    def usage_rows(self, kind=None):
+        with self.p.db.connect() as conn:
+            rows = [dict(row) for row in conn.execute("SELECT * FROM token_usage_events ORDER BY id")]
+        for row in rows:
+            row["raw"] = json.loads(row["raw_usage_json"])
+        return [row for row in rows if kind is None or row["raw"].get("kind") == kind]
+
     async def test_empty_policy_model_executes_with_the_first_catalog_model(self):
         with self.p.db.connect() as conn:
             set_default_policy(conn, model="", thinking="off")
-        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "catalog-default"}, {"id": "second"}]}))
+        self.set_catalog({"id": "catalog-default"}, {"id": "second"})
         await self.q.enqueue(self.q.user(1), "private", "Use inherited settings")
         await self.drain()
         self.assertEqual(self.requests[0]["model"], {"id": "catalog-default", "thinking": "off"})
+        self.assertNotIn("judge", self.requests[0])
 
     async def test_request_users_without_policy_fields_run_with_their_policy_group(self):
         # HTTP handlers receive the public projection, which never carries the model policy.
@@ -1994,16 +2089,16 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertEqual(self.requests[0]["model"], {"id": "model-b", "thinking": "high"})
 
-    async def test_each_usage_runs_with_its_policy_slot(self):
+    async def test_main_serves_every_usage_and_the_judge_rides_along_only_with_auto(self):
         cid = "11111111-1111-1111-1111-111111111111"
+        limits = {"contextWindow": 400000, "maxTokens": 128000}
+        self.set_catalog({"id": "gpt-6.1-sol", **limits}, {"id": "gpt-6-luna", "contextWindow": 200000, "maxTokens": 64000})
+        chat = self.chat_conversation(cid, "Slots", "user")
         with self.p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations VALUES (?,?, 'Slots',?,?,NULL)", (cid, 1, now(), now()))
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
-            set_default_policy(
-                conn, personal={"model": "m-personal", "thinking": "low"}, channel={"model": "m-channel", "thinking": "high"},
-                chat={"model": "m-chat", "thinking": "minimal"}, scout={"model": "m-scout", "thinking": "off"},
-                worker={"model": "m-worker", "thinking": "xhigh"})
-        chat = "chat-" + cid
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="auto", judge={"model": "gpt-6-luna", "thinking": "low"})
+        main = {"id": "gpt-6.1-sol", "thinking": "auto", **limits}
+        judge = {"id": "gpt-6-luna", "thinking": "low", "contextWindow": 200000, "maxTokens": 64000}
         await self.q.enqueue(self.q.user(1), "private", "personal")
         await self.drain()
         await self.q.enqueue(self.q.user(1), "private", "scheduled", schedule_run_id=self.schedule_occurrence())
@@ -2012,30 +2107,266 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         await self.q.enqueue(self.q.user(1), chat, "chat")
         await self.drain()
-        self.assertEqual([request["model"] for request in self.requests], [
-            {"id": "m-personal", "thinking": "low"}, {"id": "m-personal", "thinking": "low"},
-            {"id": "m-channel", "thinking": "high"}, {"id": "m-chat", "thinking": "minimal"}])
+        self.assertEqual([(request["model"], request["judge"]) for request in self.requests], [(main, judge)] * 4)
         for scope in (chat, "private", "channel-1"):
             await self.q.compact(self.q.user(1), scope)
             await self.drain()
-        self.assertEqual([entry["model"] for entry in self.compactions], [
-            {"id": "m-chat", "thinking": "minimal"}, {"id": "m-personal", "thinking": "low"}, {"id": "m-channel", "thinking": "high"}])
+        # Compaction summarizes at the session's last effort: the model carries `auto`, there is no judge call.
+        self.assertEqual(self.compactions, [{"model": main}] * 3)
         user = self.q.user(1)
-        for usage, expected in (("scout", {"id": "m-scout", "thinking": "off"}), ("worker", {"id": "m-worker", "thinking": "xhigh"})):
-            self.assertEqual(self.q.scope(user, "private", slot=usage)["model"], expected)
+        scoped = self.q.scope(user, "private")
+        self.assertEqual((scoped["model"], scoped["judge"]), ({"id": "gpt-6.1-sol", "thinking": "auto"}, {"id": "gpt-6-luna", "thinking": "low"}))
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="high", judge={"model": "gpt-6-luna", "thinking": "low"})
+        await self.q.enqueue(user, "private", "fixed depth")
+        await self.drain()
+        self.assertEqual(self.requests[-1]["model"], {"id": "gpt-6.1-sol", "thinking": "high", **limits})
+        self.assertNotIn("judge", self.requests[-1])
+
+    async def test_an_empty_judge_model_is_the_resolved_main_model(self):
+        self.set_catalog({"id": "gpt-6.1-sol", "contextWindow": 300000}, {"id": "other"})
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="auto", judge={"model": "", "thinking": "minimal"})
+        await self.q.enqueue(self.user, "private", "hi")
+        await self.drain()
+        self.assertEqual(self.requests[0]["judge"], {"id": "gpt-6.1-sol", "thinking": "minimal", "contextWindow": 300000})
 
     async def test_channel_agent_uses_the_triggering_users_policy_group(self):
         with self.p.db.connect() as conn:
             conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
-            group = {slot: {"model": "m-light", "thinking": "off"} for slot in ("personal", "channel", "chat", "scout", "worker")}
-            conn.execute("UPDATE settings SET value=json_insert(value,'$[#]',json(?)) WHERE key='model_policies_v1'",
-                         (json.dumps({"name": "light", "label": "Light", "slots": group}),))
+            group = {"name": "light", "label": "Light", "main": {"model": "m-light", "thinking": "off"}, "judge": {"model": "", "thinking": "low"}}
+            conn.execute("UPDATE settings SET value=json_insert(value,'$[#]',json(?)) WHERE key='model_policies_v2'", (json.dumps(group),))
             conn.execute("UPDATE users SET model_policy='light' WHERE id=2")
         await self.q.enqueue(self.q.user(2), "channel-1", "from user two")
         await self.drain()
         await self.q.enqueue(self.q.user(1), "channel-1", "from user one")
         await self.drain()
         self.assertEqual([request["model"]["id"] for request in self.requests], ["m-light", "model-a"])
+
+    async def test_effort_and_judge_usage_are_recorded_for_admins_and_never_reach_users(self):
+        self.runtime_extra = {"effort": "high", "judge_usage": {"model": "gpt-6-luna", "input": 30, "output": 3, "cache_read": 5, "cache_write": 0, "total": 33}}
+        self.set_catalog({"id": "gpt-6.1-sol"}, {"id": "gpt-6-luna"})
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="auto", judge={"model": "gpt-6-luna", "thinking": "low"})
+        request = await self.q.enqueue(self.user, "private", "hello")
+        await self.drain()
+        main, judged = self.usage_rows("agent"), self.usage_rows("auto_effort")
+        self.assertEqual(len(main), 1)
+        self.assertEqual(main[0]["raw"]["effort"], "high")
+        self.assertEqual(len(judged), 1)
+        self.assertEqual((judged[0]["model"], judged[0]["input_tokens"], judged[0]["output_tokens"], judged[0]["total_tokens"]), ("gpt-6-luna", 30, 3, 33))
+        self.assertEqual((judged[0]["raw"]["cacheRead"], judged[0]["raw"]["cacheWrite"]), (5, 0))
+        self.assertEqual((judged[0]["scope_type"], judged[0]["scope_id"], judged[0]["request_message_id"], judged[0]["response_message_id"]),
+                         (main[0]["scope_type"], main[0]["scope_id"], request["message"]["id"], main[0]["response_message_id"]))
+        self.assertNotIn("effort", judged[0]["raw"])
+        stream = self.q.events(self.user, "private", 0)
+        seen = []
+        while not seen or seen[-1].get("type") != "run_end":
+            seen.append(json.loads((await anext(stream)).split(b"data: ")[1]))
+        await stream.aclose()
+        with self.p.db.connect() as conn:
+            stored = [row[0] for row in conn.execute("SELECT event_json FROM queue_events")]
+        everything = json.dumps([seen, stored, self.q.messages(self.user, "private")])
+        for private in ("effort", "judge_usage", "gpt-6", "thinking_depth", '"auto"'):
+            self.assertNotIn(private, everything)
+        self.assertNotIn("model", seen[-1])
+
+    async def test_a_run_without_a_judge_call_records_no_auto_effort_row(self):
+        self.runtime_extra = {"effort": "low"}
+        await self.q.enqueue(self.user, "private", "hello")
+        await self.drain()
+        self.assertEqual(self.usage_rows("auto_effort"), [])
+        self.assertEqual(self.usage_rows("agent")[0]["raw"]["effort"], "low")
+
+    async def test_first_message_of_a_placeholder_chat_is_titled_asynchronously(self):
+        cid = "tc"
+        scope = self.chat_conversation(cid)
+        self.p.files.for_message = lambda info, mid: [{"filename": "报价.xlsx"}]
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="model-a", thinking="medium", judge={"model": "model-b", "thinking": "minimal"})
+        self.title_hold.clear()
+        accepted = await asyncio.wait_for(self.q.enqueue(self.user, scope, "帮我规划去成都的三天行程"), 2)
+        self.assertEqual(accepted["message"]["content"], "帮我规划去成都的三天行程")
+        await asyncio.wait_for(self.title_started.wait(), 2)
+        await self.drain()
+        self.assertEqual(self.title_requests, [{"judge": {"id": "model-b", "thinking": "minimal"}, "text": "帮我规划去成都的三天行程", "files": ["报价.xlsx"]}])
+        self.assertEqual(self.title_timeout, 25)
+        self.assertEqual(self.q.conversation(self.user, cid)["title"], "New chat")
+        self.title_hold.set()
+        await self.titled()
+        self.assertEqual(self.q.conversation(self.user, cid)["title"], "成都三日行程")
+        self.assertNotIn("title_state", self.q.conversation(self.user, cid))
+        events = [event for event in self.recorded_events(scope) if event["type"] == "conversation_title"]
+        self.assertEqual(events, [{"type": "conversation_title", "id": cid, "title": "成都三日行程"}])
+        stream = self.q.events(self.user, scope, 0)
+        frames = []
+        while not any(b"event: conversation_title" in frame for frame in frames):
+            frames.append(await anext(stream))
+        await stream.aclose()
+        rows = self.usage_rows("title")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["model"], rows[0]["scope_type"], rows[0]["scope_id"], rows[0]["scope_name"], rows[0]["request_message_id"], rows[0]["response_message_id"]),
+                         ("model-title", "private", cid, "成都三日行程", None, None))
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["output_tokens"], rows[0]["total_tokens"], rows[0]["raw"]["cacheRead"]), (40, 6, 46, 4))
+        # Only the first message is titled.
+        await self.q.enqueue(self.user, scope, "再加上预算")
+        await self.drain()
+        await self.titled()
+        self.assertEqual(len(self.title_requests), 1)
+
+    async def test_an_attachments_only_first_message_is_titled_within_runtime_limits(self):
+        scope = self.chat_conversation("files")
+        self.p.files.bind = lambda user, info, mid, ids, conn=None: None
+        self.p.files.for_message = lambda info, mid: [{"filename": ("😀" * 200 if i == 0 else f"文件{i}.pdf")} for i in range(25)]
+        await self.q.enqueue(self.user, scope, "", attachment_ids=list(range(25)))
+        await self.drain()
+        await self.titled()
+        (request,) = self.title_requests
+        self.assertEqual(len(request["files"]), 20)
+        self.assertTrue(all(len(name.encode("utf-16-le")) // 2 <= 255 for name in request["files"]))
+        self.assertTrue(request["text"].strip())
+        self.assertLessEqual(len(request["text"].encode("utf-16-le")) // 2, 8000)
+        self.assertEqual(self.q.conversation(self.user, "files")["title"], "成都三日行程")
+
+    async def test_long_astral_text_is_cut_to_runtime_utf16_units(self):
+        scope = self.chat_conversation("astral")
+        await self.q.enqueue(self.user, scope, "😀" * 6000)
+        await self.drain()
+        await self.titled()
+        self.assertEqual(len(self.title_requests[0]["text"].encode("utf-16-le")) // 2, 8000)
+        self.assertEqual(self.q.conversation(self.user, "astral")["title"], "成都三日行程")
+
+    async def test_only_placeholder_chats_get_a_first_message_title(self):
+        for cid, title, state in (("user-titled", "我的标题", "user"), ("already", "Generated", "generated")):
+            await self.q.enqueue(self.user, self.chat_conversation(cid, title, state), "hello")
+        await self.q.enqueue(self.user, "private", "personal")
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO channels(id,name,created_at) VALUES (1,'General',1)")
+        await self.q.enqueue(self.user, "channel-1", "channel")
+        await self.drain()
+        await self.titled()
+        self.assertEqual(self.title_requests, [])
+
+    async def test_title_generation_is_single_flight_per_conversation(self):
+        scope = self.chat_conversation("single")
+        self.title_hold.clear()
+        await self.q.enqueue(self.user, scope, "first")
+        await asyncio.wait_for(self.title_started.wait(), 2)
+        info = self.q.scope(self.user, scope)
+        self.q.start_title(self.user, info, "again", [])
+        self.title_hold.set()
+        await self.drain()
+        await self.titled()
+        self.assertEqual(len(self.title_requests), 1)
+
+    async def test_a_failed_title_keeps_the_placeholder_silently(self):
+        scope = self.chat_conversation("failing")
+        for reply in (lambda: httpx.Response(502, json={"error": "model failure"}), lambda: httpx.Response(200, json={"title": "  ", "usage": {}}),
+                      lambda: httpx.Response(200, json={"ok": True})):
+            self.title_reply = reply
+            with self.p.db.connect() as conn:
+                conn.execute("DELETE FROM chat_messages WHERE conversation_id='failing'")
+            await self.q.enqueue(self.user, scope, "hello")
+            await self.drain()
+            await self.titled()
+            self.assertEqual(self.q.conversation(self.user, "failing")["title"], "New chat")
+        self.assertEqual(len(self.title_requests), 3)
+        self.assertEqual([event for event in self.recorded_events(scope) if event["type"] == "conversation_title"], [])
+        self.assertEqual(self.usage_rows("title"), [])
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT title_state FROM chat_conversations WHERE id='failing'").fetchone()[0], "placeholder")
+
+    async def test_a_rename_always_wins_over_a_title_in_flight_or_sent_first(self):
+        app = Starlette(routes=routes())
+        app.state.platform = self.p
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                created = (await client.post("/api/chat/conversations", json={"title": "新聊天"})).json()["conversation"]
+                self.assertEqual(created["title"], "新聊天")
+                scope = "chat-" + created["id"]
+                self.title_hold.clear()
+                await self.q.enqueue(self.user, scope, "hello")
+                await asyncio.wait_for(self.title_started.wait(), 2)
+                await self.drain()
+                renamed = await client.patch("/api/chat/conversations/" + created["id"], json={"title": "我的名字"})
+                self.assertEqual(renamed.json()["conversation"]["title"], "我的名字")
+                self.title_hold.set()
+                await self.titled()
+                self.assertEqual((await client.get("/api/chat/conversations/" + created["id"])).json()["conversation"]["title"], "我的名字")
+                listing = (await client.get("/api/chat/conversations")).json()["conversations"]
+                self.assertEqual([item["title"] for item in listing], ["我的名字"])
+                self.assertTrue(all("title_state" not in item for item in listing))
+                self.assertEqual([event for event in self.recorded_events(scope) if event["type"] == "conversation_title"], [])
+                # The generation still spent tokens and is accounted.
+                self.assertEqual(len(self.usage_rows("title")), 1)
+                # A rename before the first message disables titling, even back to the placeholder text.
+                second = (await client.post("/api/chat/conversations", json={})).json()["conversation"]
+                await client.patch("/api/chat/conversations/" + second["id"], json={"title": "New chat"})
+                await self.q.enqueue(self.user, "chat-" + second["id"], "hello")
+                await self.drain()
+                await self.titled()
+                self.assertEqual(len(self.title_requests), 1)
+                self.assertEqual((await client.get("/api/chat/conversations/" + second["id"])).json()["conversation"]["title"], "New chat")
+
+    async def test_a_withdrawn_first_message_never_becomes_the_title_and_the_next_one_is_eligible(self):
+        scope = self.chat_conversation("withdrawn")
+        self.title_hold.clear()
+        with patch.object(self.q, "wake"):  # keep the request queued so it can be withdrawn
+            first = await self.q.enqueue(self.user, scope, "secret draft")
+            await asyncio.wait_for(self.title_started.wait(), 2)
+            await self.q.withdraw(self.user, scope, first["message"]["id"])
+        self.assertEqual(self.q.titling, {})
+        self.title_hold.set()
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.q.conversation(self.user, "withdrawn")["title"], "New chat")
+        self.assertEqual([e for e in self.recorded_events(scope) if e["type"] == "conversation_title"], [])
+        self.title_started.clear()
+        await self.q.enqueue(self.user, scope, "real question")
+        await self.drain()
+        await self.titled()
+        self.assertEqual([r["text"] for r in self.title_requests], ["secret draft", "real question"])
+        self.assertEqual(self.q.conversation(self.user, "withdrawn")["title"], "成都三日行程")
+
+    async def test_a_title_for_a_message_withdrawn_after_generation_finished_is_not_applied(self):
+        scope = self.chat_conversation("late")
+        info = self.q.scope(self.user, scope)
+        self.q.start_title(self.user, info, "gone", [], 99999)  # no such message
+        await self.titled()
+        self.assertEqual(self.q.conversation(self.user, "late")["title"], "New chat")
+
+    async def test_an_empty_patch_does_not_revert_a_title_generated_meanwhile(self):
+        scope = self.chat_conversation("race")
+        app = Starlette(routes=routes())
+        app.state.platform = self.p
+        stale = self.q.conversation(self.user, "race")
+        await self.q.enqueue(self.user, scope, "hello")
+        await self.drain()
+        await self.titled()
+        real, calls = self.q.conversation, []
+        def snapshot(user, cid):  # the handler's first read predates the generated title
+            calls.append(cid)
+            return stale if len(calls) == 1 else real(user, cid)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user), \
+                    patch.object(self.q, "conversation", side_effect=snapshot):
+                response = await client.patch("/api/chat/conversations/race", json={})
+        self.assertEqual(response.status_code, 200)
+        with self.p.db.connect() as conn:
+            self.assertEqual(tuple(conn.execute("SELECT title,title_state FROM chat_conversations WHERE id='race'").fetchone()), ("成都三日行程", "generated"))
+
+    async def test_a_patch_that_changes_no_title_keeps_the_generated_state(self):
+        scope = self.chat_conversation("keep")
+        await self.q.enqueue(self.user, scope, "hello")
+        await self.drain()
+        await self.titled()
+        app = Starlette(routes=routes())
+        app.state.platform = self.p
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://platform") as client:
+            with patch("enterprise_agent_platform.queue.current_user", return_value=self.user):
+                self.assertEqual((await client.patch("/api/chat/conversations/keep", json={})).json()["conversation"]["title"], "成都三日行程")
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT title_state FROM chat_conversations WHERE id='keep'").fetchone()[0], "generated")
+
 
 
     async def test_users_see_no_model_in_events_or_messages(self):
@@ -2083,7 +2414,7 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_compact_permission_and_ownership(self):
         with self.p.db.connect() as conn:
             conn.execute("UPDATE users SET role='user',permission_group='no-access' WHERE id=2")
-            conn.execute("INSERT INTO chat_conversations VALUES ('policy',1,'Policy',?,?,NULL)", (now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES ('policy',1,'Policy',?,?)", (now(), now()))
         with self.assertRaises(HTTPException) as denied:
             await self.q.compact(self.q.user(2), "private")
         self.assertEqual(denied.exception.status_code, 403)

@@ -1,4 +1,6 @@
-/** Toolbar pieces the artifact viewer and the live preview share: icon buttons, 放大, and the 圈选 toggle and hint. */
+/** Toolbar pieces the artifact viewer, the file view and the live preview share: the flat panel rows (the side panel's
+ * flush spec: hairline-separated rows, the screen full-bleed below them), icon buttons, 放大, and the 圈选 toggle and
+ * hint. */
 import { useState } from "react";
 import { Button } from "../../components/ui/beautiful/atoms/Button";
 import { Icon } from "../../components/ui/beautiful/controls";
@@ -7,6 +9,22 @@ import type { ArtifactKind } from "../../api";
 import { MAX_FEEDBACK, type FeedbackInput, type FeedbackSink } from "./feedback";
 
 export const ICON_BUTTON = "primitive-icon-button shrink-0 text-ink-2 transition-colors duration-100 hover:bg-hover hover:text-ink aria-disabled:pointer-events-none aria-disabled:opacity-40 touch:size-11";
+
+/** A flat row above the screen. The first row starts with the back control, so it sits closer to the edge. */
+export const PANEL_ROW = "flex min-w-0 shrink-0 flex-wrap items-center gap-1.5 border-b border-line bg-page px-3 py-2";
+export const PANEL_HEAD = "flex min-h-11 min-w-0 shrink-0 items-center gap-2 border-b border-line bg-page py-1 pr-1.5 pl-1.5";
+
+/** The screen under the rows: full-bleed, no frame. */
+export const PANEL_SCREEN = "relative flex min-h-[320px] flex-1 flex-col bg-surface";
+
+/** The page address above a web screen, as the computer's toolbar shows it. */
+export function AddressRow({ address }: { address: string }) {
+  return (
+    <div className="flex min-h-7 shrink-0 items-center border-b border-line bg-page px-3">
+      <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-ink-2" title={address}>{address}</span>
+    </div>
+  );
+}
 
 /* maximize-2, as the computer window's open control */
 export const EXPAND_ICON = <><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></>;
@@ -56,7 +74,7 @@ export function AnnotateStrip({ page, feedback, note, onDone }: {
     : w("Select text, then choose Quote in chat", "选中文字，再点「引用到对话」", "選取文字，再點「引用到對話」");
   const { count } = feedback;
   return (
-    <div className="flex min-h-9 flex-wrap items-center gap-x-3 gap-y-1 rounded-card bg-accent-tint py-1 pr-1 pl-3 text-[12.5px] text-ink" style={{ animation: "fade-in 200ms ease-out both" }}>
+    <div className="flex min-h-9 shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line bg-accent-tint py-1 pr-1.5 pl-3 text-[12.5px] text-ink" style={{ animation: "fade-in 200ms ease-out both" }}>
       {/* The hint keeps a readable width; on a phone the status and actions wrap below it. */}
       <span className="flex min-w-[min(100%,15rem)] flex-1 items-center gap-2">
         <Icon name="annotate" size={14} className="shrink-0 text-accent-ink" />

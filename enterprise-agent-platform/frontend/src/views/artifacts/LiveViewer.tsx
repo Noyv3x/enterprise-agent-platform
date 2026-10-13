@@ -12,7 +12,7 @@ import { baseName } from "./ArtifactCards";
 import type { FeedbackSink, FramePick } from "./feedback";
 import { frameStorageKey } from "./frameStorage";
 import { KindIcon, kindLabel, previewLabel } from "./kinds";
-import { AnnotateStrip, AnnotateToggle, EXPAND_ICON, ICON_BUTTON, useAnnotate } from "./toolbar";
+import { AddressRow, AnnotateStrip, AnnotateToggle, EXPAND_ICON, ICON_BUTTON, PANEL_HEAD, PANEL_ROW, PANEL_SCREEN, useAnnotate } from "./toolbar";
 import type { ArtifactsState } from "./useArtifacts";
 import { WebFrame, type FrameWidth } from "./WebFrame";
 
@@ -44,9 +44,9 @@ export function LiveViewer({ state, feedback, owner }: { state: ArtifactsState; 
 
   if (state.detailError && !preview) {
     return (
-      <div className="flex flex-col gap-3">
-        <div className="flex items-center">{backButton}</div>
-        <Notice tone="danger" title={w("This preview could not be opened", "无法打开这个网站预览", "無法開啟這個網站預覽")}
+      <div className="flex flex-col">
+        <div className={PANEL_HEAD}>{backButton}</div>
+        <Notice tone="danger" className="m-3" title={w("This preview could not be opened", "无法打开这个网站预览", "無法開啟這個網站預覽")}
           action={<Button size="sm" className="touch:h-11" onClick={state.reloadDetail}>{w("Retry", "重试", "重試")}</Button>}>
           {state.detailError}
         </Notice>
@@ -140,8 +140,8 @@ export function LiveViewer({ state, feedback, owner }: { state: ArtifactsState; 
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2.5">
-      <div className="flex min-w-0 items-center gap-2">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className={PANEL_HEAD}>
         {backButton}
         <span aria-hidden className="flex size-7 shrink-0 items-center justify-center rounded-control bg-accent-tint text-accent-ink">
           <KindIcon kind="live" size={14} />
@@ -151,9 +151,24 @@ export function LiveViewer({ state, feedback, owner }: { state: ArtifactsState; 
           <span className="truncate text-[12px] text-ink-2">{[kindLabel("live", w), preview.service].filter(Boolean).join(" · ")}</span>
         </div>
         <StatusPill tone={preview.revoked ? "neutral" : TONES[preview.state]} className="h-6 shrink-0 text-[12px]">{previewLabel(preview, w)}</StatusPill>
+        <div className="flex shrink-0 items-center gap-0.5">
+          <button type="button" aria-label={w("Refresh", "刷新", "重新整理")} title={w("Refresh", "刷新", "重新整理")} aria-disabled={!running || undefined}
+            className={ICON_BUTTON} onClick={() => setNonce((value) => value + 1)}>
+            <Icon name="refresh" size={14} />
+          </button>
+          <a href={running ? pageUrl : undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!running || undefined}
+            aria-label={w("Open in new tab", "新标签打开", "在新分頁開啟")} title={w("Open in new tab", "新标签打开", "在新分頁開啟")} className={ICON_BUTTON}>
+            <Icon name="external" size={14} />
+          </a>
+          {running && (
+            <button type="button" aria-label={w("Enlarge", "放大", "放大")} title={w("Enlarge", "放大", "放大")} onClick={() => setExpanded(true)} className={ICON_BUTTON}>
+              <Ico size={13} path={EXPAND_ICON} />
+            </button>
+          )}
+        </div>
       </div>
 
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      {!preview.revoked && <div className={PANEL_ROW}>
         {running && (
           <SegmentedControl
             options={[widths.desktop, widths.tablet, widths.phone]}
@@ -164,14 +179,6 @@ export function LiveViewer({ state, feedback, owner }: { state: ArtifactsState; 
         )}
         {annotatable && <AnnotateToggle on={annotate.on} onChange={annotate.setOn} />}
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
-          <button type="button" aria-label={w("Refresh", "刷新", "重新整理")} title={w("Refresh", "刷新", "重新整理")} aria-disabled={!running || undefined}
-            className={ICON_BUTTON} onClick={() => setNonce((value) => value + 1)}>
-            <Icon name="refresh" size={14} />
-          </button>
-          <a href={running ? pageUrl : undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!running || undefined}
-            aria-label={w("Open in new tab", "新标签打开", "在新分頁開啟")} title={w("Open in new tab", "新标签打开", "在新分頁開啟")} className={ICON_BUTTON}>
-            <Icon name="external" size={14} />
-          </a>
           {running && preview.task_id && (
             <Button variant="quiet" size="xs" onClick={() => ask("stop")} className="text-red-ink touch:h-11">
               <Icon name="stop" size={13} />
@@ -185,23 +192,14 @@ export function LiveViewer({ state, feedback, owner }: { state: ArtifactsState; 
             </Button>
           )}
         </div>
-      </div>
+      </div>}
 
       {inspecting && feedback && <AnnotateStrip page feedback={feedback} note={annotate.note} onDone={() => annotate.setOn(false)} />}
 
-      <section aria-label={title} className="relative flex min-h-[320px] flex-1 flex-col overflow-hidden rounded-window bg-surface shadow-card">
-        <FauxWindow
-          tabs={[{ id: "live", label: title }]}
-          address={pageUrl}
-          actions={running ? (
-            <button type="button" aria-label={w("Enlarge", "放大", "放大")} title={w("Enlarge", "放大", "放大")} onClick={() => setExpanded(true)}
-              className="primitive-icon-button size-6 text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink touch:size-11">
-              <Ico size={13} path={EXPAND_ICON} />
-            </button>
-          ) : undefined}
-        >
-          <div className="absolute inset-0 flex flex-col">{body}</div>
-        </FauxWindow>
+      <AddressRow address={pageUrl} />
+
+      <section aria-label={title} className={PANEL_SCREEN}>
+        <div className="absolute inset-0 flex flex-col">{body}</div>
       </section>
 
       {expanded && running && (

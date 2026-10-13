@@ -1,7 +1,7 @@
 import { useId, useState, type ReactNode } from 'react';
 import { request, type AdminUser } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
-import { ConfirmDialog, Field, FormGrid, Notice, Select, Sheet, TextField } from '../../components/ui/beautiful/controls';
+import { ConfirmDialog, Field, FormGrid, Notice, Select, Sheet, TextField, type SelectOption } from '../../components/ui/beautiful/controls';
 import { useWords } from '../../words';
 import { errorText, useAdminLabels, type ModelPolicy, type PermissionGroup } from './shared';
 
@@ -44,7 +44,10 @@ export function UserEditor({ user, self, groups, policies, onSaved, onDeactivate
   const changed = (Object.keys(draft) as (keyof Draft)[]).filter((key) => draft[key] !== initial[key]);
   const valid = draft.permission_group !== '' && draft.model_policy !== '' && (current !== null || (draft.username.trim() !== '' && draft.password !== ''));
 
-  const policyOptions = policies.map((policy) => ({ value: policy.name, label: policy.label }));
+  const policyOptions: SelectOption[] = policies.map((policy) => {
+    const model = policy.main.model || w('System default', '系统默认', '系統預設');
+    return { value: policy.name, label: policy.label, description: w(`Main: ${model} · ${labels.depth(policy.main.thinking)}`, `主模型：${model} · ${labels.depth(policy.main.thinking)}`, `主模型：${model} · ${labels.depth(policy.main.thinking)}`) };
+  });
   // An account can only point at an existing group; a name the list lacks means the list failed to load.
   if (draft.model_policy && !policies.some((policy) => policy.name === draft.model_policy)) policyOptions.push({ value: draft.model_policy, label: draft.model_policy });
 
@@ -149,7 +152,7 @@ export function UserEditor({ user, self, groups, policies, onSaved, onDeactivate
             </Field>
           </FormGrid>
         </EditorGroup>
-        <EditorGroup title={w('Models', '模型', '模型')} description={w('The model policy group decides the model and thinking depth for each use. The account does not see it.', '策略组决定每种用途的模型和思考深度。账户本人看不到。', '策略群組決定每種用途的模型和思考深度。帳戶本人看不到。')}>
+        <EditorGroup title={w('Models', '模型', '模型')} description={w('The model policy group decides the main model, the judge model and their thinking depths. The account does not see it.', '策略组决定主模型、Judge 模型及其思考深度。账户本人看不到。', '策略群組決定主模型、Judge 模型及其思考深度。帳戶本人看不到。')}>
           <Field label={w('Model policy group', '策略组', '策略群組')} required>
             <Select value={draft.model_policy} onChange={(model_policy: string) => set({ model_policy })}
               placeholder={w('Choose a group', '选择策略组', '選擇策略群組')} options={policyOptions} />

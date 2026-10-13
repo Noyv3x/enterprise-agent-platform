@@ -64,11 +64,34 @@ function previewContainer(value: object, budget: { left: number }, depth: number
   return result;
 }
 
+// An edit/write `details.patch` is kept in whole lines within what is left of the budget (never cut mid-line or
+// suffixed with "…"); a cut one carries `patch_truncated: true`, and none fitting drops it.
+function previewDetails(value: unknown, budget: { left: number }): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || typeof (value as Record<string, unknown>).patch !== 'string') return preview(value, budget);
+  const { patch, ...rest } = value as Record<string, unknown> & { patch: string };
+  const result = preview(rest, budget) as Record<string, unknown> | undefined;
+  if (!result) return undefined;
+  // Room for `,"patch":"…"` and `,"patch_truncated":true` beside the other fields.
+  const room = budget.left - Buffer.byteLength(',"patch":') - Buffer.byteLength(',"patch_truncated":true');
+  let kept = '';
+  let size = 2;
+  for (const line of patch.split(/(?<=\n)/)) {
+    const bytes = Buffer.byteLength(JSON.stringify(line)) - 2;
+    if (size + bytes > room) break;
+    size += bytes;
+    kept += line;
+  }
+  if (!kept) return result;
+  const cut = kept.length < patch.length;
+  budget.left -= Buffer.byteLength(',"patch":') + size + (cut ? Buffer.byteLength(',"patch_truncated":true') : 0);
+  return { ...result, patch: kept, ...(cut ? { patch_truncated: true } : {}) };
+}
+
 function project(event: { type: string; [key: string]: unknown }): Record<string, unknown> {
   const fields = event.type === 'tool_start' ? ['args'] : event.type === 'tool_update' ? ['partial'] : event.type === 'tool_end' ? ['content_preview', 'details'] : [];
   const result = { ...event };
   const budget = { left: ACTIVITY_BYTES - 64 };
-  for (const field of fields) if (field in result) result[field] = preview(result[field], budget);
+  for (const field of fields) if (field in result) result[field] = field === 'details' ? previewDetails(result[field], budget) : preview(result[field], budget);
   return result;
 }
 

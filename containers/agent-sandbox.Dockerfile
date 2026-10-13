@@ -9,6 +9,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     AGENT_PLATFORM_TECHNICAL_PROFILE=agent-platform-v1 \
     AGENT_PLATFORM_AGENT_UID=1000 \
     AGENT_PLATFORM_AGENT_GID=1000
+# fonts-wqy-microhei: Chinese glyphs for ReportLab PDFs. ReportLab 3.6 embeds TrueType outlines only, so
+# fonts-noto-cjk (CFF, ~91 MB) is unusable for it; Micro Hei is ~5 MB. typing_extensions>=4.9 is python-pptx 1.0's
+# only dependency missing from bookworm's apt (4.4); the others (lxml, Pillow, XlsxWriter) satisfy its ranges.
+# python3-yaml: the skill-creator validator parses SKILL.md frontmatter with PyYAML, as Platform does.
 # Keep package resolution stable between releases; update the snapshot deliberately.
 ARG DEBIAN_SNAPSHOT=20260929T000000Z
 # The base has no CA bundle yet; apt still verifies signed snapshot metadata.
@@ -16,12 +20,12 @@ RUN printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian
     && rm /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-      bash build-essential ca-certificates curl file git jq less openssh-client \
+      bash build-essential ca-certificates curl file fonts-wqy-microhei git jq less openssh-client \
       procps python-is-python3 python3 python3-docx python3-lxml python3-openpyxl python3-pil \
-      python3-pip python3-pypdf python3-reportlab python3-venv python3-xlsxwriter \
+      python3-pip python3-pypdf python3-reportlab python3-venv python3-xlsxwriter python3-yaml \
       ripgrep sudo tini unzip util-linux \
     && python3 -m pip install --break-system-packages --no-cache-dir --no-deps \
-      python-pptx==0.6.21 uv==0.13.0 \
+      python-pptx==1.0.2 pypdfium2==4.30.0 typing_extensions==4.12.2 uv==0.13.0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupmod --new-name agent node \
     && usermod --login agent --home /home/agent --move-home node \

@@ -431,29 +431,43 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(over["data"]["error"], "too_many_subagents")
         self.assertEqual(len(self.rows("user_id=1")), 9)
 
-    async def test_subagents_and_notice_turns_use_their_policy_slots(self):
+    async def test_subagents_and_notice_turns_run_on_the_main_model_and_the_judge_rides_only_with_auto(self):
+        self.p.oauth = SimpleNamespace(catalog=AsyncMock(return_value={"models": [{"id": "gpt-6.1-sol", "contextWindow": 400000}, {"id": "gpt-6-luna", "maxTokens": 64000}]}))
         with self.p.db.connect() as conn:
-            set_default_policy(conn, personal={"model": "m-personal", "thinking": "low"}, channel={"model": "m-channel", "thinking": "low"},
-                               chat={"model": "m-chat", "thinking": "low"}, scout={"model": "m-scout", "thinking": "off"},
-                               worker={"model": "m-worker", "thinking": "xhigh"})
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="auto", judge={"model": "gpt-6-luna", "thinking": "low"})
         stream = await self.parent("first")
         (scout,) = await self.spawn(1, "scout")
         (worker,) = await self.spawn(1, "task")
         await self.started(scout)
         await self.started(worker)
-        models = {sid: body["model"] for sid, _, body in self.runs}
-        self.assertEqual(models["agent-private-1"], {"id": "m-personal", "thinking": "low"})
-        self.assertEqual(models[f"agent-private-1-bg-{scout}"], {"id": "m-scout", "thinking": "off"})
-        self.assertEqual(models[f"agent-private-1-bg-{worker}"], {"id": "m-worker", "thinking": "xhigh"})
-        for tid in (scout, worker):
-            self.child_stream(tid).finish(text="done", usage={"input": 1, "output": 1, "total": 2})
+        bodies = {sid: body for sid, _, body in self.runs}
+        main = {"id": "gpt-6.1-sol", "thinking": "auto", "contextWindow": 400000}
+        judge = {"id": "gpt-6-luna", "thinking": "low", "maxTokens": 64000}
+        for sid in ("agent-private-1", f"agent-private-1-bg-{scout}", f"agent-private-1-bg-{worker}"):
+            self.assertEqual((bodies[sid]["model"], bodies[sid]["judge"]), (main, judge), sid)
+        effort = {"effort": "xhigh", "judge_usage": {"model": "gpt-6-luna", "input": 9, "output": 1, "cache_read": 0, "cache_write": 0, "total": 10}}
+        self.child_stream(scout).frames.put_nowait(([{"type": "run_end", "status": "completed", "text": "done", "model": "gpt-6.1-sol",
+                                                       "usage": {"input": 1, "output": 1, "total": 2}, "undelivered_inputs": [], **effort}], None))
+        self.child_stream(worker).finish(text="done", usage={"input": 1, "output": 1, "total": 2})
         await self.until(lambda: self.row(scout)["status"] == "completed" and self.row(worker)["status"] == "completed")
         await self.flushed()
+        with self.p.db.connect() as conn:
+            rows = [(row["model"], json.loads(row["raw_usage_json"])) for row in conn.execute("SELECT * FROM token_usage_events ORDER BY id")]
+        self.assertIn(("gpt-6-luna", {"input": 9, "output": 1, "cache_read": 0, "cache_write": 0, "total": 10, "kind": "auto_effort", "task_id": f"bg-{scout}", "cacheRead": 0, "cacheWrite": 0}), rows)
+        self.assertEqual([raw.get("effort") for model, raw in rows if raw.get("kind") == "subagent" and raw["task_id"] == f"bg-{scout}"], ["xhigh"])
+        self.assertNotIn("effort", json.dumps(self.row(scout)))
         stream.finish(text="working on it")
         await self.quiet()
         self.assertEqual(self.parent_runs, 2)
-        self.assertEqual(self.runs[-1][2]["model"], {"id": "m-personal", "thinking": "low"})
+        self.assertEqual(self.runs[-1][2]["model"], main)
         self.assertIn("<background-task-results>", self.runs[-1][2]["prompt"]["text"])
+        with self.p.db.connect() as conn:
+            set_default_policy(conn, model="gpt-6.1-sol", thinking="high", judge={"model": "gpt-6-luna", "thinking": "low"})
+        (again,) = await self.spawn(1, "scout")
+        await self.started(again)
+        body = next(body for sid, _, body in self.runs if sid == f"agent-private-1-bg-{again}")
+        self.assertEqual(body["model"], {"id": "gpt-6.1-sol", "thinking": "high", "contextWindow": 400000})
+        self.assertNotIn("judge", body)
 
     async def test_children_run_beside_the_conversation_fifo_and_a_notice_continues_the_turn(self):
         stream = await self.parent("first")

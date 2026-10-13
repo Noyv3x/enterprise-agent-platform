@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { request, type ArtifactFile, type ArtifactSource, type ArtifactVersion, type ArtifactView } from "../../api";
+import { request, type ArtifactFile, type ArtifactKind, type ArtifactSource, type ArtifactVersion, type ArtifactView } from "../../api";
 import { Button } from "../../components/ui/beautiful/atoms/Button";
 import { SegmentedControl } from "../../components/ui/beautiful/atoms/SegmentedControl";
 import { EmptyState, Icon, Notice, Select } from "../../components/ui/beautiful/controls";
@@ -9,12 +9,13 @@ import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { baseName } from "./ArtifactCards";
 import type { FeedbackSink, FramePick } from "./feedback";
+import { FileViewer } from "./FileViewer";
 import { frameStorageKey } from "./frameStorage";
 import { KindIcon, kindLabel, previewLabel } from "./kinds";
 import { LiveViewer } from "./LiveViewer";
 import { QuoteLayer } from "./QuoteLayer";
 import { ArtifactDiff, ArtifactPreview, ArtifactSourceView } from "./renderers";
-import { ANNOTATABLE, AnnotateStrip, AnnotateToggle, EXPAND_ICON, ICON_BUTTON, useAnnotate } from "./toolbar";
+import { ANNOTATABLE, AddressRow, AnnotateStrip, AnnotateToggle, EXPAND_ICON, ICON_BUTTON, PANEL_HEAD, PANEL_ROW, PANEL_SCREEN, useAnnotate } from "./toolbar";
 import { TEXT_KINDS, type ArtifactRendererProps } from "./types";
 import type { ArtifactsState } from "./useArtifacts";
 import { useViewUrl } from "./useViewUrl";
@@ -22,15 +23,20 @@ import { WebFrame, type FrameWidth } from "./WebFrame";
 
 type Mode = "preview" | "source" | "diff";
 
+/** Binary kinds: no 源码 view. */
+const BINARY: Partial<Record<ArtifactKind, true>> = { image: true, pdf: true, docx: true, xlsx: true, pptx: true };
+
 function when(iso: string): string {
   const date = new Date(iso);
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString(intlLocale(), { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 }
 
-/** The 作品 panel's content: the conversation's artifacts, or the open one with its toolbar and preview. `feedback`
- * (null when the person cannot post) enables 圈选; `owner` keys the pages' kept storage per account. */
+/** The 作品 panel's content: an attachment in file mode, the conversation's artifacts, or the open one with its toolbar
+ * and preview. `feedback` (null when the person cannot post) enables 圈选; `owner` keys the pages' kept storage per
+ * account. Flush: flat rows over a full-bleed screen; list and notices pad themselves. */
 export function ArtifactPanel({ state, feedback = null, owner }: { state: ArtifactsState; feedback?: FeedbackSink | null; owner?: number }) {
-  if (!state.selection) return <ArtifactList state={state} />;
+  if (state.file) return <FileViewer key={state.file.id} file={state.file} onClose={state.closeFile} />;
+  if (!state.selection) return <div className="flex min-h-0 flex-1 flex-col p-3"><ArtifactList state={state} /></div>;
   return state.artifact?.kind === "live"
     ? <LiveViewer state={state} feedback={feedback} owner={owner} />
     : <ArtifactViewer state={state} feedback={feedback} owner={owner} />;
@@ -121,7 +127,7 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
   const id = selection?.id ?? null;
   const version = selection?.version ?? null;
   const current = versions.find((item) => item.version === version);
-  const view = useViewUrl(current ? id : null, current ? version : null, nonce);
+  const view = useViewUrl(current ? `/api/artifacts/${id}/versions/${version}/view` : null, nonce);
 
   const backButton = (
     <button type="button" onClick={state.back} aria-label={w("All artifacts", "全部作品", "全部作品")} title={w("All artifacts", "全部作品", "全部作品")} className={ICON_BUTTON}>
@@ -131,9 +137,9 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
 
   if (state.detailError && !current) {
     return (
-      <div className="flex flex-col gap-3">
-        <div className="flex items-center">{backButton}</div>
-        <Notice tone="danger" title={w("This artifact could not be opened", "无法打开这个作品", "無法開啟這個作品")}
+      <div className="flex flex-col">
+        <div className={PANEL_HEAD}>{backButton}</div>
+        <Notice tone="danger" className="m-3" title={w("This artifact could not be opened", "无法打开这个作品", "無法開啟這個作品")}
           action={<Button size="sm" className="touch:h-11" onClick={state.reloadDetail}>{w("Retry", "重试", "重試")}</Button>}>
           {state.detailError}
         </Notice>
@@ -162,7 +168,8 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
   };
   const previous = versions.find((item) => item.version < version);
   const diffable = Boolean(TEXT_KINDS[artifact.kind]) && Boolean(previous);
-  const shownMode: Mode = mode === "diff" && !diffable ? "source" : mode;
+  const sourced = !BINARY[artifact.kind];
+  const shownMode: Mode = !sourced ? "preview" : mode === "diff" && !diffable ? "source" : mode;
   const modes = { preview: w("Preview", "预览", "預覽"), source: w("Source", "源码", "原始碼") };
   const widths: Record<FrameWidth, string> = { desktop: w("Desktop", "桌面", "桌面"), tablet: w("Tablet", "平板", "平板"), phone: w("Phone", "手机", "手機") };
   const latest = versions[0]?.version ?? version;
@@ -173,9 +180,24 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
     label: [`v${item.version}`, when(item.created_at), item.version === latest ? w("Latest", "最新", "最新") : ""].filter(Boolean).join(" · "),
   }));
 
+  // Binary kinds have no mode controls: their version select joins the first row instead of taking a row alone.
+  const controls = sourced || Boolean(annotatable);
+  const versionSelect = (
+    <Select<string>
+      aria-label={w("Version", "版本", "版本")}
+      size="sm"
+      className={controls
+        ? "ml-auto w-auto max-w-[13.5rem] shrink-0 max-sm:ml-0 max-sm:w-full max-sm:max-w-none"
+        : "w-auto max-w-[13.5rem] shrink-0 max-sm:order-last max-sm:mb-1 max-sm:ml-1.5 max-sm:w-full max-sm:max-w-none"}
+      value={String(version)}
+      options={versionOptions}
+      onChange={(value) => state.chooseVersion(Number(value))}
+    />
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-2.5">
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className={controls ? PANEL_HEAD : `${PANEL_HEAD} flex-wrap`}>
         {backButton}
         <span aria-hidden className="flex size-7 shrink-0 items-center justify-center rounded-control bg-accent-tint text-accent-ink">
           <KindIcon kind={artifact.kind} size={14} />
@@ -184,23 +206,33 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
           <h3 className="truncate text-[13px] font-semibold text-ink" title={title}>{title}</h3>
           <span className="truncate text-[12px] text-ink-2">{kindLabel(artifact.kind, w)}</span>
         </div>
-        <Select<string>
-          aria-label={w("Version", "版本", "版本")}
-          size="sm"
-          className="w-auto max-w-[13.5rem] shrink-0 max-sm:w-full max-sm:max-w-none"
-          value={String(version)}
-          options={versionOptions}
-          onChange={(value) => state.chooseVersion(Number(value))}
-        />
+        {!controls && versionSelect}
+        <div className="flex shrink-0 items-center gap-0.5">
+          <button type="button" aria-label={w("Refresh", "刷新", "重新整理")} title={w("Refresh", "刷新", "重新整理")} className={ICON_BUTTON} onClick={() => setNonce((value) => value + 1)}>
+            <Icon name="refresh" size={14} />
+          </button>
+          <a href={view.url ?? undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!view.url || undefined}
+            aria-label={w("Open in new tab", "新标签打开", "在新分頁開啟")} title={w("Open in new tab", "新标签打开", "在新分頁開啟")} className={ICON_BUTTON}>
+            <Icon name="external" size={14} />
+          </a>
+          <a href={download} download aria-label={w(`Download v${version}`, `下载 v${version}`, `下載 v${version}`)} title={w("Download", "下载", "下載")} className={ICON_BUTTON}>
+            <Icon name="download" size={14} />
+          </a>
+          <button type="button" aria-label={w("Enlarge", "放大", "放大")} title={w("Enlarge", "放大", "放大")} onClick={() => setExpanded(true)} className={ICON_BUTTON}>
+            <Ico size={13} path={EXPAND_ICON} />
+          </button>
+        </div>
       </div>
 
-      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-        <SegmentedControl
-          options={[modes.preview, modes.source]}
-          value={shownMode === "preview" ? modes.preview : modes.source}
-          onChange={(label) => setMode(label === modes.preview ? "preview" : "source")}
-          className="shrink-0 touch:h-11"
-        />
+      {controls && <div className={PANEL_ROW}>
+        {sourced && (
+          <SegmentedControl
+            options={[modes.preview, modes.source]}
+            value={shownMode === "preview" ? modes.preview : modes.source}
+            onChange={(label) => setMode(label === modes.preview ? "preview" : "source")}
+            className="shrink-0 touch:h-11"
+          />
+        )}
         {diffable && (
           <Button variant="quiet" size="xs" aria-pressed={shownMode === "diff"} onClick={() => setMode(shownMode === "diff" ? "source" : "diff")}
             className={`touch:h-11 ${shownMode === "diff" ? "bg-hover-2" : "text-ink-2"}`}>
@@ -216,31 +248,22 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
           />
         )}
         {annotatable && <AnnotateToggle on={annotate.on} onChange={annotate.setOn} />}
-        <div className="ml-auto flex shrink-0 items-center gap-0.5">
-          <button type="button" aria-label={w("Refresh", "刷新", "重新整理")} title={w("Refresh", "刷新", "重新整理")} className={ICON_BUTTON} onClick={() => setNonce((value) => value + 1)}>
-            <Icon name="refresh" size={14} />
-          </button>
-          <a href={view.url ?? undefined} target="_blank" rel="noopener noreferrer" aria-disabled={!view.url || undefined}
-            aria-label={w("Open in new tab", "新标签打开", "在新分頁開啟")} title={w("Open in new tab", "新标签打开", "在新分頁開啟")} className={ICON_BUTTON}>
-            <Icon name="external" size={14} />
-          </a>
-          <a href={download} download aria-label={w(`Download v${version}`, `下载 v${version}`, `下載 v${version}`)} title={w("Download", "下载", "下載")} className={ICON_BUTTON}>
-            <Icon name="download" size={14} />
-          </a>
-        </div>
-      </div>
+        {versionSelect}
+      </div>}
 
       {annotating && feedback && <AnnotateStrip page={annotatable === "page"} feedback={feedback} note={annotate.note} onDone={() => annotate.setOn(false)} />}
 
-      <div role="status" aria-live="polite" aria-label={w("Version updates", "版本更新", "版本更新")} className="empty:hidden">
+      <div role="status" aria-live="polite" aria-label={w("Version updates", "版本更新", "版本更新")} className="shrink-0 empty:hidden">
         {notice?.type === "updated" && notice.version === version && (
-          <span key={notice.seq} className="inline-flex h-6 items-center gap-1.5 rounded-full bg-green-tint px-2.5 text-[12px] font-medium text-ink" style={{ animation: "fade-in 200ms ease-out both" }}>
-            <Icon name="check" size={12} className="text-green-ink" />
-            {w(`Updated to v${notice.version}`, `已更新到 v${notice.version}`, `已更新到 v${notice.version}`)}
-          </span>
+          <div key={notice.seq} className="flex min-h-9 items-center border-b border-line px-3 py-1.5" style={{ animation: "fade-in 200ms ease-out both" }}>
+            <span className="inline-flex h-6 items-center gap-1.5 rounded-full bg-green-tint px-2.5 text-[12px] font-medium text-ink">
+              <Icon name="check" size={12} className="text-green-ink" />
+              {w(`Updated to v${notice.version}`, `已更新到 v${notice.version}`, `已更新到 v${notice.version}`)}
+            </span>
+          </div>
         )}
         {notice?.type === "newer" && notice.version > version && (
-          <div key={notice.seq} className="flex min-h-9 items-center gap-2 rounded-card bg-accent-tint py-1 pr-1 pl-3 text-[12.5px] text-ink" style={{ animation: "fade-in 200ms ease-out both" }}>
+          <div key={notice.seq} className="flex min-h-9 items-center gap-2 border-b border-line bg-accent-tint py-1 pr-1.5 pl-3 text-[12.5px] text-ink" style={{ animation: "fade-in 200ms ease-out both" }}>
             <Icon name="info" size={14} className="shrink-0 text-accent-ink" />
             <span className="min-w-0 flex-1">{w(`A newer version v${notice.version} is available`, `有新版本 v${notice.version}`, `有新版本 v${notice.version}`)}</span>
             <Button size="xs" className="touch:h-11" onClick={() => state.chooseVersion(notice.version)}>{w("View", "查看", "檢視")}</Button>
@@ -248,24 +271,12 @@ function ArtifactViewer({ state, feedback, owner }: { state: ArtifactsState; fee
         )}
       </div>
 
-      <section
-        aria-label={w(`${title}, v${version}`, `${title}，v${version}`, `${title}，v${version}`)}
-        className="relative flex min-h-[320px] flex-1 flex-col overflow-hidden rounded-window bg-surface shadow-card"
-      >
-        <FauxWindow
-          tabs={[{ id: "artifact", label: `${title} · v${version}` }]}
-          address={web ? artifact.path : null}
-          actions={
-            <button type="button" aria-label={w("Enlarge", "放大", "放大")} title={w("Enlarge", "放大", "放大")} onClick={() => setExpanded(true)}
-              className="primitive-icon-button size-6 text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink touch:size-11">
-              <Ico size={13} path={EXPAND_ICON} />
-            </button>
-          }
-        >
-          {expanded ? null : (
-            <ArtifactBody key={`${id}:${version}:${nonce}`} sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} frame={frame} />
-          )}
-        </FauxWindow>
+      {web && shownMode === "preview" && <AddressRow address={artifact.path} />}
+
+      <section aria-label={w(`${title}, v${version}`, `${title}，v${version}`, `${title}，v${version}`)} className={PANEL_SCREEN}>
+        {expanded ? null : (
+          <ArtifactBody key={`${id}:${version}:${nonce}`} sources={sources} artifact={artifact} current={current} previous={previous} mode={shownMode} width={width} viewUrl={view.url} viewError={view.error} frame={frame} />
+        )}
       </section>
 
       {expanded && (

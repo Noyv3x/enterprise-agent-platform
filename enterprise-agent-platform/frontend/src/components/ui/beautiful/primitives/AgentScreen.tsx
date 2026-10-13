@@ -1,10 +1,10 @@
 /* Adapted from Beautiful UI components/primitives/AgentScreen.tsx (MIT, see ../NOTICE).
  * Adaptations:
- * - window mode: the resting card is upstream's FauxWindow (exported below) carrying real data instead of the
- *   placeholder capture: traffic lights, the caller's title tab(s), an address row only when the caller gives one,
- *   and the caller's content. It fills the height its parent gives it (the caller fixes that height so the window
- *   never jumps), is a real window rather than a clickable card (its content scrolls; there is no hover overlay),
- *   and upstream's open icon sits at the right of the title row to open the expanded viewer;
+ * - panel mode (no window-in-window): the resting screen fills the side panel it sits in — no rounded/shadowed
+ *   section and no FauxWindow chrome (traffic lights). Its functional rows become `ScreenToolbar` (exported below):
+ *   a slim flat bar with the caller's title tab(s), upstream's open icon at the right to open the expanded viewer, and
+ *   an address row only when the caller gives one. The screen fills the height its parent gives it (the caller fixes
+ *   that height so it never jumps) and is real content rather than a clickable card (it scrolls; no hover overlay);
  * - the content is the agent browser's live screenshot (`streamSrc`, fitted to the window's width and top-aligned,
  *   since the window is taller than a page) or a caller node (`screen`); the expanded viewer shows the screenshot as
  *   upstream does, or the caller's larger node (`viewerScreen`) inside the same window chrome; without either the
@@ -16,8 +16,9 @@
  * - labels come from the caller (i18n); the dialog traps focus, restores it, and consumes Escape before a parent sheet;
  * - the expanded viewer sits above sheets (60) and below its portaled popovers (80);
  * - the expanded viewer's frame (scrim, card, title bar with name, status, controls and collapse, screen inset and
- *   input row) is exported as `ScreenViewer`, which the personal AI's process output viewer also uses.
- * Markup, classes, radii and motion are upstream's. */
+ *   input row) is exported as `ScreenViewer`, which the personal AI's process output viewer also uses; the expanded
+ *   viewer keeps upstream's FauxWindow around a caller node.
+ * Markup, classes, radii and motion are upstream's, apart from the panel mode above. */
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "../cn";
@@ -171,6 +172,59 @@ export function FauxWindow({ tabs, activeTab, onTabChange, tabsLabel, address, a
         </div>
       )}
       <div className="relative min-h-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
+/** Panel-mode adaptation of FauxWindow's chrome (see the header): the functional rows only, flat and slim, for a
+ * screen that fills a side panel. Title tab(s) (choosable as buttons when `onTabChange` is given and there are
+ * several), the caller's actions at the right, and an address row only when one is given. */
+export function ScreenToolbar({ tabs, activeTab, onTabChange, tabsLabel, address, actions }: {
+  tabs: WindowTab[];
+  activeTab?: string;
+  onTabChange?: (id: string) => void;
+  /** accessible name of the tab group when tabs are choosable */
+  tabsLabel?: string;
+  /** shown in the address row; the row is omitted without one */
+  address?: string | null;
+  /** controls at the right of the title row */
+  actions?: ReactNode;
+}) {
+  const active = activeTab ?? tabs[0]?.id;
+  const choosable = Boolean(onTabChange) && tabs.length > 1;
+  return (
+    <div className="shrink-0 border-b border-line bg-page">
+      <div className="flex min-h-9 items-center gap-1 pl-3 pr-1.5">
+        {choosable ? (
+          <div role="group" aria-label={tabsLabel} className="-ml-2 flex min-w-0 flex-1 items-center gap-0.5">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                aria-pressed={tab.id === active}
+                title={tab.label}
+                onClick={() => onTabChange?.(tab.id)}
+                className={cn(
+                  "h-6 min-w-0 max-w-[12rem] truncate rounded-[6px] px-2 text-[12px] font-medium transition-colors duration-100 touch:min-h-11 forced-colors:border",
+                  tab.id === active ? "bg-hover text-ink" : "text-ink-2 hover:bg-hover hover:text-ink",
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-ink" title={tabs.find((tab) => tab.id === active)?.label}>
+            {tabs.find((tab) => tab.id === active)?.label}
+          </span>
+        )}
+        {actions && <div className="ml-auto flex shrink-0 items-center gap-1">{actions}</div>}
+      </div>
+      {address && (
+        <div className="flex min-h-7 items-center border-t border-line px-3">
+          <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-ink-2" title={address}>{address}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -374,13 +428,9 @@ export default function AgentScreen({
 
   return (
     <div className={cn("flex w-full min-w-0 flex-col", className)}>
-      {/* ── the window ── */}
-      <section
-        aria-label={labels.window}
-        className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-window bg-surface shadow-card"
-        style={{ animation: "fade-up 380ms cubic-bezier(0.23,1,0.32,1) both" }}
-      >
-        <FauxWindow
+      {/* ── the screen, flush with its panel ── */}
+      <section aria-label={labels.window} className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-surface">
+        <ScreenToolbar
           tabs={tabs}
           activeTab={activeTab}
           onTabChange={onTabChange}
@@ -395,13 +445,14 @@ export default function AgentScreen({
                 title={labels.open}
                 disabled={loading}
                 onClick={() => onOpenChange(true)}
-                className="primitive-icon-button size-6 text-ink-3 transition-colors duration-100 hover:bg-hover hover:text-ink disabled:opacity-50 touch:size-11"
+                className="primitive-icon-button size-7 text-ink-2 transition-colors duration-100 hover:bg-hover hover:text-ink disabled:opacity-50 touch:size-11"
               >
                 <Ico size={13} path={openIcon} />
               </button>
             </>
           }
-        >
+        />
+        <div className="relative min-h-0 flex-1">
           {loading ? (
             <LoadingScreen label={labels.connecting} />
           ) : screen ? (
@@ -417,10 +468,10 @@ export default function AgentScreen({
           ) : (
             <div className="absolute inset-0 flex items-center justify-center bg-inset p-4 text-center text-[12.5px] text-ink-2">{empty}</div>
           )}
-        </FauxWindow>
+        </div>
       </section>
 
-      <div className="mt-2.5 flex min-w-0 items-center gap-2 px-0.5">
+      <div className="flex min-w-0 shrink-0 items-center gap-2 border-t border-line px-3 py-2">
         <span className="truncate text-[13px] font-medium text-ink" title={agentName}>{agentName}</span>
         {status}
       </div>

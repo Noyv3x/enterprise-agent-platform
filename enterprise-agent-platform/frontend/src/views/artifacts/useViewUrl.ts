@@ -7,11 +7,12 @@ export const VIEW_REFRESH_LEAD_MS = 5 * 60 * 1000;
 
 interface Minted { key: string; url: string; expiresAt: number }
 
-/** `/artifact-view/<token>/<entry>` for one artifact version, minted on demand (`POST …/view`) and re-minted before
- * the token expires, also when a hidden tab comes back after its timer was throttled. The previous URL stays until
- * the new one arrives, so a frame never blanks. `nonce` forces a fresh token (刷新). */
-export function useViewUrl(id: number | null, version: number | null, nonce = 0): { url: string | null; error: string } {
-  const key = id === null || version === null ? "" : `${id}:${version}`;
+/** A view URL (`/artifact-view/<token>/<entry>` for an artifact version, `/attachment-view/<token>/<name>` for an
+ * attachment) minted on demand by POSTing to `mint` and re-minted before the token expires, also when a hidden tab
+ * comes back after its timer was throttled. The previous URL stays until the new one arrives, so a frame never
+ * blanks. `nonce` forces a fresh token (刷新). */
+export function useViewUrl(mint: string | null, nonce = 0): { url: string | null; error: string } {
+  const key = mint ?? "";
   const [minted, setMinted] = useState<Minted | null>(null);
   const [error, setError] = useState<{ key: string; text: string } | null>(null);
   const [round, setRound] = useState(0);
@@ -20,7 +21,7 @@ export function useViewUrl(id: number | null, version: number | null, nonce = 0)
     if (!key) return;
     let cancelled = false;
     let timer = 0;
-    request<{ url: string; expires_at: string }>(`/api/artifacts/${id}/versions/${version}/view`, { method: "POST", body: "{}" }).then(
+    request<{ url: string; expires_at: string }>(key, { method: "POST", body: "{}" }).then(
       (result) => {
         if (cancelled) return;
         const expiresAt = Date.parse(result.expires_at);
@@ -36,7 +37,7 @@ export function useViewUrl(id: number | null, version: number | null, nonce = 0)
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [key, id, version, nonce, round]);
+  }, [key, nonce, round]);
 
   // Background tabs throttle timers: re-mint on return when the token is (nearly) spent.
   const expiresAt = minted?.key === key ? minted.expiresAt : null;

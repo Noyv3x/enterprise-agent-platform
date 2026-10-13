@@ -11,6 +11,13 @@ service of the Allen Institute for AI. Those services are not bundled with or
 licensed by this Skill; their public endpoints remain subject to their own
 terms and operational limits.
 
+## What was changed
+
+- Web-tool-first guidance for chat (no network in bash), version-pinned IDs and
+  links, explicit depth-read and truncation statements, and a research manifest.
+- `scripts/search_arxiv.py` gained `--start`, `--abstract-chars` with explicit
+  `[TRUNCATED]` markers, `--json`, and version-pinned URLs.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

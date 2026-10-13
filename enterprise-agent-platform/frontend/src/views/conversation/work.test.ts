@@ -16,7 +16,7 @@ describe('skill tool verbs', () => {
 
   it('titles the computer step with the skill or its source', () => {
     const call = (args: Record<string, unknown>, status: ToolCall['status'] = 'done'): ToolCall => ({
-      id: 't', name: 'skill', args, status, input: '', output: '', truncated: false, streamed: false, diff: '',
+      id: 't', name: 'skill', args, status, input: '', output: '', truncated: false, streamed: false, patch: '', patchCut: false,
     });
     expect(stepTitle(call({ action: 'install', url: 'https://github.com/acme/pdf' }, 'running'), zh)).toBe('正在安装技能 https://github.com/acme/pdf');
     expect(stepTitle(call({ action: 'remove', name: 'pdf' }), zh)).toBe('删除技能 pdf');
@@ -28,7 +28,7 @@ describe('artifact tool verbs', () => {
   it('reads publishing as 发布作品 in the trace and the computer', () => {
     expect(toolVerb('artifact', zh, { action: 'publish', path: '/workspace/deck.html' })).toBe('发布作品');
     expect(toolVerb('artifact', zh, { action: 'list' })).toBe('查看作品');
-    const call: ToolCall = { id: 'a', name: 'artifact', args: { action: 'publish', path: '/workspace/out/deck.html', title: '发布会' }, status: 'running', input: '', output: '', truncated: false, streamed: false, diff: '' };
+    const call: ToolCall = { id: 'a', name: 'artifact', args: { action: 'publish', path: '/workspace/out/deck.html', title: '发布会' }, status: 'running', input: '', output: '', truncated: false, streamed: false, patch: '', patchCut: false };
     expect(stepTitle(call, zh)).toBe('正在发布作品 发布会');
   });
 });
@@ -36,7 +36,7 @@ describe('artifact tool verbs', () => {
 describe('MCP tool verbs', () => {
   const labels = { notion: 'Notion', 'acme-crm': 'Acme CRM' };
   const call = (name: string, args: Record<string, unknown>, status: ToolCall['status'] = 'done'): ToolCall => ({
-    id: 'm', name, args, status, input: '', output: '', truncated: false, streamed: false, diff: '',
+    id: 'm', name, args, status, input: '', output: '', truncated: false, streamed: false, patch: '', patchCut: false,
   });
 
   it('reads a connector tool as 「调用 <label> · <tool>」, falling back to the connector name', () => {

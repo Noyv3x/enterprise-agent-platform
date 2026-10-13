@@ -121,6 +121,27 @@ test('activity projections remove image bytes and share a bounded UTF-8 preview 
   events.close();
 });
 
+test('a large edit/write patch is cut on whole lines within the activity budget and flagged', () => {
+  const events = new RunEvents();
+  const live = new Response();
+  events.subscribe(0, live.asHttp());
+  const lines = Array.from({ length: 60000 }, (_, at) => `+行 ${at} "quoted"\n`);
+  const large = '--- big.md\n+++ big.md\n@@ -0,0 +1,60000 @@\n' + lines.join('');
+  const small = '--- a.md\n+++ a.md\n@@ -1 +1 @@\n-a\n+b\n';
+  events.emit({ type: 'tool_end', content_preview: [{ type: 'text', text: 'Successfully wrote to big.md' }], details: { patch: large } });
+  events.emit({ type: 'tool_end', content_preview: [], details: { patch: small, firstChangedLine: 1 } });
+  events.close();
+  const [cut, whole] = values(live);
+  assert.equal(cut!.details.patch_truncated, true);
+  assert(large.startsWith(cut!.details.patch));
+  assert(cut!.details.patch.endsWith('\n'));
+  assert(!cut!.details.patch.endsWith('…'));
+  assert(cut!.details.patch.length > 30000);
+  const { type, seq, ...activity } = cut!;
+  assert(Buffer.byteLength(JSON.stringify(activity)) <= 64 * 1024);
+  assert.deepEqual(whole!.details, { firstChangedLine: 1, patch: small });
+});
+
 test('deep external tool previews cannot abort the run or lose later terminal events', () => {
   const events = new RunEvents();
   const response = new Response();

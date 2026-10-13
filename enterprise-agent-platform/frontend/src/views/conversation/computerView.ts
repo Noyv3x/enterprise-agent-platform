@@ -25,8 +25,8 @@ export const ComputerContext = createContext<{ show: (run: RunRef, callId: strin
 
 const persisted = new WeakMap<Message, ToolCall[]>();
 
-/** One reply's persisted work trace as calls (bounded args and output previews), oldest first; cached per message.
- * Oversized arguments survive only as a JSON prefix (`_preview`); its readable part is parsed back. */
+/** One reply's persisted work trace as calls (bounded args, output previews and edit/write patches), oldest first;
+ * cached per message. Oversized arguments survive only as a JSON prefix (`_preview`); its readable part is parsed back. */
 export function messageCalls(message: Message): ToolCall[] {
   const cached = persisted.get(message);
   if (cached) return cached;
@@ -35,7 +35,7 @@ export function messageCalls(message: Message): ToolCall[] {
     if (item.type !== "tool") continue;
     const preview = item.args._preview;
     const args = typeof preview === "string" ? { ...partialArgs(preview), _preview: preview } : item.args;
-    calls.push({ id: item.id, name: item.name, status: item.status, args, input: "", output: item.output, truncated: false, streamed: false, diff: "" });
+    calls.push({ id: item.id, name: item.name, status: item.status, args, input: "", output: item.output, truncated: false, streamed: false, patch: item.patch ?? "", patchCut: item.patchCut === true });
   }
   persisted.set(message, calls);
   return calls;
@@ -183,4 +183,57 @@ export function headLines(text: string, max: number): { text: string; cut: boole
     if (at === -1) return { text, cut: false };
   }
   return { text: text.slice(0, at), cut: true };
+}
+
+/** One row of a unified patch: a hunk header, or a line with its old and/or new line number. */
+export interface PatchRow {
+  type: "hunk" | "ctx" | "add" | "del";
+  old: number | null;
+  new: number | null;
+  text: string;
+}
+
+/** A standard unified patch (`---`/`+++` file headers, `@@ -a,b +c,d @@` hunks) as rows numbered against the old and
+ * new file, with exact added/removed counts. Only lines starting " ", "+" or "-" inside a hunk are rows; file
+ * headers, the empty string after the final newline and `\ No newline at end of file` markers are not. `cut` is set
+ * when a hunk ends before its header's line counts are reached (the text was clipped on the way). */
+export function parsePatch(patch: string): { rows: PatchRow[]; added: number; removed: number; cut: boolean } {
+  const rows: PatchRow[] = [];
+  let added = 0;
+  let removed = 0;
+  let oldLine = 0;
+  let newLine = 0;
+  let oldLeft = 0;
+  let newLeft = 0;
+  let cut = false;
+  for (const line of patch.split("\n")) {
+    // Content lines start with " ", "+" or "-", so a line starting "@@" is always a hunk header.
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (hunk) {
+      if (oldLeft > 0 || newLeft > 0) cut = true;
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[3]);
+      oldLeft = Number(hunk[2] ?? 1);
+      newLeft = Number(hunk[4] ?? 1);
+      // A count of 0 numbers from the line before the hunk; the next line of that side is one further.
+      if (oldLeft === 0) oldLine++;
+      if (newLeft === 0) newLine++;
+      rows.push({ type: "hunk", old: null, new: null, text: line });
+    } else if (oldLeft > 0 || newLeft > 0) {
+      if (line.startsWith("+")) {
+        rows.push({ type: "add", old: null, new: newLine++, text: line.slice(1) });
+        newLeft--;
+        added++;
+      } else if (line.startsWith("-")) {
+        rows.push({ type: "del", old: oldLine++, new: null, text: line.slice(1) });
+        oldLeft--;
+        removed++;
+      } else if (line.startsWith(" ")) {
+        rows.push({ type: "ctx", old: oldLine++, new: newLine++, text: line.slice(1) });
+        oldLeft--;
+        newLeft--;
+      }
+    }
+  }
+  return { rows, added, removed, cut: cut || oldLeft > 0 || newLeft > 0 };
 }

@@ -95,12 +95,13 @@ class ArtifactTests(unittest.TestCase):
     def test_kind_is_derived_from_the_extension_and_other_files_are_refused_with_a_media_hint(self):
         for name, kind in [('a.html', 'web'), ('a.htm', 'web'), ('a.markdown', 'markdown'), ('a.mmd', 'mermaid'), ('a.mermaid', 'mermaid'),
                            ('a.svg', 'svg'), ('a.csv', 'table'), ('a.tsv', 'table'), ('a.png', 'image'), ('a.jpeg', 'image'),
-                           ('a.pdf', 'pdf'), ('a.py', 'code'), ('a.json', 'code')]:
+                           ('a.pdf', 'pdf'), ('a.py', 'code'), ('a.json', 'code'), ('a.docx', 'docx'), ('a.xlsx', 'xlsx'),
+                           ('a.pptx', 'pptx')]:
             self.write(name, 'content')
             self.assertEqual(self.publish(name)[0]['kind'], kind, name)
-        self.write('deck.pptx', 'zip')
+        self.write('archive.zip', 'zip')
         with self.assertRaises(artifacts_module.ArtifactError) as raised:
-            self.publish('deck.pptx')
+            self.publish('archive.zip')
         self.assertEqual((raised.exception.status_code, raised.exception.code), (415, 'artifact_unsupported_kind'))
         self.assertIn('MEDIA', raised.exception.detail)
 
@@ -200,26 +201,230 @@ class ArtifactTests(unittest.TestCase):
 
     # -- MEDIA ---------------------------------------------------------------------------------
 
-    def test_media_text_kinds_become_artifacts_and_documents_stay_attachments(self):
+    def test_media_viewable_kinds_become_artifacts_and_other_files_stay_attachments(self):
         for name in ('page.html', 'notes.md', 'chart.svg', 'flow.mmd', 'data.csv', 'old.htm', 'a.markdown', 'b.mermaid', 'c.tsv'):
             self.write(name, 'content ' + name)
-        self.write('doc.docx', 'office')
-        self.write('doc.pdf', '%PDF-1.4')
+        for name in ('doc.docx', 'sheet.xlsx', 'deck.pptx', 'doc.pdf'):
+            self.write(name, 'office ' + name)
         self.write('pic.png', 'png')
         self.write('script.py', 'print(1)')
         text = '\n'.join('MEDIA: /workspace/' + name for name in (
             'page.html', 'notes.md', 'chart.svg', 'flow.mmd', 'data.csv', 'old.htm', 'a.markdown', 'b.mermaid', 'c.tsv',
-            'doc.docx', 'doc.pdf', 'pic.png', 'script.py'))
+            'doc.docx', 'sheet.xlsx', 'deck.pptx', 'doc.pdf', 'pic.png', 'script.py'))
         import asyncio
         _, job, payload = self.running_job()
         delivered = asyncio.run(self.p.files.deliver(self.admin, self.info, payload['message_id'], text, job['id']))
-        self.assertEqual(sorted(item['filename'] for item in delivered), ['doc.docx', 'doc.pdf', 'pic.png', 'script.py'])
+        self.assertEqual(sorted(item['filename'] for item in delivered), ['pic.png', 'script.py'])
         listing = self.client.get('/api/artifacts?scope=private').json()['artifacts']
         self.assertEqual(sorted(item['path'] for item in listing), sorted('/workspace/' + name for name in (
-            'page.html', 'notes.md', 'chart.svg', 'flow.mmd', 'data.csv', 'old.htm', 'a.markdown', 'b.mermaid', 'c.tsv')))
+            'page.html', 'notes.md', 'chart.svg', 'flow.mmd', 'data.csv', 'old.htm', 'a.markdown', 'b.mermaid', 'c.tsv',
+            'doc.docx', 'sheet.xlsx', 'deck.pptx', 'doc.pdf')))
+        kinds = {item['path']: item['kind'] for item in listing}
+        self.assertEqual([kinds['/workspace/' + name] for name in ('doc.docx', 'sheet.xlsx', 'deck.pptx', 'doc.pdf')], ['docx', 'xlsx', 'pptx', 'pdf'])
         with self.p.db.connect() as conn:
             rows = conn.execute('SELECT message_id,job_id FROM artifact_versions').fetchall()
         self.assertEqual({(row[0], row[1]) for row in rows}, {(payload['message_id'], job['id'])})
+
+    # -- Office viewer and attachment view tokens -------------------------------------------------
+
+    def static_file(self, relative, content):
+        path = self.root / 'static' / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+
+    def upload(self, name, data, scope='private', client=None):
+        response = (client or self.client).post(f'/api/attachments?scope={scope}', files={'file': (name, data)})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()['attachment']
+
+    def mint(self, ident, client=None):
+        return (client or self.client).post(f'/api/attachments/{ident}/view')
+
+    def test_office_artifact_view_url_is_the_sandboxed_viewer_page_and_raw_gives_the_bytes(self):
+        from enterprise_agent_platform import file_viewer
+        for name, kind in (('r.docx', 'docx'), ('b.xlsx', 'xlsx'), ('d.pptx', 'pptx')):
+            data = b'PK\x03\x04 ' + name.encode() + ' 中文'.encode()
+            self.write(name, data)
+            view = self.publish(name)[0]
+            self.assertEqual(view['kind'], kind)
+            url = self.view_url(view['id'], 1)
+            page = self.anonymous.get(url)
+            self.assertEqual(page.status_code, 200)
+            self.assertTrue(page.headers['content-type'].startswith('text/html'))
+            self.assertEqual(page.headers['content-security-policy'], file_viewer.VIEWER_CSP)
+            self.assertNotIn('allow-same-origin', page.headers['content-security-policy'])
+            self.assertIn('/file-viewer/viewer.js', page.text)
+            self.assertIn(f'data-kind="{kind}"', page.text)
+            self.assertNotIn('artifact-runtime', page.text)
+            raw = self.anonymous.get(url + '?raw=1')
+            self.assertEqual((raw.status_code, raw.content), (200, data))
+            self.assertEqual(raw.headers['access-control-allow-origin'], '*')
+            self.assertEqual(raw.headers['content-security-policy'], VIEW_CSP)
+            # Downloads are unchanged: the plain file as an attachment.
+            download = self.client.get(f"/api/artifacts/{view['id']}/versions/1/download")
+            self.assertEqual((download.content, download.headers['content-disposition'].split(';')[0]), (data, 'attachment'))
+            self.assertEqual(self.anonymous.get(url.rsplit('/', 1)[0] + '/other.docx').status_code, 404)
+
+    def test_the_viewer_page_language_follows_the_lang_query_and_only_known_values(self):
+        self.write('x.docx', 'PK')
+        url = self.view_url(self.publish('x.docx')[0]['id'], 1)
+        for query, expected in (('?lang=zh-TW', 'zh-TW'), ('?lang=zh-CN', 'zh-CN'), ('?lang=en', 'en'), ('?lang="><x', 'en'), ('', 'en')):
+            self.assertIn(f'<html lang="{expected}"', self.anonymous.get(url + query).text, query)
+
+    def test_the_viewer_title_is_escaped_and_a_site_folder_keeps_its_plain_files(self):
+        self.write('x.docx', 'PK')
+        view = self.publish('x.docx', title='</title><script>alert(1)</script>')[0]
+        page = self.anonymous.get(self.view_url(view['id'], 1))
+        self.assertNotIn('<script>alert', page.text)
+        self.write('site/index.html', '<p>x</p>')
+        self.write('site/report.docx', 'PK')
+        site = self.publish('site')[0]
+        base = self.view_url(site['id'], 1).rsplit('/', 1)[0]
+        plain = self.anonymous.get(base + '/report.docx')
+        self.assertEqual((plain.status_code, plain.content, plain.headers['content-security-policy']), (200, b'PK', VIEW_CSP))
+
+    def test_viewer_assets_are_public_cors_readable_cacheable_and_contained(self):
+        self.static_file('file-viewer/viewer.js', 'import("./chunk-docx-ABCD1234.js")')
+        self.static_file('file-viewer/chunk-docx-ABCD1234.js', 'export const render = 1')
+        self.static_file('file-viewer/notes.txt', 'nope')
+        self.static_file('secret.js', 'outside')
+        entry = self.anonymous.get('/file-viewer/viewer.js')
+        chunk = self.anonymous.get('/file-viewer/chunk-docx-ABCD1234.js')
+        for response in (entry, chunk):
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.headers['content-type'].startswith('text/javascript'))
+            self.assertEqual(response.headers['access-control-allow-origin'], '*')
+            self.assertEqual(response.headers['cross-origin-resource-policy'], 'cross-origin')
+            self.assertEqual(response.headers['x-content-type-options'], 'nosniff')
+        self.assertEqual(entry.headers['cache-control'], 'no-cache')
+        self.assertIn('immutable', chunk.headers['cache-control'])
+        import gzip
+        (self.root / 'static' / 'file-viewer' / 'viewer.js.gz').write_bytes(gzip.compress(b'import("./chunk-docx-ABCD1234.js")'))
+        packed = self.anonymous.get('/file-viewer/viewer.js', headers={'accept-encoding': 'gzip'})
+        self.assertEqual((packed.headers['content-encoding'], packed.text), ('gzip', 'import("./chunk-docx-ABCD1234.js")'))
+        self.assertNotIn('content-encoding', self.anonymous.get('/file-viewer/viewer.js', headers={'accept-encoding': 'identity'}).headers)
+        for path in ('/file-viewer/notes.txt', '/file-viewer/missing.js', '/file-viewer/%2e%2e/secret.js', '/file-viewer/..%2fsecret.js', '/file-viewer/'):
+            self.assertEqual(self.anonymous.get(path).status_code, 404, path)
+
+    def test_attachment_view_kinds_and_the_bytes_each_serves(self):
+        office = b'PK\x03\x04 office ' + '中文'.encode()
+        cases = {'a.docx': 'docx', 'b.xlsx': 'xlsx', 'c.pptx': 'pptx', 'd.pdf': 'pdf', 'e.png': 'image', 'f.txt': 'text',
+                 'g.md': 'text', 'h.ts': 'text', 'i.zip': 'other'}
+        for name, kind in cases.items():
+            attachment = self.upload(name, office)
+            self.assertEqual(attachment['view_kind'], kind, name)
+            response = self.mint(attachment['id'])
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual((body['kind'], sorted(body)), (kind, ['expires_at', 'kind', 'url']), name)
+            self.assertRegex(body['url'], r'^/attachment-view/-?\d+\.\d+\.[A-Za-z0-9_-]+/')
+            served = self.anonymous.get(body['url'])
+            self.assertEqual(served.status_code, 200, name)
+            self.assertEqual(served.headers['x-content-type-options'], 'nosniff')
+            self.assertEqual(served.headers['referrer-policy'], 'no-referrer')
+            if kind in ('docx', 'xlsx', 'pptx'):
+                self.assertIn(f'data-kind="{kind}"', served.text)
+                raw = self.anonymous.get(body['url'] + '?raw=1')
+                self.assertEqual((raw.content, raw.headers['access-control-allow-origin']), (office, '*'))
+            elif kind == 'other':
+                self.assertEqual(served.headers['content-disposition'].split(';')[0], 'attachment')
+                self.assertEqual(served.headers['content-security-policy'], 'sandbox')
+            else:
+                self.assertEqual(served.headers['content-security-policy'], VIEW_CSP)
+                self.assertEqual(served.content, office.decode('utf-8', 'replace').encode() if kind == 'text' else office)
+        # HTML uploads are shown as text, never as a page.
+        html = self.upload('p.html', '<script>alert(1)</script>')
+        shown = self.anonymous.get(self.mint(html['id']).json()['url'])
+        self.assertTrue(shown.headers['content-type'].startswith('text/plain'))
+
+    def test_text_attachments_are_cut_at_two_mebibytes_on_a_character_boundary(self):
+        attachment = self.upload('big.txt', ('中' * 1_000_000).encode())
+        served = self.anonymous.get(self.mint(attachment['id']).json()['url'])
+        self.assertEqual(served.headers['content-type'], 'text/plain; charset=utf-8')
+        self.assertLessEqual(len(served.content), 2 * 1024 * 1024)
+        self.assertNotIn('\ufffd', served.text[:-1])
+
+    def test_attachment_view_mint_is_authorized_like_the_download(self):
+        mine = self.upload('mine.docx', b'PK')
+        self.assertEqual(self.mint(mine['id'], self.bob).status_code, 404)
+        self.assertEqual(self.mint(99999).status_code, 404)
+        self.assertEqual(self.mint(-99999).status_code, 404)
+        self.assertEqual(self.mint(mine['id'], self.anonymous).status_code, 401)
+        # A pending upload belongs to its uploader until a message binds it.
+        with self.p.db.connect() as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM pending_attachments').fetchone()[0], 1)
+        # Chat attachments use negative ids and the conversation's owner check.
+        cid, _ = self.chat()
+        chat = self.upload('c.docx', b'PK', scope='chat-' + cid)
+        self.assertLess(chat['id'], 0)
+        response = self.mint(chat['id'])
+        self.assertEqual((response.status_code, response.json()['kind']), (200, 'docx'))
+        self.assertEqual(self.anonymous.get(response.json()['url'] + '?raw=1').content, b'PK')
+        self.assertEqual(self.mint(chat['id'], self.bob).status_code, 404)
+
+    def test_attachment_view_tokens_expire_and_cannot_be_forged_or_reused_across_kinds(self):
+        attachment = self.upload('t.docx', b'PK')
+        url = self.mint(attachment['id']).json()['url']
+        token, name = url.split('/')[2:4]
+        ident, expires, signature = token.split('.')
+        self.assertEqual(self.anonymous.get(url).status_code, 200)
+        self.assertTrue(7190 <= int(expires) - time.time() <= 7201)
+        with patch('enterprise_agent_platform.files.time.time', return_value=time.time() + 7300):
+            self.assertEqual(self.anonymous.get(url).status_code, 404)
+        other = f'{int(ident) + 1}.{expires}.{signature}'
+        for bad in (other, f'{ident}.{int(expires) + 100}.{signature}', f'{ident}.{expires}.{signature[:-1]}' + ('B' if signature[-1] == 'A' else 'A'), 'x.y.z', f'{ident}.{expires}'):
+            self.assertEqual(self.anonymous.get(f'/attachment-view/{bad}/{name}').status_code, 404, bad)
+        # An artifact token is not an attachment token and vice versa.
+        self.write('r.docx', 'PK')
+        view = self.publish('r.docx')[0]
+        artifact_token = self.p.artifacts.mint(view['id'], 1)[0]
+        self.assertEqual(self.anonymous.get(f'/attachment-view/{artifact_token}/r.docx').status_code, 404)
+        self.assertEqual(self.anonymous.get(f'/artifact-view/{token}/{name}').status_code, 404)
+
+    def test_attachment_view_tokens_stop_with_their_chat_or_channel(self):
+        cid, _ = self.chat()
+        chat = self.upload('c.docx', b'PK', scope='chat-' + cid)
+        chat_url = self.mint(chat['id']).json()['url']
+        channel = self.client.post('/api/channels', json={'name': 'Team'}).json()['channel']
+        shared = self.upload('s.docx', b'PK', scope=f"channel-{channel['id']}")
+        channel_url = self.mint(shared['id']).json()['url']
+        for url in (chat_url, channel_url):
+            self.assertEqual(self.anonymous.get(url + '?raw=1').status_code, 200)
+        self.p.queue.runtime = AsyncMock(return_value={})
+        self.assertEqual(self.client.delete(f'/api/chat/conversations/{cid}').status_code, 200)
+        self.assertEqual(self.anonymous.get(chat_url + '?raw=1').status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/channels/{channel['id']}").status_code, 200)
+        self.assertEqual(self.anonymous.get(channel_url + '?raw=1').status_code, 404)
+
+    def test_attachment_view_tokens_are_bound_to_the_file_content(self):
+        attachment = self.upload('t.docx', b'PK one')
+        url = self.mint(attachment['id']).json()['url']
+        self.assertEqual(self.anonymous.get(url).status_code, 200)
+        with self.p.db.connect() as conn:
+            conn.execute('UPDATE pending_attachments SET sha256=? WHERE id=?', ('0' * 64, attachment['id']))
+        self.assertEqual(self.anonymous.get(url).status_code, 404)
+
+    def test_only_the_office_bytes_are_cors_readable_among_attachment_views(self):
+        for name, data in (('a.txt', b'x'), ('b.pdf', b'%PDF'), ('c.zip', b'PK'), ('d.docx', b'PK')):
+            url = self.mint(self.upload(name, data)['id']).json()['url']
+            served = self.anonymous.get(url)
+            self.assertNotIn('access-control-allow-origin', served.headers, name)
+            self.assertNotIn('cross-origin-resource-policy', served.headers, name)
+        self.assertEqual(self.anonymous.get(url + '?raw=1').headers['access-control-allow-origin'], '*')
+
+    def test_the_old_document_text_previews_are_gone_and_only_images_have_a_thumbnail(self):
+        docx = self.upload('a.docx', b'PK')
+        text = self.upload('a.txt', b'hello')
+        self.assertEqual((docx['preview_url'], text['preview_url']), (None, None))
+        self.assertEqual(self.client.get(f"/api/attachments/{docx['id']}/preview").status_code, 415)
+        self.assertEqual(self.client.get(f"/api/attachments/{text['id']}/preview").status_code, 415)
+        buffer = io.BytesIO()
+        from PIL import Image
+        Image.new('RGB', (4, 4)).save(buffer, 'PNG')
+        image = self.upload('a.png', buffer.getvalue())
+        self.assertEqual(image['preview_url'], f"/api/attachments/{image['id']}/preview")
+        self.assertEqual(self.client.get(image['preview_url']).headers['content-type'], 'image/png')
+        self.assertEqual(self.client.get(docx['url']).content, b'PK')
 
     # -- SSE, gateway and message link ---------------------------------------------------------
 
@@ -279,8 +484,8 @@ class ArtifactTests(unittest.TestCase):
         bad = asyncio.run(self.p.browser.gateway('artifacts', 'publish', {'path': '/workspace/deck.pptx'}, self.context(info)))
         self.assertTrue(bad['is_error'])
         self.assertEqual(bad['data']['error'], 'artifact_path_not_found')
-        self.write('deck.pptx', 'zip')
-        bad = asyncio.run(self.p.browser.gateway('artifacts', 'publish', {'path': '/workspace/deck.pptx'}, self.context(info)))
+        self.write('archive.zip', 'zip')
+        bad = asyncio.run(self.p.browser.gateway('artifacts', 'publish', {'path': '/workspace/archive.zip'}, self.context(info)))
         self.assertEqual(bad['data']['error'], 'artifact_unsupported_kind')
         self.assertIn('MEDIA', bad['content'])
         # Chat and channel root runs publish into their own scopes.
@@ -306,10 +511,10 @@ class ArtifactTests(unittest.TestCase):
         import asyncio
         self.write('a.md', '# A')
         self.write('b.html', '<p>b</p>')
-        self.write('doc.docx', 'office')
+        self.write('pack.zip', 'zip')
         info, job, payload = self.running_job()
         asyncio.run(self.p.browser.gateway('artifacts', 'publish', {'path': '/workspace/a.md', 'title': 'Alpha'}, self.context(info)))
-        text = 'Done.\nMEDIA: /workspace/b.html\nMEDIA: /workspace/doc.docx'
+        text = 'Done.\nMEDIA: /workspace/b.html\nMEDIA: /workspace/pack.zip'
         asyncio.run(self.p.queue.finish(job, payload, self.admin, info, {'type': 'run_end', 'status': 'completed', 'text': text, 'usage': {}}))
         page = self.p.queue.messages(self.admin, 'private')['messages']
         reply = next(message for message in page if message['role'] == 'assistant')
@@ -317,7 +522,7 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(reply['metadata']['artifacts'], [
             {'id': listing['/workspace/a.md']['id'], 'version': 1, 'title': 'Alpha', 'kind': 'markdown', 'path': '/workspace/a.md'},
             {'id': listing['/workspace/b.html']['id'], 'version': 1, 'title': 'b', 'kind': 'web', 'path': '/workspace/b.html'}])
-        self.assertEqual([item['filename'] for item in reply['attachments']], ['doc.docx'])
+        self.assertEqual([item['filename'] for item in reply['attachments']], ['pack.zip'])
         self.assertEqual(reply['metadata']['status'], 'completed')
         for item in listing.values():
             detail = self.client.get(f"/api/artifacts/{item['id']}").json()
@@ -625,7 +830,8 @@ class ArtifactTests(unittest.TestCase):
             self.assertIn('Mermaid', prompt)
             self.assertIn('same path', prompt)
             self.assertIn('do not create v2/v3 copies', prompt)
-            self.assertIn(f'MEDIA: {cwd}/path line only for downloadable files such as DOCX, XLSX, PPTX and PDF', prompt, scope)
+            self.assertIn(f'MEDIA: {cwd}/path', prompt, scope)
+            self.assertIn('DOCX, XLSX, PPTX', prompt, scope)
 
     def test_the_run_request_offers_the_artifact_tool_to_root_runs(self):
         from enterprise_agent_platform.queue import BUILTINS

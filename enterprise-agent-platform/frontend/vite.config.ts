@@ -46,7 +46,10 @@ export default defineConfig({
       // (platform-api.md § Artifacts).
       "/artifact-view": "http://127.0.0.1:8765",
       "/artifact-live": { target: "http://127.0.0.1:8765", ws: true },
-      "/artifact-runtime.js": "http://127.0.0.1:8765"
+      "/artifact-runtime.js": "http://127.0.0.1:8765",
+      // Attachment view tokens and the sandboxed Office viewer bundle (platform-api.md § Office viewer).
+      "/attachment-view": "http://127.0.0.1:8765",
+      "/file-viewer": "http://127.0.0.1:8765"
     }
   }
 });

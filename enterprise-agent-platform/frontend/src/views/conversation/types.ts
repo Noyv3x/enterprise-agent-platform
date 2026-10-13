@@ -1,6 +1,8 @@
-import type { ArtifactRef } from "../../api";
+import type { ArtifactRef, AttachmentViewKind } from "../../api";
 import type { WorkItem } from "./work";
 
+/** A message attachment or delivered file (platform-api.md § Files): `preview_url` is an image's PNG thumbnail (null
+ * for other files); `view_kind` says how the side panel shows it (`other`: download only). */
 export interface Attachment {
   id: number;
   filename: string;
@@ -8,6 +10,7 @@ export interface Attachment {
   size_bytes: number;
   url: string;
   preview_url: string | null;
+  view_kind: AttachmentViewKind;
 }
 
 export type MessageStatus = "queued" | "running" | "completed" | "interrupted" | "cancelled";
@@ -68,8 +71,11 @@ export interface ToolCall {
   truncated: boolean;
   /** tool_output events arrived, so tool_update partials no longer replace the output */
   streamed: boolean;
-  /** unified diff of an edit's result (tool_end details) */
-  diff: string;
+  /** an edit's or write's result as a standard unified patch (`tool_end.details.patch`, or the persisted work trace's
+   * bounded `patch`); empty when there is none */
+  patch: string;
+  /** Platform kept only the first part of the patch */
+  patchCut: boolean;
 }
 
 /** The agent turn currently streaming over SSE, in arrival order; it becomes a persisted message at `run_end`. */

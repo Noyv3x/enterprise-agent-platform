@@ -10,6 +10,15 @@ Copyright (c) 2025 Nous Research
 Its own package license and installed version remain authoritative for that
 dependency.
 
+## What was changed
+
+- Rewritten around a clear metrics-only scope. `scripts/repo_metrics.py` is
+  new code written for this platform (standard library only); it replaces the
+  original `pygount` workflow and is not derived from pygount. pygount is
+  mentioned only as an optional external tool and is not bundled.
+- Removed the workspace `.venv` installation; the skill no longer modifies the
+  inspected project or its environment.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

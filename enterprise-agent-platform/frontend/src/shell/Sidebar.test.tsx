@@ -1,12 +1,12 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { User } from "../api";
 import { ThemeProvider } from "../context/ThemeContext";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../i18n";
-import { resetChatStore } from "../views/chat/chatStore";
+import { refreshChats, resetChatStore } from "../views/chat/chatStore";
 import { accessFor, allowed, landingRoute, parseRoute, type Route } from "./routes";
 import { Sidebar } from "./Sidebar";
 
@@ -29,7 +29,7 @@ function serve() {
   });
 }
 
-function renderSidebar(user: User, permissions: string[], route: Route = { view: "private" }, onClose?: () => void) {
+function renderSidebar(user: User, permissions: string[], route: Route = { view: "chat", id: null }, onClose?: () => void, collapsed = false) {
   const navigate = vi.fn();
   render(
     <I18nProvider>
@@ -41,7 +41,7 @@ function renderSidebar(user: User, permissions: string[], route: Route = { view:
           route={route}
           navigate={navigate}
           onSignOut={vi.fn()}
-          collapsed={false}
+          collapsed={collapsed}
           onCollapsedChange={vi.fn()}
           drawer={!!onClose}
           onClose={onClose}
@@ -68,7 +68,7 @@ describe("Sidebar", () => {
     await screen.findByRole("button", { name: "Budget review" });
     for (const [name, route] of [
       ["Budget review", "chat-c1"],
-      ["Chat", "chat-c1"],
+      ["Plain chat", "chat-c1"],
       ["New chat", "chat"],
       ["Product", "channel-4"],
       ["Personal AI", "private"],
@@ -85,12 +85,83 @@ describe("Sidebar", () => {
   });
 
   it("shows only the areas a member's permissions open", async () => {
-    renderSidebar(member, ["private_agent"]);
+    renderSidebar(member, ["private_agent"], { view: "private" });
     const nav = screen.getByRole("complementary", { name: "Workspace navigation" });
     expect(within(nav).getByRole("button", { name: "Personal AI" })).toBeVisible();
-    for (const hidden of ["Chat", "Channels", "Admin", "New chat"]) expect(within(nav).queryByRole("button", { name: hidden })).not.toBeInTheDocument();
+    for (const hidden of ["Plain chat", "Channels", "Admin", "New chat"]) expect(within(nav).queryByRole("button", { name: hidden })).not.toBeInTheDocument();
     expect(within(nav).getByRole("button", { name: "Settings" })).toBeVisible();
     expect(api.request).not.toHaveBeenCalled();
+  });
+
+  it("names the primary areas 个人 AI, 纯聊天模式, 频道 in that order, in every locale", async () => {
+    const names = {
+      en: ["Personal AI", "Plain chat", "Channels", "New chat"],
+      "zh-CN": ["个人 AI", "纯聊天模式", "频道", "新聊天"],
+      "zh-TW": ["個人 AI", "純聊天模式", "頻道", "新聊天"],
+    };
+    for (const [locale, [personal, chat, channels, newChat]] of Object.entries(names)) {
+      window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+      renderSidebar(admin, []);
+      const nav = screen.getByRole("complementary");
+      const order = [personal, chat, channels, newChat].map((name) => within(nav).getAllByRole("button", { name })[0]);
+      // New chat belongs to the open chat area: it follows the primary items instead of leading them.
+      for (let index = 1; index < order.length; index++) {
+        expect(order[index - 1].compareDocumentPosition(order[index]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+      expect(within(nav).getByRole("button", { name: chat })).toHaveAttribute("aria-current", "page");
+      cleanup();
+    }
+  });
+
+  it("shows New chat, the chat list and chat search only inside Plain chat, also on the rail and in the drawer", async () => {
+    const user = userEvent.setup();
+    const chatControls = ["New chat", "Search chats", "Chats", "Budget review", "Release notes"];
+    const outside: Route[] = [{ view: "private" }, { view: "channels" }, { view: "channel", id: 4 }, { view: "settings" }, { view: "admin" }];
+    for (const variant of ["sidebar", "rail", "drawer"] as const) {
+      for (const route of outside) {
+        const navigate = renderSidebar(admin, [], route, variant === "drawer" ? vi.fn() : undefined, variant === "rail");
+        // The chat list still loads, so Plain chat can open the latest chat from any area.
+        await act(() => refreshChats());
+        const nav = screen.getByRole("complementary");
+        for (const name of chatControls) expect(within(nav).queryByRole("button", { name })).not.toBeInTheDocument();
+        await user.click(within(nav).getByRole("button", { name: "Plain chat" }));
+        expect(navigate).toHaveBeenLastCalledWith("chat-c1");
+        cleanup();
+      }
+      renderSidebar(admin, [], { view: "chat", id: "c1" }, variant === "drawer" ? vi.fn() : undefined, variant === "rail");
+      await act(() => refreshChats());
+      const nav = screen.getByRole("complementary");
+      // On the rail the list is inert and the rail's own search button stands in for it.
+      expect(within(nav).getAllByRole("button", { name: "Search chats" })[0]).toBeVisible();
+      expect(within(nav).getByRole("button", { name: "New chat" })).toBeVisible();
+      expect(within(nav).getByRole("button", { name: "Budget review" })).toHaveAttribute("aria-current", "page");
+      cleanup();
+    }
+  });
+
+  it("opens a blank chat from Plain chat when there is no chat yet", async () => {
+    const user = userEvent.setup();
+    api.request.mockImplementation(async () => ({ conversations: [] }));
+    const navigate = renderSidebar(admin, [], { view: "private" });
+    await act(() => refreshChats());
+    await user.click(screen.getByRole("button", { name: "Plain chat" }));
+    expect(navigate).toHaveBeenLastCalledWith("chat");
+  });
+
+  it("re-reads the chat list when Plain chat opens, so titles generated meanwhile show", async () => {
+    let reads = 0;
+    api.request.mockImplementation(async () => ({ conversations: [{ ...chats[0], title: ++reads === 1 ? "New chat" : "Budget review" }] }));
+    const props = {
+      user: admin, channels: [], access: accessFor(admin.role, []), navigate: vi.fn(), onSignOut: vi.fn(),
+      collapsed: false, onCollapsedChange: vi.fn(),
+    };
+    const tree = (route: Route) => (
+      <I18nProvider><ThemeProvider><Sidebar {...props} route={route} /></ThemeProvider></I18nProvider>
+    );
+    const { rerender } = render(tree({ view: "private" }));
+    await act(() => refreshChats());
+    rerender(tree({ view: "chat", id: "c1" }));
+    expect(await screen.findByRole("button", { name: "Budget review" })).toHaveAttribute("aria-current", "page");
   });
 
   it("lists open channels and chats for an administrator, and searches chats", async () => {

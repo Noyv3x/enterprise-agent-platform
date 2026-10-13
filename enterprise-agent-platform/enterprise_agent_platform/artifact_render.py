@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 GLOBAL_RENDERS = 2
 QUEUE_SECONDS = 30
 SETTLE_SECONDS = 8
+VIEWER_SETTLE_SECONDS = 20
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_PIXELS = 100_000_000
 MAX_CLIP_WIDTH = 4096
@@ -37,7 +38,8 @@ Image.MAX_IMAGE_PIXELS = MAX_PIXELS
 # The trusted expressions run in the artifact's own (opaque-origin, page-controlled) realm, so they are synchronous and return plain
 # arrays: no Promise, timers, iframes or JSON, nothing a page can stall or that needs another realm. Waiting happens on the Platform
 # side by polling, and every result is parsed defensively because a hostile page may return anything.
-STATE = "[document.readyState, document.fonts ? document.fonts.status : 'loaded']"
+STATE = ("[document.readyState, document.fonts ? document.fonts.status : 'loaded', "
+         "document.documentElement ? document.documentElement.getAttribute('data-eap-viewer') : null]")
 PAGE_INFO = ("[location.href, Math.max(document.documentElement ? document.documentElement.scrollWidth : 0, document.body ? document.body.scrollWidth : 0),"
              "Math.max(document.documentElement ? document.documentElement.scrollHeight : 0, document.body ? document.body.scrollHeight : 0),"
              "Array.isArray(window.__eapLog) ? window.__eapLog.slice(0, 50) : []]")
@@ -138,14 +140,19 @@ class Renderer:
         return result if isinstance(result, list) else []
 
     async def settle(self, base, identity):
-        """Wait, at most SETTLE_SECONDS, for the document to be complete with fonts loaded, then pause briefly. An evaluate that
-        fails or times out ends the wait: settling only affects timing, never what may be screenshotted."""
+        """Wait, at most SETTLE_SECONDS, for the document to be complete with fonts loaded, then pause briefly; an Office viewer page
+        (`data-eap-viewer="loading"`) may take up to VIEWER_SETTLE_SECONDS to draw its file. An evaluate that fails or times out
+        ends the wait: settling only affects timing, never what may be screenshotted."""
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + SETTLE_SECONDS
+        started = loop.time()
+        deadline = started + SETTLE_SECONDS
         try:
             while loop.time() < deadline:
                 state = await self.evaluate(base, identity, STATE, min(EVALUATE_SECONDS, max(0.1, deadline - loop.time())))
-                if state[:2] == ['complete', 'loaded']:
+                viewing = len(state) > 2 and state[2] == 'loading'
+                if viewing:
+                    deadline = max(deadline, started + VIEWER_SETTLE_SECONDS)
+                if state[:2] == ['complete', 'loaded'] and not viewing:
                     break
                 await asyncio.sleep(SETTLE_POLL)
         except ArtifactError as exc:

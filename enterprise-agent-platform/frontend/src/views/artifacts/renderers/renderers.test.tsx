@@ -110,6 +110,16 @@ describe("ArtifactPreview", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Loading…");
     rerender(<I18nProvider><ArtifactPreview artifact={view} version={1} entry="brief.pdf" viewUrl="/artifact-view/tok/brief.pdf" loadSource={loadSource} /></I18nProvider>);
     expect(screen.getByTitle("My pdf")).toHaveAttribute("src", "/artifact-view/tok/brief.pdf");
+    // The browser's PDF viewer needs the route's CSP sandbox, not an attribute.
+    expect(screen.getByTitle("My pdf")).not.toHaveAttribute("sandbox");
+  });
+
+  it.each([["docx", "plan.docx"], ["xlsx", "budget.xlsx"], ["pptx", "deck.pptx"]] as const)("frames a %s artifact in the Office viewer with scripts only", (kind, entry) => {
+    const loadSource = preview(kind, entry, "", `/artifact-view/tok/${entry}`);
+    const frame = screen.getByTitle(`My ${kind}`);
+    expect(frame).toHaveAttribute("src", `/artifact-view/tok/${entry}?lang=en`);
+    expect(frame).toHaveAttribute("sandbox", "allow-scripts");
+    expect(loadSource).not.toHaveBeenCalled();
   });
 
   it("offers a retry when the source fails to load", async () => {

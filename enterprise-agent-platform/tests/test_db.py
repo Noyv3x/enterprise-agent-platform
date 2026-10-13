@@ -93,8 +93,8 @@ class DatabaseTests(unittest.TestCase):
             self.assertNotIn(dead, tables)
         self.assertEqual(counts, {'users': 1, 'messages': 1, 'agent_schedules': 1})
         self.assertEqual(kinds, ['agent'])
-        self.assertEqual(settings, {'keep', 'model_policies_v1'})
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(settings, {'keep', 'model_policies_v2'})
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100101').fetchone()[0]
@@ -107,10 +107,10 @@ class DatabaseTests(unittest.TestCase):
         old = self.old_database()
         old.migrate(old.path.parent)
         self.assertEqual(self.shape(self.db), self.shape(old))
-        self.assertEqual(self.db.schema_version(), 2026102001)
+        self.assertEqual(self.db.schema_version(), 2026102101)
         with self.db.connect() as conn:
             self.assertEqual([row[0] for row in conn.execute('SELECT version FROM schema_migrations ORDER BY version')],
-                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401, 2026101501, 2026102001])
+                             [2026082901, 2026100101, 2026100201, 2026101101, 2026101201, 2026101301, 2026101401, 2026101501, 2026102001, 2026102101])
 
     def test_background_tasks_migration_is_additive_idempotent_and_constrained(self):
         import sqlite3
@@ -122,7 +122,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101101')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101101').fetchone()[0]
@@ -152,8 +152,8 @@ class DatabaseTests(unittest.TestCase):
         db = Database(path)
         db.migrate(path.parent)
         with db.connect() as conn:
-            conn.execute('DELETE FROM schema_migrations WHERE version IN (2026100201, 2026101201)')
-            conn.execute("DELETE FROM settings WHERE key='model_policies_v1'")
+            conn.execute('DELETE FROM schema_migrations WHERE version IN (2026100201, 2026101201, 2026102101)')
+            conn.execute("DELETE FROM settings WHERE key IN ('model_policies_v1','model_policies_v2')")
             conn.execute('ALTER TABLE users DROP COLUMN model_policy')
             conn.execute("ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'")
@@ -164,7 +164,7 @@ class DatabaseTests(unittest.TestCase):
                 conn.execute("INSERT INTO users(id,username,display_name,password_hash,created_at) VALUES(?,?,?,?,1)", (uid, name, name, 'hash'))
             conn.execute("INSERT INTO chat_model_policies VALUES(1,'[\"a\",\"b\"]','b','now')")
             conn.execute("INSERT INTO chat_model_policies VALUES(2,'[]','','now')")
-            conn.execute("INSERT INTO chat_conversations VALUES('c',1,'title','now','now',NULL,'a')")
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at,deleted_at,model_id) VALUES('c',1,'title','now','now',NULL,'a')")
             conn.execute("INSERT INTO chat_messages(conversation_id,role,content,created_at) VALUES('c','user','hi','now')")
         return db
 
@@ -177,8 +177,8 @@ class DatabaseTests(unittest.TestCase):
             counts = [conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'chat_conversations', 'chat_messages')]
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026100201').fetchone()[0]
         slots, users = self.default_group(db)
-        # The first account's explicit chat default survives into the chat and scout slots.
-        self.assertEqual({slot: slots[slot][0] for slot in slots}, {'personal': '', 'channel': '', 'worker': '', 'chat': 'b', 'scout': 'b'})
+        # The first account's model survives as main; the old chat slot no longer exists.
+        self.assertEqual(slots, {'main': ('', 'medium'), 'judge': ('', 'low')})
         self.assertEqual(users, {1: 'default', 2: 'default', 3: 'default'})
         self.assertNotIn('model_id', conversation)
         self.assertNotIn('chat_model_policies', tables)
@@ -200,8 +200,8 @@ class DatabaseTests(unittest.TestCase):
         db = Database(path)
         db.migrate(path.parent)
         with db.connect() as conn:
-            conn.execute("DELETE FROM settings WHERE key='model_policies_v1'")
-            conn.execute('DELETE FROM schema_migrations WHERE version=2026101201')
+            conn.execute("DELETE FROM settings WHERE key IN ('model_policies_v1','model_policies_v2')")
+            conn.execute('DELETE FROM schema_migrations WHERE version IN (2026101201, 2026102101)')
             conn.execute('ALTER TABLE users DROP COLUMN model_policy')
             conn.execute("ALTER TABLE users ADD COLUMN model_name TEXT NOT NULL DEFAULT ''")
             conn.execute("ALTER TABLE users ADD COLUMN thinking_depth TEXT NOT NULL DEFAULT 'medium'")
@@ -213,13 +213,13 @@ class DatabaseTests(unittest.TestCase):
 
     def default_group(self, db):
         with db.connect() as conn:
-            policies = json.loads(conn.execute("SELECT value FROM settings WHERE key='model_policies_v1'").fetchone()[0])
+            policies = json.loads(conn.execute("SELECT value FROM settings WHERE key='model_policies_v2'").fetchone()[0])
             users = {row['id']: row['model_policy'] for row in conn.execute('SELECT id, model_policy FROM users')}
             columns = {row[1] for row in conn.execute('PRAGMA table_info(users)')}
         self.assertEqual([(policy['name'], policy['label']) for policy in policies], [('default', '默认')])
-        self.assertEqual(set(policies[0]['slots']), {'personal', 'channel', 'chat', 'scout', 'worker'})
+        self.assertEqual(set(policies[0]), {'name', 'label', 'main', 'judge'})
         self.assertTrue({'model_name', 'chat_model_name', 'thinking_depth'}.isdisjoint(columns))
-        return {slot: (value['model'], value['thinking']) for slot, value in policies[0]['slots'].items()}, users
+        return {part: (policies[0][part]['model'], policies[0][part]['thinking']) for part in ('main', 'judge')}, users
 
     def test_policy_group_migration_seeds_from_the_lowest_active_administrator(self):
         db = self.legacy_users_database('seed', [
@@ -227,39 +227,37 @@ class DatabaseTests(unittest.TestCase):
             (3, 'admin', 1, 'admin-model', 'admin-chat', 'none'), (4, 'admin', 1, 'later-admin', '', 'xhigh')])
         db.migrate(db.path.parent)
         slots, users = self.default_group(db)
-        self.assertEqual(slots, {'personal': ('admin-model', 'off'), 'channel': ('admin-model', 'off'), 'worker': ('admin-model', 'off'),
-                                 'chat': ('admin-chat', 'off'), 'scout': ('admin-chat', 'off')})
+        self.assertEqual(slots, {'main': ('admin-model', 'off'), 'judge': ('', 'low')})
         self.assertEqual(users, {1: 'default', 2: 'default', 3: 'default', 4: 'default'})
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101201').fetchone()[0]
-            conn.execute("UPDATE settings SET value=replace(value,'admin-model','edited') WHERE key='model_policies_v1'")
+            conn.execute("UPDATE settings SET value=replace(value,'admin-model','edited') WHERE key='model_policies_v2'")
         db.migrate(db.path.parent)
         self.assertEqual(self.shape(db), before)
         with db.connect() as conn:
             self.assertEqual(conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101201').fetchone()[0], applied)
-        self.assertEqual(self.default_group(db)[0]['personal'], ('edited', 'off'))
+        self.assertEqual(self.default_group(db)[0]['main'], ('edited', 'off'))
 
-    def test_policy_group_migration_chat_slots_follow_the_personal_model_when_unset(self):
-        db = self.legacy_users_database('chat', [(1, 'admin', 1, 'personal', '', 'minimal')])
+    def test_policy_group_migration_judge_defaults_to_the_main_model_at_low_depth(self):
+        db = self.legacy_users_database('chat', [(1, 'admin', 1, 'personal', 'chat-model', 'minimal')])
         db.migrate(db.path.parent)
         slots, _ = self.default_group(db)
-        self.assertEqual(set(slots.values()), {('personal', 'minimal')})
+        self.assertEqual(slots, {'main': ('personal', 'minimal'), 'judge': ('', 'low')})
 
     def test_policy_group_migration_without_an_active_administrator_uses_the_lowest_account(self):
         db = self.legacy_users_database('lowest', [(5, 'user', 1, 'five', '', 'high'), (2, 'user', 0, 'two', 'two-chat', 'low'),
                                                    (9, 'admin', 0, 'nine', '', 'xhigh')])
         db.migrate(db.path.parent)
         slots, users = self.default_group(db)
-        self.assertEqual(slots, {'personal': ('two', 'low'), 'channel': ('two', 'low'), 'worker': ('two', 'low'),
-                                 'chat': ('two-chat', 'low'), 'scout': ('two-chat', 'low')})
+        self.assertEqual(slots, {'main': ('two', 'low'), 'judge': ('', 'low')})
         self.assertEqual(users, {2: 'default', 5: 'default', 9: 'default'})
 
     def test_policy_group_migration_without_accounts_and_fresh_install_use_system_defaults(self):
         db = self.legacy_users_database('empty', [])
         db.migrate(db.path.parent)
-        expected = {slot: ('', 'medium') for slot in ('personal', 'channel', 'chat', 'scout', 'worker')}
+        expected = {'main': ('', 'medium'), 'judge': ('', 'low')}
         self.assertEqual(self.default_group(db)[0], expected)
         self.assertEqual(self.default_group(self.db)[0], expected)
         with self.db.connect() as conn:
@@ -291,7 +289,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(after['agent-only'], ['private_agent', 'read_workspace', 'install_extensions'])
         self.assertEqual(after['viewer'], ['read_workspace'])
         self.assertEqual(after['done'], ['chat', 'install_extensions'])
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             applied = conn.execute('SELECT applied_at FROM schema_migrations WHERE version=2026101301').fetchone()[0]
@@ -317,7 +315,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026101401')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'messages', 'durable_jobs', 'settings')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)
@@ -350,7 +348,7 @@ class DatabaseTests(unittest.TestCase):
             conn.execute('DELETE FROM schema_migrations WHERE version=2026102001')
             counts = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in ('users', 'artifacts', 'background_tasks')}
         db.migrate(db.path.parent)
-        self.assertEqual(db.schema_version(), 2026102001)
+        self.assertEqual(db.schema_version(), 2026102101)
         before = self.shape(db)
         with db.connect() as conn:
             self.assertEqual({name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in counts}, counts)
@@ -426,11 +424,38 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual({name: 'install_extensions' in perms for name, perms in DEFAULT_GROUPS.items()},
                          {'admin': True, 'manager': True, 'member': True, 'viewer': False})
 
+    def test_model_policy_main_judge_migration_converts_a_real_v1_row_and_marks_placeholder_titles(self):
+        db = self.legacy_users_database('v2', [(1, 'admin', 1, 'gpt-6.1-sol', 'chat-model', 'high')])
+        with db.connect() as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE version=2026102101")
+            conn.execute("DELETE FROM settings WHERE key IN ('model_policies_v1','model_policies_v2')")
+            conn.execute("ALTER TABLE chat_conversations DROP COLUMN title_state")
+            v1 = [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': model, 'thinking': thinking} for slot, model, thinking in (
+                ('personal', 'gpt-6.1-sol', 'high'), ('channel', 'c1', 'low'), ('chat', 'c2', 'off'), ('scout', 's', 'minimal'), ('worker', 'w', 'xhigh'))}},
+                  {'name': 'lite', 'label': '轻量', 'slots': {slot: {'model': '', 'thinking': 'low'} for slot in ('personal', 'channel', 'chat', 'scout', 'worker')}}]
+            conn.execute("INSERT INTO settings(key,value,secret,updated_at) VALUES('model_policies_v1',?,0,1)", (json.dumps(v1, ensure_ascii=False),))
+            for cid, title in (('a', 'New chat'), ('b', '新聊天'), ('c', '季度复盘'), ('d', 'new chat')):
+                conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES(?,1,?,'now','now')", (cid, title))
+        db.migrate(db.path.parent)
+        with db.connect() as conn:
+            policies = json.loads(conn.execute("SELECT value FROM settings WHERE key='model_policies_v2'").fetchone()[0])
+            self.assertIsNone(conn.execute("SELECT 1 FROM settings WHERE key='model_policies_v1'").fetchone())
+            states = {row['id']: row['title_state'] for row in conn.execute('SELECT id,title_state FROM chat_conversations')}
+        self.assertEqual(policies, [
+            {'name': 'default', 'label': '默认', 'main': {'model': 'gpt-6.1-sol', 'thinking': 'high'}, 'judge': {'model': '', 'thinking': 'low'}},
+            {'name': 'lite', 'label': '轻量', 'main': {'model': '', 'thinking': 'low'}, 'judge': {'model': '', 'thinking': 'low'}}])
+        self.assertEqual(states, {'a': 'placeholder', 'b': 'placeholder', 'c': 'user', 'd': 'user'})
+        before = self.shape(db)
+        with db.connect() as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE version=2026102101")
+        db.migrate(db.path.parent)  # a forced re-run neither duplicates the column nor reclassifies titles
+        self.assertEqual(self.shape(db), before)
+
     def test_foreign_keys_and_rollback(self):
         import sqlite3
         with self.assertRaises(sqlite3.IntegrityError):
             with self.db.connect() as conn:
-                conn.execute("INSERT INTO chat_conversations VALUES('c',999,'title','now','now',NULL)")
+                conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES('c',999,'title','now','now')")
         with self.assertRaises(RuntimeError):
             with self.db.connect() as conn:
                 conn.execute("INSERT INTO settings VALUES('not-committed','v',0,1)")

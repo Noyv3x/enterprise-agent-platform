@@ -1,5 +1,6 @@
-/* The app's sidebar: upstream SidebarNav fed with the session — permission-gated nav, the channel list, the chat
- * list from chatStore (search, rename, delete), Admin/Settings and the account menu (theme, language, sign out). */
+/* The app's sidebar: upstream SidebarNav fed with the session — permission-gated nav (个人 AI, 纯聊天模式, 频道), the
+ * channel list, Admin/Settings and the account menu (theme, language, sign out). Only while 纯聊天模式 is open does it
+ * add that area's controls: New chat, the chat list from chatStore (search, rename, delete) and the rail search. */
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { User } from "../api";
@@ -12,7 +13,7 @@ import { useBranding } from "../context/BrandingContext";
 import { useTheme } from "../hooks/useTheme";
 import { SUPPORTED_LOCALES, useI18n } from "../i18n";
 import type { Channel } from "../views/Channels";
-import { deleteChat, updateChat, useChats } from "../views/chat/chatStore";
+import { deleteChat, revalidateChats, updateChat, useChats } from "../views/chat/chatStore";
 import { useWords } from "../words";
 import { BrandMark } from "./BrandMark";
 import { LOCALE_NAMES } from "./preferences";
@@ -50,6 +51,12 @@ export function Sidebar({
   const untitled = w("New chat", "新聊天", "新聊天");
   const chatRows: SidebarRecent[] = (chats.conversations ?? []).map((chat) => ({ id: chat.id, label: chat.title.trim() || untitled }));
   const activeChat = route.view === "chat" ? route.id : null;
+  // New chat, the chat list and its search belong to the 纯聊天模式 area, not the whole app.
+  const chatArea = access.chat && route.view === "chat";
+  // The list shows again: pick up titles generated while no chat stream was open.
+  useEffect(() => {
+    if (chatArea) revalidateChats();
+  }, [chatArea]);
   // After a delete removes the row (and the menu trigger that opened the dialog), focus moves to the next chat row,
   // else the previous one, else New chat, instead of falling back to <body>. "" means New chat.
   const [focusAfterDelete, setFocusAfterDelete] = useState<string | null>(null);
@@ -66,7 +73,7 @@ export function Sidebar({
 
   const nav: SidebarNavItem[] = [
     ...(access.private ? [{ key: "private", label: w("Personal AI", "个人 AI", "個人 AI"), icon: <Icon name="sparkle" /> }] : []),
-    ...(access.chat ? [{ key: "chat", label: w("Chat", "聊天", "聊天"), icon: <Icon name="chat" /> }] : []),
+    ...(access.chat ? [{ key: "chat", label: w("Plain chat", "纯聊天模式", "純聊天模式"), icon: <Icon name="chat" /> }] : []),
     ...(access.channels ? [{ key: "channels", label: w("Channels", "频道", "頻道"), icon: <Icon name="hash" /> }] : []),
   ];
   const footerNav: SidebarNavItem[] = [
@@ -75,17 +82,7 @@ export function Sidebar({
   ];
 
   const sections: SidebarSection[] = [];
-  const openChannels = channels.filter((channel) => !channel.archived);
-  if (access.channels && openChannels.length > 0) {
-    sections.push({
-      key: "channels",
-      label: w("Channels", "频道", "頻道"),
-      items: openChannels.map((channel) => ({ id: String(channel.id), label: channel.name })),
-      activeId: route.view === "channel" ? String(route.id) : null,
-      onPick: (id) => selectRoute(`channel-${id}`),
-    });
-  }
-  if (access.chat) {
+  if (chatArea) {
     sections.push({
       key: "chats",
       label: w("Chats", "聊天记录", "聊天紀錄"),
@@ -103,9 +100,19 @@ export function Sidebar({
       rowActions: (chat) => <ChatRowMenu chat={chat} onRename={() => setDialog({ kind: "rename", chat })} onDelete={() => setDialog({ kind: "delete", chat })} />,
     });
   }
+  const openChannels = channels.filter((channel) => !channel.archived);
+  if (access.channels && openChannels.length > 0) {
+    sections.push({
+      key: "channels",
+      label: w("Channels", "频道", "頻道"),
+      items: openChannels.map((channel) => ({ id: String(channel.id), label: channel.name })),
+      activeId: route.view === "channel" ? String(route.id) : null,
+      onPick: (id) => selectRoute(`channel-${id}`),
+    });
+  }
 
   const openArea = (key: string) => {
-    // Chat opens the latest conversation; New chat is the way to a blank one.
+    // 纯聊天模式 opens the latest conversation; New chat (inside the area) is the way to a blank one.
     if (key === "chat" && chatRows[0]) selectRoute(`chat-${chatRows[0].id}`);
     else selectRoute(key);
   };
@@ -125,12 +132,12 @@ export function Sidebar({
         drawer={drawer}
         onClose={onClose}
         className={drawer ? "" : "max-lg:hidden"}
-        newChat={access.chat ? { label: w("New chat", "新聊天", "新聊天"), onClick: () => selectRoute("chat") } : undefined}
+        newChat={chatArea ? { label: w("New chat", "新聊天", "新聊天"), onClick: () => selectRoute("chat") } : undefined}
         nav={nav}
         activeNav={navKey(route)}
         onNavigate={openArea}
         sections={sections}
-        railSearch={access.chat && chatRows.length > 0 ? <RailSearch chats={chatRows} onPick={(id) => selectRoute(`chat-${id}`)} /> : undefined}
+        railSearch={chatArea && chatRows.length > 0 ? <RailSearch chats={chatRows} onPick={(id) => selectRoute(`chat-${id}`)} /> : undefined}
         footerNav={footerNav}
         account={<AccountMenu user={user} collapsed={!drawer && collapsed} onSignOut={onSignOut} />}
       />

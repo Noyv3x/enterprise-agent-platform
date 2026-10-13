@@ -32,13 +32,13 @@ export function Admin() {
   const pages: Record<Tab, { label: string; description: string }> = {
     users: { label: w('Accounts', '账户', '帳戶'), description: w('Who can sign in, their access and their model policy group.', '谁可以登录、访问权限和所属策略组。', '誰可以登入、存取權限和所屬策略群組。') },
     groups: { label: w('Permission groups', '权限组', '權限群組'), description: w('Each account belongs to one group; the group decides which workspace features it can use.', '每个账户属于一个权限组，权限组决定可使用的工作区功能。', '每個帳戶屬於一個權限群組，權限群組決定可使用的工作區功能。') },
-    policies: { label: w('Model policy groups', '策略组', '策略群組'), description: w('Each account belongs to one group; the group decides the model and thinking depth for each use. Accounts never see it.', '每个账户属于一个策略组，策略组决定每种用途的模型和思考深度。账户本人看不到。', '每個帳戶屬於一個策略群組，策略群組決定每種用途的模型和思考深度。帳戶本人看不到。') },
+    policies: { label: w('Model policy groups', '策略组', '策略群組'), description: w('Each account belongs to one group; the group decides its main model, judge model and thinking depths. Accounts never see it.', '每个账户属于一个策略组，策略组决定主模型、Judge 模型和思考深度。账户本人看不到。', '每個帳戶屬於一個策略群組，策略群組決定主模型、Judge 模型和思考深度。帳戶本人看不到。') },
     models: { label: w('Models', '模型', '模型'), description: w('Codex sign-in and the models it provides to every agent and chat.', 'Codex 登录及其为所有 Agent 和聊天提供的模型。', 'Codex 登入及其為所有 Agent 和聊天提供的模型。') },
     skills: { label: w('Skills', '技能', '技能'), description: w('Organization skills for chosen permission groups, and the built-in skills switched on or off for everyone. Changes apply from the next message.', '为指定权限组提供的组织技能，以及对所有人启用或停用的内置技能。更改从下一条消息起生效。', '為指定權限群組提供的組織技能，以及對所有人啟用或停用的內建技能。變更從下一則訊息起生效。') },
     connectors: { label: w('Connectors', '连接器', '連接器'), description: w('Organization MCP connectors for chosen permission groups, their credentials and tools, the call audit and the internal addresses they may reach.', '为指定权限组提供的组织 MCP 连接器、其凭据和工具、调用审计，以及允许访问的内网地址。', '為指定權限群組提供的組織 MCP 連接器、其憑證和工具、呼叫稽核，以及允許存取的內網位址。') },
     branding: { label: w('Branding', '品牌', '品牌'), description: w('Product name, agent name, accent color and logo shown to everyone.', '对所有人显示的产品名称、Agent 名称、强调色和 Logo。', '對所有人顯示的產品名稱、Agent 名稱、強調色和 Logo。') },
     system: { label: w('System', '系统', '系統'), description: w('Release, service health and updates installed by the host Manager.', '由宿主机管理器安装的版本、服务健康状态和更新。', '由主機管理器安裝的版本、服務健康狀態和更新。') },
-    usage: { label: w('Usage', '用量', '用量'), description: w('Token consumption and prompt-cache efficiency across personal AI, channels and chat.', '个人 AI、频道和聊天的 Token 消耗与提示缓存效率。', '個人 AI、頻道和聊天的 Token 消耗與提示快取效率。') },
+    usage: { label: w('Usage', '用量', '用量'), description: w('Token consumption and prompt-cache efficiency across personal AI, plain chat and channels, including judge calls.', '个人 AI、纯聊天模式和频道的 Token 消耗与提示缓存效率，含 Judge 调用。', '個人 AI、純聊天模式和頻道的 Token 消耗與提示快取效率，含 Judge 呼叫。') },
   };
 
   return <div className="flex min-h-0 flex-1 flex-col">

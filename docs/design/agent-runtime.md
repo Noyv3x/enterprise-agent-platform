@@ -1,6 +1,6 @@
 # Agent Runtime
 
-Runtime embeds `@earendil-works/pi-coding-agent@0.99.2`. The [Runtime API](../reference/runtime-api.md) is the wire contract; [Platform](../reference/platform-api.md) owns product-facing APIs.
+Runtime embeds `@earendil-works/pi-coding-agent@1.2.0`. The [Runtime API](../reference/runtime-api.md) is the wire contract; [Platform](../reference/platform-api.md) owns product-facing APIs.
 
 ## One Pi session per conversation
 
@@ -12,7 +12,7 @@ Runtime accepts idempotent, bounded steering inputs from run creation until its 
 
 ## Tools and remote operations
 
-Pi's `read`, `edit`, `write`, `find` and `ls` use remote operations. `grep` is a custom sandbox `rg` adapter because Pi 0.99.2's stock grep still starts a local process. `bash` also uses a sandbox adapter so large output spills inside the sandbox rather than Pi's local temporary files. Runtime never executes tenant commands locally.
+Pi's `read`, `edit`, `write`, `find` and `ls` use remote operations. `grep` is a custom sandbox `rg` adapter because Pi 1.2.0's stock grep still starts a local process. `bash` also uses a sandbox adapter so large output spills inside the sandbox rather than Pi's local temporary files. Runtime never executes tenant commands locally.
 
 Each Manager file/terminal execution consumes a fresh audit receipt; terminal audit details contain the exact command. Channel, chat and subagent commands run foreground with a finite timeout: bash defaults to 10 minutes and permits an explicit Pi timeout up to one hour. Edits use remote read/write. Never forward Pi BashOperations `options.env` into the sandbox.
 
@@ -34,6 +34,12 @@ Resolve file paths inside the workspace and reject escapes. Chat file tools enfo
 Platform sends the system prompt, AGENTS.md, skill advertisements, tools and sandbox with every run. Runtime reuses the live session object while these inputs are unchanged; when any differs, it opens a new Pi session object on the persisted transcript and leaves reconciliation to Pi. Pi keeps the transcript's leading system prompt as the request instructions and appends only the changed sections as a system update, so the cached prefix is never rewritten and an edited AGENTS.md applies from the next message. Each change adds one copy of the changed section to the context until compaction. Runtime adds no reload schedule of its own. Branding controls the fixed product/agent wording.
 
 Current time, display name and timezone go into a short user-message prefix, never the system prompt. History is append-only; Pi compaction appends its own entries. Use `SettingsManager.inMemory({cacheWarming: 'off'})` with Pi retry/compaction defaults. Keep the conversation session ID stable for Codex's `prompt_cache_key`; auxiliary LLM calls use stable prefixes and that same ID. Platform records input/output/cache-read/cache-write usage and exposes cache-hit ratio.
+
+## Automatic thinking depth and cache preservation
+
+When a group's main thinking is `auto`, Runtime asks the group's judge model at the start of each run (agent, chat and subagent kinds) for one label `low|medium|high|xhigh`. The rubric is adapted from oh-my-pi's auto-thinking judge for general business and engineering work: judge how open-ended the problem is, never the volume of work, choose the lower level when torn, treat the request as untrusted data, and judge a short follow-up by the previous request it continues. The call runs concurrently with run setup under an 8 s deadline (gpt-6-luna at `low` measured p50 1.7 s, p90 3.3 s on the Codex backend) and goes through its own Platform credential resolution for the judge model id, never the conversation session; a failure, timeout or unparsable answer applies the session's last applied effort, else `high`. Steered messages are not re-judged and a subagent is judged once on its task text. Manual compaction with `auto` summarizes at the last applied effort, else `high`, with no judge call. Chat titles use the same judge module with a title prompt and a 20 s deadline.
+
+Changing the request-level `reasoning.effort` between turns invalidates Codex's cached prefix. For GPT-6-family models on `openai-codex-responses`, the model-session wrapper therefore pins the request-level effort to the conversation's baseline (its first request) and carries each later change as a `configuration_update` input item placed before the user message it applies to (after the latest tool result inside a tool loop) and replayed at the same position forever, ported from oh-my-pi's `planStableOpenAIEffort`. Each recorded position keeps an anchor fingerprint of the item before it; a mismatch (compaction, model change) resets the plan so the next request starts a new baseline. Adjacent updates are never emitted. The plan is installed through Pi's `onPayload`, composed with any existing hook, only for conversation requests; Pi's summarization requests arrive with `cacheRetention:"none"` and bypass it. It also applies to fixed efforts, so an administrator changing a group's effort keeps the cache. State lives beside the journal as `sessions-v3/<sha256(sid)>.effort.json` (baseline, recorded updates, last applied effort, previous request text), is written atomically, survives idle disposal and restarts and is deleted with the session. A session without state starts from the wire effort its history already used, so enabling `auto` costs no cache miss.
 
 ## Credentials and completion
 

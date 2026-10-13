@@ -8,6 +8,8 @@
  *   collapse control for a close control;
  * - section headers toggle their list (aria-expanded); when collapsed with a searchable section, a rail search
  *   button stands in for the hidden chat search;
+ * - New chat is the open area's action, not a global one: it sits below the primary nav in its own group (a hairline
+ *   above it, as the footer has), with the rail search beside it, and appears only when the shell passes it;
  * - Central Icons replaced by open line icons; i18n labels; aria-current on the active row; ink-2 text for 4.5:1;
  *   44px rows on touch.
  * Motion (52↔224px, copy fade/slide, 180ms chat-search grow) is upstream's. Styles: ./sidebar-nav.css. */
@@ -292,6 +294,7 @@ export default function SidebarNav({
   drawer?: boolean;
   onClose?: () => void;
   className?: string;
+  /** the open area's action (New chat), below the primary nav; omitted outside that area */
   newChat?: { label: string; onClick: () => void };
   nav: SidebarNavItem[];
   activeNav?: string;
@@ -365,7 +368,6 @@ export default function SidebarNav({
         </div>
 
         <GlideGroup>
-          {newChat && <RailButton data-sidebar-new-chat icon={<Icon name="compose" size={18} />} label={newChat.label} title={isCollapsed ? newChat.label : undefined} onClick={newChat.onClick} />}
           {nav.map((item) => (
             <RailButton
               key={item.key}
@@ -377,8 +379,18 @@ export default function SidebarNav({
               onClick={() => onNavigate(item.key)}
             />
           ))}
-          {isCollapsed && railSearch}
         </GlideGroup>
+
+        {(newChat || (isCollapsed && railSearch)) && (
+          <div className="mx-2 mt-2 border-t border-line pt-2">
+            <div className="-mx-2">
+              <GlideGroup>
+                {newChat && <RailButton data-sidebar-new-chat icon={<Icon name="compose" size={18} />} label={newChat.label} title={isCollapsed ? newChat.label : undefined} onClick={newChat.onClick} />}
+                {isCollapsed && railSearch}
+              </GlideGroup>
+            </div>
+          </div>
+        )}
 
         <div className="sidebar-copy mt-3 min-h-0 flex-1 overflow-x-hidden overflow-y-auto" inert={isCollapsed || undefined}>
           {sections.map((section) => (

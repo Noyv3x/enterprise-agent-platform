@@ -13,8 +13,6 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .db import MODEL_SLOTS
-
 
 PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'manage_channels', 'manage_users', 'system_settings', 'install_extensions']
 DEFAULT_GROUPS = {'admin': PERMISSIONS, 'manager': PERMISSIONS[:4] + ['install_extensions'], 'member': PERMISSIONS[:3] + ['install_extensions'], 'viewer': PERMISSIONS[:1]}
@@ -119,23 +117,26 @@ def groups(db):
     return json.loads(row['value']) if row else [{'name': name, 'permissions': list(perms)} for name, perms in DEFAULT_GROUPS.items()]
 
 
+def default_model_policies():
+    return [{'name': 'default', 'label': '默认', 'main': {'model': '', 'thinking': 'medium'}, 'judge': {'model': '', 'thinking': 'low'}}]
+
+
 def model_policies(db):
     with db.connect() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key='model_policies_v1'").fetchone()
-    if row:
-        return json.loads(row['value'])
-    return [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': '', 'thinking': 'medium'} for slot in MODEL_SLOTS}}]
+        row = conn.execute("SELECT value FROM settings WHERE key='model_policies_v2'").fetchone()
+    return json.loads(row['value']) if row else default_model_policies()
 
 
-def model_slot(db, user, slot):
-    """The `{id, thinking}` the user's model policy group sets for a usage slot; an empty id is the system default.
+def model_choice(db, user):
+    """The user's model policy group as `{main:{id,thinking}, judge:{id,thinking}}`; an empty `main.id` is the system
+    default and an empty `judge.id` means the resolved main model (both resolved against the live catalog by the queue).
     Membership is read by account id: request users are public projections without `model_policy`."""
     with db.connect() as conn:
         row = conn.execute('SELECT model_policy FROM users WHERE id=?', (user['id'],)).fetchone()
     policy = next((policy for policy in model_policies(db) if row and policy['name'] == row['model_policy']), None)
     if policy is None:
         raise HTTPException(409, 'Model policy group is missing')
-    return {'id': policy['slots'][slot]['model'], 'thinking': policy['slots'][slot]['thinking']}
+    return {part: {'id': policy[part]['model'], 'thinking': policy[part]['thinking']} for part in ('main', 'judge')}
 
 
 def permissions(db, user):

@@ -1,7 +1,7 @@
 # Attribution and license
 
 This bundled Skill is adapted from
-[blader/humanizer](https://github.com/blader/humanizer), version 2.5.1,
+[blader/humanizer](https://github.com/blader/humanizer), version 3.1.0 (upstream commit 225a6f39ac85f76ee48dbad772ea4abe4ed6c9d8),
 originally authored by Siqi Chen and distributed under the MIT License. The
 workflow was also distributed as a port in
 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent).
@@ -11,6 +11,17 @@ The source describes its writing-pattern taxonomy as based on Wikipedia's
 Copyright (c) 2025 Siqi Chen
 
 Hermes Agent repository copyright (c) 2025 Nous Research
+
+## What was changed
+
+- `SKILL.md` is a compact workflow written for this platform; the 26-pattern
+  taxonomy is condensed into `references/patterns.md` (examples shortened or
+  rewritten).
+- Platform-specific additions: protected spans, file and artifact handling,
+  explicit retention of required disclosures and provenance, anti-impersonation
+  rules.
+- `references/chinese.md` is new material written for this platform; it is not
+  part of the upstream project.
 
 ## MIT License
 

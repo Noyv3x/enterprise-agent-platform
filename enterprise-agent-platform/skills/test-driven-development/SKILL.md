@@ -1,100 +1,110 @@
 ---
 name: "test-driven-development"
-description: "Use when implementing behavior or fixing a reproducible defect where tests are practical. Guides a safe RED-GREEN-REFACTOR loop that preserves user code, verifies the intended failure, makes the smallest fix, and runs the wider suite."
-version: "1.1.0"
-category: "software-development"
-tags: ["testing","tdd","red-green-refactor","regression","quality"]
+description: "Use when implementing behavior or fixing a reproducible defect where automated tests are practical: new features, bug fixes, refactors that must keep behavior, boundary and error handling. Drives a RED-GREEN-REFACTOR loop that proves each test fails for the right reason, preserves existing and user-written code, and runs the wider suite. 测试驱动开发、先写失败测试、回归测试。"
+license: MIT
+metadata:
+  version: "2.0.0"
+  category: "software-development"
+  tags: "testing,tdd,red-green-refactor,regression,quality"
 ---
 
 # Test-Driven Development
 
-Use tests to define behavior before expanding implementation. The essential
-proof is not that a test passes; it is that the test first failed for the
+The proof is not that a test passes. It is that the test first failed for the
 expected missing or broken behavior, then passed after the smallest relevant
-change.
+change. If you never watched it fail, you do not know it can catch the bug.
 
 ## When to use
 
-- new behavior with a stable, observable interface;
-- a bug that can be reproduced deterministically;
-- refactoring where current behavior must remain unchanged;
-- boundary cases involving parsing, validation, state, or error handling.
+New behavior with a stable observable interface; a deterministically
+reproducible bug; a refactor that must not change behavior; parsing,
+validation, state and error boundaries.
 
-Use judgment for generated files, exploratory spikes, visual-only work, or
-environments without a feasible harness. Explain the alternative verification
-rather than manufacturing a low-value test.
+Use judgment for generated files, throwaway spikes, configuration, visual-only
+work, or environments without a feasible harness: say what verification you
+used instead rather than manufacturing a low-value test.
 
 ## Preserve existing work
 
-Do not delete an existing implementation merely to recreate a textbook RED
-state. In existing or partially implemented code:
+Never delete or rewrite existing or user-written implementation just to
+recreate a textbook RED state. When code already exists (or you already wrote
+some while exploring):
 
-- add a characterization test for behavior that must remain;
-- add a focused regression test for the missing or incorrect behavior;
-- verify that the new test fails for the intended reason;
-- make a localized change that preserves unrelated behavior.
+1. Add a **characterization test** for behavior that must stay.
+2. Add a focused **regression test** for the missing or wrong behavior.
+3. Verify the new test fails for the intended reason against the current code
+   (temporarily bypass the fix in a scratch copy or by toggling the behavior,
+   never by destroying work).
+4. Make a localized change; keep unrelated behavior.
 
-Never discard user changes or rewrite broad areas just to satisfy this
-workflow.
+Never discard user changes, and never rewrite broad areas to satisfy the
+ritual. Throwaway exploration code may be discarded, but only code you wrote
+yourself in this task.
 
 ## RED
 
-1. Describe one behavior in user-visible or caller-visible terms.
-2. Inspect existing tests and conventions.
-3. Add the smallest focused test with a descriptive name.
-4. Run only that test first.
-5. Confirm it fails because the behavior is absent or wrong—not because of a
-   syntax error, missing fixture, wrong import, or broken environment.
+1. Describe one behavior in caller-visible terms.
+2. Read the existing tests and conventions; reuse their fixtures and style.
+3. Before writing the body, name the production change that would make the test
+   fail, and confirm that change is a bug, not just a decision
+   (`references/writing-good-tests.md`).
+4. Write the smallest focused test with a descriptive name; derive expected
+   values by hand, not with the code under test.
+5. Run only that test. Confirm it **fails** (not errors) with the expected
+   message, because the behavior is absent or wrong, not because of a syntax
+   error, bad import, missing fixture or broken environment.
 
-A passing new test before implementation usually means it does not exercise
-the intended gap. Strengthen the assertion or reassess whether work is needed.
+A new test that passes immediately does not exercise the gap: strengthen it or
+reconsider whether work is needed.
 
 ## GREEN
 
-1. Implement only what is necessary for the failing behavior.
-2. Re-run the focused test and observe it pass.
-3. Run adjacent tests that cover the same component or boundary.
-4. Avoid opportunistic refactors while the behavior is still unproven.
+1. Implement only what the failing test needs; no extra options or features.
+2. Re-run the focused test and watch it pass.
+3. Run adjacent tests, then the project's own test command for the affected
+   area. A passing file you wrote is not a passing suite; report any failure you
+   see by name, including one you did not cause.
+4. Do not refactor opportunistically while behavior is unproven.
 
-For bug fixes, keep the regression test. It should fail against the old
-behavior and prevent recurrence.
+For bug fixes keep the regression test.
 
 ## REFACTOR
 
-Only after green:
-
-- remove duplication;
-- improve names and boundaries;
-- simplify control flow;
-- preserve public behavior;
-- run the focused and relevant surrounding suites after each meaningful step.
-
-Do not change behavior and structure simultaneously when separate changes are
-possible.
+Only when green: remove duplication, improve names and boundaries, simplify
+control flow, preserve public behavior, and re-run the tests after each step.
+Do not change behavior and structure in the same step when you can separate
+them.
 
 ## Test quality
 
-Prefer tests that:
+- Exercise public behavior, not implementation details.
+- Realistic inputs, explicit assertions, the important error or boundary path.
+- Deterministic and isolated; wait on conditions, not guessed sleeps.
+- Mock only slow, external or unstable boundaries. Never assert on the mock
+  itself; keep real what the test depends on.
+- Do not test source text, constants or framework mechanics.
+- Finish with a mutation check: for each realistic bad change (wrong constant,
+  wrong branch, missing side effect, empty return, missing validation) at least
+  one test should fail.
 
-- exercise public behavior instead of implementation details;
-- use realistic inputs and explicit assertions;
-- cover the important error or boundary path;
-- remain deterministic and isolated;
-- fail with a useful message.
+Details: `references/writing-good-tests.md`.
 
-Use mocks at unstable or expensive boundaries, not as a substitute for testing
-the unit's real logic. Do not assert that a mock was called when the outcome is
-what matters.
+## Subagents
+
+Subagents may write tests or implement separate units, but give each its own
+files and tell it to run only its focused tests. The parent owns verification:
+after subagents land, run the focused tests and the surrounding suite once
+yourself and report the real output. Do not run the full suite from several
+agents at the same time.
 
 ## Completion checklist
 
-- The new or changed behavior has a focused test where practical.
-- The test was observed failing for the correct reason.
-- The smallest implementation made it pass.
-- Relevant existing tests still pass.
-- Refactoring did not change behavior.
-- The final report names the commands run and any untested risk.
+- New or changed behavior has a focused test where practical.
+- It was observed failing for the right reason, then passing.
+- The change was minimal; refactoring kept behavior.
+- Relevant existing tests still pass; failures are named.
+- The report lists the commands run and any untested risk.
 
-Do not stage, commit, or push unless the user separately requested it.
+Do not stage, commit or push unless the user separately asked.
 
-License and source attribution are in `references/NOTICE.md`.
+Attribution and licence: `references/NOTICE.md`.

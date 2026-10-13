@@ -35,8 +35,6 @@ SUBAGENT_TOOLS = {
     "scout": ["read", "grep", "find", "ls", "web_search", "web_fetch"],
     "task": ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"],
 }
-# The model policy slot each subagent type runs under.
-SUBAGENT_SLOT = {"scout": "scout", "task": "worker"}
 SUBAGENT_PROMPT = (
     "You are a subagent working for the user's personal AI, identified as {id}. Complete only the assigned task, "
     "using your tools. {capability} Your final answer is delivered to the personal AI as your report: state what you "
@@ -325,13 +323,13 @@ class Tasks:
         started = False
         try:
             user = self.p.queue.user(uid)
-            info = self.p.queue.scope(user, "private", authorize=False, slot=SUBAGENT_SLOT[row["agent_type"]])
+            info = self.p.queue.scope(user, "private", authorize=False)
             model = await self.p.queue.selected_model(info)
             sid = f"agent-private-{uid}-bg-{tid}"
             mcp = await self.p.mcp.run_payload(user, info, row["agent_type"])
             sandbox = {**info["sandbox"], "scope_key": f"private:{uid}/delegate/bg-{tid}"}
             result = await self.p.queue.runtime("POST", f"/v1/sessions/{sid}/runs", json={
-                "kind": "subagent", "sandbox": sandbox, "model": model,
+                "kind": "subagent", "sandbox": sandbox, **self.p.queue.model_body(info),
                 "prompt": {"text": row["prompt"], "images": []},
                 "context_prefix": json.dumps({"time": datetime.now(timezone.utc).isoformat(),
                                               "user": user["display_name"], "tz": user["timezone"]}),
@@ -386,7 +384,7 @@ class Tasks:
             outcome, reason = "failed", error or "run_failed"
         usage = event.get("usage") or {}
         self.settle(tid, outcome, reason, result=event.get("text") or error, work=work.finish(), usage=usage,
-                    accounting=(user, info, event.get("model", model["id"])))
+                    accounting=(user, info, event.get("model", model["id"]), event.get("effort"), event.get("judge_usage")))
 
     def settle(self, tid, status, reason, *, result="", work=None, usage=None, accounting=None, exit_code=None):
         """The only terminal write of a task; exactly one caller wins."""
@@ -396,17 +394,32 @@ class Tasks:
                 "updated_at=? WHERE id=? AND status='running'",
                 (status, reason, exit_code, _clip(result), json.dumps(work) if work else None,
                  json.dumps(usage) if usage else None, _ts(), _ts(), tid)).rowcount
-            if changed and accounting is not None and usage:
-                user, info, model = accounting
-                conn.execute(
-                    "INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,"
-                    "request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,"
-                    "raw_usage_json,created_at) VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
-                    (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], "",
-                     "openai-codex", model, usage.get("input", 0), usage.get("output", 0), usage.get("total", 0),
-                     json.dumps({**usage, "kind": "subagent", "task_id": f"bg-{tid}",
-                                 "cacheRead": usage.get("cache_read", 0), "cacheWrite": usage.get("cache_write", 0)}),
-                     _ts()))
+            if changed and accounting is not None:
+                user, info, model, effort, judge_usage = accounting
+                if usage:
+                    conn.execute(
+                        "INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,"
+                        "request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,"
+                        "raw_usage_json,created_at) VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
+                        (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], "",
+                         "openai-codex", model, usage.get("input", 0), usage.get("output", 0), usage.get("total", 0),
+                         json.dumps({**usage, "kind": "subagent", "task_id": f"bg-{tid}",
+                                     "cacheRead": usage.get("cache_read", 0), "cacheWrite": usage.get("cache_write", 0),
+                                     **({"effort": effort} if isinstance(effort, str) and effort else {})}),
+                         _ts()))
+                if isinstance(judge_usage, dict):
+                    judged = {key: judge_usage.get(key) if isinstance(judge_usage.get(key), int) and not isinstance(judge_usage.get(key), bool) else 0
+                              for key in ("input", "output", "cache_read", "cache_write", "total")}
+                    conn.execute(
+                        "INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,"
+                        "request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,"
+                        "raw_usage_json,created_at) VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
+                        (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], "",
+                         "openai-codex", judge_usage.get("model") if isinstance(judge_usage.get("model"), str) and judge_usage.get("model") else info["judge"]["id"],
+                         judged["input"], judged["output"], judged["total"],
+                         json.dumps({**judged, "kind": "auto_effort", "task_id": f"bg-{tid}",
+                                     "cacheRead": judged["cache_read"], "cacheWrite": judged["cache_write"]}),
+                         _ts()))
         if changed:
             self.p.live.task_ended(tid)
             self.emit(self.row(tid))

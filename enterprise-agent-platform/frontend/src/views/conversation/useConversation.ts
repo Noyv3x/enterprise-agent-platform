@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { ApiError, request, type ArtifactFeedback, type ArtifactPreview, type ArtifactRef, type ArtifactView } from "../../api";
+import { applyChatTitle } from "../chat/chatStore";
 import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
@@ -12,7 +13,7 @@ const OUTPUT_CAP = 512 * 1024;
 const EVENT_TYPES = [
   "message", "text_delta", "thinking_start", "thinking_delta", "thinking_end", "tool_input_start", "tool_input_delta", "tool_start", "tool_update", "tool_output", "tool_end",
   "input_delivered", "message_removed", "retry", "compaction", "run_end", "task", "artifact",
-  "mcp_action_required", "mcp_elicitation", "mcp_elicitation_resolved",
+  "mcp_action_required", "mcp_elicitation", "mcp_elicitation_resolved", "conversation_title",
 ] as const;
 
 /** High-rate stream fragments: they commit together once per animation frame. */
@@ -28,7 +29,7 @@ type StreamEvent = { seq: number } & (
   | { type: "tool_start"; tool_call_id: string; name: string; args: Record<string, unknown> | null }
   | { type: "tool_update"; tool_call_id: string; partial: unknown }
   | { type: "tool_output"; tool_call_id: string; delta: string; truncated?: boolean }
-  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { diff?: unknown; background?: { task_id?: unknown } | null } | null }
+  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { patch?: unknown; patch_truncated?: unknown; background?: { task_id?: unknown } | null } | null }
   | { type: "input_delivered"; message_id: number }
   /** a withdrawn message: its row is gone */
   | { type: "message_removed"; message_id: number }
@@ -45,6 +46,8 @@ type StreamEvent = { seq: number } & (
   /** a connector asks the run's user for input */
   | ({ type: "mcp_elicitation" } & McpElicitation)
   | { type: "mcp_elicitation_resolved"; id: string; action: "accept" | "decline" | "cancel"; reason?: string }
+  /** chat only: Platform generated the conversation's title; it goes to the shared chat list, not the transcript */
+  | { type: "conversation_title"; id: string; title: string }
 );
 
 /** One received SSE event with its arrival time and stream-update mark. */
@@ -156,7 +159,7 @@ function latestCompaction(current: Compaction | null, incoming: Compaction): Com
 }
 
 function newCall(id: string, name: string): ToolCall {
-  return { id, name, status: "preparing", args: {}, input: "", output: "", truncated: false, streamed: false, diff: "" };
+  return { id, name, status: "preparing", args: {}, input: "", output: "", truncated: false, streamed: false, patch: "", patchCut: false };
 }
 
 /** Updates (or creates, when its first event was missed) one call; the other calls keep their identity for memoized views. */
@@ -196,10 +199,11 @@ function applyCallEvent(call: ToolCall, event: StreamEvent): ToolCall {
       return { ...call, streamed: true, output: call.output + event.delta };
     }
     case "tool_end": {
-      const diff = event.details?.diff;
+      const patch = event.details?.patch;
       return {
         ...call, name: call.name, status: event.is_error ? "error" : "done", truncated: false,
-        output: outputText(event.content_preview) || call.output, diff: typeof diff === "string" ? diff : call.diff,
+        output: outputText(event.content_preview) || call.output,
+        ...(typeof patch === "string" ? { patch, patchCut: event.details?.patch_truncated === true } : {}),
       };
     }
     default:
@@ -217,6 +221,8 @@ function removeMessage(state: State, id: number): State {
 function applyEvent(state: State, event: StreamEvent, at: number, mark: number): State {
   if (event.type === "message") return { ...state, messages: upsert(state, [event.message]) };
   if (event.type === "message_removed") return removeMessage(state, event.message_id);
+  // A generated chat title goes to the shared chat list before dispatch; it is never run activity.
+  if (event.type === "conversation_title") return state;
   // Task updates are not run activity: they arrive between and after turns too.
   if (event.type === "task") {
     const { task } = event;
@@ -335,9 +341,11 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
             if (item.type !== "tool" || item.id !== event.tool_call_id) return item;
             if (event.type === "tool_update") return { ...item, output: outputText(event.partial) };
             const background = event.details?.background?.task_id;
+            const patch = event.details?.patch;
             return {
               ...item, output: outputText(event.content_preview) || item.output, status: event.is_error ? "error" : "done", endedAt: at,
               ...(typeof background === "string" && background ? { background } : {}),
+              ...(typeof patch === "string" && patch ? { patch, ...(event.details?.patch_truncated === true ? { patchCut: true } : {}) } : {}),
             };
           }),
         },
@@ -469,6 +477,10 @@ export function useConversation(scope: string, onRunEnd?: () => void) {
       try {
         event = JSON.parse(raw.data) as StreamEvent;
       } catch {
+        return;
+      }
+      if (event.type === "conversation_title") {
+        applyChatTitle(event.id, event.title);
         return;
       }
       if (event.type === "task") taskMark.current += 1;

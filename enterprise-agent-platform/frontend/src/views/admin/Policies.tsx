@@ -1,37 +1,53 @@
-import { useId, useState } from 'react';
+import { useState } from 'react';
 import { request } from '../../api';
 import { Button } from '../../components/ui/beautiful/atoms/Button';
 import { ValuePill } from '../../components/ui/beautiful/atoms/ValuePill';
-import { ConfirmDialog, EmptyState, Field, Icon, Notice, Select, Sheet, TextField, type SelectOption } from '../../components/ui/beautiful/controls';
+import { ConfirmDialog, EmptyState, Field, FormGrid, Icon, Notice, Select, Sheet, TextField, type SelectOption } from '../../components/ui/beautiful/controls';
 import LoadingState from '../../components/ui/beautiful/primitives/LoadingState';
 import RecordsTable, { RecordsSearch, RecordsToolbar, type RecordColumn } from '../../components/ui/beautiful/primitives/RecordsTable';
 import { useWords } from '../../words';
 import { EditorGroup } from './UserEditor';
 import {
-  POLICY_SLOTS, THINKING_DEPTHS, errorText, useAdminLabels, useRecordsLabels, useResource,
-  type ModelCatalog, type ModelOption, type ModelPolicies, type ModelPolicy, type PolicySlot, type SlotSetting,
+  AUTO_THINKING_MODEL, MAIN_THINKING_DEPTHS, THINKING_DEPTHS, errorText, useAdminLabels, useRecordsLabels, useResource,
+  type ModelCatalog, type ModelOption, type ModelPolicies, type ModelPolicy, type ModelSetting,
 } from './shared';
 
 const NAME_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
-const SYSTEM_DEFAULT = '__system_default__';
+/** Select value for `model: ''`: 系统默认 for the main model, 与主模型相同 for the judge. */
+const UNSET = '__unset__';
+/** A new group starts like a fresh install: the system default at medium, judged by the same model at low. */
+const NEW_MAIN: ModelSetting = { model: '', thinking: 'medium' };
+const NEW_JUDGE: ModelSetting = { model: '', thinking: 'low' };
+
+type Role = 'main' | 'judge';
 
 /** The live catalog, or null while it is loading or could not be fetched: then configured ids cannot be judged. */
 type Catalog = ModelOption[] | null;
+type ModelText = { text: string; tone: 'default' | 'model' | 'unavailable' };
+type ModelTextOf = (model: string, catalog: Catalog, role?: Role) => ModelText;
 
-/** How a configured slot model reads: the system default, a catalog name, or an id the catalog no longer offers. */
-function useModelText() {
+/** How a configured model reads: unset (系统默认 / 与主模型相同), a catalog name, or an id the catalog no longer offers. */
+function useModelText(): ModelTextOf {
   const w = useWords();
-  return (model: string, catalog: Catalog): { text: string; tone: 'default' | 'model' | 'unavailable' } => {
-    if (!model) return { text: w('System default', '系统默认', '系統預設'), tone: 'default' };
+  return (model: string, catalog: Catalog, role: Role = 'main'): ModelText => {
+    if (!model) return { text: role === 'main' ? w('System default', '系统默认', '系統預設') : w('Same as main model', '与主模型相同', '與主模型相同'), tone: 'default' };
     if (!catalog) return { text: model, tone: 'model' };
     const found = catalog.find((item) => item.id === model);
     return found ? { text: found.name || found.id, tone: 'model' } : { text: `${model} · ${w('unavailable', '不可用', '無法使用')}`, tone: 'unavailable' };
   };
 }
 
+/** A model and its thinking depth in one table cell. */
+function SettingCell({ model, thinking }: { model: ModelText; thinking: string }) {
+  const labels = useAdminLabels();
+  return <span className="flex min-w-0 items-center gap-1">
+    <span className={`truncate ${model.tone === 'default' ? 'text-ink-2' : model.tone === 'unavailable' ? 'text-orange-ink' : ''}`}>{model.text}</span>
+    <ValuePill className="shrink-0" tone={thinking === 'auto' ? 'green' : thinking === 'off' ? 'neutral' : 'accent'}>{labels.depth(thinking)}</ValuePill>
+  </span>;
+}
+
 export function Policies() {
   const w = useWords();
-  const labels = useAdminLabels();
   const modelText = useModelText();
   const policies = useResource<ModelPolicies>('/api/admin/model-policies');
   const catalog = useResource<ModelCatalog>('/api/admin/models');
@@ -45,23 +61,17 @@ export function Policies() {
   const needle = query.trim().toLowerCase();
   const rows = list.filter((policy) => !needle || policy.name.toLowerCase().includes(needle) || policy.label.toLowerCase().includes(needle));
 
-  // Member counts lead: they decide what can be deleted, and the five slot columns may scroll off narrower windows.
+  // Member counts lead: they decide what can be deleted.
   const columns: RecordColumn<ModelPolicy>[] = [
-    { key: 'members', label: w('Accounts', '账户数', '帳戶數'), glyph: 'user', width: 120,
+    { key: 'members', label: w('Accounts', '账户数', '帳戶數'), glyph: 'user', width: 110,
       sort: (a, b) => members(a.name) - members(b.name),
       render: (policy) => <span className="tabular-nums">{members(policy.name)}</span> },
-    ...POLICY_SLOTS.map((slot): RecordColumn<ModelPolicy> => ({
-      key: slot, label: labels.slot(slot), glyph: 'model', width: 190,
-      sort: (a, b) => a.slots[slot].model.localeCompare(b.slots[slot].model),
-      render: (policy) => {
-        const setting = policy.slots[slot];
-        const model = modelText(setting.model, models);
-        return <span className="flex min-w-0 items-center gap-1">
-          <span className={`truncate ${model.tone === 'default' ? 'text-ink-2' : model.tone === 'unavailable' ? 'text-orange-ink' : ''}`}>{model.text}</span>
-          <ValuePill className="shrink-0" tone={setting.thinking === 'off' ? 'neutral' : 'accent'}>{labels.depth(setting.thinking)}</ValuePill>
-        </span>;
-      },
-    })),
+    { key: 'main', label: w('Main model', '主模型', '主模型'), glyph: 'model', width: 220,
+      sort: (a, b) => a.main.model.localeCompare(b.main.model),
+      render: (policy) => <SettingCell model={modelText(policy.main.model, models)} thinking={policy.main.thinking} /> },
+    { key: 'judge', label: w('Judge model', 'Judge 模型', 'Judge 模型'), glyph: 'model', width: 220,
+      sort: (a, b) => a.judge.model.localeCompare(b.judge.model),
+      render: (policy) => <SettingCell model={modelText(policy.judge.model, models, 'judge')} thinking={policy.judge.thinking} /> },
     { key: 'key', label: w('Identifier', '标识', '識別碼'), glyph: 'json', width: 160,
       sort: (a, b) => a.name.localeCompare(b.name),
       render: (policy) => <span className="font-mono text-[12px] text-ink-2">{policy.name}</span> },
@@ -113,8 +123,6 @@ export function Policies() {
   </div>;
 }
 
-type Slots = Record<PolicySlot, SlotSetting>;
-
 /** Create, edit or delete one group. The API stores the whole list, so every save sends the full list. */
 function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, onClose }: {
   policy: ModelPolicy | null;
@@ -126,11 +134,13 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
   onClose: () => void;
 }) {
   const w = useWords();
+  const labels = useAdminLabels();
+  const modelText = useModelText();
   const [current, setCurrent] = useState<ModelPolicy | null>(policy);
   const [name, setName] = useState(policy?.name ?? '');
   const [label, setLabel] = useState(policy?.label ?? '');
-  // A new group starts on the system default with medium thinking in every slot, like the fresh-install baseline.
-  const [slots, setSlots] = useState<Slots>(() => policy?.slots ?? Object.fromEntries(POLICY_SLOTS.map((slot) => [slot, { model: '', thinking: 'medium' }])) as Slots);
+  const [main, setMain] = useState<ModelSetting>(policy?.main ?? NEW_MAIN);
+  const [judge, setJudge] = useState<ModelSetting>(policy?.judge ?? NEW_JUDGE);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
@@ -139,16 +149,23 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
   const trimmedLabel = label.trim();
   const nameTaken = !current && policies.some((item) => item.name === trimmedName);
   const nameInvalid = !current && trimmedName !== '' && !NAME_PATTERN.test(trimmedName);
-  const valid = trimmedLabel !== '' && (current !== null || (trimmedName !== '' && !nameTaken && !nameInvalid));
+  const autoAllowed = AUTO_THINKING_MODEL.test(main.model);
+  const autoInvalid = main.thinking === 'auto' && !autoAllowed;
+  const valid = trimmedLabel !== '' && !autoInvalid && (current !== null || (trimmedName !== '' && !nameTaken && !nameInvalid));
   const dirty = current
-    ? trimmedLabel !== current.label || JSON.stringify(slots) !== JSON.stringify(current.slots)
+    ? trimmedLabel !== current.label || JSON.stringify(main) !== JSON.stringify(current.main) || JSON.stringify(judge) !== JSON.stringify(current.judge)
     : trimmedName !== '' || trimmedLabel !== '';
   const count = current ? members(current.name) : 0;
   const last = current !== null && policies.length === 1;
   const formId = `policy-${current?.name ?? 'new'}`;
 
-  function setSlot(slot: PolicySlot, patch: Partial<SlotSetting>) {
-    setSlots((old) => ({ ...old, [slot]: { ...old[slot], ...patch } }));
+  const first = catalog?.[0];
+  const firstName = first ? first.name || first.id : '';
+  // What 与主模型相同 resolves to right now: the chosen main model, or the catalog's first model for 系统默认.
+  const mainResolved = main.model ? modelText(main.model, catalog).text : firstName;
+
+  function update(role: Role, patch: Partial<ModelSetting>) {
+    (role === 'main' ? setMain : setJudge)((old) => ({ ...old, ...patch }));
     setSaved(false);
   }
 
@@ -167,13 +184,14 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
   }
   async function save() {
     if (!dirty || !valid || saving) return;
-    const entry: ModelPolicy = { name: current?.name ?? trimmedName, label: trimmedLabel, slots };
+    const entry: ModelPolicy = { name: current?.name ?? trimmedName, label: trimmedLabel, main, judge };
     const response = await put(current ? policies.map((item) => item.name === current.name ? entry : item) : [...policies, entry]);
     if (response) {
       const stored = response.policies.find((item) => item.name === entry.name) ?? entry;
       setCurrent(stored);
       setLabel(stored.label);
-      setSlots(stored.slots);
+      setMain(stored.main);
+      setJudge(stored.judge);
       setSaved(true);
     }
   }
@@ -185,6 +203,14 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
     onClose();
   }
 
+  const mainDepths: SelectOption[] = MAIN_THINKING_DEPTHS.map((depth) => depth === 'auto'
+    ? { value: depth, label: labels.depth(depth), disabled: !autoAllowed,
+      description: autoAllowed
+        ? w('The judge picks a depth each turn', '每轮由 Judge 判断难度后选择', '每輪由 Judge 判斷難度後選擇')
+        : w('Choose a GPT-6 model first', '需先选择 GPT-6 系列模型', '需先選擇 GPT-6 系列模型') }
+    : { value: depth, label: labels.depth(depth) });
+  const judgeDepths: SelectOption[] = THINKING_DEPTHS.map((depth) => ({ value: depth, label: labels.depth(depth) }));
+
   const title = current ? current.label : w('New model policy group', '新建策略组', '新增策略群組');
   return <Sheet
     open
@@ -193,7 +219,7 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
     title={title}
     description={current
       ? w(`Changes apply to every account in this group (${count}) from its next run.`, `修改会从下一次运行起作用于组内所有账户（${count} 个）。`, `修改會從下一次執行起套用到群組內所有帳戶（${count} 個）。`)
-      : w('Name the group and choose the model and thinking depth for each use.', '为策略组命名，并为每种用途选择模型和思考深度。', '為策略群組命名，並為每種用途選擇模型和思考深度。')}
+      : w('Name the group, then choose its main model and judge model.', '为策略组命名，然后选择主模型和 Judge 模型。', '為策略群組命名，然後選擇主模型和 Judge 模型。')}
     footer={<>
       {saved && !dirty && <span className="mr-auto text-[12px] font-medium text-green-ink">{w('Saved', '已保存', '已儲存')}</span>}
       {dirty && current && <span className="mr-auto text-[12px] text-ink-2">{w('Unsaved changes', '有未保存的更改', '有未儲存的變更')}</span>}
@@ -220,11 +246,41 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
             <TextField value={name} readOnly={!!current} maxLength={64} autoComplete="off" spellCheck={false} className="font-mono" onChange={(event) => { setName(event.target.value); setSaved(false); }} />
           </Field>
         </EditorGroup>
-        <EditorGroup title={w('Models and thinking', '模型与思考', '模型與思考')}
-          description={w('System default is the first model the Codex catalog offers.', '“系统默认”是 Codex 模型目录中的第一个模型。', '「系統預設」是 Codex 模型目錄中的第一個模型。')}>
-          <div className="flex flex-col">
-            {POLICY_SLOTS.map((slot) => <SlotRow key={slot} slot={slot} setting={slots[slot]} catalog={catalog} onChange={(patch) => setSlot(slot, patch)} />)}
-          </div>
+        <EditorGroup title={w('Main model', '主模型', '主模型')}
+          description={w('Used by the personal AI, plain chat, channels and every subagent.', '主模型用于个人 AI、纯聊天模式、频道和全部子智能体。', '主模型用於個人 AI、純聊天模式、頻道和全部子智慧體。')}>
+          <FormGrid>
+            <Field label={w('Model', '模型', '模型')}>
+              <Select aria-label={w('Main model', '主模型', '主模型')} value={main.model || UNSET}
+                onChange={(value: string) => update('main', { model: value === UNSET ? '' : value })}
+                options={modelOptions(main.model, catalog, {
+                  label: w('System default', '系统默认', '系統預設'),
+                  description: firstName ? w(`Currently ${firstName}`, `当前为 ${firstName}`, `目前為 ${firstName}`) : undefined,
+                }, modelText)} />
+            </Field>
+            <Field label={w('Thinking depth', '思考深度', '思考深度')}
+              error={autoInvalid ? w('Auto needs a GPT-6 main model. Choose one, or pick a fixed depth.', '「自动」需要 GPT-6 系列主模型。请改选模型或固定深度。', '「自動」需要 GPT-6 系列主模型。請改選模型或固定深度。') : undefined}
+              hint={main.thinking === 'auto' && autoAllowed ? w('Before each turn the judge rates its difficulty and picks the depth.', '每轮开始前由 Judge 判断难度并选择深度。', '每輪開始前由 Judge 判斷難度並選擇深度。') : undefined}>
+              <Select aria-label={w('Main model thinking depth', '主模型思考深度', '主模型思考深度')} value={main.thinking}
+                onChange={(thinking: string) => update('main', { thinking })} options={mainDepths} />
+            </Field>
+          </FormGrid>
+        </EditorGroup>
+        <EditorGroup title={w('Judge model', 'Judge 模型', 'Judge 模型')}
+          description={w('Titles chats, and rates each turn’s difficulty when the main model’s depth is Auto.', 'Judge 用于生成聊天标题，并在主模型为「自动」时判断每轮难度。', 'Judge 用於產生聊天標題，並在主模型為「自動」時判斷每輪難度。')}>
+          <FormGrid>
+            <Field label={w('Model', '模型', '模型')}>
+              <Select aria-label={w('Judge model', 'Judge 模型', 'Judge 模型')} value={judge.model || UNSET}
+                onChange={(value: string) => update('judge', { model: value === UNSET ? '' : value })}
+                options={modelOptions(judge.model, catalog, {
+                  label: w('Same as main model', '与主模型相同', '與主模型相同'),
+                  description: mainResolved ? w(`Currently ${mainResolved}`, `当前为 ${mainResolved}`, `目前為 ${mainResolved}`) : undefined,
+                }, modelText)} />
+            </Field>
+            <Field label={w('Thinking depth', '思考深度', '思考深度')}>
+              <Select aria-label={w('Judge model thinking depth', 'Judge 模型思考深度', 'Judge 模型思考深度')} value={judge.thinking}
+                onChange={(thinking: string) => update('judge', { thinking })} options={judgeDepths} />
+            </Field>
+          </FormGrid>
         </EditorGroup>
       </fieldset>
     </form>
@@ -254,40 +310,12 @@ function PolicyEditor({ policy, policies, members, catalog, connected, onSaved, 
   </Sheet>;
 }
 
-/** One usage slot: what it covers, then its model and thinking depth side by side. */
-function SlotRow({ slot, setting, catalog, onChange }: {
-  slot: PolicySlot;
-  setting: SlotSetting;
-  catalog: Catalog;
-  onChange: (patch: Partial<SlotSetting>) => void;
-}) {
-  const w = useWords();
-  const labels = useAdminLabels();
-  const modelText = useModelText();
-  const id = useId();
-  const name = labels.slot(slot);
-  const first = catalog?.[0];
+/** The unset choice first, then the live catalog; a configured id the catalog no longer offers stays listed as unavailable. */
+function modelOptions(model: string, catalog: Catalog, unset: { label: string; description?: string }, modelText: ModelTextOf): SelectOption[] {
   const options: SelectOption[] = [
-    { value: SYSTEM_DEFAULT, label: w('System default', '系统默认', '系統預設'),
-      description: first ? w(`Currently ${first.name || first.id}`, `当前为 ${first.name || first.id}`, `目前為 ${first.name || first.id}`) : undefined },
-    ...(catalog ?? []).map((model) => ({ value: model.id, label: model.name || model.id })),
+    { value: UNSET, ...unset },
+    ...(catalog ?? []).map((item) => ({ value: item.id, label: item.name || item.id })),
   ];
-  if (setting.model && !catalog?.some((model) => model.id === setting.model)) options.push({ value: setting.model, label: modelText(setting.model, catalog).text });
-  return <div role="group" aria-labelledby={id} className="flex flex-col gap-2 border-t border-line py-3 first:border-t-0 first:pt-0 last:pb-0">
-    <div className="flex flex-col gap-0.5">
-      <h4 id={id} className="text-[12.5px] font-medium text-ink">{name}</h4>
-      <p className="text-[12px] leading-[1.4] text-ink-2">{labels.slotHint(slot)}</p>
-    </div>
-    <div className="flex gap-2">
-      <div className="min-w-0 flex-1">
-        <Select aria-label={w(`${name} model`, `${name}模型`, `${name}模型`)} value={setting.model || SYSTEM_DEFAULT}
-          onChange={(value: string) => onChange({ model: value === SYSTEM_DEFAULT ? '' : value })} options={options} />
-      </div>
-      <div className="w-32 shrink-0">
-        <Select aria-label={w(`${name} thinking depth`, `${name}思考深度`, `${name}思考深度`)} value={setting.thinking}
-          onChange={(thinking: string) => onChange({ thinking })}
-          options={THINKING_DEPTHS.map((depth) => ({ value: depth, label: labels.depth(depth) }))} />
-      </div>
-    </div>
-  </div>;
+  if (model && !catalog?.some((item) => item.id === model)) options.push({ value: model, label: modelText(model, catalog).text });
+  return options;
 }

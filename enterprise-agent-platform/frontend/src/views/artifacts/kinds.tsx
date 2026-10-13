@@ -24,6 +24,12 @@ export function kindLabel(kind: ArtifactKind, w: Words): string {
       return w("Image", "图片", "圖片");
     case "pdf":
       return "PDF";
+    case "docx":
+      return w("Word document", "Word 文档", "Word 文件");
+    case "xlsx":
+      return w("Spreadsheet", "Excel 表格", "Excel 試算表");
+    case "pptx":
+      return w("Presentation", "演示文稿", "簡報");
     case "live":
       return w("Live preview", "网站预览", "網站預覽");
   }
@@ -50,6 +56,9 @@ const GLYPHS: Record<ArtifactKind, ReactNode> = {
   code: <path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M13.5 5.5l-3 13" />,
   image: <><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><circle cx="9" cy="10" r="1.75" /><path d="m20.5 16-4.5-4.5-8 8" /></>,
   pdf: <><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z" /><path d="M14 3.5v5h5" /><path d="M8.5 16.5v-4h1.25a1.25 1.25 0 0 1 0 2.5H8.5" /></>,
+  docx: <><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z" /><path d="M14 3.5v5h5" /><path d="m8.5 12 1.25 4.5L12 13l2.25 3.5L15.5 12" /></>,
+  xlsx: <><path d="M14 3.5H7a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8.5z" /><path d="M14 3.5v5h5" /><path d="M8.5 12h7M8.5 15h7M8.5 18h7M12 12v6" /></>,
+  pptx: <><rect x="3.5" y="4.5" width="17" height="12" rx="2" /><path d="M12 16.5v3M9 19.5h6" /><path d="M8.5 13v-3M12 13V8.5M15.5 13v-1.5" /></>,
   live: <><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" /><path d="M3.5 9h17" /><path d="M9.5 15.5a3.5 3.5 0 0 1 5 0M7.5 13.25a6.5 6.5 0 0 1 9 0" /></>,
 };
 

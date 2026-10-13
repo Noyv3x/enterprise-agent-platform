@@ -9,6 +9,13 @@ Copyright (c) 2025 Cocoon AI
 
 Hermes Agent repository copyright (c) 2025 Nous Research
 
+## What was changed
+
+- The template was redrawn with CSS variables for light and dark themes, solid
+  fills, larger label sizes, and a narrow-panel scroll container with a hint.
+- `SKILL.md` is a new compact workflow that requires the publish, view and fix
+  loop; the original semantic color roles are retained as CSS classes.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

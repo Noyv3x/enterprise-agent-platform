@@ -1,8 +1,9 @@
 /* Adapted from Beautiful UI components/primitives/ContextCards.tsx (MIT, see ../NOTICE).
  * Adaptations: each card is a real file (message attachment or delivered `MEDIA:` file) instead of a retrieved
- * demo chunk: the bar names the file and its size, the body holds the caller's preview (image thumbnail or an
- * on-request document preview), and the source chip is the authorized download link; the header is optional;
- * the chip's entrance delay timer is dropped. Markup, classes and motion are upstream's. */
+ * demo chunk: the bar names the file and its size, the body holds the caller's image thumbnail (documents never
+ * expand inside the card; the caller's 打开 chip in `actions` shows them in the side panel), and the source chip is
+ * the authorized download link; the header is optional; the chip's entrance delay timer is dropped. Markup, classes
+ * and motion are upstream's. */
 import type { ReactNode } from "react";
 
 /* ─────────────────────────────────────────────────────────
@@ -15,7 +16,7 @@ export type ContextFile = {
   title: string;
   /** e.g. "12.4 KB" */
   chars: string;
-  /** preview body (image, document frame); omitted when the format has none */
+  /** preview body (an image thumbnail); omitted when the format has none */
   body?: ReactNode;
   /** short type badge, e.g. "PDF" */
   badge: string;
@@ -24,7 +25,7 @@ export type ContextFile = {
   href: string;
   /** accessible name of the download chip */
   downloadLabel: string;
-  /** extra chips next to the download chip (e.g. a preview toggle) */
+  /** extra chips next to the download chip (e.g. 打开 in the side panel) */
   actions?: ReactNode;
 };
 

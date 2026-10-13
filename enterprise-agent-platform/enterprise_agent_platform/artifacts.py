@@ -30,6 +30,8 @@ from starlette.routing import Route
 
 from .auth import body_json, current_user
 from .db import now
+from .file_viewer import OFFICE_KINDS, VIEW_CSP, VIEW_HEADERS, shell, wants_lang, wants_raw
+from .file_viewer import routes as viewer_routes
 from .files import MAX_FILE, open_workspace
 
 MAX_FILES = 1000
@@ -47,6 +49,9 @@ KIND_EXTENSIONS = {
     'table': ('.csv', '.tsv'),
     'image': ('.png', '.jpg', '.jpeg', '.gif', '.webp'),
     'pdf': ('.pdf',),
+    'docx': ('.docx',),
+    'xlsx': ('.xlsx',),
+    'pptx': ('.pptx',),
     'code': ('.txt', '.json', '.jsonl', '.yaml', '.yml', '.toml', '.ini', '.xml', '.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx',
              '.css', '.scss', '.less', '.py', '.rb', '.go', '.rs', '.java', '.kt', '.c', '.h', '.cc', '.cpp', '.hpp', '.cs',
              '.php', '.sh', '.bash', '.zsh', '.sql', '.lua', '.swift', '.r', '.tex', '.log', '.diff', '.patch', '.vue',
@@ -60,10 +65,11 @@ MIME_OVERRIDES = {
     '.wasm': 'application/wasm', '.webmanifest': 'application/manifest+json',
     '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.otf': 'font/otf', '.xml': 'application/xml',
     '.webp': 'image/webp', '.ico': 'image/x-icon', '.pdf': 'application/pdf', '.jsx': 'text/javascript',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 }
 TEXT_MIMES = ('application/json', 'application/xml', 'application/javascript', 'image/svg+xml', 'application/manifest+json')
-VIEW_CSP = ("sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-downloads "
-            "allow-presentation allow-pointer-lock; frame-ancestors 'self'")
 BLOB = re.compile(r'[0-9a-f]{64}')
 # The renderer's own requests also forbid external frames: the screenshot service is an unfiltered browser, so a page must
 # not embed another origin and have it photographed. Ordinary user viewing keeps unrestricted network (product decision).
@@ -72,8 +78,6 @@ RENDER_TOKEN_TTL = 300
 RENDER_QUERY = '__eap_render'
 RUNTIME_FILE = 'artifact-runtime.js'
 HTML_INJECT_LIMIT = 8 * 1024 * 1024
-VIEW_HEADERS = {'Content-Security-Policy': VIEW_CSP, 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff',
-                'Access-Control-Allow-Origin': '*', 'Cross-Origin-Resource-Policy': 'cross-origin', 'X-Frame-Options': 'SAMEORIGIN'}
 RENDERABLE_KINDS = ('web', 'site', 'svg')
 RENDERABLE_MIMES = ('text/html', 'image/svg+xml')
 CAPTURE_PADDING = 24
@@ -433,14 +437,15 @@ class Artifacts:
     def page_url(self, row, number, page):
         """`(view URL path, resolved page)` of a renderable page of one version, with a freshly minted token."""
         with self.p.db.connect() as conn:
-            if row['kind'] not in RENDERABLE_KINDS:
+            if row['kind'] not in RENDERABLE_KINDS + OFFICE_KINDS:
                 raise ArtifactError(400, 'artifact_not_renderable', f"{row['kind']} artifacts have no page to render")
             try:
                 version, manifest = self.version(conn, row['id'], row['latest_version'] if number is None else number)
             except HTTPException:
                 raise ArtifactError(404, 'artifact_not_found', 'No such artifact version') from None
-        relative = resolve_page(manifest, version['entry'], page)
-        if manifest[relative]['mime'].split(';')[0] not in RENDERABLE_MIMES:
+        # An Office version renders through the viewer shell its entry URL answers with; it has exactly one page.
+        relative = version['entry'] if row['kind'] in OFFICE_KINDS else resolve_page(manifest, version['entry'], page)
+        if row['kind'] not in OFFICE_KINDS and manifest[relative]['mime'].split(';')[0] not in RENDERABLE_MIMES:
             raise ArtifactError(400, 'artifact_not_renderable', f'{relative} is not an HTML or SVG page')
         token, _ = self.mint(row['id'], version['version'], renderer=True)
         return f'/artifact-view/{token}/{quote(relative)}', relative, version['version']
@@ -726,6 +731,7 @@ async def artifact_view(request):
             row, manifest = p.artifacts.version(conn, *granted[:2])
         except HTTPException:
             raise HTTPException(404, 'Not found') from None
+        artifact = conn.execute('SELECT kind,title FROM artifacts WHERE id=?', (granted[0],)).fetchone()
     parts = [part for part in request.path_params.get('path', '').split('/') if part]
     if any(part in ('..', '.') or '\\' in part or '\0' in part for part in parts):
         raise HTTPException(404, 'Not found')
@@ -745,6 +751,8 @@ async def artifact_view(request):
     path = p.artifacts.blob(item['sha256']) if item else None
     if path is None or not path.is_file():
         raise HTTPException(404, 'Not found')
+    if artifact is not None and artifact['kind'] in OFFICE_KINDS and relative == row['entry'] and not wants_raw(request):
+        return shell(artifact['kind'], artifact['title'], stacked=granted[2], lang=wants_lang(request))
     headers = {**VIEW_HEADERS, 'Cache-Control': 'private, max-age=7200'}
     if granted[2]:
         headers['Content-Security-Policy'] = RENDER_CSP
@@ -840,4 +848,4 @@ def routes():
             Route('/api/artifacts/{id}/live/capture', artifact_capture, methods=['POST']),
             Route('/api/artifacts/{id}/live', artifact_live_stop, methods=['DELETE']),
             Route('/api/artifacts/{id}', artifact_detail), Route('/artifact-view/{token}/{path:path}', artifact_view),
-            Route('/artifact-runtime.js', artifact_runtime)]
+            Route('/artifact-runtime.js', artifact_runtime)] + viewer_routes()

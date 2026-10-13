@@ -140,3 +140,23 @@ describe('thinking blocks', () => {
     expect(screen.getByRole('button', { name: 'Thought for 4s' })).toBeVisible();
   });
 });
+
+describe('file change chips', () => {
+  beforeEach(() => window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en'));
+  afterEach(cleanup);
+
+  it('count an overwrite exactly from its patch and fall back to the written lines without one', () => {
+    const write = (id: string, path: string, patch?: string): WorkItem => ({
+      type: 'tool', id, name: 'write', args: { path, content: 'a\nB\nc\n' }, status: 'done', output: '', startedAt: NOW - 5000, endedAt: NOW - 4000,
+      ...(patch ? { patch } : {}),
+    });
+    render(view([
+      write('w1', '/workspace/report.md', '--- report.md\n+++ report.md\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n'),
+      write('w2', '/workspace/new.md'),
+    ]));
+    const changed = screen.getByRole('button', { name: 'Show changes to report.md' });
+    expect(changed).toHaveTextContent('+1');
+    expect(changed).toHaveTextContent('−1');
+    expect(screen.getByRole('button', { name: 'Show changes to new.md' })).toHaveTextContent(/^new\.md\+3$/);
+  });
+});

@@ -138,8 +138,7 @@ jobs:
           npm test
 
       - name: Audit runtime dependencies
-        # Documented, path-specific exception: see audit-exceptions.json.
-        run: npm audit --json | python3 ../../scripts/npm-audit-gate.py audit-exceptions.json
+        run: npm audit --audit-level=high
 
   manager:
     name: Manager (Go)

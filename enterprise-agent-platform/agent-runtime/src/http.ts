@@ -3,7 +3,7 @@ import { createServer as nodeCreateServer, type IncomingMessage, type ServerResp
 import type { Runtime } from './runtime.js';
 import { validateMcp } from './mcp.js';
 
-type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history'>;
+type Service = Pick<Runtime, 'start' | 'steer' | 'removeInput' | 'events' | 'cancel' | 'cancelSession' | 'compact' | 'delete' | 'history' | 'title'>;
 const tools = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'web_search', 'web_fetch', 'browser', 'schedule', 'mcp', 'task', 'job', 'wait', 'skill', 'artifact'];
 const thinking = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 function failure(status: number, message: string): Error & { status: number } {
@@ -14,11 +14,21 @@ function object(value: unknown): value is Record<string, unknown> {
 }
 function text(value: unknown): value is string { return typeof value === 'string' && value.length > 0; }
 function validateModel(model: unknown): asserts model is Parameters<Runtime['start']>[1]['model'] {
-  if (!object(model) || !text(model.id) || typeof model.thinking !== 'string' || !thinking.includes(model.thinking)) throw failure(400, 'Invalid model');
+  if (!object(model) || !text(model.id) || typeof model.thinking !== 'string' || !(thinking.includes(model.thinking) || model.thinking === 'auto')) throw failure(400, 'Invalid model');
   for(const key of ['contextWindow','maxTokens']){
     const value=model[key];
     if(value!==undefined&&(typeof value!=='number'||!Number.isSafeInteger(value)||value<1))throw failure(400,`Invalid model ${key}`);
   }
+}
+// `judge.thinking` is never `auto`: the judge decides the depth, nothing decides the judge's.
+function validateJudge(judge: unknown): asserts judge is NonNullable<Parameters<Runtime['start']>[1]['judge']> {
+  if (!object(judge) || judge.thinking === 'auto') throw failure(400, 'Invalid judge');
+  try { validateModel(judge); } catch { throw failure(400, 'Invalid judge'); }
+}
+function validateTitle(value: unknown): asserts value is Parameters<Runtime['title']>[0] {
+  if (!object(value) || typeof value.text !== 'string' || !value.text.trim() || value.text.length > 8000) throw failure(400, 'Invalid text');
+  validateJudge(value.judge);
+  if (value.files !== undefined && (!Array.isArray(value.files) || value.files.length > 20 || !value.files.every(name => text(name) && name.length <= 255))) throw failure(400, 'Invalid files');
 }
 function validatePrompt(prompt: unknown): asserts prompt is Parameters<Runtime['start']>[1]['prompt'] {
   if (!object(prompt) || typeof prompt.text !== 'string' || (prompt.images !== undefined && (!Array.isArray(prompt.images) || !prompt.images.every(image => object(image) && text(image.mime) && text(image.data))))) throw failure(400, 'Invalid prompt');
@@ -34,6 +44,8 @@ function validateRun(value: unknown): asserts value is Parameters<Runtime['start
   const { sandbox, model, prompt, resources } = value;
   if (!object(sandbox) || !['scope_key', 'workspace_id', 'sandbox_id', 'lifecycle_id', 'cwd'].every(key => text(sandbox[key])) || !['agent', 'chat'].includes(String(sandbox.profile))) throw failure(400, 'Invalid sandbox');
   validateModel(model);
+  // Automatic depth cannot run without its judge.
+  if (model.thinking === 'auto' || value.judge !== undefined) validateJudge(value.judge);
   validatePrompt(prompt);
   if (value.context_prefix !== undefined && typeof value.context_prefix !== 'string') throw failure(400, 'Invalid context_prefix');
   if (!object(resources) || typeof resources.system_prompt !== 'string' || !Array.isArray(resources.skills) || !resources.skills.every(skill => object(skill) && text(skill.name) && typeof skill.description === 'string' && text(skill.location)) || (resources.agents_md !== null && resources.agents_md !== undefined && (!object(resources.agents_md) || !text(resources.agents_md.path) || typeof resources.agents_md.content !== 'string'))) throw failure(400, 'Invalid resources');
@@ -96,6 +108,13 @@ export function createServer(runtime: Service, token: string, maxBodyBytes = 33_
       if (url.pathname === '/health') {
         if (method !== 'GET') { response.setHeader('allow', 'GET'); throw failure(405, 'Method not allowed'); }
         json(response, 200, { status: 'ok', service: 'agent-platform-runtime' });
+        return;
+      }
+      if (url.pathname === '/v1/titles') {
+        if (method !== 'POST') { response.setHeader('allow', 'POST'); throw failure(405, 'Method not allowed'); }
+        const input = await body(request, Math.min(maxBodyBytes, 1_048_576));
+        validateTitle(input);
+        json(response, 200, await runtime.title(input));
         return;
       }
       const route = /^\/v1\/(sessions|runs)\/([^/]+)(?:\/(runs|events|steer|cancel|compact|history)|\/(inputs)\/([^/]+))?$/.exec(url.pathname);

@@ -44,14 +44,14 @@ export function RendererLoading() {
   );
 }
 
-/** A failed load with the server's reason and a retry. */
-export function RendererFailed({ error, retry }: { error: Error; retry: () => void }) {
+/** A failed load with the server's reason and a retry; `title` names what failed (default: the artifact). */
+export function RendererFailed({ error, retry, title }: { error: Error; retry: () => void; title?: string }) {
   const w = useWords();
   return (
     <div className="p-4">
       <Notice
         tone="danger"
-        title={w("Couldn't load this artifact", "无法载入作品内容", "無法載入作品內容")}
+        title={title ?? w("Couldn't load this artifact", "无法载入作品内容", "無法載入作品內容")}
         action={<Button size="xs" onClick={retry}>{w("Retry", "重试", "重試")}</Button>}
       >
         {error.message}

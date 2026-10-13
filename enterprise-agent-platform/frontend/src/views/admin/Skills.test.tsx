@@ -148,6 +148,6 @@ describe('Admin → Skills', () => {
     });
     renderAdmin('#admin/groups');
 
-    expect(await screen.findByLabelText('Permissions: Chat, Personal AI, Install skills and connectors')).toBeVisible();
+    expect(await screen.findByLabelText('Permissions: Plain chat, Personal AI, Install skills and connectors')).toBeVisible();
   });
 });

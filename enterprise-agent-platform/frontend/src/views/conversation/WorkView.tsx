@@ -2,7 +2,7 @@ import { memo, useContext, useEffect, useMemo, useRef, useState, type ReactNode 
 import ThinkingState, { TraceProse, TraceStep, TraceThinking } from "../../components/ui/beautiful/primitives/ThinkingState";
 import ToolChips, { type ToolChildRow, type ToolDetailLine, type ToolDiff, type ToolDiffLine, type ToolStep } from "../../components/ui/beautiful/primitives/ToolChips";
 import { useWords } from "../../words";
-import { ComputerContext, fileName } from "./computerView";
+import { ComputerContext, fileName, parsePatch } from "./computerView";
 import { Markdown } from "./Markdown";
 import { TASK_TOOL_STATE, TasksContext, agentTypeLabel, isRunning, promotedTaskId, taskElapsed, taskStatusLabel, tokenCount, type TasksValue, type TaskView } from "./taskState";
 import { formatThinking } from "./thinking";
@@ -158,6 +158,14 @@ function describe(tool: ToolItem, w: Words, labels: McpLabels): Described {
       // a connector's tool already names connector and tool in its verb; its arguments are the detail
       chip = mcpToolName(tool.name) ? "" : arg(args, "_preview") || arg(args, "detail") || json;
       input = json ? lines(JSON.stringify(args, null, 2), "muted") : [];
+    }
+  }
+  // A finished edit or write with its whole patch counts exactly (an overwrite's removed lines too).
+  if (diff && tool.patch && !tool.patchCut) {
+    const patch = parsePatch(tool.patch);
+    if (!patch.cut) {
+      diff = { ...diff, add: patch.added, del: patch.removed };
+      diffLines = patch.rows.flatMap((row) => (row.type === "add" || row.type === "del" ? [{ text: row.text, tone: row.type }] : [])).slice(0, 10);
     }
   }
   // Oversized arguments arrive as a JSON preview only.

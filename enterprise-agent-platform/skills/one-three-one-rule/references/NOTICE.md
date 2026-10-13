@@ -11,6 +11,12 @@ Hermes Agent repository copyright (c) 2025 Nous Research
 
 Original Skill author: Willard Moore
 
+## What was changed
+
+- Broadened from technical choices to business decisions; added assumptions,
+  proportional output, no-invented-figures rule, a Chinese template and a
+  document handoff. The 1-3-1 structure itself is unchanged.
+
 ## MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

@@ -95,31 +95,34 @@ class IdentityTests(unittest.TestCase):
         for body in ({'model_policy': []}, {'model_policy': 'missing'}, {'model_name': 'x'}, {'chat_model_name': 'x'}, {'thinking_depth': 'low'}):
             self.assertEqual(self.client.patch(user_path, json=body).status_code, 400, body)
 
-    def policy(self, name='light', **overrides):
-        slots = {slot: {'model': 'm-' + name, 'thinking': 'low'} for slot in ('personal', 'channel', 'chat', 'scout', 'worker')}
-        return {'name': name, 'label': name.title(), 'slots': {**slots, **overrides}}
+    def policy(self, name='light', main=None, judge=None):
+        return {'name': name, 'label': name.title(), 'main': {'model': 'm-' + name, 'thinking': 'low', **(main or {})},
+                'judge': {'model': 'j-' + name, 'thinking': 'low', **(judge or {})}}
 
     def test_model_policy_list_validation_and_referenced_group_removal(self):
         self.login()
         listing = self.client.get('/api/admin/model-policies').json()
         self.assertEqual([p['name'] for p in listing['policies']], ['default'])
         self.assertEqual(listing['members'], {'default': 2})
-        self.assertEqual(listing['policies'][0]['slots']['chat'], {'model': '', 'thinking': 'medium'})
+        self.assertEqual(listing['policies'][0], {'name': 'default', 'label': '默认', 'main': {'model': '', 'thinking': 'medium'},
+                                                  'judge': {'model': '', 'thinking': 'low'}})
         default = listing['policies'][0]
         light = self.policy()
-        broken_slot = self.policy(chat={'model': 'x', 'thinking': 'none'})
         invalid = [
             {}, {'policies': []}, {'policies': 'x'}, {'policies': [default], 'extra': 1}, {'policies': [5]},
             {'policies': [{**default, 'name': 'Bad Name'}]}, {'policies': [{**default, 'name': '1abc'}]},
             {'policies': [{**default, 'name': 'a' * 65}]}, {'policies': [default, default]},
             {'policies': [{**default, 'label': ''}]}, {'policies': [{**default, 'label': 'x' * 65}]}, {'policies': [{**default, 'label': 3}]},
             {'policies': [{k: v for k, v in default.items() if k != 'label'}]}, {'policies': [{**default, 'extra': 1}]},
-            {'policies': [{**default, 'slots': {k: v for k, v in default['slots'].items() if k != 'scout'}}]},
-            {'policies': [{**default, 'slots': {**default['slots'], 'extra': default['slots']['chat']}}]},
-            {'policies': [broken_slot, default]}, {'policies': [self.policy(chat={'model': 'x' * 129, 'thinking': 'low'}), default]},
-            {'policies': [self.policy(chat={'model': 5, 'thinking': 'low'}), default]},
-            {'policies': [self.policy(chat={'model': 'x'}), default]}, {'policies': [self.policy(chat={'model': 'x', 'thinking': 'low', 'e': 1}), default]},
-            {'policies': [self.policy(chat='x'), default]},
+            # The per-usage slots are gone; both parts are required.
+            {'policies': [{k: v for k, v in default.items() if k != 'judge'}]}, {'policies': [{k: v for k, v in default.items() if k != 'main'}]},
+            {'policies': [{**default, 'slots': {'personal': default['main']}}]},
+            {'policies': [self.policy(main={'thinking': 'none'}), default]}, {'policies': [self.policy(main={'model': 'x' * 129}), default]},
+            {'policies': [self.policy(main={'model': 5}), default]}, {'policies': [self.policy(judge={'model': 'x' * 129}), default]},
+            {'policies': [{**light, 'main': {'model': 'x'}}, default]}, {'policies': [{**light, 'main': {'model': 'x', 'thinking': 'low', 'e': 1}}, default]},
+            {'policies': [{**light, 'judge': 'x'}, default]}, {'policies': [{**light, 'main': 'x'}, default]},
+            # The judge never uses automatic depth.
+            {'policies': [self.policy(main={'model': 'gpt-6.1-sol', 'thinking': 'auto'}, judge={'thinking': 'auto'}), default]},
         ]
         for body in invalid:
             self.assertEqual(self.client.put('/api/admin/model-policies', json=body).status_code, 400, body)
@@ -141,6 +144,24 @@ class IdentityTests(unittest.TestCase):
         self.login('member', 'old-password')
         self.assertEqual(self.client.get('/api/admin/model-policies').status_code, 403)
         self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [default]}).status_code, 403)
+
+    def test_automatic_thinking_needs_an_explicit_gpt6_family_main_model(self):
+        self.login()
+        default = self.client.get('/api/admin/model-policies').json()['policies'][0]
+        refused = ['', 'gpt-5.5', 'gpt-60', 'gpt-6x', 'GPT-6.1-sol', ' gpt-6.1-sol', 'xgpt-6-sol', 'o3']
+        for model in refused:
+            response = self.client.put('/api/admin/model-policies', json={'policies': [self.policy(main={'model': model, 'thinking': 'auto'}), default]})
+            self.assertEqual((response.status_code, response.json()['error']), (400, 'Automatic thinking depth requires a GPT-6 model'), model)
+        self.assertEqual(self.client.get('/api/admin/model-policies').json()['policies'], [default])
+        accepted = [self.policy(f'g{i}', main={'model': model, 'thinking': 'auto'}, judge={'model': '', 'thinking': 'xhigh'})
+                    for i, model in enumerate(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6', 'gpt-6.2'])]
+        saved = self.client.put('/api/admin/model-policies', json={'policies': [default, *accepted]})
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual([p['main']['thinking'] for p in saved.json()['policies']], ['medium'] + ['auto'] * 5)
+        self.assertEqual(auth.model_policies(self.p.db)[1]['judge'], {'model': '', 'thinking': 'xhigh'})
+        # Every other depth is valid for any model, including the system default.
+        for thinking in ('off', 'minimal', 'low', 'medium', 'high', 'xhigh'):
+            self.assertEqual(self.client.put('/api/admin/model-policies', json={'policies': [self.policy(main={'model': '', 'thinking': thinking}), default]}).status_code, 200)
 
     def test_user_create_and_update_carry_the_model_policy(self):
         self.login()

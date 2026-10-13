@@ -693,7 +693,7 @@ test('HTTP runs stream real Pi text, thinking, sandbox and gateway tools, aggreg
   assert.equal(f.usage.length,2);
   const sum = (key:keyof Pick<Usage,'input'|'output'|'cacheRead'|'cacheWrite'|'totalTokens'>) => f.usage.reduce((total,usage)=>total+usage[key],0);
   assert(sum('cacheRead')>0 && sum('cacheWrite')>0);
-  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Finished from sandbox and web',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:f.faux.getModel().id,side_effects:true,undelivered_inputs:[]});
+  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Finished from sandbox and web',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:f.faux.getModel().id,effort:'off',side_effects:true,undelivered_inputs:[]});
   assert.deepEqual(await f.events(id,events.length-1),[events.at(-1)]);
   assert.deepEqual(f.executorCalls.map(c=>c.path),['/v1/executor/audit','/v1/executor/process/start','/v1/executor/process/read']);
   assert(f.executorCalls[0] && f.executorCalls[1] && f.gatewayCalls[0]);
@@ -1049,7 +1049,7 @@ test('automatic threshold compaction streams its lifecycle, accounts for summary
   const currentUsage=f.usage.slice(1);
   const sum=(key:keyof Pick<Usage,'input'|'output'|'cacheRead'|'cacheWrite'|'totalTokens'>)=>currentUsage.reduce((total,usage)=>total+usage[key],0);
   assert(f.usage[2]!.input>0 && f.usage[2]!.output>0,'summary usage must contribute to the run total');
-  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Answer before automatic compaction.',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:'runtime-proof',side_effects:false,undelivered_inputs:[]});
+  assert.deepEqual(events.at(-1),{seq:events.length,type:'run_end',status:'completed',text:'Answer before automatic compaction.',usage:{input:sum('input'),output:sum('output'),cache_read:sum('cacheRead'),cache_write:sum('cacheWrite'),total:sum('totalTokens')},model:'runtime-proof',effort:'off',side_effects:false,undelivered_inputs:[]});
   assert.equal(events.filter(event=>event.type==='text_delta').map(event=>event.delta).join(''),'Answer before automatic compaction.','summary text must not leak into assistant output');
   assert.deepEqual(await f.events(id),events,'SSE replay must preserve the compaction lifecycle and final usage');
   const history=await f.http('/v1/sessions/agent-private-1/history');

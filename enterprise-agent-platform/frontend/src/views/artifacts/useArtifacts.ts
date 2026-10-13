@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { request, type ArtifactPreview, type ArtifactView, type ArtifactVersion } from "../../api";
+import type { Attachment } from "../conversation/types";
 import { errorText } from "../conversation/useConversation";
 
 /** The artifact version the panel shows. `follow` (viewing the latest) moves it to each new version; null until the
@@ -37,6 +38,11 @@ export interface ArtifactsState {
   previewOf: (id: number) => ArtifactPreview | null;
   /** fetches the open artifact again (a live preview after 停止服务) */
   refreshDetail: () => void;
+  /** the attachment the panel shows in file mode, over the artifact or list beneath it */
+  file: Attachment | null;
+  openFile: (file: Attachment) => void;
+  /** leaves file mode, back to what was open beneath */
+  closeFile: () => void;
 }
 
 /** How long "已更新到 vN" stays in the toolbar. */
@@ -67,6 +73,7 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
   const [selection, setSelection] = useState<ArtifactSelection | null>(null);
   const [notice, setNotice] = useState<VersionNotice | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [file, setFile] = useState<Attachment | null>(null);
   const [round, setRound] = useState(0);
   const streamed = useRef(previews);
   streamed.current = previews;
@@ -146,12 +153,12 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
   // Follow the open artifact's new versions, or say a newer one exists; reveal a new artifact on desktop.
   const revealed = useRef(new Set<number>());
   const handled = useRef(0);
-  const state = useRef({ selection, shown, narrow, reveal });
-  state.current = { selection, shown, narrow, reveal };
+  const state = useRef({ selection, shown, narrow, reveal, file });
+  state.current = { selection, shown, narrow, reveal, file };
   useEffect(() => {
     if (!lastPublished || lastPublished.seq <= handled.current) return;
     handled.current = lastPublished.seq;
-    const { selection: current, shown: visible, narrow: phone, reveal: show } = state.current;
+    const { selection: current, shown: visible, narrow: phone, reveal: show, file: showing } = state.current;
     const { id, version, seq } = lastPublished;
     if (current?.id === id) {
       if (current.version >= version) return;
@@ -163,12 +170,13 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
       }
       return;
     }
-    // Another artifact stays in view; a new one takes an empty panel, or opens it on desktop once.
-    if (visible && current) return;
+    // Another artifact or a file stays in view; a new one takes an empty panel, or opens it on desktop once.
+    if (visible && (current || showing)) return;
     if (visible || (!phone && !revealed.current.has(id))) {
       revealed.current.add(id);
       setSelection({ id, version, follow: true });
       setNotice(null);
+      setFile(null);
       if (!visible) show();
     }
   }, [lastPublished]);
@@ -184,6 +192,7 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
     revealed.current.add(id);
     setSelection({ id, version, follow: known && details[id] ? version >= known.latest_version : null });
     setNotice(null);
+    setFile(null);
   }, [artifacts, details]);
 
   const chooseVersion = useCallback((version: number) => {
@@ -195,6 +204,9 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
     setSelection(null);
     setNotice(null);
   }, []);
+
+  const openFile = useCallback((next: Attachment) => setFile(next), []);
+  const closeFile = useCallback(() => setFile(null), []);
 
   const reloadDetail = useCallback(() => {
     setDetailError(null);
@@ -215,6 +227,6 @@ export function useArtifacts({ scope, published, lastPublished, previews, shown,
     list, listError, reloadList: loadList,
     selection, artifact, versions, detailLoaded: Boolean(detail),
     detailError: detailError && detailError.id === selectedId ? detailError.text : "",
-    notice, open, chooseVersion, back, reloadDetail, previewOf, refreshDetail,
+    notice, open, chooseVersion, back, reloadDetail, previewOf, refreshDetail, file, openFile, closeFile,
   };
 }

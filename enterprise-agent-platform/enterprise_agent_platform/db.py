@@ -272,7 +272,7 @@ def _chat_model_follows_personal_ai(conn: sqlite3.Connection) -> None:
         conn.execute('ALTER TABLE chat_conversations DROP COLUMN model_id')
 
 
-MODEL_SLOTS = ('personal', 'channel', 'chat', 'scout', 'worker')
+_V1_POLICY_SLOTS = ('personal', 'channel', 'chat', 'scout', 'worker')
 THINKING_DEPTHS = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh')
 
 
@@ -293,13 +293,35 @@ def _model_policy_groups(conn: sqlite3.Connection) -> None:
     thinking = 'off' if thinking == 'none' else thinking if thinking in THINKING_DEPTHS else 'medium'
     chat_model = chat_model or model
     slots = {'personal': model, 'channel': model, 'chat': chat_model, 'scout': chat_model, 'worker': model}
-    policies = [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': slots[slot], 'thinking': thinking} for slot in MODEL_SLOTS}}]
+    policies = [{'name': 'default', 'label': '默认', 'slots': {slot: {'model': slots[slot], 'thinking': thinking} for slot in _V1_POLICY_SLOTS}}]
     conn.execute("INSERT OR IGNORE INTO settings(key,value,secret,updated_at) VALUES('model_policies_v1',?,0,CAST(strftime('%s','now') AS INTEGER))",
                  (json.dumps(policies, ensure_ascii=False),))
     conn.execute("UPDATE users SET model_policy='default'")
     for column in ('model_name', 'chat_model_name', 'thinking_depth'):
         if column in columns:
             conn.execute(f'ALTER TABLE users DROP COLUMN {column}')
+
+
+def _model_policy_main_judge(conn: sqlite3.Connection) -> None:
+    """Convert `model_policies_v1` (per-usage slots) to `model_policies_v2` (`main` + `judge`) and add the chat title state.
+
+    `main` is the old `personal` slot; the judge follows the main model at `low` depth. Conversations still titled with
+    a client placeholder stay eligible for a generated title; every other title counts as the user's own.
+    """
+    row = conn.execute("SELECT value FROM settings WHERE key='model_policies_v1'").fetchone()
+    if row is not None and not conn.execute("SELECT 1 FROM settings WHERE key='model_policies_v2'").fetchone():
+        policies = []
+        for policy in json.loads(row[0]):
+            personal = policy['slots']['personal']
+            policies.append({'name': policy['name'], 'label': policy['label'],
+                             'main': {'model': personal['model'], 'thinking': personal['thinking']},
+                             'judge': {'model': '', 'thinking': 'low'}})
+        conn.execute("INSERT INTO settings(key,value,secret,updated_at) VALUES('model_policies_v2',?,0,CAST(strftime('%s','now') AS INTEGER))",
+                     (json.dumps(policies, ensure_ascii=False),))
+    conn.execute("DELETE FROM settings WHERE key='model_policies_v1'")
+    if 'title_state' not in {column[1] for column in conn.execute('PRAGMA table_info(chat_conversations)')}:
+        conn.execute("ALTER TABLE chat_conversations ADD COLUMN title_state TEXT NOT NULL DEFAULT 'user' CHECK(title_state IN ('placeholder','generated','user'))")
+        conn.execute("UPDATE chat_conversations SET title_state='placeholder' WHERE title IN ('New chat','新聊天')")
 
 
 def _skills(conn: sqlite3.Connection) -> None:
@@ -506,6 +528,7 @@ _MIGRATIONS = (
 )""",
         'CREATE INDEX IF NOT EXISTS idx_artifact_previews_task ON artifact_previews(task_id)',
     )),
+    (2026102101, 'model-policy-main-judge', _model_policy_main_judge),
 )
 
 

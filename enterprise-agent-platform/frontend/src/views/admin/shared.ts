@@ -7,13 +7,15 @@ export interface ModelOption { id: string; name: string }
 export interface ModelCatalog { models: ModelOption[]; connected: boolean }
 export interface PermissionGroup { name: string; permissions: string[] }
 
+/** Thinking depths in display order; a judge may use any of them. */
 export const THINKING_DEPTHS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
-/** Fixed usage slots of a model policy group, in display order. */
-export const POLICY_SLOTS = ['personal', 'channel', 'chat', 'scout', 'worker'] as const;
-export type PolicySlot = (typeof POLICY_SLOTS)[number];
-/** `model: ''` is the system default: the first model in the live catalog. */
-export interface SlotSetting { model: string; thinking: string }
-export interface ModelPolicy { name: string; label: string; slots: Record<PolicySlot, SlotSetting> }
+/** A main model may also use `auto`: the judge picks a depth for every turn. */
+export const MAIN_THINKING_DEPTHS = ['auto', ...THINKING_DEPTHS] as const;
+/** `auto` needs an explicitly chosen GPT-6-family main model (the system default never qualifies). */
+export const AUTO_THINKING_MODEL = /^gpt-6([.-]|$)/;
+/** `main.model: ''` is the system default (the first model in the live catalog); `judge.model: ''` uses the group's main model. */
+export interface ModelSetting { model: string; thinking: string }
+export interface ModelPolicy { name: string; label: string; main: ModelSetting; judge: ModelSetting }
 /** `GET`/`PUT /api/admin/model-policies`; `members` counts every account (active or not) per group name. */
 export interface ModelPolicies { policies: ModelPolicy[]; members: Record<string, number> }
 export const PERMISSIONS = ['read_workspace', 'chat', 'private_agent', 'install_extensions', 'manage_channels', 'manage_users', 'system_settings'] as const;
@@ -69,6 +71,7 @@ export function useAdminLabels() {
     viewer: w('Viewer', '只读', '唯讀'),
   };
   const depths: Record<string, string> = {
+    auto: w('Auto', '自动', '自動'),
     off: w('Off', '关闭', '關閉'),
     minimal: w('Minimal', '极低', '極低'),
     low: w('Low', '低', '低'),
@@ -76,16 +79,9 @@ export function useAdminLabels() {
     high: w('High', '高', '高'),
     xhigh: w('Extra high', '超高', '超高'),
   };
-  const slots: Record<PolicySlot, { label: string; hint: string }> = {
-    personal: { label: w('Personal AI', '个人 AI', '個人 AI'), hint: w('Personal AI conversations, schedules and background-task notices.', '个人 AI 对话、定时任务和后台任务通知。', '個人 AI 對話、排程任務和背景任務通知。') },
-    channel: { label: w('Channels', '频道', '頻道'), hint: w('The channel agent, chosen by the group of the person who sent the message.', '频道 Agent，按发消息者所在的策略组选择。', '頻道 Agent，依發訊息者所在的策略群組選擇。') },
-    chat: { label: w('Chat', '聊天', '聊天'), hint: w('Standard chat conversations.', '标准聊天对话。', '標準聊天對話。') },
-    scout: { label: w('Research subagent', '调研子智能体', '調研子智慧體'), hint: w('Research subagents the personal AI starts.', '个人 AI 启动的调研子智能体。', '個人 AI 啟動的調研子智慧體。') },
-    worker: { label: w('Task subagent', '执行子智能体', '執行子智慧體'), hint: w('Task subagents the personal AI starts.', '个人 AI 启动的执行子智能体。', '個人 AI 啟動的執行子智慧體。') },
-  };
   const permissions: Record<string, string> = {
     read_workspace: w('Read workspace', '读取工作区', '讀取工作區'),
-    chat: w('Chat', '聊天', '聊天'),
+    chat: w('Plain chat', '纯聊天模式', '純聊天模式'),
     private_agent: w('Personal AI', '个人 AI', '個人 AI'),
     install_extensions: w('Install skills and connectors', '安装技能和连接器', '安裝技能和連接器'),
     manage_channels: w('Manage channels', '管理频道', '管理頻道'),
@@ -96,8 +92,6 @@ export function useAdminLabels() {
     group: (name: string) => groups[name] ?? name,
     depth: (value: string) => depths[value === 'none' ? 'off' : value] ?? value,
     permission: (name: string) => permissions[name] ?? name,
-    slot: (slot: PolicySlot) => slots[slot].label,
-    slotHint: (slot: PolicySlot) => slots[slot].hint,
   };
 }
 

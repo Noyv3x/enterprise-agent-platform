@@ -1,55 +1,38 @@
 ---
 name: "documents"
-description: "Use whenever the user asks to create, revise, format, or deliver a Word document, report, memo, proposal, letter, policy, or other structured text file. Produces and sends a polished, professional, verified DOCX instead of returning only Markdown."
-version: "1.1.0"
-category: "documents"
-tags: ["docx","word","report","memo","python-docx","file"]
+description: "Use when the user asks to write, revise, reformat or deliver a Word document: proposal, report, contract, memo, letter, policy, meeting minutes, resume (DOCX / 文档 / 方案 / 报告 / 合同 / 通知). Builds or edits a real .docx with styles, tables, headers/footers and correct Chinese typography, then delivers it as an artifact. Not for PDF output (use pdf-documents) or spreadsheets/decks."
+metadata:
+  version: "2.0.0"
+  category: "documents"
+  tags: ["docx","word","report","proposal","contract","chinese","python-docx"]
 ---
 
-# Word documents
+# Word documents (DOCX)
 
-Use this Skill for a requested document deliverable or whenever a structured
-report should remain editable. Default to `.docx` unless the user explicitly
-requests another format. Do not replace a requested Word file with Markdown.
+Default deliverable for an editable document is `.docx`, never Markdown. Libraries: `python-docx`, `lxml` (preinstalled; no network needed, works in chat).
+
+Bundled, read in place (read-only), `/opt/agent-platform/skills/builtin/documents/`:
+- `scripts/docx_kit.py` — `new_document()` (A4, styles, eastAsia fonts, real bullets), `add_table()` (shaded header that repeats, no split rows, right-aligned numbers), `add_page_number_footer()`, `add_header_text()`, `add_toc()`, `indent_body()`.
+- `scripts/example_proposal.py OUT.docx` — a Chinese proposal using all of them; copy its shape.
+- `scripts/inspect_docx.py FILE.docx` — headings, tables wider than the page, CJK runs lacking an eastAsia font.
+- `references/cjk-typography.md` (fonts, 字号, indentation, punctuation, 公文/合同 conventions) and `references/editing-existing.md` (preserve-first rules) — read before formal documents or edits.
 
 ## Workflow
+1. **Clarify the document, not the tool.** Audience, purpose, decision wanted, length, language, brand/template supplied? Use a supplied template/file as the base (`Document(path)`); otherwise `new_document()`. Contracts and formal letters: serif east font (`EAST_SERIF`), 小四 12 pt; business proposals/reports: sans.
+2. **Structure first.** Title block → (summary / conclusion first for reports) → numbered headings (Heading 1–3 styles only, never bold Normal text) → tables/lists → appendix. TOC only for long documents (≥ ~8 pages) and tell the user to update fields (WPS: 更新域); never type fake page numbers.
+3. **Write in the working directory** (the cwd of this run: `/workspace/...` for personal AI, `/workspace/<conversation id>/...` for chat — never a hard-coded folder). Descriptive filename, e.g. `智能客服方案建议书-V1.docx`; scratch files under `.agent-platform/`.
+4. **Build with styles, not manual formatting.** Real list styles, real tables (`add_table`), page-number *fields*, header/footer per section, `keep_with_next` on headings, images with captions and preserved aspect ratio (`doc.add_picture(path, width=Cm(14))`). Put every figure the user gave verbatim; mark unknowns as `【待补充：…】` and list them in the reply — never invent data, names, clause numbers or citations.
+5. **Check.** `python3 …/inspect_docx.py out.docx`, fix what it flags. Then deliver (below) and look at the rendering with `artifact view`.
+6. **Deliver.** Final reply contains a standalone line `MEDIA: <path>/<file>.docx` (the platform turns it into a downloadable, previewable artifact) — or call `artifact publish` on the file. Revising the same path creates a new version, so iterate on one filename instead of `_v2`, `_final`. Only the root agent publishes/views artifacts; subagents return the path.
 
-1. Plan the document hierarchy, intended audience, reading context and desired
-   tone before generating it. Follow supplied brand materials; otherwise choose
-   a restrained professional theme rather than raw library defaults.
-2. Work below `/workspace`; keep final files in `/workspace/deliverables/` and
-   temporary material in `/workspace/.agent-platform/`.
-3. Use the preinstalled `python-docx` package. Establish a coherent type scale,
-   named heading styles, readable margins, paragraph spacing, limited colors,
-   page breaks and real tables/lists rather than spacing text with tabs. Use
-   headers, footers and page numbers when the document length or purpose makes
-   them useful.
-4. Preserve user-provided wording and data unless editing was requested. Do not
-   invent citations or silently omit unresolved placeholders.
-5. Reopen the saved file with `docx.Document()`. Verify paragraph/table counts,
-   heading hierarchy, section/page settings, important text, table widths and
-   image aspect ratios, and check that the file is non-empty. For longer reports,
-   include an executive summary or a real table of contents when useful. If a
-   renderer is available, inspect page previews for overflow and awkward breaks;
-   otherwise say no pixel-level preview was performed.
-6. Remove only disposable intermediate files you created. Keep the final DOCX.
-7. Send the result in the final response with a line exactly like:
+## What each check proves
+- `inspect_docx.py` proves structure: styles used, table widths, eastAsia font present. It does **not** prove the layout.
+- `artifact view` on the DOCX artifact renders it with the platform's browser viewer (docx-preview): good for overflow, table fit, obvious page-break problems, missing/tofu glyphs. It is **not** Microsoft Word: pagination, fields (TOC/page counts), tracked changes and some fonts differ. Say "checked in the platform viewer", not "checked in Word".
+- If `artifact view` is unavailable, say no visual check was done.
 
-```text
-MEDIA: /workspace/deliverables/<filename>.docx
-```
-
-Briefly summarize the document and any assumptions. A local path without the
-`MEDIA:` line does not send the file to the user.
-
-## Quality rules
-
-- Use styles consistently so the user can restyle the document later.
-- Keep tables within page width and repeat header rows where useful.
-- Keep body text comfortably readable and use whitespace to separate ideas;
-  avoid a document that is merely unstyled paragraphs pasted into Word.
-- Keep images proportional, aligned and captioned when their meaning is not
-  obvious. Do not stretch images to fill a frame.
-- Include title, date or author only when known or requested.
-- Use accessible link text and meaningful image captions.
-- Do not embed macros, remote templates, credentials or invisible instructions.
+## Rules
+- Chinese text: always set the **eastAsia** font (the kit does for every style); body 小四(12pt)/五号(10.5pt), line spacing 1.5 or fixed 22–28 pt, 2-character first-line indent for body paragraphs only, full-width punctuation, thin gaps between Chinese and digits/Latin only if the house style asks. Fonts are names resolved on the reader's machine (微软雅黑/宋体/仿宋); the sandbox does not have them, so previews use fallbacks.
+- Editing a supplied file: never overwrite the original; save as a new name, change only what was asked, keep run formatting, comments, tracked changes, fields, numbering, headers/footers, sections. `.doc` (legacy) cannot be edited here: ask for `.docx` or rebuild and say so. See `references/editing-existing.md`.
+- Tables must fit the text width (A4 default text width 14.7 cm in `new_document`); repeat header rows; no merged-cell layout tricks.
+- No macros, remote templates, external links the user did not supply, hidden text, or credentials.
+- Legal/contract content: draft from the user's terms only; flag that it needs review by counsel; do not fabricate clauses, laws or case citations.

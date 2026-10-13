@@ -65,6 +65,7 @@ class FakeCamofox:
         self.settle_hangs = False
         self.state_polls = 0
         self.loading_polls = 0
+        self.viewer_polls = 0  # evaluates that still report the Office viewer as loading
         self.garbage = None  # a hostile page's answer to every evaluate
         self.screenshots = 0
         self.app = Starlette(routes=[
@@ -108,7 +109,8 @@ class FakeCamofox:
                 await asyncio.sleep(3600)
             self.state_polls += 1
             return JSONResponse({'ok': True, 'result': self.garbage if self.garbage is not None else
-                                 ['loading' if self.state_polls <= self.loading_polls else 'complete', 'loaded']})
+                                 ['loading' if self.state_polls <= self.loading_polls else 'complete', 'loaded',
+                                  'loading' if self.state_polls <= self.viewer_polls else None]})
         href = (self.href_after if self.screenshots and self.href_after else self.href) or self.url
         if callable(href):
             href = href(self.url)
@@ -640,6 +642,40 @@ class RendererTests(SiteCase):
         polls = [call['body']['expression'] for call in self.camofox.calls[3:7]]
         self.assertEqual(set(polls), {artifact_render.STATE})
 
+    def test_office_artifacts_render_through_the_viewer_and_settle_waits_for_it(self):
+        for name, kind in (('r.docx', 'docx'), ('b.xlsx', 'xlsx'), ('d.pptx', 'pptx')):
+            self.write(name, b'PK office')
+            ident = self.publish(name)[0]['id']
+            self.camofox.calls.clear()
+            self.camofox.state_polls = 0
+            self.camofox.viewer_polls = 3
+            result = self.tool('view', {'id': ident, 'page': 'ignored.html'})
+            self.assertFalse(result['is_error'], result)
+            self.assertEqual((result['data']['page'], result['data']['version']), (name, 1))
+            url = [call for call in self.camofox.calls if call['name'] == 'navigate'][0]['body']['url']
+            token = url.split('/artifact-view/')[1].split('/')[0]
+            self.assertEqual(self.p.artifacts.grant(token), (ident, 1, True))
+            self.assertTrue(url.endswith('/' + name))
+            # The renderer waited out the viewer's "loading" state before the screenshot.
+            self.assertGreaterEqual(self.camofox.names.count('evaluate'), 6)
+            self.assertEqual(self.camofox.names[-3:], ['screenshot', 'evaluate', 'delete_session'])
+            page = self.anonymous.get('/artifact-view/' + url.split('/artifact-view/')[1])
+            self.assertEqual(page.status_code, 200)
+            self.assertIn('data-layout="stacked"', page.text)
+            self.assertIn(f'data-kind="{kind}"', page.text)
+        # A user's view token gets the tabbed layout; the renderer's token the stacked one.
+        user_url = self.client.post(f'/api/artifacts/{ident}/versions/1/view').json()['url']
+        self.assertNotIn('data-layout', self.anonymous.get(user_url).text)
+
+    def test_a_viewer_that_never_finishes_is_cut_off_at_the_viewer_budget(self):
+        self.write('r.docx', b'PK office')
+        ident = self.publish('r.docx')[0]['id']
+        self.camofox.viewer_polls = 10 ** 6
+        with patch.object(artifact_render, 'SETTLE_SECONDS', 0.1), patch.object(artifact_render, 'VIEWER_SETTLE_SECONDS', 0.4):
+            result = self.tool('view', {'id': ident})
+        self.assertFalse(result['is_error'], result)
+        self.assertEqual(self.camofox.names[-3:], ['screenshot', 'evaluate', 'delete_session'])
+
     def test_a_stalled_or_failing_settle_falls_through_to_the_screenshot_within_the_bound(self):
         ident = self.site()
         self.camofox.settle_hangs = True
@@ -805,7 +841,7 @@ class CaptureTests(SiteCase):
         response = self.capture(ident, {'path': 'about/index.html', 'rect': {'x': 300, 'y': 500, 'w': 200, 'h': 100}, 'viewport': {'w': 1000, 'h': 700}})
         self.assertEqual(response.status_code, 200, response.text)
         attachment = response.json()['attachment']
-        self.assertEqual(sorted(attachment), ['filename', 'id', 'mime_type', 'preview_url', 'size_bytes', 'url'])
+        self.assertEqual(sorted(attachment), ['filename', 'id', 'mime_type', 'preview_url', 'size_bytes', 'url', 'view_kind'])
         self.assertEqual((attachment['mime_type'], attachment['filename']), ('image/png', f'annotation-{ident}-v1.png'))
         calls = self.camofox.calls
         self.assertEqual(calls[1]['body']['width'], 1000)

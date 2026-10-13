@@ -15,7 +15,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from .auth import COOKIE_NAME, PERMISSIONS, TTL, admin_user, body_json, current_user, groups, hash_password, issue_session, model_policies
-from .db import MODEL_SLOTS, THINKING_DEPTHS
+from .db import THINKING_DEPTHS
 from .gates import manager_request
 
 
@@ -130,18 +130,27 @@ async def permission_groups(request):
     return JSONResponse({'groups': groups(db)})
 
 
+GPT6_MODEL = re.compile(r'^gpt-6([.-]|$)')
+
+
+def valid_model_choice(choice, thinking_values):
+    return (isinstance(choice, dict) and set(choice) == {'model', 'thinking'} and isinstance(choice['model'], str) and len(choice['model']) <= 128
+            and isinstance(choice['thinking'], str) and choice['thinking'] in thinking_values)
+
+
 def valid_model_policy(policy):
-    if not isinstance(policy, dict) or set(policy) != {'name', 'label', 'slots'}:
+    """True for a well-formed group; raises 400 when automatic depth names no GPT-6-family main model."""
+    if not isinstance(policy, dict) or set(policy) != {'name', 'label', 'main', 'judge'}:
         return False
     if not isinstance(policy['name'], str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,63}', policy['name']):
         return False
     if not isinstance(policy['label'], str) or not 1 <= len(policy['label']) <= 64:
         return False
-    slots = policy['slots']
-    if not isinstance(slots, dict) or set(slots) != set(MODEL_SLOTS):
+    if not valid_model_choice(policy['main'], ('auto',) + THINKING_DEPTHS) or not valid_model_choice(policy['judge'], THINKING_DEPTHS):
         return False
-    return all(isinstance(slot, dict) and set(slot) == {'model', 'thinking'} and isinstance(slot['model'], str) and len(slot['model']) <= 128
-               and isinstance(slot['thinking'], str) and slot['thinking'] in THINKING_DEPTHS for slot in slots.values())
+    if policy['main']['thinking'] == 'auto' and not GPT6_MODEL.match(policy['main']['model']):
+        raise HTTPException(400, 'Automatic thinking depth requires a GPT-6 model')
+    return True
 
 
 def policy_listing(db):
@@ -166,7 +175,7 @@ async def model_policy_groups(request):
             used = {row[0] for row in conn.execute('SELECT DISTINCT model_policy FROM users')}
             if used - {policy['name'] for policy in items}:
                 raise HTTPException(409, 'Cannot remove a group assigned to users')
-            setting(conn, 'model_policies_v1', json.dumps(items, ensure_ascii=False))
+            setting(conn, 'model_policies_v2', json.dumps(items, ensure_ascii=False))
     return JSONResponse(policy_listing(db))
 
 

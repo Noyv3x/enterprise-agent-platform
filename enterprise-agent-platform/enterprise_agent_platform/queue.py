@@ -15,7 +15,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from .artifacts import scope_ref
-from .auth import body_json, current_user, model_slot, permissions
+from .auth import body_json, current_user, model_choice, permissions
 from .db import now
 from .files import bounded_read, ensure_workspace, open_workspace
 from .skills import skill_guidance
@@ -28,15 +28,17 @@ def artifact_guidance(cwd, personal=False):
     """System prompt section, every scope: what to publish as an artifact, what to deliver as a download, the self-check
     before delivery; the personal AI also learns live previews."""
     return ("Publish what the user should look at with the `artifact` tool (action publish, an absolute path under "
-            f"{cwd}/): documents and reports (Markdown), web pages, complete multi-file websites (publish the folder; its entry "
+            f"{cwd}/): documents and reports (Markdown), Office files (DOCX, XLSX, PPTX) and PDF, web pages, complete multi-file websites (publish the folder; its entry "
             "defaults to index.html), slides as HTML, diagrams (Mermaid .mmd or SVG), charts (an HTML page using any chart library) "
-            "and tables (CSV). Keep the same path when you revise something: that creates a new version the user can compare, so do not "
-            "create v2/v3 copies. Use a standalone "
-            f"MEDIA: {cwd}/path line only for downloadable files such as DOCX, XLSX, PPTX and PDF. "
-            "Self-check before you say you are done: after publishing or revising HTML pages, slides or sites, call `artifact` with "
+            "and tables (CSV). A standalone "
+            f"MEDIA: {cwd}/path line on a DOCX, XLSX, PPTX, PDF, HTML, Markdown, SVG, Mermaid or CSV file publishes it the same way; any other file "
+            "(archives, images, code) is only a download. Keep the same path when you revise something: that creates a new version the user can compare, so do not "
+            "create v2/v3 copies. "
+            "Self-check before you say you are done: after publishing or revising HTML pages, slides, sites or Office files, call `artifact` with "
             "action view (path or id, optional page, width, height, full_page) to look at screenshots of what you built (ids are shown in publish, list and preview results), check for "
-            "overlapping or cut-off text, overflow, broken images and console errors, fix them and republish. For a long deck, view it at "
-            "the deck's intended size (width and height)."
+            "overlapping or cut-off text, overflow, broken images and console errors, fix them and republish. DOCX, XLSX and PPTX are drawn by the "
+            "platform's own viewer, so the screenshot approximates how they open (fonts and effects can differ from Office); PDFs cannot be viewed with it. "
+            "For a long deck, view it at the deck's intended size (width and height)."
             + (" To let the user watch a dev server, call `artifact` with action preview (service, port, path, base_aware) FIRST: it returns the "
                "base path (stable for that service) and framework guidance; then start or restart the named background service (bash with name "
                "and port, listening on 0.0.0.0) configured with that base path. Restarting the service keeps the same preview URL." if personal else ""))
@@ -45,6 +47,9 @@ def artifact_guidance(cwd, personal=False):
 FEEDBACK_KINDS = ('element', 'region', 'quote')
 MAX_FEEDBACK = 5
 FEEDBACK_TEXT = 1000
+# What users see of a conversation; `title_state` is server-side bookkeeping for generated titles.
+CONVERSATION_FIELDS = ("id", "user_id", "title", "created_at", "updated_at", "deleted_at")
+CONVERSATION_COLUMNS = ",".join(CONVERSATION_FIELDS)
 
 
 def feedback_prefix(items):
@@ -73,6 +78,12 @@ def visible_metadata(metadata):
     return {key: value for key, value in metadata.items() if key not in ("generation", "token_usage")}
 
 
+WORK_TRACE_BYTES = 256 * 1024
+"""A work trace's JSON size bound (raised from 96 KiB when edit/write items gained patches)."""
+WORK_PATCH_BYTES = 24 * 1024
+"""Per edit/write item: the unified patch is kept in whole lines up to this many bytes of JSON."""
+
+
 class _WorkTrace:
     """A bounded, per-run display record, never a Runtime transcript."""
 
@@ -80,9 +91,16 @@ class _WorkTrace:
         started = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         self.data = {"v": 1, "started_at": started, "ended_at": started,
                      "items": [], "truncated": False}
+        # JSON size of each item, parallel to data["items"], so a bound check
+        # re-encodes only the changed item rather than the whole trace.
+        self.sizes = []
         self.last_boundary_position = 0
         self.previous = None
         self.thinking = None
+
+    def size(self):
+        """len(json.dumps(self.data).encode("utf-8")): ASCII-escaped JSON, items joined by ", "."""
+        return len(json.dumps({**self.data, "items": []})) + sum(self.sizes) + 2 * max(0, len(self.sizes) - 1)
 
     def clipped(self, text, limit):
         if len(text) > limit:
@@ -99,39 +117,56 @@ class _WorkTrace:
                 text += value[:max(0, 2000 - len(text))]
         return text
 
+    def bounded_patch(self, value):
+        """The patch in whole lines up to WORK_PATCH_BYTES of JSON, and whether it was cut."""
+        size = 2
+        kept = []
+        for line in value.splitlines(keepends=True):
+            size += len(json.dumps(line).encode("utf-8")) - 2
+            if size > WORK_PATCH_BYTES:
+                self.data["truncated"] = True
+                return "".join(kept), True
+            kept.append(line)
+        return value, False
+
     def store(self, item, index=None):
         items = self.data["items"]
         if index is None and item["type"] == "input":
             # Delivery boundaries must survive a full trace. Make space by
             # evicting other work, never an already delivered user input.
             items.append(item)
-            while (len(items) > 200 or len(json.dumps(self.data).encode("utf-8")) +
+            self.sizes.append(len(json.dumps(item)))
+            while (len(items) > 200 or self.size() +
                    sum(40 for entry in items if entry["type"] in ("tool", "thinking") and
-                       entry.get("ended_at", "") is None) > 96 * 1024):
+                       entry.get("ended_at", "") is None) > WORK_TRACE_BYTES):
                 self.data["truncated"] = True
                 victim = next((i for i, entry in enumerate(items) if entry["type"] != "input"), None)
                 if victim is None:
                     break
                 items.pop(victim)
+                self.sizes.pop(victim)
                 if victim < self.last_boundary_position:
                     self.last_boundary_position -= 1
             return True
         if index is None and len(items) >= 200:
             self.data["truncated"] = True
             return False
-        old = items[index] if index is not None else None
+        size = len(json.dumps(item))
         if index is None:
             items.append(item)
+            self.sizes.append(size)
         else:
-            items[index] = item
+            old, old_size = items[index], self.sizes[index]
+            items[index], self.sizes[index] = item, size
         # Reserve timestamp space for unfinished tools and thinking blocks.
         reserve = sum(40 for entry in items if entry["type"] in ("tool", "thinking") and
                       entry.get("ended_at", "") is None)
-        if len(json.dumps(self.data).encode("utf-8")) + reserve > 96 * 1024:
+        if self.size() + reserve > WORK_TRACE_BYTES:
             if index is None:
                 items.pop()
+                self.sizes.pop()
             else:
-                items[index] = old
+                items[index], self.sizes[index] = old, old_size
             self.data["truncated"] = True
             return False
         return True
@@ -195,13 +230,25 @@ class _WorkTrace:
                     item["output"] = self.preview(event.get("content_preview", []))
                     item["status"] = "error" if event.get("is_error") else "done"
                     item["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-                    background = (event.get("details") or {}).get("background")
+                    details = event.get("details") or {}
+                    background = details.get("background")
                     if isinstance(background, dict) and isinstance(background.get("task_id"), str):
                         item["background"] = {"task_id": background["task_id"][:32],
                                               "process_id": str(background.get("process_id", ""))[:64]}
+                    patch = details.get("patch")
+                    if entry["name"] in ("edit", "write") and isinstance(patch, str) and patch:
+                        item["patch"], cut = self.bounded_patch(patch)
+                        # Runtime may already have cut a large patch to fit its event budget.
+                        if cut or details.get("patch_truncated") is True:
+                            item["patch_truncated"] = True
                 if not self.store(item, index) and kind == "tool_end":
-                    # The reserved timestamp budget guarantees terminal status
-                    # survives even when the final output cannot fit.
+                    # A patch that cannot fit goes first, then the final output; the reserved
+                    # timestamp budget guarantees terminal status survives.
+                    if "patch" in item:
+                        item.pop("patch")
+                        item.pop("patch_truncated", None)
+                        if self.store(item, index):
+                            break
                     item["output"] = entry["output"]
                     self.store(item, index)
                 break
@@ -213,8 +260,10 @@ class _WorkTrace:
 
     def finish(self):
         self.data["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
-        self.data["items"] = [item for index, item in enumerate(self.data["items"])
-                              if item["type"] != "text" or index < self.last_boundary_position]
+        kept = [index for index, item in enumerate(self.data["items"])
+                if item["type"] != "text" or index < self.last_boundary_position]
+        self.data["items"] = [self.data["items"][index] for index in kept]
+        self.sizes = [self.sizes[index] for index in kept]
         return self.data if self.data["items"] else None
 
 
@@ -228,6 +277,7 @@ class Queue:
         self.starts = {}
         self.unsettled = {}
         self.stopping = False
+        self.titling = {}
 
     @property
     def active(self):
@@ -242,10 +292,11 @@ class Queue:
                                (conversation_id, user["id"])).fetchone()
         if not row:
             raise HTTPException(404, "Conversation not found")
-        return dict(row)
+        return {key: value for key, value in dict(row).items() if key in CONVERSATION_FIELDS}
 
-    def scope(self, user, scope, authorize=True, slot=None):
-        """Resolve a scope; `slot` overrides the model slot the scope's own usage would select (subagents)."""
+    def scope(self, user, scope, authorize=True):
+        """Resolve a scope; its `model` is the account group's main model and `judge` its judge (resolved by `selected_model`)."""
+        choice = model_choice(self.p.db, user)
         root = self.p.settings.data_dir / "workspaces"
         kind, channel = "agent", None
         scope_name = ""
@@ -256,14 +307,14 @@ class Queue:
             conversation = self.conversation(user, scope[5:])
             kind = "chat"
             scope_name = conversation["title"]
-            scope_type, scope_id, key, usage = "private", conversation["id"], scope, "chat"
+            scope_type, scope_id, key = "private", conversation["id"], scope
             workspace_id = f"chat-user-{user['id']}"
             workspace = root / "chat" / f"user-{user['id']}" / conversation["id"]
             sid = scope
             sandbox_key = f"chat:{user['id']}"
             cwd = f"/workspace/{conversation['id']}"
         elif scope == "private":
-            scope_type, scope_id, usage = "private", str(user["id"]), "personal"
+            scope_type, scope_id = "private", str(user["id"])
             key, sid = f"private:{scope_id}", f"agent-private-{scope_id}"
             workspace_id, workspace = f"user-{scope_id}", root / f"user-{scope_id}"
             sandbox_key, cwd = key, "/workspace"
@@ -274,7 +325,7 @@ class Queue:
             if not row:
                 raise HTTPException(404, "Channel not found")
             scope_name = row["name"]
-            scope_type, scope_id, usage = "channel", str(channel), "channel"
+            scope_type, scope_id = "channel", str(channel)
             key, sid = f"channel:{channel}:main-agent", f"agent-channel-{channel}"
             workspace_id = f"channels/channel-{channel}"
             workspace, sandbox_key, cwd = root / workspace_id, key, "/workspace"
@@ -295,7 +346,7 @@ class Queue:
                              (key, scope_type, scope_id, sid, lifecycle, workspace_id, sandbox_id, created, created))
         ensure_workspace(self.p.settings.data_dir, workspace)
         return {"kind": kind, "scope": scope, "scope_type": scope_type, "scope_id": scope_id,
-                "scope_key": key, "sid": sid, "workspace": workspace, "model": model_slot(self.p.db, user, slot or usage),
+                "scope_key": key, "sid": sid, "workspace": workspace, "model": choice["main"], "judge": choice["judge"],
                 "scope_name": scope_name,
                 "owner_user_id": user["id"] if channel is None else None, "channel_id": channel,
                 "sandbox": {"scope_key": sandbox_key, "workspace_id": workspace_id, "sandbox_id": sandbox_id,
@@ -370,7 +421,8 @@ class Queue:
                 rows = conn.execute("SELECT id,event_json FROM queue_events WHERE scope_key=? AND id>? ORDER BY id LIMIT 100", (key, after)).fetchall()
             for row in rows:
                 event = json.loads(row["event_json"])
-                event.pop("model", None)
+                for private in ("model", "effort", "judge_usage"):
+                    event.pop(private, None)
                 if isinstance(event.get("message"), dict):
                     event["message"]["metadata"] = visible_metadata(event["message"].get("metadata", {}))
                 after = event["seq"] = row["id"]
@@ -445,6 +497,7 @@ class Queue:
                                            **({"send_mode": "after_turn"} if mode == "after_turn" else {}),
                                            **({"artifact_feedback": feedback} if feedback else {})})
                 self.p.files.bind(user, info, mid, attachment_ids or [], conn=conn)
+                titling = info["kind"] == "chat" and self.needs_title(conn, info["scope"][5:])
                 payload = {"user_id": user["id"], "scope": scope, "message_id": mid, "content": content,
                            "attachment_ids": attachment_ids or [], "schedule_run_id": schedule_run_id,
                            **({"artifact_feedback": feedback} if feedback else {})}
@@ -460,6 +513,8 @@ class Queue:
                 await self.send_inputs(payload["parent_job_id"], info)
             else:
                 self.wake(info["scope_key"])
+            if titling:
+                self.start_title(user, info, content, [attachment["filename"] for attachment in message["attachments"]], mid)
         return {"message": self.message(info, mid), "job_id": job}
 
     def absorb(self, conn, job_id, payload, info):
@@ -618,6 +673,8 @@ class Queue:
                 self.p.files.release(info, message_id, conn)
                 conn.execute(f"DELETE FROM {table} WHERE id=?", (message_id,))
                 self.emit(info["scope_key"], {"type": "message_removed", "message_id": message_id}, conn)
+                if info["kind"] == "chat" and (titling := self.titling.pop(info["scope"][5:], None)) is not None:
+                    titling.cancel()
         return {"content": row["content"], "attachments": attachments, "artifact_feedback": metadata.get("artifact_feedback", [])}
 
     def input_delivered(self, parent_job_id, info, input_id):
@@ -732,7 +789,7 @@ class Queue:
 
     async def stop(self):
         self.stopping = True
-        tasks = list(self.tasks.values())
+        tasks = list(self.tasks.values()) + list(self.titling.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -744,17 +801,74 @@ class Queue:
         return response.json()
 
     async def selected_model(self, info):
+        """Resolve the main and judge model ids against the live catalog and attach catalog limits; returns the main model."""
         catalog = await self.p.oauth.catalog()
         if not info["model"]["id"]:
             if not catalog["models"]:
                 raise HTTPException(409, "No executable model is available")
             info["model"]["id"] = catalog["models"][0]["id"]
-        selected = next((model for model in catalog["models"] if model["id"] == info["model"]["id"]), {})
-        for field in ("contextWindow", "maxTokens"):
-            value = selected.get(field)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                info["model"][field] = value
+        if not info["judge"]["id"]:
+            info["judge"]["id"] = info["model"]["id"]
+        for model in (info["model"], info["judge"]):
+            selected = next((entry for entry in catalog["models"] if entry["id"] == model["id"]), {})
+            for field in ("contextWindow", "maxTokens"):
+                value = selected.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    model[field] = value
         return info["model"]
+
+    @staticmethod
+    def model_body(info):
+        """The Runtime run fields for a resolved scope: the main model, plus the judge only while the main depth is automatic."""
+        return {"model": info["model"], **({"judge": info["judge"]} if info["model"]["thinking"] == "auto" else {})}
+
+    @staticmethod
+    def needs_title(conn, cid):
+        """True when the conversation still has its creation placeholder and this is its first user message."""
+        row = conn.execute("SELECT title_state FROM chat_conversations WHERE id=?", (cid,)).fetchone()
+        return bool(row) and row[0] == "placeholder" and conn.execute("SELECT count(*) FROM chat_messages WHERE conversation_id=? AND role='user'", (cid,)).fetchone()[0] == 1
+
+    def start_title(self, user, info, text, files, message_id=None):
+        """Single-flight asynchronous title generation for a chat conversation; never blocks message acceptance."""
+        cid = info["scope"][5:]
+        if self.stopping or cid in self.titling:
+            return
+        task = asyncio.create_task(self.generate_title(user, info, cid, text, files, message_id))
+        self.titling[cid] = task
+        task.add_done_callback(lambda done: self.titling.pop(cid, None) if self.titling.get(cid) is done else None)
+
+    async def generate_title(self, user, info, cid, text, files, message_id=None):
+        """Ask Runtime for a title with the group's judge; keep the placeholder on any failure. A rename always wins."""
+        try:
+            await self.selected_model(info)
+            judge = info["judge"]
+            # Runtime limits: text and names are measured in UTF-16 units; at most 20 files of at most 255 units.
+            def clip(value, units):
+                return value.encode("utf-16-le")[:units * 2].decode("utf-16-le", "ignore")
+            names = [clip(name, 255) for name in files[:20] if name.strip()]
+            body_text = clip(text, 8000) if text.strip() else clip("\n".join(names), 8000)
+            if not body_text.strip():
+                return
+            result = await self.runtime("POST", "/v1/titles", json={"judge": judge, "text": body_text, **({"files": names} if names else {})}, timeout=25)
+            title = " ".join(result["title"].split())[:120]
+            usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+            if not title:
+                return
+        except Exception:
+            return
+        counts = {key: usage.get(key) if isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool) else 0
+                  for key in ("input", "output", "cache_read", "cache_write", "total")}
+        model = result.get("model") if isinstance(result.get("model"), str) and result.get("model") else judge["id"]
+        with self.p.db.connect() as conn:
+            conn.execute("INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,raw_usage_json,created_at) VALUES (?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?)",
+                         (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], title,
+                          "openai-codex", model, counts["input"], counts["output"], counts["total"],
+                          json.dumps({**counts, "kind": "title", "cacheRead": counts["cache_read"], "cacheWrite": counts["cache_write"]}), int(time.time())))
+            changed = conn.execute("UPDATE chat_conversations SET title=?,title_state='generated' WHERE id=? AND title_state='placeholder' AND deleted_at IS NULL "
+                                   "AND (? IS NULL OR EXISTS(SELECT 1 FROM chat_messages WHERE id=? AND conversation_id=?))",
+                                   (title, cid, message_id, message_id, cid)).rowcount
+            if changed:
+                self.emit(info["scope_key"], {"type": "conversation_title", "id": cid, "title": title}, conn)
 
     async def settle(self, key):
         while key in self.unsettled:
@@ -836,7 +950,7 @@ class Queue:
                         conn.execute("UPDATE durable_jobs SET payload_json=? WHERE id=?", (json.dumps(payload), job["id"]))
                     self.unsettled[key] = (job["id"], payload)
                     result = await self.runtime("POST", f"/v1/sessions/{info['sid']}/runs", json={
-                        "kind": info["kind"], "sandbox": info["sandbox"], "model": info["model"], "prompt": prompt,
+                        "kind": info["kind"], "sandbox": info["sandbox"], **self.model_body(info), "prompt": prompt,
                         "context_prefix": json.dumps({"time": now(), "user": user["display_name"], "tz": user["timezone"]}),
                         "resources": self.resources(info, user), "tools": tools, **({"mcp": mcp} if mcp is not None else {})})
                     run_id = result["run_id"]
@@ -889,6 +1003,8 @@ class Queue:
         if payload.get("parent_job_id"):
             return
         event.pop("undelivered_inputs", None)
+        # Applied effort and the judge's usage are administrator accounting only: they never reach the event stream or history.
+        effort, judge_usage = event.pop("effort", None), event.pop("judge_usage", None)
         if payload.get("operation") == "compact":
             self.finish_compact(job, payload, event["status"], error=event.get("error"))
             return
@@ -921,7 +1037,16 @@ class Queue:
             conn.execute("INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,raw_usage_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                          (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], info["scope_name"],
                           payload["message_id"], mid, "openai-codex", event.get("model", info["model"]["id"]), usage.get("input", 0), usage.get("output", 0), usage.get("total", 0),
-                          json.dumps({**usage, "kind": info["kind"], "cacheRead": usage.get("cache_read", 0), "cacheWrite": usage.get("cache_write", 0)}), int(time.time())))
+                          json.dumps({**usage, "kind": info["kind"], "cacheRead": usage.get("cache_read", 0), "cacheWrite": usage.get("cache_write", 0),
+                                      **({"effort": effort} if isinstance(effort, str) and effort else {})}), int(time.time())))
+            if isinstance(judge_usage, dict):
+                judged = {key: judge_usage.get(key) if isinstance(judge_usage.get(key), int) and not isinstance(judge_usage.get(key), bool) else 0
+                          for key in ("input", "output", "cache_read", "cache_write", "total")}
+                conn.execute("INSERT INTO token_usage_events(user_id,username,display_name,scope_type,scope_id,scope_name,request_message_id,response_message_id,provider,model,input_tokens,output_tokens,total_tokens,raw_usage_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (user["id"], user["username"], user["display_name"], info["scope_type"], info["scope_id"], info["scope_name"],
+                              payload["message_id"], mid, "openai-codex", judge_usage.get("model") if isinstance(judge_usage.get("model"), str) and judge_usage.get("model") else info["judge"]["id"],
+                              judged["input"], judged["output"], judged["total"],
+                              json.dumps({**judged, "kind": "auto_effort", "cacheRead": judged["cache_read"], "cacheWrite": judged["cache_write"]}), int(time.time())))
             if payload.get("schedule_run_id"):
                 conn.execute("UPDATE agent_schedule_runs SET status=?,response_message_id=?,finished_at=?,error=?,updated_at=? WHERE id=?",
                              ("succeeded" if status == "completed" else "failed", mid, int(time.time()), event.get("error", ""), int(time.time()), payload["schedule_run_id"]))
@@ -1103,7 +1228,7 @@ async def chats(request):
         raise HTTPException(403, "Permission denied")
     if request.method == "GET":
         with p.db.connect() as conn:
-            rows = conn.execute("SELECT * FROM chat_conversations WHERE user_id=? AND deleted_at IS NULL ORDER BY updated_at DESC", (user["id"],)).fetchall()
+            rows = conn.execute(f"SELECT {CONVERSATION_COLUMNS} FROM chat_conversations WHERE user_id=? AND deleted_at IS NULL ORDER BY updated_at DESC", (user["id"],)).fetchall()
         return JSONResponse({"conversations": [dict(row) for row in rows]})
     body = await body_json(request)
     if set(body) - {"title"}:
@@ -1114,7 +1239,7 @@ async def chats(request):
     cid = str(uuid.uuid4())
     async with p.gate.admit():
         with p.db.connect() as conn:
-            conn.execute("INSERT INTO chat_conversations(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)", (cid, user["id"], title, now(), now()))
+            conn.execute("INSERT INTO chat_conversations(id,user_id,title,title_state,created_at,updated_at) VALUES (?,?,?,'placeholder',?,?)", (cid, user["id"], title, now(), now()))
         p.queue.scope(user, "chat-" + cid)
     return JSONResponse({"conversation": p.queue.conversation(user, cid)}, status_code=201)
 
@@ -1145,8 +1270,9 @@ async def chat(request):
         title = body.get("title", conversation["title"])
         if not isinstance(title, str) or not title.strip():
             raise HTTPException(400, "Title is required")
-        with p.db.connect() as conn:
-            conn.execute("UPDATE chat_conversations SET title=?,updated_at=? WHERE id=?", (title, now(), cid))
+        if "title" in body:
+            with p.db.connect() as conn:
+                conn.execute("UPDATE chat_conversations SET title=?,title_state='user',updated_at=? WHERE id=?", (title, now(), cid))
     return JSONResponse({"conversation": p.queue.conversation(user, cid)})
 
 

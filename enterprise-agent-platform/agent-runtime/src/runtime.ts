@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { readdir, rm } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 import type { ServerResponse } from 'node:http';
 import { createAgentSession, createExtensionRuntime, SettingsManager, SessionManager, type AgentSession, type AgentSessionEvent, type ModelRuntime, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { ThinkingLevel } from '@earendil-works/pi-agent-core';
 import { createModelRuntime } from './credentials.js';
-import { sessionPath } from './session-path.js';
+import { effortPath, sessionPath } from './session-path.js';
 import { compactSession, compactStored, type CompactionOutcome } from './compact.js';
 import { createTools } from './tools.js';
 import { systemPrompt, type McpPayload } from './mcp.js';
@@ -15,11 +15,15 @@ import { bindModelSession, resolveModel } from './models.js';
 import { RunEvents } from './events.js';
 import type { AssistantMessageEvent, UserMessage } from '@earendil-works/pi-ai';
 import { LiveBuffer } from './live-events.js';
+import { EffortStore } from './effort.js';
+import { bound, generateTitle, judgeEffort, type EffortJudgment, type JudgeSelection, type TitleResult } from './judge.js';
 
 export interface RunRequest {
   kind: 'agent' | 'chat' | 'subagent';
   sandbox: {scope_key:string; workspace_id:string; sandbox_id:string; lifecycle_id:string; profile:'agent'|'chat'; cwd:string};
-  model: {id:string; thinking:ThinkingLevel; contextWindow?:number; maxTokens?:number};
+  model: {id:string; thinking:ThinkingLevel|'auto'; contextWindow?:number; maxTokens?:number};
+  /** Required when `model.thinking` is `auto`: the lightweight model that picks each run's effort. */
+  judge?: JudgeSelection;
   prompt: {text:string; images?:{mime:string; data:string}[]};
   context_prefix?:string;
   resources: {system_prompt:string; agents_md?:{path:string;content:string}|null; skills:{name:string;description:string;location:string}[]};
@@ -79,6 +83,9 @@ function loader(request:RunRequest):ResourceLoader {
 export class Runtime {
   private sessions = new Map<string,Live>();
   private busy = new Set<string>();
+  private stores = new Map<string,EffortStore>();
+  private unreported = new Map<string,{model:string;input:number;output:number;cache_read:number;cache_write:number;total:number}>();
+  private judges = new Map<string,Promise<ModelRuntime>>();
   private runs = new Map<string,Run>();
   private admissions = new Map<string,Promise<Live>>();
   private admissionControllers = new Map<string,AbortController>();
@@ -97,6 +104,7 @@ export class Runtime {
   private evict() {
     const now=Date.now();
     for(const [sid,live] of this.sessions) if(!this.busy.has(sid)&&now-live.lastUsed>15*60_000){live.session.dispose();this.sessions.delete(sid);}
+    for(const sid of this.stores.keys()) if(!this.sessions.has(sid)&&!this.busy.has(sid))this.stores.delete(sid);
     for(const [id,run] of this.runs) if(run.done&&now-run.endedAt>10*60_000){run.events.dispose();this.runs.delete(id);}
   }
   private async open(sid:string,request:RunRequest,signal:AbortSignal):Promise<Live> {
@@ -119,22 +127,69 @@ export class Runtime {
     const artifactScope=fixed.kind!=='subagent';
     if(!artifactScope)fixed.tools=fixed.tools.filter(name=>name!=='artifact');
     fixed.sandbox.profile=fixed.kind==='chat'?'chat':'agent';
+    const store=this.store(sid);
+    // `auto` is decided per run; the object starts at the last applied effort until the run's judgment sets it.
+    let initial:ThinkingLevel=fixed.model.thinking==='auto'?store.applied??'high':fixed.model.thinking;
     const models=await (this.config.modelRuntimeFactory?.(fixed.model.id)??createModelRuntime(this.config.platformUrl,this.config.platformToken,()=>fixed.model.id));
     const model=await resolveModel(models,fixed.model,signal);
     const file=sessionPath(this.config.home,sid);
     // Persist a stable identity even if the first request fails before an assistant reply.
     if(!existsSync(file))writeFileSync(file,JSON.stringify({type:'session',version:3,id:sid,timestamp:new Date().toISOString(),cwd:fixed.sandbox.cwd})+'\n',{flag:'wx',mode:0o600});
     const manager=SessionManager.open(file,dirname(file),fixed.sandbox.cwd);
+    // Pi does not journal the level passed when it reopens a session. Open at the journaled level so this run's setThinkingLevel records any change;
+    // a conversation without a plan baselines on that level, the one its history actually used.
+    const branch=manager.getBranch();
+    if(branch.some(entry=>entry.type==='thinking_level_change')){
+      const journaled=manager.buildSessionContext().thinkingLevel as ThinkingLevel;
+      if(store.baseline===undefined&&branch.some(entry=>entry.type==='message'&&entry.message.role==='assistant'))store.seed(journaled);
+      initial=journaled;
+    }
     const live={} as Live;
     const guard=()=>{this.compactions.get(sid)?.controller.signal.throwIfAborted();const run=this.runs.get(live.runId);if(run?.cancelled&&!run.done)throw new DOMException('Run cancelled','AbortError');};
-    bindModelSession(models,sid,guard);
+    bindModelSession(models,sid,guard,store);
     const watchers=new Set<()=>void>();
     const inputs=(listener:()=>void)=>{watchers.add(listener);const run=this.runs.get(live.runId);if(run&&run.pendingInputs.size>0)listener();return ()=>{watchers.delete(listener);};};
     const customTools=createTools(fixed.sandbox.cwd,{sandbox:fixed.sandbox,names:fixed.tools,executor:this.executor,gateway:this.gateway,skills:skillScope,artifacts:artifactScope,inputs,...(fixed.mcp?{mcp:fixed.mcp}:{}),...(this.config.promoteAfterMs===undefined?{}:{promoteAfterMs:this.config.promoteAfterMs}),output:(id,text)=>this.liveOutput(live.runId,id,text),context:()=>{guard();return {sid,scope_key:fixed.sandbox.scope_key,run_id:live.runId,...(/^private:(\d+)$/.test(fixed.sandbox.scope_key)?{owner_user_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{}),...(/^channel:(\d+):/.test(fixed.sandbox.scope_key)?{channel_id:Number(fixed.sandbox.scope_key.split(':')[1])}:{})};}});
-    const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:fixed.model.thinking,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
+    const {session}=await createAgentSession({cwd:fixed.sandbox.cwd,agentDir:join(this.config.home,'empty-agent'),modelRuntime:models,model,thinkingLevel:initial,settingsManager:SettingsManager.inMemory({cacheWarming:'off',enableAnalytics:false,enableInstallTelemetry:false}),sessionManager:manager,resourceLoader:loader(fixed),tools:fixed.tools,customTools});
     session.agent.steeringMode='all';
     Object.assign(live,{session,manager,models,request:fixed,key,runId:'',lastUsed:Date.now(),watchers});
     this.sessions.set(sid,live);return live;
+  }
+  // This run's judge usage plus any left over from an admission that failed after its judge call.
+  private judgeUsage(sid:string,judgment?:EffortJudgment):{judge_usage?:{model:string;input:number;output:number;cache_read:number;cache_write:number;total:number}} {
+    const own=judgment?.usage?{model:judgment.model,...judgment.usage}:undefined;
+    const left=this.unreported.get(sid);this.unreported.delete(sid);
+    if(!own||!left)return own??left?{judge_usage:(own??left)!}:{};
+    return {judge_usage:{model:own.model,input:own.input+left.input,output:own.output+left.output,cache_read:own.cache_read+left.cache_read,cache_write:own.cache_write+left.cache_write,total:own.total+left.total}};
+  }
+  private store(sid:string):EffortStore {
+    let store=this.stores.get(sid);
+    if(!store){store=new EffortStore(effortPath(this.config.home,sid));this.stores.set(sid,store);}
+    return store;
+  }
+  // Judge calls get their own ModelRuntime (Platform credential resolution names the judge model), never a session's wrapper.
+  private judgeModels(id:string):Promise<ModelRuntime> {
+    let models=this.judges.get(id);
+    if(!models){
+      models=this.config.modelRuntimeFactory?.(id)??createModelRuntime(this.config.platformUrl,this.config.platformToken,()=>id);
+      this.judges.set(id,models);
+      models.catch(()=>{if(this.judges.get(id)===models)this.judges.delete(id);});
+    }
+    return models;
+  }
+  // The run's effort: a fixed level as is; `auto` asks the judge (once for a subagent), falling back to the last applied effort, else `high`.
+  private async decideEffort(sid:string,request:RunRequest,signal:AbortSignal):Promise<{effort:ThinkingLevel;judgment?:EffortJudgment}> {
+    const thinking=request.model.thinking;
+    if(thinking!=='auto')return {effort:thinking};
+    const store=this.store(sid);
+    const fallback=store.applied??'high';
+    if(request.kind==='subagent'&&store.judged)return {effort:fallback};
+    const judgment=await judgeEffort(()=>this.judgeModels(request.judge!.id),request.judge!,{text:request.prompt.text,previous:request.kind==='subagent'?undefined:store.previous},signal);
+    return {effort:judgment.effort??fallback,judgment};
+  }
+  /** One chat title from the judge model; 502 for a model failure, 504 after its deadline. */
+  title(input:{judge:JudgeSelection;text:string;files?:string[]}):Promise<TitleResult> {
+    return generateTitle(()=>this.judgeModels(input.judge.id),input.judge,{text:input.text,files:input.files});
   }
   async start(sid:string,request:RunRequest):Promise<{run_id:string}> {
     if(request.kind==='subagent')validateSubagent(sid,request);
@@ -143,17 +198,22 @@ export class Runtime {
     let live:Live;
     const controller=new AbortController();
     this.admissionControllers.set(sid,controller);
+    // The judge call overlaps with opening the session; it never rejects.
+    const decision=this.decideEffort(sid,request,controller.signal);
     const admission=this.open(sid,request,controller.signal);
     this.admissions.set(sid,admission);
     try { live=await admission; }
-    catch(error){this.busy.delete(sid);if(controller.signal.aborted)throw failure(409,'Session admission cancelled');throw error;}
+    catch(error){
+      // A judge call that already ran is reported with the session's next run_end.
+      void decision.then(({judgment})=>{if(judgment?.usage)this.unreported.set(sid,{model:judgment.model,...judgment.usage});});
+      this.busy.delete(sid);if(controller.signal.aborted)throw failure(409,'Session admission cancelled');throw error;}
     finally{this.admissions.delete(sid);this.admissionControllers.delete(sid);}
     live.request.model=structuredClone(request.model);
     const finished=Promise.withResolvers<void>();
     const stopped=Promise.withResolvers<void>();
     const run:Run={id:randomUUID(),sid,events:new RunEvents(),done:false,cancelled:false,acceptingInput:true,initialInputPending:true,acceptedInputs:new Set(),pendingInputs:new Map(),controller,stopConfirmed:stopped.promise,confirmStop:stopped.resolve,sideEffects:false,finished:finished.promise,finish:finished.resolve,endedAt:0,usage:{input:0,output:0,cache_read:0,cache_write:0,total:0},text:''};
     live.runId=run.id;this.runs.set(run.id,run);
-    void this.execute(live,run,request);
+    void this.execute(live,run,request,decision);
     return {run_id:run.id};
   }
   steer(id:string,input:SteerRequest):void {
@@ -285,12 +345,21 @@ export class Runtime {
       else delete run.error;
     }
   }
-  private async execute(live:Live,run:Run,request:RunRequest) {
+  private async execute(live:Live,run:Run,request:RunRequest,decision:Promise<{effort:ThinkingLevel;judgment?:EffortJudgment}>) {
+    let effort:ThinkingLevel|undefined;
+    let judgment:EffortJudgment|undefined;
     const unsubscribe=live.session.subscribe(event=>this.onEvent(run,event));
     try {
-      const model=await resolveModel(live.models,request.model,run.controller.signal);
+      // The judgment is kept even when resolving the model fails: the judge call was made.
+      const [resolved,settled]=await Promise.allSettled([resolveModel(live.models,request.model,run.controller.signal),decision]);
+      if(settled.status==='fulfilled')judgment=settled.value.judgment;
+      if(resolved.status==='rejected')throw resolved.reason;
+      if(settled.status==='rejected')throw settled.reason;
+      const model=resolved.value,decided=settled.value;
       if(live.session.model?.id!==model.id)await live.session.setModel(model);
-      live.session.setThinkingLevel(request.model.thinking);
+      live.session.setThinkingLevel(decided.effort);
+      effort=live.session.thinkingLevel;
+      this.store(run.sid).record({applied:effort,previous:bound(request.prompt.text,600),...(request.model.thinking==='auto'&&request.kind==='subagent'?{judged:true}:{})});
       if(run.cancelled)return;
       await live.session.prompt([request.context_prefix,request.prompt.text].filter(Boolean).join('\n'),{expandPromptTemplates:false,images:request.prompt.images?.map(i=>({type:'image' as const,mimeType:i.mime,data:i.data}))??[]});
       run.acceptingInput=false;
@@ -301,7 +370,7 @@ export class Runtime {
       if(run.acceptingInput){run.acceptingInput=false;live.session.clearQueue();}
       if(run.cancelled)await run.stopConfirmed;
       unsubscribe();live.lastUsed=Date.now();this.closeStreams(run);
-      this.emit(run,{type:'run_end',status:run.cancelled?'cancelled':run.error?'failed':'completed',text:run.text,usage:run.usage,model:request.model.id,...(run.error?{error:run.error}:{}),side_effects:run.sideEffects,undelivered_inputs:[...run.pendingInputs.keys()]});
+      this.emit(run,{type:'run_end',status:run.cancelled?'cancelled':run.error?'failed':'completed',text:run.text,usage:run.usage,model:request.model.id,effort:effort??(request.model.thinking==='auto'?this.store(run.sid).applied??'high':request.model.thinking),...this.judgeUsage(run.sid,judgment),...(run.error?{error:run.error}:{}),side_effects:run.sideEffects,undelivered_inputs:[...run.pendingInputs.keys()]});
       run.pendingInputs.clear();
       run.done=true;run.endedAt=Date.now();this.busy.delete(run.sid);
       run.events.close();
@@ -349,7 +418,7 @@ export class Runtime {
     const timer=setTimeout(()=>deadline.reject(failure(504,'Session cancellation timed out')),30_000);
     try{return await Promise.race([operation,deadline.promise]);}finally{clearTimeout(timer);}
   }
-  async compact(sid:string,selected:RunRequest['model']):Promise<CompactionOutcome> {
+  async compact(sid:string,requested:RunRequest['model']):Promise<CompactionOutcome> {
     if(this.busy.has(sid)||this.cancellations.has(sid))throw failure(409,'Session is busy');
     const live=this.sessions.get(sid);
     this.busy.add(sid);
@@ -357,6 +426,8 @@ export class Runtime {
     const settled=Promise.withResolvers<void>();
     this.compactions.set(sid,{controller,settled:settled.promise});
     try {
+      // `auto` summarizes at the last applied effort; no judge call.
+      const selected={...requested,thinking:requested.thinking==='auto'?this.store(sid).applied??'high':requested.thinking};
       if(live){
         live.request.model=structuredClone(selected);
         const model=await resolveModel(live.models,selected,controller.signal);
@@ -377,7 +448,10 @@ export class Runtime {
     this.busy.add(sid);
     try {
       this.sessions.get(sid)?.session.dispose();this.sessions.delete(sid);
-      await rm(sessionPath(this.config.home,sid),{force:true});
+      await Promise.all([rm(sessionPath(this.config.home,sid),{force:true}),rm(effortPath(this.config.home,sid),{force:true})]);
+      this.stores.delete(sid);this.unreported.delete(sid);
+      const dir=dirname(effortPath(this.config.home,sid)),prefix=`${basename(effortPath(this.config.home,sid))}.`;
+      for(const name of await readdir(dir).catch(()=>[] as string[]))if(name.startsWith(prefix)&&name.endsWith('.tmp'))await rm(join(dir,name),{force:true});
     }finally{this.busy.delete(sid);}
   }
   history(sid:string,before?:string,limit=100):unknown {

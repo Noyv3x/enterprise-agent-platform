@@ -16,7 +16,7 @@ from starlette.exceptions import HTTPException
 
 from enterprise_agent_platform.db import Database
 from enterprise_agent_platform.mcp import McpService
-from enterprise_agent_platform.files import Files, contained, office_preview, open_workspace, bounded_read
+from enterprise_agent_platform.files import Files, contained, open_workspace, bounded_read
 from enterprise_agent_platform.schedules import dispatch, next_time, tick
 from enterprise_agent_platform.tools import Browser, browser_url, fetch
 from enterprise_agent_platform.queue import Queue
@@ -221,23 +221,6 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bounded_read(fd), b'original')
         with self.assertRaises(OSError):
             open_workspace(root, 'safe.txt')
-
-    async def test_office_text_and_shared_strings_without_xml_entities(self):
-        def archive(parts):
-            stream = io.BytesIO()
-            with zipfile.ZipFile(stream, 'w') as output:
-                for name, content in parts.items():
-                    output.writestr(name, content)
-            return stream.getvalue()
-        docx = archive({'word/document.xml': '<document><p><t>Quarterly report</t></p></document>'})
-        self.assertEqual(office_preview(docx, '.docx'), 'Quarterly report')
-        xlsx = archive({'xl/sharedStrings.xml': '<sst><si><t>Revenue</t></si></sst>', 'xl/worksheets/sheet1.xml': '<worksheet><row><c t=\"s\"><v>0</v></c><c><v>42</v></c></row></worksheet>'})
-        self.assertEqual(office_preview(xlsx, '.xlsx'), 'sheet1.xml\nRevenue\t42')
-        pptx = archive({'ppt/slides/slide1.xml': '<slide><p><t>Agenda</t></p></slide>'})
-        self.assertEqual(office_preview(pptx, '.pptx'), 'Slide 1\nAgenda')
-        unsafe = archive({'word/document.xml': '<!DOCTYPE x [<!ENTITY secret SYSTEM \"file:///etc/passwd\">]><document><p><t>&secret;</t></p></document>'})
-        with self.assertRaises(ValueError):
-            office_preview(unsafe, '.docx')
 
     async def test_interval_pause_resume_keeps_legacy_numeric_dates(self):
         created = await dispatch(self.p, 'create', {'name': 'Daily', 'prompt': 'Report', 'schedule': {'type': 'interval', 'every_seconds': 86400}}, self.user)

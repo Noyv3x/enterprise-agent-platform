@@ -9,7 +9,7 @@ import { ShellContext } from "../../components/ui/beautiful/controls";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../../i18n";
 import { Conversation } from "../Conversation";
 import { visibleContent } from "../conversation/Messages";
-import type { Message } from "../conversation/types";
+import type { Attachment, Message } from "../conversation/types";
 import { VIEW_REFRESH_LEAD_MS } from "./useViewUrl";
 
 const api = vi.hoisted(() => ({ request: vi.fn() }));
@@ -39,6 +39,21 @@ function emit(event: Record<string, unknown> & { type: string }) {
 let store: Record<number, { view: ArtifactView; versions: ArtifactVersion[] }> = {};
 let minted: string[] = [];
 let lifetimeMs = 2 * 60 * 60 * 1000;
+/** The server's attachments by id, for `POST /api/attachments/{id}/view`. */
+let files: Record<number, Attachment> = {};
+
+function upload(id: number, filename: string, mime_type: string, view_kind: Attachment["view_kind"]): Attachment {
+  const file: Attachment = {
+    id, filename, mime_type, view_kind, size_bytes: 4096, url: `/api/attachments/${id}`,
+    preview_url: view_kind === "image" ? `/api/attachments/${id}/preview` : null,
+  };
+  files[id] = file;
+  return file;
+}
+
+function sent(id: number, attachments: Attachment[]): Message {
+  return { id, role: "user", content: "Please review these", metadata: { status: "completed" }, created_at: "2026-10-12T04:00:00Z", attachments };
+}
 
 function stamp(version: number) {
   return `2026-10-12T0${version}:00:00Z`;
@@ -88,6 +103,14 @@ function route(path: string, method: string, messages: Message[]): unknown {
     minted.push(url);
     return { url, expires_at: new Date(Date.now() + lifetimeMs).toISOString() };
   }
+  match = /^\/api\/attachments\/(\d+)\/view$/.exec(path);
+  if (match && method === "POST") {
+    const file = files[Number(match[1])];
+    if (!file) throw new Error("not found");
+    const url = `/attachment-view/a${minted.length + 1}-${file.id}/${file.filename}`;
+    minted.push(url);
+    return { url, kind: file.view_kind, expires_at: new Date(Date.now() + lifetimeMs).toISOString() };
+  }
   if (path === "/api/tasks") return { tasks: [] };
   if (path === "/api/browser") return { tabs: [], lease: null };
   if (path.startsWith("/api/workspace/files")) return { files: [] };
@@ -125,6 +148,7 @@ describe("Artifacts", () => {
     seq = 0;
     store = {};
     minted = [];
+    files = {};
     lifetimeMs = 2 * 60 * 60 * 1000;
     FakeEventSource.instances = [];
     vi.stubGlobal("EventSource", FakeEventSource);
@@ -299,6 +323,100 @@ describe("Artifacts", () => {
     await waitFor(() => expect(frame()).toHaveAttribute("src", "/artifact-view/t1-11-1/deck.html"));
     await user.click(within(sheet).getByRole("button", { name: "Close" }));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("opens attachments in the panel's file mode by kind, never inside the message", async () => {
+    const user = userEvent.setup();
+    const text = vi.fn(async () => ({ ok: true, status: 200, text: async () => "hello notes" }));
+    vi.stubGlobal("fetch", text);
+    const attachments = [
+      upload(31, "brief.pdf", "application/pdf", "pdf"),
+      upload(32, "plan.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
+      upload(33, "photo.png", "image/png", "image"),
+      upload(34, "notes.txt", "text/plain", "text"),
+      upload(35, "bundle.zip", "application/zip", "other"),
+    ];
+    await mount("chat-c1", [sent(1, attachments)]);
+    const bubble = await screen.findByRole("button", { name: "Open brief.pdf" });
+    expect(frame()).toBeNull();
+    // Every file downloads; a file the panel cannot show offers nothing else.
+    expect(screen.getByRole("link", { name: "Download bundle.zip" })).toHaveAttribute("href", "/api/attachments/35");
+    expect(screen.queryByRole("button", { name: "Open bundle.zip" })).not.toBeInTheDocument();
+
+    // PDF: the native viewer under the route's sandbox CSP, so no sandbox attribute.
+    await user.click(bubble);
+    const panel = await artifactsPanel();
+    await waitFor(() => expect(frame()).toHaveAttribute("src", "/attachment-view/a1-31/brief.pdf"));
+    expect(frame()).not.toHaveAttribute("sandbox");
+    expect(within(panel).getByRole("heading", { name: "brief.pdf" })).toBeVisible();
+    expect(within(panel).getByRole("link", { name: "Download brief.pdf" })).toHaveAttribute("href", "/api/attachments/31");
+    expect(within(panel).queryByRole("combobox", { name: "Version" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open brief.pdf" })).toHaveAttribute("aria-current", "true");
+
+    // Office: the viewer page in an opaque origin with scripts only.
+    await user.click(screen.getByRole("button", { name: "Open plan.docx" }));
+    await waitFor(() => expect(frame()).toHaveAttribute("src", "/attachment-view/a2-32/plan.docx?lang=en"));
+    expect(frame()).toHaveAttribute("sandbox", "allow-scripts");
+
+    // Image: the thumbnail opens it too, shown whole through the view URL.
+    await user.click(document.querySelector('img[src="/api/attachments/33/preview"]')!);
+    expect(await within(panel).findByRole("img", { name: "photo.png" })).toHaveAttribute("src", "/attachment-view/a3-33/photo.png");
+    expect(frame()).toBeNull();
+
+    // Text: read from the cookie-less view URL.
+    await user.click(screen.getByRole("button", { name: "Open notes.txt" }));
+    await waitFor(() => expect(within(panel).getByRole("region", { name: "notes.txt" })).toHaveTextContent("hello notes"));
+    expect(text).toHaveBeenCalledWith("/attachment-view/a4-34/notes.txt", expect.objectContaining({ credentials: "omit" }));
+
+    await user.click(within(panel).getByRole("button", { name: "Close file" }));
+    expect(await within(panel).findByText("No artifacts yet")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open notes.txt" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("returns to the open artifact when the file closes, and opens files in the phone sheet", async () => {
+    const user = userEvent.setup();
+    publishOnServer(11, 1);
+    const pdf = upload(31, "brief.pdf", "application/pdf", "pdf");
+    await mount("chat-c1", [sent(1, [pdf]), reply(5, [{ id: 11, version: 1 }])]);
+    await user.click(await screen.findByRole("button", { name: "Open Launch deck, v1 · Web page" }));
+    const panel = await artifactsPanel();
+    await waitFor(() => expect(frame()).toHaveAttribute("src", "/artifact-view/t1-11-1/deck.html"));
+    await user.click(screen.getByRole("button", { name: "Open brief.pdf" }));
+    await waitFor(() => expect(frame()).toHaveAttribute("src", "/attachment-view/a2-31/brief.pdf"));
+    // The file covers the artifact, whose card no longer reads as shown.
+    expect(screen.getByRole("button", { name: "Open Launch deck, v1 · Web page" })).not.toHaveAttribute("aria-current");
+    await user.click(within(panel).getByRole("button", { name: "Close file" }));
+    expect(within(panel).getByRole("heading", { name: "Launch deck" })).toBeVisible();
+
+    cleanup();
+    document.body.innerHTML = "";
+    FakeEventSource.instances = [];
+    await mount("chat-c1", [sent(1, [pdf])], true);
+    await user.click(await screen.findByRole("button", { name: "Open brief.pdf" }));
+    const sheet = await screen.findByRole("dialog", { name: "Artifacts" });
+    expect(within(sheet).getByRole("heading", { name: "brief.pdf" })).toBeVisible();
+    await waitFor(() => expect(frame()).toHaveAttribute("src", expect.stringMatching(/-31\/brief\.pdf$/)));
+  });
+
+  it("offers every artifact version for download on its card, and shows Office artifacts in the sandboxed viewer", async () => {
+    const user = userEvent.setup();
+    publishOnServer(11, 2);
+    publishOnServer(12, 1, "Budget plan", "docx");
+    const office: Message = {
+      ...reply(6),
+      metadata: { status: "completed", artifacts: [{ id: 12, version: 1, title: "Budget plan", kind: "docx", path: "/workspace/c1/plan.docx" }] },
+    };
+    await mount("chat-c1", [reply(5, [{ id: 11, version: 2 }]), office]);
+    expect(await screen.findByRole("link", { name: "Download Launch deck, v2" })).toHaveAttribute("href", "/api/artifacts/11/versions/2/download");
+    expect(screen.getByRole("link", { name: "Download Budget plan, v1" })).toHaveAttribute("href", "/api/artifacts/12/versions/1/download");
+
+    await user.click(screen.getByRole("button", { name: "Open Budget plan, v1 · Word document" }));
+    const panel = await artifactsPanel();
+    await waitFor(() => expect(frame()).toHaveAttribute("src", "/artifact-view/t1-12-1/deck.html?lang=en"));
+    expect(frame()).toHaveAttribute("sandbox", "allow-scripts");
+    // A binary kind has no source view; its toolbar still downloads it.
+    expect(within(panel).queryByRole("tab", { name: "Source" })).not.toBeInTheDocument();
+    expect(within(panel).getByRole("link", { name: "Download v1" })).toHaveAttribute("href", "/api/artifacts/12/versions/1/download");
   });
 });
 

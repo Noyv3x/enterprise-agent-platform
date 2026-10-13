@@ -20,13 +20,10 @@ const me = user(1, 'admin', { role: 'admin', permission_group: 'admin' });
 const ana = user(7, 'ana');
 const ben = user(8, 'ben', { permission_group: 'viewer', model_policy: 'light', active: false });
 
-const slots = (model: string, thinking: string) => ({
-  personal: { model, thinking }, channel: { model, thinking }, chat: { model, thinking }, scout: { model, thinking }, worker: { model, thinking },
-});
 const policies = [
-  { name: 'default', label: 'Default', slots: { ...slots('gpt-a', 'medium'), scout: { model: 'retired', thinking: 'low' } } },
-  { name: 'light', label: 'Light', slots: slots('', 'off') },
-  { name: 'spare', label: 'Spare', slots: slots('', 'medium') },
+  { name: 'default', label: 'Default', main: { model: 'gpt-6.1-sol', thinking: 'auto' }, judge: { model: 'retired', thinking: 'low' } },
+  { name: 'light', label: 'Light', main: { model: '', thinking: 'off' }, judge: { model: '', thinking: 'low' } },
+  { name: 'spare', label: 'Spare', main: { model: 'gpt-a', thinking: 'medium' }, judge: { model: '', thinking: 'low' } },
 ];
 
 type Route = (body: Record<string, unknown>) => unknown;
@@ -37,7 +34,7 @@ function serve(extra: Record<string, Route> = {}) {
     'GET /api/me': () => ({ user: me }),
     'GET /api/admin/users': () => ({ users: [me, ana, ben] }),
     'GET /api/admin/permission-groups': () => ({ groups: [{ name: 'admin', permissions: ['chat', 'manage_users'] }, { name: 'member', permissions: ['chat'] }, { name: 'viewer', permissions: [] }, { name: 'unused', permissions: ['chat'] }] }),
-    'GET /api/admin/models': () => ({ models: [{ id: 'gpt-a', name: 'GPT A' }, { id: 'gpt-b', name: 'GPT B' }], connected: true }),
+    'GET /api/admin/models': () => ({ models: [{ id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol' }, { id: 'gpt-6-luna', name: 'GPT-6 Luna' }, { id: 'gpt-a', name: 'GPT A' }], connected: true }),
     'GET /api/admin/model-policies': () => ({ policies, members: { default: 2, light: 1 } }),
     ...extra,
   };
@@ -118,8 +115,11 @@ describe('Admin', () => {
     const select = within(sheet).getByRole('combobox', { name: 'Model policy group' });
     expect(select).toHaveTextContent('Default');
     await actor.click(select);
-    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Default', 'Light', 'Spare']);
-    await actor.click(screen.getByRole('option', { name: 'Light' }));
+    // Each group names its main model and depth on a second line.
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual([
+      expect.stringMatching(/^Default.*gpt-6\.1-sol/), expect.stringMatching(/^Light/), expect.stringMatching(/^Spare.*gpt-a/),
+    ]);
+    await actor.click(screen.getByRole('option', { name: /^Light/ }));
     await actor.click(within(sheet).getByRole('button', { name: 'Save account' }));
 
     await waitFor(() => expect(sent('PATCH', '/api/admin/users/7')).toEqual({ model_policy: 'light' }));
@@ -191,7 +191,7 @@ describe('Admin', () => {
     ] }));
   });
 
-  it('edits one slot of a model policy group and saves the whole list', async () => {
+  it('edits the judge model of a group and saves the whole list', async () => {
     const actor = userEvent.setup();
     serve({ 'PUT /api/admin/model-policies': (body) => ({ ...body, members: { default: 2, light: 1 } }) });
     renderAdmin('#admin/policies');
@@ -200,19 +200,21 @@ describe('Admin', () => {
     await actor.click(await screen.findByRole('button', { name: 'Open Default' }));
     const sheet = await screen.findByRole('dialog', { name: 'Default' });
     expect(within(sheet).getByRole('textbox', { name: 'Identifier' })).toHaveAttribute('readonly');
-    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat model' }));
-    await actor.click(screen.getByRole('option', { name: 'GPT B' }));
-    await actor.click(within(sheet).getByRole('combobox', { name: 'Chat thinking depth' }));
-    await actor.click(screen.getByRole('option', { name: 'High' }));
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Judge model' }));
+    await actor.click(screen.getByRole('option', { name: 'GPT-6 Luna' }));
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Judge model thinking depth' }));
+    // A judge never thinks automatically.
+    expect(screen.queryByRole('option', { name: /^Auto/ })).not.toBeInTheDocument();
+    await actor.click(screen.getByRole('option', { name: 'Minimal' }));
     await actor.click(within(sheet).getByRole('button', { name: 'Save group' }));
 
     await waitFor(() => expect(sent('PUT', '/api/admin/model-policies')).toEqual({ policies: [
-      { ...policies[0], slots: { ...policies[0].slots, chat: { model: 'gpt-b', thinking: 'high' } } }, policies[1], policies[2],
+      { ...policies[0], judge: { model: 'gpt-6-luna', thinking: 'minimal' } }, policies[1], policies[2],
     ] }));
     expect(await within(sheet).findByText('Saved')).toBeVisible();
   });
 
-  it('creates a model policy group on the system default after validating its identifier', async () => {
+  it('creates a model policy group on the defaults after validating its identifier', async () => {
     const actor = userEvent.setup();
     serve({ 'PUT /api/admin/model-policies': (body) => ({ ...body, members: { default: 2, light: 1 } }) });
     renderAdmin('#admin/policies');
@@ -228,8 +230,36 @@ describe('Admin', () => {
     await actor.click(within(sheet).getByRole('button', { name: 'Create group' }));
 
     await waitFor(() => expect(sent('PUT', '/api/admin/model-policies')).toEqual({ policies: [
-      ...policies, { name: 'frugal', label: 'Frugal', slots: slots('', 'medium') },
+      ...policies, { name: 'frugal', label: 'Frugal', main: { model: '', thinking: 'medium' }, judge: { model: '', thinking: 'low' } },
     ] }));
+  });
+
+  it('offers automatic thinking only for a GPT-6 main model', async () => {
+    const actor = userEvent.setup();
+    serve();
+    renderAdmin('#admin/policies');
+
+    await actor.click(await screen.findByRole('button', { name: 'Open Spare' }));
+    let sheet = await screen.findByRole('dialog', { name: 'Spare' });
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Main model thinking depth' }));
+    expect(screen.getByRole('option', { name: /^Auto/ })).toHaveAttribute('aria-disabled', 'true');
+    await actor.click(screen.getByRole('option', { name: /^Auto/ }));
+    expect(within(sheet).getByRole('combobox', { name: 'Main model thinking depth' })).toHaveTextContent('Medium');
+    await actor.keyboard('{Escape}');
+    await actor.click(within(sheet).getByRole('button', { name: 'Done' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+
+    // Moving a group on Auto to a model outside GPT-6 blocks the save until the depth or model changes.
+    await actor.click(screen.getByRole('button', { name: 'Open Default' }));
+    sheet = await screen.findByRole('dialog', { name: 'Default' });
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Main model' }));
+    await actor.click(screen.getByRole('option', { name: 'GPT A' }));
+    expect(within(sheet).getByRole('combobox', { name: 'Main model thinking depth' })).toHaveAttribute('aria-invalid', 'true');
+    expect(within(sheet).getByRole('button', { name: 'Save group' })).toBeDisabled();
+    await actor.click(within(sheet).getByRole('combobox', { name: 'Main model' }));
+    await actor.click(screen.getByRole('option', { name: 'GPT-6 Luna' }));
+    expect(within(sheet).getByRole('combobox', { name: 'Main model thinking depth' })).not.toHaveAttribute('aria-invalid');
+    expect(within(sheet).getByRole('button', { name: 'Save group' })).toBeEnabled();
   });
 
   it('shows a configured model the catalog no longer offers as unavailable', async () => {
@@ -240,11 +270,11 @@ describe('Admin', () => {
     expect(await within(await screen.findByRole('row', { name: /Default/ })).findByText('retired · unavailable')).toBeVisible();
     await actor.click(screen.getByRole('button', { name: 'Open Default' }));
     const sheet = await screen.findByRole('dialog', { name: 'Default' });
-    const scout = within(sheet).getByRole('combobox', { name: 'Research subagent model' });
-    expect(scout).toHaveTextContent('retired · unavailable');
-    await actor.click(scout);
-    // The system default names the catalog model it currently resolves to on its second line.
-    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['System defaultCurrently GPT A', 'GPT A', 'GPT B', 'retired · unavailable']);
+    const judge = within(sheet).getByRole('combobox', { name: 'Judge model' });
+    expect(judge).toHaveTextContent('retired · unavailable');
+    await actor.click(judge);
+    // 与主模型相同 names the model it currently resolves to on its second line.
+    expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual(['Same as main modelCurrently GPT-6.1 Sol', 'GPT-6.1 Sol', 'GPT-6 Luna', 'GPT A', 'retired · unavailable']);
   });
 
   it('refuses to delete a model policy group that still has accounts', async () => {

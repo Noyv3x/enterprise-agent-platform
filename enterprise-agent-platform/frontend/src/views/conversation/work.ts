@@ -19,6 +19,10 @@ export type WorkItem =
       endedAt: number | null;
       /** the background task (`bg-<n>`) a promoted command keeps running as */
       background?: string;
+      /** edit/write: the result as a unified patch (bounded when persisted) */
+      patch?: string;
+      /** Platform kept only the first part of `patch` */
+      patchCut?: boolean;
     };
 
 export interface WorkTrace {
@@ -204,10 +208,12 @@ export function parseWork(value: unknown, live = false): WorkTrace | null {
     else if (item.type === "tool") {
       const status = item.status === "done" || item.status === "error" ? item.status : live && item.ended_at == null ? "running" : "cancelled";
       const background = text(record(item.background)?.task_id);
+      const patch = text(item.patch);
       items.push({
         type: "tool", id: text(item.id), name: text(item.name), args: record(item.args) ?? {}, status,
         output: text(item.output), startedAt: isoTime(item.started_at), endedAt: isoTime(item.ended_at),
         ...(background ? { background } : {}),
+        ...(patch ? { patch, ...(item.patch_truncated === true ? { patchCut: true } : {}) } : {}),
       });
     }
   }

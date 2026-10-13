@@ -6,7 +6,7 @@ import InsightCards, { AllocationCard, CompareCard, InsightMono, TrendCard, type
 import LoadingState from '../../components/ui/beautiful/primitives/LoadingState';
 import { useI18n } from '../../i18n';
 import { useWords } from '../../words';
-import { formatNumber, formatTime, useResource } from './shared';
+import { formatNumber, formatTime, useAdminLabels, useResource } from './shared';
 
 interface UsageEvent {
   id: number;
@@ -15,26 +15,45 @@ interface UsageEvent {
   username: string;
   display_name: string;
   scope_type: string;
+  scope_id: string;
   scope_name: string;
   provider: string;
   model: string;
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
-  /** `kind` is absent on rows recorded before chat mode; those are agent runs. Legacy rows spell cache reads `cacheRead`. */
-  raw_usage: { kind?: 'agent' | 'chat' | 'compaction'; cache_read?: number; cacheRead?: number } | null;
+  /** `kind` is absent on rows recorded before chat mode; those are agent runs. `title` and `auto_effort` are judge calls.
+   * `effort` is the depth a main run used. Legacy rows spell cache reads `cacheRead`. */
+  raw_usage: { kind?: 'agent' | 'chat' | 'subagent' | 'compaction' | 'title' | 'auto_effort'; effort?: string; cache_read?: number; cacheRead?: number } | null;
 }
 interface UsageReport { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; total_tokens: number; cache_hit_ratio: number; events: UsageEvent[] }
 
-type Place = 'personal' | 'channel' | 'chat' | 'compaction';
-type PlaceFilter = 'all' | Place;
+type Place = 'personal' | 'channel' | 'chat';
+type Purpose = 'turn' | 'subagent' | 'compaction' | 'title' | 'auto_effort';
+/** Filter chips partition the rows: conversations by place, then compaction and judge calls on their own. */
+type Source = Place | 'compaction' | 'judge';
+type SourceFilter = 'all' | Source;
 
 const cacheRead = (event: UsageEvent) => event.raw_usage?.cache_read ?? event.raw_usage?.cacheRead ?? 0;
 
 function placeOf(event: UsageEvent): Place {
-  if (event.raw_usage?.kind === 'compaction') return 'compaction';
-  if (event.raw_usage?.kind === 'chat') return 'chat';
-  return event.scope_type === 'channel' ? 'channel' : 'personal';
+  if (event.scope_type === 'channel') return 'channel';
+  const kind = event.raw_usage?.kind;
+  // A chat conversation is recorded in its account's private scope under the conversation id; the personal AI's scope id is the account id.
+  if (kind === 'chat' || kind === 'title' || (event.user_id !== null && event.scope_id !== String(event.user_id))) return 'chat';
+  return 'personal';
+}
+
+function purposeOf(event: UsageEvent): Purpose {
+  const kind = event.raw_usage?.kind;
+  return kind === 'subagent' || kind === 'compaction' || kind === 'title' || kind === 'auto_effort' ? kind : 'turn';
+}
+
+function sourceOf(event: UsageEvent): Source {
+  const purpose = purposeOf(event);
+  if (purpose === 'compaction') return 'compaction';
+  if (purpose === 'title' || purpose === 'auto_effort') return 'judge';
+  return placeOf(event);
 }
 
 /** Events grouped by local day (or by hour when they all fall on one day), oldest first. */
@@ -72,6 +91,7 @@ function useNarrow() {
 
 export function Usage() {
   const w = useWords();
+  const adminLabels = useAdminLabels();
   const { locale } = useI18n();
   const usage = useResource<UsageReport>('/api/admin/usage');
   const narrow = useNarrow();
@@ -88,13 +108,21 @@ export function Usage() {
   const percent = new Intl.NumberFormat(locale, { style: 'percent', maximumFractionDigits: 1 });
   const compact = new Intl.NumberFormat(locale, { notation: 'compact', maximumFractionDigits: 1 });
   const tokens = (value: number) => compact.format(Math.max(0, Math.round(value)));
-  const placeLabel: Record<Place, string> = {
+  const sourceLabel: Record<Source, string> = {
     personal: w('Personal AI', '个人 AI', '個人 AI'),
     channel: w('Channel', '频道', '頻道'),
-    chat: w('Chat', '聊天', '聊天'),
+    chat: w('Plain chat', '纯聊天模式', '純聊天模式'),
     compaction: w('Compaction', '上下文压缩', '上下文壓縮'),
+    judge: w('Judge', 'Judge', 'Judge'),
   };
-  const placeTone: Record<Place, FilterTone> = { personal: 'progress', channel: 'todo', chat: 'done', compaction: 'neutral' };
+  const sourceTone: Record<Source, FilterTone> = { personal: 'progress', channel: 'todo', chat: 'done', compaction: 'neutral', judge: 'neutral' };
+  const purposeLabel: Record<Purpose, string> = {
+    turn: w('Conversation', '对话', '對話'),
+    subagent: w('Subagent', '子智能体', '子智慧體'),
+    compaction: w('Compaction', '压缩', '壓縮'),
+    title: w('Title', '标题', '標題'),
+    auto_effort: w('Difficulty', '难度判断', '難度判斷'),
+  };
 
   const groups = buckets(data.events, locale);
   const bucketLabels = groups.map((group) => group.label);
@@ -171,15 +199,19 @@ export function Usage() {
     },
   ] : [];
 
-  const counts = (place: Place) => data.events.filter((event) => placeOf(event) === place).length;
+  const counts = (source: Source) => data.events.filter((event) => sourceOf(event) === source).length;
   const columns: FilterColumn<UsageEvent>[] = [
-    { key: 'time', label: w('Time', '时间', '時間'), width: 1.1, render: (event) => <span className="whitespace-nowrap tabular-nums">{formatTime(event.created_at)}</span> },
+    { key: 'time', label: w('Time', '时间', '時間'), width: 1.4, render: (event) => <span className="whitespace-nowrap tabular-nums">{formatTime(event.created_at)}</span> },
     { key: 'account', label: w('Account', '账户', '帳戶'), width: 0.9, primary: true, render: (event) => event.display_name || event.username || '—' },
     { key: 'where', label: w('Where', '来源', '來源'), width: 1.2, render: (event) => <span className="flex min-w-0 items-center gap-1.5">
-      <FilterStatusPill tone={placeTone[placeOf(event)]}>{placeLabel[placeOf(event)]}</FilterStatusPill>
+      <FilterStatusPill tone={sourceTone[placeOf(event)]}>{sourceLabel[placeOf(event)]}</FilterStatusPill>
       {event.scope_name && <span className="truncate">{event.scope_name}</span>}
     </span> },
-    { key: 'model', label: w('Model', '模型', '模型'), width: 0.8, render: (event) => <span className="truncate font-mono text-[12px]">{event.model || '—'}</span> },
+    { key: 'purpose', label: w('Purpose', '用途', '用途'), width: 0.6, render: (event) => <span className={`truncate ${purposeOf(event) === 'turn' ? 'text-ink-2' : 'text-ink'}`}>{purposeLabel[purposeOf(event)]}</span> },
+    { key: 'model', label: w('Model', '模型', '模型'), width: 0.9, render: (event) => <span className="flex min-w-0 items-baseline gap-1">
+      <span className="truncate font-mono text-[12px]">{event.model || '—'}</span>
+      {event.raw_usage?.effort && <span className="shrink-0 text-[12px] text-ink-2">· {adminLabels.depth(event.raw_usage.effort)}</span>}
+    </span> },
     { key: 'input', label: w('Input', '输入', '輸入'), width: 0.6, align: 'end', render: (event) => formatNumber(event.input_tokens) },
     { key: 'cached', label: w('Cached', '缓存', '快取'), width: 0.6, align: 'end', render: (event) => formatNumber(cacheRead(event)) },
     { key: 'output', label: w('Output', '输出', '輸出'), width: 0.6, align: 'end', render: (event) => formatNumber(event.output_tokens) },
@@ -208,20 +240,20 @@ export function Usage() {
 
     {data.events.length > 0 && <section aria-labelledby="usage-events" className="flex flex-col gap-1">
       <div className="flex items-baseline justify-between gap-3">
-        <h2 id="usage-events" className="text-[13px] font-semibold text-ink">{w('Recent runs', '最近的运行', '最近的執行')}</h2>
-        <span className="text-[12px] text-ink-2">{w('Newest 200 agent, chat and compaction runs.', '最近 200 次 Agent、聊天与压缩运行。', '最近 200 次 Agent、聊天與壓縮執行。')}</span>
+        <h2 id="usage-events" className="shrink-0 text-[13px] font-semibold text-ink">{w('Recent runs', '最近的运行', '最近的執行')}</h2>
+        <span className="text-right text-[12px] text-ink-2">{w('Newest 200, including judge calls.', '最近 200 条，含 Judge 调用。', '最近 200 筆，含 Judge 呼叫。')}</span>
       </div>
-      <FilterTable<UsageEvent, PlaceFilter>
+      <FilterTable<UsageEvent, SourceFilter>
         rows={[...data.events].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id)}
         rowKey={(event) => event.id}
         columns={columns}
-        minWidth={860}
+        minWidth={1000}
         labels={{ filters: w('Filter runs by source', '按来源筛选', '依來源篩選'), table: w('Recent runs', '最近的运行', '最近的執行') }}
         filters={[
           { key: 'all', label: w('All', '全部', '全部'), count: data.events.length },
-          ...(['personal', 'channel', 'chat', 'compaction'] as const).map((place) => ({ key: place, label: placeLabel[place], tone: placeTone[place], count: counts(place) })),
+          ...(['personal', 'channel', 'chat', 'compaction', 'judge'] as const).map((source) => ({ key: source, label: sourceLabel[source], tone: sourceTone[source], count: counts(source) })),
         ]}
-        matches={(event, filter) => filter === 'all' || placeOf(event) === filter}
+        matches={(event, filter) => filter === 'all' || sourceOf(event) === filter}
         empty={w('No runs from this source.', '没有来自此来源的运行。', '沒有來自此來源的執行。')}
       />
     </section>}

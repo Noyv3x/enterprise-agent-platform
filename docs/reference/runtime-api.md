@@ -57,6 +57,35 @@ account catalog. Runtime accepts those Codex IDs even when absent from Pi's
 static catalog, using native Codex transport metadata and supplied token
 limits (or native template defaults).
 
+`model.thinking` also accepts `"auto"` (run and compact bodies). A run body with
+`"auto"` MUST carry a top-level sibling
+`"judge":{"id","thinking","contextWindow"?,"maxTokens"?}` (400 otherwise);
+`judge.thinking` is one of `off|minimal|low|medium|high|xhigh`, never `auto`.
+`judge` is ignored when `thinking` is not `auto`. Applies to `kind` agent, chat
+and subagent. Before the run's first model request, Runtime asks the judge
+model for one label `low|medium|high|xhigh` from the request text (without the
+context prefix; bounded head+tail) plus the session's previous user request, so
+short follow-ups are judged by the work they continue. A subagent run judges its
+task text once (a later run of the same session reuses the applied effort).
+Steered messages are never re-judged. The call has an 8 s deadline; a failed,
+timed out or unparsable judgment applies the session's last applied effort, else
+`high`. The judge call runs concurrently with run setup and goes through its own
+Platform credential resolution for the judge model id, never the session.
+
+For `openai-codex-responses` requests to GPT-6-family models
+(`^gpt-6([.-]|$)`) every conversation request keeps `reasoning.effort` pinned to
+the session's baseline (its first request's effort). Each later effort change
+(auto or an administrator changing a fixed effort) travels as an input item
+`{"type":"configuration_update","reasoning":{"effort":"<level>"}}` inserted just
+before the user message it takes effect on (after the latest tool result when it
+changes inside a tool loop) and replayed at the same position on every later
+request; two such items are never adjacent. Pi's one-off summarization requests
+(`cacheRetention:"none"`) never carry them. The planner state is stored next to
+the journal (`sessions-v3/<sha256(sid)>.effort.json`), survives idle disposal and
+restarts and is deleted with the session; it resets when the history no longer
+extends the recorded anchors (compaction) or the model changes. A session without
+state starts from the effort its history already used.
+
 Resources, tools and kind are fixed when a live session is constructed.
 Unchanged inputs reuse that object; changed inputs reopen the same transcript
 and Pi appends changed system-prompt sections without rewriting its leading
@@ -140,10 +169,13 @@ complete browser image content.
 | retry | attempt, max, delay_ms, error |
 | compaction | phase (start/end), reason |
 | input_delivered | input_id |
-| run_end | status (completed/failed/cancelled), text, usage, model, error?, side_effects, undelivered_inputs |
+| run_end | status (completed/failed/cancelled), text, usage, model, effort, judge_usage?, error?, side_effects, undelivered_inputs |
 
 `usage` contains `input`, `output`, `cache_read`, `cache_write`, `total`.
 `run_end` is always the last event. No draft events are emitted.
+`effort` is the concrete thinking level the run used (admin-only; Platform never
+forwards it to users). `judge_usage` (`{model,input,output,cache_read,cache_write,total}`,
+admin-only) is present only when an automatic-effort judge call ran.
 `side_effects` becomes true when bash/write/edit, a mutating browser or
 schedule action, a `task` spawn, a `job` `input`/`stop`, or any MCP operation starts.
 
@@ -161,6 +193,8 @@ at most about 8 events per second per call. Live output is capped at 512 KiB per
 call, after which one `{tool_call_id,delta:"",truncated:true}` is emitted and
 no more follow. `tool_end` stays authoritative for the result. All three are
 informational: they never set `side_effects` and Platform ignores them in work traces.
+
+`tool_end.details` of a successful `edit` or `write` carries `patch`, a standard unified patch (`---`/`+++` file headers, `@@` hunks): edit's is Pi's `details.patch` (Pi's display-format `diff` is dropped), write's compares against the content it replaced, read through the same sandbox operations inside the file's mutation queue, with 3 lines of context (a new file is all additions). A write has no patch when the old file is not a regular file, is binary or not UTF-8, or is larger than 1 MiB (the read itself stops at that bound); when the new content is larger than 1 MiB (the old file is then not read); or when the diff (jsdiff `createTwoFilesPatch`, run on Runtime's event loop) exceeds 10,000 changed lines or 200 ms. On the event stream the patch shares the `tool_end` 64 KiB activity budget: it is kept in whole lines (never cut mid-line or suffixed with `…`) and a cut one adds `details.patch_truncated:true`; when not even its first line fits it is omitted.
 
 `POST /v1/runs/{run_id}/cancel` returns `{ok:true}` and cancels Pi and
 Manager execution. `POST /v1/sessions/{sid}/cancel` settles an active run
@@ -187,12 +221,24 @@ using the actual Pi compaction token usage. A session with insufficient
 history returns HTTP 200 `{compacted:false,reason:"too_small"}` without
 calling the summarization provider. This no-work result is not a failure.
 The requested model/thinking are used for summarization, including when
-restoring a persisted session after restart or eviction.
+restoring a persisted session after restart or eviction. With
+`model.thinking:"auto"` (no `judge` needed; no judge call is made) Runtime
+summarizes at the session's last applied effort, else `high`.
 Concurrent session mutations return 409. `DELETE /v1/sessions/{sid}`
 disposes the object and deletes its v3 file. `GET
 /v1/sessions/{sid}/history?before=<entry_id>&limit=n` returns
 `{messages:[{entry_id,message}],next_before}` containing model-visible
 messages for debugging/export, not UI message storage.
+
+`POST /v1/titles` `{judge:{id,thinking,contextWindow?,maxTokens?}, text, files?}`
+(`text` a string ≤ 8000 characters, `files` at most 20 attachment names, each a
+non-empty string ≤ 255 characters; `judge.thinking` never `auto`) asks the judge
+model for a short conversation title. 200 `{title,model,usage:{input,output,cache_read,cache_write,total}}`.
+The title uses the language of `text`, at most 24 CJK characters or 8 words, plain
+text without surrounding quotes or trailing punctuation. 400 invalid body; 502
+model failure or an empty answer; 504 after a 20 s deadline. The call uses the
+judge model's own Platform credential resolution and a constant cache routing id,
+never a conversation session.
 
 ## Execution and persistence
 

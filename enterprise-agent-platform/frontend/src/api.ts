@@ -53,8 +53,18 @@ export interface BuiltinSkill extends SkillView { org_enabled: boolean }
 export interface AdminSkills { org: OrgSkill[]; builtin: BuiltinSkill[]; groups: string[] }
 
 /** What an artifact (作品) shows as, derived from its entry extension (platform-api.md § Artifacts); `live` is a running
- * website preview bound to a named background service, without versions or files. */
-export type ArtifactKind = 'web' | 'site' | 'markdown' | 'mermaid' | 'svg' | 'table' | 'code' | 'image' | 'pdf' | 'live';
+ * website preview bound to a named background service, without versions or files. `docx`, `xlsx` and `pptx` render in
+ * the sandboxed Office viewer. */
+export type ArtifactKind = 'web' | 'site' | 'markdown' | 'mermaid' | 'svg' | 'table' | 'code' | 'image' | 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'live';
+
+/** How the side panel shows an attachment (`view_kind` of an attachment, `kind` of its view URL); `other` has no view,
+ * only the download. */
+export type AttachmentViewKind = 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'image' | 'text' | 'other';
+
+/** `POST /api/attachments/{id}/view`: a cookie-less `/attachment-view/<token>/<name>` URL, valid for 2 hours. Office
+ * kinds open the sandboxed viewer page, PDF the native viewer under a sandbox CSP, images and text the raw bytes (text
+ * at most 2 MiB). */
+export interface AttachmentViewGrant { url: string; kind: AttachmentViewKind; expires_at: string }
 
 /** One artifact of a conversation scope. `scope` is the `?scope=` form; `entry` is the latest version's entry relpath
  * (null for `live`, whose `latest_version` is 0). A live artifact in `GET /api/artifacts?scope=` may carry its

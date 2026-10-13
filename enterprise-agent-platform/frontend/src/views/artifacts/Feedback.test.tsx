@@ -97,7 +97,7 @@ function route(path: string, method: string, body: unknown, messages: Message[])
   if (/^\/api\/artifacts\/\d+\/versions\/\d+\/source/.test(path)) return { content: "# Plan\n\nShip the beta in May.\n", truncated: false, mime: "text/markdown" };
   if (/^\/api\/artifacts\/\d+\/(versions\/\d+|live)\/capture$/.test(path) && method === "POST") {
     const id = 900 + ++captured;
-    return { attachment: { id, filename: `capture-${id}.png`, mime_type: "image/png", size_bytes: 2048, url: `/api/attachments/${id}`, preview_url: `/api/attachments/${id}/preview` } };
+    return { attachment: { id, filename: `capture-${id}.png`, mime_type: "image/png", size_bytes: 2048, url: `/api/attachments/${id}`, preview_url: `/api/attachments/${id}/preview`, view_kind: "image" } };
   }
   if (/^\/api\/tasks\/bg-\d+\/stop$/.test(path) && method === "POST") return { task: { id: path.split("/")[3] } };
   if (path === "/api/artifacts/21/live" && method === "DELETE") {
@@ -442,7 +442,7 @@ describe("圈选反馈", () => {
     });
     withdrawn = {
       content: "Fix these headings",
-      attachments: [{ id: 77, filename: "capture-77.png", mime_type: "image/png", size_bytes: 2048, url: "/api/attachments/77", preview_url: "/api/attachments/77/preview" }],
+      attachments: [{ id: 77, filename: "capture-77.png", mime_type: "image/png", size_bytes: 2048, url: "/api/attachments/77", preview_url: "/api/attachments/77/preview", view_kind: "image" }],
       artifact_feedback: [stored(1), stored(2), stored(3), stored(4)],
     };
     const queued: Message = {

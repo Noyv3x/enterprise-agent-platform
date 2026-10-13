@@ -111,7 +111,7 @@ describe('Conversation', () => {
 
   it('retains the draft, attachment and composer focus when another member starts an empty channel', async () => {
     const user = userEvent.setup();
-    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: null, view_kind: 'text' };
     serve({
       'GET /api/conversations/channel-3/messages?limit=100': () => page([]),
       'POST /api/attachments?scope=channel-3': () => ({ attachment }),
@@ -295,7 +295,7 @@ describe('Conversation', () => {
 
   it('withdraws into the composer: the text goes above the draft and the files return as chips', async () => {
     const user = userEvent.setup();
-    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: null, view_kind: 'text' as const };
     const later: Message = { ...message(2, 'user', 'Check the totals'), metadata: { status: 'queued', send_mode: 'after_turn' }, attachments: [attachment] };
     serve({
       'GET /api/conversations/private/messages?limit=100': () => page([message(1, 'user', 'Working', 'running'), later]),
@@ -737,7 +737,7 @@ describe('Conversation', () => {
 
   it('sends an uploaded attachment without text and shows it as a downloadable file card', async () => {
     const user = userEvent.setup();
-    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: '/api/attachments/17/preview' };
+    const attachment = { id: 17, filename: 'notes.txt', mime_type: 'text/plain', size_bytes: 5, url: '/api/attachments/17', preview_url: null, view_kind: 'text' };
     serve({
       'GET /api/conversations/private/messages?limit=100': () => page([]),
       'POST /api/attachments?scope=private': () => ({ attachment }),
@@ -752,8 +752,9 @@ describe('Conversation', () => {
     expect(calls('POST', '/api/conversations/private/messages')).toEqual([{ content: '', attachment_ids: [17] }]);
     expect(await screen.findByRole('link', { name: 'Download notes.txt' })).toHaveAttribute('href', '/api/attachments/17');
     expect(screen.queryByRole('button', { name: 'Remove notes.txt' })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Preview' }));
-    expect(document.querySelector('iframe')).toHaveAttribute('src', '/api/attachments/17/preview');
+    // Documents never expand inside the message; 打开 shows them in the side panel.
+    expect(screen.getByRole('button', { name: 'Open notes.txt' })).toBeVisible();
+    expect(document.querySelector('iframe')).toBeNull();
   });
 
   it('accepts pasted files as attachments', async () => {
