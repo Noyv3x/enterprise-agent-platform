@@ -4,6 +4,9 @@ import os
 from pathlib import Path
 import secrets
 
+# Engines verified to answer from mainland China and abroad; SearXNG's default set there is mostly CAPTCHA'd or suspended.
+DEFAULT_SEARXNG_ENGINES = ('google cse', 'bing', 'bing news', 'sogou', '360search', 'yahoo')
+
 
 @dataclass
 class Settings:
@@ -19,6 +22,7 @@ class Settings:
     camofox_access_key: str = ''
     artifact_render_base_url: str = 'http://platform:8765'
     searxng_url: str = 'http://searxng:8080'
+    searxng_engines: tuple = DEFAULT_SEARXNG_ENGINES
     public_base_url: str = 'http://127.0.0.1:8080'
     trusted_proxy: bool = False
     frontend_dir: Path = Path(__file__).parent / 'static'
@@ -61,6 +65,7 @@ class Settings:
             camofox_access_key=secret('CAMOFOX_ACCESS_KEY'),
             artifact_render_base_url=value('ARTIFACT_RENDER_BASE_URL', 'http://platform:8765').rstrip('/'),
             searxng_url=value('SEARXNG_API_URL', 'http://searxng:8080').rstrip('/'),
+            searxng_engines=tuple(name.strip() for name in value('SEARXNG_ENGINES', ','.join(DEFAULT_SEARXNG_ENGINES)).split(',') if name.strip()),
             public_base_url=value('PUBLIC_BASE_URL', 'http://127.0.0.1:8080').rstrip('/'),
             trusted_proxy=value('TRUSTED_PROXY').lower() in ('1', 'true', 'yes'),
             host=value('HOST', '127.0.0.1'), port=int(value('PORT', '8765')),

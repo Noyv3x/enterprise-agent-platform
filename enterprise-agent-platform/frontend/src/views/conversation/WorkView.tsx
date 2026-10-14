@@ -4,9 +4,11 @@ import ToolChips, { type ToolChildRow, type ToolDetailLine, type ToolDiff, type 
 import { useWords } from "../../words";
 import { ComputerContext, fileName, parsePatch } from "./computerView";
 import { Markdown } from "./Markdown";
+import { SiteMark, SiteStack } from "./SiteMark";
 import { TASK_TOOL_STATE, TasksContext, agentTypeLabel, isRunning, promotedTaskId, taskElapsed, taskStatusLabel, tokenCount, type TasksValue, type TaskView } from "./taskState";
 import { formatThinking } from "./thinking";
 import type { RunRef } from "./types";
+import { WEB_TOOLS, calmFailure, clipQuery, engineList, failureDetail, failureShort, safeHref, siteOf } from "./web";
 import { McpLabelsContext, mcpSubject, mcpToolName, toolVerb, type McpLabels, type WorkItem, type WorkTrace, type Words } from "./work";
 
 type ToolItem = Extract<WorkItem, { type: "tool" }>;
@@ -43,8 +45,61 @@ function editPairs(args: Record<string, unknown>): { oldText: string; newText: s
 /** A tool call as one ToolChips row, plus the diff chip a file write contributes. */
 type Described = { step: ToolStep; diff?: ToolDiff; diffLines?: ToolDiffLine[] };
 
+/** A web step as a ToolChips row: the query or the site (its monogram leading the chip) while it runs, then what it
+ * found — stacked result sites and a count, or the page's title — or, calmly, why a page could not be read. The
+ * expanded detail lists result links, the start of the page, or the full explanation. */
+function describeWeb(tool: ToolItem, w: Words): ToolStep {
+  const { web } = tool;
+  const running = tool.status === "running";
+  const failure = web?.kind === "failure" ? web : null;
+  const calm = calmFailure(web);
+  const base = {
+    id: tool.id, mono: false, detailMono: false, state: tool.status === "done" ? "done" as const : tool.status, shimmer: true,
+    stateLabel: tool.status === "cancelled" ? w("Stopped", "已停止", "已停止") : tool.status === "error" && !calm ? w("Failed", "失败", "失敗") : undefined,
+  };
+  if (tool.name === "web_search") {
+    const search = web?.kind === "search" ? web : null;
+    const count = search?.results.length ?? 0;
+    const detail: ToolDetailLine[] = (search?.results ?? []).map((result) => ({ text: result.title || siteOf(result.url), href: safeHref(result.url), meta: siteOf(result.url) }));
+    if (search?.unresponsive.length) {
+      detail.push({ text: w(`Unavailable engines: ${engineList(search.unresponsive, w)}`, `暂不可用的搜索引擎：${engineList(search.unresponsive, w)}`, `暫不可用的搜尋引擎：${engineList(search.unresponsive, w)}`), tone: "muted" });
+    }
+    if (search?.text) detail.push(...lines(search.text));
+    if (failure?.message) detail.push(...lines(failure.message, "muted"));
+    return {
+      ...base, icon: "search", loader: "Orbit", label: running ? w("Searching", "正在搜索", "正在搜尋") : w("Searched", "搜索", "搜尋"),
+      chip: arg(tool.args, "query") || search?.query || "", detail,
+      ...(failure ? { stateLabel: w("Search unavailable", "搜索暂不可用", "搜尋暫不可用") } : {}),
+      ...(search && !search.text ? {
+        trail: count
+          ? <><SiteStack urls={search.results.map((result) => result.url)} /><span>{w(`${count} ${count === 1 ? "result" : "results"}`, `${count} 条结果`, `${count} 筆結果`)}</span></>
+          : <span>{w("No results", "没有结果", "沒有結果")}</span>,
+      } : {}),
+    };
+  }
+  const page = web?.kind === "page" ? web : null;
+  const url = page?.url || arg(tool.args, "url");
+  const site = siteOf(url);
+  const detail: ToolDetailLine[] = [];
+  if (page) {
+    detail.push({ text: page.title || site, href: safeHref(page.url), meta: page.via === "browser" ? w("opened in a browser", "经浏览器打开", "經瀏覽器開啟") : site });
+    const excerpt = page.excerpt.split("\n").map((line) => line.replace(/^[#>*\-\s]+/, "").trim()).filter(Boolean).slice(0, 4);
+    detail.push(...excerpt.map((text) => ({ text, tone: "muted" as const })));
+  }
+  if (failure) {
+    detail.push(...failureDetail(failure, w).map((text) => ({ text })));
+    if (safeHref(url)) detail.push({ text: w("Open the original page", "打开原网页", "開啟原網頁"), href: url, meta: site });
+  }
+  return {
+    ...base, icon: "web", loader: "Drive", label: running ? w("Reading", "正在阅读", "正在閱讀") : w("Read", "阅读", "閱讀"),
+    chip: page?.title ? `${site} · ${page.title}` : site, lead: site ? <SiteMark url={url} className="size-4 text-[8.5px]" /> : undefined, detail,
+    ...(calm ? { calm: true, stateLabel: failureShort(calm, w) } : {}),
+  };
+}
+
 /** How one tool call reads as a ToolChips row (and, for file writes, a diff chip). */
 function describe(tool: ToolItem, w: Words, labels: McpLabels): Described {
+  if (WEB_TOOLS[tool.name]) return { step: describeWeb(tool, w) };
   const { args } = tool;
   const path = arg(args, "path");
   let icon = "tool";
@@ -97,15 +152,6 @@ function describe(tool: ToolItem, w: Words, labels: McpLabels): Described {
     case "grep":
       icon = "search";
       chip = [arg(args, "pattern"), path].filter(Boolean).join("  ") || ".";
-      break;
-    case "web_search":
-      icon = "web";
-      chip = arg(args, "query");
-      mono = false;
-      break;
-    case "web_fetch":
-      icon = "web";
-      chip = arg(args, "url");
       break;
     case "browser":
       icon = "web";
@@ -247,6 +293,7 @@ const ToolGroup = memo(function ToolGroup({ tools, run }: { tools: ToolItem[]; r
     };
   });
   const count = tools.length;
+  const header = WEB_TOOLS[tools[0].name] ? webHeader(tools, w) : w(`${count} tool ${count === 1 ? "call" : "calls"}`, `${count} 次工具调用`, `${count} 次工具呼叫`);
   return (
     <ToolChips
       steps={steps}
@@ -254,7 +301,7 @@ const ToolGroup = memo(function ToolGroup({ tools, run }: { tools: ToolItem[]; r
       diffLines={diffLines}
       rowAction={computer ? { label: w("View in computer", "在电脑中查看", "在電腦中檢視"), onSelect: (id) => computer.show(run, id) } : undefined}
       labels={{
-        header: w(`${count} tool ${count === 1 ? "call" : "calls"}`, `${count} 次工具调用`, `${count} 次工具呼叫`),
+        header,
         showDiff: (file) => w(`Show changes to ${file}`, `查看 ${file} 的改动`, `查看 ${file} 的變更`),
       }}
     />
@@ -298,10 +345,35 @@ const ThinkingBlock = memo(function ThinkingBlock({ item, streaming }: { item: T
   return <TraceProse heading={heading}><Markdown content={content} /></TraceProse>;
 });
 
+/** A run of web steps in one phrase: "搜索 2 次 · 阅读 3 个网页 · 1 个无法打开". */
+function webHeader(tools: ToolItem[], w: Words): string {
+  const searches = tools.filter((tool) => tool.name === "web_search").length;
+  // Only finished steps count: a page is read once its text came back, and could not be opened once it failed.
+  const failed = tools.filter((tool) => tool.name === "web_fetch" && tool.web?.kind === "failure").length;
+  const reads = tools.filter((tool) => tool.name === "web_fetch" && tool.web?.kind === "page").length;
+  const opening = tools.filter((tool) => tool.name === "web_fetch" && tool.status === "running").length;
+  const phrase = [
+    searches ? w(`${searches} ${searches === 1 ? "search" : "searches"}`, `搜索 ${searches} 次`, `搜尋 ${searches} 次`) : "",
+    reads ? w(`${reads} ${reads === 1 ? "page" : "pages"} read`, `阅读 ${reads} 个网页`, `閱讀 ${reads} 個網頁`) : "",
+    failed ? w(`${failed} could not be opened`, `${failed} 个无法打开`, `${failed} 個無法開啟`) : "",
+    opening ? w(`opening ${opening} ${opening === 1 ? "page" : "pages"}`, `正在打开 ${opening} 个网页`, `正在開啟 ${opening} 個網頁`) : "",
+  ].filter(Boolean).join(" · ");
+  // Only stopped page reads: say how many web steps there were. English starts with a capital ("Opening 1 page").
+  return phrase ? phrase.charAt(0).toUpperCase() + phrase.slice(1)
+    : w(`${tools.length} web ${tools.length === 1 ? "step" : "steps"}`, `${tools.length} 个网页步骤`, `${tools.length} 個網頁步驟`);
+}
+
 function activeLabel(items: WorkItem[], w: Words): string {
   const last = items[items.length - 1];
   if (last?.type === "tool" && last.status === "running") {
-    if (last.name === "web_search" || last.name === "web_fetch") return w("Searching the web", "正在搜索网页", "正在搜尋網頁");
+    if (last.name === "web_search") {
+      const query = clipQuery(arg(last.args, "query"));
+      return query ? w(`Searching for “${query}”`, `正在搜索「${query}」`, `正在搜尋「${query}」`) : w("Searching the web", "正在搜索网页", "正在搜尋網頁");
+    }
+    if (last.name === "web_fetch") {
+      const site = siteOf(arg(last.args, "url"));
+      return site ? w(`Reading ${site}`, `正在阅读 ${site}`, `正在閱讀 ${site}`) : w("Reading a page", "正在阅读网页", "正在閱讀網頁");
+    }
     if (last.name === "wait") return w("Waiting for background results", "正在等待后台结果", "正在等待背景結果");
     return w("Running tools", "正在使用工具", "正在使用工具");
   }
@@ -332,6 +404,8 @@ export function WorkView({ trace, working, run }: { trace: WorkTrace; working: b
   };
   trace.items.forEach((item, index) => {
     if (item.type === "tool") {
+      // Consecutive web steps form their own group, read as one search session.
+      if (group.length && Boolean(WEB_TOOLS[group[0].name]) !== Boolean(WEB_TOOLS[item.name])) flush();
       group.push(item);
       return;
     }

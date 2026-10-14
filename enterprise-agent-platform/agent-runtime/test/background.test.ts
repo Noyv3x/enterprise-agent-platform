@@ -339,7 +339,7 @@ test("task, job and wait forward to the tasks gateway with the call context", as
   assert.equal(h.processes.starts.length, 0);
 
   const failing = harness({ gateway: () => ({ content: "Nothing is running and nothing is undelivered", data: null, is_error: true }) });
-  await assert.rejects(failing.invoke("wait", {}), /Nothing is running/);
+  assert.deepEqual(await failing.invoke("wait", {}), { content: [{ type: "text", text: "Nothing is running and nothing is undelivered" }], details: {}, isError: true });
 });
 
 test("task, job and wait exist only in the root personal scope", () => {

@@ -87,8 +87,13 @@ function previewDetails(value: unknown, budget: { left: number }): unknown {
   return { ...result, patch: kept, ...(cut ? { patch_truncated: true } : {}) };
 }
 
+// Web tool details are small, bounded by Platform, and are what the UI renders (results, page excerpt, failure), so they
+// are projected first and always arrive whole; the content preview gets what is left.
+const DETAILS_FIRST: Record<string, true> = { web_search: true, web_fetch: true };
+
 function project(event: { type: string; [key: string]: unknown }): Record<string, unknown> {
-  const fields = event.type === 'tool_start' ? ['args'] : event.type === 'tool_update' ? ['partial'] : event.type === 'tool_end' ? ['content_preview', 'details'] : [];
+  const fields = event.type === 'tool_start' ? ['args'] : event.type === 'tool_update' ? ['partial']
+    : event.type === 'tool_end' ? (Object.hasOwn(DETAILS_FIRST, String(event.name)) ? ['details', 'content_preview'] : ['content_preview', 'details']) : [];
   const result = { ...event };
   const budget = { left: ACTIVITY_BYTES - 64 };
   for (const field of fields) if (field in result) result[field] = field === 'details' ? previewDetails(result[field], budget) : preview(result[field], budget);

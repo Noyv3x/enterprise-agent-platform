@@ -2,7 +2,7 @@ import { Fragment, memo, useMemo, useState, type ReactNode } from "react";
 import { EntityChip } from "../../components/ui/beautiful/atoms/EntityChip";
 import { StatusPill } from "../../components/ui/beautiful/atoms/StatusPill";
 import LoadingState from "../../components/ui/beautiful/primitives/LoadingState";
-import StreamingText, { type StreamingAction } from "../../components/ui/beautiful/primitives/StreamingText";
+import StreamingText, { type StreamingAction, type StreamingSource } from "../../components/ui/beautiful/primitives/StreamingText";
 import { intlLocale } from "../../i18n";
 import { useWords } from "../../words";
 import { ArtifactCards, baseName, messageArtifacts } from "../artifacts/ArtifactCards";
@@ -12,6 +12,7 @@ import { AttachmentCards } from "./Attachments";
 import { Markdown } from "./Markdown";
 import { TaskNoticeRow } from "./Tasks";
 import type { LiveRun, Message } from "./types";
+import { readSources, siteMark } from "./web";
 import { messageWork, splitLive, workSegments, type WorkTrace } from "./work";
 import { WorkView } from "./WorkView";
 
@@ -123,6 +124,10 @@ export const Reply = memo(function Reply({ message, run, inserted = NO_MESSAGES,
   const trace = useMemo<WorkTrace | null>(() => (message ? persisted
     : live?.work.length ? { items: live.work, startedAt, endedAt: null, truncated: false, omitted: 0 } : null), [message, persisted, live, startedAt]);
   const segments = useMemo(() => (trace ? workSegments(trace) : []), [trace]);
+  // The pages this run actually read, under the settled answer.
+  const sources = useMemo<StreamingSource[]>(() => (persisted ? readSources(persisted.items).map((source) => ({
+    name: source.title, domain: source.site, href: source.url, ...siteMark(source.url),
+  })) : []), [persisted]);
 
   const working = !message && !live?.answer;
   const rows: ReactNode[] = [];
@@ -146,6 +151,8 @@ export const Reply = memo(function Reply({ message, run, inserted = NO_MESSAGES,
         key="answer"
         streaming={false}
         actions={actions}
+        sources={sources}
+        sourcesLabel={w(`${sources.length} ${sources.length === 1 ? "source" : "sources"}`, `${sources.length} 个来源`, `${sources.length} 個來源`)}
         status={status === "interrupted" || status === "cancelled" ? (
           <>
             <StatusPill tone={status === "interrupted" ? "orange" : "neutral"} className="h-5.5 text-[12px]">

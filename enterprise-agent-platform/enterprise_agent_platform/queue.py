@@ -82,6 +82,44 @@ WORK_TRACE_BYTES = 256 * 1024
 """A work trace's JSON size bound (raised from 96 KiB when edit/write items gained patches)."""
 WORK_PATCH_BYTES = 24 * 1024
 """Per edit/write item: the unified patch is kept in whole lines up to this many bytes of JSON."""
+WORK_WEB_RESULTS = 10
+"""Per web_search item: at most this many results are kept for display."""
+WORK_WEB_EXCERPT = 2000
+"""Per successful web_fetch item: the page's Markdown excerpt is kept up to this many characters."""
+
+
+def _text(value, limit):
+    return value[:limit] if isinstance(value, str) else ""
+
+
+def _web_display(name, details, is_error):
+    """The display fields of a web_search / web_fetch item from its `tool_end` details (the gateway's `data`), or
+    None when the details are not the web contract's. Bounded per field; the model's own content stays in `output`."""
+    if not isinstance(details, dict):
+        return None
+    if name == "web_search" and not is_error and isinstance(details.get("web"), list):
+        results = [{"title": _text(entry.get("title"), 200), "url": _text(entry.get("url"), 500),
+                    "description": _text(entry.get("description"), 240)}
+                   for entry in details["web"] if isinstance(entry, dict) and isinstance(entry.get("url"), str) and entry["url"]]
+        unresponsive = [{"engine": _text(entry.get("engine"), 64), "reason": _text(entry.get("reason"), 120)}
+                        for entry in details.get("unresponsive") or [] if isinstance(entry, dict)]
+        return {"query": _text(details.get("query"), 500), "results": results[:WORK_WEB_RESULTS],
+                "unresponsive": unresponsive[:5]}
+    if name == "web_fetch" and not is_error and isinstance(details.get("url"), str) and "excerpt" in details:
+        page = {"url": _text(details["url"], 2000), "title": _text(details.get("title"), 200),
+                "via": "browser" if details.get("via") == "browser" else "direct",
+                "chars": details["chars"] if type(details.get("chars")) is int else None,
+                "truncated": details.get("truncated") is True}
+        return {"page": page, "excerpt": _text(details.get("excerpt"), WORK_WEB_EXCERPT)}
+    if name == "web_fetch" and is_error and isinstance(details.get("error"), str):
+        failure = {"error": details["error"][:32], "host": _text(details.get("host"), 255),
+                   "tried_browser": details.get("tried_browser") is True}
+        if type(details.get("status")) is int:
+            failure["status"] = details["status"]
+        if isinstance(details.get("protection"), str) and details["protection"]:
+            failure["protection"] = details["protection"][:32]
+        return {"failure": failure}
+    return None
 
 
 class _WorkTrace:
@@ -224,13 +262,19 @@ class _WorkTrace:
                 if entry["type"] != "tool" or entry["id"] != event["tool_call_id"]:
                     continue
                 item = dict(entry)
+                web = None
                 if kind == "tool_update":
                     item["output"] = self.preview(event.get("partial", {}).get("content", []))
                 else:
-                    item["output"] = self.preview(event.get("content_preview", []))
                     item["status"] = "error" if event.get("is_error") else "done"
                     item["ended_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
                     details = event.get("details") or {}
+                    web = _web_display(entry["name"], details, bool(event.get("is_error")))
+                    # A successful web step's display fields replace its JSON output (the model's copy); a failure
+                    # keeps its explanation.
+                    item["output"] = "" if web and not event.get("is_error") else self.preview(event.get("content_preview", []))
+                    if web:
+                        item.update(web)
                     background = details.get("background")
                     if isinstance(background, dict) and isinstance(background.get("task_id"), str):
                         item["background"] = {"task_id": background["task_id"][:32],
@@ -242,11 +286,15 @@ class _WorkTrace:
                         if cut or details.get("patch_truncated") is True:
                             item["patch_truncated"] = True
                 if not self.store(item, index) and kind == "tool_end":
-                    # A patch that cannot fit goes first, then the final output; the reserved
-                    # timestamp budget guarantees terminal status survives.
-                    if "patch" in item:
-                        item.pop("patch")
+                    # A patch or web display fields that cannot fit go first (a web step then keeps its output
+                    # preview), then the final output; the reserved timestamp budget guarantees terminal status survives.
+                    if "patch" in item or web:
+                        item.pop("patch", None)
                         item.pop("patch_truncated", None)
+                        for key in web or ():
+                            item.pop(key)
+                        if web and not item["output"]:
+                            item["output"] = self.preview(event.get("content_preview", []))
                         if self.store(item, index):
                             break
                     item["output"] = entry["output"]

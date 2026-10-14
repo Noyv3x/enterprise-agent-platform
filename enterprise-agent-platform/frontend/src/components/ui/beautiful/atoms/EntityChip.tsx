@@ -1,3 +1,8 @@
+/* Upstream components/atoms/EntityChip.tsx. Adaptations: Monogram merges the caller's classes with `cn`, so a caller
+ * can resize it (the personal AI's site avatars: 14px stacks, 16px list marks, a 4px-radius square), and it is hidden
+ * from assistive technology, since the name beside it says the same. */
+import { cn } from "../cn";
+
 /** Monogram mark — a colored disc with an initial or short glyph.
  *  The shared building block for entity chips and monogram headings. */
 export function Monogram({
@@ -11,8 +16,9 @@ export function Monogram({
 }) {
   return (
     <span
-      className={`flex size-4 shrink-0 items-center justify-center rounded-full
-        text-[9px] font-semibold leading-none text-white ${className}`}
+      aria-hidden
+      className={cn(`flex size-4 shrink-0 items-center justify-center rounded-full
+        text-[9px] font-semibold leading-none text-white`, className)}
       style={{ background: color }}
     >
       {children}

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { I18nProvider, LOCALE_STORAGE_KEY } from '../../i18n';
 import { Reply } from './Messages';
 import type { LiveRun, Message } from './types';
+import type { WebData } from './web';
 import type { WorkItem } from './work';
 import { WorkView } from './WorkView';
 
@@ -158,5 +159,55 @@ describe('file change chips', () => {
     expect(changed).toHaveTextContent('+1');
     expect(changed).toHaveTextContent('−1');
     expect(screen.getByRole('button', { name: 'Show changes to new.md' })).toHaveTextContent(/^new\.md\+3$/);
+  });
+});
+
+describe('web steps in the work trace', () => {
+  afterEach(cleanup);
+
+  it.each([
+    ['en', 'Searching for “2026 新能源汽车销量”', 'Reading news.cn'],
+    ['zh-CN', '正在搜索「2026 新能源汽车销量」', '正在阅读 news.cn'],
+    ['zh-TW', '正在搜尋「2026 新能源汽车销量」', '正在閱讀 news.cn'],
+  ])('announces what the AI is searching or reading, politely, in %s', (locale, searching, reading) => {
+    window.localStorage.setItem(LOCALE_STORAGE_KEY, locale);
+    const search: WorkItem = { type: 'tool', id: 's', name: 'web_search', args: { query: '2026 新能源汽车销量' }, status: 'running', output: '', startedAt: NOW, endedAt: null };
+    const { rerender } = render(view([search]));
+    const status = screen.getAllByRole('status').find((node) => node.textContent?.startsWith(searching));
+    expect(status).toBeTruthy();
+    const fetch: WorkItem = { type: 'tool', id: 'f', name: 'web_fetch', args: { url: 'https://www.news.cn/a' }, status: 'running', output: '', startedAt: NOW, endedAt: null };
+    rerender(view([{ ...search, status: 'done' }, fetch]));
+    expect(screen.getAllByRole('status').some((node) => node.textContent?.startsWith(reading))).toBe(true);
+  });
+});
+
+describe('web step group header', () => {
+  beforeEach(() => window.localStorage.setItem(LOCALE_STORAGE_KEY, 'en'));
+  afterEach(cleanup);
+  const fetch = (id: string, status: 'running' | 'done' | 'error' | 'cancelled', web?: WebData): WorkItem => ({
+    type: 'tool', id, name: 'web_fetch', args: { url: `https://news.cn/${id}` }, status, output: '', startedAt: NOW - 1000, endedAt: status === 'running' ? null : NOW,
+    ...(web ? { web } : {}),
+  });
+  const page: WebData = { kind: 'page', url: 'https://news.cn/a', title: 'A', via: 'direct', chars: 10, truncated: false, excerpt: '' };
+  const blocked: WebData = { kind: 'failure', error: 'blocked', url: 'https://news.cn/b', host: 'news.cn', status: 401, protection: '', triedBrowser: true, message: '' };
+
+  it('counts only pages actually read; running and stopped reads are not', () => {
+    const { rerender } = render(view([fetch('a', 'done', page), fetch('b', 'error', blocked), fetch('c', 'running'), fetch('d', 'cancelled')]));
+    expect(screen.getByRole('button', { name: '1 page read · 1 could not be opened · opening 1 page' })).toBeVisible();
+    rerender(view([fetch('c', 'running')]));
+    expect(screen.getByRole('button', { name: 'Opening 1 page' })).toBeVisible();
+    rerender(view([fetch('d', 'cancelled')], false));
+    expect(screen.getByRole('button', { name: '1 web step' })).toBeInTheDocument();
+  });
+
+  it('never makes a link of an address that is not http or https', () => {
+    const search: WorkItem = {
+      type: 'tool', id: 's', name: 'web_search', args: { query: 'q' }, status: 'done', output: '', startedAt: NOW - 1000, endedAt: NOW,
+      web: { kind: 'search', query: 'q', unresponsive: [], results: [{ title: 'Evil', url: 'javascript:alert(1)', description: '' }, { title: 'Good', url: 'https://news.cn/', description: '' }] },
+    };
+    render(view([search]));
+    fireEvent.click(screen.getByRole('button', { name: /Searched/ }));
+    expect(screen.getByRole('link', { name: 'Good' })).toHaveAttribute('href', 'https://news.cn/');
+    expect(screen.queryByRole('link', { name: 'Evil' })).not.toBeInTheDocument();
   });
 });

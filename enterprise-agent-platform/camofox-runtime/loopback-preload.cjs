@@ -138,10 +138,17 @@ function isBlockedMetadataHostname(hostname) {
 // Strict egress for artifact renderer contexts (userId `artifact-render:<uuid>`). The renderer runs untrusted page
 // JavaScript, so unlike ordinary agent browsing it may reach only public addresses plus the exact render base host(s)
 // listed in AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS (`host` or `host:port`, comma separated; compose: `platform:8765`).
+// Platform's `web_fetch` real-browser fallback (userId `web-fetch:<uuid>`) opens arbitrary public pages, so it gets the
+// same strict machinery with no allowlisted host at all: public addresses only, DNS pinned by the strict proxy.
 const renderIdentityPrefix = "artifact-render:";
+const fetchIdentityPrefix = "web-fetch:";
 
 function isRenderIdentity(userId) {
   return String(userId || "").startsWith(renderIdentityPrefix);
+}
+
+function isFetchIdentity(userId) {
+  return String(userId || "").startsWith(fetchIdentityPrefix);
 }
 
 function parseAllowedHosts(raw) {
@@ -159,7 +166,15 @@ function parseAllowedHosts(raw) {
   return entries;
 }
 
-const strictRenderPolicy = { allowed: parseAllowedHosts(process.env.AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS) };
+const strictRenderPolicy = { kind: "strict", allowed: parseAllowedHosts(process.env.AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS) };
+const strictFetchPolicy = Object.freeze({ kind: "strict-public", allowed: Object.freeze([]) });
+
+// The strict policy a context owner gets, or null for ordinary (trusted-member) browsing.
+function strictPolicyFor(userId) {
+  if (isRenderIdentity(userId)) return strictRenderPolicy;
+  if (isFetchIdentity(userId)) return strictFetchPolicy;
+  return null;
+}
 
 function isPublicIpv4Number(numeric) {
   const within = (base, bits) => (numeric >>> (32 - bits)) === (parseIpv4(base) >>> (32 - bits));
@@ -674,10 +689,10 @@ function createPinningProxy({ lookup = pinningLookup, strict = null } = {}) {
 
 const managedPinningProxies = new Map();
 
-async function ensureManagedPinningProxy(strict = false) {
-  const kind = strict ? "strict" : "default";
+async function ensureManagedPinningProxy(strict = null) {
+  const kind = strict ? strict.kind : "default";
   if (!managedPinningProxies.has(kind)) {
-    const proxy = createPinningProxy({ strict: strict ? strictRenderPolicy : null });
+    const proxy = createPinningProxy({ strict });
     const ready = proxy.listen().then((url) => {
       reportProxyPolicy(`connection-pinning proxy (${kind}) active at ${url}`);
       return url;
@@ -744,9 +759,15 @@ function reportProxyPolicyOnce(policy) {
   reportProxyPolicy(policy);
 }
 
-async function managedContextOptions(options, inheritedPolicy, strict = false) {
+async function managedContextOptions(options, inheritedPolicy, strict = null) {
   const contextHasUpstreamProxy = hasConfiguredProxy(options);
   if (contextHasUpstreamProxy || inheritedPolicy.upstreamProxy) {
+    // A web-fetch context opens arbitrary public pages and depends on pinned DNS, which an operator proxy would bypass
+    // (DNS rebinding to internal addresses): refuse it rather than browse unpinned. Platform reports the fallback unavailable.
+    if (strict === strictFetchPolicy) {
+      reportProxyPolicyOnce("upstream proxy configured; web-fetch contexts are refused because their DNS cannot be pinned");
+      throw new Error("web-fetch browsing is unavailable behind an upstream proxy");
+    }
     // Remote-proxy DNS cannot be pinned without replacing or MITMing the
     // operator's proxy. Preserve it and retain the URL/literal/link-local
     // Playwright route guard. This limitation is explicit in the runtime log.
@@ -763,13 +784,13 @@ async function managedContextOptions(options, inheritedPolicy, strict = false) {
   };
 }
 
-async function guardCreatedContext(context, strict = false) {
+async function guardCreatedContext(context, strict = null) {
   try {
     // Hostname resolution is performed by either the connection-pinning proxy
     // or the operator's explicit upstream proxy. The route layer still blocks
     // known metadata hostnames and every literal metadata/link-local address.
     // Renderer contexts also resolve names here, so even an operator proxy cannot reach non-public targets.
-    return await installContextNetworkGuard(context, strict ? { strict: strictRenderPolicy } : { resolveDns: false });
+    return await installContextNetworkGuard(context, strict ? { strict } : { resolveDns: false });
   } catch (error) {
     await context?.close().catch(() => {});
     throw error;
@@ -783,7 +804,7 @@ function patchBrowser(browser, policy = { upstreamProxy: true, source: "unknown"
   const originalNewContext = browser.newContext;
   // The patched Camofox session code passes the owner id as a second argument (patch-runtime.cjs); Playwright ignores it.
   browser.newContext = async function managedNewContext(options = {}, meta = {}) {
-    const strict = isRenderIdentity(meta?.agentPlatformUserId);
+    const strict = strictPolicyFor(meta?.agentPlatformUserId);
     const protectedOptions = await managedContextOptions(options, this[browserProxyPolicy] || policy, strict);
     const context = await originalNewContext.call(this, protectedOptions);
     return guardCreatedContext(context, strict);
@@ -799,6 +820,14 @@ function patchBrowser(browser, policy = { upstreamProxy: true, source: "unknown"
   return browser;
 }
 
+// WebRTC (STUN/TURN/ICE) opens UDP and TCP sockets that neither the route guard nor the pinning proxy sees, so a page could
+// probe internal addresses through it. Firefox preferences are browser-wide (no per-context setting exists), so the
+// launch disables RTCPeerConnection for every context: ordinary agent browsing has no use for peer connections.
+function withoutWebRtc(options) {
+  const launch = options && typeof options === "object" ? options : {};
+  return { ...launch, firefoxUserPrefs: { ...(launch.firefoxUserPrefs || {}), "media.peerconnection.enabled": false } };
+}
+
 function patchBrowserType(browserType) {
   if (!browserType || browserType[browserTypeGuardInstalled]) return;
   Object.defineProperty(browserType, browserTypeGuardInstalled, { value: true });
@@ -809,6 +838,7 @@ function patchBrowserType(browserType) {
       const policy = method === "launch"
         ? { upstreamProxy: hasConfiguredProxy(args[0]), source: "launch" }
         : { upstreamProxy: true, source: method };
+      if (method === "launch") args[0] = withoutWebRtc(args[0]);
       return patchBrowser(await original.apply(this, args), policy);
     };
   }
@@ -844,7 +874,11 @@ module.exports = {
   createPinningProxy,
   inspectNetworkTarget,
   inspectStrictTarget,
+  isFetchIdentity,
   isRenderIdentity,
+  managedContextOptions,
+  withoutWebRtc,
+  strictPolicyFor,
   isStrictlyPublicAddress,
   parseAllowedHosts,
   installContextNetworkGuard,

@@ -1,5 +1,6 @@
 import { createContext } from "react";
 import type { Message } from "./types";
+import { webFromItem, type WebData } from "./web";
 
 /** One entry of an assistant turn's work, in arrival order (platform-api.md § Assistant message work trace). */
 export type WorkItem =
@@ -23,6 +24,8 @@ export type WorkItem =
       patch?: string;
       /** Platform kept only the first part of `patch` */
       patchCut?: boolean;
+      /** web_search / web_fetch once finished: what was found or read, or why a page could not be read */
+      web?: WebData | null;
     };
 
 export interface WorkTrace {
@@ -104,7 +107,7 @@ export function toolVerb(name: string, w: Words, args?: Record<string, unknown>,
     case "web_search":
       return w("Search the web", "搜索网页", "搜尋網頁");
     case "web_fetch":
-      return w("Open page", "打开网页", "開啟網頁");
+      return w("Read page", "阅读网页", "閱讀網頁");
     case "browser":
       return w("Browse", "浏览", "瀏覽");
     case "schedule":
@@ -209,11 +212,16 @@ export function parseWork(value: unknown, live = false): WorkTrace | null {
       const status = item.status === "done" || item.status === "error" ? item.status : live && item.ended_at == null ? "running" : "cancelled";
       const background = text(record(item.background)?.task_id);
       const patch = text(item.patch);
+      const name = text(item.name);
+      const args = record(item.args) ?? {};
+      const output = text(item.output);
+      const web = webFromItem(name, args, status, item, output);
       items.push({
-        type: "tool", id: text(item.id), name: text(item.name), args: record(item.args) ?? {}, status,
-        output: text(item.output), startedAt: isoTime(item.started_at), endedAt: isoTime(item.ended_at),
+        type: "tool", id: text(item.id), name, args, status,
+        output, startedAt: isoTime(item.started_at), endedAt: isoTime(item.ended_at),
         ...(background ? { background } : {}),
         ...(patch ? { patch, ...(item.patch_truncated === true ? { patchCut: true } : {}) } : {}),
+        ...(web ? { web } : {}),
       });
     }
   }
@@ -241,10 +249,13 @@ function fromActivity(activity: unknown[]): WorkTrace {
       const parameters = record(entry.parameters);
       const ended = epochTime(entry.completed_at);
       if (ended !== null) times.push(ended);
+      const name = text(entry.tool) || text(entry.label);
+      const args = parameters ?? (detail ? { detail } : {});
+      const status = OLD_TOOL_STATUS[text(entry.tool_status)] ?? "cancelled";
+      const output = text(entry.result);
+      const web = webFromItem(name, args, status, {}, output);
       items.push({
-        type: "tool", id: `old-${items.length}`, name: text(entry.tool) || text(entry.label),
-        args: parameters ?? (detail ? { detail } : {}), status: OLD_TOOL_STATUS[text(entry.tool_status)] ?? "cancelled",
-        output: text(entry.result), startedAt: at, endedAt: ended,
+        type: "tool", id: `old-${items.length}`, name, args, status, output, startedAt: at, endedAt: ended, ...(web ? { web } : {}),
       });
     } else if (entry.stage === "assistant.message") {
       const body = detail || text(entry.line);

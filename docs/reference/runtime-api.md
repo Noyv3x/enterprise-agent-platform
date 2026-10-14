@@ -95,7 +95,23 @@ Normal and summarization requests share the conversation session ID and
 enabled prompt caching. Credentials come from Platform's
 `POST /api/agent/tools/credentials/resolve`; refresh uses `force_refresh`.
 Credential and tool-gateway requests have finite deadlines combined with
-SDK cancellation.
+SDK cancellation. `web_fetch` waits 120 s for Platform, more than Platform's 90 s
+total fetch deadline (plain fetch plus the real-browser fallback).
+
+A gateway result with `is_error: true` (every Platform gateway tool: web,
+browser, schedule, tasks, skills, artifacts, mcp) is returned to Pi as a tool
+result `{content:[text], details:data, isError:true}` rather than thrown, so the
+model reads Platform's explanation and `tool_end` carries `is_error: true` and
+the failure `details` (`data` without image payloads: `images` and `screenshot`
+are dropped, as on success). Transport failures (non-2xx HTTP, timeouts,
+cancellation) still throw and reach `tool_end` without details.
+
+`web_search` and `web_fetch` descriptions tell the model that an empty search
+names the unavailable engines (rephrase rather than repeat), that a blocked or
+JavaScript-only page is retried in a real browser automatically, that failures
+are explained (host, status, protection, whether the browser was tried), and to
+use another source instead of retrying a failed page or opening it with
+`browser`, which is blocked the same way.
 
 `POST /v1/runs/{run_id}/steer` inserts input into the active run:
 
@@ -154,7 +170,10 @@ Healthy consumers receive 16 KiB chunks, pausing until drain as needed;
 clients exceeding a 4 MiB pending queue or stalled for ten seconds are
 disconnected and may reconnect with their last sequence. Tool activity
 previews are bounded to 64 KiB and omit image bytes; Pi still receives
-complete browser image content.
+complete browser image content. For `web_search` and `web_fetch`, `tool_end`
+projects `details` before `content_preview`, so the details Platform bounds
+(results, page excerpt or failure) always arrive whole and the content preview
+gets the rest of the budget; other tools project the content preview first.
 
 | Type | Fields |
 | --- | --- |
@@ -533,8 +552,8 @@ credentials. Two kinds of tool exist:
   `codex mcp add`, `.mcp.json`, `claude_desktop_config.json`,
   `~/.codex/config.toml`) with `import` (pasted text or a workspace file path) or `add`.
 
-Platform returns `{content,data,is_error}` for both. `is_error` fails the tool
-call with `content`. Otherwise Runtime returns `content` as a text block and one
+Platform returns `{content,data,is_error}` for both. `is_error` makes the call an
+error result with `content` as its text and `data`, without `images`, as its details. Otherwise Runtime returns `content` as a text block and one
 image block per `data.images[]` (`{mimeType,data}` base64, at most 4), keeps the
 rest of `data` as the details and never puts images into the details.
 

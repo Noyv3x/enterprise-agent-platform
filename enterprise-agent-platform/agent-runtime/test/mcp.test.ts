@@ -38,16 +38,16 @@ test("proxy tools pass the schema through, forward the name and arguments, and r
   assert.deepEqual(result.details, { structured: [1, 2] });
 });
 
-test("an image-only result carries no empty text block, an error fails the call, and malformed images are refused", async () => {
+test("an image-only result carries no empty text block, an error is an error result, and malformed images are refused", async () => {
   const replies = [
     { content: "", data: { images: [{ mimeType: "image/png", data: "aGk=" }] }, is_error: false },
-    { content: "server said no", data: null, is_error: true },
+    { content: "server said no", data: { code: "denied", images: [{ mimeType: "image/png", data: "aGk=" }] }, is_error: true },
     { content: "x", data: { images: [{ mimeType: "image/png" }] }, is_error: false },
     { content: "x", data: { images: Array.from({ length: 5 }, () => ({ mimeType: "image/png", data: "aGk=" })) }, is_error: false },
   ];
   const tool = build(personal, "/workspace", fakeGateway(() => replies.shift()!), { tools: [entry()], deferred: false }).find(value => value.name === "mcp__notion__search")!;
   assert.deepEqual((await tool.execute("a", { query: "q" }, undefined, undefined, context)).content, [{ type: "image", mimeType: "image/png", data: "aGk=" }]);
-  await assert.rejects(tool.execute("b", { query: "q" }, undefined, undefined, context), /server said no/);
+  assert.deepEqual(await tool.execute("b", { query: "q" }, undefined, undefined, context), { content: [{ type: "text", text: "server said no" }], details: { code: "denied" }, isError: true });
   await assert.rejects(tool.execute("c", { query: "q" }, undefined, undefined, context), /Invalid MCP image/);
   await assert.rejects(tool.execute("d", { query: "q" }, undefined, undefined, context), /Invalid MCP image/);
 });

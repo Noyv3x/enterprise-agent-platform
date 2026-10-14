@@ -15,10 +15,18 @@
  * Motion: group and detail disclosures share 300ms ease-out-strong (the group used the default easing upstream) and
  * the group chevron turns on that timing (200ms upstream). Rows and diff chips play their entrance only when new
  * (see ./entrance): those present when a settled trace first renders appear in place.
+ * Web steps (personal AI search and page reading): a row may replace the running ring with LoadingState's pixel grid
+ * (`loader`: Orbit while searching, Drive while opening a page), lead its chip with a node (a site monogram), sweep
+ * the chip text with the Shimmer atom while it runs (`shimmer`), add a node after the chip (`trail`: StreamingText's
+ * stacked source avatars and a result count) and, for a failure outside the AI's control (`calm`: a site turning
+ * the AI away), show a quiet info mark and an ink-2 explanation instead of the red warning. A detail line may be a
+ * link (`href`, a real anchor opening a new tab) with trailing `meta` text (the site).
  * Markup, classes and motion are otherwise upstream's. */
 import { useContext, useId, useState, type ReactNode, type SyntheticEvent } from "react";
 import { createPortal } from "react-dom";
+import { Shimmer } from "../atoms/Shimmer";
 import { EntranceContext } from "./entrance";
+import { LoaderGrid } from "./LoadingState";
 
 /* ─────────────────────────────────────────────────────────
  * TOOL CHIPS
@@ -43,7 +51,14 @@ const Icons: Record<string, ReactNode> = {
   clock: <g fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></g>,
 };
 
-export type ToolDetailLine = { text: string; tone?: "add" | "del" | "error" | "muted" };
+export type ToolDetailLine = {
+  text: string;
+  tone?: "add" | "del" | "error" | "muted";
+  /** the line is a link to this address (opens a new tab) */
+  href?: string;
+  /** quiet text after a link, e.g. its site */
+  meta?: string;
+};
 
 export type ToolStep = {
   id: string;
@@ -56,6 +71,16 @@ export type ToolStep = {
   state: "running" | "done" | "error" | "cancelled";
   /** status text read next to the chip when not done, e.g. "Failed" */
   stateLabel?: string;
+  /** LoadingState grid variant shown instead of the ring while running */
+  loader?: "Orbit" | "Drive" | "Dots";
+  /** a node at the start of the chip, e.g. a site monogram */
+  lead?: ReactNode;
+  /** sweep the chip text while running */
+  shimmer?: boolean;
+  /** a node after the chip, e.g. stacked sources and a count */
+  trail?: ReactNode;
+  /** a failure the user need not worry about: a quiet mark and an ink-2 state label */
+  calm?: boolean;
   /** a trailing status chip, e.g. the background task a command moved to; a button when it has `onSelect` */
   badge?: ToolBadge;
   /** nested rows under this row, e.g. the subagents a delegation started */
@@ -242,7 +267,12 @@ export default function ToolChips({
               >
                 <span className="relative flex size-4 shrink-0 items-center justify-center text-ink-3">
                   {row.state === "running" ? (
-                    <RunningRing />
+                    row.loader ? <LoaderGrid variant={row.loader} /> : <RunningRing />
+                  ) : row.calm ? (
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+                      className={`transition-opacity duration-100 group-enabled/row:group-hover/row:opacity-0 ${rowOpen ? "opacity-0" : ""}`} aria-hidden>
+                      <circle cx="12" cy="12" r="9" /><path d="M12 11v5M12 8h.01" />
+                    </svg>
                   ) : row.state === "error" || row.state === "cancelled" ? (
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={row.state === "error" ? "var(--red)" : "currentColor"} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
                       className={`transition-opacity duration-100 group-enabled/row:group-hover/row:opacity-0 ${rowOpen ? "opacity-0" : ""}`} aria-hidden>
@@ -270,15 +300,17 @@ export default function ToolChips({
                 <span className="shrink-0 text-[12.5px] font-medium text-ink">{row.label}</span>
                 {row.chip && (
                   <span
-                    className={`inline-flex h-5.5 min-w-0 flex-1 items-center truncate rounded-chip bg-field px-1.5
+                    className={`inline-flex h-5.5 min-w-0 ${row.trail || row.calm ? "flex-initial" : "flex-1"} items-center gap-1 truncate rounded-chip bg-field px-1.5
                       text-[11.5px] text-ink-2 shadow-hairline transition-colors duration-100 group-enabled/row:group-hover/row:bg-hover-2
-                      ${row.mono ? "font-mono" : ""}`}
+                      ${row.lead ? "pl-[3px]" : ""} ${row.mono ? "font-mono" : ""}`}
                   >
-                    <span className="truncate">{row.chip}</span>
+                    {row.lead}
+                    {row.shimmer && row.state === "running" ? <Shimmer className="min-w-0 truncate">{row.chip}</Shimmer> : <span className="truncate">{row.chip}</span>}
                   </span>
                 )}
+                {row.trail && <span className="flex min-w-0 shrink-0 items-center gap-1.5 text-[11.5px] text-ink-2 tabular-nums">{row.trail}</span>}
                 {row.stateLabel && (
-                  <span className={`shrink-0 text-[11.5px] font-medium ${row.state === "error" ? "text-red" : "text-ink-2"}`}>{row.stateLabel}</span>
+                  <span className={`${row.calm ? "min-w-0 truncate font-normal text-ink-2" : `shrink-0 font-medium ${row.state === "error" ? "text-red" : "text-ink-2"}`} text-[11.5px]`}>{row.stateLabel}</span>
                 )}
               </button>
               {row.badge && <RowBadge badge={row.badge} />}
@@ -310,7 +342,14 @@ export default function ToolChips({
               >
                 <div className="min-h-0 overflow-hidden">
                   <div className="mt-0.5 mb-1 ml-2 flex max-h-72 flex-col gap-0.5 overflow-y-auto border-l border-line py-0.5 pl-3.5" tabIndex={rowOpen ? 0 : -1}>
-                    {row.detail.map((line, index) => (
+                    {row.detail.map((line, index) => line.href ? (
+                      <span key={index} className="flex min-w-0 items-baseline gap-2 text-[11.5px] leading-[1.6]">
+                        <a href={line.href} target="_blank" rel="noopener noreferrer" className="min-w-0 truncate text-ink underline decoration-line-strong underline-offset-2 transition-colors duration-100 hover:decoration-ink-2">
+                          {line.text}
+                        </a>
+                        {line.meta && <span className="shrink-0 text-ink-2">{line.meta}</span>}
+                      </span>
+                    ) : (
                       <span
                         key={index}
                         className={`text-[11.5px] leading-[1.6] whitespace-pre-wrap [overflow-wrap:anywhere] ${row.detailMono ? "font-mono" : ""} ${line.tone ? DETAIL_TONE[line.tone] : "text-ink-2"}`}

@@ -1631,6 +1631,79 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         history = [entry for entry in self.q.messages(self.user, "private")["messages"] if entry["role"] == "assistant"]
         self.assertEqual(history[-1]["metadata"]["work"]["items"][0]["patch"], patch)
 
+    def test_work_keeps_bounded_web_display_fields_instead_of_the_json_output(self):
+        # A result without an address is no row (the UI skips it live too), so it never takes one of the 10 places.
+        results = [{"title": "no link", "url": "", "description": ""}] + [
+            {"title": "标题" * 150, "url": f"https://news.cn/{index}", "description": "d" * 400, "position": index}
+            for index in range(12)]
+        unresponsive = [{"engine": f"engine{index}", "reason": "CAPTCHA"} for index in range(7)]
+        excerpt = "# 新能源\n\n" + "正文" * 3000
+        trace = _WorkTrace()
+        for ident, name, error, details, preview in [
+            ("search", "web_search", False, {"query": "新能源 销量", "web": results, "source": "managed_search",
+                                             "unresponsive": unresponsive}, json.dumps({"web": results})),
+            ("page", "web_fetch", False, {"url": "https://www.bloomberg.com/a", "requested_url": "https://bloomberg.com/a",
+                                         "title": "China EV sales", "via": "browser", "chars": 48213, "truncated": True,
+                                         "excerpt": excerpt}, json.dumps({"url": "https://www.bloomberg.com/a", "content": excerpt})),
+            ("blocked", "web_fetch", True, {"error": "blocked", "url": "https://www.reuters.com/x", "host": "www.reuters.com",
+                                           "status": 401, "protection": "DataDome", "tried_browser": True},
+             "www.reuters.com blocked automated access (HTTP 401, DataDome); a real browser was tried. Use another source."),
+            ("old", "web_fetch", True, None, 'Platform tool HTTP 502: {"error":"Tool upstream request failed"}'),
+        ]:
+            trace.add({"type": "tool_start", "tool_call_id": ident, "name": name, "args": {}})
+            trace.add({"type": "tool_end", "tool_call_id": ident, "is_error": error,
+                       "content_preview": [{"type": "text", "text": preview}], "details": details})
+        items = {item["id"]: item for item in trace.finish()["items"]}
+        search = items["search"]
+        self.assertEqual((search["query"], search["output"], len(search["results"]), len(search["unresponsive"])),
+                         ("新能源 销量", "", 10, 5))
+        self.assertEqual(search["results"][0], {"title": ("标题" * 150)[:200], "url": "https://news.cn/0", "description": "d" * 240})
+        self.assertEqual(search["unresponsive"][0], {"engine": "engine0", "reason": "CAPTCHA"})
+        page = items["page"]
+        self.assertEqual(page["page"], {"url": "https://www.bloomberg.com/a", "title": "China EV sales", "via": "browser",
+                                        "chars": 48213, "truncated": True})
+        self.assertEqual((page["excerpt"], page["output"]), (excerpt[:2000], ""))
+        blocked = items["blocked"]
+        self.assertEqual(blocked["failure"], {"error": "blocked", "host": "www.reuters.com", "status": 401,
+                                              "protection": "DataDome", "tried_browser": True})
+        self.assertTrue(blocked["output"].startswith("www.reuters.com blocked"))
+        self.assertEqual(blocked["status"], "error")
+        old = items["old"]
+        self.assertNotIn("failure", old)
+        self.assertTrue(old["output"].startswith("Platform tool HTTP 502"))
+        # Display summaries are bounded by design: they never mark the trace as cut.
+        self.assertFalse(trace.data["truncated"])
+
+    def test_work_drops_web_display_fields_that_cannot_fit_before_the_output_preview(self):
+        trace = _WorkTrace()
+        trace.add({"type": "tool_start", "tool_call_id": "search", "name": "web_search", "args": {"query": "q"}})
+        while len(json.dumps(trace.data).encode("utf-8")) < WORK_TRACE_BYTES - 6000:
+            trace.add({"type": "text_delta", "delta": "p" * 4000})
+            trace.add({"type": "thinking_delta", "delta": "t"})
+        results = [{"title": "t" * 200, "url": "https://example.com/" + "u" * 480, "description": "d" * 240} for _ in range(10)]
+        trace.add({"type": "tool_end", "tool_call_id": "search", "is_error": False,
+                   "content_preview": [{"type": "text", "text": '{"web":[]}'}],
+                   "details": {"query": "q", "web": results, "source": "managed_search", "unresponsive": []}})
+        item = trace.data["items"][0]
+        self.assertEqual((item["status"], item["output"]), ("done", '{"web":[]}'))
+        self.assertNotIn("results", item)
+        self.assertNotIn("query", item)
+        self.assertLessEqual(len(json.dumps(trace.data).encode("utf-8")), WORK_TRACE_BYTES)
+
+    async def test_work_web_display_fields_reload_from_history_unchanged(self):
+        details = {"url": "https://news.cn/a", "title": "新华网", "via": "direct", "chars": 900, "truncated": False,
+                   "excerpt": "正文"}
+        message = await self.run_work([
+            {"type": "tool_start", "tool_call_id": "f", "name": "web_fetch", "args": {"url": "https://news.cn/a"}},
+            {"type": "tool_end", "tool_call_id": "f", "is_error": False,
+             "content_preview": [{"type": "text", "text": json.dumps({"url": "https://news.cn/a", "content": "正文"})}],
+             "details": details},
+        ])
+        live = message["metadata"]["work"]["items"][0]
+        self.assertEqual((live["page"]["title"], live["excerpt"]), ("新华网", "正文"))
+        history = [entry for entry in self.q.messages(self.user, "private")["messages"] if entry["role"] == "assistant"]
+        self.assertEqual(history[-1]["metadata"]["work"]["items"][0], live)
+
     async def test_worker_cancellation_keeps_work_already_received(self):
         received = asyncio.Event()
         never = asyncio.Event()

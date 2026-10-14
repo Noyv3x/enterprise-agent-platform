@@ -59,20 +59,19 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(302, headers={'location': 'http://localhost/secrets'})
         client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         with patch.object(asyncio.get_running_loop(), 'getaddrinfo', resolver), patch('enterprise_agent_platform.tools.httpx.AsyncClient', return_value=client):
-            with self.assertRaises(HTTPException) as raised:
-                await fetch('https://public.example/')
-        self.assertEqual(raised.exception.status_code, 400)
+            outcome = await fetch('https://public.example/')
+        self.assertTrue(outcome['is_error'])
+        self.assertEqual(outcome['data']['error'], 'forbidden')
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0].url.host, '93.184.216.34')
         self.assertEqual(requests[0].headers['host'], 'public.example')
         self.assertEqual(requests[0].extensions['sni_hostname'], 'public.example')
 
     async def test_public_fetch_bounds_response(self):
-        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b'a' * (2 * 1024 * 1024 + 1))))
+        client = httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b'a' * (8 * 1024 * 1024 + 1))))
         with patch.object(asyncio.get_running_loop(), 'getaddrinfo', AsyncMock(return_value=[(2, 1, 6, '', ('93.184.216.34', 80))])), patch('enterprise_agent_platform.tools.httpx.AsyncClient', return_value=client):
-            with self.assertRaises(HTTPException) as raised:
-                await fetch('http://public.example/')
-        self.assertEqual(raised.exception.status_code, 413)
+            outcome = await fetch('http://public.example/')
+        self.assertEqual(outcome['data']['error'], 'too_large')
 
     async def test_browser_allows_lan_but_not_core_or_metadata(self):
         answers = AsyncMock(side_effect=[[(2, 1, 6, '', ('192.168.2.10', 80))], [(2, 1, 6, '', ('172.20.0.5', 80))], [(2, 1, 6, '', ('169.254.169.254', 80))]])
@@ -149,10 +148,11 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job['status'], 'running')
         parent_id = json.loads(job['payload_json'])['parent_job_id']
         browser = Browser(self.p)
-        with patch('enterprise_agent_platform.tools.fetch', new_callable=AsyncMock, return_value={'text': 'page'}) as fetch_page:
+        page = {'content': 'page', 'data': {'url': 'https://public.example/'}, 'is_error': False}
+        with patch('enterprise_agent_platform.tools.fetch', new_callable=AsyncMock, return_value=page) as fetch_page:
             result = await browser.gateway('web', 'fetch', {'url': 'https://public.example/'},
                                            {**context, 'owner_user_id': self.user['id']})
-            self.assertEqual(result['data'], {'text': 'page'})
+            self.assertEqual(result, page)
             with self.db.connect() as conn:
                 conn.execute("UPDATE durable_jobs SET status='failed' WHERE id=?", (parent_id,))
             with self.assertRaises(HTTPException) as rejected:
@@ -297,9 +297,10 @@ class ToolsTests(unittest.IsolatedAsyncioTestCase):
         browser = Browser(self.p)
         for name in ('channel-3', 'chat-conversation'):
             _, context = await self.running_scope(name)
-            with patch('enterprise_agent_platform.tools.fetch', AsyncMock(return_value={'content': 'Public page', 'url': 'https://example.com'})):
+            page = {'content': 'Public page', 'data': {'url': 'https://example.com'}, 'is_error': False}
+            with patch('enterprise_agent_platform.tools.fetch', AsyncMock(return_value=page)):
                 value = await browser.gateway('web', 'fetch', {'url': 'https://example.com'}, context)
-                self.assertEqual(value['data']['content'], 'Public page')
+                self.assertEqual(value, page)
                 with self.assertRaises(HTTPException):
                     await browser.gateway('web', 'fetch', {'url': 'https://example.com'}, context | {'run_id': 'another-run'})
 

@@ -1,4 +1,5 @@
 import type { ArtifactRef, AttachmentViewKind } from "../../api";
+import type { WebData } from "./web";
 import type { WorkItem } from "./work";
 
 /** A message attachment or delivered file (platform-api.md § Files): `preview_url` is an image's PNG thumbnail (null
@@ -76,6 +77,9 @@ export interface ToolCall {
   patch: string;
   /** Platform kept only the first part of the patch */
   patchCut: boolean;
+  /** a finished web_search / web_fetch: its results, the page read, or why it could not be read (`tool_end.details`
+   * live, the persisted trace's fields after a reload) */
+  web?: WebData | null;
 }
 
 /** The agent turn currently streaming over SSE, in arrival order; it becomes a persisted message at `run_end`. */

@@ -1,3 +1,10 @@
+/* The personal AI's computer panel: one window following the AI's steps, the step line with its status pill, playback,
+ * browser takeover, background tasks and workspace files.
+ * Status pill: a page read that failed with a contract reason (`web_fetch` with a contract `error`, see `calmFailure`
+ * in ./web: the site's side, or the AI's own invalid or private address) was explained to the AI, which moves on, so
+ * it reads calmly in a neutral pill — 被拦截 for `blocked`, 无法打开 for every other reason — and is announced the
+ * same way, matching the calm row in the work trace and the explained notice in the window. Real failures (any other
+ * tool, a failed search, a failure without a contract reason) keep the red 失败. */
 import { useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { request } from "../../api";
 import { Button } from "../../components/ui/beautiful/atoms/Button";
@@ -13,7 +20,17 @@ import { followedRun, runCalls, stepKind, stepTitle, type RunSteps } from "./com
 import { BackgroundTasks } from "./Tasks";
 import type { BrowserLease, BrowserTab, LastRun, LiveRun, Message, StepRef, ToolCall, WorkspaceFile } from "./types";
 import { errorText } from "./useConversation";
-import { McpLabelsContext } from "./work";
+import { calmFailure } from "./web";
+import { McpLabelsContext, type Words } from "./work";
+
+/** How a refused page read is named in the pill and announced, or null when the step is not one. */
+function refusal(call: ToolCall | null | undefined, w: Words): { pill: string; announcement: string } | null {
+  const failure = call?.status === "error" ? calmFailure(call.web) : null;
+  if (!failure) return null;
+  return failure.error === "blocked"
+    ? { pill: w("Blocked", "被拦截", "被攔截"), announcement: w("The site blocked the page", "网页被网站拦截", "網頁被網站攔截") }
+    : { pill: w("Couldn't open", "无法打开", "無法開啟"), announcement: w("The page could not be opened", "网页无法打开", "網頁無法開啟") };
+}
 
 const STATE_POLL_MS = 3000;
 const FRAME_DELAY_MS = 1200;
@@ -448,21 +465,25 @@ export function ComputerBody({ live, lastRun, messages, focus }: {
     const before = previous.current;
     if (last && before?.id === last.id && (before.status === "preparing" || before.status === "running") && (last.status === "done" || last.status === "error")) {
       const shell = stepKind(last.name) === "shell";
-      setAnnouncement(last.status === "error" ? (shell ? w("Command failed", "命令失败", "命令失敗") : w("Step failed", "步骤失败", "步驟失敗"))
-        : shell ? w("Command finished", "命令已完成", "命令已完成") : w("Step finished", "步骤已完成", "步驟已完成"));
+      const refused = refusal(last, w);
+      setAnnouncement(refused ? refused.announcement
+        : last.status === "error" ? (shell ? w("Command failed", "命令失败", "命令失敗") : w("Step failed", "步骤失败", "步驟失敗"))
+          : shell ? w("Command finished", "命令已完成", "命令已完成") : w("Step finished", "步骤已完成", "步驟已完成"));
     }
     previous.current = last ? { id: last.id, status: last.status } : null;
   }, [last, w]);
 
   const pill = "h-5.5 shrink-0 text-[12px]";
+  const refused = refusal(call, w);
   const status = holding ? <StatusPill tone="red" className={pill}>{w("You're in control", "你正在控制", "你正在控制")}</StatusPill>
     : liveBrowser && browser.controlledElsewhere ? <StatusPill tone="orange" className={pill}>{w("Someone else is in control", "他人正在控制", "他人正在控制")}</StatusPill>
       : running(call) ? <StatusPill tone="accent" className={pill}>{w("Working", "工作中", "工作中")}</StatusPill>
         : following && live ? <StatusPill tone="accent" className={pill}>{w("Thinking", "思考中", "思考中")}</StatusPill>
-          : call?.status === "error" ? <StatusPill tone="red" className={pill}>{w("Failed", "失败", "失敗")}</StatusPill>
-            : call?.status === "cancelled" ? <StatusPill className={pill}>{w("Stopped", "已停止", "已停止")}</StatusPill>
-              : call ? <StatusPill tone="green" className={pill}>{w("Done", "已完成", "已完成")}</StatusPill>
-                : <StatusPill className={pill}>{w("Idle", "空闲", "閒置")}</StatusPill>;
+          : refused ? <StatusPill className={pill}>{refused.pill}</StatusPill>
+            : call?.status === "error" ? <StatusPill tone="red" className={pill}>{w("Failed", "失败", "失敗")}</StatusPill>
+              : call?.status === "cancelled" ? <StatusPill className={pill}>{w("Stopped", "已停止", "已停止")}</StatusPill>
+                : call ? <StatusPill tone="green" className={pill}>{w("Done", "已完成", "已完成")}</StatusPill>
+                  : <StatusPill className={pill}>{w("Idle", "空闲", "閒置")}</StatusPill>;
 
   const { tab } = browser;
   const browserName = tab?.title || tab?.url || w("Browser", "浏览器", "瀏覽器");

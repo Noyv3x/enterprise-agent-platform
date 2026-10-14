@@ -1,6 +1,7 @@
 import { createContext } from "react";
 import { partialArgs } from "./partialJson";
 import type { LastRun, LiveRun, Message, RunRef, ToolCall } from "./types";
+import { siteOf } from "./web";
 import { mcpSubject, mcpToolName, messageWork, toolVerb, type McpLabels, type Words } from "./work";
 
 /** How the computer window renders a step. */
@@ -35,7 +36,10 @@ export function messageCalls(message: Message): ToolCall[] {
     if (item.type !== "tool") continue;
     const preview = item.args._preview;
     const args = typeof preview === "string" ? { ...partialArgs(preview), _preview: preview } : item.args;
-    calls.push({ id: item.id, name: item.name, status: item.status, args, input: "", output: item.output, truncated: false, streamed: false, patch: item.patch ?? "", patchCut: item.patchCut === true });
+    calls.push({
+      id: item.id, name: item.name, status: item.status, args, input: "", output: item.output, truncated: false, streamed: false,
+      patch: item.patch ?? "", patchCut: item.patchCut === true, ...(item.web ? { web: item.web } : {}),
+    });
   }
   persisted.set(message, calls);
   return calls;
@@ -134,7 +138,7 @@ export function stepTitle(call: ToolCall, w: Words, labels: McpLabels = {}): str
       break;
     }
     case "fetch":
-      subject = host(str(args.url));
+      subject = siteOf(str(args.url));
       break;
     case "browser":
       subject = str(args.url) ? host(str(args.url)) : str(args.action);

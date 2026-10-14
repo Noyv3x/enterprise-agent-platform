@@ -283,10 +283,10 @@ describe("Computer panel", () => {
   it("opens an older reply's step from the conversation with View in computer", async () => {
     const user = userEvent.setup();
     const older = reply(2, [tool("t1", "bash", { command: "make" }, "built")]);
-    const latest = reply(4, [tool("s1", "web_search", { query: "pi agent" }, "Pi agent docs https://pi.dev/docs.\nMore")]);
+    const latest = reply(4, [{ ...tool("s1", "web_search", { query: "pi agent" }, ""), query: "pi agent", results: [{ title: "Pi agent docs", url: "https://pi.dev/docs", description: "Docs" }], unresponsive: [] }]);
     const panel = await mount([older, latest]);
     expect(within(windowOf(panel)).getByText("pi agent")).toBeVisible();
-    const link = within(windowOf(panel)).getByRole("link", { name: "https://pi.dev/docs" });
+    const link = within(windowOf(panel)).getByRole("link", { name: "Pi agent docs" });
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", expect.stringContaining("noopener"));
 
@@ -297,7 +297,145 @@ describe("Computer panel", () => {
     expect(within(panel).getByText("1 / 1")).toBeVisible();
 
     await user.click(within(panel).getByRole("button", { name: "Back to latest step" }));
-    expect(within(windowOf(panel)).getByRole("link", { name: "https://pi.dev/docs" })).toBeVisible();
+    expect(within(windowOf(panel)).getByRole("link", { name: "Pi agent docs" })).toBeVisible();
+  });
+
+  describe("web steps", () => {
+    const RESULTS = [
+      { title: "NEV sales up 34%", url: "https://www.news.cn/a.html", description: "Production and sales both exceeded 11 million." },
+      { title: "September auto sales", url: "https://www.reuters.com/x", description: "NEV sales rose 28%." },
+    ];
+    const PAGE = { url: "https://www.news.cn/a.html", title: "前三季度新能源汽车产销突破1100万辆", via: "direct", chars: 6842, truncated: false, excerpt: "## 渗透率\n\n9月当月达到 55.6%。\n\n![chart](https://cdn.example.com/c.png)" };
+    const BLOCKED = { error: "blocked", url: "https://www.reuters.com/x", host: "www.reuters.com", status: 401, protection: "DataDome", tried_browser: true };
+    const EXPLANATION = "Could not read www.reuters.com: blocked (HTTP 401, DataDome); a real browser was tried. Use another source.";
+    /** The run as Platform persists it (platform-api.md § Assistant message work trace). */
+    const PERSISTED = [
+      { ...tool("s1", "web_search", { query: "新能源 销量" }, ""), query: "新能源 销量", results: RESULTS, unresponsive: [] },
+      { ...tool("f1", "web_fetch", { url: PAGE.url }, ""), page: { url: PAGE.url, title: PAGE.title, via: "direct", chars: 6842, truncated: false }, excerpt: PAGE.excerpt },
+      { ...tool("f2", "web_fetch", { url: BLOCKED.url }, EXPLANATION), status: "error", failure: { error: "blocked", host: "www.reuters.com", status: 401, protection: "DataDome", tried_browser: true } },
+    ];
+
+    function webStep(id: string, name: string, args: Record<string, unknown>, details: Record<string, unknown>, isError = false, output = "{}") {
+      emit({ type: "tool_input_start", tool_call_id: id, name });
+      emit({ type: "tool_start", tool_call_id: id, name, args });
+      emit({ type: "tool_end", tool_call_id: id, is_error: isError, content_preview: text(output), details });
+    }
+
+    /** What the conversation and the computer show for the run, live or reloaded. */
+    async function expectRun(panel: HTMLElement, article: HTMLElement, user: ReturnType<typeof userEvent.setup>) {
+      // The window follows the latest step: the blocked page, explained calmly.
+      let win = windowOf(panel);
+      expect(within(win).getByRole("heading", { name: "reuters.com blocked automated access" })).toBeVisible();
+      expect(within(win).getByText(/DataDome bot protection/)).toBeVisible();
+      expect(within(win).getByText("A real browser was tried as well, without success.")).toBeVisible();
+      expect(within(win).getByRole("link", { name: "Open the original page" })).toHaveAttribute("href", BLOCKED.url);
+      // One group for the session; the blocked row explains instead of failing.
+      expect(within(article).getByRole("button", { name: "1 search · 1 page read · 1 could not be opened" })).toBeVisible();
+      expect(within(article).getByText("blocked automated access")).toBeVisible();
+      expect(within(article).queryByText("Failed")).not.toBeInTheDocument();
+      expect(within(article).getByText("2 results")).toBeVisible();
+      expect(within(article).getByText(`news.cn · ${PAGE.title}`)).toBeVisible();
+
+      const views = within(article).getAllByRole("button", { name: "View in computer" });
+      await user.click(views[0]);
+      win = windowOf(panel);
+      const rows = within(within(win).getByLabelText("Search results")).getAllByRole("listitem");
+      expect(within(rows[0]).getByRole("link", { name: RESULTS[0].title })).toHaveAttribute("target", "_blank");
+      expect(within(rows[0]).getByText("Read")).toBeVisible();
+      expect(within(rows[1]).getByText("Could not open")).toBeVisible();
+
+      await user.click(views[1]);
+      win = windowOf(panel);
+      expect(within(win).getByRole("heading", { name: PAGE.title })).toBeVisible();
+      expect(within(win).getByText("9月当月达到 55.6%。")).toBeVisible();
+      // Page images never load.
+      expect(win.querySelector("img")).toBeNull();
+      expect(within(win).getByRole("link", { name: "Open the original" })).toHaveAttribute("href", PAGE.url);
+    }
+
+    it("shows the run live from tool_end details, then reads its sources under the settled reply", async () => {
+      const user = userEvent.setup();
+      const panel = await mount();
+      webStep("s1", "web_search", { query: "新能源 销量" }, { query: "新能源 销量", web: RESULTS.map((result, at) => ({ ...result, position: at + 1 })), source: "managed_search", unresponsive: [] });
+      webStep("f1", "web_fetch", { url: PAGE.url }, PAGE);
+      emit({ type: "tool_input_start", tool_call_id: "f2", name: "web_fetch" });
+      emit({ type: "tool_start", tool_call_id: "f2", name: "web_fetch", args: { url: BLOCKED.url } });
+      expect(screen.getByRole("button", { name: /^Reading reuters\.com/ })).toBeVisible();
+      emit({ type: "tool_end", tool_call_id: "f2", is_error: true, content_preview: text(EXPLANATION), details: BLOCKED });
+      await expectRun(panel, screen.getByRole("article", { name: "Reply in progress" }), user);
+      // Still streaming: no sources yet.
+      expect(screen.queryByRole("button", { name: "1 source" })).not.toBeInTheDocument();
+
+      emit({ type: "run_end", message: reply(5, PERSISTED) });
+      const settled = screen.getByRole("article", { name: "Agent reply" });
+      const sources = within(settled).getByRole("button", { name: "1 source" });
+      expect(sources).toHaveAttribute("aria-expanded", "false");
+      await user.click(sources);
+      expect(sources).toHaveAttribute("aria-expanded", "true");
+      // Only the page actually read is a source; the blocked one is not.
+      const links = within(document.getElementById(sources.getAttribute("aria-controls")!)!).getAllByRole("link");
+      expect(links.map((link) => [link.getAttribute("href"), link.getAttribute("target")])).toEqual([[PAGE.url, "_blank"]]);
+      expect(links[0]).toHaveAccessibleName(expect.stringContaining(PAGE.title));
+    });
+
+    it("renders a reloaded run exactly like the live one", async () => {
+      const user = userEvent.setup();
+      const panel = await mount([reply(5, PERSISTED)]);
+      const article = screen.getByRole("article", { name: "Agent reply" });
+      await user.click(within(article).getByRole("button", { name: /^Worked for/ }));
+      await expectRun(panel, article, user);
+      expect(within(article).getByRole("button", { name: "1 source" })).toBeVisible();
+    });
+
+    it("names a page the site refused calmly in the status pill and announcement, while real failures stay red", async () => {
+      const user = userEvent.setup();
+      const panel = await mount();
+      const announced = () => screen.getAllByRole("status").map((node) => node.textContent);
+      const NOT_FOUND = { error: "not_found", url: "https://news.cn/gone", host: "news.cn", status: 404, tried_browser: false };
+      webStep("f1", "web_fetch", { url: BLOCKED.url }, BLOCKED, true, EXPLANATION);
+      expect(announced()).toContain("The site blocked the page");
+      webStep("f2", "web_fetch", { url: NOT_FOUND.url }, NOT_FOUND, true, "Not found");
+      expect(announced()).toContain("The page could not be opened");
+      // A gateway failure without the contract's explanation is a real failure.
+      emit({ type: "tool_input_start", tool_call_id: "f3", name: "web_fetch" });
+      emit({ type: "tool_start", tool_call_id: "f3", name: "web_fetch", args: { url: "https://example.com/" } });
+      emit({ type: "tool_end", tool_call_id: "f3", is_error: true, content_preview: text("Platform tool HTTP 502"), details: null });
+      expect(announced()).toContain("Step failed");
+      const live = screen.getByRole("article", { name: "Reply in progress" });
+      expect(within(live).getAllByText("Failed")).toHaveLength(1);
+
+      // Reviewing each step shows its pill.
+      const views = within(live).getAllByRole("button", { name: "View in computer" });
+      await user.click(views[0]);
+      expect(within(panel).getByText("Blocked")).not.toHaveClass("bg-red-tint");
+      expect(within(panel).queryByText("Failed")).not.toBeInTheDocument();
+      await user.click(views[1]);
+      expect(within(panel).getByText("Couldn't open")).not.toHaveClass("bg-red-tint");
+      await user.click(views[2]);
+      expect(within(panel).getByText("Failed")).toHaveClass("bg-red-tint");
+    });
+
+    it("names the engines that were unavailable when a search found nothing", async () => {
+      const panel = await mount([reply(4, [{ ...tool("s1", "web_search", { query: "新能源" }, ""), query: "新能源", results: [], unresponsive: [{ engine: "baidu", reason: "CAPTCHA" }, { engine: "brave", reason: "too many requests" }] }])]);
+      const win = windowOf(panel);
+      expect(within(win).getByText("No results came back")).toBeVisible();
+      expect(within(win).getByText("These engines are unavailable right now: baidu (CAPTCHA), brave (too many requests).")).toBeVisible();
+      expect(within(screen.getByRole("article", { name: "Agent reply" })).getByText("No results", { exact: true })).toBeInTheDocument();
+    });
+
+    it("keeps older traces readable: a cut JSON output and an unexplained failure", async () => {
+      const user = userEvent.setup();
+      const panel = await mount([reply(4, [
+        tool("s1", "web_search", { query: "pi" }, '{"web":[{"title":"Pi docs","url":"https://pi.dev/docs","description":"The agent'),
+        { ...tool("f1", "web_fetch", { url: "https://www.reuters.com/x" }, 'Platform tool HTTP 502: {"error":"Tool upstream request failed"}'), status: "error" },
+      ])]);
+      let win = windowOf(panel);
+      expect(within(win).getByRole("heading", { name: "reuters.com could not be opened" })).toBeVisible();
+      expect(within(win).getByText(/Tool upstream request failed/)).toBeVisible();
+      await user.click(screen.getAllByRole("button", { name: "View in computer" })[0]);
+      win = windowOf(panel);
+      expect(within(win).getByRole("link", { name: "Pi docs" })).toHaveAttribute("href", "https://pi.dev/docs");
+    });
   });
 
   it("opens the closed panel on the chosen step", async () => {

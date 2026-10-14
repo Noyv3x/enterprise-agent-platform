@@ -4,6 +4,7 @@ import { applyChatTitle } from "../chat/chatStore";
 import { LEAVE_MS, reducedMotion } from "./motion";
 import { conversationBase } from "./routes";
 import { partialArgs } from "./partialJson";
+import { webFromEvent } from "./web";
 import { mergeTask, type TaskMap, type TaskView } from "./taskState";
 import type { Attachment, Compaction, ElicitationOutcome, ElicitationState, LastRun, LiveRun, McpActionRequired, McpElicitation, Message, MessagePage, SendMode, ToolCall } from "./types";
 
@@ -29,7 +30,8 @@ type StreamEvent = { seq: number } & (
   | { type: "tool_start"; tool_call_id: string; name: string; args: Record<string, unknown> | null }
   | { type: "tool_update"; tool_call_id: string; partial: unknown }
   | { type: "tool_output"; tool_call_id: string; delta: string; truncated?: boolean }
-  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { patch?: unknown; patch_truncated?: unknown; background?: { task_id?: unknown } | null } | null }
+  /** `details`: an edit's patch, a promoted command's background task, or a web step's data (agent-runtime.md) */
+  | { type: "tool_end"; tool_call_id: string; is_error: boolean; content_preview: unknown; details?: { patch?: unknown; patch_truncated?: unknown; background?: { task_id?: unknown } | null; [key: string]: unknown } | null }
   | { type: "input_delivered"; message_id: number }
   /** a withdrawn message: its row is gone */
   | { type: "message_removed"; message_id: number }
@@ -200,10 +202,12 @@ function applyCallEvent(call: ToolCall, event: StreamEvent): ToolCall {
     }
     case "tool_end": {
       const patch = event.details?.patch;
+      const output = outputText(event.content_preview) || call.output;
+      const web = webFromEvent(call.name, call.args, event.is_error, event.details, output);
       return {
-        ...call, name: call.name, status: event.is_error ? "error" : "done", truncated: false,
-        output: outputText(event.content_preview) || call.output,
+        ...call, name: call.name, status: event.is_error ? "error" : "done", truncated: false, output,
         ...(typeof patch === "string" ? { patch, patchCut: event.details?.patch_truncated === true } : {}),
+        ...(web ? { web } : {}),
       };
     }
     default:
@@ -342,10 +346,13 @@ function applyEvent(state: State, event: StreamEvent, at: number, mark: number):
             if (event.type === "tool_update") return { ...item, output: outputText(event.partial) };
             const background = event.details?.background?.task_id;
             const patch = event.details?.patch;
+            const output = outputText(event.content_preview) || item.output;
+            const web = webFromEvent(item.name, item.args, event.is_error, event.details, output);
             return {
-              ...item, output: outputText(event.content_preview) || item.output, status: event.is_error ? "error" : "done", endedAt: at,
+              ...item, output, status: event.is_error ? "error" : "done", endedAt: at,
               ...(typeof background === "string" && background ? { background } : {}),
               ...(typeof patch === "string" && patch ? { patch, ...(event.details?.patch_truncated === true ? { patchCut: true } : {}) } : {}),
+              ...(web ? { web } : {}),
             };
           }),
         },

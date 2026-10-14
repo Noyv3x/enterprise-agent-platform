@@ -142,6 +142,22 @@ test('a large edit/write patch is cut on whole lines within the activity budget 
   assert.deepEqual(whole!.details, { firstChangedLine: 1, patch: small });
 });
 
+test('web tool details arrive whole even when the content preview alone would fill the budget', () => {
+  const events = new RunEvents();
+  const live = new Response();
+  events.subscribe(0, live.asHttp());
+  const details = { url: 'https://example.org/a', title: '标题', via: 'browser', chars: 200000, truncated: true, excerpt: '正文'.repeat(2000) };
+  const content = [{ type: 'text', text: 'x'.repeat(200_000) }];
+  events.emit({ type: 'tool_end', name: 'web_fetch', is_error: false, content_preview: content, details });
+  events.emit({ type: 'tool_end', name: 'read', is_error: false, content_preview: content, details: { note: 'y'.repeat(100) } });
+  events.close();
+  const [web, other] = values(live);
+  assert.deepEqual(web!.details, details);
+  assert(web!.content_preview[0].text.length > 1000);
+  assert(Buffer.byteLength(JSON.stringify({ content_preview: web!.content_preview, details: web!.details })) <= 64 * 1024);
+  assert.equal(other!.details?.note, undefined, 'other tools still give the content preview first claim on the budget');
+});
+
 test('deep external tool previews cannot abort the run or lose later terminal events', () => {
   const events = new RunEvents();
   const response = new Response();

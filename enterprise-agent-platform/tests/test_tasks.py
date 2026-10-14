@@ -1220,7 +1220,7 @@ class TasksTests(unittest.IsolatedAsyncioTestCase):
         browser = Browser(self.p)
         child = {"sid": f"agent-private-1-bg-{tid}", "scope_key": f"private:1/delegate/bg-{tid}",
                  "run_id": f"run-agent-private-1-bg-{tid}", "owner_user_id": 1}
-        with patch("enterprise_agent_platform.tools.fetch", AsyncMock(return_value={"text": "page"})) as fetch:
+        with patch("enterprise_agent_platform.tools.fetch", AsyncMock(return_value={"content": "page", "data": {}, "is_error": False})) as fetch:
             fetched = await browser.gateway("web", "fetch", {"url": "https://example.com"}, child)
         self.assertEqual((fetched["is_error"], fetch.await_count), (False, 1))
         refusals = [("browser", "snapshot", child), ("schedule", "list", child), ("tasks", "list", child),

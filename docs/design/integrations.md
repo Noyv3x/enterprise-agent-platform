@@ -4,7 +4,7 @@ Tool request/response shapes belong in the [Runtime API](../reference/runtime-ap
 
 ## Web search and fetch
 
-`web_search` uses managed SearXNG. `web_fetch` uses direct Platform HTTP GET with public-address SSRF validation on the initial URL and every redirect, time/size limits and HTML-to-Markdown extraction. There is no Firecrawl, PostgreSQL queue, Redis, RabbitMQ or Playwright fetch stack.
+`web_search` uses managed SearXNG with an explicit engine list from Platform (`AGENT_PLATFORM_SEARXNG_ENGINES`) and reports engines that failed. `web_fetch` uses direct Platform HTTP GET with browser-like request headers, public-address SSRF validation on the initial URL and every redirect, time/size limits and HTML-to-Markdown extraction; when a site blocks it or the page needs JavaScript, Platform retries once in Camofox under a throwaway `web-fetch:` identity. Every failure is a typed, explained tool result. Shapes: [Platform API](../reference/platform-api.md#web-search-and-fetch). There is no Firecrawl, PostgreSQL queue, Redis or RabbitMQ.
 
 All three conversation modes can search/fetch. Chat's sandbox has no network; its web requests use the Platform gateway, not sandbox networking. See [web trust rules](security-and-trust.md#web-and-browser).
 

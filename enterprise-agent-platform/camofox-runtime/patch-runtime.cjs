@@ -469,6 +469,61 @@ const displayAfter = `    let displayStartupError = null;
 const contextOwnerBefore = "const context = await b.newContext(contextOptions);";
 const contextOwnerAfter = "const context = await b.newContext(contextOptions, { agentPlatformUserId: String(key) });";
 
+// Platform's throwaway browser identities (`artifact-render:<uuid>` renders, `web-fetch:<uuid>` page fetches) must leave
+// nothing on disk. Upstream's persistence plugin saves every identity's cookies and localStorage under
+// profiles/<sha256(userId)[:32]>/ on session close and imports the bootstrap cookies.txt into new ones; the patched plugin
+// sees no session events for ephemeral identities, and on startup removes profiles an earlier version saved for them
+// (recognised by meta.json's userId; other identities' profiles are never touched).
+const persistencePlugin = path.join(path.dirname(target), "plugins", "persistence", "index.js");
+const pluginImportsBefore = "import { importBootstrapCookies } from '../../lib/cookies.js';";
+const pluginImportsAfter = `import { importBootstrapCookies } from '../../lib/cookies.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+// Agent Platform: ephemeral identities are never persisted, restored or seeded with bootstrap cookies.
+export function isEphemeralIdentity(userId) {
+  return /^(?:artifact-render|web-fetch):/.test(String(userId ?? ''));
+}
+
+export async function removeEphemeralProfiles(profileDir) {
+  const root = path.resolve(profileDir);
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9a-f]{32}$/.test(entry.name)) continue;
+    const userDir = path.join(root, entry.name);
+    let meta;
+    try {
+      meta = JSON.parse(await fs.readFile(path.join(userDir, 'meta.json'), 'utf8'));
+    } catch {
+      continue;
+    }
+    if (!isEphemeralIdentity(meta?.userId)) continue;
+    await fs.rm(userDir, { recursive: true, force: true });
+    removed += 1;
+  }
+  return removed;
+}`;
+const pluginEventsBefore = "  const { events, config, log } = ctx;";
+const pluginEventsAfter = `  const { config, log } = ctx;
+  // Agent Platform: session hooks never run for ephemeral identities, so they are not tracked, checkpointed or restored.
+  const events = {
+    on: (name, handler) => ctx.events.on(name, (payload, ...rest) =>
+      (name.startsWith('session:') && isEphemeralIdentity(payload?.userId) ? undefined : handler(payload, ...rest))),
+  };`;
+const pluginCleanupBefore = "  log('info', 'persistence plugin enabled', { profileDir });";
+const pluginCleanupAfter = `  log('info', 'persistence plugin enabled', { profileDir });
+  const removedEphemeral = await removeEphemeralProfiles(profileDir).catch((err) => {
+    log('warn', 'could not remove ephemeral identity profiles', { error: err?.message || String(err) });
+    return 0;
+  });
+  if (removedEphemeral) log('info', 'removed persisted state of ephemeral identities', { removed: removedEphemeral });`;
+
 let patched = fs.readFileSync(target, "utf8");
 
 function applyExactPatch(label, before, after) {
@@ -502,8 +557,26 @@ if (pointerRouteMatches === 0) {
   throw new Error(`expected at most one atomic-human-pointer-route, found ${pointerRouteMatches}`);
 }
 
-const source = fs.readFileSync(target, "utf8");
-if (patched === source) process.exit(0);
-const temporary = `${target}.agent-platform-patch-${process.pid}`;
-fs.writeFileSync(temporary, patched, { encoding: "utf8", mode: 0o644 });
-fs.renameSync(temporary, target);
+function patchPlugin(source) {
+  let text = source;
+  for (const [label, before, after] of [["ephemeral-identity-imports", pluginImportsBefore, pluginImportsAfter],
+    ["ephemeral-identity-events", pluginEventsBefore, pluginEventsAfter],
+    ["ephemeral-identity-startup-cleanup", pluginCleanupBefore, pluginCleanupAfter]]) {
+    if (text.includes(after)) continue;
+    const matches = text.split(before).length - 1;
+    if (matches !== 1) throw new Error(`expected exactly one ${label} patch target, found ${matches}`);
+    text = text.replace(before, after);
+  }
+  return text;
+}
+
+function writeIfChanged(file, text) {
+  if (text === fs.readFileSync(file, "utf8")) return;
+  const temporary = `${file}.agent-platform-patch-${process.pid}`;
+  fs.writeFileSync(temporary, text, { encoding: "utf8", mode: 0o644 });
+  fs.renameSync(temporary, file);
+}
+
+const pluginPatched = patchPlugin(fs.readFileSync(persistencePlugin, "utf8"));
+writeIfChanged(target, patched);
+writeIfChanged(persistencePlugin, pluginPatched);

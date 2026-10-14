@@ -376,6 +376,22 @@ test("browser screenshot and vision deliver image content without image details"
   }
 });
 
+test("gateway failures are error results that keep their details, and web_fetch outlasts Platform's 90 s deadline", async () => {
+  const failure = { error: "blocked", url: "https://www.reuters.com/x", host: "www.reuters.com", status: 401, protection: "DataDome", tried_browser: true };
+  const calls: { action: string; timeoutMs: number | undefined }[] = [];
+  const tools = createTools("/workspace", { sandbox, executor: {} as ExecutorTransport,
+    gateway: { async call(_tool, action, _args, _context, _signal, timeoutMs) { calls.push({ action, timeoutMs }); return { content: "www.reuters.com blocked the request", data: failure, is_error: true }; } },
+    context: () => ({ sid: "web", scope_key: sandbox.scope_key, run_id: "web" }), names: ["web_fetch", "web_search", "schedule"] });
+  for (const tool of tools) {
+    const args = tool.name === "web_fetch" ? { url: failure.url } : tool.name === "web_search" ? { query: "q" } : { action: "list" };
+    assert.deepEqual(await tool.execute("e", args, undefined, undefined, {} as ExtensionToolContext),
+      { content: [{ type: "text", text: "www.reuters.com blocked the request" }], details: failure, isError: true }, tool.name);
+  }
+  assert(calls.find(call => call.action === "fetch")!.timeoutMs! > 90_000);
+  const fetchTool = tools.find(tool => tool.name === "web_fetch")!;
+  assert.match(fetchTool.description, /real browser/);
+});
+
 test("gateway deadline bounds stalled bodies even with SDK cancellation signal", async t => {
   const originalTimeout = AbortSignal.timeout;
   t.mock.method(AbortSignal, "timeout", () => originalTimeout(50));

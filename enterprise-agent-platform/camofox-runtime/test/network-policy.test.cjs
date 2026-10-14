@@ -5,6 +5,8 @@ const net = require('node:net');
 const test = require('node:test');
 process.env.AGENT_PLATFORM_TECHNICAL_PROFILE = 'agent-platform-v1';
 process.env.AGENT_PLATFORM_CAMOFOX_BIND_HOST = '127.0.0.1';
+// The renderer may reach this exact host; web-fetch identities must not inherit it.
+process.env.AGENT_PLATFORM_CAMOFOX_RENDER_ALLOWED_HOSTS = 'localhost:8765';
 const { inspectNetworkTarget, resolvePinnedNetworkTarget, createPinningProxy } = require('../loopback-preload.cjs');
 
 for (const address of ['127.0.0.1', '10.2.3.4', '172.16.2.3', '192.168.2.3', '::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:10.2.3.4']) {
@@ -194,6 +196,70 @@ test('the strict pinning proxy refuses a loopback origin that the default proxy 
   }
 });
 
+test('web-fetch identities get strict public-only egress with no allowlisted host', async () => {
+  const fetchPolicy = strictPreload.strictPolicyFor('web-fetch:6f1c');
+  const renderPolicy = strictPreload.strictPolicyFor('artifact-render:6f1c');
+  assert.ok(fetchPolicy);
+  assert.deepEqual(fetchPolicy.allowed, []);
+  for (const id of ['private:1', 'web-fetch', 'x-web-fetch:1', '', undefined]) assert.equal(strictPreload.strictPolicyFor(id), null, String(id));
+  const loopback = async () => [{ address: '127.0.0.1', family: 4 }];
+  // The render base host stays reachable for renderers only.
+  assert.equal((await strictPreload.inspectStrictTarget('http://localhost:8765/', loopback, renderPolicy)).blocked, false);
+  assert.equal((await strictPreload.inspectStrictTarget('http://localhost:8765/', loopback, fetchPolicy)).blocked, true);
+  await assert.rejects(resolvePinnedNetworkTarget('localhost', loopback, { strict: fetchPolicy, port: 8765 }), error => error.blocked === true);
+  for (const address of ['10.0.0.5', '169.254.169.254', '::1', 'fd12::1']) {
+    const lookup = async () => [{ address, family: net.isIP(address) }];
+    assert.equal((await strictPreload.inspectStrictTarget('https://news.example/', lookup, fetchPolicy)).blocked, true, address);
+    await assert.rejects(resolvePinnedNetworkTarget('news.example', lookup, { strict: fetchPolicy, port: 443 }), error => error.blocked === true);
+  }
+  const pub = async () => [{ address: '93.184.216.34', family: 4 }];
+  assert.equal((await resolvePinnedNetworkTarget('news.example', pub, { strict: fetchPolicy, port: 443 })).address, '93.184.216.34');
+
+  // The strict proxy built for web-fetch refuses a loopback origin.
+  const origin = http.createServer((request, response) => response.end('inside'));
+  await new Promise(resolve => origin.listen({ host: '127.0.0.1', port: 0 }, resolve));
+  const proxy = createPinningProxy({ strict: fetchPolicy });
+  try {
+    const proxyUrl = new URL(await proxy.listen());
+    const status = await bounded(new Promise((resolve, reject) => {
+      http.get({ hostname: proxyUrl.hostname, port: proxyUrl.port, path: `http://127.0.0.1:${origin.address().port}/`, agent: false },
+        response => { response.resume(); resolve(response.statusCode); }).once('error', reject);
+    }), 3000, 'proxy request timed out');
+    assert.equal(status, 403);
+  } finally {
+    await proxy.close();
+    origin.close();
+  }
+
+  // Context creation: a web-fetch context gets its own strict proxy and a route guard that aborts private targets.
+  const created = [];
+  const routes = [];
+  const browser = {
+    contexts: () => [],
+    async newContext(options) {
+      created.push(options);
+      return { route: async (pattern, handler) => routes.push(handler), close: async () => {} };
+    },
+  };
+  strictPreload.patchBrowser(browser, { upstreamProxy: false, source: 'test' });
+  await browser.newContext({}, { agentPlatformUserId: 'private:1' });
+  await browser.newContext({}, { agentPlatformUserId: 'artifact-render:abc' });
+  await browser.newContext({}, { agentPlatformUserId: 'web-fetch:abc' });
+  await browser.newContext({}, { agentPlatformUserId: 'web-fetch:def' });
+  assert.equal(new Set(created.slice(0, 3).map(options => options.proxy.server)).size, 3);
+  assert.equal(created[2].proxy.server, created[3].proxy.server);
+  assert.equal(created[2].serviceWorkers, 'block');
+  const decide = async (handler, url) => {
+    let outcome = 'continue';
+    await handler({ request: () => ({ url: () => url }), abort: async () => { outcome = 'abort'; }, continue: async () => { outcome = 'continue'; } });
+    return outcome;
+  };
+  assert.equal(await decide(routes[2], 'http://10.0.0.5/'), 'abort');
+  assert.equal(await decide(routes[2], 'http://localhost:8765/'), 'abort');
+  assert.equal(await decide(routes[2], 'http://8.8.8.8/'), 'continue');
+  assert.equal(await decide(routes[1], 'http://localhost:8765/'), 'continue');
+});
+
 test('only artifact-render identities get the strict proxy and route guard', async () => {
   assert.equal(strictPreload.isRenderIdentity('artifact-render:1234'), true);
   for (const id of ['private:1', 'artifact-render', 'x-artifact-render:1', '', undefined]) assert.equal(strictPreload.isRenderIdentity(id), false, String(id));
@@ -229,4 +295,20 @@ test('only artifact-render identities get the strict proxy and route guard', asy
   } finally {
     process.emit('SIGTERM');
   }
+});
+
+test('the browser launch disables WebRTC, keeping the caller\'s other preferences', async () => {
+  const merged = strictPreload.withoutWebRtc({ headless: true, firefoxUserPrefs: { 'gfx.bundled-fonts.activate': 0 } });
+  assert.deepEqual(merged, { headless: true, firefoxUserPrefs: { 'gfx.bundled-fonts.activate': 0, 'media.peerconnection.enabled': false } });
+  assert.equal(strictPreload.withoutWebRtc(undefined).firefoxUserPrefs['media.peerconnection.enabled'], false);
+  // A page cannot turn it back on through the caller either: the platform value wins over a caller's true.
+  assert.equal(strictPreload.withoutWebRtc({ firefoxUserPrefs: { 'media.peerconnection.enabled': true } }).firefoxUserPrefs['media.peerconnection.enabled'], false);
+});
+
+test('behind an upstream proxy web-fetch contexts are refused, other identities keep the operator proxy', async () => {
+  const proxied = { upstreamProxy: true, source: 'test' };
+  await assert.rejects(strictPreload.managedContextOptions({}, proxied, strictPreload.strictPolicyFor('web-fetch:1')), /upstream proxy/);
+  await assert.rejects(strictPreload.managedContextOptions({ proxy: { server: 'http://corp:3128' } }, { upstreamProxy: false }, strictPreload.strictPolicyFor('web-fetch:1')), /upstream proxy/);
+  assert.deepEqual(await strictPreload.managedContextOptions({}, proxied, null), { serviceWorkers: 'block' });
+  assert.deepEqual(await strictPreload.managedContextOptions({}, proxied, strictPreload.strictPolicyFor('artifact-render:1')), { serviceWorkers: 'block' });
 });
